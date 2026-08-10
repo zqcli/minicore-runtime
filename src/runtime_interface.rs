@@ -6,7 +6,8 @@ use thiserror::Error;
 
 use crate::agent_session_lifecycle::{
     AgentDefinitionPatch, AgentMetadataPatch, AgentRevisionRef, AgentStatus, AgentUsableStatus,
-    ForkAnchor, ForkSourceKind, NewAgentDefinition, NewAgentMetadata, SessionModelConfig,
+    ForkAnchor, ForkSourceKind, NewAgentDefinition, NewAgentMetadata, SessionMetadataPatch,
+    SessionModelConfig,
 };
 use crate::prompt::{PromptIntent, SessionPromptSelection};
 use crate::skills::SkillId;
@@ -145,6 +146,57 @@ impl fmt::Debug for NewSessionDefinition {
             .field("workspace", &self.workspace)
             .field("model", &self.model)
             .field("prompts", &self.prompts)
+            .finish()
+    }
+}
+
+/// One complete-replacement definition patch for an ordinary Session definition CAS.
+/// Workspace/Model/Prompt are each complete replacement candidates, never partial nested
+/// patches; an empty patch becomes `NoChange` only after stale/lifecycle CAS checks.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SessionDefinitionPatch {
+    workspace: Option<WorkspaceDefinitionInput>,
+    model: Option<SessionModelConfig>,
+    prompts: Option<SessionPromptSelection>,
+}
+
+impl SessionDefinitionPatch {
+    pub const fn new(
+        workspace: Option<WorkspaceDefinitionInput>,
+        model: Option<SessionModelConfig>,
+        prompts: Option<SessionPromptSelection>,
+    ) -> Self {
+        Self {
+            workspace,
+            model,
+            prompts,
+        }
+    }
+
+    pub const fn workspace(&self) -> Option<&WorkspaceDefinitionInput> {
+        self.workspace.as_ref()
+    }
+
+    pub const fn model(&self) -> Option<&SessionModelConfig> {
+        self.model.as_ref()
+    }
+
+    pub const fn prompts(&self) -> Option<&SessionPromptSelection> {
+        self.prompts.as_ref()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.workspace.is_none() && self.model.is_none() && self.prompts.is_none()
+    }
+}
+
+impl fmt::Debug for SessionDefinitionPatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionDefinitionPatch")
+            .field("workspace_present", &self.workspace.is_some())
+            .field("model_present", &self.model.is_some())
+            .field("prompts_present", &self.prompts.is_some())
             .finish()
     }
 }
@@ -343,7 +395,7 @@ impl fmt::Debug for AgentCommand {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum SessionCommand {
     Create {
@@ -366,10 +418,107 @@ pub enum SessionCommand {
     Delete {
         session_id: SessionId,
     },
+    UpdateDefinition {
+        session_id: SessionId,
+        expected_revision: SessionDefinitionRevision,
+        patch: SessionDefinitionPatch,
+    },
+    UpgradeAgentRevision {
+        session_id: SessionId,
+        expected_revision: SessionDefinitionRevision,
+        target: Option<AgentRevisionRef>,
+    },
+    ReloadWorkspace {
+        session_id: SessionId,
+    },
     Fork {
         source_session_id: SessionId,
         anchor: ForkAnchor,
     },
+    UpdateMetadata {
+        session_id: SessionId,
+        expected_revision: SessionMetadataRevision,
+        patch: SessionMetadataPatch,
+    },
+}
+
+impl fmt::Debug for SessionCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Create {
+                agent_id,
+                definition,
+                metadata,
+            } => formatter
+                .debug_struct("Create")
+                .field("agent_id", agent_id)
+                .field("definition", definition)
+                .field("metadata", metadata)
+                .finish(),
+            Self::UpdateDefinition {
+                session_id,
+                expected_revision,
+                patch,
+            } => formatter
+                .debug_struct("UpdateDefinition")
+                .field("session_id", session_id)
+                .field("expected_revision", expected_revision)
+                .field("patch", patch)
+                .finish(),
+            Self::UpgradeAgentRevision {
+                session_id,
+                expected_revision,
+                target,
+            } => formatter
+                .debug_struct("UpgradeAgentRevision")
+                .field("session_id", session_id)
+                .field("expected_revision", expected_revision)
+                .field("target", target)
+                .finish(),
+            Self::ReloadWorkspace { session_id } => formatter
+                .debug_struct("ReloadWorkspace")
+                .field("session_id", session_id)
+                .finish(),
+            Self::Load { session_id } => formatter
+                .debug_struct("Load")
+                .field("session_id", session_id)
+                .finish(),
+            Self::Unload { session_id } => formatter
+                .debug_struct("Unload")
+                .field("session_id", session_id)
+                .finish(),
+            Self::Archive { session_id } => formatter
+                .debug_struct("Archive")
+                .field("session_id", session_id)
+                .finish(),
+            Self::Unarchive { session_id } => formatter
+                .debug_struct("Unarchive")
+                .field("session_id", session_id)
+                .finish(),
+            Self::Delete { session_id } => formatter
+                .debug_struct("Delete")
+                .field("session_id", session_id)
+                .finish(),
+            Self::Fork {
+                source_session_id,
+                anchor,
+            } => formatter
+                .debug_struct("Fork")
+                .field("source_session_id", source_session_id)
+                .field("anchor", anchor)
+                .finish(),
+            Self::UpdateMetadata {
+                session_id,
+                expected_revision,
+                patch,
+            } => formatter
+                .debug_struct("UpdateMetadata")
+                .field("session_id", session_id)
+                .field("expected_revision", expected_revision)
+                .field("patch", patch)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -595,9 +744,13 @@ pub enum CommandOutcome {
     SessionDefinitionUpdated {
         definition_revision: SessionDefinitionRevision,
     },
+    WorkspaceReloaded,
     SessionForked {
         session_id: SessionId,
         source: ForkSourceKind,
+    },
+    SessionMetadataUpdated {
+        metadata_revision: SessionMetadataRevision,
     },
     TurnStarted {
         turn_id: TurnId,
@@ -616,6 +769,7 @@ pub enum CommandOutcome {
         target: PublicCancelTarget,
         cancel_epoch: u64,
     },
+    SharedResourcesReloaded,
     CommandOutput,
     NoChange,
 }
@@ -2248,6 +2402,7 @@ pub struct SessionSnapshot {
     session_id: SessionId,
     metadata: SessionMetadataView,
     definition: SessionDefinitionSummary,
+    readiness: SessionReadinessView,
     recording: SessionRecordingView,
     usage: Option<SessionUsageView>,
     diagnostics: Vec<SessionDiagnosticView>,
@@ -2376,6 +2531,46 @@ impl SessionSnapshot {
         diagnostics: Vec<SessionDiagnosticView>,
         limits: ProtocolLimits,
     ) -> Result<Self, ObservationValueError> {
+        Self::new_loaded_with_readiness_with_observation(
+            session_id,
+            metadata,
+            definition,
+            SessionReadinessView::Ready,
+            execution,
+            current_turn,
+            active_items,
+            pending_interactions,
+            queues,
+            recording,
+            usage,
+            diagnostics,
+            limits,
+        )
+    }
+
+    /// General loaded Session snapshot constructor taking the real readiness.  The legal matrix:
+    /// a non-Ready Session must be Idle with no current Turn, no active items or pending
+    /// interactions, all queues empty, and `accepting_input` false; Ready keeps the existing
+    /// observation rules.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "arguments are the exact public loaded Session observation contract"
+    )]
+    pub(crate) fn new_loaded_with_readiness_with_observation(
+        session_id: SessionId,
+        metadata: SessionMetadataView,
+        definition: SessionDefinitionSummary,
+        readiness: SessionReadinessView,
+        execution: SessionExecutionView,
+        current_turn: Option<CurrentTurnView>,
+        active_items: Vec<ItemView>,
+        pending_interactions: Vec<InteractionView>,
+        queues: SessionQueueView,
+        recording: SessionRecordingView,
+        usage: Option<SessionUsageView>,
+        diagnostics: Vec<SessionDiagnosticView>,
+        limits: ProtocolLimits,
+    ) -> Result<Self, ObservationValueError> {
         if session_id != definition.session_id() {
             return Err(ObservationValueError::SessionIdentityMismatch);
         }
@@ -2404,6 +2599,35 @@ impl SessionSnapshot {
             queues.accepting_input,
             limits,
         )?;
+        if readiness != SessionReadinessView::Ready {
+            // A non-Ready loaded Session is always an empty Idle projection: no execution,
+            // Turn, items, interactions, queues, or input acceptance.
+            if execution != SessionExecutionView::Idle
+                || current_turn.is_some()
+                || !active_items.is_empty()
+                || !pending_interactions.is_empty()
+                || !queues.submit_admissions().is_empty()
+                || !queues.steers().is_empty()
+                || !queues.follow_ups().is_empty()
+                || queues.accepting_input()
+            {
+                return Err(ObservationValueError::InconsistentLoadedSessionState);
+            }
+            return Ok(Self {
+                session_id,
+                metadata,
+                definition,
+                readiness,
+                recording,
+                usage,
+                diagnostics,
+                execution,
+                current_turn,
+                active_items,
+                pending_interactions,
+                queues,
+            });
+        }
         if queues
             .submit_admissions()
             .iter()
@@ -2442,6 +2666,7 @@ impl SessionSnapshot {
             session_id,
             metadata,
             definition,
+            readiness,
             recording,
             usage,
             diagnostics,
@@ -2474,7 +2699,7 @@ impl SessionSnapshot {
     }
 
     pub const fn readiness(&self) -> SessionReadinessView {
-        SessionReadinessView::Ready
+        self.readiness
     }
 
     pub const fn execution(&self) -> SessionExecutionView {
@@ -2517,6 +2742,7 @@ impl fmt::Debug for SessionSnapshot {
             .field("session_id", &self.session_id)
             .field("metadata", &self.metadata)
             .field("definition", &self.definition)
+            .field("readiness", &self.readiness)
             .field("recording", &self.recording)
             .field("usage", &self.usage)
             .field("diagnostics", &self.diagnostics)
@@ -2574,12 +2800,19 @@ pub enum RuntimeStateEventKind {
     SessionUnarchived,
     SessionDeleted,
     SessionForked,
+    SessionDefinitionUpdated,
+    SessionMetadataUpdated,
     CommandCatalogInvalidated,
+    SharedResourcesReloaded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SessionStateEventKind {
     SessionExecutionChanged,
+    SessionDefinitionUpdated,
+    SessionMetadataUpdated,
+    SessionWorkspaceReloaded,
+    SessionReadinessChanged,
     TurnCompleted,
     TurnInterrupted,
     TurnFailed,
@@ -2816,6 +3049,81 @@ impl StateEvent {
         }
     }
 
+    pub fn session_metadata_changed(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: SessionSnapshot,
+    ) -> Self {
+        let session_id = snapshot.session_id();
+        Self {
+            timestamp,
+            command_id,
+            route: EventRoute::Session { session_id },
+            msg: StateEventMsg::Session {
+                kind: SessionStateEventKind::SessionMetadataUpdated,
+                snapshot: Box::new(snapshot),
+                detail: None,
+            },
+        }
+    }
+
+    pub fn session_definition_changed(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: SessionSnapshot,
+    ) -> Self {
+        let session_id = snapshot.session_id();
+        Self {
+            timestamp,
+            command_id,
+            route: EventRoute::Session { session_id },
+            msg: StateEventMsg::Session {
+                kind: SessionStateEventKind::SessionDefinitionUpdated,
+                snapshot: Box::new(snapshot),
+                detail: None,
+            },
+        }
+    }
+
+    pub fn session_workspace_reloaded(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: SessionSnapshot,
+    ) -> Self {
+        let session_id = snapshot.session_id();
+        Self {
+            timestamp,
+            command_id,
+            route: EventRoute::Session { session_id },
+            msg: StateEventMsg::Session {
+                kind: SessionStateEventKind::SessionWorkspaceReloaded,
+                snapshot: Box::new(snapshot),
+                detail: None,
+            },
+        }
+    }
+
+    /// Publishes one loaded Session readiness projection change (for example an Agent
+    /// Enable/Disable fan-out).  The Session route carries the exact SessionSnapshot of the
+    /// change moment and a null detail, exactly like the other loaded Session state events.
+    pub fn session_readiness_changed(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: SessionSnapshot,
+    ) -> Self {
+        let session_id = snapshot.session_id();
+        Self {
+            timestamp,
+            command_id,
+            route: EventRoute::Session { session_id },
+            msg: StateEventMsg::Session {
+                kind: SessionStateEventKind::SessionReadinessChanged,
+                snapshot: Box::new(snapshot),
+                detail: None,
+            },
+        }
+    }
+
     pub fn runtime_command_catalog_invalidated(
         timestamp: Timestamp,
         command_id: Option<CommandId>,
@@ -2831,6 +3139,57 @@ impl StateEvent {
                 detail: None,
             },
         }
+    }
+
+    /// Publishes one completed Runtime shared-resource reload.  The Runtime route carries the
+    /// current projection after the residency fan-out and the Runtime root installation (the
+    /// loaded Sessions already reflect their new readiness), and a null detail exactly like the
+    /// other null-detail Runtime events.
+    pub fn shared_resources_reloaded(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+    ) -> Self {
+        Self {
+            timestamp,
+            command_id,
+            route: EventRoute::Runtime,
+            msg: StateEventMsg::Runtime {
+                kind: RuntimeStateEventKind::SharedResourcesReloaded,
+                snapshot,
+                detail: None,
+            },
+        }
+    }
+
+    pub fn session_metadata_updated(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        session: SessionSummary,
+    ) -> Self {
+        Self::runtime_session_changed(
+            timestamp,
+            command_id,
+            snapshot,
+            session,
+            RuntimeStateEventKind::SessionMetadataUpdated,
+        )
+    }
+
+    pub fn session_definition_updated(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        session: SessionSummary,
+    ) -> Self {
+        Self::runtime_session_changed(
+            timestamp,
+            command_id,
+            snapshot,
+            session,
+            RuntimeStateEventKind::SessionDefinitionUpdated,
+        )
     }
 
     pub fn session_forked(
@@ -2932,6 +3291,8 @@ impl StateEvent {
             RuntimeStateEventKind::SessionArchived
                 | RuntimeStateEventKind::SessionUnarchived
                 | RuntimeStateEventKind::SessionDeleted
+                | RuntimeStateEventKind::SessionDefinitionUpdated
+                | RuntimeStateEventKind::SessionMetadataUpdated
         ));
         let session_id = session.session_id();
         Self {
@@ -3113,7 +3474,9 @@ impl StateEvent {
             (
                 EventRoute::Runtime,
                 StateEventMsg::Runtime {
-                    kind: RuntimeStateEventKind::CommandCatalogInvalidated,
+                    kind:
+                        RuntimeStateEventKind::CommandCatalogInvalidated
+                        | RuntimeStateEventKind::SharedResourcesReloaded,
                     detail: None,
                     ..
                 },
@@ -3147,7 +3510,9 @@ impl StateEvent {
                         | RuntimeStateEventKind::SessionArchived
                         | RuntimeStateEventKind::SessionUnarchived
                         | RuntimeStateEventKind::SessionDeleted
-                        | RuntimeStateEventKind::SessionForked),
+                        | RuntimeStateEventKind::SessionForked
+                        | RuntimeStateEventKind::SessionDefinitionUpdated
+                        | RuntimeStateEventKind::SessionMetadataUpdated),
                     detail: Some(RuntimeEventDetail::SessionChanged { session }),
                     ..
                 },
@@ -3164,13 +3529,20 @@ impl StateEvent {
                     RuntimeStateEventKind::SessionDeleted => {
                         session.lifecycle() == SessionLifecycleView::Deleted
                     }
+                    RuntimeStateEventKind::SessionDefinitionUpdated => {
+                        session.lifecycle() == SessionLifecycleView::Open
+                    }
+                    RuntimeStateEventKind::SessionMetadataUpdated => {
+                        session.lifecycle() != SessionLifecycleView::Deleted
+                    }
                     RuntimeStateEventKind::SessionLoaded
                     | RuntimeStateEventKind::SessionUnloaded
                     | RuntimeStateEventKind::AgentCreated
                     | RuntimeStateEventKind::AgentDefinitionUpdated
                     | RuntimeStateEventKind::AgentMetadataUpdated
                     | RuntimeStateEventKind::AgentStatusChanged
-                    | RuntimeStateEventKind::CommandCatalogInvalidated => false,
+                    | RuntimeStateEventKind::CommandCatalogInvalidated
+                    | RuntimeStateEventKind::SharedResourcesReloaded => false,
                 };
                 *session_id == session.session_id()
                     && lifecycle_matches
@@ -3226,11 +3598,28 @@ impl StateEvent {
             (
                 EventRoute::Session { session_id },
                 StateEventMsg::Session {
-                    kind: SessionStateEventKind::SessionExecutionChanged,
+                    kind:
+                        kind @ (SessionStateEventKind::SessionExecutionChanged
+                        | SessionStateEventKind::SessionDefinitionUpdated
+                        | SessionStateEventKind::SessionMetadataUpdated
+                        | SessionStateEventKind::SessionWorkspaceReloaded
+                        | SessionStateEventKind::SessionReadinessChanged),
                     snapshot,
                     detail: None,
                 },
-            ) => *session_id == snapshot.session_id(),
+            ) => {
+                let kind_matches = match kind {
+                    SessionStateEventKind::SessionExecutionChanged
+                    | SessionStateEventKind::SessionDefinitionUpdated
+                    | SessionStateEventKind::SessionMetadataUpdated
+                    | SessionStateEventKind::SessionWorkspaceReloaded
+                    | SessionStateEventKind::SessionReadinessChanged => true,
+                    SessionStateEventKind::TurnCompleted
+                    | SessionStateEventKind::TurnInterrupted
+                    | SessionStateEventKind::TurnFailed => false,
+                };
+                *session_id == snapshot.session_id() && kind_matches
+            }
             _ => false,
         }
     }

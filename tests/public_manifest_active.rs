@@ -4,6 +4,7 @@ use std::str::FromStr;
 use minicore_runtime::agent_session_lifecycle::{
     AgentStatus, AgentUsableStatus, ForkAnchor, ForkSourceKind,
 };
+use minicore_runtime::model_gateway::ReasoningPreference;
 use minicore_runtime::prompt::PromptBodyIntent;
 use minicore_runtime::runtime_interface::{
     AgentCommand, CommandCompletion, CommandErrorCode, CommandOutcome, EventFrame, EventRoute,
@@ -405,6 +406,8 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
                 | RuntimeStateEventKind::AgentDefinitionUpdated
                 | RuntimeStateEventKind::AgentMetadataUpdated
                 | RuntimeStateEventKind::AgentStatusChanged
+                | RuntimeStateEventKind::SessionDefinitionUpdated
+                | RuntimeStateEventKind::SessionMetadataUpdated
                 | RuntimeStateEventKind::CommandCatalogInvalidated => unreachable!(),
             }
         }
@@ -423,6 +426,117 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
             assert_eq!(
                 event.msg().session_snapshot().unwrap().execution(),
                 minicore_runtime::runtime_interface::SessionExecutionView::Finishing
+            );
+        }
+        (Some("session_metadata_updated_runtime_state"), EventFrame::State(event)) => {
+            let StateEventMsg::Runtime {
+                kind,
+                snapshot,
+                detail: Some(RuntimeEventDetail::SessionChanged { session }),
+            } = event.msg()
+            else {
+                panic!("runtime Session metadata state requires a SessionChanged summary");
+            };
+            assert_eq!(*kind, RuntimeStateEventKind::SessionMetadataUpdated);
+            let EventRoute::Session { session_id } = event.route() else {
+                panic!("runtime Session metadata state requires a Session route");
+            };
+            assert_eq!(session.session_id(), session_id);
+            assert_eq!(session.metadata().revision().get(), 2);
+            assert_eq!(session.metadata().name(), Some("Session v2"));
+            assert_eq!(
+                session.metadata().description(),
+                Some("Plans and reviews implementation work")
+            );
+            assert_eq!(session.lifecycle(), SessionLifecycleView::Open);
+            assert!(!session.forked());
+            assert!(snapshot.loaded_sessions().is_empty());
+        }
+        (Some("session_metadata_updated_session_state"), EventFrame::State(event)) => {
+            assert_eq!(
+                event.route(),
+                EventRoute::Session {
+                    session_id: "ses_22222222222222222222222222222222".parse().unwrap(),
+                }
+            );
+            assert_eq!(
+                event.msg().session_kind(),
+                Some(SessionStateEventKind::SessionMetadataUpdated)
+            );
+            assert!(event.msg().session_detail().is_none());
+            let snapshot = event.msg().session_snapshot().unwrap();
+            assert_eq!(snapshot.metadata().revision().get(), 2);
+            assert_eq!(snapshot.metadata().name(), Some("Session v2"));
+            assert_eq!(
+                snapshot.metadata().description(),
+                Some("Plans and reviews implementation work")
+            );
+            assert_eq!(
+                snapshot.execution(),
+                minicore_runtime::runtime_interface::SessionExecutionView::Idle
+            );
+        }
+        (Some("session_definition_updated_runtime_state"), EventFrame::State(event)) => {
+            let StateEventMsg::Runtime {
+                kind,
+                snapshot,
+                detail: Some(RuntimeEventDetail::SessionChanged { session }),
+            } = event.msg()
+            else {
+                panic!("runtime Session definition state requires a SessionChanged summary");
+            };
+            assert_eq!(*kind, RuntimeStateEventKind::SessionDefinitionUpdated);
+            let EventRoute::Session { session_id } = event.route() else {
+                panic!("runtime Session definition state requires a Session route");
+            };
+            assert_eq!(session.session_id(), session_id);
+            assert_eq!(session.definition_revision().get(), 2);
+            assert_eq!(session.lifecycle(), SessionLifecycleView::Open);
+            assert!(!session.forked());
+            assert!(snapshot.loaded_sessions().is_empty());
+        }
+        (Some("session_definition_updated_session_state"), EventFrame::State(event)) => {
+            assert_eq!(
+                event.route(),
+                EventRoute::Session {
+                    session_id: "ses_22222222222222222222222222222222".parse().unwrap(),
+                }
+            );
+            assert_eq!(
+                event.msg().session_kind(),
+                Some(SessionStateEventKind::SessionDefinitionUpdated)
+            );
+            assert!(event.msg().session_detail().is_none());
+            let snapshot = event.msg().session_snapshot().unwrap();
+            assert_eq!(snapshot.definition().revision().get(), 2);
+            assert_eq!(
+                snapshot.definition().model().reasoning(),
+                ReasoningPreference::High
+            );
+            assert_eq!(snapshot.definition().prompts().enabled().len(), 1);
+            assert_eq!(
+                snapshot.execution(),
+                minicore_runtime::runtime_interface::SessionExecutionView::Idle
+            );
+        }
+        (Some("session_workspace_reloaded_state"), EventFrame::State(event)) => {
+            assert_eq!(
+                event.route(),
+                EventRoute::Session {
+                    session_id: "ses_22222222222222222222222222222222".parse().unwrap(),
+                }
+            );
+            assert_eq!(
+                event.msg().session_kind(),
+                Some(SessionStateEventKind::SessionWorkspaceReloaded)
+            );
+            assert!(event.msg().session_detail().is_none());
+            let snapshot = event.msg().session_snapshot().unwrap();
+            assert_eq!(snapshot.definition().revision().get(), 2);
+            assert_eq!(snapshot.definition().workspace().roots().len(), 1);
+            assert_eq!(
+                snapshot.execution(),
+                minicore_runtime::runtime_interface::SessionExecutionView::Idle
             );
         }
         (Some("turn_completed_state"), EventFrame::State(event)) => {
@@ -640,6 +754,20 @@ fn assert_command_response_semantics(
                 "ses_33333333333333333333333333333333"
             );
         }
+        (
+            Some("session_metadata_updated_completion"),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::SessionMetadataUpdated { metadata_revision },
+                output: None,
+            },
+        ) => assert_eq!(metadata_revision.get(), 2),
+        (
+            Some("workspace_reloaded_completion"),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::WorkspaceReloaded,
+                output: None,
+            },
+        ) => {}
         (
             Some("session_archived_completion"),
             CommandCompletion::Completed {
@@ -901,6 +1029,118 @@ fn assert_request_semantics(vector: &PublicVector, request: &RuntimeRequest) {
                 "ses_22222222222222222222222222222222"
             );
             assert_eq!(item_id.to_string(), "itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        }
+        (
+            assertion @ ("session_update_metadata_set"
+            | "session_update_metadata_clear"
+            | "session_update_metadata_keep"),
+            RuntimeCommand::Session(SessionCommand::UpdateMetadata {
+                session_id,
+                expected_revision,
+                patch,
+            }),
+        ) => {
+            assert_eq!(
+                session_id.to_string(),
+                "ses_22222222222222222222222222222222"
+            );
+            match assertion {
+                "session_update_metadata_set" => {
+                    assert_eq!(expected_revision.get(), 1);
+                    assert_eq!(patch.name().set_value(), Some("Session v2"));
+                    assert_eq!(
+                        patch.description().set_value(),
+                        Some("Plans and reviews implementation work")
+                    );
+                }
+                "session_update_metadata_clear" => {
+                    assert_eq!(expected_revision.get(), 2);
+                    assert!(patch.name().is_keep());
+                    assert!(patch.description().is_clear());
+                }
+                "session_update_metadata_keep" => {
+                    assert_eq!(expected_revision.get(), 2);
+                    assert!(patch.name().is_keep());
+                    assert!(patch.description().is_keep());
+                }
+                _ => unreachable!(),
+            }
+        }
+        (
+            "session_update_definition_set",
+            RuntimeCommand::Session(SessionCommand::UpdateDefinition {
+                session_id,
+                expected_revision,
+                patch,
+            }),
+        ) => {
+            assert_eq!(
+                session_id.to_string(),
+                "ses_22222222222222222222222222222222"
+            );
+            assert_eq!(expected_revision.get(), 1);
+            let workspace = patch.workspace().expect("the patch replaces the Workspace");
+            assert_eq!(workspace.primary_root().key().as_str(), "repo");
+            assert_eq!(
+                workspace.primary_root().path().as_str(),
+                "file:///Users/alice/project"
+            );
+            assert_eq!(workspace.cwd().relative_path().as_str(), "src");
+            assert_eq!(
+                patch.model().unwrap().reasoning(),
+                ReasoningPreference::High
+            );
+            assert_eq!(
+                patch
+                    .prompts()
+                    .unwrap()
+                    .enabled()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                ["base"]
+            );
+        }
+        (
+            assertion @ ("session_upgrade_agent_revision_current"
+            | "session_upgrade_agent_revision_exact"),
+            RuntimeCommand::Session(SessionCommand::UpgradeAgentRevision {
+                session_id,
+                expected_revision,
+                target,
+            }),
+        ) => {
+            assert_eq!(
+                session_id.to_string(),
+                "ses_22222222222222222222222222222222"
+            );
+            assert_eq!(expected_revision.get(), 1);
+            match assertion {
+                "session_upgrade_agent_revision_current" => {
+                    assert!(
+                        target.is_none(),
+                        "the current fixture resolves the Agent current revision"
+                    );
+                }
+                "session_upgrade_agent_revision_exact" => {
+                    let target = target.expect("the exact fixture pins one target revision");
+                    assert_eq!(
+                        target.agent_id().to_string(),
+                        "agt_11111111111111111111111111111111"
+                    );
+                    assert_eq!(target.revision().get(), 2);
+                }
+                _ => unreachable!(),
+            }
+        }
+        (
+            "session_reload_workspace",
+            RuntimeCommand::Session(SessionCommand::ReloadWorkspace { session_id }),
+        ) => {
+            assert_eq!(
+                session_id.to_string(),
+                "ses_22222222222222222222222222222222"
+            );
         }
         (
             "turn_cancel_turn",

@@ -5,18 +5,28 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use minicore_runtime::agent_session_lifecycle::{
-    AgentDefinitionPatch, AgentMetadataPatch, AgentStatus, AgentUsableStatus, NewAgentDefinition,
-    NewAgentMetadata, OptionalTextPatch,
+    AgentDefinitionPatch, AgentMetadataPatch, AgentRevisionRef, AgentStatus, AgentUsableStatus,
+    NewAgentDefinition, NewAgentMetadata, OptionalTextPatch, SessionMetadataPatch,
+    SessionModelConfig,
 };
-use minicore_runtime::prompt::AgentPromptSelection;
+use minicore_runtime::model_gateway::{ModelSelection, ReasoningPreference};
+use minicore_runtime::prompt::{AgentPromptSelection, SessionPromptSelection};
 use minicore_runtime::runtime_interface::{
     AgentCommand, AgentQuery, AgentQueryResult, CommandCompletion, CommandErrorCode,
-    CommandOutcome, CommandRequest, EventFrame, EventRoute, PageRequest, QueryErrorCode,
-    QueryResult, RuntimeCommand, RuntimeEventDetail, RuntimeQuery, RuntimeStateEventKind,
-    SessionCommand, SessionQuery, SessionQueryResult, SnapshotResponse, StateEventMsg,
+    CommandOutcome, CommandRequest, EventFrame, EventRoute, NewSessionDefinition,
+    NewSessionMetadata, PageRequest, PublicSubject, QueryErrorCode, QueryResult, RetryAdvice,
+    RuntimeCommand, RuntimeEventDetail, RuntimeQuery, RuntimeStateEventKind, SessionCommand,
+    SessionDefinitionPatch, SessionExecutionView, SessionLifecycleView, SessionQuery,
+    SessionQueryResult, SessionStateEventKind, SnapshotRequest, SnapshotResponse, StateEventMsg,
     SubscriptionRequest, SubscriptionScope,
 };
-use minicore_runtime::wire::CommandId;
+use minicore_runtime::wire::{
+    CanonicalFileUri, CommandId, SessionDefinitionRevision, SessionId, SessionMetadataRevision,
+};
+use minicore_runtime::workspace::{
+    RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput, WorkspaceRootInput,
+    WorkspaceRootKey, WorkspaceSourcePolicy,
+};
 use minicore_runtime::{
     CompactionSettings, MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError,
 };
@@ -1929,4 +1939,2372 @@ fn runtime_rejects_invalid_compaction_settings_before_opening_storage() {
 
     assert_eq!(error, RuntimeInitializationError::InvalidConfiguration);
     assert!(!root.path().exists());
+}
+
+struct TempWorkspace {
+    path: PathBuf,
+}
+
+impl TempWorkspace {
+    fn new() -> Self {
+        loop {
+            let suffix = NEXT_TEMP_SUFFIX.fetch_add(1, Ordering::Relaxed);
+            assert_ne!(suffix, 0, "test workspace suffix must be nonzero");
+            let path = std::env::temp_dir().join(format!(
+                "minicore-runtime-foundation-workspace-{}-{suffix}",
+                std::process::id()
+            ));
+            if !path.exists() {
+                fs::create_dir_all(path.join("src"))
+                    .expect("the temporary Workspace root is created");
+                return Self { path };
+            }
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempWorkspace {
+    fn drop(&mut self) {
+        if self.path.is_dir() {
+            fs::remove_dir_all(&self.path)
+                .expect("the temporary Workspace root is removed deterministically");
+        } else if self.path.exists() {
+            fs::remove_file(&self.path)
+                .expect("the temporary Workspace file is removed deterministically");
+        }
+    }
+}
+
+fn workspace_uri(path: &Path) -> CanonicalFileUri {
+    #[cfg(windows)]
+    {
+        let path = path.to_string_lossy().replace('\\', "/");
+        let path = path.strip_prefix('/').unwrap_or(&path);
+        return format!("file:///{path}")
+            .parse()
+            .expect("temporary Windows URI");
+    }
+    #[cfg(not(windows))]
+    {
+        format!("file://{}", path.to_str().expect("temporary path is UTF-8"))
+            .parse()
+            .expect("temporary POSIX URI")
+    }
+}
+
+fn workspace_input(path: &Path) -> WorkspaceDefinitionInput {
+    let key: WorkspaceRootKey = "repo".parse().unwrap();
+    WorkspaceDefinitionInput::new(
+        WorkspaceRootInput::new(
+            key.clone(),
+            workspace_uri(path),
+            RequestedFilesystemAccess::ReadWrite,
+            WorkspaceSourcePolicy::new(false, false),
+        ),
+        Vec::new(),
+        WorkspaceCwdSpec::new(key, "src".parse().unwrap()),
+    )
+    .unwrap()
+}
+
+fn session_model_config() -> minicore_runtime::agent_session_lifecycle::SessionModelConfig {
+    minicore_runtime::agent_session_lifecycle::SessionModelConfig::new(
+        ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+        ReasoningPreference::Auto,
+        Some(NonZeroU32::new(4096).unwrap()),
+    )
+}
+
+fn command_output(response: &minicore_runtime::runtime_interface::CommandResponse) -> &str {
+    match response.completion() {
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::CommandOutput,
+            output: Some(output),
+        } => output.text(),
+        completion => panic!("expected command output, got {completion:?}"),
+    }
+}
+
+async fn create_public_agent(runtime: &MiniCoreRuntime) -> minicore_runtime::wire::AgentId {
+    let created = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::Create {
+                definition: NewAgentDefinition::new(AgentPromptSelection::new(Vec::new()).unwrap()),
+                metadata: NewAgentMetadata::new("Test Agent", None::<&str>).unwrap(),
+            }),
+        ))
+        .await
+        .expect("Agent Create dispatches");
+    let CommandCompletion::Completed {
+        outcome: CommandOutcome::AgentCreated { agent_id, .. },
+        output: None,
+    } = created.completion()
+    else {
+        panic!("Agent Create returns its typed outcome");
+    };
+    *agent_id
+}
+
+async fn create_public_session(runtime: &MiniCoreRuntime, workspace_root: &Path) -> SessionId {
+    let agent_id = create_public_agent(runtime).await;
+    let created = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Create {
+                agent_id,
+                definition: Box::new(NewSessionDefinition::new(
+                    workspace_input(workspace_root),
+                    session_model_config(),
+                    SessionPromptSelection::new(Vec::new()).unwrap(),
+                )),
+                metadata: NewSessionMetadata::new(None::<&str>, None::<&str>).unwrap(),
+            }),
+        ))
+        .await
+        .expect("public Session Create dispatches");
+    command_output(&created).parse().unwrap()
+}
+
+async fn load_public_session(runtime: &MiniCoreRuntime, session_id: SessionId) {
+    let load = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Load { session_id }),
+        ))
+        .await
+        .expect("public Load dispatches");
+    assert_eq!(command_output(&load), "session loaded");
+}
+
+fn session_metadata_update_command(
+    session_id: SessionId,
+    expected_revision: SessionMetadataRevision,
+    name: OptionalTextPatch,
+    description: OptionalTextPatch,
+) -> RuntimeCommand {
+    RuntimeCommand::Session(SessionCommand::UpdateMetadata {
+        session_id,
+        expected_revision,
+        patch: SessionMetadataPatch::new(name, description).unwrap(),
+    })
+}
+
+fn listed_session(
+    page: &minicore_runtime::runtime_interface::Page<
+        minicore_runtime::runtime_interface::SessionSummary,
+    >,
+    session_id: SessionId,
+) -> &minicore_runtime::runtime_interface::SessionSummary {
+    page.items()
+        .iter()
+        .find(|session| session.session_id() == session_id)
+        .unwrap_or_else(|| panic!("the Session catalog page contains {session_id}"))
+}
+
+async fn list_sessions(
+    runtime: &MiniCoreRuntime,
+    cursor: Option<minicore_runtime::wire::PageCursor>,
+    limit: u32,
+) -> minicore_runtime::runtime_interface::Page<minicore_runtime::runtime_interface::SessionSummary>
+{
+    let response = runtime
+        .query(RuntimeQuery::Session(SessionQuery::ListSessions {
+            page: PageRequest::new(cursor, NonZeroU32::new(limit).unwrap()),
+            include_archived: false,
+        }))
+        .await
+        .expect("the Session catalog query succeeds");
+    let QueryResult::Session(SessionQueryResult::Sessions(page)) = response.data() else {
+        panic!("the Session query returns a Session page");
+    };
+    page.clone()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_session_metadata_cas_on_unloaded_open_sessions_publishes_and_refreshes_catalog() {
+    let root = TempRoot::new();
+    let workspace = TempWorkspace::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let mut events = runtime
+        .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+        .await
+        .expect("the Runtime subscription opens");
+    assert!(matches!(
+        events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+    ));
+
+    let first = create_public_session(&runtime, workspace.path()).await;
+    // Create publishes Runtime-scope events on the live subscription; drain until the
+    // SessionCreated frame (and its AgentCreated frame) has passed.
+    loop {
+        match events.recv().await {
+            Some(EventFrame::State(event))
+                if event.msg().runtime_kind() == Some(RuntimeStateEventKind::SessionCreated) =>
+            {
+                break;
+            }
+            Some(EventFrame::State(_)) => {}
+            other => panic!("unexpected frame while draining creates: {other:?}"),
+        }
+    }
+
+    let missing = "ses_ffffffffffffffffffffffffffffffff".parse().unwrap();
+    let rejected = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_metadata_update_command(
+                missing,
+                "smr_1".parse().unwrap(),
+                OptionalTextPatch::keep(),
+                OptionalTextPatch::keep(),
+            ),
+        ))
+        .await
+        .expect("the missing Session metadata update dispatches");
+    assert!(matches!(
+        rejected.completion(),
+        CommandCompletion::Rejected(error)
+            if error.code() == CommandErrorCode::NotFound
+                && error.subject() == Some(&PublicSubject::Session(missing))
+    ));
+
+    let first_list = list_sessions(&runtime, None, 1).await;
+    assert_eq!(first_list.items().len(), 1);
+    assert!(
+        first_list
+            .items()
+            .iter()
+            .all(|session| session.metadata().revision().get() == 1
+                && session.metadata().name().is_none())
+    );
+
+    let update_id = CommandId::generate().unwrap();
+    let updated = runtime
+        .dispatch(CommandRequest::new(
+            update_id,
+            session_metadata_update_command(
+                first,
+                "smr_1".parse().unwrap(),
+                OptionalTextPatch::set("Renamed Session").unwrap(),
+                OptionalTextPatch::set("A renamed Session").unwrap(),
+            ),
+        ))
+        .await
+        .expect("the Session metadata update dispatches");
+    assert!(matches!(
+        updated.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionMetadataUpdated { metadata_revision },
+            output: None,
+        } if metadata_revision.get() == 2
+    ));
+    let Some(EventFrame::State(event)) = events.recv().await else {
+        panic!("the Session metadata update publishes one Runtime StateEvent");
+    };
+    assert_eq!(event.command_id(), Some(update_id));
+    assert!(matches!(
+        event.msg(),
+        StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::SessionMetadataUpdated,
+            detail: Some(RuntimeEventDetail::SessionChanged { session }),
+            ..
+        } if session.session_id() == first
+            && session.metadata().revision().get() == 2
+            && session.metadata().name() == Some("Renamed Session")
+            && session.metadata().description() == Some("A renamed Session")
+            && session.lifecycle() == SessionLifecycleView::Open
+    ));
+
+    // A fresh ListSessions token reflects the changed metadata.
+    let fresh = list_sessions(&runtime, None, 10).await;
+    let refreshed = listed_session(&fresh, first);
+    assert_eq!(refreshed.metadata().revision().get(), 2);
+    assert_eq!(refreshed.metadata().name(), Some("Renamed Session"));
+
+    // Stale wins over an equivalent patch, then the equivalent patch is a no-op without events.
+    let stale = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_metadata_update_command(
+                first,
+                "smr_1".parse().unwrap(),
+                OptionalTextPatch::keep(),
+                OptionalTextPatch::keep(),
+            ),
+        ))
+        .await
+        .expect("the stale Session metadata update dispatches");
+    assert!(matches!(
+        stale.completion(),
+        CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::StaleRevision
+    ));
+    let noop = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_metadata_update_command(
+                first,
+                "smr_2".parse().unwrap(),
+                OptionalTextPatch::keep(),
+                OptionalTextPatch::keep(),
+            ),
+        ))
+        .await
+        .expect("the equivalent Session metadata update dispatches");
+    assert!(matches!(
+        noop.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::NoChange,
+            output: None,
+        }
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+            .await
+            .is_err(),
+        "a Session metadata no-op publishes no Runtime event"
+    );
+
+    let cleared = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_metadata_update_command(
+                first,
+                "smr_2".parse().unwrap(),
+                OptionalTextPatch::keep(),
+                OptionalTextPatch::clear(),
+            ),
+        ))
+        .await
+        .expect("the Session description clear dispatches");
+    assert!(matches!(
+        cleared.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionMetadataUpdated { metadata_revision },
+            output: None,
+        } if metadata_revision.get() == 3
+    ));
+    assert!(matches!(
+        events.recv().await,
+        Some(EventFrame::State(event))
+            if matches!(
+                event.msg(),
+                StateEventMsg::Runtime {
+                    kind: RuntimeStateEventKind::SessionMetadataUpdated,
+                    detail: Some(RuntimeEventDetail::SessionChanged { session }),
+                    ..
+                } if session.session_id() == first && session.metadata().description().is_none()
+            )
+    ));
+
+    // The pre-update cursor continuation is covered by the standalone catalog cursor snapshot
+    // test; a fresh ListSessions token already proved the changed metadata above.
+
+    runtime.shutdown().await;
+
+    let reopened = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime reopens with the changed Session metadata");
+    let recovered = list_sessions(&reopened, None, 10).await;
+    let recovered = listed_session(&recovered, first);
+    assert_eq!(recovered.metadata().revision().get(), 3);
+    assert_eq!(recovered.metadata().name(), Some("Renamed Session"));
+    assert_eq!(recovered.metadata().description(), None);
+    reopened.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_session_metadata_cas_allows_archived_rejects_deleted_and_preserves_conversation_bytes()
+ {
+    let root = TempRoot::new();
+    let workspace = TempWorkspace::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let archived_session = create_public_session(&runtime, workspace.path()).await;
+    let deleted_session = create_public_session(&runtime, workspace.path()).await;
+    let loaded_session = create_public_session(&runtime, workspace.path()).await;
+    let conversation_path = root
+        .path()
+        .join("sessions")
+        .join(loaded_session.to_string())
+        .join("conversation.jsonl");
+    let before = fs::read(&conversation_path).expect("the conversation is readable after Create");
+
+    let archived = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Archive {
+                session_id: archived_session,
+            }),
+        ))
+        .await
+        .expect("Archive dispatches");
+    assert!(matches!(
+        archived.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionArchived,
+            output: None,
+        }
+    ));
+    let archived_update = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_metadata_update_command(
+                archived_session,
+                "smr_1".parse().unwrap(),
+                OptionalTextPatch::set("Archived v2").unwrap(),
+                OptionalTextPatch::keep(),
+            ),
+        ))
+        .await
+        .expect("the Archived Session metadata update dispatches");
+    assert!(matches!(
+        archived_update.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionMetadataUpdated { metadata_revision },
+            output: None,
+        } if metadata_revision.get() == 2
+    ));
+
+    // A Session cannot transition Open -> Deleted; the closed matrix requires Archive first.
+    let archived_deleted = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Archive {
+                session_id: deleted_session,
+            }),
+        ))
+        .await
+        .expect("Archive dispatches");
+    assert!(matches!(
+        archived_deleted.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionArchived,
+            output: None,
+        }
+    ));
+    let deleted = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Delete {
+                session_id: deleted_session,
+            }),
+        ))
+        .await
+        .expect("Delete dispatches");
+    assert!(matches!(
+        deleted.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionDeleted,
+            output: None,
+        }
+    ));
+    let deleted_update = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_metadata_update_command(
+                deleted_session,
+                "smr_1".parse().unwrap(),
+                OptionalTextPatch::keep(),
+                OptionalTextPatch::keep(),
+            ),
+        ))
+        .await
+        .expect("the Deleted Session metadata update dispatches");
+    assert!(matches!(
+        deleted_update.completion(),
+        CommandCompletion::Rejected(error)
+            if error.code() == CommandErrorCode::SessionDeleted
+                && error.retry()
+                    == minicore_runtime::runtime_interface::RetryAdvice::DoNotRetry
+    ));
+    let deleted_after_archive = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Delete {
+                session_id: archived_session,
+            }),
+        ))
+        .await
+        .expect("the Archived Session Delete dispatches");
+    assert!(matches!(
+        deleted_after_archive.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionDeleted,
+            output: None,
+        }
+    ));
+    let deleted_archived_update = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_metadata_update_command(
+                archived_session,
+                "smr_2".parse().unwrap(),
+                OptionalTextPatch::keep(),
+                OptionalTextPatch::keep(),
+            ),
+        ))
+        .await
+        .expect("the deleted Archived Session metadata update dispatches");
+    assert!(matches!(
+        deleted_archived_update.completion(),
+        CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::SessionDeleted
+    ));
+
+    // A real loaded path: Load, metadata update, Unload, then reopen.  The physical conversation
+    // JSONL bytes must be untouched by the metadata CAS.
+    load_public_session(&runtime, loaded_session).await;
+    let loaded_update = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_metadata_update_command(
+                loaded_session,
+                "smr_1".parse().unwrap(),
+                OptionalTextPatch::set("Loaded v3").unwrap(),
+                OptionalTextPatch::keep(),
+            ),
+        ))
+        .await
+        .expect("the loaded Session metadata update dispatches");
+    assert!(matches!(
+        loaded_update.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionMetadataUpdated { metadata_revision },
+            output: None,
+        } if metadata_revision.get() == 2
+    ));
+    runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Unload {
+                session_id: loaded_session,
+            }),
+        ))
+        .await
+        .expect("Unload dispatches");
+
+    runtime.shutdown().await;
+    assert_eq!(
+        fs::read(&conversation_path).expect("the conversation remains readable"),
+        before,
+        "Session metadata updates never touch conversation JSONL bytes"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_session_metadata_cas_while_loaded_publishes_exact_runtime_and_session_events() {
+    let root = TempRoot::new();
+    let workspace = TempWorkspace::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let session_id = create_public_session(&runtime, workspace.path()).await;
+    load_public_session(&runtime, session_id).await;
+
+    let mut runtime_events = runtime
+        .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+        .await
+        .expect("the Runtime subscription opens");
+    assert!(matches!(
+        runtime_events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+    ));
+    let mut session_events = runtime
+        .subscribe(SubscriptionRequest::new(
+            SubscriptionScope::Session { session_id },
+            false,
+        ))
+        .await
+        .expect("the Session subscription opens");
+    assert!(matches!(
+        session_events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+    ));
+
+    let first_id = CommandId::generate().unwrap();
+    let first_update = runtime
+        .dispatch(CommandRequest::new(
+            first_id,
+            session_metadata_update_command(
+                session_id,
+                "smr_1".parse().unwrap(),
+                OptionalTextPatch::set("Loaded v2").unwrap(),
+                OptionalTextPatch::set("").unwrap(),
+            ),
+        ))
+        .await
+        .expect("the loaded Session metadata update dispatches");
+    assert!(matches!(
+        first_update.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionMetadataUpdated { metadata_revision },
+            output: None,
+        } if metadata_revision.get() == 2
+    ));
+
+    let Some(EventFrame::State(runtime_event)) = runtime_events.recv().await else {
+        panic!("the loaded update publishes one Runtime StateEvent");
+    };
+    assert_eq!(runtime_event.command_id(), Some(first_id));
+    assert!(matches!(
+        runtime_event.msg(),
+        StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::SessionMetadataUpdated,
+            detail: Some(RuntimeEventDetail::SessionChanged { session }),
+            ..
+        } if session.session_id() == session_id
+            && session.metadata().revision().get() == 2
+            && session.metadata().name() == Some("Loaded v2")
+            && session.metadata().description() == Some("")
+    ));
+
+    let Some(EventFrame::State(session_event)) = session_events.recv().await else {
+        panic!("the loaded update publishes one Session StateEvent");
+    };
+    assert_eq!(session_event.command_id(), Some(first_id));
+    assert_eq!(session_event.timestamp(), runtime_event.timestamp());
+    assert_eq!(session_event.route(), EventRoute::Session { session_id });
+    assert_eq!(
+        session_event.msg().session_kind(),
+        Some(SessionStateEventKind::SessionMetadataUpdated)
+    );
+    assert!(session_event.msg().session_detail().is_none());
+    let snapshot = session_event.msg().session_snapshot().unwrap();
+    assert_eq!(snapshot.metadata().revision().get(), 2);
+    assert_eq!(snapshot.metadata().name(), Some("Loaded v2"));
+    assert_eq!(snapshot.metadata().description(), Some(""));
+    assert_eq!(
+        snapshot.execution(),
+        minicore_runtime::runtime_interface::SessionExecutionView::Idle
+    );
+
+    // A second consecutive update carries its own exact revision on both streams.
+    let second_id = CommandId::generate().unwrap();
+    let second_update = runtime
+        .dispatch(CommandRequest::new(
+            second_id,
+            session_metadata_update_command(
+                session_id,
+                "smr_2".parse().unwrap(),
+                OptionalTextPatch::keep(),
+                OptionalTextPatch::clear(),
+            ),
+        ))
+        .await
+        .expect("the second loaded Session metadata update dispatches");
+    assert!(matches!(
+        second_update.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionMetadataUpdated { metadata_revision },
+            output: None,
+        } if metadata_revision.get() == 3
+    ));
+    assert!(matches!(
+        runtime_events.recv().await,
+        Some(EventFrame::State(event))
+            if matches!(
+                event.msg(),
+                StateEventMsg::Runtime {
+                    kind: RuntimeStateEventKind::SessionMetadataUpdated,
+                    detail: Some(RuntimeEventDetail::SessionChanged { session }),
+                    ..
+                } if session.session_id() == session_id
+                    && session.metadata().revision().get() == 3
+                    && session.metadata().description().is_none()
+            )
+    ));
+    assert!(matches!(
+        session_events.recv().await,
+        Some(EventFrame::State(event))
+            if event.msg().session_kind() == Some(SessionStateEventKind::SessionMetadataUpdated)
+                && event.msg().session_snapshot().unwrap().metadata().revision().get() == 3
+                && event.msg().session_snapshot().unwrap().metadata().name() == Some("Loaded v2")
+    ));
+
+    // A loaded no-op publishes nothing on either stream.
+    let noop = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_metadata_update_command(
+                session_id,
+                "smr_3".parse().unwrap(),
+                OptionalTextPatch::keep(),
+                OptionalTextPatch::keep(),
+            ),
+        ))
+        .await
+        .expect("the loaded equivalent Session metadata update dispatches");
+    assert!(matches!(
+        noop.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::NoChange,
+            output: None,
+        }
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), runtime_events.recv())
+            .await
+            .is_err(),
+        "a loaded Session metadata no-op publishes no Runtime event"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), session_events.recv())
+            .await
+            .is_err(),
+        "a loaded Session metadata no-op publishes no Session event"
+    );
+
+    // The snapshot request observes the installed executor metadata.
+    let observed = runtime
+        .snapshot(SnapshotRequest::Session { session_id })
+        .await
+        .expect("the loaded Session snapshot is available");
+    let SnapshotResponse::Session(observed) = observed else {
+        panic!("the Session snapshot request returns a Session snapshot");
+    };
+    assert_eq!(observed.metadata().revision().get(), 3);
+    assert_eq!(observed.metadata().name(), Some("Loaded v2"));
+    assert_eq!(observed.metadata().description(), None);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_session_metadata_cas_with_one_expected_revision_wins_exactly_once() {
+    let root = TempRoot::new();
+    let workspace = TempWorkspace::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let session_id = create_public_session(&runtime, workspace.path()).await;
+
+    let (first, second) = tokio::join!(
+        runtime.dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_metadata_update_command(
+                session_id,
+                "smr_1".parse().unwrap(),
+                OptionalTextPatch::set("Concurrent A").unwrap(),
+                OptionalTextPatch::keep(),
+            ),
+        )),
+        runtime.dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_metadata_update_command(
+                session_id,
+                "smr_1".parse().unwrap(),
+                OptionalTextPatch::set("Concurrent B").unwrap(),
+                OptionalTextPatch::keep(),
+            ),
+        )),
+    );
+    let first = first.expect("the first concurrent update dispatches");
+    let second = second.expect("the second concurrent update dispatches");
+
+    let mut updated = 0;
+    let mut stale = 0;
+    for response in [first, second] {
+        match response.completion() {
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::SessionMetadataUpdated { metadata_revision },
+                output: None,
+            } => {
+                assert_eq!(metadata_revision.get(), 2);
+                updated += 1;
+            }
+            CommandCompletion::Rejected(error)
+                if error.code() == CommandErrorCode::StaleRevision =>
+            {
+                stale += 1;
+            }
+            completion => panic!("unexpected concurrent completion: {completion:?}"),
+        }
+    }
+    assert_eq!(
+        (updated, stale),
+        (1, 1),
+        "one concurrent CAS wins and the other is stale"
+    );
+
+    let page = list_sessions(&runtime, None, 10).await;
+    let winner = listed_session(&page, session_id);
+    assert_eq!(winner.metadata().revision().get(), 2);
+    assert!(matches!(
+        winner.metadata().name(),
+        Some("Concurrent A") | Some("Concurrent B")
+    ));
+
+    runtime.shutdown().await;
+}
+
+fn changed_session_model_config() -> SessionModelConfig {
+    SessionModelConfig::new(
+        ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+        ReasoningPreference::High,
+        Some(NonZeroU32::new(2048).unwrap()),
+    )
+}
+
+fn session_definition_update_command(
+    session_id: SessionId,
+    expected_revision: SessionDefinitionRevision,
+    workspace: Option<WorkspaceDefinitionInput>,
+    model: Option<SessionModelConfig>,
+    prompts: Option<SessionPromptSelection>,
+) -> RuntimeCommand {
+    RuntimeCommand::Session(SessionCommand::UpdateDefinition {
+        session_id,
+        expected_revision,
+        patch: SessionDefinitionPatch::new(workspace, model, prompts),
+    })
+}
+
+fn session_agent_upgrade_command(
+    session_id: SessionId,
+    expected_revision: SessionDefinitionRevision,
+    target: Option<AgentRevisionRef>,
+) -> RuntimeCommand {
+    RuntimeCommand::Session(SessionCommand::UpgradeAgentRevision {
+        session_id,
+        expected_revision,
+        target,
+    })
+}
+
+async fn create_public_session_for_agent(
+    runtime: &MiniCoreRuntime,
+    agent_id: minicore_runtime::wire::AgentId,
+    workspace_root: &Path,
+) -> SessionId {
+    let created = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Create {
+                agent_id,
+                definition: Box::new(NewSessionDefinition::new(
+                    workspace_input(workspace_root),
+                    session_model_config(),
+                    SessionPromptSelection::new(Vec::new()).unwrap(),
+                )),
+                metadata: NewSessionMetadata::new(None::<&str>, None::<&str>).unwrap(),
+            }),
+        ))
+        .await
+        .expect("public Session Create dispatches");
+    command_output(&created).parse().unwrap()
+}
+
+async fn update_public_agent_definition_to_second_revision(
+    runtime: &MiniCoreRuntime,
+    agent_id: minicore_runtime::wire::AgentId,
+) {
+    let definition = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::UpdateDefinition {
+                agent_id,
+                expected_revision: "ar_1".parse().unwrap(),
+                patch: AgentDefinitionPatch::new(Some(
+                    AgentPromptSelection::new(vec!["base".parse().unwrap()]).unwrap(),
+                )),
+            }),
+        ))
+        .await
+        .expect("Agent definition update dispatches");
+    assert!(matches!(
+        definition.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::AgentDefinitionUpdated {
+                definition_revision
+            },
+            output: None,
+        } if definition_revision.get() == 2
+    ));
+}
+
+fn workspace_input_with_cwd(path: &Path, relative_path: &str) -> WorkspaceDefinitionInput {
+    let key: WorkspaceRootKey = "repo".parse().unwrap();
+    WorkspaceDefinitionInput::new(
+        WorkspaceRootInput::new(
+            key.clone(),
+            workspace_uri(path),
+            RequestedFilesystemAccess::ReadWrite,
+            WorkspaceSourcePolicy::new(false, false),
+        ),
+        Vec::new(),
+        WorkspaceCwdSpec::new(key, relative_path.parse().unwrap()),
+    )
+    .unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_session_definition_cas_on_unloaded_open_sessions_publishes_and_recovers() {
+    let root = TempRoot::new();
+    let workspace = TempWorkspace::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let mut events = runtime
+        .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+        .await
+        .expect("the Runtime subscription opens");
+    assert!(matches!(
+        events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+    ));
+
+    let session_id = create_public_session(&runtime, workspace.path()).await;
+    loop {
+        match events.recv().await {
+            Some(EventFrame::State(event))
+                if event.msg().runtime_kind() == Some(RuntimeStateEventKind::SessionCreated) =>
+            {
+                break;
+            }
+            Some(EventFrame::State(_)) => {}
+            other => panic!("unexpected frame while draining creates: {other:?}"),
+        }
+    }
+
+    let missing = "ses_ffffffffffffffffffffffffffffffff".parse().unwrap();
+    let rejected = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_definition_update_command(
+                missing,
+                "sdr_1".parse().unwrap(),
+                None,
+                Some(changed_session_model_config()),
+                None,
+            ),
+        ))
+        .await
+        .expect("the missing Session definition update dispatches");
+    assert!(matches!(
+        rejected.completion(),
+        CommandCompletion::Rejected(error)
+            if error.code() == CommandErrorCode::NotFound
+                && error.subject() == Some(&PublicSubject::Session(missing))
+    ));
+
+    let first_id = CommandId::generate().unwrap();
+    let updated = runtime
+        .dispatch(CommandRequest::new(
+            first_id,
+            session_definition_update_command(
+                session_id,
+                "sdr_1".parse().unwrap(),
+                None,
+                Some(changed_session_model_config()),
+                None,
+            ),
+        ))
+        .await
+        .expect("the unloaded Session definition update dispatches");
+    assert!(matches!(
+        updated.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionDefinitionUpdated { definition_revision },
+            output: None,
+        } if definition_revision.get() == 2
+    ));
+    let Some(EventFrame::State(event)) = events.recv().await else {
+        panic!("the definition update publishes one Runtime StateEvent");
+    };
+    assert_eq!(event.command_id(), Some(first_id));
+    assert!(matches!(
+        event.msg(),
+        StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::SessionDefinitionUpdated,
+            detail: Some(RuntimeEventDetail::SessionChanged { session }),
+            ..
+        } if session.session_id() == session_id
+            && session.definition_revision().get() == 2
+            && session.lifecycle() == SessionLifecycleView::Open
+    ));
+
+    // Stale beats an otherwise-empty no-op patch.
+    let stale = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_definition_update_command(
+                session_id,
+                "sdr_1".parse().unwrap(),
+                None,
+                None,
+                None,
+            ),
+        ))
+        .await
+        .expect("the stale Session definition update dispatches");
+    assert!(matches!(
+        stale.completion(),
+        CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::StaleRevision
+    ));
+    // Empty and canonical-equivalent patches are NoChange without events.
+    let empty = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_definition_update_command(
+                session_id,
+                "sdr_2".parse().unwrap(),
+                None,
+                None,
+                None,
+            ),
+        ))
+        .await
+        .expect("the empty Session definition patch dispatches");
+    assert!(matches!(
+        empty.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::NoChange,
+            output: None,
+        }
+    ));
+    let equivalent = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_definition_update_command(
+                session_id,
+                "sdr_2".parse().unwrap(),
+                Some(workspace_input(workspace.path())),
+                Some(changed_session_model_config()),
+                Some(SessionPromptSelection::new(Vec::new()).unwrap()),
+            ),
+        ))
+        .await
+        .expect("the canonical-equivalent Session definition patch dispatches");
+    assert!(matches!(
+        equivalent.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::NoChange,
+            output: None,
+        }
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+            .await
+            .is_err(),
+        "a Session definition no-op publishes no Runtime event"
+    );
+
+    // Only Open Sessions accept an ordinary definition update.
+    let archived_session = create_public_session(&runtime, workspace.path()).await;
+    let archived = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Archive {
+                session_id: archived_session,
+            }),
+        ))
+        .await
+        .expect("Archive dispatches");
+    assert!(matches!(
+        archived.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionArchived,
+            output: None,
+        }
+    ));
+    let archived_update = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_definition_update_command(
+                archived_session,
+                "sdr_1".parse().unwrap(),
+                None,
+                Some(changed_session_model_config()),
+                None,
+            ),
+        ))
+        .await
+        .expect("the Archived Session definition update dispatches");
+    assert!(matches!(
+        archived_update.completion(),
+        CommandCompletion::Rejected(error)
+            if error.code() == CommandErrorCode::SessionArchived
+                && error.retry()
+                    == minicore_runtime::runtime_interface::RetryAdvice::UserActionRequired
+    ));
+    let deleted_session = create_public_session(&runtime, workspace.path()).await;
+    let archive_first = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Archive {
+                session_id: deleted_session,
+            }),
+        ))
+        .await
+        .expect("Archive dispatches");
+    assert!(matches!(
+        archive_first.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionArchived,
+            output: None,
+        }
+    ));
+    let deleted = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Delete {
+                session_id: deleted_session,
+            }),
+        ))
+        .await
+        .expect("Delete dispatches");
+    assert!(matches!(
+        deleted.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionDeleted,
+            output: None,
+        }
+    ));
+    let deleted_update = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_definition_update_command(
+                deleted_session,
+                "sdr_1".parse().unwrap(),
+                None,
+                Some(changed_session_model_config()),
+                None,
+            ),
+        ))
+        .await
+        .expect("the Deleted Session definition update dispatches");
+    assert!(matches!(
+        deleted_update.completion(),
+        CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::SessionDeleted
+    ));
+
+    runtime.shutdown().await;
+
+    let reopened = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime reopens");
+    let page = list_sessions(&reopened, None, 10).await;
+    let recovered = listed_session(&page, session_id);
+    assert_eq!(recovered.definition_revision().get(), 2);
+    reopened.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_session_definition_cas_while_loaded_publishes_exact_runtime_and_session_events() {
+    let root = TempRoot::new();
+    let first_workspace = TempWorkspace::new();
+    let second_workspace = TempWorkspace::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let session_id = create_public_session(&runtime, first_workspace.path()).await;
+    load_public_session(&runtime, session_id).await;
+
+    let mut runtime_events = runtime
+        .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+        .await
+        .expect("the Runtime subscription opens");
+    assert!(matches!(
+        runtime_events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+    ));
+    let mut session_events = runtime
+        .subscribe(SubscriptionRequest::new(
+            SubscriptionScope::Session { session_id },
+            false,
+        ))
+        .await
+        .expect("the Session subscription opens");
+    assert!(matches!(
+        session_events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+    ));
+
+    // A loaded Idle Workspace change increments both revisions and publishes exact events.
+    let second_workspace_input = workspace_input_with_cwd(second_workspace.path(), "");
+    let first_id = CommandId::generate().unwrap();
+    let workspace_update = runtime
+        .dispatch(CommandRequest::new(
+            first_id,
+            session_definition_update_command(
+                session_id,
+                "sdr_1".parse().unwrap(),
+                Some(second_workspace_input.clone()),
+                None,
+                None,
+            ),
+        ))
+        .await
+        .expect("the loaded Workspace definition update dispatches");
+    assert!(matches!(
+        workspace_update.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionDefinitionUpdated { definition_revision },
+            output: None,
+        } if definition_revision.get() == 2
+    ));
+
+    let Some(EventFrame::State(runtime_event)) = runtime_events.recv().await else {
+        panic!("the loaded update publishes one Runtime StateEvent");
+    };
+    assert_eq!(runtime_event.command_id(), Some(first_id));
+    assert!(matches!(
+        runtime_event.msg(),
+        StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::SessionDefinitionUpdated,
+            detail: Some(RuntimeEventDetail::SessionChanged { session }),
+            ..
+        } if session.session_id() == session_id
+            && session.definition_revision().get() == 2
+    ));
+
+    let Some(EventFrame::State(session_event)) = session_events.recv().await else {
+        panic!("the loaded update publishes one Session StateEvent");
+    };
+    assert_eq!(session_event.command_id(), Some(first_id));
+    assert_eq!(session_event.route(), EventRoute::Session { session_id });
+    assert_eq!(
+        session_event.msg().session_kind(),
+        Some(SessionStateEventKind::SessionDefinitionUpdated)
+    );
+    assert!(session_event.msg().session_detail().is_none());
+    let snapshot = session_event.msg().session_snapshot().unwrap();
+    assert_eq!(snapshot.definition().revision().get(), 2);
+    assert_eq!(
+        snapshot.definition().created_at(),
+        session_event.timestamp()
+    );
+    assert_eq!(
+        snapshot
+            .definition()
+            .workspace()
+            .cwd()
+            .relative_path()
+            .as_str(),
+        ""
+    );
+    assert_eq!(snapshot.execution(), SessionExecutionView::Idle);
+
+    // A second consecutive future-only update carries its own exact revision on both streams
+    // while preserving the installed Workspace.
+    let second_id = CommandId::generate().unwrap();
+    let model_update = runtime
+        .dispatch(CommandRequest::new(
+            second_id,
+            session_definition_update_command(
+                session_id,
+                "sdr_2".parse().unwrap(),
+                None,
+                Some(changed_session_model_config()),
+                None,
+            ),
+        ))
+        .await
+        .expect("the second loaded Session definition update dispatches");
+    assert!(matches!(
+        model_update.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionDefinitionUpdated { definition_revision },
+            output: None,
+        } if definition_revision.get() == 3
+    ));
+    assert!(matches!(
+        runtime_events.recv().await,
+        Some(EventFrame::State(event))
+            if matches!(
+                event.msg(),
+                StateEventMsg::Runtime {
+                    kind: RuntimeStateEventKind::SessionDefinitionUpdated,
+                    detail: Some(RuntimeEventDetail::SessionChanged { session }),
+                    ..
+                } if session.session_id() == session_id
+                    && session.definition_revision().get() == 3
+            )
+    ));
+    assert!(matches!(
+        session_events.recv().await,
+        Some(EventFrame::State(event))
+            if event.msg().session_kind()
+                == Some(SessionStateEventKind::SessionDefinitionUpdated)
+                && event.msg().session_snapshot().unwrap().definition().revision().get() == 3
+                && event
+                    .msg()
+                    .session_snapshot()
+                    .unwrap()
+                    .definition()
+                    .model()
+                    .reasoning()
+                    == ReasoningPreference::High
+                && event
+                    .msg()
+                    .session_snapshot()
+                    .unwrap()
+                    .definition()
+                    .workspace()
+                    .cwd()
+                    .relative_path()
+                    .as_str()
+                    == ""
+    ));
+
+    // A loaded no-op publishes nothing on either stream.
+    let noop = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_definition_update_command(
+                session_id,
+                "sdr_3".parse().unwrap(),
+                Some(second_workspace_input),
+                Some(changed_session_model_config()),
+                Some(SessionPromptSelection::new(Vec::new()).unwrap()),
+            ),
+        ))
+        .await
+        .expect("the loaded canonical-equivalent Session definition update dispatches");
+    assert!(matches!(
+        noop.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::NoChange,
+            output: None,
+        }
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), runtime_events.recv())
+            .await
+            .is_err(),
+        "a loaded Session definition no-op publishes no Runtime event"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), session_events.recv())
+            .await
+            .is_err(),
+        "a loaded Session definition no-op publishes no Session event"
+    );
+
+    // The snapshot request observes the installed executor definition.
+    let observed = runtime
+        .snapshot(SnapshotRequest::Session { session_id })
+        .await
+        .expect("the loaded Session snapshot is available");
+    let SnapshotResponse::Session(observed) = observed else {
+        panic!("the Session snapshot request returns a Session snapshot");
+    };
+    assert_eq!(observed.definition().revision().get(), 3);
+    assert_eq!(
+        observed.definition().model().reasoning(),
+        ReasoningPreference::High
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_session_definition_cas_with_one_expected_revision_wins_exactly_once() {
+    let root = TempRoot::new();
+    let workspace = TempWorkspace::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let session_id = create_public_session(&runtime, workspace.path()).await;
+
+    let (first, second) = tokio::join!(
+        runtime.dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_definition_update_command(
+                session_id,
+                "sdr_1".parse().unwrap(),
+                None,
+                Some(changed_session_model_config()),
+                None,
+            ),
+        )),
+        runtime.dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_definition_update_command(
+                session_id,
+                "sdr_1".parse().unwrap(),
+                None,
+                None,
+                Some(SessionPromptSelection::new(vec!["base".parse().unwrap()]).unwrap()),
+            ),
+        )),
+    );
+    let first = first.expect("the first concurrent update dispatches");
+    let second = second.expect("the second concurrent update dispatches");
+
+    let mut updated = 0;
+    let mut stale = 0;
+    for response in [first, second] {
+        match response.completion() {
+            CommandCompletion::Completed {
+                outcome:
+                    CommandOutcome::SessionDefinitionUpdated {
+                        definition_revision,
+                    },
+                output: None,
+            } => {
+                assert_eq!(definition_revision.get(), 2);
+                updated += 1;
+            }
+            CommandCompletion::Rejected(error)
+                if error.code() == CommandErrorCode::StaleRevision =>
+            {
+                stale += 1;
+            }
+            completion => panic!("unexpected concurrent completion: {completion:?}"),
+        }
+    }
+    assert_eq!(
+        (updated, stale),
+        (1, 1),
+        "one concurrent CAS wins and the other is stale"
+    );
+
+    let page = list_sessions(&runtime, None, 10).await;
+    let winner = listed_session(&page, session_id);
+    assert_eq!(winner.definition_revision().get(), 2);
+
+    runtime.shutdown().await;
+}
+
+#[test]
+fn session_agent_upgrade_command_debug_is_safe_and_stable() {
+    let command = RuntimeCommand::Session(SessionCommand::UpgradeAgentRevision {
+        session_id: "ses_22222222222222222222222222222222".parse().unwrap(),
+        expected_revision: "sdr_1".parse().unwrap(),
+        target: Some(AgentRevisionRef::new(
+            "agt_11111111111111111111111111111111".parse().unwrap(),
+            "ar_1".parse().unwrap(),
+        )),
+    });
+    let debug = format!("{command:?}");
+    assert!(debug.contains("UpgradeAgentRevision"), "{debug}");
+    assert!(
+        debug.contains("ses_22222222222222222222222222222222"),
+        "{debug}"
+    );
+    assert!(!debug.contains("secret"), "{debug}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_session_agent_upgrade_pins_current_rolls_back_and_survives_restart() {
+    let root = TempRoot::new();
+    let workspace = TempWorkspace::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let mut events = runtime
+        .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+        .await
+        .expect("the Runtime subscription opens");
+    assert!(matches!(
+        events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+    ));
+
+    let agent_id = create_public_agent(&runtime).await;
+    let session_id = create_public_session_for_agent(&runtime, agent_id, workspace.path()).await;
+    loop {
+        match events.recv().await {
+            Some(EventFrame::State(event))
+                if event.msg().runtime_kind() == Some(RuntimeStateEventKind::SessionCreated) =>
+            {
+                break;
+            }
+            Some(EventFrame::State(_)) => {}
+            other => panic!("unexpected frame while draining creates: {other:?}"),
+        }
+    }
+    let conversation_path = root
+        .path()
+        .join("sessions")
+        .join(session_id.to_string())
+        .join("conversation.jsonl");
+    let conversation_before = fs::read(&conversation_path).expect("the conversation is readable");
+
+    update_public_agent_definition_to_second_revision(&runtime, agent_id).await;
+    loop {
+        match events.recv().await {
+            Some(EventFrame::State(event))
+                if event.msg().runtime_kind()
+                    == Some(RuntimeStateEventKind::AgentDefinitionUpdated) =>
+            {
+                break;
+            }
+            Some(EventFrame::State(_)) => {}
+            other => panic!("unexpected frame while draining the Agent update: {other:?}"),
+        }
+    }
+
+    // None pins the Agent current revision (ar_2) at a checked successor definition revision.
+    let upgrade_id = CommandId::generate().unwrap();
+    let upgraded = runtime
+        .dispatch(CommandRequest::new(
+            upgrade_id,
+            session_agent_upgrade_command(session_id, "sdr_1".parse().unwrap(), None),
+        ))
+        .await
+        .expect("the Session Agent upgrade dispatches");
+    assert!(matches!(
+        upgraded.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionDefinitionUpdated { definition_revision },
+            output: None,
+        } if definition_revision.get() == 2
+    ));
+    let Some(EventFrame::State(event)) = events.recv().await else {
+        panic!("the Agent upgrade publishes one Runtime StateEvent");
+    };
+    assert_eq!(event.command_id(), Some(upgrade_id));
+    assert!(matches!(
+        event.msg(),
+        StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::SessionDefinitionUpdated,
+            detail: Some(RuntimeEventDetail::SessionChanged { session }),
+            ..
+        } if session.session_id() == session_id && session.definition_revision().get() == 2
+    ));
+
+    // The pin is observable in the loaded Session snapshot.
+    load_public_session(&runtime, session_id).await;
+    let observed = runtime
+        .snapshot(SnapshotRequest::Session { session_id })
+        .await
+        .expect("the loaded Session snapshot is available");
+    let SnapshotResponse::Session(observed) = observed else {
+        panic!("the Session snapshot request returns a Session snapshot");
+    };
+    assert_eq!(observed.definition().revision().get(), 2);
+    assert_eq!(observed.definition().agent().agent_id(), agent_id);
+    assert_eq!(observed.definition().agent().revision().get(), 2);
+    let unload = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Unload { session_id }),
+        ))
+        .await
+        .expect("Unload dispatches");
+    assert_eq!(command_output(&unload), "session unloaded");
+
+    // A fresh subscription observes only the no-op, stale, and rollback below; the
+    // earlier Load/Unload events stay on the previous stream.
+    let mut events = runtime
+        .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+        .await
+        .expect("the Runtime subscription opens");
+    assert!(matches!(
+        events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+    ));
+
+    // The same pin is a canonical no-op without events; stale wins before the no-op.
+    let noop = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_agent_upgrade_command(session_id, "sdr_2".parse().unwrap(), None),
+        ))
+        .await
+        .expect("the same-pin upgrade dispatches");
+    assert!(matches!(
+        noop.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::NoChange,
+            output: None,
+        }
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+            .await
+            .is_err(),
+        "a same-pin upgrade publishes no Runtime event"
+    );
+    let stale = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_agent_upgrade_command(session_id, "sdr_1".parse().unwrap(), None),
+        ))
+        .await
+        .expect("the stale upgrade dispatches");
+    assert!(matches!(
+        stale.completion(),
+        CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::StaleRevision
+    ));
+
+    // An explicit exact target rolls back to the retained ar_1.
+    let rollback_id = CommandId::generate().unwrap();
+    let rolled_back = runtime
+        .dispatch(CommandRequest::new(
+            rollback_id,
+            session_agent_upgrade_command(
+                session_id,
+                "sdr_2".parse().unwrap(),
+                Some(AgentRevisionRef::new(agent_id, "ar_1".parse().unwrap())),
+            ),
+        ))
+        .await
+        .expect("the explicit rollback dispatches");
+    assert!(matches!(
+        rolled_back.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionDefinitionUpdated { definition_revision },
+            output: None,
+        } if definition_revision.get() == 3
+    ));
+    let Some(EventFrame::State(event)) = events.recv().await else {
+        panic!("the rollback publishes one Runtime StateEvent");
+    };
+    assert_eq!(event.command_id(), Some(rollback_id));
+    assert!(matches!(
+        event.msg(),
+        StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::SessionDefinitionUpdated,
+            detail: Some(RuntimeEventDetail::SessionChanged { session }),
+            ..
+        } if session.definition_revision().get() == 3
+    ));
+    assert_eq!(
+        fs::read(&conversation_path).unwrap(),
+        conversation_before,
+        "Agent upgrades never write the conversation"
+    );
+
+    // Restart retains the exact pin (the rollback to ar_1 at sdr_3).
+    runtime.shutdown().await;
+    let reopened = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime reopens with the upgraded Session definition");
+    let page = list_sessions(&reopened, None, 10).await;
+    let recovered = listed_session(&page, session_id);
+    assert_eq!(recovered.definition_revision().get(), 3);
+    load_public_session(&reopened, session_id).await;
+    let observed = reopened
+        .snapshot(SnapshotRequest::Session { session_id })
+        .await
+        .expect("the recovered Session snapshot is available");
+    let SnapshotResponse::Session(observed) = observed else {
+        panic!("the recovered Session snapshot request returns a Session snapshot");
+    };
+    assert_eq!(observed.definition().revision().get(), 3);
+    assert_eq!(observed.definition().agent().agent_id(), agent_id);
+    assert_eq!(
+        observed.definition().agent().revision().get(),
+        1,
+        "restart retains the exact pinned Agent revision"
+    );
+    reopened.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_session_agent_upgrade_maps_agent_and_session_errors_without_events() {
+    let root = TempRoot::new();
+    let workspace = TempWorkspace::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let agent_id = create_public_agent(&runtime).await;
+    let session_id = create_public_session_for_agent(&runtime, agent_id, workspace.path()).await;
+    let other_agent = create_public_agent(&runtime).await;
+    let archived_session =
+        create_public_session_for_agent(&runtime, agent_id, workspace.path()).await;
+    let deleted_session =
+        create_public_session_for_agent(&runtime, agent_id, workspace.path()).await;
+    let archived = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Archive {
+                session_id: archived_session,
+            }),
+        ))
+        .await
+        .expect("Archive dispatches");
+    assert!(matches!(
+        archived.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionArchived,
+            output: None,
+        }
+    ));
+    let archived_for_delete = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Archive {
+                session_id: deleted_session,
+            }),
+        ))
+        .await
+        .expect("Archive dispatches for the later Delete");
+    assert!(matches!(
+        archived_for_delete.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionArchived,
+            output: None,
+        }
+    ));
+    let deleted = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Delete {
+                session_id: deleted_session,
+            }),
+        ))
+        .await
+        .expect("Delete dispatches");
+    assert!(matches!(
+        deleted.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionDeleted,
+            output: None,
+        }
+    ));
+    let disabled_agent = create_public_agent(&runtime).await;
+    let disabled_session =
+        create_public_session_for_agent(&runtime, disabled_agent, workspace.path()).await;
+    let deleted_agent = create_public_agent(&runtime).await;
+    let deleted_agent_session =
+        create_public_session_for_agent(&runtime, deleted_agent, workspace.path()).await;
+    let disabled = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::SetStatus {
+                agent_id: disabled_agent,
+                expected_status: AgentStatus::Enabled,
+                status: AgentUsableStatus::Disabled,
+            }),
+        ))
+        .await
+        .expect("Agent Disable dispatches");
+    assert!(matches!(
+        disabled.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::AgentStatusChanged { .. },
+            output: None,
+        }
+    ));
+    let deleted_agent_disabled = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::SetStatus {
+                agent_id: deleted_agent,
+                expected_status: AgentStatus::Enabled,
+                status: AgentUsableStatus::Disabled,
+            }),
+        ))
+        .await
+        .expect("Agent Disable dispatches for the later Delete");
+    assert!(matches!(
+        deleted_agent_disabled.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::AgentStatusChanged { .. },
+            output: None,
+        }
+    ));
+    let deleted_agent_response = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::Delete {
+                agent_id: deleted_agent,
+                expected_status: AgentStatus::Disabled,
+            }),
+        ))
+        .await
+        .expect("Agent Delete dispatches");
+    assert!(matches!(
+        deleted_agent_response.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::AgentDeleted,
+            output: None,
+        }
+    ));
+
+    // A fresh subscription observes only the failures below.
+    let mut events = runtime
+        .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+        .await
+        .expect("the Runtime subscription opens");
+    assert!(matches!(
+        events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+    ));
+
+    let session_subject = Some(PublicSubject::Session(session_id));
+    let mut rejected = Vec::new();
+    for (command, expected_code, expected_retry, expected_subject) in [
+        (
+            session_agent_upgrade_command(
+                session_id,
+                "sdr_1".parse().unwrap(),
+                Some(AgentRevisionRef::new(other_agent, "ar_1".parse().unwrap())),
+            ),
+            CommandErrorCode::InvalidArgument,
+            RetryAdvice::DoNotRetry,
+            session_subject.clone(),
+        ),
+        (
+            session_agent_upgrade_command(
+                session_id,
+                "sdr_1".parse().unwrap(),
+                Some(AgentRevisionRef::new(agent_id, "ar_99".parse().unwrap())),
+            ),
+            CommandErrorCode::NotFound,
+            RetryAdvice::RefreshAndRetry,
+            session_subject.clone(),
+        ),
+        (
+            session_agent_upgrade_command(disabled_session, "sdr_1".parse().unwrap(), None),
+            CommandErrorCode::AgentDisabled,
+            RetryAdvice::UserActionRequired,
+            Some(PublicSubject::Session(disabled_session)),
+        ),
+        (
+            session_agent_upgrade_command(
+                deleted_agent_session,
+                "sdr_1".parse().unwrap(),
+                Some(AgentRevisionRef::new(
+                    deleted_agent,
+                    "ar_1".parse().unwrap(),
+                )),
+            ),
+            CommandErrorCode::AgentDeleted,
+            RetryAdvice::DoNotRetry,
+            Some(PublicSubject::Session(deleted_agent_session)),
+        ),
+        (
+            session_agent_upgrade_command(archived_session, "sdr_1".parse().unwrap(), None),
+            CommandErrorCode::SessionArchived,
+            RetryAdvice::UserActionRequired,
+            Some(PublicSubject::Session(archived_session)),
+        ),
+        (
+            session_agent_upgrade_command(deleted_session, "sdr_1".parse().unwrap(), None),
+            CommandErrorCode::SessionDeleted,
+            RetryAdvice::DoNotRetry,
+            Some(PublicSubject::Session(deleted_session)),
+        ),
+    ] {
+        let response = runtime
+            .dispatch(CommandRequest::new(CommandId::generate().unwrap(), command))
+            .await
+            .expect("the failing Agent upgrade dispatches");
+        let CommandCompletion::Rejected(error) = response.completion() else {
+            panic!("the failing upgrade is rejected: {response:?}");
+        };
+        assert_eq!(error.code(), expected_code);
+        assert_eq!(error.retry(), expected_retry);
+        assert_eq!(error.subject(), expected_subject.as_ref());
+        rejected.push(response);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "a rejected Agent upgrade publishes no Runtime event"
+        );
+    }
+    assert_eq!(rejected.len(), 6);
+
+    // The archived/deleted Sessions and the pinned definition are untouched by failures.
+    let page = list_sessions(&runtime, None, 10).await;
+    let pinned = listed_session(&page, session_id);
+    assert_eq!(pinned.definition_revision().get(), 1);
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_session_agent_upgrade_while_loaded_publishes_exact_runtime_and_session_events() {
+    let root = TempRoot::new();
+    let workspace = TempWorkspace::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let agent_id = create_public_agent(&runtime).await;
+    let session_id = create_public_session_for_agent(&runtime, agent_id, workspace.path()).await;
+    update_public_agent_definition_to_second_revision(&runtime, agent_id).await;
+    load_public_session(&runtime, session_id).await;
+
+    let mut runtime_events = runtime
+        .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+        .await
+        .expect("the Runtime subscription opens");
+    assert!(matches!(
+        runtime_events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+    ));
+    let mut session_events = runtime
+        .subscribe(SubscriptionRequest::new(
+            SubscriptionScope::Session { session_id },
+            false,
+        ))
+        .await
+        .expect("the Session subscription opens");
+    assert!(matches!(
+        session_events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+    ));
+
+    let upgrade_id = CommandId::generate().unwrap();
+    let upgraded = runtime
+        .dispatch(CommandRequest::new(
+            upgrade_id,
+            session_agent_upgrade_command(session_id, "sdr_1".parse().unwrap(), None),
+        ))
+        .await
+        .expect("the loaded Session Agent upgrade dispatches");
+    assert!(matches!(
+        upgraded.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionDefinitionUpdated { definition_revision },
+            output: None,
+        } if definition_revision.get() == 2
+    ));
+
+    let Some(EventFrame::State(runtime_event)) = runtime_events.recv().await else {
+        panic!("the loaded upgrade publishes one Runtime StateEvent");
+    };
+    assert_eq!(runtime_event.command_id(), Some(upgrade_id));
+    assert!(matches!(
+        runtime_event.msg(),
+        StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::SessionDefinitionUpdated,
+            detail: Some(RuntimeEventDetail::SessionChanged { session }),
+            ..
+        } if session.session_id() == session_id && session.definition_revision().get() == 2
+    ));
+
+    let Some(EventFrame::State(session_event)) = session_events.recv().await else {
+        panic!("the loaded upgrade publishes one Session StateEvent");
+    };
+    assert_eq!(session_event.command_id(), Some(upgrade_id));
+    assert_eq!(session_event.timestamp(), runtime_event.timestamp());
+    assert_eq!(session_event.route(), EventRoute::Session { session_id });
+    assert_eq!(
+        session_event.msg().session_kind(),
+        Some(SessionStateEventKind::SessionDefinitionUpdated)
+    );
+    assert!(session_event.msg().session_detail().is_none());
+    let snapshot = session_event.msg().session_snapshot().unwrap();
+    assert_eq!(snapshot.definition().revision().get(), 2);
+    assert_eq!(snapshot.definition().agent().agent_id(), agent_id);
+    assert_eq!(snapshot.definition().agent().revision().get(), 2);
+    assert_eq!(
+        snapshot.definition().created_at(),
+        session_event.timestamp()
+    );
+    assert_eq!(snapshot.execution(), SessionExecutionView::Idle);
+    assert_eq!(
+        snapshot
+            .definition()
+            .workspace()
+            .cwd()
+            .relative_path()
+            .as_str(),
+        "src"
+    );
+
+    // The snapshot request observes the exact installed definition with the same Workspace.
+    let observed = runtime
+        .snapshot(SnapshotRequest::Session { session_id })
+        .await
+        .expect("the loaded Session snapshot is available");
+    let SnapshotResponse::Session(observed) = observed else {
+        panic!("the Session snapshot request returns a Session snapshot");
+    };
+    assert_eq!(observed.definition().revision().get(), 2);
+    assert_eq!(observed.definition().agent().revision().get(), 2);
+    assert_eq!(
+        observed
+            .definition()
+            .workspace()
+            .cwd()
+            .relative_path()
+            .as_str(),
+        "src"
+    );
+
+    // A loaded same-pin no-op publishes nothing on either stream.
+    let noop = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_agent_upgrade_command(session_id, "sdr_2".parse().unwrap(), None),
+        ))
+        .await
+        .expect("the loaded same-pin upgrade dispatches");
+    assert!(matches!(
+        noop.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::NoChange,
+            output: None,
+        }
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), runtime_events.recv())
+            .await
+            .is_err(),
+        "a loaded same-pin upgrade publishes no Runtime event"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), session_events.recv())
+            .await
+            .is_err(),
+        "a loaded same-pin upgrade publishes no Session event"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_session_agent_upgrade_with_one_expected_revision_wins_exactly_once() {
+    let root = TempRoot::new();
+    let workspace = TempWorkspace::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let agent_id = create_public_agent(&runtime).await;
+    let session_id = create_public_session_for_agent(&runtime, agent_id, workspace.path()).await;
+    update_public_agent_definition_to_second_revision(&runtime, agent_id).await;
+
+    let (first, second) = tokio::join!(
+        runtime.dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_agent_upgrade_command(session_id, "sdr_1".parse().unwrap(), None),
+        )),
+        runtime.dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            session_agent_upgrade_command(session_id, "sdr_1".parse().unwrap(), None),
+        )),
+    );
+    let first = first.expect("the first concurrent upgrade dispatches");
+    let second = second.expect("the second concurrent upgrade dispatches");
+
+    let mut updated = 0;
+    let mut stale = 0;
+    for response in [first, second] {
+        match response.completion() {
+            CommandCompletion::Completed {
+                outcome:
+                    CommandOutcome::SessionDefinitionUpdated {
+                        definition_revision,
+                    },
+                output: None,
+            } => {
+                assert_eq!(definition_revision.get(), 2);
+                updated += 1;
+            }
+            CommandCompletion::Rejected(error)
+                if error.code() == CommandErrorCode::StaleRevision =>
+            {
+                stale += 1;
+            }
+            completion => panic!("unexpected concurrent completion: {completion:?}"),
+        }
+    }
+    assert_eq!(
+        (updated, stale),
+        (1, 1),
+        "one concurrent Agent upgrade wins and the other is stale"
+    );
+
+    let page = list_sessions(&runtime, None, 10).await;
+    let winner = listed_session(&page, session_id);
+    assert_eq!(winner.definition_revision().get(), 2);
+
+    runtime.shutdown().await;
+}
+
+fn now_truncated_to_millis() -> time::OffsetDateTime {
+    let now = time::OffsetDateTime::now_utc();
+    let nanoseconds = now.nanosecond();
+    now.replace_nanosecond(nanoseconds - (nanoseconds % 1_000_000))
+        .expect("truncating a nanosecond component stays within its valid range")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_loaded_workspace_reload_returns_workspace_reloaded_and_publishes_session_event() {
+    let root = TempRoot::new();
+    let workspace = TempWorkspace::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let session_id = create_public_session(&runtime, workspace.path()).await;
+    load_public_session(&runtime, session_id).await;
+
+    let mut runtime_events = runtime
+        .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+        .await
+        .expect("the Runtime subscription opens");
+    assert!(matches!(
+        runtime_events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+    ));
+    let mut session_events = runtime
+        .subscribe(SubscriptionRequest::new(
+            SubscriptionScope::Session { session_id },
+            false,
+        ))
+        .await
+        .expect("the Session subscription opens");
+    assert!(matches!(
+        session_events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+    ));
+    let conversation_path = root
+        .path()
+        .join("sessions")
+        .join(session_id.to_string())
+        .join("conversation.jsonl");
+    let conversation_before = fs::read(&conversation_path).expect("the conversation is readable");
+
+    let reload_id = CommandId::generate().unwrap();
+    let before = now_truncated_to_millis();
+    let reloaded = runtime
+        .dispatch(CommandRequest::new(
+            reload_id,
+            RuntimeCommand::Session(SessionCommand::ReloadWorkspace { session_id }),
+        ))
+        .await
+        .expect("the loaded Workspace reload dispatches");
+    let after = now_truncated_to_millis();
+    assert!(matches!(
+        reloaded.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::WorkspaceReloaded,
+            output: None,
+        }
+    ));
+
+    // The Session-scope subscriber receives the exact WorkspaceReloaded event: the owner
+    // command id, the single sampled timestamp, the matching Session route with a null detail,
+    // and the exact post-reload loaded Ready Idle snapshot.
+    let Some(EventFrame::State(session_event)) = session_events.recv().await else {
+        panic!("the reload publishes one Session StateEvent");
+    };
+    assert_eq!(session_event.command_id(), Some(reload_id));
+    assert_eq!(session_event.route(), EventRoute::Session { session_id });
+    assert_eq!(
+        session_event.msg().session_kind(),
+        Some(SessionStateEventKind::SessionWorkspaceReloaded)
+    );
+    assert!(session_event.msg().session_detail().is_none());
+    let timestamp = session_event.timestamp().as_datetime();
+    assert!(timestamp >= before && timestamp <= after);
+    let snapshot = session_event.msg().session_snapshot().unwrap();
+    assert_eq!(snapshot.session_id(), session_id);
+    assert_eq!(snapshot.definition().revision().get(), 1);
+    assert_eq!(
+        snapshot
+            .definition()
+            .workspace()
+            .cwd()
+            .relative_path()
+            .as_str(),
+        "src"
+    );
+    assert_eq!(snapshot.execution(), SessionExecutionView::Idle);
+    assert_eq!(snapshot.metadata().revision().get(), 1);
+    // A reload keeps the durable definition createdAt; it is not the reload timestamp.
+    assert_ne!(
+        snapshot.definition().created_at(),
+        session_event.timestamp()
+    );
+
+    // The Runtime-scope subscriber receives no reload event, and no other Session event follows.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), runtime_events.recv())
+            .await
+            .is_err(),
+        "a Workspace reload publishes no Runtime event"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), session_events.recv())
+            .await
+            .is_err(),
+        "a Workspace reload publishes exactly one Session event"
+    );
+
+    // The reload changed no durable fact: definition revision, metadata, and conversation bytes
+    // are all preserved.
+    let observed = runtime
+        .snapshot(SnapshotRequest::Session { session_id })
+        .await
+        .expect("the loaded Session snapshot is available");
+    let SnapshotResponse::Session(observed) = observed else {
+        panic!("the Session snapshot request returns a Session snapshot");
+    };
+    assert_eq!(observed.definition().revision().get(), 1);
+    assert_eq!(observed.metadata().revision().get(), 1);
+    assert_eq!(
+        fs::read(&conversation_path).expect("the conversation is readable"),
+        conversation_before,
+        "a Workspace reload never writes the conversation"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_workspace_reload_errors_preserve_state_and_map_typed_failures() {
+    let root = TempRoot::new();
+    let workspace = TempWorkspace::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let session_id = create_public_session(&runtime, workspace.path()).await;
+    load_public_session(&runtime, session_id).await;
+
+    let mut runtime_events = runtime
+        .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+        .await
+        .expect("the Runtime subscription opens");
+    assert!(matches!(
+        runtime_events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+    ));
+    let mut session_events = runtime
+        .subscribe(SubscriptionRequest::new(
+            SubscriptionScope::Session { session_id },
+            false,
+        ))
+        .await
+        .expect("the Session subscription opens");
+    assert!(matches!(
+        session_events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+    ));
+
+    // A root that is a plain file fails validation: ReloadValidationFailed with
+    // UserActionRequired, no event on either stream, and the old snapshot preserved.
+    fs::remove_dir_all(workspace.path()).expect("the Workspace root is removed");
+    fs::write(workspace.path(), b"not a directory")
+        .expect("the Workspace root becomes a plain file");
+    let rejected = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::ReloadWorkspace { session_id }),
+        ))
+        .await
+        .expect("the invalid Workspace reload dispatches");
+    assert!(matches!(
+        rejected.completion(),
+        CommandCompletion::Rejected(error)
+            if error.code() == CommandErrorCode::ReloadValidationFailed
+                && error.retry()
+                    == minicore_runtime::runtime_interface::RetryAdvice::UserActionRequired
+                && error.subject() == Some(&PublicSubject::Session(session_id))
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), runtime_events.recv())
+            .await
+            .is_err(),
+        "a failed reload publishes no Runtime event"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), session_events.recv())
+            .await
+            .is_err(),
+        "a failed reload publishes no Session event"
+    );
+    let preserved = runtime
+        .snapshot(SnapshotRequest::Session { session_id })
+        .await
+        .expect("the loaded Session snapshot is still available");
+    let SnapshotResponse::Session(preserved) = preserved else {
+        panic!("the Session snapshot request returns a Session snapshot");
+    };
+    assert_eq!(preserved.definition().revision().get(), 1);
+    assert_eq!(preserved.execution(), SessionExecutionView::Idle);
+    assert_eq!(
+        preserved
+            .definition()
+            .workspace()
+            .cwd()
+            .relative_path()
+            .as_str(),
+        "src"
+    );
+
+    // Unloaded and missing Sessions map to SessionNotLoaded with UserActionRequired.
+    let unload = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Unload { session_id }),
+        ))
+        .await
+        .expect("Unload dispatches");
+    assert_eq!(command_output(&unload), "session unloaded");
+    for target in [
+        session_id,
+        "ses_ffffffffffffffffffffffffffffffff".parse().unwrap(),
+    ] {
+        let not_loaded = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::ReloadWorkspace { session_id: target }),
+            ))
+            .await
+            .expect("the unloaded Workspace reload dispatches");
+        assert!(matches!(
+            not_loaded.completion(),
+            CommandCompletion::Rejected(error)
+                if error.code() == CommandErrorCode::SessionNotLoaded
+                    && error.retry()
+                        == minicore_runtime::runtime_interface::RetryAdvice::UserActionRequired
+                    && error.subject() == Some(&PublicSubject::Session(target))
+        ));
+    }
+
+    runtime.shutdown().await;
 }

@@ -2,7 +2,7 @@
 
 日期：2026-07-31
 
-状态：当前权威架构（ADR 0136/0137；M5 durable foundation与replay/Recorder-backed hydration、Workspace resolver/Snapshot及Runtime-owned residency foundation已实现；minimal public dispatch/query/snapshot/subscribe已接通Agent Create/Enable/Disable/Delete/UpdateDefinition/UpdateMetadata与Session Create/Load/Submit/Unload/Fork/Archive/Unarchive/Delete、typed ResolveInteraction/NoChange、durable `ListAgents`/`ListSessions`分页、`GetSessionForkProvenance`、snapshot-first Runtime/Session subscription、Runtime Agent/Session membership/lifecycle/definition/metadata StateEvent、loaded Ready+Idle Snapshot与Turn Completed/Failed Event；M9 Starting/Running/Finishing observation、current Turn/active Items/Pending Interaction安全摘要已接通；Session usage、Degraded recording与bounded diagnostics也已接通；selected-V1 Agent mutation、Progress/Closed及SessionDefinitionUpdated codec已关闭public manifest pending；M11 remaining Session definition/metadata CAS、readiness、grace/cancel式active-Turn Unload及完整cross-platform native matrix pending）
+状态：当前权威架构（ADR 0136/0137；M5 durable foundation与replay/Recorder-backed hydration、Workspace resolver/Snapshot及Runtime-owned residency foundation已实现；minimal public dispatch/query/snapshot/subscribe已接通Agent Create/Enable/Disable/Delete/UpdateDefinition/UpdateMetadata与Session Create/Load/Submit/Unload/Fork/Archive/Unarchive/Delete/UpdateDefinition/UpgradeAgentRevision/ReloadWorkspace/UpdateMetadata、typed ResolveInteraction/NoChange、durable `ListAgents`/`ListSessions`分页、`GetSessionForkProvenance`、snapshot-first Runtime/Session subscription、Runtime Agent/Session membership/lifecycle/definition/metadata StateEvent、loaded Session metadata/definition/workspace-reload StateEvent、loaded Ready+Idle与Workspace/Prompt Unavailable Snapshot及Turn Completed/Failed Event；M9 Starting/Running/Finishing observation、current Turn/active Items/Pending Interaction安全摘要已接通；Session usage、Degraded recording与bounded diagnostics也已接通；selected-V1 Agent/Session metadata mutation、ordinary Session definition CAS、Agent revision upgrade、Ready-state与Unavailable恢复的reload workspace、Progress/Closed及SessionDefinitionUpdated codec已关闭public manifest pending；Workspace/Prompt Unavailable loaded readiness与ReloadWorkspace恢复已实现；Agent readiness fan-out亦已实现（`SetStatus/Delete` durable Updated后按同一owner timestamp经residency per-Session gate逐个fan-out `set_agent_availability`，Idle立即应用、非Idle保存最新pending并在回Idle后应用，仅public readiness真实变化发布Session-scope `session_readiness_changed`，Agent Disabled/Deleted的Load仍返回Loaded并投影AgentUnavailable，Enable恢复底层Ready或原resource Unavailable，active Turn不变且future admission拒绝）；ModelUnavailable load/definition projection亦已实现（`SessionExecutorSnapshot`新增独立`model_available: bool`事实并收窄重命名`resource_unavailable`为`workspace_unavailable`，readiness优先级固定为AgentUnavailable→workspace cause→ModelUnavailable→Ready；Load用现有`resolve_for_turn`按captured definition.model同步分类model_available，普通model incompatibility→false且Load仍Loaded而catalog owner/source/definition internal→现有internal load路径，任何install新definition的publication install前按当前catalog计算新definition的model_available并与definition一起安装，ReloadWorkspace保留当前事实，true Workspace publication只清workspace cause，DefinitionUpdated/WorkspaceReloaded event snapshot自然携带新readiness）；selected PromptUnavailable load/definition projection亦已实现（`SessionExecutorSnapshot`新增独立`prompt_available: bool`事实，readiness优先级固定为AgentUnavailable→workspace cause→selected prompt unavailable→PromptUnavailable→ModelUnavailable→Ready；Load与任何install新definition的publication在install前经`read_agent_definition`读exact retained Agent revision并复用`for_turn` selection阶段验证exact Agent+Session Prompt selection，missing/wrong role/duplicate resolved key→PromptUnavailable而非Workspace cause，Agent read的Closing→Load Closing、其余Agent read失败与owner/identity mismatch→internal路径，ReloadWorkspace保留当前事实）；shared-resource reload recovery/fanout亦已实现（`ReloadSharedResources`并行build candidates并预计算后经residency per-Session gate fan-out new Prompt/Model roots至全部loaded executors，非Idle合并单一pending availability composite在terminal/admission failure后应用，随后一次原子替换Runtime root pair并发布`shared_resources_reloaded`）；active-Turn graceful Unload亦已实现（`MiniCoreRuntimeConfig::with_unload_grace` default 30s/≤5min验证；public Unload经runtime publication gate与residency per-Session gate执行prepare→close→remove_exact，executor先同步关admission gate并经unbounded emergency lane接受`PrepareUnloadRequest`，grace内active admission/Turn自然完成，deadline到期对exact current emergency target signal `PrepareForUnload`（sticky first-wins，更早Cancel/SecurityRevoked保留原reason）并cancel其cancellation token、以`SessionUnloaded` settle pending Interaction、不直接drop task；Starting Submit在Input未live apply时经internal `SessionSubmitError::PrepareForUnload`公开映射`SessionNotLoaded`而非`SubmitCancelled`，Input先赢仍`TurnStarted`随后同一Turn `Interrupted(PrepareForUnload)`；registry shutdown先广播begin_prepare使grace并行再逐个await waiter再close；不新增queue_updated event，manifest保持139项）；RuntimeDependencyUnavailable/Preparing、security invalidation event与full recovery scenarios及完整cross-platform native matrix pending）
 
 ## 目的
 
@@ -422,7 +422,7 @@ pub struct SessionMetadataPatch {
 
 `ReloadSharedResources`对应`/reload`：Runtime完整build Prompt/Skill/Tool/Model candidates，validate所有required candidates，然后在短publication gate下原子替换current immutable objects；任一required candidate失败时保留全部old current values并返回`ReloadValidationFailed`，不发布`RuntimeReloaded`或`shared_resources_reloaded`。active/completed Turn不更新，future Turn捕获reload后的objects。
 
-`ReloadWorkspace`对应`/reload workspace`：作用于loaded Session的current Workspace state，不修改SessionDefinitionRevision。Session必须Idle；Runtime重新resolve current definition，并由PromptService/SkillService捕获candidate授权的Workspace-bound sources。Ready时成功则替换Snapshot及captured values，失败保留old Snapshot；Unavailable时成功发布new Snapshot并恢复Ready，失败保持Unavailable。失败返回`ReloadValidationFailed`且不发布`WorkspaceReloaded`或`session_workspace_reloaded`。Starting/Running/Finishing返回`SessionBusy`，不排队、不隐式Cancel、不原地替换active Turn Context。unloaded Session的Workspace在后续load时完成同一流程。
+`ReloadWorkspace`对应`/reload workspace`：只作用于loaded Session的current Workspace state，不修改SessionDefinitionRevision、metadata、conversation或Recorder。Session必须Idle且无active publication；Runtime经residency per-Session gate路由（loaded-only，不读取/更新DurableState），复用executor既有single active publication slot，worker重新resolve exact installed definition.workspace、由PromptService捕获Workspace-bound sources（Skill capture仍fail-closed为空）、required authority revalidation后finish exact WorkspaceSnapshot；成功原子替换Snapshot并发布Session-scope `session_workspace_reloaded`（detail null，Runtime scope不发事件），失败保留old Snapshot且不发布任何事件。Starting/Running/Finishing或已有active publication返回`SessionBusy`（不排队、不隐式Cancel、不原地替换active Turn Context）；unloaded Session返回`SessionNotLoaded`。resolver RootUnavailable/CanonicalizationFailed/AuthorityUnavailable或Prompt SourceDiscovery→`Unavailable`+RetryWithBackoff，AuthorityDenied→`Unauthorized`+UserActionRequired，RootNotDirectory/DuplicateRoot/OverlappingRoots/CwdOutsideRoots/CwdRootMismatch或Prompt ContentLoad/DuplicateKey→`ReloadValidationFailed`+UserActionRequired。Unavailable（WorkspaceUnavailable/PromptUnavailable）+ Idle的loaded Session同样接受reload：成功安装exact WorkspaceSnapshot并恢复Ready（发布同一`session_workspace_reloaded`），普通失败保持原Unavailable cause且不安装、不发事件。
 
 `SessionDefinitionPatch`原子修改Workspace、SessionModelConfig或SessionPromptSelection，并生成新的`SessionDefinitionRevision`。修改Agent reference必须走`UpgradeAgentRevision`。若patch改变Workspace且Session已loaded，只在`SessionExecutionState::Idle`接受；Starting/Running/Finishing返回typed `SessionBusy`，不排队、不隐式Cancel。Host需要显式`Cancel → wait session_settled → UpdateDefinition`。
 
@@ -681,7 +681,7 @@ pub enum CommandOutcome {
     SessionArchived,
     SessionUnarchived,
     SessionDeleted,
-    RuntimeReloaded,
+    SharedResourcesReloaded,
     WorkspaceReloaded,
     SessionForked {
         session_id: SessionId,
@@ -713,7 +713,7 @@ Command completion不是完整业务完成流：
 - Agent/Session create返回definition与metadata两个独立revision；definition、metadata、status/lifecycle mutation使用不同outcome，caller不能把metadata token误当execution revision；
 - metadata canonical no-op返回`NoChange`并保持原token，不发布metadata event；
 - `SessionForked.source`精确报告该Fork使用`LiveSnapshot`还是`RecordedHistory`；同一值保存在child durable provenance；
-- `SubmitCancelled`只表示用户Cancel在initiating UserMessage live apply前获胜；没有TurnId、UserMessage、TurnStarted或Turn terminal event。Input live apply先赢时原Submit仍返回`TurnStarted { turn_id }`，随后同一Turn按Cancel路径发布`TurnInterrupted`；SecurityRevoked、Unload或Runtime shutdown使用各自typed rejection，不伪装成SubmitCancelled；
+- `SubmitCancelled`只表示用户Cancel在initiating UserMessage live apply前获胜；没有TurnId、UserMessage、TurnStarted或Turn terminal event。Input live apply先赢时原Submit仍返回`TurnStarted { turn_id }`，随后同一Turn按Cancel路径发布`TurnInterrupted`；SecurityRevoked、Unload或Runtime shutdown使用各自typed rejection，不伪装成SubmitCancelled；graceful Unload的deadline在Input live apply前先赢时Starting Submit公开映射`SessionNotLoaded`（internal `PrepareForUnload`重分类），Input live apply先赢时仍`TurnStarted`并随后发布`TurnInterrupted(PrepareForUnload)`；
 - `TurnStarted`只表示initiating UserMessage已live apply并完成当前record attempt，领域Turn已在当前loaded Session创建；它不是durable Turn-start receipt；
 - Turn最终`Completed | Interrupted | Failed`由StateEvent发布；
 - `CancelAccepted`只表示target仍可取消且sticky cancel epoch已经发布。Input live apply前它使正在进行的capture/composition future失效并取消candidate；Input已apply但`TurnStarted`尚未发布时，它绑定同一Turn并阻止task spawn；active Turn中则与live Completed decision first-wins，accepted后Completed不得再赢。Tool清理和Turn terminal通过后续StateEvent/Snapshot观察；
@@ -733,7 +733,8 @@ Command completion不是完整业务完成流：
 | Update SessionDefinition（non-Workspace或unloaded Workspace） | new definition revision durable publication |
 | Update Session Metadata | expected SessionMetadataRevision/lifecycle CAS成功，返回new metadata revision或NoChange |
 | Update loaded Session Workspace | Idle校验、new revision durable publication和new WorkspaceSnapshot Ready publication全部完成 |
-| Reload shared Prompt/Skill/Tool/Model | required candidates全部validate，并在publication gate下替换current immutable objects；失败时old current values保持不变 |
+| Upgrade Agent Revision | exact same-Agent pinned new definition revision durable publication（target current解析与Enabled/retained校验只在DurableState `Agent → Session` gates内完成）；unloaded直接发布definition，loaded经executor既有publication slot原子安装exact definition并发布Runtime+Session `SessionDefinitionUpdated`事件；NoChange不发布 |
+| Reload shared Prompt/Model | Prompt/Model candidates全部validate并在shared-resource write gate下fan-out new roots至全部loaded executors后一次原子替换Runtime root pair；失败时old roots/executors保持不变且无事件 |
 | Load Session | single-flight load/recovery完成并发布readiness |
 | Reload Workspace | Session Idle校验、Workspace resolve和Workspace-bound Prompt/Skill source capture全部完成后替换Snapshot；非Idle返回SessionBusy |
 | Unload Session | LifecycleControl完成grace/fail-closed task settlement并从loaded map移除；Recorder无后台drain |
@@ -1965,7 +1966,7 @@ pub enum QueueUpdateReason {
 }
 ```
 
-M2/M11 State codec已materialize Runtime `command_catalog_invalidated | agent_created | agent_definition_updated | agent_metadata_updated | agent_status_changed | session_created | session_loaded | session_unloaded | session_archived | session_unarchived | session_deleted | session_forked`以及Session `session_execution_changed | turn_completed | turn_interrupted | turn_failed` + matching detail；Progress和Closed EventFrame亦已materialize全部typed payload并通过selected-V1 canonical round-trip。Session definition/metadata及Item/Interaction/queue StateEvent kinds继续返回known `PendingPublicTarget`。`SessionSnapshot`与Runtime `SessionChanged` summary上的Box只控制enum尺寸。
+M2/M11 State codec已materialize Runtime `command_catalog_invalidated | agent_created | agent_definition_updated | agent_metadata_updated | agent_status_changed | session_created | session_loaded | session_unloaded | session_definition_updated | session_metadata_updated | session_archived | session_unarchived | session_deleted | session_forked`以及Session `session_definition_updated | session_metadata_updated | session_execution_changed | turn_completed | turn_interrupted | turn_failed` + matching detail；Progress和Closed EventFrame亦已materialize全部typed payload并通过selected-V1 canonical round-trip。Item/Interaction/queue StateEvent kinds继续返回known `PendingPublicTarget`。`SessionSnapshot`与Runtime `SessionChanged` summary上的Box只控制enum尺寸。
 
 StateEvent本身始终是非durable observer record，不因payload来源不同而成为第二日志：
 
@@ -2034,7 +2035,7 @@ session_workspace_reloaded
 command_catalog_invalidated
 ```
 
-`shared_resources_reloaded`是Runtime-scope typed unit payload，表示Prompt/Skill/Tool/Model四个safe catalog都可能变化；它不携带revision/generation。`session_workspace_reloaded { session_id }`是Session-scope payload，表示new WorkspaceSnapshot及Workspace-bound Prompt/Skill captured sources已经一起发布；订阅者随后以new SessionSnapshot为准。
+`shared_resources_reloaded`是Runtime-scope typed unit payload（detail null），表示Prompt/Model两个已实现safe catalog可能变化（Tool/Skill shared roots reload仍pending）；它不携带revision/generation，snapshot为fan-out后的current projection。loaded Session的readiness变化由各自`session_readiness_changed`表达（仅真实变化时发布）。`session_workspace_reloaded { session_id }`是Session-scope payload，表示new WorkspaceSnapshot及Workspace-bound Prompt/Skill captured sources已经一起发布；订阅者随后以new SessionSnapshot为准。
 
 `session_recording_changed`只在loaded Session的公开recording state发生变化时发布。first failure执行`Healthy → Degraded`并在同一Snapshot publication中安装当前脱敏recording diagnostic。重复`record()`在Degraded下返回`NotRecorded`时不重复发布state event。
 
@@ -2278,7 +2279,7 @@ loaded SessionId → private SessionExecutionHandle
 - public command显式携带SessionId；
 - Runtime不保存selected/current Session；
 - load single-flight；
-- unload先设置`PrepareForUnload` lifecycle signal：停止admission、清理queued input，在有限grace期后fail-closed cancel，再移除loaded owner；
+- unload先设置`PrepareForUnload` lifecycle signal：同步关闭admission gate、清理queued Steer/FollowUp（无queue_updated event，queue只经subsequent snapshots/terminal event体现），在有限grace期（default 30s、≤5min）内让active admission/Turn自然完成，deadline到期后对exact current emergency target signal `PrepareForUnload`（sticky first-wins，更早Cancel/SecurityRevoked保留原reason）并fail-closed cancel且以`SessionUnloaded` settle pending Interaction，再移除loaded owner；grace期内Submit公开映射`SessionNotLoaded`（registry本身closing才映射`RuntimeClosing`）；
 - SessionDefinition update使用expected revision；
 - active Turn继续pin旧definition；future Turn使用新revision；
 - archive/delete与load/admission按lifecycle规则线性化。
@@ -2639,7 +2640,7 @@ Public interface是 contract test surface。
 - Cancel清理current Turn Steer但保留FollowUp，Finishing期间新FollowUp仍可Queued；
 - CancelAccepted后execution snapshot/event进入Finishing，最终TurnInterrupted另行发布；
 - stale Cancel TurnId不取消新的active Turn；
-- Unload grace deadline到期后Cancel active Turn并以Cancelled关闭Interaction；
+- Unload grace deadline到期后signal `PrepareForUnload`并Cancel active Turn，以`SessionUnloaded`关闭Interaction（更早Cancel/SecurityRevoked first-wins保留原reason：`TurnCancelled`/`SecurityRevoked`）；
 - Interaction长时间无回答或subscriber断开时保持Pending，不产生默认Deny；
 - Interaction first live terminal resolution wins；same key/same canonical payload幂等且无第二record/event，same key/different payload为CommandConflict，different key after terminal为InteractionAlreadyResolved；
 - Tool approval只接受exact request option index或Deny；unknown index/cross-request reuse拒绝，restricted option不能扩大PermissionSet；

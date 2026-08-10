@@ -1,0 +1,1 @@
+{"commandId":"cmd_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","command":{"type":"session","data":{"type":"update_metadata","data":{"sessionId":"ses_22222222222222222222222222222222","expectedRevision":"smr_2","patch":{"name":{"type":"keep"},"description":{"type":"clear"}}}}}}

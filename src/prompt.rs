@@ -220,6 +220,10 @@ pub(crate) enum PromptErrorKind {
     InvalidIntent,
     InvalidContribution,
     ContextLimitExceeded,
+    /// An internal invariant, never an ordinary availability or validation outcome.  The
+    /// selection-availability seam uses this kind for an owner mismatch so the caller can
+    /// distinguish an internal invariant from an ordinary `PromptUnavailable`.
+    Internal,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -678,6 +682,43 @@ impl PromptService {
             );
         }
         Ok(captured.into())
+    }
+
+    /// Verifies one exact Agent+Session Prompt selection against the given resource view for the
+    /// `for_turn` selection stage only: `Ok(true)` means every selected Prompt resolves with the
+    /// exact expected role/provenance and no duplicate resolved key.  The three ordinary
+    /// selection failures (missing Prompt, wrong role, duplicate resolved key) degrade to
+    /// `Ok(false)`; an owner mismatch or any other Prompt failure is an internal invariant that
+    /// the caller must surface through its existing fatal/internal path, never as a fabricated
+    /// `PromptUnavailable`.  It deliberately reuses `resolve_selected_definitions` and exposes no
+    /// definitions.
+    pub(crate) fn selection_available(
+        &self,
+        resources: &PromptResourceView,
+        agent_prompts: &AgentPromptSelection,
+        session_prompts: &SessionPromptSelection,
+    ) -> Result<bool, PromptError> {
+        if !Arc::ptr_eq(&self.owner, &resources.owner) {
+            return Err(PromptError::new(PromptErrorKind::Internal));
+        }
+        match resolve_selected_definitions(
+            resources,
+            agent_prompts.enabled(),
+            PromptRole::System,
+            true,
+        ) {
+            Ok(_) => {}
+            Err(error) => return selection_availability(error),
+        }
+        match resolve_selected_definitions(
+            resources,
+            session_prompts.enabled(),
+            PromptRole::User,
+            false,
+        ) {
+            Ok(_) => Ok(true),
+            Err(error) => selection_availability(error),
+        }
     }
 
     pub(crate) fn for_turn(
@@ -1716,6 +1757,24 @@ fn resolve_selected_definitions(
         return Err(PromptError::new(PromptErrorKind::DuplicateKey));
     }
     Ok(definitions)
+}
+
+/// Classifies one selection-stage resolution failure for the selection-availability seam: the
+/// three ordinary selection failures degrade to `Ok(false)`; every other kind (which the
+/// selection stage cannot produce on an installed view) is an internal invariant.
+fn selection_availability(error: PromptError) -> Result<bool, PromptError> {
+    match error.kind() {
+        PromptErrorKind::PromptUnavailable
+        | PromptErrorKind::InvalidRole
+        | PromptErrorKind::DuplicateKey => Ok(false),
+        PromptErrorKind::SourceDiscovery
+        | PromptErrorKind::ContentLoad
+        | PromptErrorKind::RequiredPromptMissing
+        | PromptErrorKind::InvalidIntent
+        | PromptErrorKind::InvalidContribution
+        | PromptErrorKind::ContextLimitExceeded
+        | PromptErrorKind::Internal => Err(error),
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]

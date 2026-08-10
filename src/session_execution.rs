@@ -5,7 +5,8 @@
 
 //! The crate-private loaded Session execution seam.
 //!
-//! This module deliberately stops at one already-loaded, Ready+Idle Session. It retains the
+//! This module deliberately stops at one already-loaded, Idle Session (Ready or Unavailable).
+//! It retains the
 //! replay-seeded live state and inline Recorder supplied by residency, but owns neither Runtime
 //! residency nor the public Runtime facade. The Runtime-owned residency registry that starts an
 //! executor retains its permit (and excludes lifecycle/load changes) for as long as the loaded
@@ -20,8 +21,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_session_lifecycle::{
-    ForkAnchor, SealedSessionDefinitionAttempt, SessionDefinition, SessionDefinitionDecision,
-    SessionDefinitionDecisionError, SessionLifecycle,
+    AgentRevisionRef, ForkAnchor, SealedSessionAgentUpgradeAttempt, SealedSessionDefinitionAttempt,
+    SessionDefinition, SessionDefinitionDecision, SessionDefinitionDecisionError, SessionLifecycle,
+    SessionMetadata, SessionModelConfig,
 };
 use crate::compaction::{
     Compaction, CompactionPlan, CompactionPressure, CompactionSettings, CompactionSettingsSnapshot,
@@ -34,7 +36,8 @@ use crate::conversation_storage::{
     StoredUserMessage,
 };
 use crate::durable_state::{
-    AgentAdmissionError, DurableAgentDefinitionReadError, DurableSessionDefinitionError,
+    AgentAdmissionError, DurableAgentDefinitionReadError, DurableSessionAgentUpgradeError,
+    DurableSessionAgentUpgradeOutcome, DurableSessionDefinitionError,
     DurableSessionDefinitionOutcome, DurableState,
 };
 use crate::live_conversation::{
@@ -45,15 +48,17 @@ use crate::live_conversation::{
 use crate::model_gateway::{
     FinalizedAssistantContent, ModelCallError, ModelCallErrorReason, ModelCallPurpose,
     ModelCallRequest, ModelCallResult, ModelCatalogView, ModelGateway, ModelProgressPublisher,
-    ModelRequestValidationErrorKind, ModelUsage, ProviderRequestDeliveryState,
+    ModelRequestValidationErrorKind, ModelResolutionError, ModelResolutionErrorKind, ModelUsage,
+    ProviderRequestDeliveryState, ResolveTurnModelRequest,
 };
 use crate::prompt::{
     PromptError, PromptErrorKind, PromptIntent, PromptResourceView, PromptService,
+    SessionPromptSelection,
 };
 use crate::runtime_interface::{
     CurrentTurnView, InteractionView, ItemContentView, ItemStatusView, ItemView,
-    SessionDiagnosticView, SessionRecordingState, SessionUsageView, TurnExecutionPhaseView,
-    TurnStatusView,
+    SessionDiagnosticView, SessionReadinessView, SessionRecordingState, SessionUnavailableView,
+    SessionUsageView, TurnExecutionPhaseView, TurnStatusView,
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, RuntimeTaskError, SystemClock, TrackedTask};
 use crate::session_ingress::{
@@ -114,6 +119,7 @@ pub(crate) enum SessionTurnFailure {
 pub(crate) enum SessionTurnInterruption {
     UserCancelled,
     SecurityRevoked,
+    PrepareForUnload,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,6 +135,26 @@ pub(crate) enum SessionExecutorEvent {
         timestamp: Timestamp,
         snapshot: Arc<SessionExecutorSnapshot>,
     },
+    DefinitionUpdated {
+        timestamp: Timestamp,
+        command_id: CommandId,
+        snapshot: Arc<SessionExecutorSnapshot>,
+    },
+    MetadataUpdated {
+        timestamp: Timestamp,
+        command_id: CommandId,
+        snapshot: Arc<SessionExecutorSnapshot>,
+    },
+    WorkspaceReloaded {
+        timestamp: Timestamp,
+        command_id: CommandId,
+        snapshot: Arc<SessionExecutorSnapshot>,
+    },
+    ReadinessChanged {
+        timestamp: Timestamp,
+        command_id: CommandId,
+        snapshot: Arc<SessionExecutorSnapshot>,
+    },
     TurnTerminal {
         timestamp: Timestamp,
         command_id: CommandId,
@@ -141,38 +167,56 @@ pub(crate) enum SessionExecutorEvent {
 impl SessionExecutorEvent {
     pub(crate) const fn timestamp(&self) -> Timestamp {
         match self {
-            Self::ExecutionChanged { timestamp, .. } | Self::TurnTerminal { timestamp, .. } => {
-                *timestamp
-            }
+            Self::ExecutionChanged { timestamp, .. }
+            | Self::DefinitionUpdated { timestamp, .. }
+            | Self::MetadataUpdated { timestamp, .. }
+            | Self::WorkspaceReloaded { timestamp, .. }
+            | Self::ReadinessChanged { timestamp, .. }
+            | Self::TurnTerminal { timestamp, .. } => *timestamp,
         }
     }
 
     pub(crate) const fn command_id(&self) -> Option<CommandId> {
         match self {
             Self::ExecutionChanged { .. } => None,
-            Self::TurnTerminal { command_id, .. } => Some(*command_id),
+            Self::DefinitionUpdated { command_id, .. }
+            | Self::MetadataUpdated { command_id, .. }
+            | Self::WorkspaceReloaded { command_id, .. }
+            | Self::ReadinessChanged { command_id, .. }
+            | Self::TurnTerminal { command_id, .. } => Some(*command_id),
         }
     }
 
     pub(crate) const fn turn_id(&self) -> Option<TurnId> {
         match self {
-            Self::ExecutionChanged { .. } => None,
+            Self::ExecutionChanged { .. }
+            | Self::DefinitionUpdated { .. }
+            | Self::MetadataUpdated { .. }
+            | Self::WorkspaceReloaded { .. }
+            | Self::ReadinessChanged { .. } => None,
             Self::TurnTerminal { turn_id, .. } => Some(*turn_id),
         }
     }
 
     pub(crate) const fn terminal(&self) -> Option<SessionTurnTerminal> {
         match self {
-            Self::ExecutionChanged { .. } => None,
+            Self::ExecutionChanged { .. }
+            | Self::DefinitionUpdated { .. }
+            | Self::MetadataUpdated { .. }
+            | Self::WorkspaceReloaded { .. }
+            | Self::ReadinessChanged { .. } => None,
             Self::TurnTerminal { terminal, .. } => Some(*terminal),
         }
     }
 
     pub(crate) const fn snapshot(&self) -> &Arc<SessionExecutorSnapshot> {
         match self {
-            Self::ExecutionChanged { snapshot, .. } | Self::TurnTerminal { snapshot, .. } => {
-                snapshot
-            }
+            Self::ExecutionChanged { snapshot, .. }
+            | Self::DefinitionUpdated { snapshot, .. }
+            | Self::MetadataUpdated { snapshot, .. }
+            | Self::WorkspaceReloaded { snapshot, .. }
+            | Self::ReadinessChanged { snapshot, .. }
+            | Self::TurnTerminal { snapshot, .. } => snapshot,
         }
     }
 }
@@ -201,10 +245,17 @@ impl SessionExecutionState {
 /// A small immutable, coherent loaded Session read model.
 ///
 /// It intentionally exposes no live conversation, turn, model, tool, recorder, or event state.
+/// The installed Session metadata is part of this immutable observation state so every executor
+/// event carries the exact metadata of its moment instead of re-reading durable state later.
 #[derive(Clone)]
 pub(crate) struct SessionExecutorSnapshot {
     definition: Arc<SessionDefinition>,
-    workspace: Arc<WorkspaceSnapshot>,
+    agent_available: bool,
+    model_available: bool,
+    prompt_available: bool,
+    workspace_unavailable: Option<SessionUnavailableView>,
+    workspace: Option<Arc<WorkspaceSnapshot>>,
+    metadata: Arc<SessionMetadata>,
     execution_state: SessionExecutionState,
     current_turn: Option<TurnId>,
     current_turn_view: Option<CurrentTurnView>,
@@ -223,12 +274,22 @@ pub(crate) struct SessionExecutorSnapshot {
 impl SessionExecutorSnapshot {
     fn new(
         definition: Arc<SessionDefinition>,
-        workspace: Arc<WorkspaceSnapshot>,
+        agent_available: bool,
+        model_available: bool,
+        prompt_available: bool,
+        workspace_unavailable: Option<SessionUnavailableView>,
+        workspace: Option<Arc<WorkspaceSnapshot>>,
+        metadata: Arc<SessionMetadata>,
         execution_state: SessionExecutionState,
     ) -> Self {
         Self {
             definition,
+            agent_available,
+            model_available,
+            prompt_available,
+            workspace_unavailable,
             workspace,
+            metadata,
             execution_state,
             current_turn: None,
             current_turn_view: None,
@@ -245,6 +306,104 @@ impl SessionExecutorSnapshot {
         }
     }
 
+    fn with_metadata(&self, metadata: Arc<SessionMetadata>) -> Self {
+        Self {
+            definition: Arc::clone(&self.definition),
+            agent_available: self.agent_available,
+            model_available: self.model_available,
+            prompt_available: self.prompt_available,
+            workspace_unavailable: self.workspace_unavailable,
+            workspace: self.workspace.clone(),
+            metadata,
+            execution_state: self.execution_state,
+            current_turn: self.current_turn,
+            current_turn_view: self.current_turn_view,
+            active_items: Arc::clone(&self.active_items),
+            public_pending_interactions: Arc::clone(&self.public_pending_interactions),
+            usage: self.usage.clone(),
+            recording: self.recording,
+            diagnostics: Arc::clone(&self.diagnostics),
+            last_terminal: self.last_terminal,
+            pending_interactions: Arc::clone(&self.pending_interactions),
+            active_submit_command_id: self.active_submit_command_id,
+            follow_up_command_ids: Arc::clone(&self.follow_up_command_ids),
+            steer_command_ids: Arc::clone(&self.steer_command_ids),
+        }
+    }
+
+    /// Installs a brand-new WorkspaceSnapshot alongside a new definition and clears only the
+    /// workspace Unavailable cause while installing the new definition's own model and
+    /// selected-Prompt availability facts.  This is the ordinary true-Workspace definition
+    /// publication and the ReloadWorkspace recovery path; it keeps every immutable observation
+    /// fact and rebuilds nothing.  A disabled Agent stays AgentUnavailable until it is
+    /// re-enabled, and a model or selected Prompt that cannot serve a Turn stays
+    /// ModelUnavailable/PromptUnavailable until a definition publication restores it.
+    fn with_definition_and_workspace(
+        &self,
+        definition: Arc<SessionDefinition>,
+        workspace: Arc<WorkspaceSnapshot>,
+        model_available: bool,
+        prompt_available: bool,
+    ) -> Self {
+        Self {
+            definition,
+            agent_available: self.agent_available,
+            model_available,
+            prompt_available,
+            workspace_unavailable: None,
+            workspace: Some(workspace),
+            metadata: Arc::clone(&self.metadata),
+            execution_state: self.execution_state,
+            current_turn: self.current_turn,
+            current_turn_view: self.current_turn_view,
+            active_items: Arc::clone(&self.active_items),
+            public_pending_interactions: Arc::clone(&self.public_pending_interactions),
+            usage: self.usage.clone(),
+            recording: self.recording,
+            diagnostics: Arc::clone(&self.diagnostics),
+            last_terminal: self.last_terminal,
+            pending_interactions: Arc::clone(&self.pending_interactions),
+            active_submit_command_id: self.active_submit_command_id,
+            follow_up_command_ids: Arc::clone(&self.follow_up_command_ids),
+            steer_command_ids: Arc::clone(&self.steer_command_ids),
+        }
+    }
+
+    /// Installs a new definition while preserving the exact current optional WorkspaceSnapshot
+    /// and workspace readiness, installing the new definition's own model and selected-Prompt
+    /// availability facts.  This is the future-only Model/Prompt replacement and the Agent
+    /// revision upgrade; an Unavailable Session stays Unavailable with no Workspace unless the
+    /// new model/Prompt facts restore it.
+    fn with_definition(
+        &self,
+        definition: Arc<SessionDefinition>,
+        model_available: bool,
+        prompt_available: bool,
+    ) -> Self {
+        Self {
+            definition,
+            agent_available: self.agent_available,
+            model_available,
+            prompt_available,
+            workspace_unavailable: self.workspace_unavailable,
+            workspace: self.workspace.clone(),
+            metadata: Arc::clone(&self.metadata),
+            execution_state: self.execution_state,
+            current_turn: self.current_turn,
+            current_turn_view: self.current_turn_view,
+            active_items: Arc::clone(&self.active_items),
+            public_pending_interactions: Arc::clone(&self.public_pending_interactions),
+            usage: self.usage.clone(),
+            recording: self.recording,
+            diagnostics: Arc::clone(&self.diagnostics),
+            last_terminal: self.last_terminal,
+            pending_interactions: Arc::clone(&self.pending_interactions),
+            active_submit_command_id: self.active_submit_command_id,
+            follow_up_command_ids: Arc::clone(&self.follow_up_command_ids),
+            steer_command_ids: Arc::clone(&self.steer_command_ids),
+        }
+    }
+
     fn with_execution(
         &self,
         execution_state: SessionExecutionState,
@@ -253,7 +412,12 @@ impl SessionExecutorSnapshot {
     ) -> Self {
         Self {
             definition: Arc::clone(&self.definition),
-            workspace: Arc::clone(&self.workspace),
+            agent_available: self.agent_available,
+            model_available: self.model_available,
+            prompt_available: self.prompt_available,
+            workspace_unavailable: self.workspace_unavailable,
+            workspace: self.workspace.clone(),
+            metadata: Arc::clone(&self.metadata),
             execution_state,
             current_turn,
             current_turn_view: self.current_turn_view,
@@ -276,7 +440,12 @@ impl SessionExecutorSnapshot {
     ) -> Self {
         Self {
             definition: Arc::clone(&self.definition),
-            workspace: Arc::clone(&self.workspace),
+            agent_available: self.agent_available,
+            model_available: self.model_available,
+            prompt_available: self.prompt_available,
+            workspace_unavailable: self.workspace_unavailable,
+            workspace: self.workspace.clone(),
+            metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
             current_turn_view: self.current_turn_view,
@@ -301,7 +470,12 @@ impl SessionExecutorSnapshot {
     ) -> Self {
         Self {
             definition: Arc::clone(&self.definition),
-            workspace: Arc::clone(&self.workspace),
+            agent_available: self.agent_available,
+            model_available: self.model_available,
+            prompt_available: self.prompt_available,
+            workspace_unavailable: self.workspace_unavailable,
+            workspace: self.workspace.clone(),
+            metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
             current_turn_view: self.current_turn_view,
@@ -326,7 +500,12 @@ impl SessionExecutorSnapshot {
     ) -> Self {
         Self {
             definition: Arc::clone(&self.definition),
-            workspace: Arc::clone(&self.workspace),
+            agent_available: self.agent_available,
+            model_available: self.model_available,
+            prompt_available: self.prompt_available,
+            workspace_unavailable: self.workspace_unavailable,
+            workspace: self.workspace.clone(),
+            metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
             current_turn_view,
@@ -351,7 +530,12 @@ impl SessionExecutorSnapshot {
     ) -> Self {
         Self {
             definition: Arc::clone(&self.definition),
-            workspace: Arc::clone(&self.workspace),
+            agent_available: self.agent_available,
+            model_available: self.model_available,
+            prompt_available: self.prompt_available,
+            workspace_unavailable: self.workspace_unavailable,
+            workspace: self.workspace.clone(),
+            metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
             current_turn_view: self.current_turn_view,
@@ -368,16 +552,132 @@ impl SessionExecutorSnapshot {
         }
     }
 
+    /// Applies one Agent availability fact while preserving the optional WorkspaceSnapshot and
+    /// every other immutable observation fact.  Enable restores the underlying workspace cause
+    /// or model fact; Disable only ever produces AgentUnavailable and never drops a last-good
+    /// WorkspaceSnapshot.
+    fn with_agent_availability(&self, agent_available: bool) -> Self {
+        Self {
+            definition: Arc::clone(&self.definition),
+            agent_available,
+            model_available: self.model_available,
+            prompt_available: self.prompt_available,
+            workspace_unavailable: self.workspace_unavailable,
+            workspace: self.workspace.clone(),
+            metadata: Arc::clone(&self.metadata),
+            execution_state: self.execution_state,
+            current_turn: self.current_turn,
+            current_turn_view: self.current_turn_view,
+            active_items: Arc::clone(&self.active_items),
+            public_pending_interactions: Arc::clone(&self.public_pending_interactions),
+            usage: self.usage.clone(),
+            recording: self.recording,
+            diagnostics: Arc::clone(&self.diagnostics),
+            last_terminal: self.last_terminal,
+            pending_interactions: Arc::clone(&self.pending_interactions),
+            active_submit_command_id: self.active_submit_command_id,
+            follow_up_command_ids: Arc::clone(&self.follow_up_command_ids),
+            steer_command_ids: Arc::clone(&self.steer_command_ids),
+        }
+    }
+
+    /// Applies the three intended availability facts together while preserving the optional
+    /// WorkspaceSnapshot and every other immutable observation fact.  This is the minimal
+    /// combined update used by a Runtime shared-resource reload fan-out: the Agent fact stays
+    /// the current installed value, while the precomputed model and selected-Prompt facts of the
+    /// exact installed definition against the candidate resources replace the current values.
+    fn with_combined_availability(
+        &self,
+        agent_available: bool,
+        model_available: bool,
+        prompt_available: bool,
+    ) -> Self {
+        Self {
+            definition: Arc::clone(&self.definition),
+            agent_available,
+            model_available,
+            prompt_available,
+            workspace_unavailable: self.workspace_unavailable,
+            workspace: self.workspace.clone(),
+            metadata: Arc::clone(&self.metadata),
+            execution_state: self.execution_state,
+            current_turn: self.current_turn,
+            current_turn_view: self.current_turn_view,
+            active_items: Arc::clone(&self.active_items),
+            public_pending_interactions: Arc::clone(&self.public_pending_interactions),
+            usage: self.usage.clone(),
+            recording: self.recording,
+            diagnostics: Arc::clone(&self.diagnostics),
+            last_terminal: self.last_terminal,
+            pending_interactions: Arc::clone(&self.pending_interactions),
+            active_submit_command_id: self.active_submit_command_id,
+            follow_up_command_ids: Arc::clone(&self.follow_up_command_ids),
+            steer_command_ids: Arc::clone(&self.steer_command_ids),
+        }
+    }
+
     pub(crate) fn definition(&self) -> &Arc<SessionDefinition> {
         &self.definition
     }
 
+    /// Ready-invariant Workspace accessor.  A Ready snapshot always carries its exact
+    /// WorkspaceSnapshot; callers under the Ready invariant only use this getter, while
+    /// production branches that must run for Unavailable Sessions use `workspace_optional`.
     pub(crate) fn workspace(&self) -> &Arc<WorkspaceSnapshot> {
-        &self.workspace
+        self.workspace
+            .as_ref()
+            .expect("a Ready Session snapshot always carries its WorkspaceSnapshot")
     }
 
+    pub(crate) fn workspace_optional(&self) -> Option<&Arc<WorkspaceSnapshot>> {
+        self.workspace.as_ref()
+    }
+
+    pub(crate) fn metadata(&self) -> &Arc<SessionMetadata> {
+        &self.metadata
+    }
+
+    /// The installed model availability fact for the exact installed definition: whether the
+    /// current Runtime-owned catalog can resolve this definition's model for a Turn.
+    pub(crate) const fn model_available(&self) -> bool {
+        self.model_available
+    }
+
+    /// The installed selected-Prompt availability fact for the exact installed definition:
+    /// whether the current Runtime-owned Prompt resources can resolve this definition's exact
+    /// Agent+Session Prompt selection for the `for_turn` selection stage.
+    pub(crate) const fn prompt_available(&self) -> bool {
+        self.prompt_available
+    }
+
+    /// The single public readiness projection derived from the four internal facts: a disabled
+    /// Agent always wins with AgentUnavailable, then the current workspace Unavailable cause
+    /// (including a workspace-source PromptUnavailable), then an unavailable selected Prompt,
+    /// then an unavailable model, then Ready.  Every mutation preserves the internal facts so
+    /// this projection can never diverge from them.
+    pub(crate) const fn readiness(&self) -> SessionReadinessView {
+        if !self.agent_available {
+            SessionReadinessView::Unavailable(SessionUnavailableView::AgentUnavailable)
+        } else {
+            match self.workspace_unavailable {
+                Some(cause) => SessionReadinessView::Unavailable(cause),
+                None => {
+                    if !self.prompt_available {
+                        SessionReadinessView::Unavailable(SessionUnavailableView::PromptUnavailable)
+                    } else if !self.model_available {
+                        SessionReadinessView::Unavailable(SessionUnavailableView::ModelUnavailable)
+                    } else {
+                        SessionReadinessView::Ready
+                    }
+                }
+            }
+        }
+    }
+
+    /// The durable definition Workspace revision, which is authoritative for both Ready and
+    /// Unavailable Sessions; it avoids propagating the optional WorkspaceSnapshot.
     pub(crate) fn workspace_revision(&self) -> WorkspaceRevision {
-        self.workspace.revision()
+        self.definition.workspace().revision()
     }
 
     pub(crate) fn definition_revision(&self) -> SessionDefinitionRevision {
@@ -444,7 +744,15 @@ impl fmt::Debug for SessionExecutorSnapshot {
         formatter
             .debug_struct("SessionExecutorSnapshot")
             .field("session_definition_revision", &self.definition.revision())
-            .field("workspace_revision", &self.workspace.revision())
+            .field("readiness", &self.readiness())
+            .field("agent_available", &self.agent_available)
+            .field("model_available", &self.model_available)
+            .field("prompt_available", &self.prompt_available)
+            .field(
+                "workspace_revision",
+                &self.workspace.as_ref().map(|workspace| workspace.revision()),
+            )
+            .field("metadata_revision", &self.metadata.revision())
             .field("execution_state", &self.execution_state)
             .field("current_turn", &self.current_turn)
             .field("current_turn_view", &self.current_turn_view)
@@ -468,9 +776,94 @@ impl fmt::Debug for SessionExecutorSnapshot {
     }
 }
 
-/// The closed result of one Workspace definition CAS.
+/// Resolves one Session definition's model against an installed Runtime-owned catalog through
+/// the exact Turn model resolution seam.  `Ok(true)` means a Turn can be served; the three
+/// ordinary model incompatibilities (selection, reasoning, output limit) mean `Ok(false)`;
+/// every other resolution failure on an installed Runtime-owned catalog is an internal
+/// invariant that the caller must surface through its existing fatal/internal path, never as a
+/// fabricated ModelUnavailable.
+pub(crate) fn model_available_for_definition(
+    model_gateway: &ModelGateway,
+    model_catalog: Arc<ModelCatalogView>,
+    definition: &SessionDefinition,
+) -> Result<bool, ModelResolutionError> {
+    let model = definition.model();
+    let request = ResolveTurnModelRequest::new(
+        model.selection().clone(),
+        model.reasoning(),
+        model.max_output_tokens(),
+    );
+    match model_gateway.resolve_for_turn(model_catalog, request) {
+        Ok(_) => Ok(true),
+        Err(error) => match error.kind() {
+            ModelResolutionErrorKind::ModelUnavailable
+            | ModelResolutionErrorKind::UnsupportedReasoning
+            | ModelResolutionErrorKind::InvalidOutputLimit => Ok(false),
+            ModelResolutionErrorKind::CatalogUnavailable
+            | ModelResolutionErrorKind::SourceUnavailable
+            | ModelResolutionErrorKind::InvalidDefinition => Err(error),
+        },
+    }
+}
+
+/// The closed result of one selected-Prompt availability check for an exact Session definition
+/// against the installed Runtime-owned Prompt resources.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionPromptAvailabilityError {
+    #[error("session executor is closing")]
+    Closing,
+    #[error("session executor dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+/// Resolves one Session definition's selected Agent+Session Prompt selection against the
+/// installed Runtime-owned Prompt resources through the exact `for_turn` selection stage.
+/// `Ok(true)` means a Turn can serve this selection; the three ordinary selection failures
+/// (missing Prompt, wrong role, duplicate resolved key) mean `Ok(false)`; every other failure
+/// on an installed Runtime-owned Prompt view is an internal invariant that the caller must
+/// surface through its existing fatal/internal path, never as a fabricated PromptUnavailable.
+/// The exact retained Agent revision is read (never the current), and the returned Agent
+/// identity/revision must match the definition pin exactly.
+pub(crate) async fn prompt_available_for_definition(
+    durable_state: DurableState,
+    prompt_service: Arc<PromptService>,
+    prompt_resources: Arc<PromptResourceView>,
+    definition: &SessionDefinition,
+) -> Result<bool, SessionPromptAvailabilityError> {
+    let agent = durable_state
+        .read_agent_definition(definition.agent())
+        .await
+        .map_err(map_agent_definition_read_to_prompt_availability)?;
+    if agent.agent_id() != definition.agent().agent_id()
+        || agent.revision() != definition.agent().revision()
+    {
+        return Err(SessionPromptAvailabilityError::InternalDispatchUnavailable);
+    }
+    prompt_service
+        .selection_available(&prompt_resources, agent.prompts(), definition.prompts())
+        .map_err(|_| SessionPromptAvailabilityError::InternalDispatchUnavailable)
+}
+
+fn map_agent_definition_read_to_prompt_availability(
+    error: DurableAgentDefinitionReadError,
+) -> SessionPromptAvailabilityError {
+    match error {
+        DurableAgentDefinitionReadError::Closing => SessionPromptAvailabilityError::Closing,
+        DurableAgentDefinitionReadError::AgentNotFound
+        | DurableAgentDefinitionReadError::RevisionUnavailable
+        | DurableAgentDefinitionReadError::StorageUnavailable
+        | DurableAgentDefinitionReadError::InternalDispatchUnavailable => {
+            SessionPromptAvailabilityError::InternalDispatchUnavailable
+        }
+    }
+}
+
+/// The closed result of one Session definition publication CAS (ordinary definition replacement,
+/// explicit Agent revision upgrade, or Workspace reload).  The name is deliberately general; the
+/// old Workspace-specific names remain as crate-private type aliases for the ordinary definition
+/// seam.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SessionWorkspaceDefinitionOutcome {
+pub(crate) enum SessionDefinitionPublicationOutcome {
     NoChange {
         definition_revision: SessionDefinitionRevision,
         workspace_revision: WorkspaceRevision,
@@ -479,9 +872,16 @@ pub(crate) enum SessionWorkspaceDefinitionOutcome {
         definition_revision: SessionDefinitionRevision,
         workspace_revision: WorkspaceRevision,
     },
+    Reloaded {
+        definition_revision: SessionDefinitionRevision,
+        workspace_revision: WorkspaceRevision,
+    },
 }
 
-impl SessionWorkspaceDefinitionOutcome {
+/// Backward-compatible alias for the ordinary loaded Workspace definition seam.
+pub(crate) type SessionWorkspaceDefinitionOutcome = SessionDefinitionPublicationOutcome;
+
+impl SessionDefinitionPublicationOutcome {
     pub(crate) const fn definition_revision(self) -> SessionDefinitionRevision {
         match self {
             Self::NoChange {
@@ -489,6 +889,10 @@ impl SessionWorkspaceDefinitionOutcome {
                 ..
             }
             | Self::Updated {
+                definition_revision,
+                ..
+            }
+            | Self::Reloaded {
                 definition_revision,
                 ..
             } => definition_revision,
@@ -502,18 +906,24 @@ impl SessionWorkspaceDefinitionOutcome {
             }
             | Self::Updated {
                 workspace_revision, ..
+            }
+            | Self::Reloaded {
+                workspace_revision, ..
             } => workspace_revision,
         }
     }
 
     pub(crate) const fn changed(self) -> bool {
-        matches!(self, Self::Updated { .. })
+        matches!(self, Self::Updated { .. } | Self::Reloaded { .. })
     }
 }
 
-/// Redacted failures for the loaded Workspace definition interface.
+/// Redacted failures for one loaded Session definition publication (ordinary definition
+/// replacement or explicit Agent revision upgrade). The Agent-specific failures are impossible
+/// on the ordinary definition path and the Workspace-specific failures are impossible on the
+/// Agent upgrade path; each caller maps its impossible executor failures as internal poison.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub(crate) enum SessionWorkspaceDefinitionError {
+pub(crate) enum SessionDefinitionPublicationError {
     #[error("session executor is closing")]
     Closing,
     #[error("session execution is busy")]
@@ -526,23 +936,63 @@ pub(crate) enum SessionWorkspaceDefinitionError {
     SessionArchived,
     #[error("Session is deleted")]
     SessionDeleted,
-    #[error("Session definition revision is exhausted")]
-    RevisionExhausted,
+    #[error("Session upgrade targets another Agent")]
+    AgentMismatch,
+    #[error("Agent is disabled")]
+    AgentDisabled,
+    #[error("Agent is deleted")]
+    AgentDeleted,
+    #[error("Agent revision is unavailable")]
+    RevisionUnavailable,
     #[error("durable state exceeds its selected size limit")]
     StateTooLarge,
     #[error("workspace is unavailable")]
     WorkspaceUnavailable,
     #[error("workspace candidate was rejected")]
     WorkspaceRejected,
+    #[error("workspace authority was denied")]
+    Unauthorized,
     #[error("durable storage is unavailable")]
     StorageUnavailable,
     #[error("session executor dispatch is unavailable")]
     InternalDispatchUnavailable,
 }
 
+/// Backward-compatible alias for the ordinary loaded Workspace definition seam.
+pub(crate) type SessionWorkspaceDefinitionError = SessionDefinitionPublicationError;
+
 /// Redacted failures for the immutable snapshot request.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SessionExecutorSnapshotError {
+    #[error("session executor is closing")]
+    Closing,
+    #[error("session executor dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+/// Redacted failures for the loaded Session metadata publication.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionMetadataPublishError {
+    #[error("session executor is closing")]
+    Closing,
+    #[error("session executor dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+/// Redacted failures for one Agent availability fact application.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionAgentAvailabilityError {
+    #[error("session executor is closing")]
+    Closing,
+    #[error("session executor dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+/// Redacted failures for one Runtime shared-resource installation on a loaded Session.  The
+/// installation never touches DurableState; it replaces only the Prompt/Model roots inside the
+/// executor's future `TurnResources` and applies the precomputed availability facts.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionSharedResourceUpdateError {
     #[error("session executor is closing")]
     Closing,
     #[error("session executor dispatch is unavailable")]
@@ -638,6 +1088,15 @@ pub(crate) enum SessionExecutorCloseError {
     InternalDispatchUnavailable,
 }
 
+/// Redacted failures from preparing one loaded Session executor for graceful Unload.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionExecutorPrepareUnloadError {
+    #[error("session executor is closing")]
+    Closing,
+    #[error("session executor dispatch is unavailable")]
+    Internal,
+}
+
 /// Redacted failures from executor construction.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SessionExecutorStartError {
@@ -659,6 +1118,8 @@ pub(crate) enum SessionSubmitError {
     CommandConflict,
     #[error("session execution is busy")]
     SessionBusy,
+    #[error("Session is not ready to accept Turns: {0:?}")]
+    SessionNotReady(SessionUnavailableView),
     #[error("loaded session execution dependencies are unavailable")]
     DependencyUnavailable,
     #[error("agent is unavailable for execution")]
@@ -673,6 +1134,8 @@ pub(crate) enum SessionSubmitError {
     Cancelled,
     #[error("Session authority was revoked before Turn start")]
     SecurityRevoked,
+    #[error("the Session is preparing for unload")]
+    PrepareForUnload,
     #[error("session turn dispatch is unavailable")]
     InternalDispatchUnavailable,
 }
@@ -998,7 +1461,7 @@ impl SessionExecutor {
         workspace: Arc<WorkspaceSnapshot>,
         conversation: LoadedSessionConversation,
     ) -> Result<Self, SessionExecutorStartError> {
-        Self::start_loaded_ready_idle_inner(
+        Self::start_loaded_idle_inner(
             SessionExecutorDependencies::without_turn_resources(
                 task_context,
                 durable_state,
@@ -1006,7 +1469,11 @@ impl SessionExecutor {
                 prompt_service,
             ),
             definition,
-            workspace,
+            true,
+            true,
+            true,
+            None,
+            Some(workspace),
             Some(Arc::new(conversation)),
             CancellationToken::new(),
         )
@@ -1035,9 +1502,72 @@ impl SessionExecutor {
         conversation: LoadedSessionConversation,
         lifecycle_closing: CancellationToken,
     ) -> Result<Self, SessionExecutorStartError> {
-        Self::start_loaded_ready_idle_inner(
+        Self::start_loaded_idle_inner(
             dependencies,
             definition,
+            true,
+            true,
+            true,
+            None,
+            Some(workspace),
+            Some(Arc::new(conversation)),
+            lifecycle_closing,
+        )
+    }
+
+    /// Starts a loaded Idle Session that is not Ready for a workspace cause: it carries no
+    /// WorkspaceSnapshot and settles every Submit with the given Unavailable cause until a
+    /// Workspace reload or a true Workspace definition publication restores Ready.  The Agent,
+    /// model and selected-Prompt availability facts default to enabled/available.
+    pub(crate) fn start_loaded_unavailable_idle_with_turn_resources_and_lifecycle(
+        dependencies: SessionExecutorDependencies,
+        definition: Arc<SessionDefinition>,
+        unavailable: SessionUnavailableView,
+        conversation: LoadedSessionConversation,
+        lifecycle_closing: CancellationToken,
+    ) -> Result<Self, SessionExecutorStartError> {
+        Self::start_loaded_idle_inner(
+            dependencies,
+            definition,
+            true,
+            true,
+            true,
+            Some(unavailable),
+            None,
+            Some(Arc::new(conversation)),
+            lifecycle_closing,
+        )
+    }
+
+    /// The production Load seam that combines the four independent availability facts: the
+    /// Agent availability fact, the model availability fact and the selected-Prompt
+    /// availability fact for the captured definition, and the optional captured
+    /// WorkspaceSnapshot with the current workspace Unavailable cause, so a disabled/deleted
+    /// Agent, an unresolvable model or selected Prompt, or an unavailable Workspace still
+    /// loads its last-good Workspace while projecting its own Unavailable cause until that
+    /// fact changes.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the production Load seam atomically installs the four availability facts, the optional Workspace, the conversation, and the lifecycle closing token"
+    )]
+    pub(crate) fn start_loaded_idle_with_turn_resources_and_lifecycle(
+        dependencies: SessionExecutorDependencies,
+        definition: Arc<SessionDefinition>,
+        agent_available: bool,
+        model_available: bool,
+        prompt_available: bool,
+        workspace_unavailable: Option<SessionUnavailableView>,
+        workspace: Option<Arc<WorkspaceSnapshot>>,
+        conversation: LoadedSessionConversation,
+        lifecycle_closing: CancellationToken,
+    ) -> Result<Self, SessionExecutorStartError> {
+        Self::start_loaded_idle_inner(
+            dependencies,
+            definition,
+            agent_available,
+            model_available,
+            prompt_available,
+            workspace_unavailable,
             workspace,
             Some(Arc::new(conversation)),
             lifecycle_closing,
@@ -1053,7 +1583,7 @@ impl SessionExecutor {
         definition: Arc<SessionDefinition>,
         workspace: Arc<WorkspaceSnapshot>,
     ) -> Result<Self, SessionExecutorStartError> {
-        Self::start_loaded_ready_idle_inner(
+        Self::start_loaded_idle_inner(
             SessionExecutorDependencies::without_turn_resources(
                 task_context,
                 durable_state,
@@ -1061,16 +1591,28 @@ impl SessionExecutor {
                 prompt_service,
             ),
             definition,
-            workspace,
+            true,
+            true,
+            true,
+            None,
+            Some(workspace),
             None,
             CancellationToken::new(),
         )
     }
 
-    fn start_loaded_ready_idle_inner(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one atomic Load installs the four availability facts, the optional Workspace, the conversation, and the lifecycle closing token"
+    )]
+    fn start_loaded_idle_inner(
         dependencies: SessionExecutorDependencies,
         definition: Arc<SessionDefinition>,
-        workspace: Arc<WorkspaceSnapshot>,
+        agent_available: bool,
+        model_available: bool,
+        prompt_available: bool,
+        workspace_unavailable: Option<SessionUnavailableView>,
+        workspace: Option<Arc<WorkspaceSnapshot>>,
         conversation: Option<Arc<LoadedSessionConversation>>,
         lifecycle_closing: CancellationToken,
     ) -> Result<Self, SessionExecutorStartError> {
@@ -1081,18 +1623,43 @@ impl SessionExecutor {
             prompt_service,
             turn_resources,
         } = dependencies;
-        if definition.session_id() != workspace.session_id() {
-            return Err(SessionExecutorStartError::SessionIdMismatch);
+        // Session identity and Workspace revision agreement only exist for a captured
+        // WorkspaceSnapshot; an Unavailable Session deliberately has none.
+        if let Some(workspace) = workspace.as_ref() {
+            if definition.session_id() != workspace.session_id() {
+                return Err(SessionExecutorStartError::SessionIdMismatch);
+            }
+            if definition.workspace().revision() != workspace.revision() {
+                return Err(SessionExecutorStartError::WorkspaceRevisionMismatch);
+            }
         }
-        if definition.workspace().revision() != workspace.revision() {
-            return Err(SessionExecutorStartError::WorkspaceRevisionMismatch);
-        }
+        // The Load operation installs the durable current metadata into the immutable observation
+        // state synchronously under the per-Session gate, so every later executor event carries the
+        // exact metadata of its moment instead of re-reading durable state at subscription time.
+        // The durable head must still agree with the loaded identity, lifecycle, and definition;
+        // any disagreement means the gate-coherent snapshot this executor was built from is stale.
+        let current = match durable_state.session_current(definition.session_id()) {
+            Some(current)
+                if current.head().session_id() == definition.session_id()
+                    && current.head().lifecycle() == SessionLifecycle::Open
+                    && current.definition() == &definition =>
+            {
+                current
+            }
+            _ => return Err(SessionExecutorStartError::InternalDispatchUnavailable),
+        };
+        let metadata = Arc::new(current.head().metadata().clone());
 
         let (usage, recording, diagnostics) = capture_public_session_state(conversation.as_ref());
         let current = Arc::new(
             SessionExecutorSnapshot::new(
                 Arc::clone(&definition),
+                agent_available,
+                model_available,
+                prompt_available,
+                workspace_unavailable,
                 workspace,
+                metadata,
                 SessionExecutionState::Idle,
             )
             .with_public_session_state(usage, recording, diagnostics),
@@ -1134,6 +1701,8 @@ impl SessionExecutor {
             turn_admission_gate: Arc::clone(&turn_admission_gate),
             events: events.clone(),
             emergency: emergency.clone(),
+            pending_availability: None,
+            prepare_unload: None,
             #[cfg(test)]
             hooks: Arc::clone(&hooks),
         };
@@ -1203,6 +1772,47 @@ impl SessionExecutor {
         }
     }
 
+    /// Starts one graceful-Unload preparation.  The admission gate is closed synchronously, then
+    /// the deadline and its waiter are handed to the actor over the unbounded emergency lane so
+    /// this request can never be blocked behind the bounded work lane.  The returned waiter
+    /// resolves once the actor has no active publication, admission, or Turn; an earlier
+    /// duplicate request keeps the effective deadline (a later deadline never extends it), and
+    /// once the deadline has fired a duplicate only joins the waiters without re-triggering it.
+    pub(crate) fn begin_prepare_for_unload(
+        &self,
+        grace: std::time::Duration,
+    ) -> Result<PrepareUnloadWaiter, SessionExecutorPrepareUnloadError> {
+        // The gate is the synchronous admission stop: no in-flight or future admission can pass
+        // it, so the actor only has to drain work that already entered.
+        self.turn_admission_gate.close();
+        let (response, receiver) = oneshot::channel();
+        let request = SessionExecutorRequest::PrepareUnload(PrepareUnloadRequest {
+            deadline: tokio::time::Instant::now()
+                .checked_add(grace)
+                .unwrap_or_else(tokio::time::Instant::now),
+            response: Some(response),
+        });
+        if let Err(error) = self.emergency_sender.send(request) {
+            // The actor is gone; the dropped request settles its waiter with Closing.
+            drop(error.0);
+            return Err(SessionExecutorPrepareUnloadError::Closing);
+        }
+        Ok(PrepareUnloadWaiter {
+            receiver,
+            failure_state: Arc::clone(&self.failure_state),
+        })
+    }
+
+    /// Prepares this executor for graceful Unload: closes admission, lets the grace period run,
+    /// and returns once the actor is Idle (no active publication, admission, or Turn).
+    pub(crate) async fn prepare_for_unload(
+        &self,
+        grace: std::time::Duration,
+    ) -> Result<(), SessionExecutorPrepareUnloadError> {
+        let waiter = self.begin_prepare_for_unload(grace)?;
+        waiter.wait().await
+    }
+
     /// Returns the last coherent immutable loaded snapshot.  Requests sent while a publication
     /// is in flight observe the old snapshot until the actor installs the new one.
     pub(crate) async fn snapshot(
@@ -1263,11 +1873,44 @@ impl SessionExecutor {
         owner_timestamp: Timestamp,
         candidate_cancellation: CancellationToken,
     ) -> Result<SessionWorkspaceDefinitionOutcome, SessionWorkspaceDefinitionError> {
+        self.update_session_definition_with_cancellation(
+            expected_revision,
+            Some(workspace),
+            None,
+            None,
+            owner_timestamp,
+            CommandId::generate().expect("test wrapper generates a process-local command id"),
+            candidate_cancellation,
+        )
+        .await
+    }
+
+    /// Publishes one complete lowered Session definition replacement through the loaded Session
+    /// actor.  The actor decides whether the candidate changes Workspace semantics (by comparing
+    /// the owner-materialized candidate WorkspaceRevision with the installed revision) and only
+    /// then applies the loaded Idle requirement or the prebuilt Workspace Snapshot installation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one atomic definition publication carries its CAS token, three replacements, owner event facts, and cancellation"
+    )]
+    pub(crate) async fn update_session_definition_with_cancellation(
+        &self,
+        expected_revision: SessionDefinitionRevision,
+        workspace: Option<Workspace>,
+        model: Option<SessionModelConfig>,
+        prompts: Option<SessionPromptSelection>,
+        owner_timestamp: Timestamp,
+        command_id: CommandId,
+        candidate_cancellation: CancellationToken,
+    ) -> Result<SessionWorkspaceDefinitionOutcome, SessionWorkspaceDefinitionError> {
         let (response, waiter) = oneshot::channel();
         let mut request = SessionExecutorRequest::Update(WorkspaceDefinitionRequest {
             expected_revision,
             workspace,
+            model,
+            prompts,
             owner_timestamp,
+            command_id,
             candidate_cancellation,
             response: Some(response),
         });
@@ -1293,6 +1936,255 @@ impl SessionExecutor {
                 Err(SessionWorkspaceDefinitionError::Closing)
             } else {
                 Err(SessionWorkspaceDefinitionError::InternalDispatchUnavailable)
+            }
+        })
+    }
+
+    /// Publishes one explicit Session Agent revision upgrade through the loaded Session actor.
+    /// The executor never resolves target current, retained membership, Agent status, or a
+    /// candidate definition; only DurableState resolves those facts under its Agent → Session
+    /// publication gates.  The actor prechecks only the installed expected revision, publication
+    /// busy, and closing/cancellation, then validates the exact durable outcome before install.
+    pub(crate) async fn upgrade_session_agent_with_cancellation(
+        &self,
+        expected_revision: SessionDefinitionRevision,
+        target: Option<AgentRevisionRef>,
+        owner_timestamp: Timestamp,
+        command_id: CommandId,
+        candidate_cancellation: CancellationToken,
+    ) -> Result<SessionDefinitionPublicationOutcome, SessionDefinitionPublicationError> {
+        let (response, waiter) = oneshot::channel();
+        let mut request = SessionExecutorRequest::UpgradeAgent(AgentUpgradeRequest {
+            expected_revision,
+            target,
+            owner_timestamp,
+            command_id,
+            candidate_cancellation,
+            response: Some(response),
+        });
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionDefinitionPublicationError::Closing));
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject_closing();
+                    return waiter.await.unwrap_or(Err(
+                        SessionDefinitionPublicationError::InternalDispatchUnavailable,
+                    ));
+                }
+            },
+        };
+        // Reserving the bounded sender is the admission point.  No cancellable await occurs
+        // between it and handing ownership of the request to the actor.
+        permit.send(request);
+        waiter.await.unwrap_or_else(|_| {
+            if self.closing.is_cancelled() || self.sender.is_closed() {
+                Err(SessionDefinitionPublicationError::Closing)
+            } else {
+                Err(SessionDefinitionPublicationError::InternalDispatchUnavailable)
+            }
+        })
+    }
+
+    /// Reloads the loaded Session's installed Workspace through the actor's single active
+    /// publication slot.  The worker re-resolves the exact currently installed definition
+    /// Workspace, captures Workspace Prompt sources, revalidates the required authority, and
+    /// finishes one exact WorkspaceSnapshot; it never calls DurableState.  The actor validates
+    /// the exact admission definition and Snapshot shape before atomically replacing only the
+    /// WorkspaceSnapshot Arc, preserving the exact definition Arc and every other loaded fact.
+    pub(crate) async fn reload_workspace_with_cancellation(
+        &self,
+        owner_timestamp: Timestamp,
+        command_id: CommandId,
+        candidate_cancellation: CancellationToken,
+    ) -> Result<SessionDefinitionPublicationOutcome, SessionDefinitionPublicationError> {
+        let (response, waiter) = oneshot::channel();
+        let mut request = SessionExecutorRequest::ReloadWorkspace(ReloadWorkspaceRequest {
+            owner_timestamp,
+            command_id,
+            candidate_cancellation,
+            response: Some(response),
+        });
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionDefinitionPublicationError::Closing));
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject_closing();
+                    return waiter.await.unwrap_or(Err(
+                        SessionDefinitionPublicationError::InternalDispatchUnavailable,
+                    ));
+                }
+            },
+        };
+        // Reserving the bounded sender is the admission point.  No cancellable await occurs
+        // between it and handing ownership of the request to the actor.
+        permit.send(request);
+        waiter.await.unwrap_or_else(|_| {
+            if self.closing.is_cancelled() || self.sender.is_closed() {
+                Err(SessionDefinitionPublicationError::Closing)
+            } else {
+                Err(SessionDefinitionPublicationError::InternalDispatchUnavailable)
+            }
+        })
+    }
+
+    /// Applies one Agent availability fact to the loaded Session without touching DurableState.
+    /// The actor immediately updates an Idle Session that has no active admission/Turn and only
+    /// publishes `ReadinessChanged` when the public readiness actually changes; during
+    /// Starting/Running/Finishing (or an active admission/Turn) it saves the latest pending fact
+    /// and applies it when the Session returns to Idle.
+    pub(crate) async fn set_agent_availability_with_cancellation(
+        &self,
+        agent_id: crate::wire::AgentId,
+        available: bool,
+        timestamp: Timestamp,
+        command_id: CommandId,
+        candidate_cancellation: CancellationToken,
+    ) -> Result<(), SessionAgentAvailabilityError> {
+        let (response, waiter) = oneshot::channel();
+        let mut request = SessionExecutorRequest::SetAgentAvailability(AgentAvailabilityRequest {
+            agent_id,
+            available,
+            timestamp,
+            command_id,
+            candidate_cancellation,
+            response: Some(response),
+        });
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionAgentAvailabilityError::Closing));
+            }
+            _ = candidate_cancellation.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionAgentAvailabilityError::Closing));
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject_closing();
+                    return waiter.await.unwrap_or(Err(SessionAgentAvailabilityError::InternalDispatchUnavailable));
+                }
+            },
+        };
+        permit.send(request);
+        waiter.await.unwrap_or_else(|_| {
+            if self.closing.is_cancelled() || self.sender.is_closed() {
+                Err(SessionAgentAvailabilityError::Closing)
+            } else {
+                Err(SessionAgentAvailabilityError::InternalDispatchUnavailable)
+            }
+        })
+    }
+
+    /// Installs one Runtime shared-resource pair on the loaded Session without touching
+    /// DurableState.  The actor validates by `Arc::ptr_eq` that the exact expected definition is
+    /// still installed, replaces only the Prompt/Model roots of the future `turn_resources`, and
+    /// applies the precomputed facts: immediately for an Idle Session with no active
+    /// admission/Turn (publishing `ReadinessChanged` only when the public readiness actually
+    /// changes), or merged into the latest intended availability composite for any other
+    /// Session, applied when it returns to Idle.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one shared-resource installation carries its exact definition identity, the new Prompt/Model roots, the two precomputed facts, and owner event facts"
+    )]
+    pub(crate) async fn update_shared_resources_with_cancellation(
+        &self,
+        expected_definition: Arc<SessionDefinition>,
+        prompt_resources: Arc<PromptResourceView>,
+        model_catalog: Arc<ModelCatalogView>,
+        prompt_available: bool,
+        model_available: bool,
+        timestamp: Timestamp,
+        command_id: CommandId,
+        candidate_cancellation: CancellationToken,
+    ) -> Result<(), SessionSharedResourceUpdateError> {
+        let (response, waiter) = oneshot::channel();
+        let mut request =
+            SessionExecutorRequest::UpdateSharedResources(SharedResourceUpdateRequest {
+                expected_definition,
+                prompt_resources,
+                model_catalog,
+                prompt_available,
+                model_available,
+                timestamp,
+                command_id,
+                candidate_cancellation,
+                response: Some(response),
+            });
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionSharedResourceUpdateError::Closing));
+            }
+            _ = candidate_cancellation.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionSharedResourceUpdateError::Closing));
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject_closing();
+                    return waiter.await.unwrap_or(Err(SessionSharedResourceUpdateError::InternalDispatchUnavailable));
+                }
+            },
+        };
+        permit.send(request);
+        waiter.await.unwrap_or_else(|_| {
+            if self.closing.is_cancelled() || self.sender.is_closed() {
+                Err(SessionSharedResourceUpdateError::Closing)
+            } else {
+                Err(SessionSharedResourceUpdateError::InternalDispatchUnavailable)
+            }
+        })
+    }
+
+    pub(crate) async fn publish_metadata(
+        &self,
+        metadata: Arc<SessionMetadata>,
+        timestamp: Timestamp,
+        command_id: CommandId,
+    ) -> Result<Arc<SessionExecutorSnapshot>, SessionMetadataPublishError> {
+        let (response, waiter) = oneshot::channel();
+        let mut request = SessionExecutorRequest::PublishMetadata(UpdateSessionMetadataRequest {
+            metadata,
+            timestamp,
+            command_id,
+            response: Some(response),
+        });
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionMetadataPublishError::Closing));
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject_closing();
+                    return waiter.await.unwrap_or(Err(SessionMetadataPublishError::InternalDispatchUnavailable));
+                }
+            },
+        };
+        // Reserving the bounded sender is the admission point.  No cancellable await occurs
+        // between it and handing ownership of the request to the actor.
+        permit.send(request);
+        waiter.await.unwrap_or_else(|_| {
+            if self.closing.is_cancelled() || self.sender.is_closed() {
+                Err(SessionMetadataPublishError::Closing)
+            } else {
+                Err(SessionMetadataPublishError::InternalDispatchUnavailable)
             }
         })
     }
@@ -1686,6 +2578,26 @@ impl SessionExecutor {
     }
 }
 
+/// The actor-owned shared settlement waiter of one graceful-Unload preparation.  A duplicate
+/// `PrepareUnload` request joins the same actor state, so every caller waits on the same Idle
+/// settlement and the effective deadline can only shorten until it fires.
+pub(crate) struct PrepareUnloadWaiter {
+    receiver: oneshot::Receiver<Result<(), SessionExecutorPrepareUnloadError>>,
+    failure_state: Arc<ActorFailureState>,
+}
+
+impl PrepareUnloadWaiter {
+    pub(crate) async fn wait(self) -> Result<(), SessionExecutorPrepareUnloadError> {
+        self.receiver.await.unwrap_or_else(|_| {
+            if self.failure_state.is_fatal() {
+                Err(SessionExecutorPrepareUnloadError::Internal)
+            } else {
+                Err(SessionExecutorPrepareUnloadError::Closing)
+            }
+        })
+    }
+}
+
 struct SessionExecutorActor {
     receiver: mpsc::Receiver<SessionExecutorRequest>,
     emergency_receiver: mpsc::UnboundedReceiver<SessionExecutorRequest>,
@@ -1712,13 +2624,48 @@ struct SessionExecutorActor {
     turn_admission_gate: Arc<TurnAdmissionGate>,
     events: broadcast::Sender<Arc<SessionExecutorEvent>>,
     emergency: EmergencyControlHandle,
+    pending_availability: Option<PendingAvailability>,
+    prepare_unload: Option<PrepareUnloadState>,
     #[cfg(test)]
     hooks: Arc<SessionExecutorTestHooksInner>,
+}
+
+/// The latest intended availability facts observed while the Session was Starting/Running/
+/// Finishing (or had an active admission/Turn).  It is never applied to a legal non-Idle
+/// snapshot; the actor keeps only the latest intended value of every fact and applies the whole
+/// composite when the Session returns to Idle, so a Disable followed by an Enable before
+/// terminal collapses to the final value, and an Agent fact and a shared-resource reload fact
+/// arriving in either order both survive to the single Idle application.  The timestamp and
+/// command_id are always the last received command's, so the final `ReadinessChanged`
+/// attribution is the command whose fact actually moved the public readiness last.
+struct PendingAvailability {
+    agent_available: bool,
+    prompt_available: bool,
+    model_available: bool,
+    timestamp: Timestamp,
+    command_id: CommandId,
+}
+
+/// The single accepted graceful-Unload preparation.  The admission gate is already closed by the
+/// caller; the actor only keeps the shared deadline and waiters.  The effective deadline is the
+/// earliest request's; a later request can never extend it, and a shorter deadline replaces it
+/// while it has not yet fired.  Once `deadline_fired` is set, the main select disables the
+/// deadline branch, so the fired deadline never re-triggers and a duplicate request only joins
+/// the waiters without shortening or extending anything.  (The timer itself is re-created from
+/// the copied deadline on every main-select iteration, so the state owns no pinned sleep.)  The
+/// state is cleared when the actor becomes Idle, but the admission gate stays closed until
+/// `close()`.
+struct PrepareUnloadState {
+    deadline: tokio::time::Instant,
+    deadline_fired: bool,
+    waiters: Vec<oneshot::Sender<Result<(), SessionExecutorPrepareUnloadError>>>,
 }
 
 struct ActivePublication {
     permit: SessionDefinitionPublicationPermit,
     expected: ExpectedPublication,
+    timestamp: Timestamp,
+    command_id: CommandId,
     waiter: Arc<PublicationWaiterState>,
     worker_task: Option<TrackedTask>,
 }
@@ -1783,21 +2730,50 @@ impl WorkspacePublicationContext {
     }
 }
 
+/// The one publication shape admitted by the loaded Session's single active publication slot:
+/// an ordinary definition replacement, an explicit Agent revision upgrade, or a Workspace reload.
 #[derive(Clone)]
 enum ExpectedPublication {
-    NoChange { definition: Arc<SessionDefinition> },
-    Publish { definition: Arc<SessionDefinition> },
+    NoChange {
+        definition: Arc<SessionDefinition>,
+    },
+    Publish {
+        definition: Arc<SessionDefinition>,
+        workspace_changed: bool,
+    },
+    AgentUpgrade {
+        expected_revision: SessionDefinitionRevision,
+    },
+    ReloadWorkspace {
+        definition: Arc<SessionDefinition>,
+    },
 }
 
 impl ExpectedPublication {
     fn definition(&self) -> &Arc<SessionDefinition> {
         match self {
-            Self::NoChange { definition } | Self::Publish { definition } => definition,
+            Self::NoChange { definition }
+            | Self::Publish { definition, .. }
+            | Self::ReloadWorkspace { definition } => definition,
+            Self::AgentUpgrade { .. } => {
+                panic!("an Agent upgrade publication never carries a prebuilt candidate")
+            }
         }
     }
 
     const fn is_publish(&self) -> bool {
         matches!(self, Self::Publish { .. })
+    }
+
+    const fn workspace_changed(&self) -> bool {
+        match self {
+            Self::NoChange { .. } | Self::AgentUpgrade { .. } | Self::ReloadWorkspace { .. } => {
+                false
+            }
+            Self::Publish {
+                workspace_changed, ..
+            } => *workspace_changed,
+        }
     }
 }
 
@@ -1807,55 +2783,83 @@ enum ActorFatality {
     Internal,
 }
 
+/// One select iteration of the actor main loop.  The branches borrow disjoint fields, so the
+/// wakeup is collected first and processed after the select completes.
+enum ActorWakeup {
+    Closing,
+    PrepareDeadline,
+    Completion(ExecutorCompletion),
+    Request(SessionExecutorRequest),
+}
+
+/// Waits until the copied graceful-Unload deadline.  The timer is re-created on every main-select
+/// iteration, so a request that shortens the effective deadline is picked up by the next
+/// iteration's copied value; a fired deadline never re-fires because the handler marks the state
+/// `deadline_fired` and the main select disables the deadline branch from then on.
+async fn prepare_unload_deadline(deadline: Option<tokio::time::Instant>) {
+    let Some(deadline) = deadline else {
+        return;
+    };
+    tokio::time::sleep_until(deadline).await;
+}
+
 impl SessionExecutorActor {
     async fn run(mut self) -> bool {
         loop {
             if self.closing.is_cancelled() {
                 return self.close_and_drain().await;
             }
-            tokio::select! {
-                biased;
-                _ = self.closing.cancelled() => {
-                    return self.close_and_drain().await;
+            let prepare_deadline = self.prepare_unload.as_ref().and_then(|state| {
+                if state.deadline_fired {
+                    None
+                } else {
+                    Some(state.deadline)
                 }
+            });
+            let wakeup = tokio::select! {
+                biased;
+                _ = self.closing.cancelled() => ActorWakeup::Closing,
+                _ = prepare_unload_deadline(prepare_deadline), if prepare_deadline.is_some() => ActorWakeup::PrepareDeadline,
                 completion = self.completions.recv() => match completion {
-                    Some(completion) => {
-                        if let Err(fatality) = self.handle_completion(completion).await {
-                            self.close_for_fatal(fatality);
-                            return self.close_and_drain().await;
-                        }
-                    }
+                    Some(completion) => ActorWakeup::Completion(completion),
                     None => {
                         self.reap_after_missing_completion().await;
                         return self.close_and_drain().await;
                     }
                 },
                 request = self.emergency_receiver.recv() => match request {
-                    Some(mut request) => {
-                        if self.closing.is_cancelled() {
-                            request.reject_closing();
-                            continue;
-                        }
-                        if let Err(fatality) = self.handle_request(&mut request).await {
-                            self.close_for_fatal(fatality);
-                            return self.close_and_drain().await;
-                        }
-                    }
+                    Some(request) => ActorWakeup::Request(request),
                     None => return self.close_and_drain().await,
                 },
                 request = self.receiver.recv() => match request {
-                    Some(mut request) => {
-                        if self.closing.is_cancelled() {
-                            request.reject_closing();
-                            continue;
-                        }
-                        if let Err(fatality) = self.handle_request(&mut request).await {
-                            self.close_for_fatal(fatality);
-                            return self.close_and_drain().await;
-                        }
-                    }
+                    Some(request) => ActorWakeup::Request(request),
                     None => return self.close_and_drain().await,
                 },
+            };
+            match wakeup {
+                ActorWakeup::Closing => return self.close_and_drain().await,
+                ActorWakeup::PrepareDeadline => {
+                    if let Err(fatality) = self.handle_prepare_deadline().await {
+                        self.close_for_fatal(fatality);
+                        return self.close_and_drain().await;
+                    }
+                }
+                ActorWakeup::Completion(completion) => {
+                    if let Err(fatality) = self.handle_completion(completion).await {
+                        self.close_for_fatal(fatality);
+                        return self.close_and_drain().await;
+                    }
+                }
+                ActorWakeup::Request(mut request) => {
+                    if self.closing.is_cancelled() {
+                        request.reject_closing();
+                        continue;
+                    }
+                    if let Err(fatality) = self.handle_request(&mut request).await {
+                        self.close_for_fatal(fatality);
+                        return self.close_and_drain().await;
+                    }
+                }
             }
         }
     }
@@ -1865,8 +2869,24 @@ impl SessionExecutorActor {
         self.emergency_receiver.close();
         self.follow_up.clear();
         self.steer.clear();
-        self.execution_state = SessionExecutionState::Finishing;
-        self.install_current_state(SessionExecutionState::Finishing);
+        if let Some(state) = self.prepare_unload.take() {
+            // Distinguish a fatal exit (Internal) from an ordinary close (Closing) so the
+            // unload caller maps the outcome truthfully.
+            let outcome = if self.failure_state.is_fatal() {
+                Err(SessionExecutorPrepareUnloadError::Internal)
+            } else {
+                Err(SessionExecutorPrepareUnloadError::Closing)
+            };
+            for waiter in state.waiters {
+                let _ = waiter.send(outcome);
+            }
+        }
+        // Only an executor that still has an active admission or Turn projects Finishing.  An
+        // already-Idle prepared executor must not fabricate a Finishing ExecutionChanged event.
+        if self.active_admission.is_some() || self.active_turn.is_some() {
+            self.execution_state = SessionExecutionState::Finishing;
+            self.install_current_state(SessionExecutionState::Finishing);
+        }
         let pending_interactions = self
             .pending_interactions
             .keys()
@@ -1992,6 +3012,9 @@ impl SessionExecutorActor {
                 self.hooks.before_snapshot_response().await;
                 request.settle(Ok(Arc::clone(&self.current)));
             }
+            SessionExecutorRequest::PublishMetadata(request) => {
+                self.publish_metadata(request)?;
+            }
             SessionExecutorRequest::Subscribe(request) => {
                 request.settle(Ok(SessionExecutorSubscription {
                     snapshot: Arc::clone(&self.current),
@@ -2008,6 +3031,12 @@ impl SessionExecutorActor {
             }
             SessionExecutorRequest::Update(request) => {
                 self.start_publication(request)?;
+            }
+            SessionExecutorRequest::UpgradeAgent(request) => {
+                self.start_agent_upgrade_publication(request)?;
+            }
+            SessionExecutorRequest::ReloadWorkspace(request) => {
+                self.start_workspace_reload(request)?;
             }
             SessionExecutorRequest::Submit(request) => {
                 self.start_admission(request)?;
@@ -2030,11 +3059,166 @@ impl SessionExecutorActor {
             SessionExecutorRequest::SecurityRevoked(request) => {
                 self.security_revoke_request(request).await?;
             }
+            SessionExecutorRequest::SetAgentAvailability(request) => {
+                self.set_agent_availability(request)?;
+            }
+            SessionExecutorRequest::UpdateSharedResources(request) => {
+                self.update_shared_resources(request)?;
+            }
+            SessionExecutorRequest::PrepareUnload(request) => {
+                self.accept_prepare_unload(request)?;
+            }
         }
         Ok(())
     }
 
+    /// Accepts one graceful-Unload preparation.  Admission is closed (the caller already closed
+    /// the gate synchronously; this keeps it closed), the actor Steer and FollowUp lanes are
+    /// cleared and re-projected, and the request joins the shared deadline state: the effective
+    /// deadline only shortens while it has not fired, and an already-Idle executor settles
+    /// immediately.  Once the deadline has fired, a duplicate request only joins the waiters.
+    /// The actor keeps running until `close()`; new Submit/Steer/FollowUp requests are rejected
+    /// from now on, while ResolveInteraction, Cancel, SecurityRevoked, Snapshot, and accepted
+    /// publication completions remain processable.
+    fn accept_prepare_unload(
+        &mut self,
+        request: &mut PrepareUnloadRequest,
+    ) -> Result<(), ActorFatality> {
+        self.turn_admission_gate.close();
+        self.follow_up.clear();
+        self.steer.clear();
+        self.publish_queue_projection();
+        let Some(response) = request.response.take() else {
+            return Err(ActorFatality::Integrity);
+        };
+        match self.prepare_unload.as_mut() {
+            Some(state) => {
+                // Once the deadline has fired, a duplicate request only joins the waiters: it
+                // neither re-triggers the handler nor shortens/extends the effective deadline.
+                // Before the deadline fires, the effective deadline can only shorten.
+                if !state.deadline_fired && request.deadline < state.deadline {
+                    state.deadline = request.deadline;
+                }
+                state.waiters.push(response);
+            }
+            None => {
+                self.prepare_unload = Some(PrepareUnloadState {
+                    deadline: request.deadline,
+                    deadline_fired: false,
+                    waiters: vec![response],
+                });
+            }
+        }
+        self.settle_prepare_unload_if_idle();
+        Ok(())
+    }
+
+    /// The graceful-Unload deadline fired while the actor still has an active admission or Turn.
+    /// The exact current emergency target is signaled `PrepareForUnload` first-wins (an earlier
+    /// Cancel/SecurityRevoked keeps its original signal and reason), the cancellation token is
+    /// cancelled, and the Turn's pending Interactions are truthfully settled as
+    /// `SessionUnloaded`.  Only an active Turn projects Finishing (the first such projection
+    /// emits `ExecutionChanged`); an admission-only deadline keeps `Starting` — and its Starting
+    /// submit queue projection — legal, leaving the truth to the admission completion, which
+    /// either reclassifies the failed admission to `PrepareForUnload` and returns to Idle, or
+    /// migrates the signal onto the same Turn and then projects Finishing and settles terminal.
+    /// Active tasks are never dropped: they settle through the same completion paths as
+    /// ordinary emergency control.  The deadline fires at most once per preparation: this
+    /// handler marks the state `deadline_fired`, so the main select disables the deadline branch
+    /// and a duplicate Prepare only joins the waiters from now on.
+    async fn handle_prepare_deadline(&mut self) -> Result<(), ActorFatality> {
+        if self.prepare_unload.is_none() {
+            return Ok(());
+        }
+        // The deadline has fired.  The main select's deadline branch is disabled from this
+        // point, so the handler never re-runs for this preparation and no re-armed timer is
+        // needed while the admission/Turn/publication settlement drains.
+        self.prepare_unload
+            .as_mut()
+            .expect("prepare state exists after the guard")
+            .deadline_fired = true;
+        let target = if let Some(active) = self.active_admission.as_ref() {
+            Some(active.emergency.target())
+        } else if let Some(active) = self.active_turn.as_ref() {
+            Some(active.emergency.target())
+        } else {
+            None
+        };
+        if let Some(target) = target {
+            let prepared_won = match self
+                .emergency
+                .signal(target, EmergencyControlSignal::PrepareForUnload)
+            {
+                EmergencyControlSignalOutcome::Accepted { .. } => true,
+                // An earlier Cancel or SecurityRevoked keeps its original signal and reason.
+                EmergencyControlSignalOutcome::AlreadySignaled { .. } => false,
+                EmergencyControlSignalOutcome::StaleTarget => return Err(ActorFatality::Integrity),
+            };
+            if prepared_won {
+                if let Some(active) = self.active_admission.as_ref() {
+                    active.cancellation.cancel();
+                }
+                if let Some(active) = self.active_turn.as_ref() {
+                    active.cancellation.cancel();
+                }
+                // Only an active Turn projects Finishing.  An admission-only deadline (the
+                // Input is still being captured) keeps Starting and its Starting submit queue
+                // projection legal: the admission completion settles the truth, either by
+                // reclassifying the failed admission to PrepareForUnload and returning to Idle,
+                // or by migrating the signal onto the same Turn, which then projects Finishing.
+                if self.active_turn.is_some()
+                    && self.execution_state != SessionExecutionState::Finishing
+                {
+                    self.execution_state = SessionExecutionState::Finishing;
+                    self.publish_execution_state(
+                        SessionExecutionState::Finishing,
+                        self.current.current_turn(),
+                        self.current.last_terminal(),
+                    );
+                }
+                // Pending Interactions exist only while a Turn is active, so an admission-only
+                // deadline finds this map empty.
+                let pending = self.pending_interactions.keys().copied().collect::<Vec<_>>();
+                for request_id in pending {
+                    self.cancel_pending_interaction(
+                        request_id,
+                        SystemClock.now(),
+                        InteractionCancelReason::SessionUnloaded,
+                    )
+                    .await?;
+                }
+            }
+        } else {
+            // No active admission or Turn at the deadline: nothing to signal.  The waiters
+            // settle now when the executor is fully Idle (no active publication either).
+            self.settle_prepare_unload_if_idle();
+        }
+        Ok(())
+    }
+
+    /// Settles every accepted graceful-Unload waiter with Ok only when no active publication,
+    /// admission, or Turn remains.  The state is cleared, but the admission gate stays closed
+    /// until `close()`.
+    fn settle_prepare_unload_if_idle(&mut self) {
+        if self.active_publication.is_some()
+            || self.active_admission.is_some()
+            || self.active_turn.is_some()
+        {
+            return;
+        }
+        let Some(state) = self.prepare_unload.take() else {
+            return;
+        };
+        for waiter in state.waiters {
+            let _ = waiter.send(Ok(()));
+        }
+    }
+
     fn enqueue_follow_up(&mut self, request: &mut FollowUpRequest) -> Result<(), ActorFatality> {
+        if self.prepare_unload.is_some() {
+            request.settle(Err(SessionFollowUpError::TurnNotRunning));
+            return Ok(());
+        }
         let Some(active_turn) = self.active_turn.as_ref() else {
             request.settle(Err(SessionFollowUpError::TurnNotRunning));
             return Ok(());
@@ -2083,6 +3267,10 @@ impl SessionExecutorActor {
     }
 
     fn enqueue_steer(&mut self, request: &mut SteerRequest) -> Result<(), ActorFatality> {
+        if self.prepare_unload.is_some() {
+            request.settle(Err(SessionSteerError::TurnNotRunning));
+            return Ok(());
+        }
         let Some(active_turn) = self.active_turn.as_ref() else {
             request.settle(Err(SessionSteerError::TurnNotRunning));
             return Ok(());
@@ -2128,7 +3316,214 @@ impl SessionExecutorActor {
         Ok(())
     }
 
+    /// Applies one Agent availability fact.  The installed definition must pin the requested
+    /// AgentId; any mismatch is an internal invariant that poisons the executor.  An Idle
+    /// Session with no active admission/Turn applies the fact immediately and publishes
+    /// `ReadinessChanged` only when the public readiness truly changes; any other Session merges
+    /// the fact into the latest intended availability composite (a Disable followed by an Enable
+    /// collapses to the final value, and an interleaved shared-resource reload fact survives to
+    /// the same Idle application) and applies it when it returns to Idle.  Every applied fact
+    /// re-projects the public queue under the new readiness first, so the retained internal
+    /// FollowUp is hidden while AgentUnavailable and re-exposed on Enable, and the
+    /// `ReadinessChanged` snapshot carries the re-projected queue.
+    fn set_agent_availability(
+        &mut self,
+        request: &mut AgentAvailabilityRequest,
+    ) -> Result<(), ActorFatality> {
+        if self.current.definition().agent().agent_id() != request.agent_id {
+            request.settle(Err(SessionAgentAvailabilityError::InternalDispatchUnavailable));
+            return Err(ActorFatality::Integrity);
+        }
+        if self.execution_state.is_idle()
+            && self.active_admission.is_none()
+            && self.active_turn.is_none()
+        {
+            if self.current.agent_available != request.available {
+                let previous = self.current.readiness();
+                self.publish_current(Arc::new(self.current.with_agent_availability(request.available)));
+                // Re-project the public queue under the new readiness before any comparison or
+                // event, so an AgentDisable hides the retained internal FollowUp and an Enable
+                // re-exposes it; the ReadinessChanged snapshot must carry this projection.
+                self.publish_queue_projection();
+                if self.current.readiness() != previous {
+                    let _ = self
+                        .events
+                        .send(Arc::new(SessionExecutorEvent::ReadinessChanged {
+                            timestamp: request.timestamp,
+                            command_id: request.command_id,
+                            snapshot: Arc::clone(&self.current),
+                        }));
+                }
+                request.settle(Ok(()));
+                if request.available {
+                    self.start_queued_follow_up_after_publication()?;
+                }
+            } else {
+                request.settle(Ok(()));
+            }
+            return Ok(());
+        }
+        self.merge_pending_availability(
+            request.available,
+            self.pending_availability
+                .as_ref()
+                .map(|pending| pending.prompt_available)
+                .unwrap_or(self.current.prompt_available),
+            self.pending_availability
+                .as_ref()
+                .map(|pending| pending.model_available)
+                .unwrap_or(self.current.model_available),
+            request.timestamp,
+            request.command_id,
+        );
+        request.settle(Ok(()));
+        Ok(())
+    }
+
+    /// Installs one Runtime shared-resource pair on the loaded Session and applies the
+    /// precomputed model/selected-Prompt availability facts of the exact installed definition
+    /// against the candidate resources.  The actor validates by `Arc::ptr_eq` that the exact
+    /// definition the Runtime precomputed against is still installed; any mismatch is an
+    /// internal invariant that poisons the executor.  The future `turn_resources` roots are
+    /// replaced immediately (preserving the model gateway, tool set, and compaction settings),
+    /// so an active Turn keeps its already-captured old context, a FollowUp admitted before this
+    /// request linearizes before the reload and keeps its old capture, and a FollowUp admitted
+    /// after this request uses the new roots.  An Idle Session with no active admission/Turn
+    /// applies the facts immediately and publishes `ReadinessChanged` only when the public
+    /// readiness truly changes; any other Session merges them into the latest intended
+    /// availability composite and applies them when it returns to Idle.
+    fn update_shared_resources(
+        &mut self,
+        request: &mut SharedResourceUpdateRequest,
+    ) -> Result<(), ActorFatality> {
+        if !Arc::ptr_eq(self.current.definition(), &request.expected_definition) {
+            request.settle(Err(SessionSharedResourceUpdateError::InternalDispatchUnavailable));
+            return Err(ActorFatality::Integrity);
+        }
+        let Some(resources) = self.turn_resources.as_mut() else {
+            request.settle(Err(SessionSharedResourceUpdateError::InternalDispatchUnavailable));
+            return Err(ActorFatality::Integrity);
+        };
+        resources.prompt_resources = Arc::clone(&request.prompt_resources);
+        resources.model_catalog = Arc::clone(&request.model_catalog);
+        if self.execution_state.is_idle()
+            && self.active_admission.is_none()
+            && self.active_turn.is_none()
+        {
+            if self.current.prompt_available != request.prompt_available
+                || self.current.model_available != request.model_available
+            {
+                let previous = self.current.readiness();
+                self.publish_current(Arc::new(self.current.with_combined_availability(
+                    self.current.agent_available,
+                    request.model_available,
+                    request.prompt_available,
+                )));
+                // Re-project the public queue under the new readiness before any comparison or
+                // event, so an unavailable selected Prompt/model hides the retained internal
+                // FollowUp and a restore re-exposes it; the ReadinessChanged snapshot must
+                // carry this projection.
+                self.publish_queue_projection();
+                if self.current.readiness() != previous {
+                    let _ = self
+                        .events
+                        .send(Arc::new(SessionExecutorEvent::ReadinessChanged {
+                            timestamp: request.timestamp,
+                            command_id: request.command_id,
+                            snapshot: Arc::clone(&self.current),
+                        }));
+                }
+            }
+            request.settle(Ok(()));
+            self.start_queued_follow_up_after_publication()?;
+            return Ok(());
+        }
+        self.merge_pending_availability(
+            self.pending_availability
+                .as_ref()
+                .map(|pending| pending.agent_available)
+                .unwrap_or(self.current.agent_available),
+            request.prompt_available,
+            request.model_available,
+            request.timestamp,
+            request.command_id,
+        );
+        request.settle(Ok(()));
+        Ok(())
+    }
+
+    /// Merges one observed availability fact set into the latest intended composite.  The
+    /// composite never exists on a legal Idle-without-admission/Turn snapshot, so every caller
+    /// stores the current installed value of the facts it does not update.
+    fn merge_pending_availability(
+        &mut self,
+        agent_available: bool,
+        prompt_available: bool,
+        model_available: bool,
+        timestamp: Timestamp,
+        command_id: CommandId,
+    ) {
+        self.pending_availability = Some(PendingAvailability {
+            agent_available,
+            prompt_available,
+            model_available,
+            timestamp,
+            command_id,
+        });
+    }
+
+    /// Applies the latest intended availability composite after the Session has returned to
+    /// Idle and publishes `ReadinessChanged` only when the public readiness truly changed.  The
+    /// new readiness is projected onto the public queue before the comparison, so the retained
+    /// internal FollowUp is hidden while Unavailable and re-exposed on restore, and the
+    /// `ReadinessChanged` snapshot carries the re-projected queue.  The attribution is the last
+    /// command that observed a fact.  The caller decides the FollowUp handoff: an Enable applied
+    /// here leaves one queued FollowUp for the terminal path's pop/start or for the next Enable,
+    /// so a retained FollowUp is never dropped.
+    fn apply_pending_availability(&mut self) -> Result<(), ActorFatality> {
+        let Some(pending) = self.pending_availability.take() else {
+            return Ok(());
+        };
+        let previous = self.current.readiness();
+        self.publish_current(Arc::new(self.current.with_combined_availability(
+            pending.agent_available,
+            pending.model_available,
+            pending.prompt_available,
+        )));
+        // Re-project the public queue under the new readiness before any comparison or event,
+        // so the retained internal FollowUp is hidden while Unavailable and re-exposed on
+        // restore; the ReadinessChanged snapshot must carry this projection.
+        self.publish_queue_projection();
+        if self.current.readiness() != previous {
+            let _ = self
+                .events
+                .send(Arc::new(SessionExecutorEvent::ReadinessChanged {
+                    timestamp: pending.timestamp,
+                    command_id: pending.command_id,
+                    snapshot: Arc::clone(&self.current),
+                }));
+        }
+        Ok(())
+    }
+
     fn start_admission(&mut self, request: &mut SubmitRequest) -> Result<(), ActorFatality> {
+        if self.prepare_unload.is_some() {
+            // The admission gate is closed and the queues were cleared at PrepareForUnload
+            // accept; this Submit is rejected exactly like a closed admission gate.
+            request.settle(Err(SessionSubmitError::Closing));
+            return Ok(());
+        }
+        // Readiness is checked before any TurnId generation, execution mutation, or Workspace
+        // clone.  An Unavailable Session is always Idle with no active admission/Turn/queues,
+        // so this settles before the SessionBusy path and before any Ready-only accessor.
+        match self.current.readiness() {
+            SessionReadinessView::Ready => {}
+            SessionReadinessView::Unavailable(cause) => {
+                request.settle(Err(SessionSubmitError::SessionNotReady(cause)));
+                return Ok(());
+            }
+            SessionReadinessView::Preparing => return Err(ActorFatality::Integrity),
+        }
         if let Some(active) = self.active_admission.as_mut() {
             if active.command_id == request.command_id {
                 let Some(intent) = request.intent.as_ref() else {
@@ -2268,14 +3663,33 @@ impl SessionExecutorActor {
         let context = match completion.result {
             Ok(context) => context,
             Err(error) => {
+                // Observe the current emergency signal before retiring the admission
+                // observation: a PrepareForUnload that won the deadline reclassifies the
+                // generic admission cancellation (a user Cancel still stays SubmitCancelled).
+                // Every other failure stays truthful.
+                let emergency_signal = self
+                    .emergency
+                    .observe(active.emergency.target())
+                    .and_then(|observation| observation.signal());
                 self.emergency.retire(active.emergency);
+                let error = match (emergency_signal, error) {
+                    (
+                        Some(EmergencyControlSignal::PrepareForUnload),
+                        SessionSubmitError::Cancelled | SessionSubmitError::Closing,
+                    ) => SessionSubmitError::PrepareForUnload,
+                    _ => error,
+                };
                 self.execution_state = SessionExecutionState::Idle;
                 self.publish_execution_state(
                     SessionExecutionState::Idle,
                     None,
                     self.current.last_terminal(),
                 );
+                // The Session is Idle again: apply the latest intended availability composite
+                // so the readiness projected by this failure is the final value.
+                self.apply_pending_availability()?;
                 active.settle(Err(error));
+                self.settle_prepare_unload_if_idle();
                 return Ok(());
             }
         };
@@ -2389,6 +3803,7 @@ impl SessionExecutorActor {
             }
         }
         active.settle(Ok(active.turn_id));
+        self.settle_prepare_unload_if_idle();
         Ok(())
     }
 
@@ -2439,6 +3854,9 @@ impl SessionExecutorActor {
                     EmergencyControlSignal::Cancel => InteractionCancelReason::TurnCancelled,
                     EmergencyControlSignal::SecurityRevoked => {
                         InteractionCancelReason::SecurityRevoked
+                    }
+                    EmergencyControlSignal::PrepareForUnload => {
+                        InteractionCancelReason::SessionUnloaded
                     }
                 })
                 .unwrap_or(InteractionCancelReason::TurnCancelled);
@@ -2772,6 +4190,14 @@ impl SessionExecutorActor {
                 request.settle(Err(SessionSecurityRevokedError::AlreadyRevoked));
                 false
             }
+            EmergencyControlSignalOutcome::AlreadySignaled {
+                signal: EmergencyControlSignal::PrepareForUnload,
+                ..
+            } => {
+                // The unload already won the target; the Turn is being cancelled by unload.
+                request.settle(Err(SessionSecurityRevokedError::AlreadyCancelling));
+                false
+            }
             EmergencyControlSignalOutcome::StaleTarget => return Err(ActorFatality::Integrity),
         };
         if accepted {
@@ -2925,11 +4351,6 @@ impl SessionExecutorActor {
             self.publish_pending_interactions()?;
         }
         self.steer.clear_for_turn(active.turn_id);
-        let queued_follow_up = if task_result.is_ok() {
-            self.follow_up.pop_front()
-        } else {
-            None
-        };
         let live_turn = lock(&conversation.live_state).current_turn();
         if live_turn == Some(active.turn_id) {
             lock(&conversation.live_state)
@@ -2948,6 +4369,31 @@ impl SessionExecutorActor {
             None,
             Some((active.turn_id, completion.terminal)),
         );
+        // The Session is Idle again: apply the latest intended availability composite before
+        // the FollowUp decision, so a Disable at terminal leaves the queue intact for a later
+        // Enable and an Enable can hand off one FollowUp immediately, while a shared-resource
+        // reload fact observed during the Turn applies here with the last command attribution.
+        // A pending composite is never applied to a legal non-Idle snapshot.
+        self.apply_pending_availability()?;
+        // A FollowUp is only popped and started here when no publication is active, no
+        // graceful-Unload preparation is in flight, and the Session is Ready.  If a future-only
+        // definition publication is still in flight at terminal, or the Agent is unavailable, or
+        // the executor is preparing for unload, the FollowUp stays queued: the publication
+        // settlement or the next Enable starts it, so a queued FollowUp is never dropped (the
+        // prepare path has already cleared the queues).
+        let queued_follow_up = if task_result.is_ok()
+            && self.prepare_unload.is_none()
+            && self.active_publication.is_none()
+            && matches!(self.current.readiness(), SessionReadinessView::Ready)
+        {
+            self.follow_up.pop_front()
+        } else {
+            None
+        };
+        if queued_follow_up.is_some() {
+            // Re-project the queue so the terminal snapshot reflects the popped FollowUp.
+            self.publish_queue_projection();
+        }
         let _ = self
             .events
             .send(Arc::new(SessionExecutorEvent::TurnTerminal {
@@ -2966,6 +4412,7 @@ impl SessionExecutorActor {
             };
             self.start_admission(&mut request)?;
         }
+        self.settle_prepare_unload_if_idle();
         if task_result.is_err() {
             Err(ActorFatality::Internal)
         } else {
@@ -2977,7 +4424,7 @@ impl SessionExecutorActor {
         &mut self,
         request: &mut WorkspaceDefinitionRequest,
     ) -> Result<(), ActorFatality> {
-        if self.active_publication.is_some() || !self.execution_state.is_idle() {
+        if self.active_publication.is_some() {
             request.settle(Err(SessionWorkspaceDefinitionError::SessionBusy));
             return Ok(());
         }
@@ -2997,9 +4444,9 @@ impl SessionExecutorActor {
         let attempt = SealedSessionDefinitionAttempt::new(
             self.current.definition().session_id(),
             request.expected_revision,
-            Some(request.workspace.clone()),
-            None,
-            None,
+            request.workspace.clone(),
+            request.model.clone(),
+            request.prompts.clone(),
             request.owner_timestamp,
         );
         // This is deliberately before publication admission and before any resolver call.  In
@@ -3008,9 +4455,21 @@ impl SessionExecutorActor {
             Ok(SessionDefinitionDecision::NoChange) => ExpectedPublication::NoChange {
                 definition: Arc::clone(self.current.definition()),
             },
-            Ok(SessionDefinitionDecision::Publish(definition)) => ExpectedPublication::Publish {
-                definition: Arc::new(definition),
-            },
+            Ok(SessionDefinitionDecision::Publish(definition)) => {
+                let workspace_changed = definition.workspace().revision()
+                    != self.current.definition().workspace().revision();
+                // A true Workspace semantic change is only acceptable while Idle.  A
+                // canonical-equivalent Workspace combined with a Model/Prompt change is
+                // future-only and is allowed during active execution.
+                if workspace_changed && !self.execution_state.is_idle() {
+                    request.settle(Err(SessionWorkspaceDefinitionError::SessionBusy));
+                    return Ok(());
+                }
+                ExpectedPublication::Publish {
+                    definition: Arc::new(definition),
+                    workspace_changed,
+                }
+            }
             Err(SessionDefinitionDecisionError::StaleRevision) => {
                 request.settle(Err(SessionWorkspaceDefinitionError::StaleRevision));
                 return Ok(());
@@ -3024,7 +4483,7 @@ impl SessionExecutorActor {
                 return Ok(());
             }
             Err(SessionDefinitionDecisionError::RevisionExhausted) => {
-                request.settle(Err(SessionWorkspaceDefinitionError::RevisionExhausted));
+                request.settle(Err(SessionWorkspaceDefinitionError::StateTooLarge));
                 return Ok(());
             }
         };
@@ -3040,6 +4499,8 @@ impl SessionExecutorActor {
         let active = ActivePublication {
             permit: permit.clone(),
             expected: expected.clone(),
+            timestamp: request.owner_timestamp,
+            command_id: request.command_id,
             waiter,
             worker_task: None,
         };
@@ -3093,6 +4554,204 @@ impl SessionExecutorActor {
                 self.active_publication
                     .as_mut()
                     .expect("the active publication is installed before spawning")
+                    .worker_task = Some(task);
+            }
+            Err(RuntimeTaskError::OwnerClosing) => {
+                // A closing owner cannot admit a worker.  The guard's completion is still the
+                // single settlement path; its redacted Closing result is mapped by the actor.
+            }
+            Err(RuntimeTaskError::OperationPanicked | RuntimeTaskError::WorkerUnavailable) => {
+                // The moved RAII guard reports the one InternalDispatchUnavailable completion and
+                // closes both owners.  Do not settle here or create a second completion.
+            }
+        }
+        Ok(())
+    }
+
+    fn start_agent_upgrade_publication(
+        &mut self,
+        request: &mut AgentUpgradeRequest,
+    ) -> Result<(), ActorFatality> {
+        if self.active_publication.is_some() {
+            request.settle(Err(SessionDefinitionPublicationError::SessionBusy));
+            return Ok(());
+        }
+        if self.current.definition().revision() != request.expected_revision {
+            request.settle(Err(SessionDefinitionPublicationError::StaleRevision));
+            return Ok(());
+        }
+        if self.task_context.is_closing() {
+            request.settle(Err(SessionDefinitionPublicationError::Closing));
+            return Ok(());
+        }
+        if request.candidate_cancellation.is_cancelled() {
+            request.settle(Err(SessionDefinitionPublicationError::Closing));
+            return Ok(());
+        }
+
+        let attempt = SealedSessionAgentUpgradeAttempt::new(
+            self.current.definition().session_id(),
+            request.expected_revision,
+            request.target,
+            request.owner_timestamp,
+        );
+        // The executor deliberately does not resolve target current, retained membership, Agent
+        // status, or a candidate definition: those facts are resolved only inside DurableState
+        // under its Agent → Session publication gates.  The durable outcome therefore decides
+        // changed/no-op and the actor validates its exact shape before installation.
+        let expected = ExpectedPublication::AgentUpgrade {
+            expected_revision: request.expected_revision,
+        };
+
+        let permit = SessionDefinitionPublicationPermit::new();
+        let waiter = Arc::new(PublicationWaiterState::new(
+            request
+                .response
+                .take()
+                .expect("an admitted Agent upgrade request owns one waiter"),
+        ));
+        self.failure_state.install(Arc::clone(&waiter));
+        let active = ActivePublication {
+            permit: permit.clone(),
+            expected: expected.clone(),
+            timestamp: request.owner_timestamp,
+            command_id: request.command_id,
+            waiter,
+            worker_task: None,
+        };
+        // Install the actor publication state before spawning any asynchronous work.  The second
+        // request is therefore Busy even if the owner scheduler immediately runs the worker.
+        self.active_publication = Some(active);
+
+        let completion_sender = self.completion_sender.clone();
+        let task_context = self.task_context.clone();
+        let durable_state = self.durable_state.clone();
+        let publication_context = WorkspacePublicationContext {
+            durable_state: durable_state.clone(),
+            resolver: Arc::clone(&self.resolver),
+            prompt_service: Arc::clone(&self.prompt_service),
+            executor_closing: self.closing.clone(),
+            candidate_cancellation: request.candidate_cancellation.clone(),
+        };
+        #[cfg(test)]
+        let hooks_for_worker = Arc::clone(&self.hooks);
+        let guard = PublicationCompletionGuard::new(
+            completion_sender.clone(),
+            permit,
+            task_context.clone(),
+            durable_state.clone(),
+        );
+        let worker = async move {
+            let mut guard = guard;
+            #[cfg(test)]
+            let result =
+                run_agent_upgrade_publication(publication_context, attempt, hooks_for_worker).await;
+            #[cfg(not(test))]
+            let result = run_agent_upgrade_publication(publication_context, attempt).await;
+            guard.complete(result);
+        };
+        match self.task_context.spawn_tracked(worker) {
+            Ok(task) => {
+                self.active_publication
+                    .as_mut()
+                    .expect("the active Agent upgrade publication is installed before spawning")
+                    .worker_task = Some(task);
+            }
+            Err(RuntimeTaskError::OwnerClosing) => {
+                // A closing owner cannot admit a worker.  The guard's completion is still the
+                // single settlement path; its redacted Closing result is mapped by the actor.
+            }
+            Err(RuntimeTaskError::OperationPanicked | RuntimeTaskError::WorkerUnavailable) => {
+                // The moved RAII guard reports the one InternalDispatchUnavailable completion and
+                // closes both owners.  Do not settle here or create a second completion.
+            }
+        }
+        Ok(())
+    }
+
+    fn start_workspace_reload(
+        &mut self,
+        request: &mut ReloadWorkspaceRequest,
+    ) -> Result<(), ActorFatality> {
+        if self.active_publication.is_some() {
+            request.settle(Err(SessionDefinitionPublicationError::SessionBusy));
+            return Ok(());
+        }
+        if !self.execution_state.is_idle() {
+            request.settle(Err(SessionDefinitionPublicationError::SessionBusy));
+            return Ok(());
+        }
+        if self.task_context.is_closing() {
+            request.settle(Err(SessionDefinitionPublicationError::Closing));
+            return Ok(());
+        }
+        if request.candidate_cancellation.is_cancelled() {
+            request.settle(Err(SessionDefinitionPublicationError::Closing));
+            return Ok(());
+        }
+
+        // The reload never publishes a durable definition: the worker re-resolves the exact
+        // currently installed definition Workspace, and the actor validates after completion
+        // that this exact definition (and its Workspace revision) is still installed before
+        // atomically replacing only the WorkspaceSnapshot Arc.
+        let expected = ExpectedPublication::ReloadWorkspace {
+            definition: Arc::clone(self.current.definition()),
+        };
+
+        let permit = SessionDefinitionPublicationPermit::new();
+        let waiter = Arc::new(PublicationWaiterState::new(
+            request
+                .response
+                .take()
+                .expect("an admitted reload request owns one waiter"),
+        ));
+        self.failure_state.install(Arc::clone(&waiter));
+        let active = ActivePublication {
+            permit: permit.clone(),
+            expected: expected.clone(),
+            timestamp: request.owner_timestamp,
+            command_id: request.command_id,
+            waiter,
+            worker_task: None,
+        };
+        // Install the actor publication state before spawning any asynchronous work.  The second
+        // request is therefore Busy even if the owner scheduler immediately runs the worker.
+        self.active_publication = Some(active);
+
+        let completion_sender = self.completion_sender.clone();
+        let task_context = self.task_context.clone();
+        let durable_state = self.durable_state.clone();
+        let publication_context = WorkspacePublicationContext {
+            durable_state: durable_state.clone(),
+            resolver: Arc::clone(&self.resolver),
+            prompt_service: Arc::clone(&self.prompt_service),
+            executor_closing: self.closing.clone(),
+            candidate_cancellation: request.candidate_cancellation.clone(),
+        };
+        let definition_for_worker = Arc::clone(expected.definition());
+        #[cfg(test)]
+        let hooks_for_worker = Arc::clone(&self.hooks);
+        let guard = PublicationCompletionGuard::new(
+            completion_sender.clone(),
+            permit,
+            task_context.clone(),
+            durable_state.clone(),
+        );
+        let worker = async move {
+            let mut guard = guard;
+            #[cfg(test)]
+            let result =
+                run_workspace_reload(publication_context, definition_for_worker, hooks_for_worker)
+                    .await;
+            #[cfg(not(test))]
+            let result = run_workspace_reload(publication_context, definition_for_worker).await;
+            guard.complete(result);
+        };
+        match self.task_context.spawn_tracked(worker) {
+            Ok(task) => {
+                self.active_publication
+                    .as_mut()
+                    .expect("the active reload publication is installed before spawning")
                     .worker_task = Some(task);
             }
             Err(RuntimeTaskError::OwnerClosing) => {
@@ -3172,6 +4831,48 @@ impl SessionExecutorActor {
         Ok(())
     }
 
+    /// Synchronous helper that classifies one Session definition's model availability against
+    /// the installed Runtime-owned Turn catalog through the exact Turn model resolution seam.
+    /// The test-only dependency shape without Turn resources captures no model fact and
+    /// defaults to available; production always carries the Runtime-owned catalog, so a
+    /// CatalogUnavailable/SourceUnavailable/InvalidDefinition result there is an internal
+    /// invariant for the caller's fatal path.
+    fn definition_model_available(
+        &self,
+        definition: Arc<SessionDefinition>,
+    ) -> Result<bool, ModelResolutionError> {
+        let Some(resources) = self.turn_resources.as_ref() else {
+            return Ok(true);
+        };
+        model_available_for_definition(
+            &resources.model_gateway,
+            Arc::clone(&resources.model_catalog),
+            &definition,
+        )
+    }
+
+    /// Async helper that classifies one Session definition's selected-Prompt availability
+    /// against the current installed Runtime-owned Prompt resources through the exact
+    /// `for_turn` selection stage.  The test-only dependency shape without Turn resources
+    /// captures no Prompt fact and defaults to available; production always carries the
+    /// Runtime-owned Prompt view, so a Closing or any other failure there is an internal
+    /// invariant for the caller's fatal path, never a fabricated PromptUnavailable.
+    async fn definition_prompt_available(
+        &self,
+        definition: Arc<SessionDefinition>,
+    ) -> Result<bool, SessionPromptAvailabilityError> {
+        let Some(resources) = self.turn_resources.as_ref() else {
+            return Ok(true);
+        };
+        prompt_available_for_definition(
+            self.durable_state.clone(),
+            Arc::clone(&self.prompt_service),
+            Arc::clone(&resources.prompt_resources),
+            &definition,
+        )
+        .await
+    }
+
     async fn handle_publication_completion(
         &mut self,
         completion: PublicationCompletion,
@@ -3202,39 +4903,114 @@ impl SessionExecutorActor {
             return Err(ActorFatality::Integrity);
         }
 
-        let handling = self.validate_completion(&active.expected, result);
+        let handling = self.validate_completion(&active.expected, active.timestamp, result);
         match handling {
             CompletionHandling::Success(outcome, new_snapshot, new_definition) => {
-                if let Some(snapshot) = new_snapshot {
-                    let Some(definition) = new_definition else {
-                        self.active_publication = Some(active);
-                        self.close_for_fatal(ActorFatality::Integrity);
-                        return Err(ActorFatality::Integrity);
-                    };
+                if new_snapshot.is_some() || new_definition.is_some() {
                     if self.installation_fault_is_armed() {
                         self.active_publication = Some(active);
                         self.close_for_fatal(ActorFatality::Integrity);
                         return Err(ActorFatality::Integrity);
                     }
+                    // Any installed new definition carries its own model and selected-Prompt
+                    // availability facts, resolved against the current installed Runtime-owned
+                    // catalog/Prompt resources before installation, so an ordinary future-only
+                    // Model/Prompt replacement, true Workspace publication, or Agent revision
+                    // upgrade can both restore and degrade readiness atomically with the
+                    // definition.  A Workspace reload (new_definition None) preserves the exact
+                    // installed definition Arc and keeps the current model and selected-Prompt
+                    // availability facts.  A real Workspace installation clears only the
+                    // workspace Unavailable cause; a disabled Agent keeps AgentUnavailable until
+                    // it is re-enabled.  with_definition and with_definition_and_workspace keep
+                    // every immutable observation fact (usage, recording, diagnostics, public
+                    // pending interactions) in all cases, and the
+                    // DefinitionUpdated/WorkspaceReloaded event snapshot carries the
+                    // re-projected readiness without an extra ReadinessChanged event.
+                    let prompt_available = match new_definition.as_ref() {
+                        Some(definition) => {
+                            match self.definition_prompt_available(Arc::clone(definition)).await {
+                                Ok(available) => available,
+                                Err(_) => {
+                                    self.active_publication = Some(active);
+                                    self.close_for_fatal(ActorFatality::Internal);
+                                    return Err(ActorFatality::Internal);
+                                }
+                            }
+                        }
+                        None => self.current.prompt_available(),
+                    };
+                    let model_available = match new_definition.as_ref() {
+                        Some(definition) => {
+                            match self.definition_model_available(Arc::clone(definition)) {
+                                Ok(available) => available,
+                                Err(_) => {
+                                    // A resolution failure other than the three ordinary model
+                                    // incompatibilities on the installed Runtime-owned catalog is an
+                                    // internal invariant, never a fabricated ModelUnavailable.
+                                    self.active_publication = Some(active);
+                                    self.close_for_fatal(ActorFatality::Internal);
+                                    return Err(ActorFatality::Internal);
+                                }
+                            }
+                        }
+                        None => self.current.model_available(),
+                    };
+                    let current = match (new_snapshot, new_definition) {
+                        (Some(snapshot), Some(definition)) => self.current
+                            .with_definition_and_workspace(
+                                definition,
+                                snapshot,
+                                model_available,
+                                prompt_available,
+                            ),
+                        (Some(snapshot), None) => self.current.with_definition_and_workspace(
+                            Arc::clone(self.current.definition()),
+                            snapshot,
+                            model_available,
+                            prompt_available,
+                        ),
+                        (None, Some(definition)) => {
+                            self.current
+                                .with_definition(definition, model_available, prompt_available)
+                        }
+                        (None, None) => {
+                            self.active_publication = Some(active);
+                            self.close_for_fatal(ActorFatality::Integrity);
+                            return Err(ActorFatality::Integrity);
+                        }
+                    };
                     let (active_submit_command_id, follow_up_command_ids, steer_command_ids) =
                         self.queue_projection(self.current.current_turn());
                     let current = Arc::new(
-                        SessionExecutorSnapshot::new(definition, snapshot, self.execution_state)
-                            .with_execution(
-                                self.execution_state,
-                                self.current.current_turn(),
-                                self.current.last_terminal(),
-                            )
-                            .with_queue_projection(
-                                active_submit_command_id,
-                                follow_up_command_ids,
-                                steer_command_ids,
-                            ),
+                        current.with_queue_projection(
+                            active_submit_command_id,
+                            follow_up_command_ids,
+                            steer_command_ids,
+                        ),
                     );
                     self.publish_current(current);
+                    let _ = self.events.send(Arc::new(match outcome {
+                        SessionWorkspaceDefinitionOutcome::Reloaded { .. } => {
+                            SessionExecutorEvent::WorkspaceReloaded {
+                                timestamp: active.timestamp,
+                                command_id: active.command_id,
+                                snapshot: Arc::clone(&self.current),
+                            }
+                        }
+                        SessionWorkspaceDefinitionOutcome::NoChange { .. }
+                        | SessionWorkspaceDefinitionOutcome::Updated { .. } => {
+                            SessionExecutorEvent::DefinitionUpdated {
+                                timestamp: active.timestamp,
+                                command_id: active.command_id,
+                                snapshot: Arc::clone(&self.current),
+                            }
+                        }
+                    }));
                 }
                 active.waiter.settle(Ok(outcome));
                 self.finish_active_waiter(&active.waiter);
+                self.start_queued_follow_up_after_publication()?;
+                self.settle_prepare_unload_if_idle();
                 Ok(())
             }
             CompletionHandling::Ordinary(error) => {
@@ -3251,6 +5027,10 @@ impl SessionExecutorActor {
                 }
                 active.waiter.settle(Err(error));
                 self.finish_active_waiter(&active.waiter);
+                if !matches!(error, SessionWorkspaceDefinitionError::Closing) {
+                    self.start_queued_follow_up_after_publication()?;
+                }
+                self.settle_prepare_unload_if_idle();
                 Ok(())
             }
             CompletionHandling::Fatal(fatality) => {
@@ -3261,20 +5041,116 @@ impl SessionExecutorActor {
         }
     }
 
+    /// Starts the next queued FollowUp after a publication settles or an Enable restores Ready,
+    /// when the Session is Idle, Ready, and no admission, Turn, or publication remains.  A
+    /// FollowUp left queued at Turn terminal because a future-only publication was still active
+    /// or the Agent was unavailable is therefore never lost: it starts here against the
+    /// post-publication current definition or the next Enable.
+    fn start_queued_follow_up_after_publication(&mut self) -> Result<(), ActorFatality> {
+        if self.closing.is_cancelled()
+            || self.prepare_unload.is_some()
+            || self.active_publication.is_some()
+            || self.active_admission.is_some()
+            || self.active_turn.is_some()
+            || !self.execution_state.is_idle()
+            || !matches!(self.current.readiness(), SessionReadinessView::Ready)
+        {
+            return Ok(());
+        }
+        if let Some(queued) = self.follow_up.pop_front() {
+            let (command_id, intent) = queued.into_parts();
+            let mut request = SubmitRequest {
+                command_id,
+                intent: Some(intent),
+                response: None,
+            };
+            self.start_admission(&mut request)?;
+        }
+        Ok(())
+    }
+
     fn validate_completion(
         &self,
         expected: &ExpectedPublication,
+        owner_timestamp: Timestamp,
         result: PublicationCompletionResult,
     ) -> CompletionHandling {
         match result {
             PublicationCompletionResult::Error(error) => {
                 if matches!(
                     error,
-                    SessionWorkspaceDefinitionError::InternalDispatchUnavailable
+                    SessionDefinitionPublicationError::InternalDispatchUnavailable
                 ) {
                     CompletionHandling::Fatal(ActorFatality::Internal)
                 } else {
                     CompletionHandling::Ordinary(error)
+                }
+            }
+            PublicationCompletionResult::AgentUpgrade { outcome } => {
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return CompletionHandling::Ordinary(map_durable_agent_upgrade_error(
+                            error,
+                        ));
+                    }
+                };
+                match (expected, outcome) {
+                    (
+                        ExpectedPublication::AgentUpgrade { expected_revision },
+                        DurableSessionAgentUpgradeOutcome::NoChange(head, returned),
+                    ) => {
+                        // A canonical no-op must return the exact installed head/definition and
+                        // never install a snapshot or emit an event.
+                        if self.current.definition().revision() != *expected_revision
+                            || !valid_durable_definition_shape(
+                                head.as_ref(),
+                                returned.as_ref(),
+                                self.current.definition().as_ref(),
+                            )
+                            || returned.as_ref() != self.current.definition().as_ref()
+                        {
+                            CompletionHandling::Fatal(ActorFatality::Integrity)
+                        } else {
+                            CompletionHandling::Success(
+                                SessionDefinitionPublicationOutcome::NoChange {
+                                    definition_revision: returned.revision(),
+                                    workspace_revision: returned.workspace().revision(),
+                                },
+                                None,
+                                None,
+                            )
+                        }
+                    }
+                    (
+                        ExpectedPublication::AgentUpgrade { expected_revision },
+                        DurableSessionAgentUpgradeOutcome::Updated(head, returned),
+                    ) => {
+                        // The durable candidate must be the exact checked successor pinning the
+                        // same AgentId at a different retained revision with every other durable
+                        // fact unchanged; no prebuilt WorkspaceSnapshot may exist.
+                        if !valid_durable_agent_upgrade_shape(
+                            head.as_ref(),
+                            returned.as_ref(),
+                            self.current.definition().as_ref(),
+                            *expected_revision,
+                            owner_timestamp,
+                        ) {
+                            CompletionHandling::Fatal(ActorFatality::Integrity)
+                        } else {
+                            CompletionHandling::Success(
+                                SessionDefinitionPublicationOutcome::Updated {
+                                    definition_revision: returned.revision(),
+                                    workspace_revision: returned.workspace().revision(),
+                                },
+                                None,
+                                Some(returned),
+                            )
+                        }
+                    }
+                    // A durable outcome with the wrong changed/no-op shape is an integrity
+                    // failure.  It may already have crossed the Store commit point.
+                    _ => CompletionHandling::Fatal(ActorFatality::Integrity),
                 }
             }
             PublicationCompletionResult::Durable { outcome, snapshot } => {
@@ -3310,34 +5186,91 @@ impl SessionExecutorActor {
                         }
                     }
                     (
-                        ExpectedPublication::Publish { definition },
+                        ExpectedPublication::Publish {
+                            definition,
+                            workspace_changed,
+                        },
                         DurableSessionDefinitionOutcome::Updated(head, returned),
                     ) => {
-                        let Some(snapshot) = snapshot else {
-                            return CompletionHandling::Fatal(ActorFatality::Integrity);
-                        };
                         if !valid_durable_definition_shape(
                             head.as_ref(),
                             returned.as_ref(),
                             definition.as_ref(),
                         ) || returned.as_ref() != definition.as_ref()
+                        {
+                            return CompletionHandling::Fatal(ActorFatality::Integrity);
+                        }
+                        if *workspace_changed {
+                            let Some(snapshot) = snapshot else {
+                                return CompletionHandling::Fatal(ActorFatality::Integrity);
+                            };
+                            if snapshot.session_id() != definition.session_id()
+                                || snapshot.revision() != definition.workspace().revision()
+                            {
+                                CompletionHandling::Fatal(ActorFatality::Integrity)
+                            } else {
+                                CompletionHandling::Success(
+                                    SessionWorkspaceDefinitionOutcome::Updated {
+                                        definition_revision: returned.revision(),
+                                        workspace_revision: returned.workspace().revision(),
+                                    },
+                                    Some(snapshot),
+                                    Some(returned),
+                                )
+                            }
+                        } else {
+                            // Future-only replacement preserves the exact installed Workspace
+                            // Snapshot (or its absence while Unavailable); the durable candidate
+                            // must therefore keep the current WorkspaceRevision, and no prebuilt
+                            // snapshot may exist.  The current WorkspaceRevision is read from the
+                            // installed durable definition so the check also covers an
+                            // Unavailable Session that has no WorkspaceSnapshot.
+                            if snapshot.is_some()
+                                || returned.workspace().revision()
+                                    != self.current.workspace_revision()
+                            {
+                                CompletionHandling::Fatal(ActorFatality::Integrity)
+                            } else {
+                                CompletionHandling::Success(
+                                    SessionWorkspaceDefinitionOutcome::Updated {
+                                        definition_revision: returned.revision(),
+                                        workspace_revision: returned.workspace().revision(),
+                                    },
+                                    None,
+                                    Some(returned),
+                                )
+                            }
+                        }
+                    }
+                    // A durable outcome with the wrong changed/no-op shape is an integrity
+                    // failure.  It may already have crossed the Store commit point.
+                    _ => CompletionHandling::Fatal(ActorFatality::Integrity),
+                }
+            }
+            PublicationCompletionResult::Reload { snapshot } => {
+                // A reload never touches DurableState: the admission-time definition must still
+                // be the exact installed Arc (identity, not structural equality), and the
+                // returned Snapshot must carry the exact Session identity and the exact
+                // installed Workspace revision before the actor atomically replaces the
+                // WorkspaceSnapshot Arc while preserving the exact definition Arc.
+                match expected {
+                    ExpectedPublication::ReloadWorkspace { definition } => {
+                        if !Arc::ptr_eq(self.current.definition(), definition)
                             || snapshot.session_id() != definition.session_id()
                             || snapshot.revision() != definition.workspace().revision()
                         {
                             CompletionHandling::Fatal(ActorFatality::Integrity)
                         } else {
                             CompletionHandling::Success(
-                                SessionWorkspaceDefinitionOutcome::Updated {
-                                    definition_revision: returned.revision(),
-                                    workspace_revision: returned.workspace().revision(),
+                                SessionWorkspaceDefinitionOutcome::Reloaded {
+                                    definition_revision: definition.revision(),
+                                    workspace_revision: snapshot.revision(),
                                 },
                                 Some(snapshot),
-                                Some(returned),
+                                None,
                             )
                         }
                     }
-                    // A durable outcome with the wrong changed/no-op shape is an integrity
-                    // failure.  It may already have crossed the Store commit point.
                     _ => CompletionHandling::Fatal(ActorFatality::Integrity),
                 }
             }
@@ -3379,6 +5312,11 @@ impl SessionExecutorActor {
         self.failure_state.mark_fatal();
         self.task_context.request_closing();
         self.durable_state.request_closing();
+        if let Some(state) = self.prepare_unload.take() {
+            for waiter in state.waiters {
+                let _ = waiter.send(Err(SessionExecutorPrepareUnloadError::Internal));
+            }
+        }
         if let Some(active) = self.active_publication.take() {
             active.waiter.settle(Err(
                 SessionWorkspaceDefinitionError::InternalDispatchUnavailable,
@@ -3437,7 +5375,16 @@ impl SessionExecutorActor {
         } else {
             None
         };
-        let follow_up_command_ids = Arc::from(self.follow_up.command_ids());
+        // The public legal readiness matrix requires every queue to be empty while non-Ready.
+        // A FollowUp retained across an Agent Disable stays in the actor queue (it is never
+        // dropped) but is hidden from the projection until Ready, when the Enable handoff
+        // starts it.
+        let ready = matches!(self.current.readiness(), SessionReadinessView::Ready);
+        let follow_up_command_ids = if ready {
+            Arc::from(self.follow_up.command_ids())
+        } else {
+            Arc::from([])
+        };
         let steer_command_ids = Arc::from(
             current_turn
                 .map(|turn_id| self.steer.command_ids_for_turn(turn_id))
@@ -3448,6 +5395,37 @@ impl SessionExecutorActor {
             follow_up_command_ids,
             steer_command_ids,
         )
+    }
+
+    /// Atomically replaces the loaded Session's current/published snapshot metadata and emits the
+    /// Session-scope metadata event carrying that exact snapshot.  The actor is the sole writer of
+    /// `self.current` and `published_snapshot`, so the swap and the event share one metadata value.
+    /// The actor verifies the durable CAS result is exactly the checked successor of the installed
+    /// metadata before installing it; otherwise the gate-coherent revision contract is broken and
+    /// the actor must not overwrite its snapshot.
+    fn publish_metadata(
+        &mut self,
+        request: &mut UpdateSessionMetadataRequest,
+    ) -> Result<(), ActorFatality> {
+        let current_revision = self.current.metadata().revision().get();
+        let expected_revision = current_revision.checked_add(1);
+        if expected_revision != Some(request.metadata.revision().get())
+            || request.metadata.updated_at() != request.timestamp
+        {
+            return Err(ActorFatality::Integrity);
+        }
+        let current = Arc::new(self.current.with_metadata(Arc::clone(&request.metadata)));
+        self.current = Arc::clone(&current);
+        *lock(&self.published_snapshot) = Arc::clone(&current);
+        let _ = self
+            .events
+            .send(Arc::new(SessionExecutorEvent::MetadataUpdated {
+                timestamp: request.timestamp,
+                command_id: request.command_id,
+                snapshot: Arc::clone(&current),
+            }));
+        request.settle(Ok(current));
+        Ok(())
     }
 
     fn publish_queue_projection(&mut self) {
@@ -3970,6 +5948,35 @@ fn valid_durable_definition_shape(
         && returned.workspace().revision() == expected.workspace().revision()
 }
 
+/// Validates an Agent upgrade `Updated` durable outcome against the installed current definition,
+/// the admitted expected revision and the request owner timestamp: the installed current
+/// revision matching the admitted expected revision, exact checked successor revision, same
+/// SessionId, same AgentId at a different Agent revision, exact Workspace (including
+/// WorkspaceRevision), Model and Prompt selection unchanged, owner timestamp preserved, and the
+/// head pointing at the returned revision.
+fn valid_durable_agent_upgrade_shape(
+    head: &crate::durable_state::DurableSessionHead,
+    returned: &SessionDefinition,
+    current: &SessionDefinition,
+    expected_revision: SessionDefinitionRevision,
+    owner_timestamp: Timestamp,
+) -> bool {
+    let Some(successor) = current.revision().get().checked_add(1) else {
+        return false;
+    };
+    current.revision() == expected_revision
+        && head.session_id() == current.session_id()
+        && returned.session_id() == current.session_id()
+        && head.current_definition_revision() == returned.revision()
+        && returned.revision().get() == successor
+        && returned.agent().agent_id() == current.agent().agent_id()
+        && returned.agent().revision() != current.agent().revision()
+        && returned.workspace() == current.workspace()
+        && returned.model() == current.model()
+        && returned.prompts() == current.prompts()
+        && returned.created_at() == owner_timestamp
+}
+
 enum ExecutorCompletion {
     Publication(PublicationCompletion),
     Admission(AdmissionCompletion),
@@ -4023,7 +6030,13 @@ enum PublicationCompletionResult {
         outcome: Result<DurableSessionDefinitionOutcome, DurableSessionDefinitionError>,
         snapshot: Option<Arc<WorkspaceSnapshot>>,
     },
-    Error(SessionWorkspaceDefinitionError),
+    AgentUpgrade {
+        outcome: Result<DurableSessionAgentUpgradeOutcome, DurableSessionAgentUpgradeError>,
+    },
+    Reload {
+        snapshot: Arc<WorkspaceSnapshot>,
+    },
+    Error(SessionDefinitionPublicationError),
 }
 
 enum CompletionHandling {
@@ -5061,6 +7074,7 @@ const fn session_turn_interruption(signal: EmergencyControlSignal) -> SessionTur
     match signal {
         EmergencyControlSignal::Cancel => SessionTurnInterruption::UserCancelled,
         EmergencyControlSignal::SecurityRevoked => SessionTurnInterruption::SecurityRevoked,
+        EmergencyControlSignal::PrepareForUnload => SessionTurnInterruption::PrepareForUnload,
     }
 }
 
@@ -5305,6 +7319,7 @@ fn map_submit_prompt_error(error: PromptError) -> SessionSubmitError {
         PromptErrorKind::InvalidIntent | PromptErrorKind::InvalidContribution => {
             SessionSubmitError::InvalidArgument
         }
+        PromptErrorKind::Internal => SessionSubmitError::InternalDispatchUnavailable,
     }
 }
 
@@ -5330,6 +7345,7 @@ fn map_turn_prompt_error(error: PromptError) -> SessionTurnFailure {
         | PromptErrorKind::RequiredPromptMissing
         | PromptErrorKind::InvalidIntent
         | PromptErrorKind::InvalidContribution => SessionTurnFailure::Prompt,
+        PromptErrorKind::Internal => SessionTurnFailure::Internal,
     }
 }
 
@@ -5360,23 +7376,151 @@ async fn run_publication(
         };
     }
 
+    let snapshot = if expected.workspace_changed() {
+        let candidate = match context
+            .resolver
+            .resolve(session_id, expected.definition().workspace())
+            .await
+        {
+            Ok(candidate) => candidate,
+            Err(error) => return PublicationCompletionResult::Error(map_workspace_error(error)),
+        };
+        if candidate.revision() != expected.definition().workspace().revision() {
+            return PublicationCompletionResult::Error(
+                SessionWorkspaceDefinitionError::InternalDispatchUnavailable,
+            );
+        }
+        let skill_context = candidate.skill_capture_context();
+        if !skill_context.roots().is_empty() {
+            return PublicationCompletionResult::Error(
+                SessionWorkspaceDefinitionError::InternalDispatchUnavailable,
+            );
+        }
+        let prompt_context = candidate.prompt_capture_context();
+        let requires_revalidation = !prompt_context.roots().is_empty();
+        let capture = context
+            .prompt_service
+            .capture_workspace_sources(prompt_context);
+        tokio::pin!(capture);
+        let prompt_sources = match tokio::select! {
+            biased;
+            _ = context.cancelled() => return PublicationCompletionResult::Error(
+                SessionWorkspaceDefinitionError::Closing,
+            ),
+            result = &mut capture => result,
+        } {
+            Ok(sources) => sources,
+            Err(error) => return PublicationCompletionResult::Error(map_prompt_error(error)),
+        };
+        if requires_revalidation {
+            let revalidation_result = {
+                let revalidation = context
+                    .resolver
+                    .revalidate_candidate(&candidate, expected.definition().workspace());
+                tokio::pin!(revalidation);
+                tokio::select! {
+                    biased;
+                    _ = context.cancelled() => return PublicationCompletionResult::Error(
+                        SessionWorkspaceDefinitionError::Closing,
+                    ),
+                    result = &mut revalidation => result,
+                }
+            };
+            match revalidation_result {
+                Ok(true) => {}
+                Ok(false) => {
+                    return PublicationCompletionResult::Error(
+                        SessionWorkspaceDefinitionError::WorkspaceUnavailable,
+                    );
+                }
+                Err(error) => {
+                    return PublicationCompletionResult::Error(map_workspace_error(error));
+                }
+            }
+        }
+        let skill_sources = Arc::from(Vec::new().into_boxed_slice());
+        if context.is_cancelled() {
+            return PublicationCompletionResult::Error(SessionWorkspaceDefinitionError::Closing);
+        }
+        let snapshot = match candidate.finish(prompt_sources, skill_sources) {
+            Ok(snapshot) => snapshot,
+            Err(WorkspaceSnapshotFinishError::AuthorizationMismatch) => {
+                return PublicationCompletionResult::Error(
+                    SessionWorkspaceDefinitionError::InternalDispatchUnavailable,
+                );
+            }
+        };
+
+        #[cfg(test)]
+        hooks.after_candidate_snapshot_finish_before_durable().await;
+        Some(snapshot)
+    } else {
+        // Future-only Model/Prompt (or canonical-equivalent Workspace) replacement never invokes
+        // the Workspace resolver and never builds a new snapshot.
+        None
+    };
+
+    let outcome = context
+        .durable_state
+        .update_session_definition(attempt)
+        .await;
+    #[cfg(test)]
+    if matches!(&outcome, Ok(DurableSessionDefinitionOutcome::Updated(..))) {
+        hooks.after_commit_before_install().await;
+    }
+    PublicationCompletionResult::Durable { outcome, snapshot }
+}
+
+/// Publishes one explicit Session Agent revision upgrade.  It never invokes the Workspace
+/// resolver and never captures Prompt or Skill sources: DurableState resolves target current and
+/// validates retained membership and Agent status under its own Agent → Session publication
+/// gates, and the exact candidate is validated by the actor only after the durable outcome
+/// returns.
+async fn run_agent_upgrade_publication(
+    context: WorkspacePublicationContext,
+    attempt: SealedSessionAgentUpgradeAttempt,
+    #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
+) -> PublicationCompletionResult {
+    if context.is_cancelled() {
+        return PublicationCompletionResult::Error(SessionDefinitionPublicationError::Closing);
+    }
+    let outcome = context.durable_state.upgrade_session_agent(attempt).await;
+    #[cfg(test)]
+    if matches!(&outcome, Ok(DurableSessionAgentUpgradeOutcome::Updated(..))) {
+        hooks.after_commit_before_install().await;
+    }
+    PublicationCompletionResult::AgentUpgrade { outcome }
+}
+
+/// Reloads one loaded Session's installed Workspace.  It re-resolves the exact currently
+/// installed definition Workspace, captures the Workspace Prompt sources, revalidates the
+/// required authority, and finishes one exact WorkspaceSnapshot; it never calls DurableState and
+/// never changes the durable definition, metadata, conversation, or Recorder.
+async fn run_workspace_reload(
+    context: WorkspacePublicationContext,
+    definition: Arc<SessionDefinition>,
+    #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
+) -> PublicationCompletionResult {
+    if context.is_cancelled() {
+        return PublicationCompletionResult::Error(SessionDefinitionPublicationError::Closing);
+    }
     let candidate = match context
         .resolver
-        .resolve(session_id, expected.definition().workspace())
+        .resolve(definition.session_id(), definition.workspace())
         .await
     {
         Ok(candidate) => candidate,
-        Err(error) => return PublicationCompletionResult::Error(map_workspace_error(error)),
+        Err(error) => return PublicationCompletionResult::Error(map_reload_workspace_error(error)),
     };
-    if candidate.revision() != expected.definition().workspace().revision() {
+    if candidate.revision() != definition.workspace().revision() {
         return PublicationCompletionResult::Error(
-            SessionWorkspaceDefinitionError::InternalDispatchUnavailable,
+            SessionDefinitionPublicationError::InternalDispatchUnavailable,
         );
     }
     let skill_context = candidate.skill_capture_context();
     if !skill_context.roots().is_empty() {
         return PublicationCompletionResult::Error(
-            SessionWorkspaceDefinitionError::InternalDispatchUnavailable,
+            SessionDefinitionPublicationError::InternalDispatchUnavailable,
         );
     }
     let prompt_context = candidate.prompt_capture_context();
@@ -5388,23 +7532,23 @@ async fn run_publication(
     let prompt_sources = match tokio::select! {
         biased;
         _ = context.cancelled() => return PublicationCompletionResult::Error(
-            SessionWorkspaceDefinitionError::Closing,
+            SessionDefinitionPublicationError::Closing,
         ),
         result = &mut capture => result,
     } {
         Ok(sources) => sources,
-        Err(error) => return PublicationCompletionResult::Error(map_prompt_error(error)),
+        Err(error) => return PublicationCompletionResult::Error(map_reload_prompt_error(error)),
     };
     if requires_revalidation {
         let revalidation_result = {
             let revalidation = context
                 .resolver
-                .revalidate_candidate(&candidate, expected.definition().workspace());
+                .revalidate_candidate(&candidate, definition.workspace());
             tokio::pin!(revalidation);
             tokio::select! {
                 biased;
                 _ = context.cancelled() => return PublicationCompletionResult::Error(
-                    SessionWorkspaceDefinitionError::Closing,
+                    SessionDefinitionPublicationError::Closing,
                 ),
                 result = &mut revalidation => result,
             }
@@ -5413,39 +7557,67 @@ async fn run_publication(
             Ok(true) => {}
             Ok(false) => {
                 return PublicationCompletionResult::Error(
-                    SessionWorkspaceDefinitionError::WorkspaceUnavailable,
+                    SessionDefinitionPublicationError::WorkspaceUnavailable,
                 );
             }
-            Err(error) => return PublicationCompletionResult::Error(map_workspace_error(error)),
+            Err(error) => {
+                return PublicationCompletionResult::Error(map_reload_workspace_error(error));
+            }
         }
     }
     let skill_sources = Arc::from(Vec::new().into_boxed_slice());
     if context.is_cancelled() {
-        return PublicationCompletionResult::Error(SessionWorkspaceDefinitionError::Closing);
+        return PublicationCompletionResult::Error(SessionDefinitionPublicationError::Closing);
     }
     let snapshot = match candidate.finish(prompt_sources, skill_sources) {
         Ok(snapshot) => snapshot,
         Err(WorkspaceSnapshotFinishError::AuthorizationMismatch) => {
             return PublicationCompletionResult::Error(
-                SessionWorkspaceDefinitionError::InternalDispatchUnavailable,
+                SessionDefinitionPublicationError::InternalDispatchUnavailable,
             );
         }
     };
 
     #[cfg(test)]
     hooks.after_candidate_snapshot_finish_before_durable().await;
+    PublicationCompletionResult::Reload { snapshot }
+}
 
-    let outcome = context
-        .durable_state
-        .update_session_definition(attempt)
-        .await;
-    #[cfg(test)]
-    if matches!(&outcome, Ok(DurableSessionDefinitionOutcome::Updated(..))) {
-        hooks.after_commit_before_install().await;
+fn map_reload_workspace_error(error: WorkspaceResolveError) -> SessionDefinitionPublicationError {
+    match error {
+        WorkspaceResolveError::Closing => SessionDefinitionPublicationError::Closing,
+        WorkspaceResolveError::RootUnavailable
+        | WorkspaceResolveError::AuthorityUnavailable
+        | WorkspaceResolveError::CanonicalizationFailed => {
+            SessionDefinitionPublicationError::WorkspaceUnavailable
+        }
+        WorkspaceResolveError::AuthorityDenied => SessionDefinitionPublicationError::Unauthorized,
+        WorkspaceResolveError::RootNotDirectory
+        | WorkspaceResolveError::DuplicateRoot
+        | WorkspaceResolveError::OverlappingRoots
+        | WorkspaceResolveError::CwdOutsideRoots
+        | WorkspaceResolveError::CwdRootMismatch => {
+            SessionDefinitionPublicationError::WorkspaceRejected
+        }
+        WorkspaceResolveError::InternalDispatchUnavailable => {
+            SessionDefinitionPublicationError::InternalDispatchUnavailable
+        }
     }
-    PublicationCompletionResult::Durable {
-        outcome,
-        snapshot: Some(snapshot),
+}
+
+fn map_reload_prompt_error(error: PromptError) -> SessionDefinitionPublicationError {
+    match error.kind() {
+        PromptErrorKind::SourceDiscovery => SessionDefinitionPublicationError::WorkspaceUnavailable,
+        PromptErrorKind::ContentLoad | PromptErrorKind::DuplicateKey => {
+            SessionDefinitionPublicationError::WorkspaceRejected
+        }
+        PromptErrorKind::PromptUnavailable
+        | PromptErrorKind::InvalidRole
+        | PromptErrorKind::RequiredPromptMissing
+        | PromptErrorKind::InvalidIntent
+        | PromptErrorKind::InvalidContribution
+        | PromptErrorKind::ContextLimitExceeded
+        | PromptErrorKind::Internal => SessionDefinitionPublicationError::InternalDispatchUnavailable,
     }
 }
 
@@ -5460,9 +7632,8 @@ fn map_prompt_error(error: PromptError) -> SessionWorkspaceDefinitionError {
         | PromptErrorKind::RequiredPromptMissing
         | PromptErrorKind::InvalidIntent
         | PromptErrorKind::InvalidContribution
-        | PromptErrorKind::ContextLimitExceeded => {
-            SessionWorkspaceDefinitionError::InternalDispatchUnavailable
-        }
+        | PromptErrorKind::ContextLimitExceeded
+        | PromptErrorKind::Internal => SessionWorkspaceDefinitionError::InternalDispatchUnavailable,
     }
 }
 
@@ -5491,37 +7662,81 @@ fn map_workspace_error(error: WorkspaceResolveError) -> SessionWorkspaceDefiniti
 
 fn map_durable_definition_error(
     error: DurableSessionDefinitionError,
-) -> SessionWorkspaceDefinitionError {
+) -> SessionDefinitionPublicationError {
     match error {
-        DurableSessionDefinitionError::Closing => SessionWorkspaceDefinitionError::Closing,
+        DurableSessionDefinitionError::Closing => SessionDefinitionPublicationError::Closing,
         DurableSessionDefinitionError::SessionNotFound => {
-            SessionWorkspaceDefinitionError::SessionNotFound
+            SessionDefinitionPublicationError::SessionNotFound
         }
         DurableSessionDefinitionError::StaleRevision => {
-            SessionWorkspaceDefinitionError::StaleRevision
+            SessionDefinitionPublicationError::StaleRevision
         }
         DurableSessionDefinitionError::SessionArchived => {
-            SessionWorkspaceDefinitionError::SessionArchived
+            SessionDefinitionPublicationError::SessionArchived
         }
         DurableSessionDefinitionError::SessionDeleted => {
-            SessionWorkspaceDefinitionError::SessionDeleted
+            SessionDefinitionPublicationError::SessionDeleted
         }
         DurableSessionDefinitionError::DurableStateTooLarge => {
-            SessionWorkspaceDefinitionError::StateTooLarge
+            SessionDefinitionPublicationError::StateTooLarge
         }
         DurableSessionDefinitionError::StorageUnavailable => {
-            SessionWorkspaceDefinitionError::StorageUnavailable
+            SessionDefinitionPublicationError::StorageUnavailable
         }
         DurableSessionDefinitionError::InternalDispatchUnavailable => {
-            SessionWorkspaceDefinitionError::InternalDispatchUnavailable
+            SessionDefinitionPublicationError::InternalDispatchUnavailable
+        }
+    }
+}
+
+fn map_durable_agent_upgrade_error(
+    error: DurableSessionAgentUpgradeError,
+) -> SessionDefinitionPublicationError {
+    match error {
+        DurableSessionAgentUpgradeError::Closing => SessionDefinitionPublicationError::Closing,
+        DurableSessionAgentUpgradeError::SessionNotFound => {
+            SessionDefinitionPublicationError::SessionNotFound
+        }
+        DurableSessionAgentUpgradeError::StaleRevision => {
+            SessionDefinitionPublicationError::StaleRevision
+        }
+        DurableSessionAgentUpgradeError::SessionArchived => {
+            SessionDefinitionPublicationError::SessionArchived
+        }
+        DurableSessionAgentUpgradeError::SessionDeleted => {
+            SessionDefinitionPublicationError::SessionDeleted
+        }
+        DurableSessionAgentUpgradeError::AgentMismatch => {
+            SessionDefinitionPublicationError::AgentMismatch
+        }
+        DurableSessionAgentUpgradeError::AgentDisabled => {
+            SessionDefinitionPublicationError::AgentDisabled
+        }
+        DurableSessionAgentUpgradeError::AgentDeleted => {
+            SessionDefinitionPublicationError::AgentDeleted
+        }
+        DurableSessionAgentUpgradeError::RevisionUnavailable => {
+            SessionDefinitionPublicationError::RevisionUnavailable
+        }
+        DurableSessionAgentUpgradeError::DurableStateTooLarge => {
+            SessionDefinitionPublicationError::StateTooLarge
+        }
+        DurableSessionAgentUpgradeError::StorageUnavailable => {
+            SessionDefinitionPublicationError::StorageUnavailable
+        }
+        DurableSessionAgentUpgradeError::InternalDispatchUnavailable => {
+            SessionDefinitionPublicationError::InternalDispatchUnavailable
         }
     }
 }
 
 struct WorkspaceDefinitionRequest {
     expected_revision: SessionDefinitionRevision,
-    workspace: Workspace,
+    workspace: Option<Workspace>,
+    model: Option<SessionModelConfig>,
+    prompts: Option<SessionPromptSelection>,
     owner_timestamp: Timestamp,
+    command_id: CommandId,
     candidate_cancellation: CancellationToken,
     response: Option<
         oneshot::Sender<Result<SessionWorkspaceDefinitionOutcome, SessionWorkspaceDefinitionError>>,
@@ -5544,6 +7759,162 @@ impl WorkspaceDefinitionRequest {
 }
 
 impl Drop for WorkspaceDefinitionRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
+struct AgentUpgradeRequest {
+    expected_revision: SessionDefinitionRevision,
+    target: Option<AgentRevisionRef>,
+    owner_timestamp: Timestamp,
+    command_id: CommandId,
+    candidate_cancellation: CancellationToken,
+    response: Option<
+        oneshot::Sender<
+            Result<SessionDefinitionPublicationOutcome, SessionDefinitionPublicationError>,
+        >,
+    >,
+}
+
+impl AgentUpgradeRequest {
+    fn settle(
+        &mut self,
+        outcome: Result<SessionDefinitionPublicationOutcome, SessionDefinitionPublicationError>,
+    ) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionDefinitionPublicationError::Closing));
+    }
+}
+
+impl Drop for AgentUpgradeRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
+struct ReloadWorkspaceRequest {
+    owner_timestamp: Timestamp,
+    command_id: CommandId,
+    candidate_cancellation: CancellationToken,
+    response: Option<
+        oneshot::Sender<
+            Result<SessionDefinitionPublicationOutcome, SessionDefinitionPublicationError>,
+        >,
+    >,
+}
+
+impl ReloadWorkspaceRequest {
+    fn settle(
+        &mut self,
+        outcome: Result<SessionDefinitionPublicationOutcome, SessionDefinitionPublicationError>,
+    ) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionDefinitionPublicationError::Closing));
+    }
+}
+
+impl Drop for ReloadWorkspaceRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
+struct UpdateSessionMetadataRequest {
+    metadata: Arc<SessionMetadata>,
+    timestamp: Timestamp,
+    command_id: CommandId,
+    response:
+        Option<oneshot::Sender<Result<Arc<SessionExecutorSnapshot>, SessionMetadataPublishError>>>,
+}
+
+impl UpdateSessionMetadataRequest {
+    fn settle(
+        &mut self,
+        outcome: Result<Arc<SessionExecutorSnapshot>, SessionMetadataPublishError>,
+    ) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionMetadataPublishError::Closing));
+    }
+}
+
+impl Drop for UpdateSessionMetadataRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
+struct AgentAvailabilityRequest {
+    agent_id: crate::wire::AgentId,
+    available: bool,
+    timestamp: Timestamp,
+    command_id: CommandId,
+    candidate_cancellation: CancellationToken,
+    response: Option<oneshot::Sender<Result<(), SessionAgentAvailabilityError>>>,
+}
+
+impl AgentAvailabilityRequest {
+    fn settle(&mut self, outcome: Result<(), SessionAgentAvailabilityError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionAgentAvailabilityError::Closing));
+    }
+}
+
+impl Drop for AgentAvailabilityRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
+/// One Runtime shared-resource installation request.  The exact definition the Runtime
+/// precomputed availability against is carried as an Arc so the actor can validate by identity
+/// that no definition publication replaced it; the precomputed model/selected-Prompt facts and
+/// the new Prompt/Model roots arrive together.
+struct SharedResourceUpdateRequest {
+    expected_definition: Arc<SessionDefinition>,
+    prompt_resources: Arc<PromptResourceView>,
+    model_catalog: Arc<ModelCatalogView>,
+    prompt_available: bool,
+    model_available: bool,
+    timestamp: Timestamp,
+    command_id: CommandId,
+    candidate_cancellation: CancellationToken,
+    response: Option<oneshot::Sender<Result<(), SessionSharedResourceUpdateError>>>,
+}
+
+impl SharedResourceUpdateRequest {
+    fn settle(&mut self, outcome: Result<(), SessionSharedResourceUpdateError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionSharedResourceUpdateError::Closing));
+    }
+}
+
+impl Drop for SharedResourceUpdateRequest {
     fn drop(&mut self) {
         self.reject_closing();
     }
@@ -5640,6 +8011,33 @@ struct ResolveInteractionRequest {
     resolution: Option<InteractionResolutionInput>,
     timestamp: Timestamp,
     response: Option<oneshot::Sender<Result<(), SessionInteractionError>>>,
+}
+
+/// One graceful-Unload preparation.  The deadline is computed by the caller from the configured
+/// grace; the actor joins it into the shared deadline state where the effective deadline only
+/// shortens until it fires.  The waiter is retained by the actor until the executor is Idle (or
+/// closes).
+struct PrepareUnloadRequest {
+    deadline: tokio::time::Instant,
+    response: Option<oneshot::Sender<Result<(), SessionExecutorPrepareUnloadError>>>,
+}
+
+impl PrepareUnloadRequest {
+    fn settle(&mut self, outcome: Result<(), SessionExecutorPrepareUnloadError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionExecutorPrepareUnloadError::Closing));
+    }
+}
+
+impl Drop for PrepareUnloadRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
 }
 
 struct CancelRequest {
@@ -5799,6 +8197,9 @@ impl Drop for StartingProbeRequest {
 
 enum SessionExecutorRequest {
     Update(WorkspaceDefinitionRequest),
+    UpgradeAgent(AgentUpgradeRequest),
+    ReloadWorkspace(ReloadWorkspaceRequest),
+    PublishMetadata(UpdateSessionMetadataRequest),
     Snapshot(SnapshotRequest),
     Submit(SubmitRequest),
     FollowUp(FollowUpRequest),
@@ -5808,6 +8209,9 @@ enum SessionExecutorRequest {
     Cancel(CancelRequest),
     SecurityRevoked(SecurityRevokedRequest),
     Subscribe(SubscribeRequest),
+    SetAgentAvailability(AgentAvailabilityRequest),
+    UpdateSharedResources(SharedResourceUpdateRequest),
+    PrepareUnload(PrepareUnloadRequest),
     #[cfg(test)]
     StartingProbe(StartingProbeRequest),
 }
@@ -5816,6 +8220,9 @@ impl SessionExecutorRequest {
     fn reject_closing(&mut self) {
         match self {
             Self::Update(request) => request.reject_closing(),
+            Self::UpgradeAgent(request) => request.reject_closing(),
+            Self::ReloadWorkspace(request) => request.reject_closing(),
+            Self::PublishMetadata(request) => request.reject_closing(),
             Self::Snapshot(request) => request.reject_closing(),
             Self::Submit(request) => request.reject_closing(),
             Self::FollowUp(request) => request.reject_closing(),
@@ -5825,6 +8232,9 @@ impl SessionExecutorRequest {
             Self::Cancel(request) => request.reject_closing(),
             Self::SecurityRevoked(request) => request.reject_closing(),
             Self::Subscribe(request) => request.reject_closing(),
+            Self::SetAgentAvailability(request) => request.reject_closing(),
+            Self::UpdateSharedResources(request) => request.reject_closing(),
+            Self::PrepareUnload(request) => request.reject_closing(),
             #[cfg(test)]
             Self::StartingProbe(request) => request.reject_closing(),
         }
@@ -6477,7 +8887,7 @@ mod tests {
         RecorderWriteBarrier, load_replayed_conversation_with_barrier_for_test,
     };
     use crate::durable_state::DurableState;
-    use crate::model_gateway::ScriptedModelFixture;
+    use crate::model_gateway::{ModelSelection, ReasoningPreference, ScriptedModelFixture};
     use crate::prompt::{PromptBodyIntent, TextIntent};
     use crate::runtime_task::RuntimeTaskContext;
     use crate::wire::{CanonicalFileUri, FileUriFamily, RequestId, SessionId};
@@ -6678,6 +9088,7 @@ mod tests {
         state: DurableState,
         executor: SessionExecutor,
         definition: Arc<SessionDefinition>,
+        resolver: Arc<WorkspaceResolver>,
         lifecycle_closing: CancellationToken,
     }
 
@@ -6783,6 +9194,24 @@ mod tests {
         create_file(&g1.join("COMMITTED"), b"");
     }
 
+    fn create_fixture_agent_g2(root: &Path) {
+        let generation = root
+            .join("agents")
+            .join(AGENT_ID)
+            .join("generations")
+            .join(G2);
+        create_dir(&generation);
+        create_file(
+            &generation.join("head.json"),
+            include_bytes!("../docs/fixtures/durable-store-v1/agent-head-2-definition.json"),
+        );
+        create_file(
+            &generation.join("definition.json"),
+            include_bytes!("../docs/fixtures/durable-store-v1/agent-definition-2.json"),
+        );
+        create_file(&generation.join("COMMITTED"), b"");
+    }
+
     fn conversation_header_fixture() -> Vec<u8> {
         format!(
             "{{\"type\":\"session_header\",\"data\":{{\"formatVersion\":1,\"sessionId\":\"{SESSION_ID}\",\"createdAt\":\"2026-08-03T10:01:00.456Z\",\"initialAgent\":{{\"agentId\":\"{AGENT_ID}\",\"revision\":\"ar_1\"}},\"initialDefinitionRevision\":\"sdr_1\"}}}}\n"
@@ -6849,7 +9278,7 @@ mod tests {
         let executor = SessionExecutor::start_loaded_ready_idle_without_conversation(
             context.clone(),
             state.clone(),
-            resolver,
+            resolver.clone(),
             prompt_service,
             Arc::clone(&definition),
             workspace_snapshot,
@@ -6860,6 +9289,7 @@ mod tests {
             state,
             executor,
             definition,
+            resolver,
             lifecycle_closing: CancellationToken::new(),
         }
     }
@@ -6954,7 +9384,7 @@ mod tests {
             SessionExecutorDependencies::with_turn_resources_and_tools_and_compaction(
                 context.clone(),
                 state.clone(),
-                resolver,
+                Arc::clone(&resolver),
                 Arc::clone(&prompt_service),
                 prompt_resources,
                 Arc::clone(model.gateway()),
@@ -6977,6 +9407,7 @@ mod tests {
             state,
             executor,
             definition,
+            resolver,
             lifecycle_closing,
         }
     }
@@ -10765,5 +13196,926 @@ mod tests {
         loaded.state.close().await;
         assert_eq!(loaded.context.registered_task_count_for_test(), 0);
         let _ = loaded.context;
+    }
+
+    fn text_intent(text: &str) -> PromptIntent {
+        PromptIntent::new(
+            PromptBodyIntent::Text(TextIntent::new(text).unwrap()),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn unknown_model_config() -> SessionModelConfig {
+        SessionModelConfig::new(
+            ModelSelection::new("openai".parse().unwrap(), "gpt-99".parse().unwrap()),
+            ReasoningPreference::High,
+            None,
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn future_only_model_update_during_running_preserves_turn_and_changes_next_admission() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["first answer"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_before_agent_run_attempt();
+        let turn_id = loaded
+            .executor
+            .submit(CommandId::generate().unwrap(), text_intent("hello"))
+            .await
+            .expect("the first Turn starts");
+        hooks.wait_before_agent_run_attempt().await;
+
+        let before = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(before.definition_revision().get(), 1);
+        assert_eq!(before.execution_state(), SessionExecutionState::Running);
+
+        let update = loaded
+            .executor
+            .update_session_definition_with_cancellation(
+                before.definition_revision(),
+                None,
+                Some(unknown_model_config()),
+                None,
+                "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                CommandId::generate().unwrap(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a future-only definition update succeeds during Running");
+        assert!(update.changed());
+        assert_eq!(update.definition_revision().get(), 2);
+        assert_eq!(update.workspace_revision().get(), 1);
+
+        // The installed snapshot preserves the exact WorkspaceSnapshot, current Turn, and
+        // execution state while carrying the new definition revision.
+        let during = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(during.definition_revision().get(), 2);
+        assert!(Arc::ptr_eq(during.workspace(), before.workspace()));
+        assert_eq!(during.workspace_revision().get(), 1);
+        assert_eq!(during.current_turn(), Some(turn_id));
+        assert_eq!(during.execution_state(), SessionExecutionState::Running);
+        let durable = loaded.state.session_current_definition(session_id).unwrap();
+        assert_eq!(durable.revision().get(), 2);
+        assert_eq!(durable.model().selection().model_id().as_str(), "gpt-99");
+
+        hooks.release_before_agent_run_attempt();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        // The active Turn ran to completion against its already-captured old model.
+        assert_eq!(model.request_count(), 1);
+
+        // A future admission reads the new current definition: the replaced model is not in the
+        // catalog, so the next Turn cannot capture it.
+        assert_eq!(
+            loaded
+                .executor
+                .submit(CommandId::generate().unwrap(), text_intent("second"))
+                .await,
+            Err(SessionSubmitError::DependencyUnavailable)
+        );
+        let settled = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(settled.execution_state(), SessionExecutionState::Idle);
+        assert_eq!(settled.definition_revision().get(), 2);
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_change_during_running_is_busy_but_stale_still_wins() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["first answer"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_before_agent_run_attempt();
+        let turn_id = loaded
+            .executor
+            .submit(CommandId::generate().unwrap(), text_intent("hello"))
+            .await
+            .expect("the Turn starts");
+        hooks.wait_before_agent_run_attempt().await;
+        let running = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(running.execution_state(), SessionExecutionState::Running);
+
+        // A true Workspace semantic change is only accepted while Idle.
+        assert_eq!(
+            loaded
+                .executor
+                .update_workspace_definition(
+                    running.definition_revision(),
+                    changed_workspace(&store.new_workspace),
+                    "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                )
+                .await,
+            Err(SessionWorkspaceDefinitionError::SessionBusy)
+        );
+        // Stale beats busy for a changed-Workspace request during Running.
+        assert_eq!(
+            loaded
+                .executor
+                .update_workspace_definition(
+                    "sdr_99".parse().unwrap(),
+                    changed_workspace(&store.new_workspace),
+                    "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                )
+                .await,
+            Err(SessionWorkspaceDefinitionError::StaleRevision)
+        );
+        let unchanged = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(unchanged.definition_revision().get(), 1);
+
+        hooks.release_before_agent_run_attempt();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 1);
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn definition_update_never_touches_conversation_bytes_or_recorder_health() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["first answer"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let turn_id = loaded
+            .executor
+            .submit(CommandId::generate().unwrap(), text_intent("hello"))
+            .await
+            .expect("the Turn starts");
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        let conversation_path = store.session_path().join("conversation.jsonl");
+        let after_turn = fs::read(&conversation_path).unwrap();
+        assert!(after_turn.len() > conversation_header_fixture().len());
+        let recorder = loaded.executor.recorder_for_test().unwrap();
+        assert!(matches!(&*recorder.health(), RecordingHealth::Healthy));
+
+        let before = loaded.executor.snapshot().await.unwrap();
+        let updated = loaded
+            .executor
+            .update_session_definition_with_cancellation(
+                before.definition_revision(),
+                None,
+                Some(unknown_model_config()),
+                None,
+                "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                CommandId::generate().unwrap(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the Idle future-only update publishes");
+        assert!(updated.changed());
+        assert_eq!(fs::read(&conversation_path).unwrap(), after_turn);
+        assert!(matches!(&*recorder.health(), RecordingHealth::Healthy));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_follow_up_survives_terminal_publication_race_and_starts_after_settlement() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["first answer", "second answer"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        let follow_up_id = CommandId::generate().unwrap();
+
+        // Hold the future-only publication between its durable commit and its snapshot install
+        // so the first Turn terminal observes an active publication.
+        hooks.arm_after_commit_before_install();
+        hooks.arm_before_agent_run_attempt();
+        let turn_id = loaded
+            .executor
+            .submit(CommandId::generate().unwrap(), text_intent("hello"))
+            .await
+            .expect("the first Turn starts");
+        hooks.wait_before_agent_run_attempt().await;
+        let running = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(running.definition_revision().get(), 1);
+        let publication = {
+            let executor = loaded.executor.clone();
+            tokio::spawn(async move {
+                executor
+                    .update_session_definition_with_cancellation(
+                        running.definition_revision(),
+                        None,
+                        Some(unknown_model_config()),
+                        None,
+                        "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                        CommandId::generate().unwrap(),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        hooks.wait_after_commit_before_install().await;
+        loaded
+            .executor
+            .follow_up(follow_up_id, text_intent("queued follow up"))
+            .await
+            .expect("the FollowUp is queued while the Turn runs");
+        let queued = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(queued.follow_up_command_ids(), [follow_up_id]);
+
+        // The Turn terminates while the publication is still active; the FollowUp stays queued.
+        hooks.release_before_agent_run_attempt();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 1);
+        let terminal = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(terminal.follow_up_command_ids(), [follow_up_id]);
+
+        // Once the publication settles, the queued FollowUp starts against the new current
+        // definition: it is popped and its admission captures the replaced model, which is not
+        // in the catalog.
+        hooks.release_after_commit_before_install();
+        assert!(publication.await.unwrap().unwrap().changed());
+        assert_eq!(
+            loaded
+                .executor
+                .snapshot()
+                .await
+                .unwrap()
+                .definition_revision()
+                .get(),
+            2
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = loaded.executor.snapshot().await.unwrap();
+                if snapshot.follow_up_command_ids().is_empty()
+                    && snapshot.execution_state() == SessionExecutionState::Idle
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the FollowUp leaves the queue after the publication settles");
+        // The FollowUp admission consumed the updated definition and failed capture; the first
+        // Turn's single model request is unchanged.
+        assert_eq!(model.request_count(), 1);
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_upgrade_while_loaded_idle_pins_revision_and_preserves_workspace_snapshot() {
+        let store = TempStore::new();
+        create_fixture_agent_g2(&store.root);
+        let loaded = loaded_fixture(&store).await;
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let before = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(before.definition_revision().get(), 1);
+        assert_eq!(before.definition().agent().revision().get(), 1);
+
+        let command_id = CommandId::generate().unwrap();
+        let owner_timestamp = "2026-08-03T10:02:00.000Z".parse().unwrap();
+        let upgraded = loaded
+            .executor
+            .upgrade_session_agent_with_cancellation(
+                before.definition_revision(),
+                None,
+                owner_timestamp,
+                command_id,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the loaded Idle Agent upgrade publishes");
+        assert!(upgraded.changed());
+        assert_eq!(upgraded.definition_revision().get(), 2);
+        assert_eq!(upgraded.workspace_revision().get(), 1);
+
+        // The exact post-install snapshot keeps the same WorkspaceSnapshot and every non-Agent
+        // durable fact while carrying the checked successor revision at the new Agent ref.
+        let during = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(during.definition_revision().get(), 2);
+        assert_eq!(during.definition().agent().revision().get(), 2);
+        assert_eq!(
+            during.definition().agent().agent_id(),
+            before.definition().agent().agent_id()
+        );
+        assert!(Arc::ptr_eq(during.workspace(), before.workspace()));
+        assert_eq!(during.workspace_revision().get(), 1);
+        assert_eq!(
+            during.definition().workspace(),
+            before.definition().workspace()
+        );
+        assert_eq!(during.definition().model(), before.definition().model());
+        assert_eq!(during.definition().prompts(), before.definition().prompts());
+        assert_eq!(during.definition().created_at(), owner_timestamp);
+        let durable = loaded
+            .state
+            .session_current_definition(SESSION_ID.parse().unwrap())
+            .unwrap();
+        assert_eq!(durable.revision().get(), 2);
+        assert_eq!(durable.agent().revision().get(), 2);
+
+        // The exact existing DefinitionUpdated executor event carries the owner command id and
+        // timestamp with the post-install snapshot.
+        let event = subscription
+            .recv()
+            .await
+            .expect("the Agent upgrade publishes one executor event");
+        match event.as_ref() {
+            SessionExecutorEvent::DefinitionUpdated {
+                timestamp,
+                command_id: event_command_id,
+                snapshot,
+            } => {
+                assert_eq!(*timestamp, owner_timestamp);
+                assert_eq!(*event_command_id, command_id);
+                assert_eq!(snapshot.definition_revision().get(), 2);
+                assert_eq!(snapshot.definition().agent().revision().get(), 2);
+            }
+            _ => panic!("the Agent upgrade publishes exactly one DefinitionUpdated event"),
+        }
+        // No Recorder call and no conversation write.
+        assert_eq!(
+            fs::read(store.session_path().join("conversation.jsonl")).unwrap(),
+            conversation_header_fixture()
+        );
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_upgrade_same_pin_is_nochange_without_event_or_install() {
+        let store = TempStore::new();
+        let loaded = loaded_fixture(&store).await;
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let before = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(before.definition().agent().revision().get(), 1);
+
+        let noop = loaded
+            .executor
+            .upgrade_session_agent_with_cancellation(
+                before.definition_revision(),
+                Some(AgentRevisionRef::new(
+                    before.definition().agent().agent_id(),
+                    "ar_1".parse().unwrap(),
+                )),
+                "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                CommandId::generate().unwrap(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the same-pin upgrade returns a typed outcome");
+        assert!(!noop.changed());
+        assert_eq!(noop.definition_revision().get(), 1);
+        assert_eq!(noop.workspace_revision().get(), 1);
+
+        // A canonical no-op installs nothing: the same immutable snapshot Arc stays published.
+        let after = loaded.executor.snapshot().await.unwrap();
+        assert!(Arc::ptr_eq(&after, &before), "a no-op installs no snapshot");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), subscription.recv())
+                .await
+                .is_err(),
+            "a no-op publishes no executor event"
+        );
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_upgrade_stale_wins_and_rejects_wrong_and_unavailable_targets() {
+        let store = TempStore::new();
+        create_fixture_agent_g2(&store.root);
+        let loaded = loaded_fixture(&store).await;
+        let before = loaded.executor.snapshot().await.unwrap();
+        let owner_timestamp = "2026-08-03T10:02:00.000Z".parse().unwrap();
+
+        // Stale beats an exact same-pin no-op.
+        assert_eq!(
+            loaded
+                .executor
+                .upgrade_session_agent_with_cancellation(
+                    "sdr_99".parse().unwrap(),
+                    Some(before.definition().agent()),
+                    owner_timestamp,
+                    CommandId::generate().unwrap(),
+                    CancellationToken::new(),
+                )
+                .await,
+            Err(SessionDefinitionPublicationError::StaleRevision)
+        );
+
+        // A target pinned to another Agent is rejected.
+        assert_eq!(
+            loaded
+                .executor
+                .upgrade_session_agent_with_cancellation(
+                    before.definition_revision(),
+                    Some(AgentRevisionRef::new(
+                        "agt_22222222222222222222222222222222".parse().unwrap(),
+                        "ar_1".parse().unwrap(),
+                    )),
+                    owner_timestamp,
+                    CommandId::generate().unwrap(),
+                    CancellationToken::new(),
+                )
+                .await,
+            Err(SessionDefinitionPublicationError::AgentMismatch)
+        );
+
+        // A future or non-retained revision is unavailable.
+        assert_eq!(
+            loaded
+                .executor
+                .upgrade_session_agent_with_cancellation(
+                    before.definition_revision(),
+                    Some(AgentRevisionRef::new(
+                        before.definition().agent().agent_id(),
+                        "ar_99".parse().unwrap(),
+                    )),
+                    owner_timestamp,
+                    CommandId::generate().unwrap(),
+                    CancellationToken::new(),
+                )
+                .await,
+            Err(SessionDefinitionPublicationError::RevisionUnavailable)
+        );
+
+        // No rejected request changed the installed definition or emitted an event.
+        let unchanged = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(unchanged.definition_revision().get(), 1);
+        assert_eq!(unchanged.definition().agent().revision().get(), 1);
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_upgrade_during_running_preserves_active_turn_and_next_admission_uses_new_ref() {
+        let store = TempStore::new();
+        create_fixture_agent_g2(&store.root);
+        let model = ScriptedModelFixture::new(vec!["first answer", "second answer"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_before_agent_run_attempt();
+        let turn_id = loaded
+            .executor
+            .submit(CommandId::generate().unwrap(), text_intent("hello"))
+            .await
+            .expect("the first Turn starts");
+        hooks.wait_before_agent_run_attempt().await;
+        let running = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(running.execution_state(), SessionExecutionState::Running);
+        assert_eq!(running.definition().agent().revision().get(), 1);
+
+        // The Workspace root disappears before the upgrade.  An Agent upgrade never invokes the
+        // Workspace resolver, so it still succeeds without touching the Snapshot.
+        fs::remove_dir_all(&store.old_workspace).unwrap();
+        let upgraded = loaded
+            .executor
+            .upgrade_session_agent_with_cancellation(
+                running.definition_revision(),
+                None,
+                "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                CommandId::generate().unwrap(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the Agent upgrade succeeds during Running without the resolver");
+        assert!(upgraded.changed());
+        assert_eq!(upgraded.definition_revision().get(), 2);
+
+        // The installed snapshot keeps the exact WorkspaceSnapshot and active Turn while
+        // carrying the new Agent ref: the already-captured Turn context is untouched.
+        let during = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(during.execution_state(), SessionExecutionState::Running);
+        assert_eq!(during.current_turn(), Some(turn_id));
+        assert_eq!(during.definition_revision().get(), 2);
+        assert_eq!(during.definition().agent().revision().get(), 2);
+        assert!(Arc::ptr_eq(during.workspace(), running.workspace()));
+
+        hooks.release_before_agent_run_attempt();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 1);
+
+        // A future admission reads the new installed definition and resolves the new Agent ref
+        // from durable state, so it captures against ar_2.  The test PromptService only carries
+        // the prompts patched into the ar_1 fixture definitions, so ar_2's prompt selection is
+        // unavailable and the admission fails with Prompt instead of starting a second Turn.  If
+        // the stale ar_1 capture were wrongly reused, the "second answer" model request would
+        // run instead, so the Prompt failure itself proves the admission used the new Agent ref.
+        assert_eq!(
+            loaded
+                .executor
+                .submit(CommandId::generate().unwrap(), text_intent("second"))
+                .await,
+            Err(SessionSubmitError::Prompt)
+        );
+        let admitted = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(admitted.execution_state(), SessionExecutionState::Idle);
+        assert_eq!(admitted.current_turn(), None);
+        assert_eq!(admitted.definition().agent().revision().get(), 2);
+        assert_eq!(model.request_count(), 1);
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_upgrade_terminal_race_keeps_follow_up_and_hands_off_against_new_ref() {
+        let store = TempStore::new();
+        create_fixture_agent_g2(&store.root);
+        let model = ScriptedModelFixture::new(vec!["first answer", "second answer"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        let follow_up_id = CommandId::generate().unwrap();
+
+        // Hold the Agent upgrade between its durable commit and its snapshot install so the
+        // first Turn terminal observes an active publication.
+        hooks.arm_after_commit_before_install();
+        hooks.arm_before_agent_run_attempt();
+        let turn_id = loaded
+            .executor
+            .submit(CommandId::generate().unwrap(), text_intent("hello"))
+            .await
+            .expect("the first Turn starts");
+        hooks.wait_before_agent_run_attempt().await;
+        let running = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(running.definition().agent().revision().get(), 1);
+        let publication = {
+            let executor = loaded.executor.clone();
+            tokio::spawn(async move {
+                executor
+                    .upgrade_session_agent_with_cancellation(
+                        running.definition_revision(),
+                        None,
+                        "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                        CommandId::generate().unwrap(),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        hooks.wait_after_commit_before_install().await;
+        loaded
+            .executor
+            .follow_up(follow_up_id, text_intent("queued follow up"))
+            .await
+            .expect("the FollowUp is queued while the Turn runs");
+        let queued = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(queued.follow_up_command_ids(), [follow_up_id]);
+
+        // The Turn terminates while the publication is still active; the FollowUp stays queued.
+        hooks.release_before_agent_run_attempt();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 1);
+        let terminal = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(terminal.follow_up_command_ids(), [follow_up_id]);
+        assert_eq!(terminal.definition().agent().revision().get(), 1);
+
+        // Once the upgrade settles, the queued FollowUp is handed off against the new Agent ref.
+        // ar_2's prompts are unavailable in the test PromptService, so its admission capture
+        // fails with Prompt and the FollowUp drains without a model request; reusing the stale
+        // ar_1 capture would have produced the "second answer" model request instead.
+        hooks.release_after_commit_before_install();
+        assert!(publication.await.unwrap().unwrap().changed());
+        assert_eq!(
+            loaded
+                .executor
+                .snapshot()
+                .await
+                .unwrap()
+                .definition()
+                .agent()
+                .revision()
+                .get(),
+            2
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = loaded.executor.snapshot().await.unwrap();
+                if snapshot.follow_up_command_ids().is_empty()
+                    && snapshot.execution_state() == SessionExecutionState::Idle
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the FollowUp leaves the queue after the upgrade settles");
+        assert_eq!(
+            loaded
+                .executor
+                .snapshot()
+                .await
+                .unwrap()
+                .definition()
+                .agent()
+                .revision()
+                .get(),
+            2
+        );
+        assert_eq!(model.request_count(), 1);
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_upgrade_postcommit_install_failure_is_fatal() {
+        let store = TempStore::new();
+        create_fixture_agent_g2(&store.root);
+        let loaded = loaded_fixture(&store).await;
+        let hooks = loaded.executor.test_hooks();
+        let before = loaded.executor.snapshot().await.unwrap();
+        hooks.fail_next_snapshot_install_after_commit();
+        let result = loaded
+            .executor
+            .upgrade_session_agent_with_cancellation(
+                before.definition_revision(),
+                None,
+                "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                CommandId::generate().unwrap(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            result,
+            Err(SessionDefinitionPublicationError::InternalDispatchUnavailable)
+        );
+        // The durable commit happened before the fatal install; the executor actor and shared
+        // owners are poisoned and closing.
+        let durable = loaded
+            .state
+            .session_current_definition(SESSION_ID.parse().unwrap())
+            .unwrap();
+        assert_eq!(durable.revision().get(), 2);
+        assert_eq!(durable.agent().revision().get(), 2);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            loaded.executor.wait_until_closing_for_test(),
+        )
+        .await
+        .expect("the poisoned executor enters closing");
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_workspace_while_idle_installs_new_snapshot_and_publishes_exact_event() {
+        let store = TempStore::new();
+        let loaded = loaded_fixture(&store).await;
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let before = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(before.definition_revision().get(), 1);
+        assert_eq!(before.workspace_revision().get(), 1);
+        assert_eq!(before.execution_state(), SessionExecutionState::Idle);
+
+        let command_id = CommandId::generate().unwrap();
+        let owner_timestamp = "2026-08-03T10:02:00.000Z".parse().unwrap();
+        let reloaded = loaded
+            .executor
+            .reload_workspace_with_cancellation(
+                owner_timestamp,
+                command_id,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the loaded Idle Workspace reload publishes");
+        assert!(reloaded.changed());
+        assert_eq!(reloaded.definition_revision().get(), 1);
+        assert_eq!(reloaded.workspace_revision().get(), 1);
+
+        // The reload is always a real reload: a fresh WorkspaceSnapshot Arc is installed while
+        // the exact installed definition Arc and Workspace revision are preserved.
+        let after = loaded.executor.snapshot().await.unwrap();
+        assert!(!Arc::ptr_eq(after.workspace(), before.workspace()));
+        assert_eq!(after.workspace_revision().get(), 1);
+        assert_eq!(
+            after.workspace().session_id(),
+            before.workspace().session_id()
+        );
+        assert!(Arc::ptr_eq(after.definition(), before.definition()));
+        assert_eq!(after.definition_revision().get(), 1);
+        assert_eq!(after.execution_state(), SessionExecutionState::Idle);
+        assert_eq!(after.metadata().revision(), before.metadata().revision());
+        // The durable definition is untouched: the Store generation is unchanged.
+        assert_eq!(
+            loaded
+                .state
+                .session_head(SESSION_ID.parse().unwrap())
+                .unwrap()
+                .storage_generation()
+                .get(),
+            1
+        );
+
+        // The exact WorkspaceReloaded executor event carries the owner command id and timestamp
+        // with the post-install snapshot.
+        let event = subscription
+            .recv()
+            .await
+            .expect("the reload publishes one executor event");
+        match event.as_ref() {
+            SessionExecutorEvent::WorkspaceReloaded {
+                timestamp,
+                command_id: event_command_id,
+                snapshot,
+            } => {
+                assert_eq!(*timestamp, owner_timestamp);
+                assert_eq!(*event_command_id, command_id);
+                assert_eq!(snapshot.workspace_revision().get(), 1);
+                assert_eq!(snapshot.definition_revision().get(), 1);
+            }
+            _ => panic!("the reload publishes exactly one WorkspaceReloaded event"),
+        }
+        // No Recorder call and no conversation write.
+        assert_eq!(
+            fs::read(store.session_path().join("conversation.jsonl")).unwrap(),
+            conversation_header_fixture()
+        );
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_workspace_ordinary_failure_preserves_old_snapshot_and_no_event_then_recovers() {
+        let store = TempStore::new();
+        let loaded = loaded_fixture(&store).await;
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let before = loaded.executor.snapshot().await.unwrap();
+        let before_definition = Arc::clone(before.definition());
+        let before_workspace = Arc::clone(before.workspace());
+
+        // A missing root is an ordinary resolver failure: the exact old snapshot Arc is kept and
+        // no event is published.
+        fs::remove_dir_all(&store.old_workspace).unwrap();
+        assert_eq!(
+            loaded
+                .executor
+                .reload_workspace_with_cancellation(
+                    "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                    CommandId::generate().unwrap(),
+                    CancellationToken::new(),
+                )
+                .await,
+            Err(SessionDefinitionPublicationError::WorkspaceUnavailable)
+        );
+        let after_failure = loaded.executor.snapshot().await.unwrap();
+        assert!(Arc::ptr_eq(&after_failure, &before));
+        assert!(Arc::ptr_eq(after_failure.workspace(), &before_workspace));
+        assert!(Arc::ptr_eq(after_failure.definition(), &before_definition));
+        assert_eq!(after_failure.workspace_revision().get(), 1);
+        assert_eq!(loaded.definition.revision().get(), 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), subscription.recv())
+                .await
+                .is_err(),
+            "a failed reload publishes no executor event"
+        );
+
+        // Restoring the root makes the next reload succeed with a fresh snapshot Arc.
+        create_dir(&store.old_workspace);
+        create_dir(&store.old_workspace.join("src"));
+        let recovered = loaded
+            .executor
+            .reload_workspace_with_cancellation(
+                "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                CommandId::generate().unwrap(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the restored Workspace reloads");
+        assert!(recovered.changed());
+        assert_eq!(recovered.workspace_revision().get(), 1);
+        let after_recovery = loaded.executor.snapshot().await.unwrap();
+        assert!(!Arc::ptr_eq(after_recovery.workspace(), &before_workspace));
+        assert_eq!(after_recovery.workspace_revision().get(), 1);
+        assert!(Arc::ptr_eq(after_recovery.definition(), &before_definition));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_workspace_during_running_is_busy_without_resolver_calls() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["first answer"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let resolver_hooks = loaded.resolver.test_hooks();
+        let hooks = loaded.executor.test_hooks();
+        resolver_hooks.arm_after_candidate_before_final_recheck();
+
+        // A reload during Running is Busy before any resolver call.
+        hooks.arm_before_agent_run_attempt();
+        let turn_id = loaded
+            .executor
+            .submit(CommandId::generate().unwrap(), text_intent("hello"))
+            .await
+            .expect("the first Turn starts");
+        hooks.wait_before_agent_run_attempt().await;
+        assert_eq!(
+            loaded
+                .executor
+                .reload_workspace_with_cancellation(
+                    "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                    CommandId::generate().unwrap(),
+                    CancellationToken::new(),
+                )
+                .await,
+            Err(SessionDefinitionPublicationError::SessionBusy)
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                resolver_hooks.wait_after_candidate_before_final_recheck(),
+            )
+            .await
+            .is_err(),
+            "the Busy reload never invokes the resolver"
+        );
+        let busy_snapshot = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(
+            busy_snapshot.execution_state(),
+            SessionExecutionState::Running
+        );
+
+        hooks.release_before_agent_run_attempt();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 1);
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_workspace_uses_the_single_publication_slot_both_directions() {
+        let store = TempStore::new();
+        let loaded = loaded_fixture(&store).await;
+        let resolver_hooks = loaded.resolver.test_hooks();
+        let hooks = loaded.executor.test_hooks();
+
+        // A reload while another publication occupies the single active slot is Busy.
+        hooks.arm_after_candidate_snapshot_finish_before_durable();
+        let idle = loaded.executor.snapshot().await.unwrap();
+        let executor = loaded.executor.clone();
+        let new_workspace = store.new_workspace.clone();
+        let publication = tokio::spawn(async move {
+            executor
+                .update_workspace_definition(
+                    idle.definition_revision(),
+                    changed_workspace(&new_workspace),
+                    "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                )
+                .await
+        });
+        hooks
+            .wait_after_candidate_snapshot_finish_before_durable()
+            .await;
+        assert_eq!(
+            loaded
+                .executor
+                .reload_workspace_with_cancellation(
+                    "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                    CommandId::generate().unwrap(),
+                    CancellationToken::new(),
+                )
+                .await,
+            Err(SessionDefinitionPublicationError::SessionBusy)
+        );
+        hooks.release_after_candidate_snapshot_finish_before_durable();
+        assert!(publication.await.unwrap().unwrap().changed());
+
+        // The reverse exclusion also holds: a reload in flight makes an ordinary update Busy.
+        resolver_hooks.arm_after_candidate_before_final_recheck();
+        let reloaded_executor = loaded.executor.clone();
+        let reload = tokio::spawn(async move {
+            reloaded_executor
+                .reload_workspace_with_cancellation(
+                    "2026-08-03T10:04:00.000Z".parse().unwrap(),
+                    CommandId::generate().unwrap(),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        // Hold the reload worker at the resolver barrier so the publication slot is occupied.
+        resolver_hooks
+            .wait_after_candidate_before_final_recheck()
+            .await;
+        let running = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(
+            loaded
+                .executor
+                .update_workspace_definition(
+                    running.definition_revision(),
+                    changed_workspace(&store.new_workspace),
+                    "2026-08-03T10:05:00.000Z".parse().unwrap(),
+                )
+                .await,
+            Err(SessionWorkspaceDefinitionError::SessionBusy)
+        );
+        resolver_hooks.release_after_candidate_before_final_recheck();
+        let outcome = reload.await.unwrap().expect("the held reload completes");
+        assert!(outcome.changed());
+        close_loaded(loaded).await;
     }
 }

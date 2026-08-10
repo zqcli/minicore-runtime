@@ -976,6 +976,8 @@ loaded Session要求SessionExecutionState = Idle；否则SessionBusy
 
 `/reload workspace`重新解析Workspace facts并重新捕获Workspace-bound Prompt/Skill source；它不替换shared Prompt/Skill/Tool/Model roots。authority hard restriction后的mandatory re-resolve若失败仍进入Unavailable；该security路径不同于用户发起且允许保留old Snapshot的reload。
 
+实现状态：Unavailable + success恢复Ready与Unavailable + failure保持Unavailable已在loaded residency落地（reload失败不安装、不发事件，保留原Unavailable cause；成功安装exact WorkspaceSnapshot并发布`session_workspace_reloaded`）。Load时的Workspace/Prompt resolve、capture与revalidation普通失败同样安装Unavailable+Idle loaded Session而非Load error。Agent readiness fan-out后，ReloadWorkspace与true Workspace definition update只清除resource cause：若Agent仍Disabled/Deleted，Session保持`Unavailable(AgentUnavailable)`（保留last-good WorkspaceSnapshot），重新Enable后才恢复底层Ready或原resource Unavailable；具体见[agent-session-lifecycle](agent-session-lifecycle.md#session-readiness)。
+
 ### Unload
 
 Workspace 没有独立 unload lifecycle。
@@ -1359,5 +1361,7 @@ upload / telemetry
 - [x] 冻结Idle-only public update payload：只CAS SessionDefinitionRevision，WorkspaceDefinitionInput不携带WorkspaceRevision（ADR 0133）。
 - [x] 冻结WorkspaceUnavailable → SessionNotReady/UserActionRequired公开映射；
 - [x] 对齐Session lifecycle、definition revision、load/readiness、Idle-only update和security interruption语义；
+- [x] 实现loaded Workspace/Prompt Unavailable readiness与ReloadWorkspace恢复：Load在resolve/capture/revalidation普通失败时安装带Unavailable cause的loaded executor（conversation照常replay并初始化Recorder），非Ready+Idle Session对Submit返回typed SessionNotReady；ReloadWorkspace与true Workspace definition update在Unavailable+Idle可恢复Ready，future-only Model/Prompt与Agent upgrade保持Unavailable；Agent/Model/RuntimeDependency cause、Preparing与readiness invalidation event仍pending。
+- [x] 实现Agent readiness fan-out：Agent Disabled/Deleted的Load仍返回Loaded并投影`Unavailable(AgentUnavailable)`（保留last-good WorkspaceSnapshot与底层resource cause），active Turn不变、future admission拒绝，Enable恢复底层Ready或原resource Unavailable；ReloadWorkspace/true Workspace update只清除resource cause，`SetStatus/Delete` durable Updated后Runtime按同一owner timestamp经residency per-Session gate逐个fan-out并仅在readiness真实变化时发布`SessionReadinessChanged`；Model/RuntimeDependency cause、Preparing、security invalidation与full recovery scenarios仍pending。
 - [x] conversation JSONL不保存Turn-start Workspace摘要；WorkspaceSnapshotRef与WorkspaceRevision execution binding均不进入recording。
 - [x] 实现M6.1 crate-private resolver/snapshot foundation：owner-tracked local canonicalization、duplicate/overlap/cwd校验、fail-closed restricted authority、exact authority-request binding、Prompt/Skill capture contexts与immutable Snapshot；Workspace Prompt candidate capture已接入Load与loaded Idle Workspace publication并保持candidate失败不发布，actual filesystem discovery、Skill capture、Tool access view和security integration仍由后续slice消费。

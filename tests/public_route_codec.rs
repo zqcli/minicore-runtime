@@ -4,8 +4,8 @@ use minicore_runtime::runtime_interface::{
     ProgressEventKind, ProgressUpdate, QueryErrorCode, QueryResult, RuntimeCommand,
     RuntimeDispatchError, RuntimeEventDetail, RuntimeLifecycleCommand, RuntimeQuery,
     RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest, RuntimeStateEventKind, SessionCommand,
-    SessionLifecycleView, SessionQuery, SessionQueryResult, SessionSummary, SnapshotRequest,
-    StateEvent, StateEventMsg, SubscriptionClosed, SubscriptionScope,
+    SessionLifecycleView, SessionQuery, SessionQueryResult, SessionStateEventKind, SessionSummary,
+    SnapshotRequest, StateEvent, StateEventMsg, SubscriptionClosed, SubscriptionScope,
 };
 use minicore_runtime::tools::ToolCallId;
 use minicore_runtime::wire::{
@@ -711,4 +711,671 @@ fn command_root_reports_manifest_stable_decode_faults() {
 
 fn without_lf(input: &[u8]) -> Vec<u8> {
     input.strip_suffix(b"\n").unwrap_or(input).to_vec()
+}
+
+#[test]
+fn session_metadata_updated_events_reject_mismatched_contracts_and_round_trip_valid_frames() {
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+
+    let runtime_frame = include_bytes!(
+        "../docs/fixtures/wire-v1/public/valid/session-metadata-updated-runtime-state-frame.json"
+    );
+    let frame = protocol.decode_event_frame(runtime_frame).unwrap();
+    let EventFrame::State(event) = &frame else {
+        panic!("the Runtime metadata fixture decodes as a StateEvent");
+    };
+    assert!(matches!(
+        event.msg(),
+        StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::SessionMetadataUpdated,
+            detail: Some(RuntimeEventDetail::SessionChanged { .. }),
+            ..
+        }
+    ));
+    assert_eq!(
+        protocol.encode_event_frame(&frame).unwrap(),
+        without_lf(runtime_frame)
+    );
+
+    let session_frame = include_bytes!(
+        "../docs/fixtures/wire-v1/public/valid/session-metadata-updated-session-state-frame.json"
+    );
+    let frame = protocol.decode_event_frame(session_frame).unwrap();
+    let EventFrame::State(event) = &frame else {
+        panic!("the Session metadata fixture decodes as a StateEvent");
+    };
+    assert_eq!(
+        event.route(),
+        EventRoute::Session {
+            session_id: "ses_22222222222222222222222222222222".parse().unwrap()
+        }
+    );
+    assert_eq!(
+        event.msg().session_kind(),
+        Some(minicore_runtime::runtime_interface::SessionStateEventKind::SessionMetadataUpdated)
+    );
+    assert!(event.msg().session_detail().is_none());
+    assert_eq!(
+        protocol.encode_event_frame(&frame).unwrap(),
+        without_lf(session_frame)
+    );
+
+    // The Runtime-scope contract rejects a Deleted lifecycle summary.
+    let mut value: serde_json::Value =
+        serde_json::from_slice(runtime_frame).expect("the fixture is JSON");
+    value["data"]["msg"]["data"]["detail"]["data"]["session"]["lifecycle"] =
+        serde_json::json!("deleted");
+    let error = protocol
+        .decode_event_frame(&serde_json::to_vec(&value).unwrap())
+        .unwrap_err();
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::TypedScalar);
+    assert_eq!(fault.code(), PublicDecodeCode::InvalidScalar);
+
+    // The Runtime-scope contract rejects a missing SessionChanged detail.
+    let mut value: serde_json::Value =
+        serde_json::from_slice(runtime_frame).expect("the fixture is JSON");
+    value["data"]["msg"]["data"]["detail"] = serde_json::Value::Null;
+    let error = protocol
+        .decode_event_frame(&serde_json::to_vec(&value).unwrap())
+        .unwrap_err();
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::SelectedSchema);
+    assert_eq!(fault.code(), PublicDecodeCode::WrongJsonType);
+
+    // The Session-scope contract rejects a populated detail.
+    let mut value: serde_json::Value =
+        serde_json::from_slice(session_frame).expect("the fixture is JSON");
+    value["data"]["msg"]["data"]["detail"] = serde_json::json!({
+        "type": "turn_terminal",
+        "data": {
+            "turnId": "trn_33333333333333333333333333333333",
+            "terminal": {
+                "type": "completed",
+                "data": { "completedAt": "2026-08-03T10:02:00.123Z" },
+            },
+        },
+    });
+    let error = protocol
+        .decode_event_frame(&serde_json::to_vec(&value).unwrap())
+        .unwrap_err();
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::TypedScalar);
+    assert_eq!(fault.code(), PublicDecodeCode::InvalidScalar);
+
+    // The Session-scope contract rejects a Turn route.
+    let mut value: serde_json::Value =
+        serde_json::from_slice(session_frame).expect("the fixture is JSON");
+    value["data"]["route"] = serde_json::json!({
+        "type": "turn",
+        "data": {
+            "sessionId": "ses_22222222222222222222222222222222",
+            "turnId": "trn_33333333333333333333333333333333",
+        },
+    });
+    let error = protocol
+        .decode_event_frame(&serde_json::to_vec(&value).unwrap())
+        .unwrap_err();
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::TypedScalar);
+    assert_eq!(fault.code(), PublicDecodeCode::InvalidScalar);
+
+    // The Runtime-scope metadata encoder rejects a Deleted summary; Archived metadata updates
+    // remain valid by contract.
+    let event = protocol.decode_event_frame(runtime_frame).unwrap();
+    let EventFrame::State(event) = &event else {
+        panic!("the Runtime metadata fixture decodes as a StateEvent");
+    };
+    let StateEventMsg::Runtime {
+        snapshot,
+        detail: Some(RuntimeEventDetail::SessionChanged { session }),
+        ..
+    } = event.msg()
+    else {
+        panic!("the Runtime metadata fixture carries one SessionChanged detail");
+    };
+    let invalid_summary = SessionSummary::new(
+        session.session_id(),
+        session.definition_revision(),
+        session.metadata().clone(),
+        SessionLifecycleView::Deleted,
+        session.forked(),
+        session.created_at(),
+    );
+    let invalid = EventFrame::State(StateEvent::session_metadata_updated(
+        event.timestamp(),
+        event.command_id(),
+        snapshot.clone(),
+        invalid_summary,
+    ));
+    let error = protocol.encode_event_frame(&invalid).unwrap_err();
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::TypedScalar);
+    assert_eq!(fault.code(), PublicDecodeCode::InvalidScalar);
+}
+
+#[test]
+fn session_update_definition_command_round_trips_with_canonical_optional_replacement_fields() {
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let command = include_bytes!(
+        "../docs/fixtures/wire-v1/public/valid/update-session-definition-command.json"
+    );
+    let request = protocol
+        .decode_request(RuntimeRequestKind::Dispatch, command)
+        .unwrap();
+    let RuntimeRequest::Dispatch(dispatch) = &request else {
+        panic!("UpdateDefinition fixture decodes as a dispatch request");
+    };
+    let RuntimeCommand::Session(SessionCommand::UpdateDefinition {
+        session_id,
+        expected_revision,
+        patch,
+    }) = dispatch.command()
+    else {
+        panic!("the fixture decodes as Session UpdateDefinition");
+    };
+    assert_eq!(
+        session_id.to_string(),
+        "ses_22222222222222222222222222222222"
+    );
+    assert_eq!(expected_revision.get(), 1);
+    let workspace = patch
+        .workspace()
+        .expect("the fixture replaces the Workspace");
+    assert_eq!(workspace.primary_root().key().as_str(), "repo");
+    assert_eq!(
+        workspace.primary_root().path().as_str(),
+        "file:///Users/alice/project"
+    );
+    assert_eq!(
+        patch
+            .model()
+            .expect("the fixture replaces the model")
+            .reasoning(),
+        minicore_runtime::model_gateway::ReasoningPreference::High
+    );
+    assert_eq!(
+        patch
+            .prompts()
+            .expect("the fixture replaces the prompts")
+            .enabled()
+            .len(),
+        1
+    );
+    assert_eq!(
+        protocol.encode_request(&request).unwrap(),
+        without_lf(command)
+    );
+
+    // An empty replacement object is a valid explicit empty patch (all fields null).
+    let mut empty: serde_json::Value =
+        serde_json::from_slice(command).expect("the fixture is JSON");
+    empty["command"]["data"]["data"]["patch"] = serde_json::json!({
+        "workspace": null,
+        "model": null,
+        "prompts": null,
+    });
+    let request = protocol
+        .decode_request(
+            RuntimeRequestKind::Dispatch,
+            &serde_json::to_vec(&empty).unwrap(),
+        )
+        .expect("an all-null patch decodes");
+    let RuntimeRequest::Dispatch(dispatch) = &request else {
+        panic!("the empty patch decodes as a dispatch request");
+    };
+    let RuntimeCommand::Session(SessionCommand::UpdateDefinition { patch, .. }) =
+        dispatch.command()
+    else {
+        panic!("the empty patch decodes as Session UpdateDefinition");
+    };
+    assert!(patch.workspace().is_none());
+    assert!(patch.model().is_none());
+    assert!(patch.prompts().is_none());
+    let canonical_empty = br#"{"commandId":"cmd_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","command":{"type":"session","data":{"type":"update_definition","data":{"sessionId":"ses_22222222222222222222222222222222","expectedRevision":"sdr_1","patch":{"workspace":null,"model":null,"prompts":null}}}}}"#;
+    assert_eq!(protocol.encode_request(&request).unwrap(), canonical_empty);
+
+    // Unknown fields inside the patch are rejected.
+    let mut unknown: serde_json::Value =
+        serde_json::from_slice(command).expect("the fixture is JSON");
+    unknown["command"]["data"]["data"]["patch"]["unknownField"] = serde_json::json!(true);
+    let error = protocol
+        .decode_request(
+            RuntimeRequestKind::Dispatch,
+            &serde_json::to_vec(&unknown).unwrap(),
+        )
+        .unwrap_err();
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::SelectedSchema);
+    assert_eq!(fault.code(), PublicDecodeCode::UnknownInputField);
+}
+
+#[test]
+fn session_agent_upgrade_command_round_trips_with_canonical_null_target() {
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let current = include_bytes!(
+        "../docs/fixtures/wire-v1/public/valid/upgrade-session-agent-current-command.json"
+    );
+    let exact = include_bytes!(
+        "../docs/fixtures/wire-v1/public/valid/upgrade-session-agent-exact-command.json"
+    );
+    for (bytes, expected_target) in [
+        (current.as_slice(), None),
+        (
+            exact.as_slice(),
+            Some(("agt_11111111111111111111111111111111", 2_u64)),
+        ),
+    ] {
+        let request = protocol
+            .decode_request(RuntimeRequestKind::Dispatch, bytes)
+            .expect("the Agent upgrade fixture decodes");
+        let RuntimeRequest::Dispatch(dispatch) = &request else {
+            panic!("the Agent upgrade fixture decodes as a dispatch request");
+        };
+        let RuntimeCommand::Session(SessionCommand::UpgradeAgentRevision {
+            session_id,
+            expected_revision,
+            target,
+        }) = dispatch.command()
+        else {
+            panic!("the fixture decodes as Session UpgradeAgentRevision");
+        };
+        assert_eq!(
+            session_id.to_string(),
+            "ses_22222222222222222222222222222222"
+        );
+        assert_eq!(expected_revision.get(), 1);
+        match (target, expected_target) {
+            (None, None) => {}
+            (Some(target), Some((agent_id, revision))) => {
+                assert_eq!(target.agent_id().to_string(), agent_id);
+                assert_eq!(target.revision().get(), revision);
+            }
+            (target, expected) => {
+                panic!("target mismatch: {target:?} vs {expected:?}")
+            }
+        }
+        assert_eq!(
+            protocol.encode_request(&request).unwrap(),
+            without_lf(bytes)
+        );
+    }
+
+    // An omitted target decodes as None and the canonical reencode includes target:null,
+    // matching the serde Option convention.
+    let mut omitted: serde_json::Value = serde_json::from_slice(current).expect("fixture is JSON");
+    omitted["command"]["data"]["data"]
+        .as_object_mut()
+        .expect("the command payload is an object")
+        .remove("target");
+    let request = protocol
+        .decode_request(
+            RuntimeRequestKind::Dispatch,
+            &serde_json::to_vec(&omitted).expect("the omitted-target command encodes"),
+        )
+        .expect("an omitted target decodes as None");
+    let RuntimeRequest::Dispatch(dispatch) = &request else {
+        panic!("the omitted-target command decodes as a dispatch request");
+    };
+    assert!(matches!(
+        dispatch.command(),
+        RuntimeCommand::Session(SessionCommand::UpgradeAgentRevision { target: None, .. })
+    ));
+    assert_eq!(
+        protocol.encode_request(&request).unwrap(),
+        without_lf(current),
+        "canonical reencode restores target:null"
+    );
+
+    // Unknown fields inside the target object are rejected by the selected schema.
+    let mut unknown: serde_json::Value = serde_json::from_slice(exact).expect("fixture is JSON");
+    unknown["command"]["data"]["data"]["target"]["unknownField"] = serde_json::json!(true);
+    let error = protocol
+        .decode_request(
+            RuntimeRequestKind::Dispatch,
+            &serde_json::to_vec(&unknown).expect("the unknown-field command encodes"),
+        )
+        .expect_err("an unknown target field is rejected");
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::SelectedSchema);
+    assert_eq!(fault.code(), PublicDecodeCode::UnknownInputField);
+
+    // A target that is not null or an object is rejected.
+    let mut wrong_shape: serde_json::Value =
+        serde_json::from_slice(current).expect("fixture is JSON");
+    wrong_shape["command"]["data"]["data"]["target"] = serde_json::json!("ar_1");
+    let error = protocol
+        .decode_request(
+            RuntimeRequestKind::Dispatch,
+            &serde_json::to_vec(&wrong_shape).expect("the wrong-shape command encodes"),
+        )
+        .expect_err("a non-object target is rejected");
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::SelectedSchema);
+    assert_eq!(fault.code(), PublicDecodeCode::WrongJsonType);
+
+    // Wrong target ID and revision types are rejected as typed scalars.
+    let mut wrong_id: serde_json::Value = serde_json::from_slice(exact).expect("fixture is JSON");
+    wrong_id["command"]["data"]["data"]["target"]["agentId"] = serde_json::json!(123);
+    let error = protocol
+        .decode_request(
+            RuntimeRequestKind::Dispatch,
+            &serde_json::to_vec(&wrong_id).expect("the wrong-ID command encodes"),
+        )
+        .expect_err("a non-string agentId is rejected");
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::TypedScalar);
+
+    let mut wrong_revision: serde_json::Value =
+        serde_json::from_slice(exact).expect("fixture is JSON");
+    wrong_revision["command"]["data"]["data"]["target"]["revision"] = serde_json::json!(1);
+    let error = protocol
+        .decode_request(
+            RuntimeRequestKind::Dispatch,
+            &serde_json::to_vec(&wrong_revision).expect("the wrong-revision command encodes"),
+        )
+        .expect_err("a non-string revision is rejected");
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::TypedScalar);
+}
+
+#[test]
+fn session_definition_updated_events_reject_mismatched_contracts_and_round_trip_valid_frames() {
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+
+    let runtime_frame = include_bytes!(
+        "../docs/fixtures/wire-v1/public/valid/session-definition-updated-runtime-state-frame.json"
+    );
+    let frame = protocol.decode_event_frame(runtime_frame).unwrap();
+    let EventFrame::State(event) = &frame else {
+        panic!("the Runtime definition fixture decodes as a StateEvent");
+    };
+    assert!(matches!(
+        event.msg(),
+        StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::SessionDefinitionUpdated,
+            detail: Some(RuntimeEventDetail::SessionChanged { .. }),
+            ..
+        }
+    ));
+    assert_eq!(
+        protocol.encode_event_frame(&frame).unwrap(),
+        without_lf(runtime_frame)
+    );
+
+    let session_frame = include_bytes!(
+        "../docs/fixtures/wire-v1/public/valid/session-definition-updated-session-state-frame.json"
+    );
+    let frame = protocol.decode_event_frame(session_frame).unwrap();
+    let EventFrame::State(event) = &frame else {
+        panic!("the Session definition fixture decodes as a StateEvent");
+    };
+    assert_eq!(
+        event.route(),
+        EventRoute::Session {
+            session_id: "ses_22222222222222222222222222222222".parse().unwrap()
+        }
+    );
+    assert_eq!(
+        event.msg().session_kind(),
+        Some(SessionStateEventKind::SessionDefinitionUpdated)
+    );
+    assert!(event.msg().session_detail().is_none());
+    assert_eq!(
+        event
+            .msg()
+            .session_snapshot()
+            .unwrap()
+            .definition()
+            .revision()
+            .get(),
+        2
+    );
+    assert_eq!(
+        protocol.encode_event_frame(&frame).unwrap(),
+        without_lf(session_frame)
+    );
+
+    // The Runtime-scope contract rejects a Deleted lifecycle summary.
+    let mut value: serde_json::Value =
+        serde_json::from_slice(runtime_frame).expect("the fixture is JSON");
+    value["data"]["msg"]["data"]["detail"]["data"]["session"]["lifecycle"] =
+        serde_json::json!("deleted");
+    let error = protocol
+        .decode_event_frame(&serde_json::to_vec(&value).unwrap())
+        .unwrap_err();
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::TypedScalar);
+    assert_eq!(fault.code(), PublicDecodeCode::InvalidScalar);
+
+    // The Session-scope contract rejects a populated detail.
+    let mut value: serde_json::Value =
+        serde_json::from_slice(session_frame).expect("the fixture is JSON");
+    value["data"]["msg"]["data"]["detail"] = serde_json::json!({
+        "type": "turn_terminal",
+        "data": {
+            "turnId": "trn_33333333333333333333333333333333",
+            "terminal": {
+                "type": "completed",
+                "data": { "completedAt": "2026-08-03T10:02:00.123Z" },
+            },
+        },
+    });
+    let error = protocol
+        .decode_event_frame(&serde_json::to_vec(&value).unwrap())
+        .unwrap_err();
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::TypedScalar);
+    assert_eq!(fault.code(), PublicDecodeCode::InvalidScalar);
+
+    // The Runtime-scope definition encoder rejects Archived as well as Deleted because ordinary
+    // definition updates are only valid for Open Sessions.
+    let event = protocol.decode_event_frame(runtime_frame).unwrap();
+    let EventFrame::State(event) = &event else {
+        panic!("the Runtime definition fixture decodes as a StateEvent");
+    };
+    let StateEventMsg::Runtime {
+        snapshot,
+        detail: Some(RuntimeEventDetail::SessionChanged { session }),
+        ..
+    } = event.msg()
+    else {
+        panic!("the Runtime definition fixture carries one SessionChanged detail");
+    };
+    let invalid_summary = SessionSummary::new(
+        session.session_id(),
+        session.definition_revision(),
+        session.metadata().clone(),
+        SessionLifecycleView::Archived,
+        session.forked(),
+        session.created_at(),
+    );
+    let invalid = EventFrame::State(StateEvent::session_definition_updated(
+        event.timestamp(),
+        event.command_id(),
+        snapshot.clone(),
+        invalid_summary,
+    ));
+    let error = protocol.encode_event_frame(&invalid).unwrap_err();
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::TypedScalar);
+    assert_eq!(fault.code(), PublicDecodeCode::InvalidScalar);
+}
+
+#[test]
+fn reload_workspace_command_round_trips_strictly_and_rejects_unknown_payload_fields() {
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let fixture = include_bytes!(
+        "../docs/fixtures/wire-v1/public/valid/reload-session-workspace-command.json"
+    );
+    let request = protocol
+        .decode_request(RuntimeRequestKind::Dispatch, fixture)
+        .expect("the reload fixture decodes");
+    let RuntimeRequest::Dispatch(dispatch) = &request else {
+        panic!("the reload fixture decodes as a dispatch request");
+    };
+    let RuntimeCommand::Session(SessionCommand::ReloadWorkspace { session_id }) =
+        dispatch.command()
+    else {
+        panic!("the fixture decodes as Session ReloadWorkspace");
+    };
+    assert_eq!(
+        session_id.to_string(),
+        "ses_22222222222222222222222222222222"
+    );
+    assert_eq!(
+        protocol.encode_request(&request).unwrap(),
+        without_lf(fixture)
+    );
+
+    // An unknown payload field is rejected by the selected schema even though the typed
+    // payload itself is a strict single-sessionId object.
+    let mut unknown: serde_json::Value = serde_json::from_slice(fixture).expect("fixture is JSON");
+    unknown["command"]["data"]["data"]["expectedRevision"] = serde_json::json!("sdr_1");
+    let error = protocol
+        .decode_request(
+            RuntimeRequestKind::Dispatch,
+            &serde_json::to_vec(&unknown).expect("the unknown-field command encodes"),
+        )
+        .expect_err("an unknown reload payload field is rejected");
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::SelectedSchema);
+    assert_eq!(fault.code(), PublicDecodeCode::UnknownInputField);
+
+    // A non-object payload and a non-canonical sessionId are rejected.
+    let mut null_data: serde_json::Value =
+        serde_json::from_slice(fixture).expect("fixture is JSON");
+    null_data["command"]["data"]["data"] = serde_json::json!(null);
+    let error = protocol
+        .decode_request(
+            RuntimeRequestKind::Dispatch,
+            &serde_json::to_vec(&null_data).expect("the null-data command encodes"),
+        )
+        .expect_err("a null reload payload is rejected");
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::SelectedSchema);
+    assert_eq!(fault.code(), PublicDecodeCode::WrongJsonType);
+}
+
+#[test]
+fn workspace_reloaded_outcome_round_trips_strictly_and_rejects_populated_data() {
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let fixture =
+        include_bytes!("../docs/fixtures/wire-v1/public/valid/workspace-reloaded-response.json");
+    let response = protocol
+        .decode_command_response(fixture)
+        .expect("the reload completion fixture decodes");
+    assert!(matches!(
+        response.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::WorkspaceReloaded,
+            output: None,
+        }
+    ));
+    assert_eq!(
+        protocol.encode_command_response(&response).unwrap(),
+        without_lf(fixture)
+    );
+
+    // A WorkspaceReloaded outcome with populated data is rejected: the selected schema activates
+    // it as a strict typed unit, not a pending unit.
+    let mut populated: serde_json::Value =
+        serde_json::from_slice(fixture).expect("fixture is JSON");
+    populated["completion"]["data"]["outcome"]["data"] = serde_json::json!({});
+    let error = protocol
+        .decode_command_response(&serde_json::to_vec(&populated).unwrap())
+        .expect_err("a populated WorkspaceReloaded outcome is rejected");
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::SelectedSchema);
+    assert_eq!(fault.code(), PublicDecodeCode::WrongJsonType);
+
+    // The semantic encoder rejects a completion that pairs the unit outcome with output text.
+    let mut with_output: serde_json::Value =
+        serde_json::from_slice(fixture).expect("fixture is JSON");
+    with_output["completion"]["data"]["output"] = serde_json::json!({ "text": "reloaded" });
+    let error = protocol
+        .decode_command_response(&serde_json::to_vec(&with_output).unwrap())
+        .expect_err("a unit completion cannot carry output text");
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::TypedScalar);
+    assert_eq!(fault.code(), PublicDecodeCode::InvalidScalar);
+}
+
+#[test]
+fn session_workspace_reloaded_state_frame_round_trips_and_rejects_broken_contracts() {
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let fixture = include_bytes!(
+        "../docs/fixtures/wire-v1/public/valid/session-workspace-reloaded-session-state-frame.json"
+    );
+    let frame = protocol.decode_event_frame(fixture).unwrap();
+    let EventFrame::State(event) = &frame else {
+        panic!("the reload fixture decodes as a StateEvent");
+    };
+    assert_eq!(
+        event.route(),
+        EventRoute::Session {
+            session_id: "ses_22222222222222222222222222222222".parse().unwrap()
+        }
+    );
+    assert_eq!(
+        event.msg().session_kind(),
+        Some(SessionStateEventKind::SessionWorkspaceReloaded)
+    );
+    assert!(event.msg().session_detail().is_none());
+    let snapshot = event.msg().session_snapshot().unwrap();
+    assert_eq!(
+        snapshot.session_id().to_string(),
+        "ses_22222222222222222222222222222222"
+    );
+    assert_eq!(snapshot.definition().revision().get(), 2);
+    assert_eq!(
+        snapshot.execution(),
+        minicore_runtime::runtime_interface::SessionExecutionView::Idle
+    );
+    assert_eq!(
+        protocol.encode_event_frame(&frame).unwrap(),
+        without_lf(fixture)
+    );
+
+    // The Session-scope contract rejects a populated detail.
+    let mut value: serde_json::Value = serde_json::from_slice(fixture).expect("fixture is JSON");
+    value["data"]["msg"]["data"]["detail"] = serde_json::json!({
+        "type": "turn_terminal",
+        "data": {
+            "turnId": "trn_33333333333333333333333333333333",
+            "terminal": {
+                "type": "completed",
+                "data": { "completedAt": "2026-08-03T10:02:00.123Z" },
+            },
+        },
+    });
+    let error = protocol
+        .decode_event_frame(&serde_json::to_vec(&value).unwrap())
+        .unwrap_err();
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::TypedScalar);
+    assert_eq!(fault.code(), PublicDecodeCode::InvalidScalar);
+
+    // A Runtime route with the same message is rejected.
+    let mut wrong_route: serde_json::Value =
+        serde_json::from_slice(fixture).expect("fixture is JSON");
+    wrong_route["data"]["route"] = serde_json::json!({ "type": "runtime" });
+    let error = protocol
+        .decode_event_frame(&serde_json::to_vec(&wrong_route).unwrap())
+        .unwrap_err();
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::TypedScalar);
+    assert_eq!(fault.code(), PublicDecodeCode::InvalidScalar);
+
+    // A mismatched snapshot Session identity is rejected.
+    let mut wrong_session: serde_json::Value =
+        serde_json::from_slice(fixture).expect("fixture is JSON");
+    wrong_session["data"]["route"]["data"]["sessionId"] =
+        serde_json::json!("ses_33333333333333333333333333333333");
+    let error = protocol
+        .decode_event_frame(&serde_json::to_vec(&wrong_session).unwrap())
+        .unwrap_err();
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::TypedScalar);
+    assert_eq!(fault.code(), PublicDecodeCode::InvalidScalar);
 }

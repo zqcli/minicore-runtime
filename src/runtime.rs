@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration as StdDuration, Instant};
 
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, Semaphore, broadcast};
+use tokio::sync::{Notify, RwLock, Semaphore, broadcast};
 
 use crate::agent_session_lifecycle::{
-    AgentStatus, SealedAgentCreateAttempt, SealedAgentDefinitionAttempt,
+    AgentRevisionRef, AgentStatus, SealedAgentCreateAttempt, SealedAgentDefinitionAttempt,
     SealedAgentMetadataAttempt, SealedAgentStatusAttempt, SealedSessionCreateAttempt,
-    SealedSessionLifecycleAttempt, SessionLifecycle,
+    SealedSessionLifecycleAttempt, SealedSessionMetadataAttempt, SessionLifecycle,
 };
 use crate::compaction::CompactionSettings;
 use crate::durable_state::{
@@ -28,12 +28,12 @@ use crate::runtime_interface::{
     CommandError, CommandErrorCode, CommandOutcome, CommandOutput, CommandRequest, CommandResponse,
     EventFrame, InteractionCommand, LoadedSessionSummary, Page, PublicCancelTarget, PublicSubject,
     QueryError, QueryErrorCode, QueryResponse, QueryResult, QueuedFollowUpView, QueuedSteerView,
-    RetryAdvice, RuntimeCapabilities, RuntimeCommand, RuntimeDispatchError, RuntimeQuery,
-    RuntimeQueryResult, RuntimeReadQuery, RuntimeSnapshot, RuntimeStateEventKind,
+    RetryAdvice, RuntimeCapabilities, RuntimeCommand, RuntimeDispatchError, RuntimeLifecycleCommand,
+    RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, RuntimeSnapshot, RuntimeStateEventKind,
     RuntimeStatusView, RuntimeView, SessionCommand, SessionDefinitionSummary, SessionExecutionView,
     SessionForkProvenanceView, SessionLifecycleView, SessionMetadataView, SessionQuery,
     SessionQueryResult, SessionQueueView, SessionReadinessView, SessionRecordingView,
-    SessionSnapshot, SessionSummary, SnapshotError, SnapshotErrorCode, SnapshotRequest,
+    SessionSnapshot, SessionSummary, SessionUnavailableView, SnapshotError, SnapshotErrorCode, SnapshotRequest,
     SnapshotResponse, StateEvent, SubmitAdmissionStateView, SubmitAdmissionView, SubscriptionError,
     SubscriptionErrorCode, SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView,
     TurnInterruptionView,
@@ -42,18 +42,20 @@ use crate::runtime_task::{Clock, RuntimeTaskContext, SystemClock};
 use crate::session_execution::{
     SessionCancelTarget, SessionExecutionState, SessionExecutorEvent, SessionExecutorSnapshot,
     SessionExecutorSubscription, SessionTurnFailure, SessionTurnInterruption, SessionTurnTerminal,
-    SessionWorkspaceDefinitionOutcome,
 };
 use crate::session_residency::{
-    SessionResidencyCancelError, SessionResidencyFollowUpError, SessionResidencyForkError,
-    SessionResidencyInteractionError, SessionResidencyLifecycleError, SessionResidencyLoadError,
-    SessionResidencyLoadOutcome, SessionResidencyQueuedMessageError, SessionResidencyRegistry,
+    SessionResidencyAgentUpgradeError, SessionResidencyCancelError, SessionResidencyFollowUpError,
+    SessionResidencyForkError, SessionResidencyInteractionError, SessionResidencyLifecycleError,
+    SessionResidencyLoadError, SessionResidencyLoadOutcome, SessionResidencyMetadataError,
+    SessionResidencyQueuedMessageError, SessionResidencyRegistry, SessionResidencySharedResourcesError,
     SessionResidencySnapshotError, SessionResidencyStartError, SessionResidencySteerError,
     SessionResidencySubmitError, SessionResidencySubscriptionError, SessionResidencyUnloadError,
     SessionResidencyUnloadOutcome, SessionResidencyWorkspaceDefinitionError,
+    SessionResidencyWorkspaceReloadError,
 };
 use crate::wire::{
-    PageCursor, ProtocolLimits, SessionDefinitionRevision, SessionId, Timestamp, WorkspaceRevision,
+    PageCursor, ProtocolLimits, SessionDefinitionRevision, SessionId, SessionMetadataRevision,
+    Timestamp, WorkspaceRevision,
 };
 use crate::workspace::{
     Workspace, WorkspaceDefinitionSummaryView, WorkspacePathTarget, WorkspaceResolver,
@@ -66,11 +68,18 @@ const PAGE_CURSOR_TTL: StdDuration = StdDuration::from_secs(15 * 60);
 const PAGE_CURSOR_GENERATION_ATTEMPTS: usize = 32;
 const RUNTIME_EVENT_CAPACITY: usize = 32;
 
+/// The default graceful-Unload grace: active Turns settle naturally within this window before
+/// the executor fails-closed.
+const DEFAULT_UNLOAD_GRACE: StdDuration = StdDuration::from_secs(30);
+/// The validated upper bound for `unload_grace`.
+const MAX_UNLOAD_GRACE: StdDuration = StdDuration::from_secs(5 * 60);
+
 /// Host configuration for a MiniCore runtime instance.
 #[non_exhaustive]
 pub struct MiniCoreRuntimeConfig {
     durable_root: PathBuf,
     compaction: CompactionSettings,
+    unload_grace: StdDuration,
 }
 
 impl MiniCoreRuntimeConfig {
@@ -78,11 +87,20 @@ impl MiniCoreRuntimeConfig {
         Self {
             durable_root,
             compaction: CompactionSettings::default(),
+            unload_grace: DEFAULT_UNLOAD_GRACE,
         }
     }
 
     pub fn with_compaction_settings(mut self, compaction: CompactionSettings) -> Self {
         self.compaction = compaction;
+        self
+    }
+
+    /// Sets the graceful-Unload grace period.  `open` validates its finite semantics: it must be
+    /// non-zero and at most 5 minutes, otherwise initialization fails with
+    /// `RuntimeInitializationError::InvalidConfiguration`.
+    pub fn with_unload_grace(mut self, unload_grace: StdDuration) -> Self {
+        self.unload_grace = unload_grace;
         self
     }
 }
@@ -171,6 +189,13 @@ impl MiniCoreRuntime {
             .compaction
             .validate()
             .map_err(|_| RuntimeInitializationError::InvalidConfiguration)?;
+        // The graceful-Unload grace must be finite and bounded: non-zero and at most 5 minutes.
+        // `std::time::Duration` itself is finite, so the finite check is the zero/upper-bound
+        // validation.
+        if config.unload_grace.is_zero() || config.unload_grace > MAX_UNLOAD_GRACE {
+            return Err(RuntimeInitializationError::InvalidConfiguration);
+        }
+        let unload_grace = config.unload_grace;
         let task_context = RuntimeTaskContext::new(handle)
             .await
             .map_err(|_| RuntimeInitializationError::RuntimeDependencyUnavailable)?;
@@ -217,7 +242,7 @@ impl MiniCoreRuntime {
             };
 
         let resolver = Arc::new(WorkspaceResolver::new(task_context.clone()));
-        let session_residency = match SessionResidencyRegistry::start_with_turn_resources(
+        let session_residency = match SessionResidencyRegistry::start_with_turn_resources_and_tools_and_compaction_and_unload_grace(
             task_context.clone(),
             durable_state.clone(),
             resolver,
@@ -225,7 +250,9 @@ impl MiniCoreRuntime {
             Arc::clone(&prompt_resources),
             Arc::clone(&model_gateway),
             Arc::clone(&model_catalog),
+            crate::tools::ToolSet::empty(),
             compaction,
+            unload_grace,
         ) {
             Ok(session_residency) => Arc::new(session_residency),
             Err(error) => {
@@ -247,6 +274,7 @@ impl MiniCoreRuntime {
             prompt_resources,
             model_gateway,
             model_catalog,
+            unload_grace,
         ));
         inner.retain_until_shutdown();
         Ok(Self { inner })
@@ -317,6 +345,42 @@ impl EventStream {
                     SessionExecutorEvent::ExecutionChanged { timestamp, .. } => {
                         StateEvent::session_execution_changed(*timestamp, None, snapshot)
                     }
+                    SessionExecutorEvent::DefinitionUpdated {
+                        timestamp,
+                        command_id,
+                        ..
+                    } => StateEvent::session_definition_changed(
+                        *timestamp,
+                        Some(*command_id),
+                        snapshot,
+                    ),
+                    SessionExecutorEvent::MetadataUpdated {
+                        timestamp,
+                        command_id,
+                        ..
+                    } => StateEvent::session_metadata_changed(
+                        *timestamp,
+                        Some(*command_id),
+                        snapshot,
+                    ),
+                    SessionExecutorEvent::WorkspaceReloaded {
+                        timestamp,
+                        command_id,
+                        ..
+                    } => StateEvent::session_workspace_reloaded(
+                        *timestamp,
+                        Some(*command_id),
+                        snapshot,
+                    ),
+                    SessionExecutorEvent::ReadinessChanged {
+                        timestamp,
+                        command_id,
+                        ..
+                    } => StateEvent::session_readiness_changed(
+                        *timestamp,
+                        Some(*command_id),
+                        snapshot,
+                    ),
                     SessionExecutorEvent::TurnTerminal {
                         timestamp,
                         command_id,
@@ -569,6 +633,43 @@ impl PageCursorStore {
     }
 }
 
+/// The Runtime-owned shared resource roots, replaced atomically as one pair after a successful
+/// ReloadSharedResources fan-out.  The owning PromptService/ModelGateway stay immutable; only
+/// the materialized PromptResourceView/ModelCatalogView roots rotate.
+struct SharedResourceRoots {
+    #[allow(
+        dead_code,
+        reason = "the immediately adjacent shared-resource capture slice consumes this root"
+    )]
+    prompt_resources: Arc<PromptResourceView>,
+    #[allow(
+        dead_code,
+        reason = "the immediately adjacent shared-resource capture slice consumes this root"
+    )]
+    model_catalog: Arc<ModelCatalogView>,
+}
+
+impl SharedResourceRoots {
+    fn new(
+        prompt_resources: Arc<PromptResourceView>,
+        model_catalog: Arc<ModelCatalogView>,
+    ) -> Self {
+        Self {
+            prompt_resources,
+            model_catalog,
+        }
+    }
+
+    fn install(
+        &mut self,
+        prompt_resources: Arc<PromptResourceView>,
+        model_catalog: Arc<ModelCatalogView>,
+    ) {
+        self.prompt_resources = prompt_resources;
+        self.model_catalog = model_catalog;
+    }
+}
+
 struct RuntimeInner {
     task_context: RuntimeTaskContext,
     #[allow(
@@ -578,19 +679,25 @@ struct RuntimeInner {
     prompt_service: Arc<PromptService>,
     #[allow(
         dead_code,
-        reason = "the immediately adjacent shared-resource capture slice consumes this root"
-    )]
-    prompt_resources: Arc<PromptResourceView>,
-    #[allow(
-        dead_code,
         reason = "the immediately adjacent Turn capture slice consumes the Runtime owner"
     )]
     model_gateway: Arc<ModelGateway>,
     #[allow(
         dead_code,
-        reason = "the immediately adjacent shared-resource capture slice consumes this root"
+        reason = "the configured graceful-Unload grace is installed on the residency registry at open; retained for the public Unload route and shutdown"
     )]
-    model_catalog: Arc<ModelCatalogView>,
+    unload_grace: StdDuration,
+    // The current Runtime-owned shared resource roots.  A successful ReloadSharedResources
+    // replaces this pair once under this mutex after the residency fan-out; external Submit
+    // admissions hold the shared-resource read gate across their Turn context capture, so they
+    // can never observe a half-switched pair.
+    shared_resources: Mutex<SharedResourceRoots>,
+    // Serializes a ReloadSharedResources fan-out + root install against external Submit
+    // admissions.  Reload holds the write side; every external TurnCommand::Submit holds the
+    // read side only until residency.submit returns (the Turn context admission is complete).
+    // This is a multi-reader gate, so Submits across different Sessions never serialize against
+    // each other.
+    shared_resource_gate: Arc<RwLock<()>>,
     retained_until_shutdown: Mutex<Option<Arc<RuntimeInner>>>,
     session_residency: Mutex<Option<Arc<SessionResidencyRegistry>>>,
     durable_state: Mutex<Option<DurableState>>,
@@ -613,14 +720,19 @@ impl RuntimeInner {
         prompt_resources: Arc<PromptResourceView>,
         model_gateway: Arc<ModelGateway>,
         model_catalog: Arc<ModelCatalogView>,
+        unload_grace: StdDuration,
     ) -> Self {
         let (runtime_events, _) = broadcast::channel(RUNTIME_EVENT_CAPACITY);
         Self {
             task_context,
             prompt_service,
-            prompt_resources,
             model_gateway,
-            model_catalog,
+            unload_grace,
+            shared_resources: Mutex::new(SharedResourceRoots::new(
+                prompt_resources,
+                model_catalog,
+            )),
+            shared_resource_gate: Arc::new(RwLock::new(())),
             retained_until_shutdown: Mutex::new(None),
             session_residency: Mutex::new(Some(session_residency)),
             durable_state: Mutex::new(Some(durable_state)),
@@ -640,13 +752,21 @@ impl RuntimeInner {
     }
 
     #[cfg(test)]
-    fn prompt_resources(&self) -> (&Arc<PromptService>, &Arc<PromptResourceView>) {
-        (&self.prompt_service, &self.prompt_resources)
+    fn prompt_resources(&self) -> (Arc<PromptService>, Arc<PromptResourceView>) {
+        let roots = lock(&self.shared_resources);
+        (
+            Arc::clone(&self.prompt_service),
+            Arc::clone(&roots.prompt_resources),
+        )
     }
 
     #[cfg(test)]
-    fn model_resources(&self) -> (&Arc<ModelGateway>, &Arc<ModelCatalogView>) {
-        (&self.model_gateway, &self.model_catalog)
+    fn model_resources(&self) -> (Arc<ModelGateway>, Arc<ModelCatalogView>) {
+        let roots = lock(&self.shared_resources);
+        (
+            Arc::clone(&self.model_gateway),
+            Arc::clone(&roots.model_catalog),
+        )
     }
 
     async fn dispatch(
@@ -959,6 +1079,39 @@ impl RuntimeInner {
                     Err(error) => map_fork_error(command_id, source_session_id, error)?,
                 }
             }
+            RuntimeCommand::Session(SessionCommand::UpdateDefinition {
+                session_id,
+                expected_revision,
+                patch,
+            }) => {
+                self.dispatch_session_definition(command_id, session_id, expected_revision, patch)
+                    .await?
+            }
+            RuntimeCommand::Session(SessionCommand::UpgradeAgentRevision {
+                session_id,
+                expected_revision,
+                target,
+            }) => {
+                self.dispatch_session_agent_upgrade(
+                    command_id,
+                    session_id,
+                    expected_revision,
+                    target,
+                )
+                .await?
+            }
+            RuntimeCommand::Session(SessionCommand::ReloadWorkspace { session_id }) => {
+                self.dispatch_session_workspace_reload(command_id, session_id)
+                    .await?
+            }
+            RuntimeCommand::Session(SessionCommand::UpdateMetadata {
+                session_id,
+                expected_revision,
+                patch,
+            }) => {
+                self.dispatch_session_metadata(command_id, session_id, expected_revision, patch)
+                    .await?
+            }
             RuntimeCommand::Interaction(InteractionCommand::Resolve {
                 session_id,
                 expected_turn_id,
@@ -992,6 +1145,13 @@ impl RuntimeInner {
                 let Some(residency) = self.residency() else {
                     return Err(RuntimeDispatchError::RuntimeClosed);
                 };
+                // External Submit admission captures the current shared resource pair into its
+                // Turn context: hold the shared-resource read gate until residency.submit
+                // returns (the admission is installed and its Turn context captured), so a
+                // concurrent ReloadSharedResources cannot install a half-switched pair under
+                // the admission.  The multi-reader gate never serializes Submits across
+                // different Sessions against each other.
+                let _shared_read = self.shared_resource_gate.read().await;
                 match residency.submit(session_id, command_id, intent).await {
                     Ok(turn_id) => CommandCompletion::Completed {
                         outcome: CommandOutcome::TurnStarted { turn_id },
@@ -1068,12 +1228,9 @@ impl RuntimeInner {
                     Err(error) => map_cancel_error(command_id, session_id, error)?,
                 }
             }
-            RuntimeCommand::Runtime(_) => rejected_completion(
-                CommandErrorCode::ReloadValidationFailed,
-                "shared resource reload is not available in this runtime slice",
-                RetryAdvice::UserActionRequired,
-                Some(PublicSubject::Runtime),
-            ),
+            RuntimeCommand::Runtime(RuntimeLifecycleCommand::ReloadSharedResources) => {
+                self.dispatch_shared_resources_reload(command_id).await?
+            }
         };
         CommandResponse::new(command_id, completion)
             .map_err(|_| RuntimeDispatchError::InternalDispatchUnavailable)
@@ -1290,7 +1447,7 @@ impl RuntimeInner {
             loaded.push(
                 LoadedSessionSummary::new(
                     session_id,
-                    SessionReadinessView::Ready,
+                    snapshot.readiness(),
                     public_execution_state(snapshot.execution_state()),
                     SessionRecordingView::new(snapshot.recording()),
                 )
@@ -1358,8 +1515,73 @@ impl RuntimeInner {
             | RuntimeStateEventKind::SessionUnarchived
             | RuntimeStateEventKind::SessionDeleted
             | RuntimeStateEventKind::SessionForked
-            | RuntimeStateEventKind::CommandCatalogInvalidated => return,
+            | RuntimeStateEventKind::SessionMetadataUpdated
+            | RuntimeStateEventKind::SessionDefinitionUpdated
+            | RuntimeStateEventKind::CommandCatalogInvalidated
+            | RuntimeStateEventKind::SharedResourcesReloaded => return,
         };
+        let _ = sender.send(Arc::new(event));
+    }
+
+    fn publish_durable_agent_status_changed(
+        &self,
+        command_id: crate::wire::CommandId,
+        timestamp: Timestamp,
+        head: &DurableAgentHead,
+    ) {
+        let Ok(agent) = public_agent_summary(head) else {
+            return;
+        };
+        let events = lock(&self.runtime_events);
+        let Some(sender) = events.as_ref() else {
+            return;
+        };
+        let Ok(snapshot) = self.public_runtime_snapshot() else {
+            return;
+        };
+        let event = StateEvent::agent_status_changed(timestamp, Some(command_id), snapshot, agent);
+        let _ = sender.send(Arc::new(event));
+    }
+
+    fn publish_session_metadata_updated(
+        &self,
+        command_id: crate::wire::CommandId,
+        timestamp: Timestamp,
+        head: &DurableSessionHead,
+    ) {
+        let Ok(session) = public_session_summary(head) else {
+            return;
+        };
+        let events = lock(&self.runtime_events);
+        let Some(sender) = events.as_ref() else {
+            return;
+        };
+        let Ok(snapshot) = self.public_runtime_snapshot() else {
+            return;
+        };
+        let event =
+            StateEvent::session_metadata_updated(timestamp, Some(command_id), snapshot, session);
+        let _ = sender.send(Arc::new(event));
+    }
+
+    fn publish_session_definition_updated(
+        &self,
+        command_id: crate::wire::CommandId,
+        timestamp: Timestamp,
+        head: &DurableSessionHead,
+    ) {
+        let Ok(session) = public_session_summary(head) else {
+            return;
+        };
+        let events = lock(&self.runtime_events);
+        let Some(sender) = events.as_ref() else {
+            return;
+        };
+        let Ok(snapshot) = self.public_runtime_snapshot() else {
+            return;
+        };
+        let event =
+            StateEvent::session_definition_updated(timestamp, Some(command_id), snapshot, session);
         let _ = sender.send(Arc::new(event));
     }
 
@@ -1408,11 +1630,14 @@ impl RuntimeInner {
             }
             RuntimeStateEventKind::SessionLoaded
             | RuntimeStateEventKind::SessionUnloaded
+            | RuntimeStateEventKind::SessionMetadataUpdated
+            | RuntimeStateEventKind::SessionDefinitionUpdated
             | RuntimeStateEventKind::AgentCreated
             | RuntimeStateEventKind::AgentDefinitionUpdated
             | RuntimeStateEventKind::AgentMetadataUpdated
             | RuntimeStateEventKind::AgentStatusChanged
-            | RuntimeStateEventKind::CommandCatalogInvalidated => return,
+            | RuntimeStateEventKind::CommandCatalogInvalidated
+            | RuntimeStateEventKind::SharedResourcesReloaded => return,
         };
         let _ = sender.send(Arc::new(event));
     }
@@ -1439,6 +1664,8 @@ impl RuntimeInner {
                 StateEvent::session_unloaded(timestamp, Some(command_id), snapshot, session_id)
             }
             RuntimeStateEventKind::SessionCreated
+            | RuntimeStateEventKind::SessionMetadataUpdated
+            | RuntimeStateEventKind::SessionDefinitionUpdated
             | RuntimeStateEventKind::AgentCreated
             | RuntimeStateEventKind::AgentDefinitionUpdated
             | RuntimeStateEventKind::AgentMetadataUpdated
@@ -1447,7 +1674,8 @@ impl RuntimeInner {
             | RuntimeStateEventKind::SessionUnarchived
             | RuntimeStateEventKind::SessionDeleted
             | RuntimeStateEventKind::SessionForked
-            | RuntimeStateEventKind::CommandCatalogInvalidated => return,
+            | RuntimeStateEventKind::CommandCatalogInvalidated
+            | RuntimeStateEventKind::SharedResourcesReloaded => return,
         };
         let _ = sender.send(Arc::new(event));
     }
@@ -1457,16 +1685,12 @@ impl RuntimeInner {
         snapshot: Arc<SessionExecutorSnapshot>,
     ) -> Result<SessionSnapshot, SnapshotError> {
         let session_id = snapshot.definition().session_id();
-        let Some(durable_state) = lock(&self.durable_state).as_ref().cloned() else {
-            return Err(runtime_snapshot_closing());
-        };
-        let current = durable_state
-            .session_current(session_id)
-            .ok_or_else(|| not_found_snapshot(session_id))?;
-        if current.definition().as_ref() != snapshot.definition().as_ref() {
-            return Err(unavailable_snapshot(session_id));
-        }
-        let metadata = current.head().metadata();
+        // The whole read model is projected from the executor's immutable observation state,
+        // including the definition.  The recv()/snapshot projection never compares against a
+        // temporary durable read here, so every event and snapshot carries the exact definition
+        // (and metadata) of its moment even across consecutive updates, and older queued events
+        // are never dropped or revision-crossed.
+        let metadata = snapshot.metadata();
         let metadata = SessionMetadataView::new(
             metadata.revision(),
             metadata.name(),
@@ -1486,6 +1710,7 @@ impl RuntimeInner {
             definition.created_at(),
         );
         let execution = public_execution_state(snapshot.execution_state());
+        let readiness = snapshot.readiness();
         let submit_admissions = snapshot
             .active_submit_command_id()
             .map(|command_id| {
@@ -1524,13 +1749,14 @@ impl RuntimeInner {
             matches!(
                 execution,
                 SessionExecutionView::Idle | SessionExecutionView::Running
-            ),
+            ) && matches!(readiness, SessionReadinessView::Ready),
         )
         .map_err(|_| unavailable_snapshot(session_id))?;
-        SessionSnapshot::new_loaded_ready_with_observation(
+        SessionSnapshot::new_loaded_with_readiness_with_observation(
             session_id,
             metadata,
             definition,
+            readiness,
             execution,
             snapshot.current_turn_view(),
             snapshot.active_items().to_vec(),
@@ -1676,11 +1902,42 @@ impl RuntimeInner {
         match durable_state.set_agent_status(attempt).await {
             Ok(outcome @ DurableAgentStatusOutcome::Updated(_)) => {
                 let head = outcome.head();
-                self.publish_durable_agent_event(
-                    RuntimeStateEventKind::AgentStatusChanged,
-                    command_id,
-                    head.as_ref(),
-                );
+                // DurableState has already released the per-Agent status gate: sample the single
+                // owner timestamp for this status change, then fan the availability fact out to
+                // every loaded Session that pins this Agent before publishing the Runtime event,
+                // so the AgentStatusChanged RuntimeSnapshot already reflects the new readiness.
+                let timestamp = SystemClock.now();
+                if let Some(residency) = self.residency() {
+                    let session_ids = residency.loaded_session_ids_for_agent(agent_id);
+                    let available = matches!(head.status(), AgentStatus::Enabled);
+                    for session_id in session_ids {
+                        match residency
+                            .set_session_agent_availability(
+                                session_id,
+                                agent_id,
+                                available,
+                                timestamp,
+                                command_id,
+                            )
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(
+                                SessionResidencyAgentAvailabilityError::Closing
+                                | SessionResidencyAgentAvailabilityError::InternalDispatchUnavailable,
+                            ) => {
+                                // The durable Agent status has already changed, so this command
+                                // must not settle as an ordinary rejection (RuntimeClosing or
+                                // otherwise): the post-durable required live Session publication
+                                // is incomplete, and durable Agent status and live Session
+                                // readiness would diverge indefinitely.  Fail the outer dispatch
+                                // exactly like the InternalDispatchUnavailable invariant.
+                                return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+                            }
+                        }
+                    }
+                }
+                self.publish_durable_agent_status_changed(command_id, timestamp, head.as_ref());
                 let command_outcome = if deleted_outcome {
                     CommandOutcome::AgentDeleted
                 } else {
@@ -1823,31 +2080,275 @@ impl RuntimeInner {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "the pending public Session snapshot route consumes this owner seam"
-    )]
-    async fn loaded_session_snapshot(
+    async fn dispatch_session_metadata(
         &self,
+        command_id: crate::wire::CommandId,
         session_id: SessionId,
-    ) -> Result<Arc<SessionExecutorSnapshot>, SessionResidencySnapshotError> {
-        match self.residency() {
-            Some(residency) => residency.snapshot(session_id).await,
-            None => Err(SessionResidencySnapshotError::Closing),
+        expected_revision: SessionMetadataRevision,
+        patch: crate::agent_session_lifecycle::SessionMetadataPatch,
+    ) -> Result<CommandCompletion, RuntimeDispatchError> {
+        // One owner timestamp is sampled inside the publication semaphore and feeds both the
+        // sealed attempt and every metadata event of this command.
+        let _publication = Arc::clone(&self.runtime_publication)
+            .acquire_owned()
+            .await
+            .expect("Runtime publication semaphore remains open");
+        let Some(residency) = self.residency() else {
+            return Err(RuntimeDispatchError::RuntimeClosed);
+        };
+        let timestamp = SystemClock.now();
+        let (name, description) = patch.into_sealed_parts();
+        let attempt = SealedSessionMetadataAttempt::new(
+            session_id,
+            expected_revision,
+            name,
+            description,
+            timestamp,
+        );
+        match residency
+            .update_session_metadata(attempt, timestamp, command_id)
+            .await
+        {
+            Ok(outcome) if outcome.changed() => {
+                self.publish_session_metadata_updated(
+                    command_id,
+                    timestamp,
+                    outcome.head().as_ref(),
+                );
+                Ok(completed_outcome(CommandOutcome::SessionMetadataUpdated {
+                    metadata_revision: outcome.head().metadata().revision(),
+                }))
+            }
+            Ok(_) => Ok(completed_outcome(CommandOutcome::NoChange)),
+            Err(error) => map_session_metadata_error(command_id, session_id, error),
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "the pending Session definition command consumes this owner seam"
-    )]
+    async fn dispatch_session_definition(
+        &self,
+        command_id: crate::wire::CommandId,
+        session_id: SessionId,
+        expected_revision: SessionDefinitionRevision,
+        patch: crate::runtime_interface::SessionDefinitionPatch,
+    ) -> Result<CommandCompletion, RuntimeDispatchError> {
+        // One owner timestamp is sampled inside the publication semaphore and feeds both the
+        // sealed attempt and every definition event of this command.
+        let _publication = Arc::clone(&self.runtime_publication)
+            .acquire_owned()
+            .await
+            .expect("Runtime publication semaphore remains open");
+        let Some(residency) = self.residency() else {
+            return Err(RuntimeDispatchError::RuntimeClosed);
+        };
+        let timestamp = SystemClock.now();
+        // The Workspace candidate is host-lowered before any Session gate or durable CAS; an
+        // invalid lowering means the typed command cannot form on this host.
+        let workspace = match patch.workspace().cloned() {
+            Some(input) => match lower_workspace(
+                input,
+                WorkspaceRevision::new(NonZeroU64::new(1).expect("one is non-zero")),
+                WorkspacePathTarget::current(),
+            ) {
+                Ok(workspace) => Some(workspace),
+                Err(_) => {
+                    return Ok(rejected_completion(
+                        CommandErrorCode::InvalidArgument,
+                        "workspace input is invalid for this host",
+                        RetryAdvice::DoNotRetry,
+                        Some(PublicSubject::Session(session_id)),
+                    ));
+                }
+            },
+            None => None,
+        };
+        match residency
+            .update_session_definition(
+                session_id,
+                expected_revision,
+                workspace,
+                patch.model().cloned(),
+                patch.prompts().cloned(),
+                timestamp,
+                command_id,
+            )
+            .await
+        {
+            Ok(outcome) if outcome.changed() => {
+                self.publish_session_definition_updated(
+                    command_id,
+                    timestamp,
+                    outcome.head().as_ref(),
+                );
+                Ok(completed_outcome(
+                    CommandOutcome::SessionDefinitionUpdated {
+                        definition_revision: outcome.definition_revision(),
+                    },
+                ))
+            }
+            Ok(_) => Ok(completed_outcome(CommandOutcome::NoChange)),
+            Err(error) => map_session_definition_error(command_id, session_id, error),
+        }
+    }
+
+    async fn dispatch_session_agent_upgrade(
+        &self,
+        command_id: crate::wire::CommandId,
+        session_id: SessionId,
+        expected_revision: SessionDefinitionRevision,
+        target: Option<AgentRevisionRef>,
+    ) -> Result<CommandCompletion, RuntimeDispatchError> {
+        // One owner timestamp is sampled inside the publication semaphore and feeds both the
+        // sealed attempt and every definition event of this command.  Target current resolution
+        // happens only inside DurableState under its Agent → Session publication gates.
+        let _publication = Arc::clone(&self.runtime_publication)
+            .acquire_owned()
+            .await
+            .expect("Runtime publication semaphore remains open");
+        let Some(residency) = self.residency() else {
+            return Err(RuntimeDispatchError::RuntimeClosed);
+        };
+        let timestamp = SystemClock.now();
+        match residency
+            .upgrade_session_agent(session_id, expected_revision, target, timestamp, command_id)
+            .await
+        {
+            Ok(outcome) if outcome.changed() => {
+                self.publish_session_definition_updated(
+                    command_id,
+                    timestamp,
+                    outcome.head().as_ref(),
+                );
+                Ok(completed_outcome(
+                    CommandOutcome::SessionDefinitionUpdated {
+                        definition_revision: outcome.definition().revision(),
+                    },
+                ))
+            }
+            Ok(_) => Ok(completed_outcome(CommandOutcome::NoChange)),
+            Err(error) => map_session_agent_upgrade_error(command_id, session_id, error),
+        }
+    }
+
+    async fn dispatch_session_workspace_reload(
+        &self,
+        command_id: crate::wire::CommandId,
+        session_id: SessionId,
+    ) -> Result<CommandCompletion, RuntimeDispatchError> {
+        // The reload is Session-scope only: it emits a SessionExecutorEvent, never reads or
+        // updates DurableState, and publishes no Runtime-scope event.  The per-Session residency
+        // gate plus the executor publication slot already serialize it, so no Runtime
+        // publication semaphore is held here.
+        let Some(residency) = self.residency() else {
+            return Err(RuntimeDispatchError::RuntimeClosed);
+        };
+        let timestamp = SystemClock.now();
+        match residency
+            .reload_workspace(session_id, timestamp, command_id)
+            .await
+        {
+            Ok(_) => Ok(completed_outcome(CommandOutcome::WorkspaceReloaded)),
+            Err(error) => map_session_workspace_reload_error(command_id, session_id, error),
+        }
+    }
+
+    /// Dispatches one Runtime shared-resource reload inside the Runtime publication semaphore.
+    /// Both candidates build before anything is installed: any Prompt/Model candidate failure
+    /// leaves the old roots, every loaded executor, and every future `turn_resources` completely
+    /// unchanged and settles as a typed `ReloadValidationFailed` rejection with no events.  After
+    /// both candidates succeed, the shared-resource write gate covers the residency fan-out and
+    /// the single atomic Runtime root pair replacement, so no external Submit admission can
+    /// capture a half-switched pair; every residency failure at or after this point may already
+    /// have entered a required live publication, so it fails the outer dispatch as
+    /// `InternalDispatchUnavailable` instead of an ordinary rejection.  Only then is the
+    /// Runtime-scope `SharedResourcesReloaded` event published and the typed outcome returned;
+    /// per-Session readiness changes are published by the executor fan-out itself.
+    async fn dispatch_shared_resources_reload(
+        &self,
+        command_id: crate::wire::CommandId,
+    ) -> Result<CommandCompletion, RuntimeDispatchError> {
+        let _publication = Arc::clone(&self.runtime_publication)
+            .acquire_owned()
+            .await
+            .expect("Runtime publication semaphore remains open");
+        // The two candidate builds are independent; join them so a slow Prompt discovery and a
+        // slow Model discovery overlap.
+        let (prompt_candidate, model_candidate) = tokio::join!(
+            self.prompt_service.build_reload_candidate(),
+            self.model_gateway.build_reload_candidate(),
+        );
+        let (prompt_resources, model_catalog) = match (prompt_candidate, model_candidate) {
+            (Ok(prompt_resources), Ok(model_catalog)) => (prompt_resources, model_catalog),
+            _ => {
+                // Any ordinary candidate failure (source discovery, content load, duplicate
+                // key, invalid definition) is a validation outcome: the old roots stay fully
+                // installed and no event is published.
+                return Ok(rejected_completion(
+                    CommandErrorCode::ReloadValidationFailed,
+                    "shared resource reload validation failed",
+                    RetryAdvice::UserActionRequired,
+                    Some(PublicSubject::Runtime),
+                ));
+            }
+        };
+        let Some(residency) = self.residency() else {
+            return Err(RuntimeDispatchError::RuntimeClosed);
+        };
+        let timestamp = SystemClock.now();
+        // The write gate covers the residency fan-out and the Runtime root install below.
+        let _shared_write = self.shared_resource_gate.write().await;
+        residency
+            .install_shared_resources(
+                Arc::clone(&prompt_resources),
+                Arc::clone(&model_catalog),
+                timestamp,
+                command_id,
+            )
+            .await
+            .map_err(|error| match error {
+                SessionResidencySharedResourcesError::Closing
+                | SessionResidencySharedResourcesError::InternalDispatchUnavailable => {
+                    // The candidate succeeded; a Closing/Internal residency result at or after
+                    // the install boundary may already have entered a required live
+                    // publication, so this can never settle as an ordinary reload rejection.
+                    RuntimeDispatchError::InternalDispatchUnavailable
+                }
+            })?;
+        // One atomic root pair replacement after the whole fan-out succeeded.  The write gate is
+        // still held, so the pair is never observed half-switched by an external Submit.
+        lock(&self.shared_resources)
+            .install(prompt_resources, model_catalog);
+        self.publish_shared_resources_reloaded(command_id, timestamp);
+        Ok(completed_outcome(CommandOutcome::SharedResourcesReloaded))
+    }
+
+    fn publish_shared_resources_reloaded(
+        &self,
+        command_id: crate::wire::CommandId,
+        timestamp: Timestamp,
+    ) {
+        let events = lock(&self.runtime_events);
+        let Some(sender) = events.as_ref() else {
+            return;
+        };
+        let Ok(snapshot) = self.public_runtime_snapshot() else {
+            return;
+        };
+        let event =
+            StateEvent::shared_resources_reloaded(timestamp, Some(command_id), snapshot);
+        let _ = sender.send(Arc::new(event));
+    }
+
+    #[cfg(test)]
     async fn update_session_workspace_definition(
         &self,
         session_id: SessionId,
         expected_revision: SessionDefinitionRevision,
         workspace: Workspace,
         owner_timestamp: Timestamp,
-    ) -> Result<SessionWorkspaceDefinitionOutcome, SessionResidencyWorkspaceDefinitionError> {
+    ) -> Result<
+        crate::durable_state::DurableSessionDefinitionOutcome,
+        SessionResidencyWorkspaceDefinitionError,
+    > {
         match self.residency() {
             Some(residency) => {
                 residency
@@ -1860,6 +2361,20 @@ impl RuntimeInner {
                     .await
             }
             None => Err(SessionResidencyWorkspaceDefinitionError::Closing),
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the pending public Session snapshot route consumes this owner seam"
+    )]
+    async fn loaded_session_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Arc<SessionExecutorSnapshot>, SessionResidencySnapshotError> {
+        match self.residency() {
+            Some(residency) => residency.snapshot(session_id).await,
+            None => Err(SessionResidencySnapshotError::Closing),
         }
     }
 
@@ -2543,6 +3058,266 @@ fn map_session_lifecycle_error(
     Ok(completion)
 }
 
+fn map_session_metadata_error(
+    _command_id: crate::wire::CommandId,
+    session_id: SessionId,
+    error: SessionResidencyMetadataError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let subject = Some(PublicSubject::Session(session_id));
+    let completion = match error {
+        SessionResidencyMetadataError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        SessionResidencyMetadataError::SessionNotFound => rejected_completion(
+            CommandErrorCode::NotFound,
+            "Session was not found",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyMetadataError::StaleRevision => rejected_completion(
+            CommandErrorCode::StaleRevision,
+            "Session metadata compare-and-swap is stale",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyMetadataError::SessionDeleted => rejected_completion(
+            CommandErrorCode::SessionDeleted,
+            "Session is deleted",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencyMetadataError::DurableStateTooLarge => rejected_completion(
+            CommandErrorCode::DurableStateTooLarge,
+            "durable state exceeds its selected size limit",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyMetadataError::StorageUnavailable => rejected_completion(
+            CommandErrorCode::Unavailable,
+            "Session metadata update is unavailable",
+            retry_with_backoff(),
+            subject,
+        ),
+        SessionResidencyMetadataError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
+}
+
+fn map_session_definition_error(
+    _command_id: crate::wire::CommandId,
+    session_id: SessionId,
+    error: SessionResidencyWorkspaceDefinitionError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let subject = Some(PublicSubject::Session(session_id));
+    let completion = match error {
+        SessionResidencyWorkspaceDefinitionError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        SessionResidencyWorkspaceDefinitionError::SessionBusy => rejected_completion(
+            CommandErrorCode::SessionBusy,
+            "the loaded Session must be Idle to change its Workspace",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyWorkspaceDefinitionError::SessionNotFound => rejected_completion(
+            CommandErrorCode::NotFound,
+            "Session was not found",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyWorkspaceDefinitionError::StaleRevision => rejected_completion(
+            CommandErrorCode::StaleRevision,
+            "Session definition compare-and-swap is stale",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyWorkspaceDefinitionError::SessionArchived => rejected_completion(
+            CommandErrorCode::SessionArchived,
+            "Session is archived",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyWorkspaceDefinitionError::SessionDeleted => rejected_completion(
+            CommandErrorCode::SessionDeleted,
+            "Session is deleted",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencyWorkspaceDefinitionError::StateTooLarge => rejected_completion(
+            CommandErrorCode::DurableStateTooLarge,
+            "durable state exceeds its selected size limit",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyWorkspaceDefinitionError::WorkspaceUnavailable => rejected_completion(
+            CommandErrorCode::Unavailable,
+            "the Workspace candidate is unavailable",
+            retry_with_backoff(),
+            subject,
+        ),
+        SessionResidencyWorkspaceDefinitionError::WorkspaceRejected => rejected_completion(
+            CommandErrorCode::Unavailable,
+            "the Workspace candidate was rejected",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencyWorkspaceDefinitionError::StorageUnavailable => rejected_completion(
+            CommandErrorCode::Unavailable,
+            "Session definition update is unavailable",
+            retry_with_backoff(),
+            subject,
+        ),
+        SessionResidencyWorkspaceDefinitionError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
+}
+
+fn map_session_agent_upgrade_error(
+    _command_id: crate::wire::CommandId,
+    session_id: SessionId,
+    error: SessionResidencyAgentUpgradeError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let subject = Some(PublicSubject::Session(session_id));
+    let completion = match error {
+        SessionResidencyAgentUpgradeError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        SessionResidencyAgentUpgradeError::SessionBusy => rejected_completion(
+            CommandErrorCode::SessionBusy,
+            "Session is busy",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyAgentUpgradeError::SessionNotFound => rejected_completion(
+            CommandErrorCode::NotFound,
+            "Session was not found",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyAgentUpgradeError::StaleRevision => rejected_completion(
+            CommandErrorCode::StaleRevision,
+            "Session definition compare-and-swap is stale",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyAgentUpgradeError::SessionArchived => rejected_completion(
+            CommandErrorCode::SessionArchived,
+            "Session is archived",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyAgentUpgradeError::SessionDeleted => rejected_completion(
+            CommandErrorCode::SessionDeleted,
+            "Session is deleted",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencyAgentUpgradeError::AgentMismatch => rejected_completion(
+            CommandErrorCode::InvalidArgument,
+            "Session Agent upgrade targets another Agent",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencyAgentUpgradeError::AgentDisabled => rejected_completion(
+            CommandErrorCode::AgentDisabled,
+            "Agent is disabled",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyAgentUpgradeError::AgentDeleted => rejected_completion(
+            CommandErrorCode::AgentDeleted,
+            "Agent is deleted",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencyAgentUpgradeError::RevisionUnavailable => rejected_completion(
+            CommandErrorCode::NotFound,
+            "Agent revision is unavailable",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyAgentUpgradeError::DurableStateTooLarge => rejected_completion(
+            CommandErrorCode::DurableStateTooLarge,
+            "durable state exceeds its selected size limit",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyAgentUpgradeError::StorageUnavailable => rejected_completion(
+            CommandErrorCode::Unavailable,
+            "Session Agent upgrade is unavailable",
+            retry_with_backoff(),
+            subject,
+        ),
+        SessionResidencyAgentUpgradeError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
+}
+
+fn map_session_workspace_reload_error(
+    _command_id: crate::wire::CommandId,
+    session_id: SessionId,
+    error: SessionResidencyWorkspaceReloadError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let subject = Some(PublicSubject::Session(session_id));
+    let completion = match error {
+        SessionResidencyWorkspaceReloadError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        SessionResidencyWorkspaceReloadError::SessionNotLoaded => rejected_completion(
+            CommandErrorCode::SessionNotLoaded,
+            "Session is not loaded",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyWorkspaceReloadError::SessionBusy => rejected_completion(
+            CommandErrorCode::SessionBusy,
+            "the loaded Session must be Idle to reload its Workspace",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyWorkspaceReloadError::WorkspaceUnavailable => rejected_completion(
+            CommandErrorCode::Unavailable,
+            "the Workspace is unavailable",
+            retry_with_backoff(),
+            subject,
+        ),
+        SessionResidencyWorkspaceReloadError::WorkspaceRejected => rejected_completion(
+            CommandErrorCode::ReloadValidationFailed,
+            "Workspace reload validation failed",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyWorkspaceReloadError::Unauthorized => rejected_completion(
+            CommandErrorCode::Unauthorized,
+            "Workspace authority was denied",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyWorkspaceReloadError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
+}
+
 fn map_fork_error(
     _command_id: crate::wire::CommandId,
     source_session_id: SessionId,
@@ -2643,6 +3418,40 @@ fn map_submit_error(
             RetryAdvice::RefreshAndRetry,
             subject,
         ),
+        SessionResidencySubmitError::SessionNotReady(cause) => match cause {
+            SessionUnavailableView::WorkspaceUnavailable
+            | SessionUnavailableView::PromptUnavailable => rejected_completion(
+                CommandErrorCode::SessionNotReady,
+                "the Session is not ready to accept Turns",
+                RetryAdvice::UserActionRequired,
+                subject,
+            ),
+            SessionUnavailableView::AgentUnavailable
+            | SessionUnavailableView::ModelUnavailable => rejected_completion(
+                CommandErrorCode::SessionNotReady,
+                "the Session is not ready to accept Turns",
+                RetryAdvice::UserActionRequired,
+                subject,
+            ),
+            SessionUnavailableView::RuntimeDependencyUnavailable => rejected_completion(
+                CommandErrorCode::SessionNotReady,
+                "the Session is not ready to accept Turns",
+                retry_with_backoff(),
+                subject,
+            ),
+            SessionUnavailableView::DurableStateCorrupt => rejected_completion(
+                CommandErrorCode::DurableStateCorrupt,
+                "durable Session state is corrupt",
+                RetryAdvice::UserActionRequired,
+                subject,
+            ),
+            SessionUnavailableView::DurableStateTooLarge => rejected_completion(
+                CommandErrorCode::DurableStateTooLarge,
+                "durable Session state exceeds its selected size limit",
+                RetryAdvice::UserActionRequired,
+                subject,
+            ),
+        },
         SessionResidencySubmitError::AgentUnavailable
         | SessionResidencySubmitError::DependencyUnavailable
         | SessionResidencySubmitError::Prompt => rejected_completion(
@@ -2996,6 +3805,7 @@ fn public_turn_interruption(interruption: SessionTurnInterruption) -> TurnInterr
     match interruption {
         SessionTurnInterruption::UserCancelled => TurnInterruptionView::UserCancelled,
         SessionTurnInterruption::SecurityRevoked => TurnInterruptionView::SecurityRevoked,
+        SessionTurnInterruption::PrepareForUnload => TurnInterruptionView::PrepareForUnload,
     }
 }
 
@@ -3005,15 +3815,6 @@ fn runtime_snapshot_closing() -> SnapshotError {
         "runtime is closing",
         retry_with_backoff(),
         Some(PublicSubject::Runtime),
-    )
-}
-
-fn not_found_snapshot(session_id: SessionId) -> SnapshotError {
-    SnapshotError::new(
-        SnapshotErrorCode::NotFound,
-        "Session was not found",
-        RetryAdvice::RefreshAndRetry,
-        Some(PublicSubject::Session(session_id)),
     )
 }
 
@@ -3137,8 +3938,9 @@ mod tests {
         map_interaction_error,
     };
     use crate::agent_session_lifecycle::{
-        ForkAnchor, ForkSourceKind, SealedAgentCreateAttempt, SealedSessionCreateAttempt,
-        SealedSessionLifecycleAttempt, SessionModelConfig,
+        ForkAnchor, ForkSourceKind, OptionalTextPatch, SealedAgentCreateAttempt,
+        SealedSessionCreateAttempt, SealedSessionLifecycleAttempt, SessionMetadataPatch,
+        SessionModelConfig,
     };
     use crate::conversation_storage::{RecordOutcome, RecorderWriteBarrier, SessionHeader};
     use crate::model_gateway::{
@@ -3168,7 +3970,7 @@ mod tests {
     use crate::wire::conversation_jsonl::ConversationLineCodec;
     use crate::wire::{
         AgentId, CanonicalFileUri, CommandId, FileUriFamily, InteractionResolutionKey, ItemId,
-        RequestId, SessionId, TurnId,
+        RequestId, SessionId, SessionMetadataRevision, TurnId,
     };
     use crate::workspace::{
         RequestedFilesystemAccess, Workspace, WorkspaceCwdSpec, WorkspaceDefinitionInput,
@@ -5732,5 +6534,191 @@ mod tests {
         .await
         .expect("the second shutdown leader releases the retained lease");
         reopened.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_session_metadata_cas_while_running_keeps_execution_and_conversation_untouched()
+    {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::new(vec!["running metadata answer"]);
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the scripted Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+
+        let residency = runtime
+            .inner
+            .residency()
+            .expect("residency remains installed");
+        let executor = residency
+            .executor_for_test(session_id)
+            .expect("the loaded executor is installed");
+        let hooks = executor.test_hooks();
+        hooks.arm_before_agent_run_attempt();
+        drop(executor);
+        drop(residency);
+
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(
+                            TextIntent::new("run while metadata updates").unwrap(),
+                        ),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("the public Submit dispatches");
+        let running_turn = started_turn(&submit);
+        hooks.wait_before_agent_run_attempt().await;
+
+        let SnapshotResponse::Session(running) = runtime
+            .snapshot(SnapshotRequest::Session { session_id })
+            .await
+            .expect("the running Session snapshot is available")
+        else {
+            panic!("the running snapshot is a Session snapshot");
+        };
+        assert_eq!(running.execution(), SessionExecutionView::Running);
+        assert_eq!(running.current_turn().unwrap().turn_id(), running_turn);
+        assert_eq!(running.queues().submit_admissions().len(), 0);
+        assert_eq!(running.queues().steers().len(), 0);
+        assert_eq!(running.queues().follow_ups().len(), 0);
+        let running_items = running.active_items().len();
+
+        // The Running Turn is held at the agent-run hook, so the conversation bytes are quiescent
+        // across the metadata CAS below.
+        let conversation_path = root
+            .path()
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("conversation.jsonl");
+        let before =
+            fs::read(&conversation_path).expect("the conversation is readable while Running");
+
+        let update_id = CommandId::generate().unwrap();
+        let updated = runtime
+            .dispatch(CommandRequest::new(
+                update_id,
+                RuntimeCommand::Session(SessionCommand::UpdateMetadata {
+                    session_id,
+                    expected_revision: "smr_1".parse::<SessionMetadataRevision>().unwrap(),
+                    patch: SessionMetadataPatch::new(
+                        OptionalTextPatch::set("Running v2").unwrap(),
+                        OptionalTextPatch::keep(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("the Running Session metadata update dispatches");
+        assert!(
+            matches!(
+                updated.completion(),
+                CommandCompletion::Completed {
+                    outcome: CommandOutcome::SessionMetadataUpdated { metadata_revision },
+                    output: None,
+                } if metadata_revision.get() == 2
+            ),
+            "a Running Session accepts metadata updates without SessionBusy"
+        );
+
+        // The Subscription was opened before Submit, so Starting/Running execution events can
+        // precede the metadata event on the same stream; drain until the matching update.
+        let session_event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::SessionMetadataUpdated)
+                            && event.command_id() == Some(update_id) =>
+                    {
+                        return event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => {
+                        panic!("unexpected frame while draining to the metadata event: {other:?}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the Running update publishes its Session MetadataUpdated event");
+        assert_eq!(
+            session_event.msg().session_kind(),
+            Some(SessionStateEventKind::SessionMetadataUpdated)
+        );
+        let snapshot = session_event.msg().session_snapshot().unwrap();
+        assert_eq!(snapshot.metadata().revision().get(), 2);
+        assert_eq!(snapshot.metadata().name(), Some("Running v2"));
+        assert_eq!(snapshot.execution(), SessionExecutionView::Running);
+        assert_eq!(snapshot.current_turn().unwrap().turn_id(), running_turn);
+
+        let SnapshotResponse::Session(after) = runtime
+            .snapshot(SnapshotRequest::Session { session_id })
+            .await
+            .expect("the post-update Session snapshot is available")
+        else {
+            panic!("the post-update snapshot is a Session snapshot");
+        };
+        assert_eq!(after.metadata().revision().get(), 2);
+        assert_eq!(after.metadata().name(), Some("Running v2"));
+        assert_eq!(after.execution(), SessionExecutionView::Running);
+        assert_eq!(after.current_turn().unwrap().turn_id(), running_turn);
+        assert_eq!(after.queues().submit_admissions().len(), 0);
+        assert_eq!(after.queues().steers().len(), 0);
+        assert_eq!(after.queues().follow_ups().len(), 0);
+        assert_eq!(after.active_items().len(), running_items);
+        assert_eq!(
+            fs::read(&conversation_path).expect("the conversation remains readable"),
+            before,
+            "a Running Session metadata update never touches conversation JSONL bytes"
+        );
+
+        hooks.release_before_agent_run_attempt();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        return event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => panic!("unexpected frame while draining to TurnCompleted: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the Running Turn reaches terminal state");
+        assert_eq!(
+            terminal.msg().session_kind(),
+            Some(SessionStateEventKind::TurnCompleted)
+        );
+
+        runtime.shutdown().await;
     }
 }

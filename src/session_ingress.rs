@@ -23,6 +23,7 @@ pub(crate) const STEER_QUEUE_CAPACITY: usize = 8;
 pub(crate) enum EmergencyControlSignal {
     Cancel,
     SecurityRevoked,
+    PrepareForUnload,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

@@ -1236,10 +1236,6 @@ pub(crate) enum SessionAgentUpgradeDecision {
 }
 
 impl SealedSessionAgentUpgradeAttempt {
-    #[allow(
-        dead_code,
-        reason = "the public Session upgrade command constructor consumes this sealed seam"
-    )]
     pub(crate) const fn new(
         session_id: SessionId,
         expected_revision: SessionDefinitionRevision,
@@ -1457,20 +1453,13 @@ pub(crate) fn session_metadata_has_same_canonical_content(
 }
 
 /// The sealed name half of a Session metadata patch. Its representation is private so a caller
-/// cannot forge an invalid canonical Set value or confuse Keep with Clear.
-#[allow(
-    dead_code,
-    reason = "the sealed Session metadata patch is consumed by the pending Session command surface"
-)]
+/// cannot forge an invalid canonical Set value or confuse Keep with Clear. Set requires a
+/// non-empty canonical name bounded by the selected display-name limit.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct SessionMetadataNamePatch {
     value: SessionMetadataNamePatchValue,
 }
 
-#[allow(
-    dead_code,
-    reason = "the sealed Session metadata patch is consumed by the pending Session command surface"
-)]
 #[derive(Clone, Eq, PartialEq)]
 enum SessionMetadataNamePatchValue {
     Keep,
@@ -1478,10 +1467,6 @@ enum SessionMetadataNamePatchValue {
     Clear,
 }
 
-#[allow(
-    dead_code,
-    reason = "the sealed Session metadata patch is consumed by the pending Session command surface"
-)]
 impl SessionMetadataNamePatch {
     pub(crate) const fn keep() -> Self {
         Self {
@@ -1536,19 +1521,11 @@ impl fmt::Debug for SessionMetadataNamePatch {
 
 /// The sealed description half of a Session metadata patch. Set permits the canonical empty
 /// description, while the representation still keeps Keep distinct from Clear.
-#[allow(
-    dead_code,
-    reason = "the sealed Session metadata patch is consumed by the pending Session command surface"
-)]
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct SessionMetadataDescriptionPatch {
     value: SessionMetadataDescriptionPatchValue,
 }
 
-#[allow(
-    dead_code,
-    reason = "the sealed Session metadata patch is consumed by the pending Session command surface"
-)]
 #[derive(Clone, Eq, PartialEq)]
 enum SessionMetadataDescriptionPatchValue {
     Keep,
@@ -1556,10 +1533,6 @@ enum SessionMetadataDescriptionPatchValue {
     Clear,
 }
 
-#[allow(
-    dead_code,
-    reason = "the sealed Session metadata patch is consumed by the pending Session command surface"
-)]
 impl SessionMetadataDescriptionPatch {
     pub(crate) const fn keep() -> Self {
         Self {
@@ -1612,6 +1585,87 @@ impl fmt::Debug for SessionMetadataDescriptionPatch {
     }
 }
 
+/// The public Session metadata patch: one Keep/Set/Clear half per canonical field. The halves use
+/// the existing public `OptionalTextPatch`, but `new`/`new_with_limits` re-validate each Set half
+/// against the canonical Session field limits so a caller cannot smuggle an empty or oversized
+/// name Set past the public constructor.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SessionMetadataPatch {
+    name: OptionalTextPatch,
+    description: OptionalTextPatch,
+}
+
+impl SessionMetadataPatch {
+    pub fn new(
+        name: OptionalTextPatch,
+        description: OptionalTextPatch,
+    ) -> Result<Self, SessionMetadataError> {
+        Self::new_with_limits(name, description, ProtocolLimits::v1_0())
+    }
+
+    pub(crate) fn new_with_limits(
+        name: OptionalTextPatch,
+        description: OptionalTextPatch,
+        limits: ProtocolLimits,
+    ) -> Result<Self, SessionMetadataError> {
+        if let Some(value) = name.set_value() {
+            normalize_session_metadata_text(
+                value,
+                usize::from(limits.text.max_display_name_bytes),
+                false,
+            )?;
+        }
+        if let Some(value) = description.set_value() {
+            normalize_session_metadata_text(
+                value,
+                usize::try_from(limits.text.max_description_bytes).unwrap_or(usize::MAX),
+                true,
+            )?;
+        }
+        Ok(Self { name, description })
+    }
+
+    pub const fn name(&self) -> &OptionalTextPatch {
+        &self.name
+    }
+
+    pub const fn description(&self) -> &OptionalTextPatch {
+        &self.description
+    }
+
+    /// Crate-private lowering into the sealed durable-owner parts consumed by the existing
+    /// `SealedSessionMetadataAttempt`. The Set values were canonicalized by `OptionalTextPatch`
+    /// and re-validated by `new`/`new_with_limits` against limits no larger than the v1.0 maxima,
+    /// so the sealed constructors cannot fail here.
+    pub(crate) fn into_sealed_parts(
+        self,
+    ) -> (SessionMetadataNamePatch, SessionMetadataDescriptionPatch) {
+        let name = match self.name.value {
+            OptionalTextPatchValue::Keep => SessionMetadataNamePatch::keep(),
+            OptionalTextPatchValue::Set(value) => SessionMetadataNamePatch::set(value)
+                .expect("SessionMetadataPatch::new_with_limits validated the name Set"),
+            OptionalTextPatchValue::Clear => SessionMetadataNamePatch::clear(),
+        };
+        let description = match self.description.value {
+            OptionalTextPatchValue::Keep => SessionMetadataDescriptionPatch::keep(),
+            OptionalTextPatchValue::Set(value) => SessionMetadataDescriptionPatch::set(value)
+                .expect("SessionMetadataPatch::new_with_limits validated the description Set"),
+            OptionalTextPatchValue::Clear => SessionMetadataDescriptionPatch::clear(),
+        };
+        (name, description)
+    }
+}
+
+impl fmt::Debug for SessionMetadataPatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionMetadataPatch")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .finish()
+    }
+}
+
 /// Lifecycle-owned semantic input to one Session metadata CAS. It carries only the Session lookup
 /// key, expected current metadata revision, canonical patch intent, and owner timestamp. Storage
 /// generation, paths, markers, command identity, and publication handles do not cross this seam.
@@ -1640,10 +1694,6 @@ pub(crate) enum SessionMetadataDecision {
 }
 
 impl SealedSessionMetadataAttempt {
-    #[allow(
-        dead_code,
-        reason = "the public Session metadata command constructor consumes this sealed seam"
-    )]
     pub(crate) fn new(
         session_id: SessionId,
         expected_revision: SessionMetadataRevision,
@@ -2180,7 +2230,8 @@ mod tests {
         SessionDefinitionDecisionError, SessionForkAttemptError, SessionLifecycle,
         SessionLifecycleAction, SessionLifecycleDecision, SessionLifecycleDecisionError,
         SessionMetadataDecision, SessionMetadataDecisionError, SessionMetadataDescriptionPatch,
-        SessionMetadataNamePatch, SessionModelConfig,
+        SessionMetadataDescriptionPatchValue, SessionMetadataError, SessionMetadataNamePatch,
+        SessionMetadataNamePatchValue, SessionMetadataPatch, SessionModelConfig,
     };
     use crate::model_gateway::{ModelSelection, ReasoningPreference};
     use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
@@ -2698,6 +2749,89 @@ mod tests {
             empty.decide(AgentStatus::Enabled, &current).unwrap(),
             AgentMetadataDecision::NoChange
         );
+    }
+
+    #[test]
+    fn public_session_patch_revalidates_name_preserves_intent_and_redacts_values() {
+        let patch = SessionMetadataPatch::new(
+            OptionalTextPatch::set("private name\r\nline").unwrap(),
+            OptionalTextPatch::set("private description\r\nline").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(patch.name().set_value(), Some("private name\nline"));
+        assert_eq!(
+            patch.description().set_value(),
+            Some("private description\nline")
+        );
+        let debug = format!("{patch:?}");
+        assert!(!debug.contains("private name"));
+        assert!(!debug.contains("private description"));
+
+        let keep = SessionMetadataPatch::new(OptionalTextPatch::keep(), OptionalTextPatch::keep())
+            .unwrap();
+        assert!(keep.name().is_keep());
+        assert!(keep.description().is_keep());
+        assert_eq!(keep.name().set_value(), None);
+        let clear =
+            SessionMetadataPatch::new(OptionalTextPatch::clear(), OptionalTextPatch::clear())
+                .unwrap();
+        assert!(clear.name().is_clear());
+        assert!(clear.description().is_clear());
+        assert_eq!(clear.name().set_value(), None);
+
+        // `OptionalTextPatch` itself permits an empty Set, but the Session name half re-validates
+        // under the canonical display-name rules (non-empty, display-name limit) in
+        // `SessionMetadataPatch::new`; the description half keeps the allow-empty rule.
+        let empty_name = OptionalTextPatch::set("").unwrap();
+        assert_eq!(empty_name.set_value(), Some(""));
+        assert_eq!(
+            SessionMetadataPatch::new(empty_name, OptionalTextPatch::keep()).unwrap_err(),
+            SessionMetadataError::EmptyName
+        );
+        let empty_description = SessionMetadataPatch::new(
+            OptionalTextPatch::keep(),
+            OptionalTextPatch::set("").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(empty_description.description().set_value(), Some(""));
+
+        let limits = crate::wire::ProtocolLimits::v1_0();
+        let oversized = "x".repeat(usize::from(limits.text.max_display_name_bytes) + 1);
+        assert_eq!(
+            SessionMetadataPatch::new_with_limits(
+                OptionalTextPatch::set(&oversized).unwrap(),
+                OptionalTextPatch::keep(),
+                limits,
+            )
+            .unwrap_err(),
+            SessionMetadataError::TextTooLong,
+            "the name half re-validates the display-name limit"
+        );
+        assert!(
+            SessionMetadataPatch::new_with_limits(
+                OptionalTextPatch::keep(),
+                OptionalTextPatch::set(&oversized).unwrap(),
+                limits,
+            )
+            .is_ok(),
+            "the description half keeps the optional-text limit"
+        );
+
+        // The crate-private lowering preserves Keep/Set/Clear intent for the sealed attempt.
+        let (sealed_name, sealed_description) = SessionMetadataPatch::new(
+            OptionalTextPatch::set("Sealed name").unwrap(),
+            OptionalTextPatch::clear(),
+        )
+        .unwrap()
+        .into_sealed_parts();
+        assert!(matches!(
+            sealed_name.value,
+            SessionMetadataNamePatchValue::Set(ref value) if value.as_ref() == "Sealed name"
+        ));
+        assert!(matches!(
+            sealed_description.value,
+            SessionMetadataDescriptionPatchValue::Clear
+        ));
     }
 
     #[test]

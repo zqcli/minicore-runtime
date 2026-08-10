@@ -53,7 +53,7 @@ use crate::wire::durable_store::{
 };
 use crate::wire::{
     AgentId, AgentMetadataRevision, AgentRevision, SessionDefinitionRevision, SessionId,
-    SessionMetadataRevision, Timestamp,
+    SessionMetadataRevision, Timestamp, WorkspaceRevision,
 };
 use crate::workspace::workspace_revision_transition_is_valid;
 
@@ -1015,20 +1015,12 @@ pub(crate) enum DurableSessionMetadataError {
     InternalDispatchUnavailable,
 }
 
-#[allow(
-    dead_code,
-    reason = "the pending Session metadata command consumes this private durable outcome"
-)]
 #[derive(Clone, Debug)]
 pub(crate) enum DurableSessionMetadataOutcome {
     NoChange(Arc<DurableSessionHead>),
     Updated(Arc<DurableSessionHead>),
 }
 
-#[allow(
-    dead_code,
-    reason = "the pending Session metadata command consumes these outcome projections"
-)]
 impl DurableSessionMetadataOutcome {
     pub(crate) fn head(&self) -> &Arc<DurableSessionHead> {
         match self {
@@ -1129,6 +1121,20 @@ impl DurableSessionDefinitionOutcome {
     pub(crate) fn definition(&self) -> &Arc<SessionDefinition> {
         match self {
             Self::NoChange(_, definition) | Self::Updated(_, definition) => definition,
+        }
+    }
+
+    pub(crate) fn definition_revision(&self) -> SessionDefinitionRevision {
+        match self {
+            Self::NoChange(_, definition) | Self::Updated(_, definition) => definition.revision(),
+        }
+    }
+
+    pub(crate) fn workspace_revision(&self) -> WorkspaceRevision {
+        match self {
+            Self::NoChange(_, definition) | Self::Updated(_, definition) => {
+                definition.workspace().revision()
+            }
         }
     }
 
@@ -1286,20 +1292,12 @@ impl Drop for IndexedDefinitionReadPoisonGuard {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "the pending Session upgrade command consumes this private durable outcome"
-)]
 #[derive(Clone, Debug)]
 pub(crate) enum DurableSessionAgentUpgradeOutcome {
     NoChange(Arc<DurableSessionHead>, Arc<SessionDefinition>),
     Updated(Arc<DurableSessionHead>, Arc<SessionDefinition>),
 }
 
-#[allow(
-    dead_code,
-    reason = "the pending Session upgrade command consumes these outcome projections"
-)]
 impl DurableSessionAgentUpgradeOutcome {
     pub(crate) fn head(&self) -> &Arc<DurableSessionHead> {
         match self {
@@ -9774,10 +9772,6 @@ impl DurableState {
             .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "the pending Session command surface consumes this durable metadata CAS seam"
-    )]
     pub(crate) async fn update_session_metadata(
         &self,
         attempt: SealedSessionMetadataAttempt,
@@ -9809,10 +9803,6 @@ impl DurableState {
             .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "the pending Session command surface consumes this durable Agent upgrade seam"
-    )]
     pub(crate) async fn upgrade_session_agent(
         &self,
         attempt: SealedSessionAgentUpgradeAttempt,
