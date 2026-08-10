@@ -2541,6 +2541,14 @@ impl RuntimeCommandOwner {
     async fn run(self, mut guard: RuntimeCommandOwnerGuard) {
         let RuntimeCommandOwner { request } = self;
         let result = guard.inner.dispatch_once(request).await;
+        // The shared task context can close while this dispatch is in flight (for example the
+        // DurableState actor detects root lease identity loss and requests closing). Propagate
+        // that shared closing signal to the public lifecycle before the first fatal response
+        // becomes observable, so no dispatch returns while the public lifecycle still reports
+        // Open. This is a general owner invariant, not a root-lease special case.
+        if guard.inner.task_context.is_closing() {
+            guard.inner.request_closing();
+        }
         guard.complete(result);
     }
 }

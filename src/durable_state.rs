@@ -3168,6 +3168,19 @@ impl DurableStateActorHandle {
 }
 
 impl DurableStateActor {
+    /// Re-validates the canonical root lease without blocking the actor's Tokio loop.
+    ///
+    /// Validation is filesystem I/O, so it runs on a tracked blocking worker. Any owner
+    /// admission, worker, or operation panic failure is treated as a missing or replaced
+    /// canonical lock.
+    async fn validate_root_lease(&self) -> bool {
+        let lease = Arc::clone(&self.lease);
+        let job = self
+            .task_context
+            .spawn_blocking_tracked(move || lease.validate());
+        job.wait().await.is_ok_and(|valid| valid)
+    }
+
     fn run(self) -> impl Future<Output = ()> + Send {
         let mut unexpected_exit = UnexpectedActorExitGuard::new(
             self.task_context.clone(),
@@ -3198,7 +3211,7 @@ impl DurableStateActor {
                         }
                         // A missing or replaced canonical lock means the lease this actor was
                         // opened under is gone; settle the request as dispatch-unavailable.
-                        if !self.lease.validate() {
+                        if !self.validate_root_lease().await {
                             request.reject_unavailable();
                             self.task_context.request_closing();
                             self.closing.cancel();
@@ -14226,8 +14239,8 @@ mod tests {
         DurableOpenError, DurableSessionDefinitionError, DurableSessionDefinitionReadError,
         DurableSessionHead, DurableState, FORMAT_MARKER, GENERATION_PAYLOAD_ENTRY_CAP, LOCK_FILE,
         RESERVATIONS_DIRECTORY, RESERVATIONS_ENTRY_CAP, ROOT_ENTRY_CAP, RecoveryCaps,
-        SESSIONS_DIRECTORY, StorageGeneration, parse_agent_id_name, read_durable_document,
-        read_entries_bounded, recover_marked_root_with_caps,
+        SESSIONS_DIRECTORY, StorageGeneration, parse_agent_id_name, prove_same_target_identity,
+        read_durable_document, read_entries_bounded, recover_marked_root_with_caps,
     };
     use super::{
         CapturedForkConversation, DirectorySync, DurableFilesystem, ForkAnchorResolutionError,
@@ -26511,15 +26524,65 @@ mod tests {
         let writable_metadata = writable_file.metadata().unwrap();
         assert_eq!(target_metadata.len(), conversation.len() as u64);
         assert_eq!(writable_metadata.len(), conversation.len() as u64);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-
-            assert_eq!(target_metadata.dev(), writable_metadata.dev());
-            assert_eq!(target_metadata.ino(), writable_metadata.ino());
-        }
+        // The two issued handles and the current published path must identify one physical
+        // file on every platform, proven with safe `same_file::Handle` comparisons.
+        let conversation_path = session_path(root.path(), SESSION_ONE).join("conversation.jsonl");
+        let target_identity = same_file::Handle::from_file(
+            target_file
+                .try_clone()
+                .expect("the append handle clones for identity capture"),
+        )
+        .expect("the append handle identity is captured");
+        let truncation_identity = same_file::Handle::from_file(
+            writable_file
+                .try_clone()
+                .expect("the truncation handle clones for identity capture"),
+        )
+        .expect("the truncation handle identity is captured");
+        let path_identity = same_file::Handle::from_path(&conversation_path)
+            .expect("the published conversation path identity is captured");
+        assert_eq!(
+            target_identity, truncation_identity,
+            "the append and truncation handles identify the same physical file"
+        );
+        assert_eq!(
+            target_identity, path_identity,
+            "the append handle identifies the current published path"
+        );
+        assert_eq!(
+            truncation_identity, path_identity,
+            "the truncation handle identifies the current published path"
+        );
 
         state.close().await;
+    }
+
+    #[test]
+    fn prove_same_target_identity_rejects_distinct_files_and_a_replaced_path() {
+        let root = TempRoot::existing();
+        let path = root.path().join("conversation.jsonl");
+        create_file(&path, b"original conversation");
+        let original = File::open(&path).expect("the original target handle opens");
+        let second_original = File::open(&path).expect("a second original target handle opens");
+
+        // (a) Handles to distinct regular files never prove the same target.
+        let other = root.path().join("other-conversation.jsonl");
+        create_file(&other, b"a different conversation");
+        let other_file = File::open(&other).expect("the distinct target handle opens");
+        assert_eq!(
+            prove_same_target_identity(&original, &other_file, &path),
+            Err(DurableConversationTargetError::StorageUnavailable)
+        );
+
+        // (b) Two handles to the original file must not prove the same target once the
+        // current path has been atomically renamed away and replaced by another file.
+        let replaced = root.path().join("conversation.jsonl.replaced");
+        fs::rename(&path, &replaced).expect("the current path is atomically renamed away");
+        create_file(&path, b"replacement conversation");
+        assert_eq!(
+            prove_same_target_identity(&original, &second_original, &path),
+            Err(DurableConversationTargetError::StorageUnavailable)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
