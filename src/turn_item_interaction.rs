@@ -2,7 +2,6 @@ use std::fmt;
 
 use thiserror::Error;
 
-#[cfg(test)]
 use crate::tools::ToolApprovalDecisionInput;
 use crate::tools::{
     ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequestView, ToolApprovalResolution,
@@ -170,13 +169,12 @@ impl InteractionRequest {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn resolve_host(
         &self,
-        input: InteractionHostResolutionInput,
+        input: InteractionResolutionInput,
     ) -> Result<ResolvedInteraction, InteractionValueError> {
         match (self, input) {
-            (Self::ToolApproval(request), InteractionHostResolutionInput::ToolApproval(input)) => {
+            (Self::ToolApproval(request), InteractionResolutionInput::ToolApproval(input)) => {
                 let (decision, resolution) = request
                     .resolve(input)
                     .map_err(|_| InteractionValueError::InvalidResolution)?;
@@ -185,7 +183,7 @@ impl InteractionRequest {
                     view: InteractionResolutionView::tool_approval(resolution),
                 })
             }
-            (Self::UserQuestion(request), InteractionHostResolutionInput::UserAnswer(answer)) => {
+            (Self::UserQuestion(request), InteractionResolutionInput::UserAnswer(answer)) => {
                 let answer = request
                     .validate_answer(answer)
                     .map_err(|_| InteractionValueError::InvalidResolution)?;
@@ -194,7 +192,7 @@ impl InteractionRequest {
                     view: InteractionResolutionView::user_answer(answer),
                 })
             }
-            (_, InteractionHostResolutionInput::Cancelled) => Ok(ResolvedInteraction::cancelled(
+            (_, InteractionResolutionInput::Cancelled) => Ok(ResolvedInteraction::cancelled(
                 InteractionCancelReason::HostCancelled,
             )),
             _ => Err(InteractionValueError::FamilyMismatch),
@@ -268,9 +266,8 @@ impl InteractionRequest {
     }
 }
 
-#[cfg(test)]
 #[derive(Clone, Eq, PartialEq)]
-pub(crate) enum InteractionHostResolutionInput {
+pub enum InteractionResolutionInput {
     ToolApproval(ToolApprovalDecisionInput),
     UserAnswer(UserQuestionAnswer),
     Cancelled,
@@ -323,14 +320,12 @@ pub enum InteractionResolutionViewRef<'a> {
 }
 
 impl InteractionResolutionView {
-    #[cfg(test)]
     pub(crate) const fn tool_approval(resolution: ToolApprovalResolution) -> Self {
         Self {
             kind: InteractionResolutionViewKind::ToolApproval(resolution),
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn user_answer(answer: UserQuestionAnswer) -> Self {
         Self {
             kind: InteractionResolutionViewKind::UserAnswer(answer),
@@ -392,6 +387,7 @@ pub(crate) enum InteractionResolution {
     Cancelled(InteractionCancelReason),
 }
 
+#[derive(Eq, PartialEq)]
 pub(crate) struct ResolvedInteraction {
     live: InteractionResolution,
     view: InteractionResolutionView,
@@ -488,7 +484,7 @@ mod tests {
         ])
         .unwrap();
         let resolved = request
-            .resolve_host(InteractionHostResolutionInput::UserAnswer(answer))
+            .resolve_host(InteractionResolutionInput::UserAnswer(answer))
             .unwrap();
         assert!(!format!("{:?}", resolved.view()).contains("SECRET-ANSWER"));
         assert!(matches!(
@@ -496,7 +492,7 @@ mod tests {
             InteractionResolution::UserAnswer(_)
         ));
         assert!(matches!(
-            request.resolve_host(InteractionHostResolutionInput::ToolApproval(
+            request.resolve_host(InteractionResolutionInput::ToolApproval(
                 ToolApprovalDecisionInput::Deny
             )),
             Err(InteractionValueError::FamilyMismatch)
@@ -511,7 +507,7 @@ mod tests {
             InteractionRequestView::ToolApproval(_)
         ));
         let resolved = request
-            .resolve_host(InteractionHostResolutionInput::ToolApproval(
+            .resolve_host(InteractionResolutionInput::ToolApproval(
                 ToolApprovalDecisionInput::Allow { option_index: 0 },
             ))
             .unwrap();
@@ -528,7 +524,7 @@ mod tests {
                 )
         ));
         assert!(matches!(
-            request.resolve_host(InteractionHostResolutionInput::ToolApproval(
+            request.resolve_host(InteractionResolutionInput::ToolApproval(
                 ToolApprovalDecisionInput::Allow { option_index: 1 },
             )),
             Err(InteractionValueError::InvalidResolution)
@@ -556,7 +552,7 @@ mod tests {
             UserQuestionAnswer::new(vec![UserQuestionFieldAnswer::text(0, "yes").unwrap()])
                 .unwrap();
         let valid = request
-            .resolve_host(InteractionHostResolutionInput::UserAnswer(valid_answer))
+            .resolve_host(InteractionResolutionInput::UserAnswer(valid_answer))
             .unwrap();
         assert!(request.validate_exact_resolution(&valid).is_ok());
 
@@ -576,7 +572,7 @@ mod tests {
             .unwrap(),
         );
         let different = different_request
-            .resolve_host(InteractionHostResolutionInput::UserAnswer(
+            .resolve_host(InteractionResolutionInput::UserAnswer(
                 UserQuestionAnswer::new(vec![UserQuestionFieldAnswer::text(1, "answer").unwrap()])
                     .unwrap(),
             ))
@@ -619,7 +615,7 @@ mod tests {
             .unwrap(),
         );
         let host = request
-            .resolve_host(InteractionHostResolutionInput::Cancelled)
+            .resolve_host(InteractionResolutionInput::Cancelled)
             .unwrap();
         assert!(matches!(
             host.view().as_ref(),

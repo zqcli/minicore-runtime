@@ -265,7 +265,7 @@ fn runtime_and_terminal_state_frames_round_trip_with_coherent_routes() {
 }
 
 #[test]
-fn later_event_slices_are_known_pending_and_unknown_frames_are_protocol_errors() {
+fn active_and_pending_event_slices_remain_distinct_from_unknown_frames() {
     let protocol = IncrementalRuntimeProtocolV1::v1_0();
     let starting = protocol
         .decode_event_frame(&fixture("valid/starting-session-snapshot-frame.json"))
@@ -280,12 +280,11 @@ fn later_event_slices_are_known_pending_and_unknown_frames_are_protocol_errors()
     assert_eq!(starting.queues().submit_admissions().len(), 1);
 
     for path in ["valid/progress-frame.json", "valid/closed-frame.json"] {
-        assert!(
-            protocol
-                .decode_event_frame(&fixture(path))
-                .unwrap_err()
-                .is_pending_public_target(),
-            "{path}"
+        let raw = fixture(path);
+        let frame = protocol.decode_event_frame(&raw).unwrap();
+        assert_eq!(
+            protocol.encode_event_frame(&frame).unwrap(),
+            without_lf(&raw)
         );
     }
 
@@ -311,7 +310,7 @@ fn later_event_slices_are_known_pending_and_unknown_frames_are_protocol_errors()
 }
 
 #[test]
-fn known_pending_observations_do_not_validate_future_payloads() {
+fn active_observations_validate_their_payloads_before_future_state_slices() {
     let protocol = IncrementalRuntimeProtocolV1::v1_0();
     let mut starting: serde_json::Value =
         serde_json::from_slice(&fixture("valid/starting-session-snapshot-frame.json")).unwrap();
@@ -364,11 +363,12 @@ fn known_pending_observations_do_not_validate_future_payloads() {
         .as_object_mut()
         .unwrap()
         .remove("delta");
-    assert!(
+    assert_fault(
         protocol
             .decode_event_frame(&serde_json::to_vec(&progress).unwrap())
-            .unwrap_err()
-            .is_pending_public_target()
+            .unwrap_err(),
+        PublicDecodeStage::SelectedSchema,
+        PublicDecodeCode::MissingRequiredField,
     );
 }
 
@@ -487,7 +487,7 @@ fn state_event_cross_field_mismatches_fail_as_invalid_scalars() {
 }
 
 #[test]
-fn progress_frame_validates_only_its_closed_outer_contract() {
+fn progress_frame_validates_its_complete_selected_v1_contract() {
     let protocol = IncrementalRuntimeProtocolV1::v1_0();
     let canonical = fixture("valid/progress-frame.json");
 
@@ -539,11 +539,12 @@ fn progress_frame_validates_only_its_closed_outer_contract() {
 
     let mut empty_update_data: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
     empty_update_data["data"]["update"]["data"] = serde_json::json!({});
-    assert!(
+    assert_fault(
         protocol
             .decode_event_frame(&serde_json::to_vec(&empty_update_data).unwrap())
-            .unwrap_err()
-            .is_pending_public_target()
+            .unwrap_err(),
+        PublicDecodeStage::SelectedSchema,
+        PublicDecodeCode::MissingRequiredField,
     );
 
     empty_data["data"] = serde_json::json!({
@@ -552,11 +553,10 @@ fn progress_frame_validates_only_its_closed_outer_contract() {
         "kind": "model",
         "update": {"type": "item_delta", "data": {}}
     });
-    assert!(
+    assert_invalid_scalar(
         protocol
             .decode_event_frame(&serde_json::to_vec(&empty_data).unwrap())
-            .unwrap_err()
-            .is_pending_public_target()
+            .unwrap_err(),
     );
 }
 
@@ -708,7 +708,7 @@ fn event_decode_and_encode_use_variant_specific_effective_byte_caps() {
 }
 
 #[test]
-fn event_discriminator_is_order_independent_and_selects_pending_progress_cap() {
+fn event_discriminator_is_order_independent_and_selects_progress_cap() {
     let canonical = fixture("valid/runtime-state-frame.json");
     let value: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
     let reordered = serde_json::to_vec(&serde_json::json!({

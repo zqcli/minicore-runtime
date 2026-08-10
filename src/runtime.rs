@@ -21,8 +21,8 @@ use crate::prompt::{PromptResourceView, PromptService};
 use crate::runtime_interface::{
     AgentMetadataView, AgentQuery, AgentQueryResult, AgentSummary, CommandCompletion, CommandError,
     CommandErrorCode, CommandOutcome, CommandOutput, CommandRequest, CommandResponse, EventFrame,
-    LoadedSessionSummary, Page, PublicCancelTarget, PublicSubject, QueryError, QueryErrorCode,
-    QueryResponse, QueryResult, QueuedFollowUpView, QueuedSteerView, RetryAdvice,
+    InteractionCommand, LoadedSessionSummary, Page, PublicCancelTarget, PublicSubject, QueryError,
+    QueryErrorCode, QueryResponse, QueryResult, QueuedFollowUpView, QueuedSteerView, RetryAdvice,
     RuntimeCapabilities, RuntimeCommand, RuntimeDispatchError, RuntimeQuery, RuntimeQueryResult,
     RuntimeReadQuery, RuntimeSnapshot, RuntimeStateEventKind, RuntimeStatusView, RuntimeView,
     SessionCommand, SessionDefinitionSummary, SessionExecutionView, SessionForkProvenanceView,
@@ -40,11 +40,11 @@ use crate::session_execution::{
 };
 use crate::session_residency::{
     SessionResidencyCancelError, SessionResidencyFollowUpError, SessionResidencyForkError,
-    SessionResidencyLifecycleError, SessionResidencyLoadError, SessionResidencyLoadOutcome,
-    SessionResidencyQueuedMessageError, SessionResidencyRegistry, SessionResidencySnapshotError,
-    SessionResidencyStartError, SessionResidencySteerError, SessionResidencySubmitError,
-    SessionResidencySubscriptionError, SessionResidencyUnloadError, SessionResidencyUnloadOutcome,
-    SessionResidencyWorkspaceDefinitionError,
+    SessionResidencyInteractionError, SessionResidencyLifecycleError, SessionResidencyLoadError,
+    SessionResidencyLoadOutcome, SessionResidencyQueuedMessageError, SessionResidencyRegistry,
+    SessionResidencySnapshotError, SessionResidencyStartError, SessionResidencySteerError,
+    SessionResidencySubmitError, SessionResidencySubscriptionError, SessionResidencyUnloadError,
+    SessionResidencyUnloadOutcome, SessionResidencyWorkspaceDefinitionError,
 };
 use crate::wire::{
     PageCursor, ProtocolLimits, SessionDefinitionRevision, SessionId, Timestamp, WorkspaceRevision,
@@ -865,6 +865,35 @@ impl RuntimeInner {
                         })
                     }
                     Err(error) => map_fork_error(command_id, source_session_id, error)?,
+                }
+            }
+            RuntimeCommand::Interaction(InteractionCommand::Resolve {
+                session_id,
+                expected_turn_id,
+                item_id,
+                request_id,
+                resolution,
+                resolution_key,
+            }) => {
+                let Some(residency) = self.residency() else {
+                    return Err(RuntimeDispatchError::RuntimeClosed);
+                };
+                match residency
+                    .resolve_interaction(
+                        session_id,
+                        crate::session_residency::SessionInteractionTarget {
+                            expected_turn_id,
+                            item_id,
+                            request_id,
+                        },
+                        resolution_key,
+                        resolution,
+                        SystemClock.now(),
+                    )
+                    .await
+                {
+                    Ok(()) => completed_outcome(CommandOutcome::InteractionResolved),
+                    Err(error) => map_interaction_error(command_id, session_id, error)?,
                 }
             }
             RuntimeCommand::Turn(TurnCommand::Submit { session_id, intent }) => {
@@ -1715,6 +1744,7 @@ fn implemented_runtime_capabilities() -> RuntimeCapabilities {
         crate::runtime_interface::RuntimeCapability::RuntimeSnapshot,
         crate::runtime_interface::RuntimeCapability::SessionSnapshot,
         crate::runtime_interface::RuntimeCapability::PagedQueries,
+        crate::runtime_interface::RuntimeCapability::InteractionResolution,
         crate::runtime_interface::RuntimeCapability::SessionFork,
     ])
     .expect("the implemented Runtime capability set is a canonical V1 subset")
@@ -2163,6 +2193,68 @@ fn map_submit_error(
     Ok(completion)
 }
 
+fn map_interaction_error(
+    _command_id: crate::wire::CommandId,
+    session_id: SessionId,
+    error: SessionResidencyInteractionError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let subject = Some(PublicSubject::Session(session_id));
+    let completion = match error {
+        SessionResidencyInteractionError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        SessionResidencyInteractionError::SessionNotLoaded => rejected_completion(
+            CommandErrorCode::SessionNotLoaded,
+            "Session is not loaded",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyInteractionError::ExpectedTurnMismatch => rejected_completion(
+            CommandErrorCode::ExpectedTurnMismatch,
+            "the Interaction target does not match the active Turn",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyInteractionError::NotFound => rejected_completion(
+            CommandErrorCode::InteractionNotFound,
+            "Interaction was not found",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyInteractionError::FamilyMismatch => rejected_completion(
+            CommandErrorCode::InteractionFamilyMismatch,
+            "Interaction resolution family does not match the request",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencyInteractionError::InvalidResolution => rejected_completion(
+            CommandErrorCode::InvalidArgument,
+            "Interaction resolution is invalid",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencyInteractionError::AlreadyResolved => rejected_completion(
+            CommandErrorCode::InteractionAlreadyResolved,
+            "Interaction was already resolved",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyInteractionError::CommandConflict => rejected_completion(
+            CommandErrorCode::CommandConflict,
+            "Interaction resolution conflicts with an existing command",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencyInteractionError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
+}
+
 fn map_follow_up_error(
     _command_id: crate::wire::CommandId,
     session_id: SessionId,
@@ -2556,6 +2648,7 @@ mod tests {
 
     use super::{
         MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError, RuntimeLifecycle,
+        map_interaction_error,
     };
     use crate::agent_session_lifecycle::{
         ForkAnchor, ForkSourceKind, SealedAgentCreateAttempt, SealedSessionCreateAttempt,
@@ -2570,22 +2663,27 @@ mod tests {
     };
     use crate::runtime_interface::{
         CommandCompletion, CommandErrorCode, CommandOutcome, CommandRequest, CommandResponse,
-        EventFrame, EventRoute, ItemContentView, NewSessionDefinition, NewSessionMetadata,
-        PublicCancelTarget, QueryResult, RetryAdvice, RuntimeCapability, RuntimeCommand,
-        RuntimeEventDetail, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery,
-        RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionExecutionView,
-        SessionLifecycleView, SessionRecordingState, SessionStateEventKind, SnapshotRequest,
-        SnapshotResponse, StateEventMsg, SubscriptionRequest, SubscriptionScope, TurnCommand,
-        TurnFailureView, TurnTerminalView,
+        EventFrame, EventRoute, InteractionCommand, ItemContentView, NewSessionDefinition,
+        NewSessionMetadata, PublicCancelTarget, QueryResult, RetryAdvice, RuntimeCapability,
+        RuntimeCommand, RuntimeDispatchError, RuntimeEventDetail, RuntimeQuery, RuntimeQueryResult,
+        RuntimeReadQuery, RuntimeStateEventKind, SessionCommand, SessionEventDetail,
+        SessionExecutionView, SessionLifecycleView, SessionRecordingState, SessionStateEventKind,
+        SnapshotRequest, SnapshotResponse, StateEventMsg, SubscriptionRequest, SubscriptionScope,
+        TurnCommand, TurnFailureView, TurnTerminalView,
     };
     use crate::runtime_task::RuntimeTaskError;
     use crate::session_execution::SessionExecutionState;
     use crate::session_residency::{
-        SessionResidencyLifecycleError, SessionResidencyLoadError, SessionResidencyLoadOutcome,
-        SessionResidencyUnloadOutcome,
+        SessionResidencyInteractionError, SessionResidencyLifecycleError,
+        SessionResidencyLoadError, SessionResidencyLoadOutcome, SessionResidencyUnloadOutcome,
     };
+    use crate::tools::ToolApprovalDecisionInput;
+    use crate::turn_item_interaction::InteractionResolutionInput;
     use crate::wire::conversation_jsonl::ConversationLineCodec;
-    use crate::wire::{AgentId, CanonicalFileUri, CommandId, FileUriFamily, SessionId, TurnId};
+    use crate::wire::{
+        AgentId, CanonicalFileUri, CommandId, FileUriFamily, InteractionResolutionKey, ItemId,
+        RequestId, SessionId, TurnId,
+    };
     use crate::workspace::{
         RequestedFilesystemAccess, Workspace, WorkspaceCwdSpec, WorkspaceDefinitionInput,
         WorkspacePathTarget, WorkspaceRootInput, WorkspaceRootKey, WorkspaceSourcePolicy,
@@ -3264,6 +3362,7 @@ mod tests {
                 RuntimeCapability::RuntimeSnapshot,
                 RuntimeCapability::SessionSnapshot,
                 RuntimeCapability::PagedQueries,
+                RuntimeCapability::InteractionResolution,
                 RuntimeCapability::SessionFork,
             ]
         );
@@ -3598,6 +3697,125 @@ mod tests {
             assert_eq!(snapshot.current_turn(), None);
         }
         reopened.shutdown().await;
+    }
+
+    #[test]
+    fn interaction_error_mapping_is_typed_and_deterministic() {
+        let command_id: CommandId = "cmd_11111111111111111111111111111111".parse().unwrap();
+        let session_id: SessionId = "ses_22222222222222222222222222222222".parse().unwrap();
+        let cases = [
+            (
+                SessionResidencyInteractionError::SessionNotLoaded,
+                CommandErrorCode::SessionNotLoaded,
+                RetryAdvice::UserActionRequired,
+            ),
+            (
+                SessionResidencyInteractionError::ExpectedTurnMismatch,
+                CommandErrorCode::ExpectedTurnMismatch,
+                RetryAdvice::RefreshAndRetry,
+            ),
+            (
+                SessionResidencyInteractionError::NotFound,
+                CommandErrorCode::InteractionNotFound,
+                RetryAdvice::RefreshAndRetry,
+            ),
+            (
+                SessionResidencyInteractionError::FamilyMismatch,
+                CommandErrorCode::InteractionFamilyMismatch,
+                RetryAdvice::DoNotRetry,
+            ),
+            (
+                SessionResidencyInteractionError::InvalidResolution,
+                CommandErrorCode::InvalidArgument,
+                RetryAdvice::DoNotRetry,
+            ),
+            (
+                SessionResidencyInteractionError::AlreadyResolved,
+                CommandErrorCode::InteractionAlreadyResolved,
+                RetryAdvice::RefreshAndRetry,
+            ),
+            (
+                SessionResidencyInteractionError::CommandConflict,
+                CommandErrorCode::CommandConflict,
+                RetryAdvice::DoNotRetry,
+            ),
+        ];
+
+        for (source, code, retry) in cases {
+            let completion = map_interaction_error(command_id, session_id, source).unwrap();
+            assert!(matches!(
+                completion,
+                CommandCompletion::Rejected(error)
+                    if error.code() == code
+                        && error.retry() == retry
+                        && error.subject()
+                            == Some(&crate::runtime_interface::PublicSubject::Session(session_id))
+            ));
+        }
+
+        let closing = map_interaction_error(
+            command_id,
+            session_id,
+            SessionResidencyInteractionError::Closing,
+        )
+        .unwrap();
+        assert!(matches!(
+            closing,
+            CommandCompletion::Rejected(error)
+                if error.code() == CommandErrorCode::RuntimeClosing
+                    && error.subject()
+                        == Some(&crate::runtime_interface::PublicSubject::Runtime)
+        ));
+        assert_eq!(
+            map_interaction_error(
+                command_id,
+                session_id,
+                SessionResidencyInteractionError::InternalDispatchUnavailable,
+            ),
+            Err(RuntimeDispatchError::InternalDispatchUnavailable)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_interaction_command_routes_to_typed_session_errors() {
+        let root = TempRoot::new();
+        let runtime = MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+        )
+        .await
+        .expect("the Runtime opens");
+        let session_id: SessionId = "ses_22222222222222222222222222222222".parse().unwrap();
+        let response = runtime
+            .dispatch(CommandRequest::new(
+                "cmd_55555555555555555555555555555555".parse().unwrap(),
+                RuntimeCommand::Interaction(InteractionCommand::Resolve {
+                    session_id,
+                    expected_turn_id: "trn_33333333333333333333333333333333".parse().unwrap(),
+                    item_id: "itm_88888888888888888888888888888888"
+                        .parse::<ItemId>()
+                        .unwrap(),
+                    request_id: "req_66666666666666666666666666666666"
+                        .parse::<RequestId>()
+                        .unwrap(),
+                    resolution: InteractionResolutionInput::ToolApproval(
+                        ToolApprovalDecisionInput::Deny,
+                    ),
+                    resolution_key: "irk_77777777777777777777777777777777"
+                        .parse::<InteractionResolutionKey>()
+                        .unwrap(),
+                }),
+            ))
+            .await
+            .expect("the Interaction command returns a typed completion");
+        assert!(matches!(
+            response.completion(),
+            CommandCompletion::Rejected(error)
+                if error.code() == CommandErrorCode::SessionNotLoaded
+                    && error.subject()
+                        == Some(&crate::runtime_interface::PublicSubject::Session(session_id))
+        ));
+        runtime.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]

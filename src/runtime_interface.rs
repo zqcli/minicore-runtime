@@ -9,12 +9,15 @@ use crate::agent_session_lifecycle::{
 };
 use crate::prompt::{PromptIntent, SessionPromptSelection};
 use crate::skills::SkillId;
-use crate::turn_item_interaction::{InteractionRequestView, UserMessageSource};
+use crate::tools::ToolCallId;
+use crate::turn_item_interaction::{
+    InteractionRequestView, InteractionResolutionInput, UserMessageSource,
+};
 use crate::wire::lexical::{normalize_newlines, validate_safe_text, validate_stable_symbolic_key};
 use crate::wire::{
-    AgentId, AgentMetadataRevision, AgentRevision, CommandId, Duration, ItemId, Money, PageCursor,
-    ProtocolLimits, RequestId, SessionDefinitionRevision, SessionId, SessionMetadataRevision,
-    Timestamp, TurnId,
+    AgentId, AgentMetadataRevision, AgentRevision, CommandId, Duration, InteractionResolutionKey,
+    ItemId, Money, PageCursor, ProtocolLimits, RequestId, SessionDefinitionRevision, SessionId,
+    SessionMetadataRevision, Timestamp, TurnId,
 };
 use crate::workspace::{WorkspaceDefinitionInput, WorkspaceDefinitionSummaryView};
 
@@ -240,6 +243,7 @@ pub enum RuntimeCommand {
     Runtime(RuntimeLifecycleCommand),
     Session(SessionCommand),
     Turn(TurnCommand),
+    Interaction(InteractionCommand),
 }
 
 impl fmt::Debug for RuntimeCommand {
@@ -248,6 +252,9 @@ impl fmt::Debug for RuntimeCommand {
             Self::Runtime(command) => formatter.debug_tuple("Runtime").field(command).finish(),
             Self::Session(command) => formatter.debug_tuple("Session").field(command).finish(),
             Self::Turn(command) => formatter.debug_tuple("Turn").field(command).finish(),
+            Self::Interaction(command) => {
+                formatter.debug_tuple("Interaction").field(command).finish()
+            }
         }
     }
 }
@@ -305,6 +312,49 @@ pub enum TurnCommand {
         session_id: SessionId,
         target: PublicCancelTarget,
     },
+}
+
+#[derive(Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum InteractionCommand {
+    Resolve {
+        session_id: SessionId,
+        expected_turn_id: TurnId,
+        item_id: ItemId,
+        request_id: RequestId,
+        resolution: InteractionResolutionInput,
+        resolution_key: InteractionResolutionKey,
+    },
+}
+
+impl fmt::Debug for InteractionCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Resolve {
+                session_id,
+                expected_turn_id,
+                item_id,
+                request_id,
+                resolution,
+                resolution_key: _,
+            } => formatter
+                .debug_struct("Resolve")
+                .field("session_id", session_id)
+                .field("expected_turn_id", expected_turn_id)
+                .field("item_id", item_id)
+                .field("request_id", request_id)
+                .field(
+                    "resolution",
+                    &match resolution {
+                        InteractionResolutionInput::ToolApproval(_) => "tool_approval",
+                        InteractionResolutionInput::UserAnswer(_) => "user_answer",
+                        InteractionResolutionInput::Cancelled => "cancelled",
+                    },
+                )
+                .field("resolution_key", &"redacted")
+                .finish(),
+        }
+    }
 }
 
 impl fmt::Debug for TurnCommand {
@@ -443,6 +493,9 @@ impl fmt::Debug for CommandCompletion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CommandOutcome {
+    SessionDefinitionUpdated {
+        definition_revision: SessionDefinitionRevision,
+    },
     SessionForked {
         session_id: SessionId,
         source: ForkSourceKind,
@@ -459,6 +512,7 @@ pub enum CommandOutcome {
     SessionArchived,
     SessionUnarchived,
     SessionDeleted,
+    InteractionResolved,
     CancelAccepted {
         target: PublicCancelTarget,
         cancel_epoch: u64,
@@ -1086,6 +1140,8 @@ pub enum ObservationValueError {
     InconsistentLoadedSessionState,
     #[error("state event route, kind, snapshot, and detail are inconsistent")]
     InconsistentStateEvent,
+    #[error("progress event route and update are inconsistent")]
+    InconsistentProgressEvent,
     #[error("observation value belongs to a later protocol slice")]
     NonMinimalObservation,
 }
@@ -1094,6 +1150,14 @@ fn validate_observation_text(
     value: &str,
     allow_empty: bool,
 ) -> Result<Box<str>, ObservationValueError> {
+    validate_observation_text_value(value, allow_empty)?;
+    Ok(value.into())
+}
+
+fn validate_observation_text_value(
+    value: &str,
+    allow_empty: bool,
+) -> Result<(), ObservationValueError> {
     if !allow_empty && value.is_empty() {
         return Err(ObservationValueError::EmptyText);
     }
@@ -1103,7 +1167,7 @@ fn validate_observation_text(
         crate::wire::lexical::LexicalError::UnsafeText
         | crate::wire::lexical::LexicalError::InvalidGrammar => ObservationValueError::UnsafeText,
     })?;
-    Ok(value.into())
+    Ok(())
 }
 
 fn validate_observation_symbol(
@@ -2976,6 +3040,262 @@ impl StateEvent {
 pub enum EventFrame {
     Snapshot(SnapshotResponse),
     State(StateEvent),
+    Progress(ProgressEvent),
+    Closed(SubscriptionClosed),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SubscriptionClosed {
+    Backpressure,
+    RuntimeClosing,
+    PublisherRestarted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ProgressEventKind {
+    Model,
+    Tool,
+    Compaction,
+    Retry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ItemProgressContentKind {
+    AssistantText,
+    Reasoning,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ModelCallPurpose {
+    AgentRun,
+    CompactionSummary,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum ProgressUpdate {
+    ItemStarted {
+        item_id: ItemId,
+        content_index: u32,
+        content_kind: ItemProgressContentKind,
+    },
+    ItemDelta {
+        item_id: ItemId,
+        content_index: u32,
+        content_kind: ItemProgressContentKind,
+        delta: Box<str>,
+    },
+    ToolOutputDelta {
+        item_id: ItemId,
+        tool_call_id: ToolCallId,
+        delta: Box<str>,
+    },
+    ModelRetryScheduled {
+        purpose: ModelCallPurpose,
+        retry_count: u8,
+        ready_at: Timestamp,
+    },
+    OperationStatus {
+        message: Box<str>,
+    },
+}
+
+impl ProgressUpdate {
+    pub const fn item_started(
+        item_id: ItemId,
+        content_index: u32,
+        content_kind: ItemProgressContentKind,
+    ) -> Self {
+        Self::ItemStarted {
+            item_id,
+            content_index,
+            content_kind,
+        }
+    }
+
+    pub fn item_delta(
+        item_id: ItemId,
+        content_index: u32,
+        content_kind: ItemProgressContentKind,
+        delta: impl AsRef<str>,
+    ) -> Result<Self, ObservationValueError> {
+        Ok(Self::ItemDelta {
+            item_id,
+            content_index,
+            content_kind,
+            delta: validate_observation_text(delta.as_ref(), false)?,
+        })
+    }
+
+    pub fn tool_output_delta(
+        item_id: ItemId,
+        tool_call_id: ToolCallId,
+        delta: impl AsRef<str>,
+    ) -> Result<Self, ObservationValueError> {
+        Ok(Self::ToolOutputDelta {
+            item_id,
+            tool_call_id,
+            delta: validate_observation_text(delta.as_ref(), false)?,
+        })
+    }
+
+    pub const fn model_retry_scheduled(
+        purpose: ModelCallPurpose,
+        retry_count: u8,
+        ready_at: Timestamp,
+    ) -> Self {
+        Self::ModelRetryScheduled {
+            purpose,
+            retry_count,
+            ready_at,
+        }
+    }
+
+    pub fn operation_status(message: impl AsRef<str>) -> Result<Self, ObservationValueError> {
+        Ok(Self::OperationStatus {
+            message: validate_observation_text(message.as_ref(), false)?,
+        })
+    }
+}
+
+impl fmt::Debug for ProgressUpdate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ItemStarted {
+                item_id,
+                content_index,
+                content_kind,
+            } => formatter
+                .debug_struct("ItemStarted")
+                .field("item_id", item_id)
+                .field("content_index", content_index)
+                .field("content_kind", content_kind)
+                .finish(),
+            Self::ItemDelta {
+                item_id,
+                content_index,
+                content_kind,
+                delta,
+            } => formatter
+                .debug_struct("ItemDelta")
+                .field("item_id", item_id)
+                .field("content_index", content_index)
+                .field("content_kind", content_kind)
+                .field("delta_bytes", &delta.len())
+                .finish(),
+            Self::ToolOutputDelta {
+                item_id,
+                tool_call_id,
+                delta,
+            } => formatter
+                .debug_struct("ToolOutputDelta")
+                .field("item_id", item_id)
+                .field("tool_call_id", tool_call_id)
+                .field("delta_bytes", &delta.len())
+                .finish(),
+            Self::ModelRetryScheduled {
+                purpose,
+                retry_count,
+                ready_at,
+            } => formatter
+                .debug_struct("ModelRetryScheduled")
+                .field("purpose", purpose)
+                .field("retry_count", retry_count)
+                .field("ready_at", ready_at)
+                .finish(),
+            Self::OperationStatus { message } => formatter
+                .debug_struct("OperationStatus")
+                .field("message_bytes", &message.len())
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgressEvent {
+    timestamp: Timestamp,
+    route: EventRoute,
+    kind: ProgressEventKind,
+    update: ProgressUpdate,
+}
+
+impl ProgressEvent {
+    pub fn new(
+        timestamp: Timestamp,
+        route: EventRoute,
+        kind: ProgressEventKind,
+        update: ProgressUpdate,
+    ) -> Result<Self, ObservationValueError> {
+        validate_progress_update_text(&update)?;
+        if !Self::contract_is_valid(route, kind, &update) {
+            return Err(ObservationValueError::InconsistentProgressEvent);
+        }
+        Ok(Self {
+            timestamp,
+            route,
+            kind,
+            update,
+        })
+    }
+
+    fn contract_is_valid(
+        route: EventRoute,
+        kind: ProgressEventKind,
+        update: &ProgressUpdate,
+    ) -> bool {
+        match (kind, update) {
+            (
+                ProgressEventKind::Model,
+                ProgressUpdate::ItemStarted { item_id, .. }
+                | ProgressUpdate::ItemDelta { item_id, .. },
+            )
+            | (ProgressEventKind::Tool, ProgressUpdate::ToolOutputDelta { item_id, .. }) => {
+                matches!(route, EventRoute::Item { item_id: route_item_id, .. } if route_item_id == *item_id)
+            }
+            (ProgressEventKind::Retry, ProgressUpdate::ModelRetryScheduled { .. }) => {
+                matches!(route, EventRoute::Turn { .. })
+            }
+            (
+                ProgressEventKind::Tool | ProgressEventKind::Compaction,
+                ProgressUpdate::OperationStatus { .. },
+            ) => matches!(route, EventRoute::Turn { .. } | EventRoute::Item { .. }),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn has_valid_contract(&self) -> bool {
+        validate_progress_update_text(&self.update).is_ok()
+            && Self::contract_is_valid(self.route, self.kind, &self.update)
+    }
+
+    pub const fn timestamp(&self) -> Timestamp {
+        self.timestamp
+    }
+
+    pub const fn route(&self) -> EventRoute {
+        self.route
+    }
+
+    pub const fn kind(&self) -> ProgressEventKind {
+        self.kind
+    }
+
+    pub const fn update(&self) -> &ProgressUpdate {
+        &self.update
+    }
+}
+
+fn validate_progress_update_text(update: &ProgressUpdate) -> Result<(), ObservationValueError> {
+    let value = match update {
+        ProgressUpdate::ItemDelta { delta, .. } | ProgressUpdate::ToolOutputDelta { delta, .. } => {
+            Some(delta.as_ref())
+        }
+        ProgressUpdate::OperationStatus { message } => Some(message.as_ref()),
+        ProgressUpdate::ItemStarted { .. } | ProgressUpdate::ModelRetryScheduled { .. } => None,
+    };
+    let Some(value) = value else {
+        return Ok(());
+    };
+    validate_observation_text_value(value, false)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

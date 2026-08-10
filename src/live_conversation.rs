@@ -13,8 +13,8 @@ use crate::compaction::{
 use crate::prompt::{ModelAssistantContent, ModelMessage};
 use crate::turn_item_interaction::{
     AssistantDisposition, InteractionCancelReason, InteractionRequest, InteractionRequestView,
-    InteractionResolution, InteractionResolutionViewRef, ItemContentFamily, ItemRelation,
-    ResolvedInteraction, UserMessageSource,
+    InteractionResolution, InteractionResolutionInput, InteractionResolutionViewRef,
+    InteractionValueError, ItemContentFamily, ItemRelation, ResolvedInteraction, UserMessageSource,
 };
 use crate::wire::{
     EntryId, InteractionResolutionKey, ItemId, RequestId, SessionId, Timestamp, TurnId,
@@ -207,6 +207,25 @@ impl AppliedConversationFact {
 pub(crate) enum InteractionResolutionApplyOutcome {
     Applied(AppliedConversationFact),
     Idempotent { revision: ConversationRevision },
+}
+
+pub(crate) enum HostInteractionResolutionApplyOutcome {
+    Applied {
+        fact: AppliedConversationFact,
+        resolution: ResolvedInteraction,
+    },
+    Idempotent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostInteractionResolutionError {
+    NotFound,
+    ExpectedTurnMismatch,
+    FamilyMismatch,
+    InvalidResolution,
+    AlreadyResolved,
+    CommandConflict,
+    Internal,
 }
 
 pub(crate) struct InteractionRequestCandidate {
@@ -1003,6 +1022,72 @@ impl LiveSessionState {
         ))
     }
 
+    pub(crate) fn apply_host_interaction_resolution(
+        &mut self,
+        request_id: RequestId,
+        expected_turn_id: TurnId,
+        item_id: ItemId,
+        resolution_key: InteractionResolutionKey,
+        input: InteractionResolutionInput,
+        timestamp: Timestamp,
+    ) -> Result<HostInteractionResolutionApplyOutcome, HostInteractionResolutionError> {
+        let interaction = self
+            .interactions
+            .iter()
+            .find(|interaction| interaction.request_id == request_id)
+            .ok_or(HostInteractionResolutionError::NotFound)?;
+        if interaction.turn_id != expected_turn_id {
+            return Err(HostInteractionResolutionError::ExpectedTurnMismatch);
+        }
+        if interaction.item_id != item_id {
+            return Err(HostInteractionResolutionError::NotFound);
+        }
+        let resolution = interaction
+            .request
+            .resolve_host(input)
+            .map_err(|error| match error {
+                InteractionValueError::FamilyMismatch => {
+                    HostInteractionResolutionError::FamilyMismatch
+                }
+                InteractionValueError::InvalidResolution => {
+                    HostInteractionResolutionError::InvalidResolution
+                }
+            })?;
+        if let InteractionState::Resolved {
+            resolution: existing,
+            resolution_key: existing_key,
+        } = &interaction.state
+        {
+            return match existing_key.as_ref() {
+                Some(existing_key)
+                    if existing_key == &resolution_key && existing == &resolution =>
+                {
+                    Ok(HostInteractionResolutionApplyOutcome::Idempotent)
+                }
+                Some(existing_key) if existing_key == &resolution_key => {
+                    Err(HostInteractionResolutionError::CommandConflict)
+                }
+                Some(_) | None => Err(HostInteractionResolutionError::AlreadyResolved),
+            };
+        }
+        let resolution_for_owner = resolution.clone_for_owner();
+        let candidate =
+            InteractionResolutionCandidate::host(request_id, resolution_key, resolution)
+                .map_err(|_| HostInteractionResolutionError::Internal)?;
+        match self.apply_interaction_resolution(candidate, timestamp) {
+            Ok(InteractionResolutionApplyOutcome::Applied(fact)) => {
+                Ok(HostInteractionResolutionApplyOutcome::Applied {
+                    fact,
+                    resolution: resolution_for_owner,
+                })
+            }
+            Ok(InteractionResolutionApplyOutcome::Idempotent { .. }) => {
+                Err(HostInteractionResolutionError::Internal)
+            }
+            Err(_) => Err(HostInteractionResolutionError::Internal),
+        }
+    }
+
     pub(crate) fn apply_compaction(
         &mut self,
         source: Arc<LiveCompactionSourceView>,
@@ -1383,6 +1468,11 @@ impl LiveSessionState {
     }
 
     #[cfg(test)]
+    pub(crate) fn clear_scripted_entry_id_candidates(&mut self) {
+        self.scripted_entry_ids = None;
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_prepared_unit_failure_for_test(&mut self, enabled: bool) {
         self.fail_prepared_unit_preflight = enabled;
     }
@@ -1453,7 +1543,7 @@ mod tests {
         ToolResultDisposition, UserQuestionAnswer, UserQuestionField, UserQuestionFieldAnswer,
         UserQuestionInput, UserQuestionRequest,
     };
-    use crate::turn_item_interaction::InteractionHostResolutionInput;
+    use crate::turn_item_interaction::InteractionResolutionInput;
 
     fn entry_id(value: &str) -> EntryId {
         value.parse().expect("test entry IDs are valid")
@@ -1699,9 +1789,30 @@ mod tests {
         )
     }
 
+    fn pending_approval_state() -> LiveSessionState {
+        let turn_id = turn(1);
+        let mut state = scripted_state(session(1), (1..=8).map(entry));
+        start(&mut state, turn_id);
+        state
+            .apply_assistant_message(
+                assistant_with_calls(&[(item(2), "call_a")]),
+                turn_id,
+                timestamp(),
+            )
+            .unwrap();
+        state
+            .apply_interaction_request(
+                InteractionRequestCandidate::new(request(1), item(2), approval_request()),
+                turn_id,
+                timestamp(),
+            )
+            .unwrap();
+        state
+    }
+
     fn approval_denial() -> ResolvedInteraction {
         approval_request()
-            .resolve_host(InteractionHostResolutionInput::ToolApproval(
+            .resolve_host(InteractionResolutionInput::ToolApproval(
                 ToolApprovalDecisionInput::Deny,
             ))
             .unwrap()
@@ -1709,10 +1820,130 @@ mod tests {
 
     fn approval_allowance() -> ResolvedInteraction {
         approval_request()
-            .resolve_host(InteractionHostResolutionInput::ToolApproval(
+            .resolve_host(InteractionResolutionInput::ToolApproval(
                 ToolApprovalDecisionInput::Allow { option_index: 0 },
             ))
             .unwrap()
+    }
+
+    #[test]
+    fn host_interaction_resolution_has_typed_target_family_and_idempotency_errors() {
+        let mut state = pending_approval_state();
+        let answer =
+            UserQuestionAnswer::new(vec![UserQuestionFieldAnswer::text(0, "answer").unwrap()])
+                .unwrap();
+        for (request_id, expected_turn_id, item_id, input, expected) in [
+            (
+                request(2),
+                turn(1),
+                item(2),
+                InteractionResolutionInput::ToolApproval(ToolApprovalDecisionInput::Deny),
+                HostInteractionResolutionError::NotFound,
+            ),
+            (
+                request(1),
+                turn(2),
+                item(2),
+                InteractionResolutionInput::ToolApproval(ToolApprovalDecisionInput::Deny),
+                HostInteractionResolutionError::ExpectedTurnMismatch,
+            ),
+            (
+                request(1),
+                turn(1),
+                item(3),
+                InteractionResolutionInput::ToolApproval(ToolApprovalDecisionInput::Deny),
+                HostInteractionResolutionError::NotFound,
+            ),
+            (
+                request(1),
+                turn(1),
+                item(2),
+                InteractionResolutionInput::UserAnswer(answer),
+                HostInteractionResolutionError::FamilyMismatch,
+            ),
+            (
+                request(1),
+                turn(1),
+                item(2),
+                InteractionResolutionInput::ToolApproval(ToolApprovalDecisionInput::Allow {
+                    option_index: u32::MAX,
+                }),
+                HostInteractionResolutionError::InvalidResolution,
+            ),
+        ] {
+            assert!(matches!(
+                state.apply_host_interaction_resolution(
+                    request_id,
+                    expected_turn_id,
+                    item_id,
+                    resolution_key(1),
+                    input,
+                    timestamp(),
+                ),
+                Err(error) if error == expected
+            ));
+        }
+
+        let mut allocation_failure = pending_approval_state();
+        allocation_failure.script_entry_id_candidates([Err(())]);
+        assert!(matches!(
+            allocation_failure.apply_host_interaction_resolution(
+                request(1),
+                turn(1),
+                item(2),
+                resolution_key(1),
+                InteractionResolutionInput::ToolApproval(ToolApprovalDecisionInput::Deny),
+                timestamp(),
+            ),
+            Err(HostInteractionResolutionError::Internal)
+        ));
+
+        assert!(matches!(
+            state.apply_host_interaction_resolution(
+                request(1),
+                turn(1),
+                item(2),
+                resolution_key(1),
+                InteractionResolutionInput::ToolApproval(ToolApprovalDecisionInput::Deny),
+                timestamp(),
+            ),
+            Ok(HostInteractionResolutionApplyOutcome::Applied { .. })
+        ));
+        assert!(matches!(
+            state.apply_host_interaction_resolution(
+                request(1),
+                turn(1),
+                item(2),
+                resolution_key(1),
+                InteractionResolutionInput::ToolApproval(ToolApprovalDecisionInput::Deny),
+                timestamp(),
+            ),
+            Ok(HostInteractionResolutionApplyOutcome::Idempotent)
+        ));
+        assert!(matches!(
+            state.apply_host_interaction_resolution(
+                request(1),
+                turn(1),
+                item(2),
+                resolution_key(1),
+                InteractionResolutionInput::ToolApproval(ToolApprovalDecisionInput::Allow {
+                    option_index: 0,
+                }),
+                timestamp(),
+            ),
+            Err(HostInteractionResolutionError::CommandConflict)
+        ));
+        assert!(matches!(
+            state.apply_host_interaction_resolution(
+                request(1),
+                turn(1),
+                item(2),
+                resolution_key(2),
+                InteractionResolutionInput::ToolApproval(ToolApprovalDecisionInput::Deny),
+                timestamp(),
+            ),
+            Err(HostInteractionResolutionError::AlreadyResolved)
+        ));
     }
 
     fn owner_cancellation() -> InteractionCancelReason {
@@ -1736,7 +1967,7 @@ mod tests {
             .unwrap(),
         );
         request
-            .resolve_host(InteractionHostResolutionInput::UserAnswer(
+            .resolve_host(InteractionResolutionInput::UserAnswer(
                 UserQuestionAnswer::new(vec![UserQuestionFieldAnswer::text(1, "answer").unwrap()])
                     .unwrap(),
             ))
@@ -2496,7 +2727,7 @@ mod tests {
         ])
         .unwrap();
         let valid_resolution = question_request()
-            .resolve_host(InteractionHostResolutionInput::UserAnswer(
+            .resolve_host(InteractionResolutionInput::UserAnswer(
                 expected_answer.clone(),
             ))
             .unwrap();

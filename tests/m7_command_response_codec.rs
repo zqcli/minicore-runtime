@@ -66,11 +66,21 @@ fn retry_with_backoff_response_round_trips_with_typed_duration() {
 }
 
 #[test]
-fn later_slice_response_is_known_pending_not_unknown_output_variant() {
-    let error = IncrementalRuntimeProtocolV1::v1_0()
-        .decode_command_response(&fixture("valid/session-definition-updated-response.json"))
-        .unwrap_err();
-    assert!(error.is_pending_public_target());
+fn session_definition_updated_response_is_an_active_typed_outcome() {
+    let bytes = fixture("valid/session-definition-updated-response.json");
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let response = protocol.decode_command_response(&bytes).unwrap();
+    assert!(matches!(
+        response.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionDefinitionUpdated { definition_revision },
+            output: None,
+        } if definition_revision.get() == 2
+    ));
+    assert_eq!(
+        protocol.encode_command_response(&response).unwrap(),
+        without_lf(&bytes)
+    );
 }
 
 #[test]
