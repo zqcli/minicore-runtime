@@ -7630,12 +7630,13 @@ async fn run_active_turn_inner(
         let (result, logical_retry_count) = match call_result {
             Ok(success) => success,
             Err(error) if error.reason() == ModelCallErrorReason::ContextOverflow => {
-                if !cancellation.is_cancelled()
-                    && let Some(signal) = emergency_control
+                if !cancellation.is_cancelled() {
+                    if let Some(signal) = emergency_control
                         .observe(emergency_observation.target())
                         .and_then(|observation| observation.signal())
-                {
-                    return Err(SessionTurnFailure::EmergencyControl(signal));
+                    {
+                        return Err(SessionTurnFailure::EmergencyControl(signal));
+                    }
                 }
                 compaction
                     .execute(
@@ -7647,12 +7648,13 @@ async fn run_active_turn_inner(
                 continue;
             }
             Err(error) => {
-                if !cancellation.is_cancelled()
-                    && let Some(signal) = emergency_control
+                if !cancellation.is_cancelled() {
+                    if let Some(signal) = emergency_control
                         .observe(emergency_observation.target())
                         .and_then(|observation| observation.signal())
-                {
-                    return Err(SessionTurnFailure::EmergencyControl(signal));
+                    {
+                        return Err(SessionTurnFailure::EmergencyControl(signal));
+                    }
                 }
                 return Err(map_model_call_failure(error));
             }
@@ -8027,13 +8029,14 @@ impl ActiveTurnCompaction {
             .call_summary_with_logical_retry(&operation)
             .await
             .map_err(|error| {
-                if !self.cancellation.is_cancelled()
-                    && let Some(signal) = self
+                if !self.cancellation.is_cancelled() {
+                    if let Some(signal) = self
                         .emergency_control
                         .observe(self.emergency_observation.target())
                         .and_then(|observation| observation.signal())
-                {
-                    return SessionTurnFailure::EmergencyControl(signal);
+                    {
+                        return SessionTurnFailure::EmergencyControl(signal);
+                    }
                 }
                 map_model_call_failure(error)
             })?;
@@ -8161,8 +8164,8 @@ impl ActiveTurnCompaction {
             Arc::clone(&self.hooks),
         )
         .await?;
-        if let Some(queued) = steer.queued
-            && let Some(steer) = resolve_one_steer(
+        if let Some(queued) = steer.queued {
+            if let Some(steer) = resolve_one_steer(
                 Arc::clone(&self.context),
                 Arc::clone(&self.conversation),
                 self.turn_id,
@@ -8175,21 +8178,22 @@ impl ActiveTurnCompaction {
                 Arc::clone(&self.hooks),
             )
             .await?
-        {
-            if !emergency_control_is_unsignaled_current(
-                &self.emergency_control,
-                self.emergency_observation,
-            ) {
-                return Err(SessionTurnFailure::Model);
+            {
+                if !emergency_control_is_unsignaled_current(
+                    &self.emergency_control,
+                    self.emergency_observation,
+                ) {
+                    return Err(SessionTurnFailure::Model);
+                }
+                let fact = lock(&self.conversation.live_state)
+                    .apply_user_message(steer, self.turn_id, SystemClock.now())
+                    .map_err(|_| SessionTurnFailure::Internal)?;
+                let _ = self
+                    .conversation
+                    .recorder
+                    .record(Arc::clone(fact.entry()))
+                    .await;
             }
-            let fact = lock(&self.conversation.live_state)
-                .apply_user_message(steer, self.turn_id, SystemClock.now())
-                .map_err(|_| SessionTurnFailure::Internal)?;
-            let _ = self
-                .conversation
-                .recorder
-                .record(Arc::clone(fact.entry()))
-                .await;
         }
         Ok(())
     }
