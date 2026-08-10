@@ -621,12 +621,12 @@ enum PhysicalGenerationPayload {
 /// point: an observed marker, even an invalid one, never falls through to unpublished staging.
 enum ScannedAgentEntity {
     Published(PhysicalGenerationScan),
-    Unpublished(UnpublishedEntityFiles),
+    Unpublished(Box<UnpublishedEntityFiles>),
 }
 
 enum ScannedSessionEntity {
     Published(PhysicalGenerationScan),
-    Unpublished(UnpublishedEntityFiles),
+    Unpublished(Box<UnpublishedEntityFiles>),
 }
 
 /// Exact markerless new-entity facts. The plan later owns only these paths and booleans, never
@@ -653,15 +653,12 @@ struct UnpublishedGenerationFiles {
     definition_shape: Option<CleanupRegularFileShape>,
 }
 
-/// Current platform-observable identity facts retained only for cleanup-time revalidation. Unix
-/// uses device plus inode; other platforms intentionally retain an empty seam pending the M5.0
-/// native identity/reparse process gate. It contains neither a path nor an open handle.
+/// Current platform-observable identity facts retained only for cleanup-time revalidation: one
+/// `file_id::FileId` (device + inode on Unix, volume serial + file index on Windows) captured
+/// from the exact path at observation time. It contains neither a path nor an open handle.
 #[derive(Clone, Eq, PartialEq)]
 struct CleanupNodeIdentityShape {
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
+    file_id: file_id::FileId,
 }
 
 /// A closed regular-file observation. In addition to its node identity it records the observed
@@ -8773,9 +8770,13 @@ fn prepare_conversation_proof(
     {
         return Err(SessionConversationPublicationError::Unavailable);
     }
+    let shape = match cleanup_regular_file_shape(path, &final_path_metadata) {
+        Ok(shape) => shape,
+        Err(_) => return Err(SessionConversationPublicationError::Unavailable),
+    };
     Ok(PreparedConversationProof {
         header: header.clone(),
-        shape: cleanup_regular_file_shape(&final_path_metadata),
+        shape,
     })
 }
 
@@ -8795,7 +8796,11 @@ fn revalidate_conversation_proof(
     {
         return PublicationCertainty::CommittedCorruptPoisoned;
     }
-    if cleanup_regular_file_shape(&metadata) == proof.shape {
+    let shape = match cleanup_regular_file_shape(path, &metadata) {
+        Ok(shape) => shape,
+        Err(_) => return PublicationCertainty::IndeterminatePoisoned,
+    };
+    if shape == proof.shape {
         PublicationCertainty::Published
     } else {
         PublicationCertainty::CommittedCorruptPoisoned
@@ -9458,7 +9463,7 @@ fn cleanup_operation_owned_agent_staging(
     let files = match scan_agent_entity(&entity, GENERATION_ENTRY_CAP)
         .map_err(|_| StagingCleanupError::Poisoned)?
     {
-        ScannedAgentEntity::Unpublished(files) => files,
+        ScannedAgentEntity::Unpublished(files) => *files,
         ScannedAgentEntity::Published(_) => return Err(StagingCleanupError::Poisoned),
     };
     validate_unpublished_agent_candidate(agent_id, &files)
@@ -9516,7 +9521,7 @@ fn cleanup_operation_owned_session_staging(
     let files = match scan_session_entity(&entity, GENERATION_ENTRY_CAP)
         .map_err(|_| StagingCleanupError::Poisoned)?
     {
-        ScannedSessionEntity::Unpublished(files) => files,
+        ScannedSessionEntity::Unpublished(files) => *files,
         ScannedSessionEntity::Published(_) => return Err(StagingCleanupError::Poisoned),
     };
     validate_unpublished_session_candidate(session_id, &files, agents, sessions)
@@ -11486,7 +11491,7 @@ fn scan_session_entity(
     errors.finish()?;
     match (published, published_scan, unpublished_scan) {
         (true, Some(scan), _) => Ok(ScannedSessionEntity::Published(scan)),
-        (false, _, Some(files)) => Ok(ScannedSessionEntity::Unpublished(files)),
+        (false, _, Some(files)) => Ok(ScannedSessionEntity::Unpublished(Box::new(files))),
         _ => Err(DurableOpenError::DurableStateCorrupt),
     }
 }
@@ -11528,7 +11533,7 @@ fn recover_agents(
                         deferred_unpublished_agent_cleanup(
                             root,
                             agent_id,
-                            files,
+                            *files,
                             generation_collection_cap,
                             reservation_shape,
                         ),
@@ -11570,7 +11575,7 @@ fn recover_sessions(
                     return Err(DurableOpenError::DurableStateCorrupt);
                 }
             }
-            ScannedSessionEntity::Unpublished(files) => unpublished.push((session_id, files)),
+            ScannedSessionEntity::Unpublished(files) => unpublished.push((session_id, *files)),
         }
     }
     validate_fork_provenance_references_and_cycles(&sessions)?;
@@ -12063,7 +12068,7 @@ fn scan_agent_entity(
     errors.finish()?;
     match (published, published_scan, unpublished_scan) {
         (true, Some(scan), _) => Ok(ScannedAgentEntity::Published(scan)),
-        (false, _, Some(files)) => Ok(ScannedAgentEntity::Unpublished(files)),
+        (false, _, Some(files)) => Ok(ScannedAgentEntity::Unpublished(Box::new(files))),
         _ => Err(DurableOpenError::DurableStateCorrupt),
     }
 }
@@ -12076,7 +12081,7 @@ fn scan_unpublished_entity(
     generation_maximum: usize,
 ) -> Result<UnpublishedEntityFiles, DurableOpenError> {
     let entity_metadata = metadata_without_following(entity_path)?;
-    let entity_shape = cleanup_node_identity_shape(&entity_metadata);
+    let entity_shape = cleanup_node_identity_shape(entity_path, &entity_metadata)?;
     // Keep the G1 and conversation observations in one deliberately narrow accumulator. In
     // particular, a corrupt G1/COMMITTED observation must not make us skip a reachable sparse
     // conversation's 1 GiB metadata bound: TooLarge wins after both physical scans complete.
@@ -12084,7 +12089,7 @@ fn scan_unpublished_entity(
     let generations_shape = generations_path.as_deref().and_then(|path| {
         errors
             .record(metadata_without_following(path))
-            .map(|metadata| cleanup_node_identity_shape(&metadata))
+            .and_then(|metadata| errors.record(cleanup_node_identity_shape(path, &metadata)))
     });
     let generation = generations_path.as_deref().and_then(|path| {
         errors
@@ -12151,10 +12156,10 @@ fn scan_unpublished_generation(
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             continue;
         }
-        let Some(payload) = errors.record(scan_unpublished_generation_payload(
-            entry.path(),
-            cleanup_node_identity_shape(&metadata),
-        )) else {
+        let Some(payload) = errors.record(
+            cleanup_node_identity_shape(&entry.path(), &metadata)
+                .and_then(|shape| scan_unpublished_generation_payload(entry.path(), shape)),
+        ) else {
             continue;
         };
         let invalid_generation = generation.get() != 1 || generation_one.replace(payload).is_some();
@@ -12232,31 +12237,46 @@ fn validate_unpublished_conversation_physical_shape(
     if metadata.len() > MAX_CONVERSATION_FILE_BYTES {
         return Err(DurableOpenError::DurableStateTooLarge);
     }
-    Ok(cleanup_regular_file_shape(&metadata))
+    cleanup_regular_file_shape(path, &metadata)
 }
 
-fn cleanup_regular_file_shape(metadata: &fs::Metadata) -> CleanupRegularFileShape {
-    CleanupRegularFileShape {
+fn cleanup_regular_file_shape(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<CleanupRegularFileShape, DurableOpenError> {
+    Ok(CleanupRegularFileShape {
         length: metadata.len(),
-        node: cleanup_node_identity_shape(metadata),
-    }
+        node: cleanup_node_identity_shape(path, metadata)?,
+    })
 }
 
-fn cleanup_node_identity_shape(metadata: &fs::Metadata) -> CleanupNodeIdentityShape {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+fn cleanup_node_identity_shape(
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<CleanupNodeIdentityShape, DurableOpenError> {
+    use std::os::unix::fs::MetadataExt;
 
-        CleanupNodeIdentityShape {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        CleanupNodeIdentityShape {}
-    }
+    Ok(CleanupNodeIdentityShape {
+        file_id: file_id::FileId::new_inode(metadata.dev(), metadata.ino()),
+    })
+}
+
+#[cfg(windows)]
+fn cleanup_node_identity_shape(
+    path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<CleanupNodeIdentityShape, DurableOpenError> {
+    let file_id = file_id::get_file_id(path).map_err(|_| DurableOpenError::StorageUnavailable)?;
+    Ok(CleanupNodeIdentityShape { file_id })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn cleanup_node_identity_shape(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<CleanupNodeIdentityShape, DurableOpenError> {
+    Err(DurableOpenError::StorageUnavailable)
 }
 
 /// Scans the shared physical generation layout before either domain's decode/fold pass. A
@@ -12430,7 +12450,7 @@ fn validate_generation_document_physical_shape(
     if metadata.len() > MAX_DURABLE_DOCUMENT_BYTES as u64 {
         return Err(DurableOpenError::DurableStateTooLarge);
     }
-    Ok(cleanup_regular_file_shape(&metadata))
+    cleanup_regular_file_shape(path, &metadata)
 }
 
 fn deferred_agent_generation_cleanup(
@@ -13140,7 +13160,7 @@ fn validate_zero_regular_file(path: &Path) -> Result<CleanupNodeIdentityShape, D
         &final_handle_metadata,
         &final_path_metadata,
     )?;
-    Ok(cleanup_node_identity_shape(&final_path_metadata))
+    cleanup_node_identity_shape(path, &final_path_metadata)
 }
 
 fn create_private_directory(path: &Path) -> Result<(), DurableOpenError> {
@@ -13821,7 +13841,8 @@ fn revalidate_deferred_unpublished_entity_cleanup(
 
     let entity_metadata = cleanup_metadata_without_following(&cleanup.entity_path)?;
     validate_existing_directory(&entity_metadata, DurableOpenError::DurableStateCorrupt)?;
-    if cleanup_node_identity_shape(&entity_metadata) != cleanup.entity_shape {
+    if cleanup_node_identity_shape(&cleanup.entity_path, &entity_metadata)? != cleanup.entity_shape
+    {
         return Err(DurableOpenError::DurableStateCorrupt);
     }
     let mut entries = read_cleanup_entries_bounded(&cleanup.entity_path, cleanup.entity_entry_cap)?;
@@ -13840,7 +13861,7 @@ fn revalidate_deferred_unpublished_entity_cleanup(
             }
             validate_directory_entry(&entry, DurableOpenError::DurableStateCorrupt)?;
             let metadata = cleanup_metadata_without_following(&entry.path())?;
-            generations_shape = Some(cleanup_node_identity_shape(&metadata));
+            generations_shape = Some(cleanup_node_identity_shape(&entry.path(), &metadata)?);
         } else if entry_has_name(&entry, "conversation.jsonl") {
             if conversation_path.replace(entry.path()).is_some() {
                 return Err(DurableOpenError::DurableStateCorrupt);
@@ -13879,7 +13900,9 @@ fn revalidate_deferred_unpublished_entity_cleanup(
             }
             validate_directory_entry(entry, DurableOpenError::DurableStateCorrupt)?;
             let metadata = cleanup_metadata_without_following(&entry.path())?;
-            if Some(cleanup_node_identity_shape(&metadata)) != cleanup.generation_shape {
+            if Some(cleanup_node_identity_shape(&entry.path(), &metadata)?)
+                != cleanup.generation_shape
+            {
                 return Err(DurableOpenError::DurableStateCorrupt);
             }
             revalidate_unpublished_generation_payload(cleanup)
@@ -14072,7 +14095,7 @@ fn validate_cleanup_zero_regular_file(
     if metadata.len() != 0 {
         return Err(DurableOpenError::DurableStateCorrupt);
     }
-    Ok(cleanup_node_identity_shape(&metadata))
+    cleanup_node_identity_shape(path, &metadata)
 }
 
 fn validate_cleanup_generation_document(
@@ -14083,7 +14106,7 @@ fn validate_cleanup_generation_document(
     if metadata.len() > MAX_DURABLE_DOCUMENT_BYTES as u64 {
         return Err(DurableOpenError::DurableStateTooLarge);
     }
-    Ok(cleanup_regular_file_shape(&metadata))
+    cleanup_regular_file_shape(path, &metadata)
 }
 
 fn read_cleanup_entries_bounded(
@@ -24899,7 +24922,21 @@ mod tests {
         assert!(entity.exists());
     }
 
-    #[cfg(unix)]
+    /// Replaces an existing regular file with a fresh one, portably: Unix rename lands over
+    /// the destination atomically, while Windows rename cannot replace an existing file so the
+    /// destination is removed first. Either way the replacement carries a new node identity.
+    fn replace_file_over_existing(replacement: &Path, destination: &Path) {
+        #[cfg(unix)]
+        {
+            fs::rename(replacement, destination).expect("the file is atomically replaced");
+        }
+        #[cfg(windows)]
+        {
+            fs::remove_file(destination).expect("the destination is removed first");
+            fs::rename(replacement, destination).expect("the replacement then lands");
+        }
+    }
+
     #[test]
     fn whole_entity_cleanup_revalidation_rejects_same_shape_node_replacements() {
         let committed = TempRoot::existing();
@@ -24911,7 +24948,7 @@ mod tests {
             .join("COMMITTED");
         let replacement = marker.with_extension("replacement");
         create_file(&replacement, b"");
-        fs::rename(&replacement, &marker).expect("the zero marker is atomically replaced");
+        replace_file_over_existing(&replacement, &marker);
         assert!(matches!(
             super::finalize_deferred_cleanup(
                 &super::DeferredCleanup::UnpublishedEntity(Box::new(cleanup)),
@@ -24993,8 +25030,7 @@ mod tests {
             .join(AGENT_ONE);
         let replacement = reservation.with_extension("replacement");
         create_file(&replacement, b"");
-        fs::rename(&replacement, &reservation)
-            .expect("the permanent zero reservation is atomically replaced");
+        replace_file_over_existing(&replacement, &reservation);
         assert!(matches!(
             super::finalize_deferred_cleanup(
                 &super::DeferredCleanup::UnpublishedEntity(Box::new(cleanup)),
@@ -25007,6 +25043,61 @@ mod tests {
             entity.exists(),
             "reservation replacement causes zero deletion"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_open_handle_blocks_removal_until_dropped() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = TempRoot::existing();
+        let entity = create_unpublished_committed_session_staging(root.path());
+        let marker = entity
+            .join("generations")
+            .join(GENERATION_ONE)
+            .join("COMMITTED");
+        let handle = OpenOptions::new()
+            .read(true)
+            .write(true)
+            // FILE_SHARE_READ (0x1) | FILE_SHARE_WRITE (0x2): deliberately omits
+            // FILE_SHARE_DELETE (0x4) so the marker stays pinned while held.
+            .share_mode(0x1 | 0x2)
+            .open(&marker)
+            .expect("the COMMITTED marker opens with delete sharing excluded");
+
+        assert!(matches!(
+            open(root.path()).await,
+            Err(DurableOpenError::StorageUnavailable)
+        ));
+        assert!(
+            marker.exists(),
+            "the blocked open leaves the marker in place"
+        );
+        assert!(
+            entity.exists(),
+            "the blocked open leaves the entity in place"
+        );
+        assert!(
+            matches!(
+                open(root.path()).await,
+                Err(DurableOpenError::StorageUnavailable)
+            ),
+            "cleanup stays blocked while the handle is held"
+        );
+        assert!(
+            entity.exists(),
+            "the entity survives the second blocked open"
+        );
+
+        drop(handle);
+        let state = open(root.path())
+            .await
+            .expect("once the marker is free the reopened root completes cleanup");
+        assert!(
+            !entity.exists(),
+            "the cleanup completes after the handle drops"
+        );
+        state.close().await;
     }
 
     #[test]
