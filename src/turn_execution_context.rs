@@ -295,12 +295,17 @@ mod tests {
     }
 
     fn workspace(revision: u64) -> Workspace {
+        #[cfg(windows)]
+        let workspace_uri = "file:///C:/minicore-context-test";
+        #[cfg(not(windows))]
+        let workspace_uri = "file:///minicore-context-test";
+
         let root_key: WorkspaceRootKey = "repo".parse().unwrap();
         lower_workspace(
             WorkspaceDefinitionInput::new(
                 WorkspaceRootInput::new(
                     root_key.clone(),
-                    "file:///minicore-context-test".parse().unwrap(),
+                    workspace_uri.parse().unwrap(),
                     RequestedFilesystemAccess::ReadOnly,
                     WorkspaceSourcePolicy::new(false, false),
                 ),
