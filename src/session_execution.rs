@@ -5216,6 +5216,13 @@ impl SessionExecutorActor {
     /// installed before the spawn so a rejected spawn's RAII guard still delivers its one
     /// fallback completion through the single settlement path.  The probe has no waiter, no
     /// timer, and no TurnId.
+    ///
+    /// Start ordering for the test hook: the first-failure path sends its ReadinessChanged
+    /// install event and then calls this method in the same synchronous actor step (every call
+    /// between the event send and the state install is non-async), and the probe-active test
+    /// flag is set at the state install, before the spawn.  A test that awaits probe idle
+    /// after receiving the install event can therefore never observe the flag still false on a
+    /// probe that is about to start: the idle wait cannot return early.
     fn start_runtime_dependency_probe(&mut self) {
         if self.runtime_dependency_probe.is_some() {
             return;
@@ -5231,6 +5238,14 @@ impl SessionExecutorActor {
             reference,
             worker_task: None,
         });
+        // The probe-active test flag is set synchronously at state install, before the spawn
+        // below and before any completion can be handled, so a waiter that observed the
+        // install event (sent in the same actor step, immediately before this call) always
+        // sees the probe active and waits for its settlement instead of returning early.
+        #[cfg(test)]
+        self.hooks
+            .runtime_dependency_probe_active
+            .store(true, std::sync::atomic::Ordering::Release);
         // The RAII guard is created before the future is constructed.  If `spawn_tracked`
         // rejects the worker (owner closing, unavailable, or a spawn panic), the never-polled
         // future is dropped with the guard inside it, and the guard's Drop reports the one
@@ -5315,6 +5330,15 @@ impl SessionExecutorActor {
             {
                 self.start_runtime_dependency_probe();
             }
+            // A discarded stale completion never settles a test waiter: when a replacement
+            // probe starts, it re-installs the state and sets the probe-active flag true again
+            // (the `take` above never clears it), so the flag stays true across the transition
+            // and the waiter must observe the replacement's eventual settlement.  When no
+            // replacement starts (the fact was cleared by another path, or the executor is
+            // closing/prepared for unload), the flag is also left true with no notification:
+            // none of these is a normal-path settlement, and notifying idle would be a false
+            // normal-path signal.  The generation also stays put: only a fully-handled
+            // matching nonfatal settlement increments it.
             return Ok(());
         }
         match completion.result {
@@ -5342,11 +5366,26 @@ impl SessionExecutorActor {
                 // admission/Turn/publication, no security invalidation, and the sticky
                 // PrepareUnload marker, so a probe recovery can never bypass those.
                 self.start_queued_follow_up_after_publication()?;
+                // The recovery is fully handled only after the readiness install/event above
+                // and the successful retained FollowUp handoff, and no replacement probe is
+                // active (the fact is cleared), so this settlement is the one a test waiter
+                // must observe before its next re-arm Submit: the probe-active flag clears
+                // and notifies idle waiters, and the cumulative settlement generation
+                // increments.
+                #[cfg(test)]
+                self.hooks.settle_runtime_dependency_probe();
             }
             RuntimeDependencyProbeResult::StillUnavailable => {
                 // The storage observation is still failing: the fact stays installed, no
                 // event is published, and the cleared probe slot waits for the next Submit
-                // (or publication settlement) to re-arm the probe.
+                // (or publication settlement) to re-arm the probe.  No replacement probe is
+                // active, so this settlement is complete and the probe-active flag clears
+                // (notifying idle waiters) and the cumulative settlement generation
+                // increments; a stale Agent ref would have been discarded by the check above,
+                // which starts a replacement probe and must not settle here (the waiter
+                // observes the replacement's settlement).
+                #[cfg(test)]
+                self.hooks.settle_runtime_dependency_probe();
             }
             RuntimeDependencyProbeResult::Closing => {
                 // Cancellation through the executor token is caught by the check above; the
@@ -10255,6 +10294,25 @@ impl SessionExecutorTestHooks {
         self.inner.after_commit_before_install.release();
     }
 
+    /// The cumulative generation of runtime-dependency probe settlements so far.
+    pub(crate) fn runtime_dependency_probe_settlement_generation(&self) -> usize {
+        self.inner.runtime_dependency_probe_settlement_generation()
+    }
+
+    /// Awaits a runtime-dependency probe settlement strictly after the captured `generation`.
+    pub(crate) async fn await_runtime_dependency_probe_settlement_after(&self, generation: usize) {
+        self.inner
+            .await_runtime_dependency_probe_settlement_after(generation)
+            .await;
+    }
+
+    /// Awaits the runtime-dependency probe to be fully idle: no probe is installed/running,
+    /// and the last matching nonfatal probe was fully handled with no replacement active.
+    /// Returns immediately when no probe is installed.
+    pub(crate) async fn await_runtime_dependency_probe_idle(&self) {
+        self.inner.await_runtime_dependency_probe_idle().await;
+    }
+
     pub(crate) async fn wait_for_publication_settlement(&self) {
         self.inner.settled.wait().await;
     }
@@ -10280,6 +10338,14 @@ struct SessionExecutorTestHooksInner {
     after_commit_before_install: Arc<NamedAsyncBarrier>,
     settled: Arc<SettlementNotification>,
     fail_next_install_after_commit: std::sync::atomic::AtomicBool,
+    runtime_dependency_probe_settlements: std::sync::atomic::AtomicUsize,
+    runtime_dependency_probe_settled: tokio::sync::Notify,
+    /// Whether an owner-tracked runtime-dependency probe is installed/running: set
+    /// synchronously at state install (before the spawn), cleared only by a fully-handled
+    /// matching nonfatal settlement with no replacement active.
+    runtime_dependency_probe_active: std::sync::atomic::AtomicBool,
+    /// Wakes `await_runtime_dependency_probe_idle` when the probe-active flag clears.
+    runtime_dependency_probe_idle: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -10298,6 +10364,10 @@ impl SessionExecutorTestHooksInner {
             after_commit_before_install: Arc::new(NamedAsyncBarrier::new()),
             settled: Arc::new(SettlementNotification::new()),
             fail_next_install_after_commit: std::sync::atomic::AtomicBool::new(false),
+            runtime_dependency_probe_settlements: std::sync::atomic::AtomicUsize::new(0),
+            runtime_dependency_probe_settled: tokio::sync::Notify::new(),
+            runtime_dependency_probe_active: std::sync::atomic::AtomicBool::new(false),
+            runtime_dependency_probe_idle: tokio::sync::Notify::new(),
         }
     }
 
@@ -10341,6 +10411,73 @@ impl SessionExecutorTestHooksInner {
 
     async fn after_commit_before_install(&self) {
         self.after_commit_before_install.wait_if_armed().await;
+    }
+
+    /// Records one fully-handled matching nonfatal runtime-dependency probe settlement: the
+    /// probe-active flag clears and wakes idle waiters, and the cumulative settlement
+    /// generation increments.  The generation is never consumed: a stale pre-restore
+    /// completion that lands before a post-restore re-arm Submit can never satisfy a wait
+    /// issued after that Submit, because the wait is strictly after the generation captured
+    /// before the Submit.  Called only when the matching probe is fully handled with no
+    /// replacement active — Recovered after the readiness install/event and the successful
+    /// retained FollowUp handoff, StillUnavailable after the probe slot cleared.
+    fn settle_runtime_dependency_probe(&self) {
+        // Publish the cumulative settlement before exposing idle, so an idle waiter that
+        // subsequently captures the generation must include this exact settlement even on a
+        // multi-threaded test runtime.
+        self.runtime_dependency_probe_settlements
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.runtime_dependency_probe_settled.notify_waiters();
+        self.runtime_dependency_probe_active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.runtime_dependency_probe_idle.notify_waiters();
+    }
+
+    /// Awaits the probe-active flag to clear: returns only when no owner-tracked
+    /// runtime-dependency probe is running and the last matching nonfatal probe was fully
+    /// handled with no replacement active.  The waiter registers its Notify interest before
+    /// re-checking the flag (register-before-check), so a settlement between registration and
+    /// check cannot be lost: a probe settling after the check wakes this waiter through the
+    /// registered notify; a probe settled before the check is observed directly by the check.
+    async fn await_runtime_dependency_probe_idle(&self) {
+        loop {
+            let notified = self.runtime_dependency_probe_idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self
+                .runtime_dependency_probe_active
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// The cumulative generation of runtime-dependency probe settlements so far.
+    fn runtime_dependency_probe_settlement_generation(&self) -> usize {
+        self.runtime_dependency_probe_settlements
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Awaits a runtime-dependency probe settlement strictly after the captured `generation`.
+    /// The waiter registers its Notify interest before re-checking the generation
+    /// (register-before-check), so a settlement between registration and check is still
+    /// observed and no wakeup can be lost against the cumulative counter.
+    async fn await_runtime_dependency_probe_settlement_after(&self, generation: usize) {
+        loop {
+            let notified = self.runtime_dependency_probe_settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .runtime_dependency_probe_settlements
+                .load(std::sync::atomic::Ordering::Acquire)
+                > generation
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -16236,24 +16373,38 @@ mod tests {
         );
         assert_eq!(model.request_count(), 1);
 
-        // Restore the storage and explicitly re-arm the owner probe with fresh direct Submits.
-        // The probe armed at the failed handoff may already have settled StillUnavailable,
-        // which clears the probe slot without publishing any event, so the test must never
-        // assume a probe is still in flight (a blind Ready wait could then hang).  A Submit
-        // while the fact is installed settles SessionNotReady(RuntimeDependencyUnavailable)
-        // and re-arms the probe only when no probe is running; the probe completion and the
-        // Submit are drained through separate channels (the actor's biased select), so a stale
-        // StillUnavailable can land after a re-arm Submit, and only the next Submit re-arms.
-        // The bounded loop therefore keeps submitting fresh CommandIds until the restored
-        // pinned ar_1 is observed: every probe started after the restore recovers, so the loop
-        // converges — the recovery publishes Ready(command_id: None) and automatically hands
-        // off the exact retained FollowUp (no new Submit), and the next Submit then settles
-        // SessionBusy (or, in the defensive race where it instead started a Turn, Ok).  The
-        // two scripted answers map 1:1 to the two real Turns (the first Turn and the automatic
+        // Drain any probe armed at the failed handoff completely while the storage is still
+        // denied, before restoring it.  The install event above and the probe start are one
+        // synchronous actor step: the first-failure path sends ReadinessChanged and then calls
+        // start_runtime_dependency_probe (which installs the probe state and sets the
+        // probe-active test flag before spawning) with no await in between, so a test that
+        // received the install event can never observe the flag still false — the idle wait
+        // cannot return early on a probe that is about to start.  The probe re-reads the
+        // pinned ar_1 through the still-denied directory, so it settles StillUnavailable and
+        // clears its slot; awaiting idle then drains any pre-restore probe completely, and no
+        // other path re-arms while the fact stays installed.  Only then restore the storage
+        // and capture the cumulative probe-settlement generation as the baseline: every
+        // settlement after this baseline belongs to a probe started by a re-arm Submit after
+        // the restore, so no pre-restore settlement can satisfy the post-Submit waits below.
+        //
+        // The re-arm loop makes each iteration represent exactly one completed probe, not one
+        // fast request: it captures the settlement generation before the Submit and, on
+        // SessionNotReady, awaits a settlement strictly after that captured generation before
+        // refreshing the generation for the next Submit.  A Submit while the fact is installed
+        // settles SessionNotReady(RuntimeDependencyUnavailable) and re-arms the probe only
+        // when no probe is running; every probe started after the restore recovers, so the
+        // loop converges within a handful of settlements — the recovery publishes
+        // Ready(command_id: None) and automatically hands off the exact retained FollowUp (no
+        // new Submit), and the next Submit then settles SessionBusy (or, in the defensive race
+        // where it instead started a Turn, Ok).  The cap below is only an invariant guard:
+        // with one completed probe per iteration the loop cannot plausibly reach it.  The two
+        // scripted answers map 1:1 to the two real Turns (the first Turn and the automatic
         // FollowUp handoff); the re-arm Submits never consume a model request.
+        hooks.await_runtime_dependency_probe_idle().await;
         readability.restore();
+        let mut settled_generation = hooks.runtime_dependency_probe_settlement_generation();
         let rearm_turn = 'rearm: {
-            for _ in 0..100 {
+            for _ in 0..16 {
                 let outcome = loaded
                     .executor
                     .submit(CommandId::generate().unwrap(), text_intent("re-arm"))
@@ -16262,8 +16413,15 @@ mod tests {
                     Err(SessionSubmitError::SessionNotReady(
                         SessionUnavailableView::RuntimeDependencyUnavailable,
                     )) => {
-                        // The fact is still installed; the re-arm may or may not have started a
-                        // probe.  Loop so a probe eventually observes the restored directory.
+                        // The fact is still installed; the Submit settled immediately and
+                        // re-armed the probe only when none was running.  One completed probe
+                        // must elapse before the next Submit: await the settlement strictly
+                        // after the generation captured before this Submit, then refresh the
+                        // captured generation.
+                        hooks
+                            .await_runtime_dependency_probe_settlement_after(settled_generation)
+                            .await;
+                        settled_generation = hooks.runtime_dependency_probe_settlement_generation();
                     }
                     Err(SessionSubmitError::SessionBusy) => break 'rearm None,
                     Ok(turn_id) => break 'rearm Some(turn_id),
