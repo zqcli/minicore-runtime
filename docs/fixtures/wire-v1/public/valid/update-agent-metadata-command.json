@@ -1,0 +1,1 @@
+{"commandId":"cmd_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","command":{"type":"agent","data":{"type":"update_metadata","data":{"agentId":"agt_11111111111111111111111111111111","expectedRevision":"amr_1","patch":{"name":"Planner v2","description":{"type":"set","data":"Plans and reviews implementation work"}}}}}}

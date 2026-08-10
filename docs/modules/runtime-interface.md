@@ -2,7 +2,7 @@
 
 日期：2026-07-31
 
-状态：当前权威架构（ADR 0136/0137；M5 durable foundation与replay/Recorder-backed hydration、Workspace resolver/Snapshot及Runtime-owned residency foundation已实现；minimal public dispatch/query/snapshot/subscribe已接通Agent Create/Enable/Disable/Delete与Session Create/Load/Submit/Unload/Fork/Archive/Unarchive/Delete、typed ResolveInteraction/NoChange、durable `ListAgents`/`ListSessions`分页、`GetSessionForkProvenance`、snapshot-first Runtime/Session subscription、Runtime Agent/Session membership/lifecycle StateEvent、loaded Ready+Idle Snapshot与Turn Completed/Failed Event；M9 Starting/Running/Finishing observation、current Turn/active Items/Pending Interaction安全摘要已接通；Session usage、Degraded recording与bounded diagnostics也已接通；selected-V1 Agent lifecycle、Progress/Closed及SessionDefinitionUpdated codec已关闭public manifest pending；M11 remaining Agent/Session definition/metadata CAS、readiness、grace/cancel式active-Turn Unload及完整cross-platform native matrix pending）
+状态：当前权威架构（ADR 0136/0137；M5 durable foundation与replay/Recorder-backed hydration、Workspace resolver/Snapshot及Runtime-owned residency foundation已实现；minimal public dispatch/query/snapshot/subscribe已接通Agent Create/Enable/Disable/Delete/UpdateDefinition/UpdateMetadata与Session Create/Load/Submit/Unload/Fork/Archive/Unarchive/Delete、typed ResolveInteraction/NoChange、durable `ListAgents`/`ListSessions`分页、`GetSessionForkProvenance`、snapshot-first Runtime/Session subscription、Runtime Agent/Session membership/lifecycle/definition/metadata StateEvent、loaded Ready+Idle Snapshot与Turn Completed/Failed Event；M9 Starting/Running/Finishing observation、current Turn/active Items/Pending Interaction安全摘要已接通；Session usage、Degraded recording与bounded diagnostics也已接通；selected-V1 Agent mutation、Progress/Closed及SessionDefinitionUpdated codec已关闭public manifest pending；M11 remaining Session definition/metadata CAS、readiness、grace/cancel式active-Turn Unload及完整cross-platform native matrix pending）
 
 ## 目的
 
@@ -1965,7 +1965,7 @@ pub enum QueueUpdateReason {
 }
 ```
 
-M2/M11 State codec已materialize Runtime `command_catalog_invalidated | agent_created | agent_status_changed | session_created | session_loaded | session_unloaded | session_archived | session_unarchived | session_deleted | session_forked`以及Session `session_execution_changed | turn_completed | turn_interrupted | turn_failed` + matching detail；Progress和Closed EventFrame亦已materialize全部typed payload并通过selected-V1 canonical round-trip。Agent/Session definition/metadata及Item/Interaction/queue StateEvent kinds继续返回known `PendingPublicTarget`。`SessionSnapshot`与Runtime `SessionChanged` summary上的Box只控制enum尺寸。
+M2/M11 State codec已materialize Runtime `command_catalog_invalidated | agent_created | agent_definition_updated | agent_metadata_updated | agent_status_changed | session_created | session_loaded | session_unloaded | session_archived | session_unarchived | session_deleted | session_forked`以及Session `session_execution_changed | turn_completed | turn_interrupted | turn_failed` + matching detail；Progress和Closed EventFrame亦已materialize全部typed payload并通过selected-V1 canonical round-trip。Session definition/metadata及Item/Interaction/queue StateEvent kinds继续返回known `PendingPublicTarget`。`SessionSnapshot`与Runtime `SessionChanged` summary上的Box只控制enum尺寸。
 
 StateEvent本身始终是非durable observer record，不因payload来源不同而成为第二日志：
 

@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use minicore_runtime::agent_session_lifecycle::{
-    AgentStatus, AgentUsableStatus, NewAgentDefinition, NewAgentMetadata,
+    AgentDefinitionPatch, AgentMetadataPatch, AgentStatus, AgentUsableStatus, NewAgentDefinition,
+    NewAgentMetadata, OptionalTextPatch,
 };
 use minicore_runtime::prompt::AgentPromptSelection;
 use minicore_runtime::runtime_interface::{
@@ -684,6 +685,390 @@ async fn public_agent_lifecycle_publishes_real_changes_and_survives_restart() {
     assert_eq!(recovered.items().len(), 1);
     assert_eq!(recovered.items()[0].agent_id(), agent_id);
     assert_eq!(recovered.items()[0].status(), AgentStatus::Deleted);
+    reopened.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_agent_definition_and_metadata_cas_publish_and_survive_restart() {
+    let root = TempRoot::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let mut events = runtime
+        .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+        .await
+        .expect("the Runtime subscription opens");
+    assert!(matches!(
+        events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+    ));
+
+    let missing_agent_id = "agt_ffffffffffffffffffffffffffffffff".parse().unwrap();
+    for command in [
+        RuntimeCommand::Agent(AgentCommand::UpdateDefinition {
+            agent_id: missing_agent_id,
+            expected_revision: "ar_1".parse().unwrap(),
+            patch: AgentDefinitionPatch::new(None),
+        }),
+        RuntimeCommand::Agent(AgentCommand::UpdateMetadata {
+            agent_id: missing_agent_id,
+            expected_revision: "amr_1".parse().unwrap(),
+            patch: AgentMetadataPatch::new(None::<&str>, OptionalTextPatch::keep()).unwrap(),
+        }),
+    ] {
+        let response = runtime
+            .dispatch(CommandRequest::new(CommandId::generate().unwrap(), command))
+            .await
+            .expect("missing Agent update dispatches");
+        assert!(matches!(
+            response.completion(),
+            CommandCompletion::Rejected(error)
+                if error.code() == CommandErrorCode::NotFound
+                    && error.subject()
+                        == Some(&minicore_runtime::runtime_interface::PublicSubject::Agent(
+                            missing_agent_id
+                        ))
+        ));
+    }
+
+    let created = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::Create {
+                definition: NewAgentDefinition::new(AgentPromptSelection::new(Vec::new()).unwrap()),
+                metadata: NewAgentMetadata::new("Planner", Some("Initial description")).unwrap(),
+            }),
+        ))
+        .await
+        .expect("Agent Create dispatches");
+    let CommandCompletion::Completed {
+        outcome: CommandOutcome::AgentCreated { agent_id, .. },
+        output: None,
+    } = created.completion()
+    else {
+        panic!("Agent Create returns its typed outcome");
+    };
+    let agent_id = *agent_id;
+    assert!(matches!(events.recv().await, Some(EventFrame::State(_))));
+
+    let definition_id = CommandId::generate().unwrap();
+    let definition = runtime
+        .dispatch(CommandRequest::new(
+            definition_id,
+            RuntimeCommand::Agent(AgentCommand::UpdateDefinition {
+                agent_id,
+                expected_revision: "ar_1".parse().unwrap(),
+                patch: AgentDefinitionPatch::new(Some(
+                    AgentPromptSelection::new(vec!["base".parse().unwrap()]).unwrap(),
+                )),
+            }),
+        ))
+        .await
+        .expect("Agent definition update dispatches");
+    assert!(matches!(
+        definition.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::AgentDefinitionUpdated {
+                definition_revision
+            },
+            output: None,
+        } if definition_revision.get() == 2
+    ));
+    let Some(EventFrame::State(definition_event)) = events.recv().await else {
+        panic!("Agent definition update publishes one StateEvent");
+    };
+    assert_eq!(definition_event.command_id(), Some(definition_id));
+    assert!(matches!(
+        definition_event.msg(),
+        StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::AgentDefinitionUpdated,
+            detail: Some(RuntimeEventDetail::AgentChanged { agent }),
+            ..
+        } if agent.definition_revision().get() == 2
+            && agent.metadata().revision().get() == 1
+            && agent.status() == AgentStatus::Enabled
+    ));
+
+    let definition_noop = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::UpdateDefinition {
+                agent_id,
+                expected_revision: "ar_2".parse().unwrap(),
+                patch: AgentDefinitionPatch::new(None),
+            }),
+        ))
+        .await
+        .expect("empty Agent definition patch dispatches");
+    assert!(matches!(
+        definition_noop.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::NoChange,
+            output: None,
+        }
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+            .await
+            .is_err()
+    );
+
+    let stale_definition = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::UpdateDefinition {
+                agent_id,
+                expected_revision: "ar_1".parse().unwrap(),
+                patch: AgentDefinitionPatch::new(None),
+            }),
+        ))
+        .await
+        .expect("stale Agent definition update dispatches");
+    assert!(matches!(
+        stale_definition.completion(),
+        CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::StaleRevision
+    ));
+
+    let metadata_id = CommandId::generate().unwrap();
+    let metadata = runtime
+        .dispatch(CommandRequest::new(
+            metadata_id,
+            RuntimeCommand::Agent(AgentCommand::UpdateMetadata {
+                agent_id,
+                expected_revision: "amr_1".parse().unwrap(),
+                patch: AgentMetadataPatch::new(
+                    Some("Planner v2"),
+                    OptionalTextPatch::set("Revised description").unwrap(),
+                )
+                .unwrap(),
+            }),
+        ))
+        .await
+        .expect("Agent metadata update dispatches");
+    assert!(matches!(
+        metadata.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::AgentMetadataUpdated { metadata_revision },
+            output: None,
+        } if metadata_revision.get() == 2
+    ));
+    let Some(EventFrame::State(metadata_event)) = events.recv().await else {
+        panic!("Agent metadata update publishes one StateEvent");
+    };
+    assert_eq!(metadata_event.command_id(), Some(metadata_id));
+    assert!(matches!(
+        metadata_event.msg(),
+        StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::AgentMetadataUpdated,
+            detail: Some(RuntimeEventDetail::AgentChanged { agent }),
+            ..
+        } if agent.definition_revision().get() == 2
+            && agent.metadata().revision().get() == 2
+            && agent.metadata().name() == "Planner v2"
+            && agent.metadata().description() == Some("Revised description")
+    ));
+
+    let metadata_noop = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::UpdateMetadata {
+                agent_id,
+                expected_revision: "amr_2".parse().unwrap(),
+                patch: AgentMetadataPatch::new(None::<&str>, OptionalTextPatch::keep()).unwrap(),
+            }),
+        ))
+        .await
+        .expect("empty Agent metadata patch dispatches");
+    assert!(matches!(
+        metadata_noop.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::NoChange,
+            output: None,
+        }
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+            .await
+            .is_err()
+    );
+
+    let stale_metadata = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::UpdateMetadata {
+                agent_id,
+                expected_revision: "amr_1".parse().unwrap(),
+                patch: AgentMetadataPatch::new(None::<&str>, OptionalTextPatch::keep()).unwrap(),
+            }),
+        ))
+        .await
+        .expect("stale Agent metadata update dispatches");
+    assert!(matches!(
+        stale_metadata.completion(),
+        CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::StaleRevision
+    ));
+
+    let cleared = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::UpdateMetadata {
+                agent_id,
+                expected_revision: "amr_2".parse().unwrap(),
+                patch: AgentMetadataPatch::new(None::<&str>, OptionalTextPatch::clear()).unwrap(),
+            }),
+        ))
+        .await
+        .expect("Agent description clear dispatches");
+    assert!(matches!(
+        cleared.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::AgentMetadataUpdated { metadata_revision },
+            output: None,
+        } if metadata_revision.get() == 3
+    ));
+    assert!(matches!(
+        events.recv().await,
+        Some(EventFrame::State(event))
+            if matches!(
+                event.msg(),
+                StateEventMsg::Runtime {
+                    kind: RuntimeStateEventKind::AgentMetadataUpdated,
+                    detail: Some(RuntimeEventDetail::AgentChanged { agent }),
+                    ..
+                } if agent.metadata().description().is_none()
+            )
+    ));
+
+    runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::SetStatus {
+                agent_id,
+                expected_status: AgentStatus::Enabled,
+                status: AgentUsableStatus::Disabled,
+            }),
+        ))
+        .await
+        .expect("Agent Disable dispatches");
+    assert!(matches!(events.recv().await, Some(EventFrame::State(_))));
+
+    let disabled_definition = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::UpdateDefinition {
+                agent_id,
+                expected_revision: "ar_2".parse().unwrap(),
+                patch: AgentDefinitionPatch::new(Some(
+                    AgentPromptSelection::new(vec!["disabled".parse().unwrap()]).unwrap(),
+                )),
+            }),
+        ))
+        .await
+        .expect("disabled Agent definition update dispatches");
+    assert!(matches!(
+        disabled_definition.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::AgentDefinitionUpdated {
+                definition_revision
+            },
+            output: None,
+        } if definition_revision.get() == 3
+    ));
+    assert!(matches!(events.recv().await, Some(EventFrame::State(_))));
+
+    let disabled_metadata = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::UpdateMetadata {
+                agent_id,
+                expected_revision: "amr_3".parse().unwrap(),
+                patch: AgentMetadataPatch::new(Some("Disabled Planner"), OptionalTextPatch::keep())
+                    .unwrap(),
+            }),
+        ))
+        .await
+        .expect("disabled Agent metadata update dispatches");
+    assert!(matches!(
+        disabled_metadata.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::AgentMetadataUpdated { metadata_revision },
+            output: None,
+        } if metadata_revision.get() == 4
+    ));
+    assert!(matches!(events.recv().await, Some(EventFrame::State(_))));
+
+    runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::Delete {
+                agent_id,
+                expected_status: AgentStatus::Disabled,
+            }),
+        ))
+        .await
+        .expect("Agent Delete dispatches");
+    assert!(matches!(events.recv().await, Some(EventFrame::State(_))));
+
+    let deleted_definition = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::UpdateDefinition {
+                agent_id,
+                expected_revision: "ar_3".parse().unwrap(),
+                patch: AgentDefinitionPatch::new(None),
+            }),
+        ))
+        .await
+        .expect("deleted Agent definition update dispatches");
+    assert!(matches!(
+        deleted_definition.completion(),
+        CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::AgentDeleted
+    ));
+    let deleted_metadata = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::UpdateMetadata {
+                agent_id,
+                expected_revision: "amr_4".parse().unwrap(),
+                patch: AgentMetadataPatch::new(None::<&str>, OptionalTextPatch::keep()).unwrap(),
+            }),
+        ))
+        .await
+        .expect("deleted Agent metadata update dispatches");
+    assert!(matches!(
+        deleted_metadata.completion(),
+        CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::AgentDeleted
+    ));
+
+    runtime.shutdown().await;
+
+    let reopened = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime reopens");
+    let recovered = reopened
+        .query(RuntimeQuery::Agent(AgentQuery::ListAgents {
+            page: PageRequest::new(None, NonZeroU32::new(10).unwrap()),
+            include_deleted: true,
+        }))
+        .await
+        .expect("the recovered Agent catalog query succeeds");
+    let QueryResult::Agent(AgentQueryResult::Agents(recovered)) = recovered.data() else {
+        panic!("the recovered Agent query returns an Agent page");
+    };
+    assert_eq!(recovered.items().len(), 1);
+    let agent = &recovered.items()[0];
+    assert_eq!(agent.agent_id(), agent_id);
+    assert_eq!(agent.definition_revision().get(), 3);
+    assert_eq!(agent.metadata().revision().get(), 4);
+    assert_eq!(agent.metadata().name(), "Disabled Planner");
+    assert!(agent.metadata().description().is_none());
+    assert_eq!(agent.status(), AgentStatus::Deleted);
     reopened.shutdown().await;
 }
 

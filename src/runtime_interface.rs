@@ -5,8 +5,8 @@ use std::num::NonZeroU32;
 use thiserror::Error;
 
 use crate::agent_session_lifecycle::{
-    AgentRevisionRef, AgentStatus, AgentUsableStatus, ForkAnchor, ForkSourceKind,
-    NewAgentDefinition, NewAgentMetadata, SessionModelConfig,
+    AgentDefinitionPatch, AgentMetadataPatch, AgentRevisionRef, AgentStatus, AgentUsableStatus,
+    ForkAnchor, ForkSourceKind, NewAgentDefinition, NewAgentMetadata, SessionModelConfig,
 };
 use crate::prompt::{PromptIntent, SessionPromptSelection};
 use crate::skills::SkillId;
@@ -269,6 +269,16 @@ pub enum AgentCommand {
         definition: NewAgentDefinition,
         metadata: NewAgentMetadata,
     },
+    UpdateDefinition {
+        agent_id: AgentId,
+        expected_revision: AgentRevision,
+        patch: AgentDefinitionPatch,
+    },
+    UpdateMetadata {
+        agent_id: AgentId,
+        expected_revision: AgentMetadataRevision,
+        patch: AgentMetadataPatch,
+    },
     SetStatus {
         agent_id: AgentId,
         expected_status: AgentStatus,
@@ -290,6 +300,26 @@ impl fmt::Debug for AgentCommand {
                 .debug_struct("Create")
                 .field("definition", definition)
                 .field("metadata", metadata)
+                .finish(),
+            Self::UpdateDefinition {
+                agent_id,
+                expected_revision,
+                patch,
+            } => formatter
+                .debug_struct("UpdateDefinition")
+                .field("agent_id", agent_id)
+                .field("expected_revision", expected_revision)
+                .field("patch", patch)
+                .finish(),
+            Self::UpdateMetadata {
+                agent_id,
+                expected_revision,
+                patch,
+            } => formatter
+                .debug_struct("UpdateMetadata")
+                .field("agent_id", agent_id)
+                .field("expected_revision", expected_revision)
+                .field("patch", patch)
                 .finish(),
             Self::SetStatus {
                 agent_id,
@@ -550,6 +580,12 @@ pub enum CommandOutcome {
     AgentCreated {
         agent_id: AgentId,
         definition_revision: AgentRevision,
+        metadata_revision: AgentMetadataRevision,
+    },
+    AgentDefinitionUpdated {
+        definition_revision: AgentRevision,
+    },
+    AgentMetadataUpdated {
         metadata_revision: AgentMetadataRevision,
     },
     AgentStatusChanged {
@@ -2528,6 +2564,8 @@ pub enum EventRoute {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RuntimeStateEventKind {
     AgentCreated,
+    AgentDefinitionUpdated,
+    AgentMetadataUpdated,
     AgentStatusChanged,
     SessionCreated,
     SessionLoaded,
@@ -2703,6 +2741,36 @@ impl StateEvent {
         )
     }
 
+    pub fn agent_definition_updated(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        agent: AgentSummary,
+    ) -> Self {
+        Self::runtime_agent_changed(
+            timestamp,
+            command_id,
+            snapshot,
+            agent,
+            RuntimeStateEventKind::AgentDefinitionUpdated,
+        )
+    }
+
+    pub fn agent_metadata_updated(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        agent: AgentSummary,
+    ) -> Self {
+        Self::runtime_agent_changed(
+            timestamp,
+            command_id,
+            snapshot,
+            agent,
+            RuntimeStateEventKind::AgentMetadataUpdated,
+        )
+    }
+
     fn runtime_agent_changed(
         timestamp: Timestamp,
         command_id: Option<CommandId>,
@@ -2712,7 +2780,10 @@ impl StateEvent {
     ) -> Self {
         debug_assert!(matches!(
             kind,
-            RuntimeStateEventKind::AgentCreated | RuntimeStateEventKind::AgentStatusChanged
+            RuntimeStateEventKind::AgentCreated
+                | RuntimeStateEventKind::AgentDefinitionUpdated
+                | RuntimeStateEventKind::AgentMetadataUpdated
+                | RuntimeStateEventKind::AgentStatusChanged
         ));
         let agent_id = agent.agent_id();
         Self {
@@ -3052,6 +3123,8 @@ impl StateEvent {
                 StateEventMsg::Runtime {
                     kind:
                         kind @ (RuntimeStateEventKind::AgentCreated
+                        | RuntimeStateEventKind::AgentDefinitionUpdated
+                        | RuntimeStateEventKind::AgentMetadataUpdated
                         | RuntimeStateEventKind::AgentStatusChanged),
                     detail: Some(RuntimeEventDetail::AgentChanged { agent }),
                     ..
@@ -3060,6 +3133,11 @@ impl StateEvent {
                 *agent_id == agent.agent_id()
                     && (!matches!(kind, RuntimeStateEventKind::AgentCreated)
                         || agent.status() == AgentStatus::Enabled)
+                    && (!matches!(
+                        kind,
+                        RuntimeStateEventKind::AgentDefinitionUpdated
+                            | RuntimeStateEventKind::AgentMetadataUpdated
+                    ) || agent.status() != AgentStatus::Deleted)
             }
             (
                 EventRoute::Session { session_id },
@@ -3089,6 +3167,8 @@ impl StateEvent {
                     RuntimeStateEventKind::SessionLoaded
                     | RuntimeStateEventKind::SessionUnloaded
                     | RuntimeStateEventKind::AgentCreated
+                    | RuntimeStateEventKind::AgentDefinitionUpdated
+                    | RuntimeStateEventKind::AgentMetadataUpdated
                     | RuntimeStateEventKind::AgentStatusChanged
                     | RuntimeStateEventKind::CommandCatalogInvalidated => false,
                 };

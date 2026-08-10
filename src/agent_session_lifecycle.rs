@@ -315,6 +315,174 @@ impl fmt::Debug for NewAgentMetadata {
     }
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct AgentDefinitionPatch {
+    prompts: Option<AgentPromptSelection>,
+}
+
+impl AgentDefinitionPatch {
+    pub const fn new(prompts: Option<AgentPromptSelection>) -> Self {
+        Self { prompts }
+    }
+
+    pub const fn prompts(&self) -> Option<&AgentPromptSelection> {
+        self.prompts.as_ref()
+    }
+}
+
+impl fmt::Debug for AgentDefinitionPatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentDefinitionPatch")
+            .field("prompts_changed", &self.prompts.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct OptionalTextPatch {
+    value: OptionalTextPatchValue,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+enum OptionalTextPatchValue {
+    Keep,
+    Set(Box<str>),
+    Clear,
+}
+
+impl OptionalTextPatch {
+    pub const fn keep() -> Self {
+        Self {
+            value: OptionalTextPatchValue::Keep,
+        }
+    }
+
+    pub fn set<T>(value: T) -> Result<Self, AgentMetadataError>
+    where
+        T: AsRef<str>,
+    {
+        Self::set_with_limits(value, ProtocolLimits::v1_0())
+    }
+
+    pub(crate) fn set_with_limits<T>(
+        value: T,
+        limits: ProtocolLimits,
+    ) -> Result<Self, AgentMetadataError>
+    where
+        T: AsRef<str>,
+    {
+        let value = normalize_agent_metadata_text(
+            value.as_ref(),
+            usize::try_from(limits.text.max_description_bytes).unwrap_or(usize::MAX),
+            true,
+        )?;
+        Ok(Self {
+            value: OptionalTextPatchValue::Set(value),
+        })
+    }
+
+    pub const fn clear() -> Self {
+        Self {
+            value: OptionalTextPatchValue::Clear,
+        }
+    }
+
+    pub const fn is_keep(&self) -> bool {
+        matches!(self.value, OptionalTextPatchValue::Keep)
+    }
+
+    pub const fn is_clear(&self) -> bool {
+        matches!(self.value, OptionalTextPatchValue::Clear)
+    }
+
+    pub fn set_value(&self) -> Option<&str> {
+        match &self.value {
+            OptionalTextPatchValue::Set(value) => Some(value),
+            OptionalTextPatchValue::Keep | OptionalTextPatchValue::Clear => None,
+        }
+    }
+
+    fn apply_to(&self, current: Option<&str>) -> Option<Box<str>> {
+        match &self.value {
+            OptionalTextPatchValue::Keep => current.map(Into::into),
+            OptionalTextPatchValue::Set(value) => Some(value.clone()),
+            OptionalTextPatchValue::Clear => None,
+        }
+    }
+}
+
+impl fmt::Debug for OptionalTextPatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.value {
+            OptionalTextPatchValue::Keep => "Keep",
+            OptionalTextPatchValue::Set(_) => "Set",
+            OptionalTextPatchValue::Clear => "Clear",
+        };
+        formatter
+            .debug_struct("OptionalTextPatch")
+            .field("kind", &kind)
+            .field("value", &"redacted")
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct AgentMetadataPatch {
+    name: Option<Box<str>>,
+    description: OptionalTextPatch,
+}
+
+impl AgentMetadataPatch {
+    pub fn new<N>(
+        name: Option<N>,
+        description: OptionalTextPatch,
+    ) -> Result<Self, AgentMetadataError>
+    where
+        N: AsRef<str>,
+    {
+        Self::new_with_limits(name, description, ProtocolLimits::v1_0())
+    }
+
+    pub(crate) fn new_with_limits<N>(
+        name: Option<N>,
+        description: OptionalTextPatch,
+        limits: ProtocolLimits,
+    ) -> Result<Self, AgentMetadataError>
+    where
+        N: AsRef<str>,
+    {
+        let name = name
+            .map(|value| {
+                normalize_agent_metadata_text(
+                    value.as_ref(),
+                    usize::from(limits.text.max_display_name_bytes),
+                    false,
+                )
+            })
+            .transpose()?;
+        Ok(Self { name, description })
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub const fn description(&self) -> &OptionalTextPatch {
+        &self.description
+    }
+}
+
+impl fmt::Debug for AgentMetadataPatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentMetadataPatch")
+            .field("name_changed", &self.name.is_some())
+            .field("description", &self.description)
+            .finish()
+    }
+}
+
 fn normalize_agent_metadata_text(
     value: &str,
     maximum: usize,
@@ -515,10 +683,6 @@ pub(crate) enum AgentDefinitionDecision {
 }
 
 impl SealedAgentDefinitionAttempt {
-    #[allow(
-        dead_code,
-        reason = "the public Agent definition command constructor consumes this sealed seam"
-    )]
     pub(crate) fn new(
         agent_id: AgentId,
         expected_revision: AgentRevision,
@@ -596,83 +760,9 @@ impl fmt::Debug for SealedAgentDefinitionAttempt {
     }
 }
 
-/// The sealed description half of an Agent metadata patch. Its representation is private so a
-/// caller cannot forge an invalid canonical Set value or confuse Keep with Clear.
-#[allow(
-    dead_code,
-    reason = "the sealed description patch is consumed by the pending Agent command surface"
-)]
-#[derive(Clone, Eq, PartialEq)]
-pub(crate) struct AgentMetadataDescriptionPatch {
-    value: AgentMetadataDescriptionPatchValue,
-}
-
-#[allow(
-    dead_code,
-    reason = "the sealed description patch is consumed by the pending Agent command surface"
-)]
-#[derive(Clone, Eq, PartialEq)]
-enum AgentMetadataDescriptionPatchValue {
-    Keep,
-    Set(Box<str>),
-    Clear,
-}
-
-#[allow(
-    dead_code,
-    reason = "the sealed description patch is consumed by the pending Agent command surface"
-)]
-impl AgentMetadataDescriptionPatch {
-    pub(crate) const fn keep() -> Self {
-        Self {
-            value: AgentMetadataDescriptionPatchValue::Keep,
-        }
-    }
-
-    pub(crate) fn set<D>(raw: D) -> Result<Self, AgentMetadataError>
-    where
-        D: AsRef<str>,
-    {
-        let limits = ProtocolLimits::v1_0().text;
-        let value = normalize_agent_metadata_text(
-            raw.as_ref(),
-            usize::try_from(limits.max_description_bytes).unwrap_or(usize::MAX),
-            true,
-        )?;
-        Ok(Self {
-            value: AgentMetadataDescriptionPatchValue::Set(value),
-        })
-    }
-
-    pub(crate) const fn clear() -> Self {
-        Self {
-            value: AgentMetadataDescriptionPatchValue::Clear,
-        }
-    }
-
-    fn apply_to(&self, current: Option<&str>) -> Option<Box<str>> {
-        match &self.value {
-            AgentMetadataDescriptionPatchValue::Keep => current.map(|value| value.into()),
-            AgentMetadataDescriptionPatchValue::Set(value) => Some(value.clone()),
-            AgentMetadataDescriptionPatchValue::Clear => None,
-        }
-    }
-}
-
-impl fmt::Debug for AgentMetadataDescriptionPatch {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let kind = match self.value {
-            AgentMetadataDescriptionPatchValue::Keep => "Keep",
-            AgentMetadataDescriptionPatchValue::Set(_) => "Set",
-            AgentMetadataDescriptionPatchValue::Clear => "Clear",
-        };
-        formatter
-            .debug_struct("AgentMetadataDescriptionPatch")
-            .field("kind", &kind)
-            .field("value", &"redacted")
-            .finish()
-    }
-}
+/// Existing internal call sites use this lifecycle-local name, but the sealed CAS and public
+/// command deliberately share one unforgeable owner value rather than shadow representations.
+pub(crate) type AgentMetadataDescriptionPatch = OptionalTextPatch;
 
 /// Lifecycle-owned semantic input to one Agent metadata CAS. It carries only the Agent lookup
 /// key, expected current metadata revision, canonical patch intent, and owner timestamp. Storage
@@ -702,10 +792,6 @@ pub(crate) enum AgentMetadataDecision {
 }
 
 impl SealedAgentMetadataAttempt {
-    #[allow(
-        dead_code,
-        reason = "the public Agent metadata command constructor consumes this sealed seam"
-    )]
     pub(crate) fn new(
         agent_id: AgentId,
         expected_revision: AgentMetadataRevision,
@@ -2082,9 +2168,10 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     use super::{
-        AgentDefinitionDecision, AgentMetadataDecision, AgentMetadataDecisionError,
-        AgentMetadataDescriptionPatch, AgentRevisionRef, AgentStatus, AgentStatusAttemptError,
-        AgentUsableStatus, NewAgentDefinition, NewAgentMetadata, SealedAgentCreateAttempt,
+        AgentDefinitionDecision, AgentDefinitionPatch, AgentMetadataDecision,
+        AgentMetadataDecisionError, AgentMetadataDescriptionPatch, AgentMetadataPatch,
+        AgentRevisionRef, AgentStatus, AgentStatusAttemptError, AgentUsableStatus,
+        NewAgentDefinition, NewAgentMetadata, OptionalTextPatch, SealedAgentCreateAttempt,
         SealedAgentDefinitionAttempt, SealedAgentMetadataAttempt, SealedAgentStatusAttempt,
         SealedSessionAgentUpgradeAttempt, SealedSessionCreateAttempt,
         SealedSessionDefinitionAttempt, SealedSessionForkAttempt, SealedSessionLifecycleAttempt,
@@ -2196,6 +2283,40 @@ mod tests {
             AgentUsableStatus::Disabled.as_agent_status(),
             AgentStatus::Disabled
         );
+    }
+
+    #[test]
+    fn public_agent_patches_normalize_preserve_intent_and_redact_values() {
+        let prompts = AgentPromptSelection::new(vec!["private-prompt".parse().unwrap()]).unwrap();
+        let definition = AgentDefinitionPatch::new(Some(prompts));
+        assert_eq!(definition.prompts().unwrap().enabled().len(), 1);
+        assert!(!format!("{definition:?}").contains("private-prompt"));
+
+        let keep = OptionalTextPatch::keep();
+        assert!(keep.is_keep());
+        assert!(!keep.is_clear());
+        assert_eq!(keep.set_value(), None);
+
+        let set = OptionalTextPatch::set("private description\r\nline").unwrap();
+        assert!(!set.is_keep());
+        assert!(!set.is_clear());
+        assert_eq!(set.set_value(), Some("private description\nline"));
+        assert!(!format!("{set:?}").contains("private description"));
+
+        let clear = OptionalTextPatch::clear();
+        assert!(!clear.is_keep());
+        assert!(clear.is_clear());
+        assert_eq!(clear.set_value(), None);
+
+        let metadata = AgentMetadataPatch::new(Some("private name\r\nline"), set).unwrap();
+        assert_eq!(metadata.name(), Some("private name\nline"));
+        assert_eq!(
+            metadata.description().set_value(),
+            Some("private description\nline")
+        );
+        let debug = format!("{metadata:?}");
+        assert!(!debug.contains("private name"));
+        assert!(!debug.contains("private description"));
     }
 
     #[test]
