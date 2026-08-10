@@ -18,9 +18,9 @@ use minicore_runtime::runtime_interface::{
     CommandOutcome, CommandRequest, EventFrame, EventRoute, NewSessionDefinition,
     NewSessionMetadata, PageRequest, PublicSubject, QueryErrorCode, QueryResult, RetryAdvice,
     RuntimeCommand, RuntimeDispatchError, RuntimeEventDetail, RuntimeQuery, RuntimeStateEventKind,
-    SessionCommand, SessionDefinitionPatch, SessionExecutionView, SessionLifecycleView,
-    SessionQuery, SessionQueryResult, SessionStateEventKind, SnapshotRequest, SnapshotResponse,
-    StateEventMsg, SubscriptionRequest, SubscriptionScope,
+    RuntimeStatusView, SessionCommand, SessionDefinitionPatch, SessionExecutionView,
+    SessionLifecycleView, SessionQuery, SessionQueryResult, SessionStateEventKind, SnapshotRequest,
+    SnapshotResponse, StateEventMsg, SubscriptionRequest, SubscriptionScope,
 };
 use minicore_runtime::wire::{
     CanonicalFileUri, CommandId, SessionDefinitionRevision, SessionId, SessionMetadataRevision,
@@ -99,6 +99,21 @@ fn create_private_file(path: &Path, contents: &[u8]) {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .expect("the Store V1 file receives its private mode");
     }
+}
+
+/// Creates a marked empty Store V1 root without the canonical `agents` directory.
+///
+/// Tests that plant a wrong-case `Agents` entry or an `agents` directory link use this
+/// scaffold so the planted entry is a distinct root entry even on case-insensitive hosts;
+/// the canonical lock, marker, reservations, and sessions entries are created as usual.
+fn create_marked_empty_store_without_agents(root: &Path) {
+    create_existing_private_root(root);
+    create_private_file(&root.join(".minicore.lock"), b"");
+    create_private_file(&root.join("MINICORE_STORE_V1"), b"");
+    create_private_directory(&root.join("reservations"));
+    create_private_directory(&root.join("reservations/agents"));
+    create_private_directory(&root.join("reservations/sessions"));
+    create_private_directory(&root.join("sessions"));
 }
 
 fn create_published_g1_agent_store(root: &Path) {
@@ -1823,6 +1838,17 @@ async fn root_lease_identity_loss_rejects_requests_and_blocks_reopen() {
 
     assert_eq!(error, RuntimeDispatchError::InternalDispatchUnavailable);
 
+    // The first fatal response must not return while the public lifecycle still reports
+    // Open: the shared closing signal propagates to the Runtime lifecycle immediately.
+    let SnapshotResponse::Runtime(snapshot) = runtime
+        .snapshot(SnapshotRequest::Runtime)
+        .await
+        .expect("the Runtime snapshot is available while closing")
+    else {
+        panic!("the Runtime snapshot is requested");
+    };
+    assert_eq!(snapshot.runtime().status(), RuntimeStatusView::Closing);
+
     runtime.shutdown().await;
 
     // The replacement lock is removed, leaving the marked root with a missing canonical lock
@@ -1999,7 +2025,7 @@ fn create_agents_directory_link(root: &Path) -> TempRoot {
 #[tokio::test(flavor = "current_thread")]
 async fn case_alias_rejected_a_wrong_case_recognized_root_name_blocks_open() {
     let root = TempRoot::new();
-    create_existing_private_root(root.path());
+    create_marked_empty_store_without_agents(root.path());
     fs::create_dir(root.path().join("Agents")).expect("the wrong-case root entry is created");
 
     let error = MiniCoreRuntime::open(
@@ -2009,13 +2035,23 @@ async fn case_alias_rejected_a_wrong_case_recognized_root_name_blocks_open() {
     .await
     .expect_err("a wrong-case recognized root name is rejected");
 
-    assert_eq!(error, RuntimeInitializationError::UnsupportedStoreFormat);
+    assert_eq!(error, RuntimeInitializationError::DurableStateCorrupt);
+
+    // A second independent open observes the same blocked result: the marked store stays
+    // blocked while the wrong-case entry is present.
+    let reopen = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect_err("the wrong-case root name keeps blocking reopening");
+    assert_eq!(reopen, RuntimeInitializationError::DurableStateCorrupt);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn symlink_reparse_rejected_a_directory_link_named_agents_blocks_open() {
     let root = TempRoot::new();
-    create_existing_private_root(root.path());
+    create_marked_empty_store_without_agents(root.path());
     let _target = create_agents_directory_link(root.path());
 
     let error = MiniCoreRuntime::open(
@@ -2025,7 +2061,17 @@ async fn symlink_reparse_rejected_a_directory_link_named_agents_blocks_open() {
     .await
     .expect_err("a directory link named like a recognized root entry is rejected");
 
-    assert_eq!(error, RuntimeInitializationError::UnsupportedStoreFormat);
+    assert_eq!(error, RuntimeInitializationError::DurableStateCorrupt);
+
+    // A second independent open observes the same blocked result: the marked store stays
+    // blocked while the directory link is present.
+    let reopen = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect_err("the directory link keeps blocking reopening");
+    assert_eq!(reopen, RuntimeInitializationError::DurableStateCorrupt);
 }
 
 #[test]
@@ -4427,12 +4473,19 @@ const ROOT_LEASE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 struct HolderChild {
     child: Child,
+    proof: PathBuf,
+    release: PathBuf,
 }
 
 impl HolderChild {
-    fn spawn(root: &Path, mode: &'static str) -> (Self, PathBuf, PathBuf) {
+    fn spawn(root: &Path, mode: &'static str) -> Self {
         let proof = root.with_extension("holder-ready-proof");
         let release = root.with_extension("holder-release-marker");
+        assert!(!proof.exists(), "the holder ready proof must not pre-exist");
+        assert!(
+            !release.exists(),
+            "the holder release marker must not pre-exist"
+        );
         let child =
             Command::new(std::env::current_exe().expect("the test binary path is available"))
                 .arg("--exact")
@@ -4445,7 +4498,19 @@ impl HolderChild {
                 .env("MINICORE_TEST_ROOT_LEASE_MODE", mode)
                 .spawn()
                 .expect("the holder child test spawns");
-        (Self { child }, proof, release)
+        Self {
+            child,
+            proof,
+            release,
+        }
+    }
+
+    fn proof(&self) -> &Path {
+        &self.proof
+    }
+
+    fn release(&self) -> &Path {
+        &self.release
     }
 
     async fn wait_exit(&mut self, deadline: Instant) -> ExitStatus {
@@ -4466,6 +4531,16 @@ impl Drop for HolderChild {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        for path in [&self.proof, &self.release] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!(
+                    "removing the holder proof/release file {:?} failed: {error}",
+                    path
+                ),
+            }
+        }
     }
 }
 
@@ -4490,8 +4565,9 @@ async fn wait_for_exact_ready_proof(child: &mut HolderChild, proof: &Path, deadl
 #[tokio::test(flavor = "current_thread")]
 async fn cross_process_lock_contention_returns_store_in_use_then_clean_child_shutdown_reacquires() {
     let root = TempRoot::new();
-    let (mut child, proof, release) = HolderChild::spawn(root.path(), "release");
+    let mut child = HolderChild::spawn(root.path(), "release");
     let deadline = Instant::now() + ROOT_LEASE_CHILD_DEADLINE;
+    let proof = child.proof().to_path_buf();
     wait_for_exact_ready_proof(&mut child, &proof, deadline).await;
 
     let contended = MiniCoreRuntime::open(
@@ -4502,7 +4578,7 @@ async fn cross_process_lock_contention_returns_store_in_use_then_clean_child_shu
     .expect_err("a second open contends on the child-owned root lease");
     assert_eq!(contended, RuntimeInitializationError::StoreInUse);
 
-    fs::write(&release, ROOT_LEASE_RELEASE_MARKER).expect("the release marker is written");
+    fs::write(child.release(), ROOT_LEASE_RELEASE_MARKER).expect("the release marker is written");
     let status = child.wait_exit(deadline).await;
     assert!(status.success(), "the holder child shuts down cleanly");
 
@@ -4518,8 +4594,9 @@ async fn cross_process_lock_contention_returns_store_in_use_then_clean_child_shu
 #[tokio::test(flavor = "current_thread")]
 async fn killing_the_root_lease_holder_releases_the_os_lease_and_reopens() {
     let root = TempRoot::new();
-    let (mut child, proof, _release) = HolderChild::spawn(root.path(), "hold");
+    let mut child = HolderChild::spawn(root.path(), "hold");
     let deadline = Instant::now() + ROOT_LEASE_CHILD_DEADLINE;
+    let proof = child.proof().to_path_buf();
     wait_for_exact_ready_proof(&mut child, &proof, deadline).await;
 
     child.child.kill().expect("the holder child is killed");
@@ -4565,10 +4642,16 @@ async fn root_lease_holder_child() {
     let deadline = Instant::now() + ROOT_LEASE_CHILD_DEADLINE;
     match mode.as_str() {
         "release" => {
-            while !release.exists() {
+            loop {
+                match fs::read(&release) {
+                    Ok(contents) if contents == ROOT_LEASE_RELEASE_MARKER => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("reading the release marker failed: {error}"),
+                }
                 assert!(
                     Instant::now() < deadline,
-                    "the holder child never observed the release marker"
+                    "the holder child never observed its exact release marker"
                 );
                 tokio::time::sleep(ROOT_LEASE_POLL_INTERVAL).await;
             }
