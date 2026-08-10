@@ -3953,6 +3953,21 @@ pub enum RuntimeDispatchError {
     InternalDispatchUnavailable,
 }
 
+/// Redacted failures of one host-only security Workspace authority invalidation
+/// (`MiniCoreRuntime::invalidate_session_workspace_authority`).  This seam is not a wire
+/// command: the host has already published the current hard restriction fact, and the Runtime
+/// only drives the loaded executor's signal plus Workspace recovery.  It never touches the
+/// durable definition/revision/metadata/conversation.
+#[derive(Clone, Copy, Debug, Eq, Error, Hash, PartialEq)]
+pub enum SessionWorkspaceInvalidationError {
+    #[error("runtime is closing")]
+    RuntimeClosing,
+    #[error("Session is not loaded")]
+    SessionNotLoaded,
+    #[error("runtime dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum QueryErrorCode {
     InvalidArgument,

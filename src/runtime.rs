@@ -33,10 +33,10 @@ use crate::runtime_interface::{
     RuntimeStatusView, RuntimeView, SessionCommand, SessionDefinitionSummary, SessionExecutionView,
     SessionForkProvenanceView, SessionLifecycleView, SessionMetadataView, SessionQuery,
     SessionQueryResult, SessionQueueView, SessionReadinessView, SessionRecordingView,
-    SessionSnapshot, SessionSummary, SessionUnavailableView, SnapshotError, SnapshotErrorCode, SnapshotRequest,
-    SnapshotResponse, StateEvent, SubmitAdmissionStateView, SubmitAdmissionView, SubscriptionError,
-    SubscriptionErrorCode, SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView,
-    TurnInterruptionView,
+    SessionSnapshot, SessionSummary, SessionUnavailableView, SessionWorkspaceInvalidationError,
+    SnapshotError, SnapshotErrorCode, SnapshotRequest, SnapshotResponse, StateEvent,
+    SubmitAdmissionStateView, SubmitAdmissionView, SubscriptionError, SubscriptionErrorCode,
+    SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView, TurnInterruptionView,
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, SystemClock};
 use crate::session_execution::{
@@ -47,7 +47,8 @@ use crate::session_residency::{
     SessionResidencyAgentUpgradeError, SessionResidencyCancelError, SessionResidencyFollowUpError,
     SessionResidencyForkError, SessionResidencyInteractionError, SessionResidencyLifecycleError,
     SessionResidencyLoadError, SessionResidencyLoadOutcome, SessionResidencyMetadataError,
-    SessionResidencyQueuedMessageError, SessionResidencyRegistry, SessionResidencySharedResourcesError,
+    SessionResidencyQueuedMessageError, SessionResidencyRegistry,
+    SessionResidencySecurityInvalidationError, SessionResidencySharedResourcesError,
     SessionResidencySnapshotError, SessionResidencyStartError, SessionResidencySteerError,
     SessionResidencySubmitError, SessionResidencySubscriptionError, SessionResidencyUnloadError,
     SessionResidencyUnloadOutcome, SessionResidencyWorkspaceDefinitionError,
@@ -311,6 +312,24 @@ impl MiniCoreRuntime {
     ) -> Result<EventStream, SubscriptionError> {
         self.inner.subscribe(request).await
     }
+
+    /// Host-only security Workspace authority invalidation (not a wire command).  The host has
+    /// already published the current hard restriction fact; the Runtime routes out-of-band to
+    /// the loaded Session executor — without the runtime publication semaphore and without
+    /// waiting on any ordinary work lane — samples one `SystemClock` timestamp, signals the
+    /// active admission/Turn first-wins with `SecurityRevoked` (or enters Preparing directly
+    /// when Idle), and re-resolves the installed Workspace with the exact current definition.
+    /// The await resolves only after the recovery final state is installed (Ready or the new
+    /// Workspace/Prompt Unavailable cause).  The durable definition/revision/metadata/
+    /// conversation are never changed.  No `CommandId` is generated.
+    pub async fn invalidate_session_workspace_authority(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), SessionWorkspaceInvalidationError> {
+        self.inner
+            .invalidate_session_workspace_authority(session_id)
+            .await
+    }
 }
 
 pub struct EventStream {
@@ -376,11 +395,7 @@ impl EventStream {
                         timestamp,
                         command_id,
                         ..
-                    } => StateEvent::session_readiness_changed(
-                        *timestamp,
-                        Some(*command_id),
-                        snapshot,
-                    ),
+                    } => StateEvent::session_readiness_changed(*timestamp, *command_id, snapshot),
                     SessionExecutorEvent::TurnTerminal {
                         timestamp,
                         command_id,
@@ -1840,6 +1855,40 @@ impl RuntimeInner {
 
     fn residency(&self) -> Option<Arc<SessionResidencyRegistry>> {
         lock(&self.session_residency).as_ref().cloned()
+    }
+
+    /// The host-only security invalidation route: no runtime publication semaphore, no ordinary
+    /// work-lane wait.  A missing loaded executor is `SessionNotLoaded`; a registry/runtime
+    /// closing is `RuntimeClosing`; an impossible actor failure is `Internal`.  The single
+    /// `SystemClock` timestamp is sampled here and carried through the executor recovery events.
+    async fn invalidate_session_workspace_authority(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), SessionWorkspaceInvalidationError> {
+        if !matches!(*lock(&self.lifecycle), RuntimeLifecycle::Open) {
+            return Err(SessionWorkspaceInvalidationError::RuntimeClosing);
+        }
+        let Some(residency) = self.residency() else {
+            return Err(SessionWorkspaceInvalidationError::RuntimeClosing);
+        };
+        let timestamp = SystemClock.now();
+        match residency
+            .invalidate_workspace_authority(session_id, timestamp)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => match error {
+                SessionResidencySecurityInvalidationError::Closing => {
+                    Err(SessionWorkspaceInvalidationError::RuntimeClosing)
+                }
+                SessionResidencySecurityInvalidationError::SessionNotLoaded => {
+                    Err(SessionWorkspaceInvalidationError::SessionNotLoaded)
+                }
+                SessionResidencySecurityInvalidationError::InternalDispatchUnavailable => {
+                    Err(SessionWorkspaceInvalidationError::InternalDispatchUnavailable)
+                }
+            },
+        }
     }
 
     #[allow(
