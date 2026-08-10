@@ -2,7 +2,7 @@
 
 日期：2026-08-08
 
-状态：当前权威架构（M6.2 scripted foundation、M8.1最小ToolCall及M10 CompactionSummary purpose/budget request validation与ActiveTurnTask orchestration已实现；完整ToolSpec schema、Structured、credential/connection implementation、Rig reality gate与production adapters待实现）
+状态：当前权威架构（M6.2 scripted foundation、M8.1最小ToolCall、M10 CompactionSummary purpose/budget request validation与ActiveTurnTask orchestration，以及crate-private Structured output foundation已实现；完整ToolSpec schema、credential/connection implementation、provider-native Structured schema mapping/sanitization、Rig reality gate与production adapters待实现）
 
 ## 目的
 
@@ -27,7 +27,7 @@
 - provider-native compaction artifact的持久化格式；
 - 完整pricing、billing ledger或成本审计。
 
-当前M6.2 foundation与M8.1最小ToolCall路径已运行：Runtime仍默认拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行。M10新增`CompactionSummary` purpose，并要求assembly budget proof、`NoToolCalls`、empty ToolSpec和explicit max output exact匹配，仍复用同一个single-attempt Gateway。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。完整ToolSpec schema、Structured schema、auth/credential/connection/cache、async Compaction retry/orchestration以及Rig provider mapping仍未实现。
+当前M6.2 foundation与M8.1最小ToolCall路径已运行：Runtime仍默认拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行。M10新增`CompactionSummary` purpose，并要求assembly budget proof、`NoToolCalls`、empty ToolSpec和explicit max output exact匹配，仍复用同一个single-attempt Gateway。crate-private Structured foundation已实现：`OutputContract::Structured` contract由绑定exact `TurnModelSnapshot`的constructor创建（capability与`max_schema_bytes` cap校验、schema v1 subset验证），optional name按[stable symbolic key](wire-schema.md#stable-symbolic-keys)共同floor限制为1..64 bytes，`ModelCallRequest` constructor按proof复验exact model/OutputContract绑定，Gateway对terminal执行exact JSON object parse与本地schema validation（`Refused` bypass；`UnexpectedToolCall`/`IncompleteResponse`/`InvalidStructuredOutput` precedence），并由ScriptedProviderAdapter端到端conformance覆盖；无JSON repair、type coercion或Markdown code-fence extraction。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。仍pending：任何public requester/Wire/SessionDefinition structured字段、Runtime/ActiveTurnTask structured激活（ordinary AgentRun路径仍`output_contract=None`，toolful Turn在普通ToolRound后的第二次Structured call未激活，Compaction仍固定`NoToolCalls`）、provider-native schema mapping/sanitization、完整ToolSpec schema、auth/credential/connection/cache、async Compaction retry/orchestration以及Rig production adapters。
 
 相关权威文档：
 
@@ -688,11 +688,17 @@ impl StructuredOutputContract {
 }
 ```
 
+contract与enum都是crate-private，不是public requester/Wire/SessionDefinition类型。已实现的`StructuredOutputContract`由绑定exact `TurnModelSnapshot`的constructor创建：它保存process-local exact `TurnModelRef`、校验model capability与`max_schema_bytes` cap，并把schema v1 subset在内存中编译为schema value；compiled schema细节保持private，Debug只暴露has_name/schema_bytes。同一contract只能在绑定model上使用，`ModelCallRequest`构造时按proof复验exact model/OutputContract绑定，不能跨model复用。
+
 `NoToolCalls`不是普通prompt text。请求中的`tools`必须为空；provider支持显式tool-choice/allowed-tools禁用时adapter同时设置该字段。若provider允许在未声明Tool时仍返回可执行ToolCall，Gateway必须返回`UnexpectedToolCall`，不能把它交给ActiveTurnTask执行。
 
-`StructuredOutputContract` constructor要求optional name满足[stable symbolic key](wire-schema.md#stable-symbolic-keys)共同floor并进一步限制为1..64 bytes；schema必须通过BoundedJsonSchema、ModelGateway supported-keyword validation，并与exact TurnModelSnapshot `max_schema_bytes`取更小cap。schema root必须是object schema；remote ref、network lookup、unbounded regex与provider-only raw option不能进入contract。
+`StructuredOutputContract` constructor要求optional name满足[stable symbolic key](wire-schema.md#stable-symbolic-keys)共同floor并进一步限制为1..64 bytes；schema必须通过BoundedJsonSchema、ModelGateway supported-keyword validation，并与exact TurnModelSnapshot `max_schema_bytes`取更小cap。schema root必须是object schema；remote ref、network lookup、unbounded regex与provider-only raw option不能进入contract。已实现constructor还会在contract构造和request构造时fail-closed复验capability与schema byte cap。
 
 `Structured`在MVP中同样要求`tools`为空。provider-native strict schema只是第一层约束；Gateway仍必须对terminal text执行exact JSON parse和本地schema validation。MVP不做JSON repair、type coercion或Markdown code-fence extraction。需要Tool的AgentRun先完成普通ToolRound，之后再使用新的Structured `ModelCallRequest`取得terminal structured response。
+
+当前实现的schema v1 subset精确为：root必须`type: object`；允许keyword只有`$schema`（仅root且exact Draft 2020-12 URI `https://json-schema.org/draft/2020-12/schema`）、`type`（object/array/string/number/integer/boolean/null）、`description`（string）、`properties`（递归object）、`required`（string数组、无重复）、boolean `additionalProperties`、`items`（递归）、`enum`（非空且无重复）、`const`。任何其他keyword（包括`$ref`、`$defs`、`pattern`、`anyOf`/`allOf`/`oneOf`/`not`等）fail closed为`UnsupportedSchema`，不做sanitize、改写或忽略。terminal validation对`BoundedJsonObject`执行exact JSON parse并与compiled schema本地校验：`Refused`且非空refusal text作为successful response直接bypass schema校验；`UnexpectedToolCall`（contract下出现ToolCall）优先于`IncompleteResponse`/`InvalidStructuredOutput`，后两者按Response Validation顺序形成non-retryable error。
+
+该foundation目前仍未被生产路径激活：当前Runtime/ActiveTurnTask不构造`Structured` contract（ordinary AgentRun保持`output_contract=None`，Compaction固定`NoToolCalls`），没有public requester/Wire/SessionDefinition structured字段，也没有provider-native schema mapping/sanitization与Rig/production adapter；scripted端到端conformance tests已闭合。
 
 ModelGateway可以：
 
@@ -1953,6 +1959,7 @@ src/model_gateway/provider/scripted.rs
 - [ ] 随M8/M10扩展ScriptedProviderAdapter覆盖允许ToolCall与CompactionSummary vertical slices。
 - [ ] 尽早执行Rig 0.40.0 ModelGateway integration spike，在production adapter冻结前完成。
 - [x] 实现ModelGateway model resolution、immutable request/proof与single-attempt scripted core。
-- [ ] 实现credential/connection/cache policy和Rig production provider adapters。
+- [x] 实现crate-private Structured foundation：`OutputContract::Structured` exact-model contract constructor（capability/`max_schema_bytes` cap、name 1..64、schema v1 subset）、`ModelCallRequest` exact-model/OutputContract proof复验、terminal exact JSON object parse与本地schema validation、`Refused` bypass及`UnexpectedToolCall`/`IncompleteResponse`/`InvalidStructuredOutput` precedence，ScriptedProviderAdapter端到端conformance。
+- [ ] 实现credential/connection/cache policy、provider-native Structured schema mapping/sanitization和Rig production provider adapters，并激活public structured requester/Wire/SessionDefinition字段与Runtime/ActiveTurnTask structured调用。
 - [ ] 完成OpenAI Responses与Anthropic Messages mock-server tests。
 - [x] 在阶段9冻结公开model catalog/query协议。

@@ -16,7 +16,7 @@ use crate::tools::{ToolCallId, ToolName};
 use crate::wire::lexical::{
     LexicalError, validate_opaque_ascii, validate_safe_text, validate_stable_symbolic_key,
 };
-use crate::wire::{BoundedJsonObject, Money};
+use crate::wire::{BoundedJsonObject, BoundedJsonSchema, Money, ProtocolLimits};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ModelIdentityError {
@@ -267,6 +267,7 @@ pub(crate) struct ModelCapabilities {
     text_input: bool,
     reasoning: ReasoningCapabilities,
     supports_streaming: bool,
+    structured_json_schema: bool,
 }
 
 #[cfg_attr(
@@ -285,6 +286,16 @@ impl ModelCapabilities {
             text_input: true,
             reasoning,
             supports_streaming,
+            structured_json_schema: false,
+        }
+    }
+
+    /// Opts a model into the minimal structured JSON-schema output capability.  A plain
+    /// text-only model never supports structured output unless it opts in explicitly.
+    pub(crate) const fn with_structured_json_schema(self) -> Self {
+        Self {
+            structured_json_schema: true,
+            ..self
         }
     }
 }
@@ -293,6 +304,7 @@ impl ModelCapabilities {
 pub(crate) struct EffectiveModelLimits {
     context_window_tokens: Option<NonZeroU32>,
     max_output_tokens: Option<NonZeroU32>,
+    max_schema_bytes: Option<NonZeroU32>,
 }
 
 #[cfg_attr(
@@ -307,6 +319,17 @@ impl EffectiveModelLimits {
         Self {
             context_window_tokens,
             max_output_tokens,
+            max_schema_bytes: None,
+        }
+    }
+
+    /// Binds an explicit canonical schema byte cap for structured output.  The effective cap is
+    /// `min(protocol schema max, model max_schema_bytes)`; absent a model cap the protocol cap
+    /// still applies.
+    pub(crate) const fn with_max_schema_bytes(self, max_schema_bytes: NonZeroU32) -> Self {
+        Self {
+            max_schema_bytes: Some(max_schema_bytes),
+            ..self
         }
     }
 
@@ -316,6 +339,10 @@ impl EffectiveModelLimits {
 
     pub(crate) const fn context_window_tokens(self) -> Option<NonZeroU32> {
         self.context_window_tokens
+    }
+
+    pub(crate) const fn max_schema_bytes(self) -> Option<NonZeroU32> {
+        self.max_schema_bytes
     }
 }
 
@@ -742,13 +769,46 @@ impl TurnModelSnapshot {
         generation_max_output_tokens: NonZeroU32,
         bytes_per_token: NonZeroU32,
     ) -> Arc<Self> {
+        let limits = EffectiveModelLimits::new(context_window_tokens, model_max_output_tokens);
+        Self::fixture_with(
+            limits,
+            ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
+            generation_max_output_tokens,
+            bytes_per_token,
+        )
+    }
+
+    /// A structured-output-capable fixture: same shape as the text fixture but explicitly
+    /// supporting structured JSON-schema output with an explicit canonical schema byte cap.
+    #[cfg(test)]
+    pub(crate) fn test_fixture_with_structured(
+        context_window_tokens: Option<NonZeroU32>,
+        max_schema_bytes: NonZeroU32,
+    ) -> Arc<Self> {
+        let limits = EffectiveModelLimits::new(context_window_tokens, NonZeroU32::new(8_192))
+            .with_max_schema_bytes(max_schema_bytes);
+        Self::fixture_with(
+            limits,
+            ModelCapabilities::text_only(ReasoningCapabilities::all(), true)
+                .with_structured_json_schema(),
+            NonZeroU32::new(4_096).expect("non-zero fixture output limit"),
+            NonZeroU32::new(3).expect("non-zero fixture estimate rate"),
+        )
+    }
+
+    #[cfg(test)]
+    fn fixture_with(
+        limits: EffectiveModelLimits,
+        capabilities: ModelCapabilities,
+        generation_max_output_tokens: NonZeroU32,
+        bytes_per_token: NonZeroU32,
+    ) -> Arc<Self> {
         let owner = Arc::new(ModelGatewayOwner);
         let identity = Arc::new(TurnModelIdentity);
-        let limits = EffectiveModelLimits::new(context_window_tokens, model_max_output_tokens);
         let definition = ModelDefinition::new(
             ModelSelection::new("fixture".parse().unwrap(), "fixture".parse().unwrap()),
             ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
-            ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
+            capabilities,
             limits,
             TokenEstimateRate::new(bytes_per_token, 1).unwrap(),
             ModelGenerationDefaults::new(
@@ -945,6 +1005,357 @@ pub(crate) enum ModelCallPurpose {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum OutputContract {
     NoToolCalls,
+    Structured(StructuredOutputContract),
+}
+
+/// Minimal typed failure taxonomy for one structured output contract.  Variants carry no
+/// payload, so a redacted error never echoes the name or the schema.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum StructuredOutputContractError {
+    #[error("structured output contract name is invalid")]
+    InvalidName,
+    #[error("model does not support structured output")]
+    UnsupportedModel,
+    #[error("structured output schema exceeds the model schema byte cap")]
+    SchemaTooLarge,
+    #[error("structured output schema is outside the supported v1 subset")]
+    UnsupportedSchema,
+}
+
+/// One structured output contract bound to the exact `TurnModelRef` it was validated against.
+/// The contract is the only fact source for a structured model call: it carries the validated
+/// schema v1 subset (compiled in memory from the bounded `BoundedJsonSchema`) and re-verifies
+/// capability and byte cap against the current exact model at request construction.
+#[derive(Clone)]
+pub(crate) struct StructuredOutputContract {
+    turn_ref: TurnModelRef,
+    name: Option<Box<str>>,
+    schema: BoundedJsonSchema,
+    schema_value: serde_json::Value,
+}
+
+const STRUCTURED_CONTRACT_NAME_MAX_BYTES: usize = 64;
+const STRUCTURED_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
+
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "constructed by the adjacent M7 Turn slice")
+)]
+impl StructuredOutputContract {
+    pub(crate) fn new(
+        model: &TurnModelSnapshot,
+        name: Option<&str>,
+        schema: BoundedJsonSchema,
+    ) -> Result<Self, StructuredOutputContractError> {
+        if let Some(name) = name {
+            validate_stable_symbolic_key(name, STRUCTURED_CONTRACT_NAME_MAX_BYTES, false)
+                .map_err(|_| StructuredOutputContractError::InvalidName)?;
+        }
+        if !model.capabilities.structured_json_schema {
+            return Err(StructuredOutputContractError::UnsupportedModel);
+        }
+        if !schema_within_model_cap(
+            model.limits.max_schema_bytes(),
+            schema.canonical_bytes().len(),
+        ) {
+            return Err(StructuredOutputContractError::SchemaTooLarge);
+        }
+        let schema_value = parse_structured_schema(&schema)?;
+        Ok(Self {
+            turn_ref: model.turn_model_ref(),
+            name: name.map(Into::into),
+            schema,
+            schema_value,
+        })
+    }
+
+    pub(crate) const fn name(&self) -> Option<&str> {
+        match &self.name {
+            Some(name) => Some(name),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn schema(&self) -> &BoundedJsonSchema {
+        &self.schema
+    }
+
+    /// Parses one bounded terminal object exactly once and validates it against the compiled
+    /// schema.  The caller (never the ActiveTurnTask) is responsible for this single parse.
+    pub(crate) fn validate_instance(&self, object: &BoundedJsonObject) -> bool {
+        let Ok(instance) = serde_json::from_slice::<serde_json::Value>(object.canonical_bytes())
+        else {
+            return false;
+        };
+        validate_structured_instance(&self.schema_value, &instance)
+    }
+
+    /// Fail-closed re-verification against the current exact model: the contract must be bound
+    /// to this exact model, the model must support structured output, and the canonical schema
+    /// bytes must still fit `min(protocol schema max, model max_schema_bytes)`.  A contract
+    /// assembled for one model can never be reused against another.
+    fn is_supported_by(&self, model: &TurnModelSnapshot) -> bool {
+        self.turn_ref.is_exact(&model.turn_model_ref())
+            && model.capabilities.structured_json_schema
+            && schema_within_model_cap(
+                model.limits.max_schema_bytes(),
+                self.schema.canonical_bytes().len(),
+            )
+    }
+}
+
+impl PartialEq for StructuredOutputContract {
+    fn eq(&self, other: &Self) -> bool {
+        self.turn_ref.is_exact(&other.turn_ref)
+            && self.name == other.name
+            && self.schema == other.schema
+    }
+}
+
+impl Eq for StructuredOutputContract {}
+
+impl fmt::Debug for StructuredOutputContract {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StructuredOutputContract")
+            .field("has_name", &self.name.is_some())
+            .field("schema_bytes", &self.schema.canonical_bytes().len())
+            .finish()
+    }
+}
+
+fn schema_within_model_cap(
+    model_max_schema_bytes: Option<NonZeroU32>,
+    schema_bytes: usize,
+) -> bool {
+    let protocol_max = usize::try_from(
+        ProtocolLimits::v1_0()
+            .embedded_json
+            .schema
+            .max_encoded_bytes,
+    )
+    .unwrap_or(usize::MAX);
+    let maximum = model_max_schema_bytes.map_or(protocol_max, |limit| {
+        usize::try_from(limit.get())
+            .unwrap_or(usize::MAX)
+            .min(protocol_max)
+    });
+    schema_bytes <= maximum
+}
+
+/// Parses the bounded canonical schema and validates the supported v1 subset in memory.  Both
+/// schema and instance are already bounded, so this recursion never performs I/O.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "compiled by the structured contract constructor")
+)]
+fn parse_structured_schema(
+    schema: &BoundedJsonSchema,
+) -> Result<serde_json::Value, StructuredOutputContractError> {
+    let value = serde_json::from_slice::<serde_json::Value>(schema.canonical_bytes())
+        .map_err(|_| StructuredOutputContractError::UnsupportedSchema)?;
+    validate_structured_schema_node(&value, true)
+        .map_err(|_| StructuredOutputContractError::UnsupportedSchema)?;
+    Ok(value)
+}
+
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "compiled by the structured contract constructor")
+)]
+fn validate_structured_schema_node(
+    node: &serde_json::Value,
+    is_root: bool,
+) -> Result<(), StructuredOutputContractError> {
+    let object = node
+        .as_object()
+        .ok_or(StructuredOutputContractError::UnsupportedSchema)?;
+    if is_root && object.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+        return Err(StructuredOutputContractError::UnsupportedSchema);
+    }
+    for (key, value) in object {
+        match key.as_str() {
+            "$schema" => {
+                if !is_root || value.as_str() != Some(STRUCTURED_SCHEMA_DIALECT) {
+                    return Err(StructuredOutputContractError::UnsupportedSchema);
+                }
+            }
+            "type" => {
+                let Some(type_name) = value.as_str() else {
+                    return Err(StructuredOutputContractError::UnsupportedSchema);
+                };
+                if !matches!(
+                    type_name,
+                    "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"
+                ) {
+                    return Err(StructuredOutputContractError::UnsupportedSchema);
+                }
+            }
+            "description" => {
+                if !value.is_string() {
+                    return Err(StructuredOutputContractError::UnsupportedSchema);
+                }
+            }
+            "properties" => {
+                let Some(properties) = value.as_object() else {
+                    return Err(StructuredOutputContractError::UnsupportedSchema);
+                };
+                for (_, child) in properties {
+                    validate_structured_schema_node(child, false)?;
+                }
+            }
+            "required" => {
+                let Some(items) = value.as_array() else {
+                    return Err(StructuredOutputContractError::UnsupportedSchema);
+                };
+                let mut seen = Vec::new();
+                for item in items {
+                    let Some(name) = item.as_str() else {
+                        return Err(StructuredOutputContractError::UnsupportedSchema);
+                    };
+                    if seen.contains(&name) {
+                        return Err(StructuredOutputContractError::UnsupportedSchema);
+                    }
+                    seen.push(name);
+                }
+            }
+            "additionalProperties" => {
+                if !value.is_boolean() {
+                    return Err(StructuredOutputContractError::UnsupportedSchema);
+                }
+            }
+            "items" => validate_structured_schema_node(value, false)?,
+            "enum" => {
+                let Some(items) = value.as_array() else {
+                    return Err(StructuredOutputContractError::UnsupportedSchema);
+                };
+                if items.is_empty() {
+                    return Err(StructuredOutputContractError::UnsupportedSchema);
+                }
+                for (index, item) in items.iter().enumerate() {
+                    if items[..index].contains(item) {
+                        return Err(StructuredOutputContractError::UnsupportedSchema);
+                    }
+                }
+            }
+            "const" => {}
+            _ => return Err(StructuredOutputContractError::UnsupportedSchema),
+        }
+    }
+    Ok(())
+}
+
+/// Validates one parsed bounded instance against the compiled schema node.  Both sides are
+/// canonical JSON, so enum/const equality is exact.
+fn validate_structured_instance(schema: &serde_json::Value, instance: &serde_json::Value) -> bool {
+    let Some(object) = schema.as_object() else {
+        return true;
+    };
+    if let Some(type_name) = object.get("type").and_then(serde_json::Value::as_str) {
+        if !structured_instance_matches_type(type_name, instance) {
+            return false;
+        }
+    }
+    if let Some(enum_values) = object.get("enum").and_then(serde_json::Value::as_array) {
+        if !enum_values.iter().any(|candidate| candidate == instance) {
+            return false;
+        }
+    }
+    if let Some(const_value) = object.get("const") {
+        if const_value != instance {
+            return false;
+        }
+    }
+    if let Some(properties) = object
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    {
+        if let Some(instance_object) = instance.as_object() {
+            for (name, child_schema) in properties {
+                if let Some(child) = instance_object.get(name) {
+                    if !validate_structured_instance(child_schema, child) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(required) = object.get("required").and_then(serde_json::Value::as_array) {
+        if let Some(instance_object) = instance.as_object() {
+            for name in required {
+                let name = name
+                    .as_str()
+                    .expect("subset validation guarantees string required names");
+                if !instance_object.contains_key(name) {
+                    return false;
+                }
+            }
+        }
+    }
+    if object
+        .get("additionalProperties")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        if let Some(instance_object) = instance.as_object() {
+            let declared = object
+                .get("properties")
+                .and_then(serde_json::Value::as_object);
+            for name in instance_object.keys() {
+                if declared.is_none_or(|properties| !properties.contains_key(name)) {
+                    return false;
+                }
+            }
+        }
+    }
+    if let Some(items) = object.get("items") {
+        if let Some(instance_array) = instance.as_array() {
+            for item in instance_array {
+                if !validate_structured_instance(items, item) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn structured_instance_matches_type(type_name: &str, instance: &serde_json::Value) -> bool {
+    match type_name {
+        "object" => instance.is_object(),
+        "array" => instance.is_array(),
+        "string" => instance.is_string(),
+        "number" => instance.is_number(),
+        "integer" => instance
+            .as_number()
+            .map(serde_json::Number::as_str)
+            .is_some_and(is_canonical_integer_literal),
+        "boolean" => instance.is_boolean(),
+        "null" => instance.is_null(),
+        _ => false,
+    }
+}
+
+/// An integer is judged from the canonical JSON number's decimal scale. No float coercion is
+/// applied, including when canonical form retains scientific notation for a large magnitude.
+fn is_canonical_integer_literal(literal: &str) -> bool {
+    let unsigned = literal.strip_prefix('-').unwrap_or(literal);
+    let (coefficient, exponent) = match unsigned.split_once('e') {
+        Some((coefficient, exponent)) => {
+            let Ok(exponent) = exponent.parse::<i32>() else {
+                return false;
+            };
+            (coefficient, exponent)
+        }
+        None => (unsigned, 0),
+    };
+    let fractional_digits = coefficient
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    let Ok(fractional_digits) = i32::try_from(fractional_digits) else {
+        return false;
+    };
+    exponent >= fractional_digits
 }
 
 #[cfg_attr(
@@ -1142,6 +1553,13 @@ impl ModelCallRequest {
             return Err(ModelRequestValidationError::new(
                 ModelRequestValidationErrorKind::UnsupportedInput,
             ));
+        }
+        if let Some(OutputContract::Structured(contract)) = input.output_contract() {
+            if !contract.is_supported_by(&model) {
+                return Err(ModelRequestValidationError::new(
+                    ModelRequestValidationErrorKind::AssemblyMismatch,
+                ));
+            }
         }
         if max_output_tokens.is_some_and(|requested| {
             model
@@ -2217,10 +2635,16 @@ fn finalize_provider_result(
                 content.push(FinalizedAssistantContent::Reasoning(reasoning));
             }
             ProviderAttemptContent::Text(text) => {
-                validate_artifact(&text, 65_536).map_err(|_| {
-                    ModelCallError::new(ModelCallErrorReason::InvalidProviderResponse)
-                })?;
-                has_visible_text = true;
+                // An empty Text block is not user-visible: it must not fail artifact
+                // validation up front (ADR 0120 classifies empty Stop/Unknown as
+                // `IncompleteResponse`), but it still counts as a content block for
+                // structured multiple-text and downstream fidelity.
+                if !text.is_empty() {
+                    validate_artifact(&text, 65_536).map_err(|_| {
+                        ModelCallError::new(ModelCallErrorReason::InvalidProviderResponse)
+                    })?;
+                    has_visible_text = true;
+                }
                 content.push(FinalizedAssistantContent::Text { text });
             }
             ProviderAttemptContent::ToolCall {
@@ -2297,6 +2721,15 @@ fn finalize_provider_result(
         _ => {}
     }
 
+    if let Some(OutputContract::Structured(contract)) = request.input.output_contract() {
+        // A non-empty Refused response is a terminal success that skips structured schema
+        // validation; every other complete finish must satisfy the contract exactly.
+        if result.finish_reason != ModelFinishReason::Refused {
+            validate_structured_output(&content, contract)
+                .map_err(|_| ModelCallError::new(ModelCallErrorReason::InvalidStructuredOutput))?;
+        }
+    }
+
     let definition = request.model.definition();
     Ok(ModelCallResult {
         response: FinalizedAssistantResponse {
@@ -2345,6 +2778,31 @@ fn validate_optional_opaque_artifact(
             Ok(value.into())
         })
         .transpose()
+}
+
+/// A structured terminal must be exactly one non-empty Text block (Reasoning blocks may be
+/// retained alongside it) whose text parses exactly as a `BoundedJsonObject` that satisfies
+/// the contract schema.  Multiple Text blocks, JSON fences, syntax errors, scalar roots, and
+/// schema mismatches are all `InvalidStructuredOutput`.
+fn validate_structured_output(
+    content: &[FinalizedAssistantContent],
+    contract: &StructuredOutputContract,
+) -> Result<(), ()> {
+    let mut text_blocks = content.iter().filter_map(|block| match block {
+        FinalizedAssistantContent::Text { text } => Some(text),
+        _ => None,
+    });
+    let Some(text) = text_blocks.next() else {
+        return Err(());
+    };
+    if text_blocks.next().is_some() {
+        return Err(());
+    }
+    let object: BoundedJsonObject = text.parse().map_err(|_| ())?;
+    if !contract.validate_instance(&object) {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn validate_artifact(value: &str, maximum: usize) -> Result<(), ModelValueError> {
@@ -3039,6 +3497,134 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn empty_text_finish_reasons_follow_the_completeness_contract() {
+        let scripts = vec![
+            // Empty Stop is an explicitly incomplete terminal, not an invalid response.
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    finish_reason: ModelFinishReason::Stop,
+                    ..text_attempt_result("")
+                },
+            ),
+            // Empty Unknown is an incomplete terminal, not an invalid response.
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    finish_reason: ModelFinishReason::Unknown,
+                    ..text_attempt_result("")
+                },
+            ),
+            // Refused without non-empty refusal text stays InvalidProviderResponse.
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    finish_reason: ModelFinishReason::Refused,
+                    ..text_attempt_result("")
+                },
+            ),
+            // Non-empty text still runs artifact validation: unsafe text is rejected.
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::Text(Arc::from(
+                        "unsafe\u{0001} text",
+                    ))]),
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+            // Non-empty oversize text is still rejected by the byte cap.
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::Text(Arc::from(
+                        "x".repeat(65_537),
+                    ))]),
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+        ];
+        let adapter = Arc::new(ScriptedProviderAdapter::new(scripts));
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let source = Arc::new(MutableModelSource::new(vec![text_definition(
+            1, 4_096, provider,
+        )]));
+        let source_adapter: Arc<dyn ModelSourceAdapter> = source;
+        let gateway = ModelGateway::new(vec![source_adapter]);
+        let model = gateway
+            .resolve_for_turn(gateway.initialize().await.unwrap(), resolve_request(None))
+            .unwrap();
+        let request = request_for_model(Arc::clone(&model)).await;
+
+        for expected in [
+            ModelCallErrorReason::IncompleteResponse,
+            ModelCallErrorReason::IncompleteResponse,
+            ModelCallErrorReason::InvalidProviderResponse,
+            ModelCallErrorReason::InvalidProviderResponse,
+            ModelCallErrorReason::InvalidProviderResponse,
+        ] {
+            let error = gateway
+                .generate_model_turn(
+                    Arc::clone(&request),
+                    ModelProgressPublisher::discard(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.reason(), expected);
+        }
+        assert_eq!(adapter.requests().len(), 5);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn structured_empty_stop_is_incomplete_response() {
+        let adapter = Arc::new(ScriptedProviderAdapter::new(vec![
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::Text(Arc::from(""))]),
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+        ]));
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let source = Arc::new(MutableModelSource::new(vec![structured_definition(
+            1,
+            4_096,
+            NonZeroU32::new(65_536).unwrap(),
+            provider,
+        )]));
+        let source_adapter: Arc<dyn ModelSourceAdapter> = source;
+        let gateway = ModelGateway::new(vec![source_adapter]);
+        let model = gateway
+            .resolve_for_turn(gateway.initialize().await.unwrap(), resolve_request(None))
+            .unwrap();
+        let contract =
+            StructuredOutputContract::new(&model, None, structured_schema(r#"{"type":"object"}"#))
+                .unwrap();
+        let request = structured_request(&model, &contract).await;
+
+        let error = gateway
+            .generate_model_turn(
+                request,
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason(), ModelCallErrorReason::IncompleteResponse);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn allowed_tool_responses_reject_duplicate_ids_but_accept_unknown_finish_reason() {
         let duplicate_id: ToolCallId = "call_duplicate".parse().unwrap();
         let adapter = Arc::new(ScriptedProviderAdapter::new(vec![
@@ -3344,5 +3930,537 @@ mod tests {
         assert_eq!(usage.input_tokens(), Some(10));
         assert_eq!(usage.cache_write_tokens(), Some(1));
         assert_eq!(usage.reported_cost(), Some(&cost));
+    }
+
+    fn structured_schema(json: &str) -> BoundedJsonSchema {
+        json.parse().unwrap()
+    }
+
+    fn bounded_object(json: &str) -> BoundedJsonObject {
+        json.parse().unwrap()
+    }
+
+    fn structured_definition(
+        version: u64,
+        default_max_output_tokens: u32,
+        max_schema_bytes: NonZeroU32,
+        adapter: Arc<dyn ProviderAdapter>,
+    ) -> ModelDefinition {
+        ModelDefinition::new(
+            ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+            ModelDefinitionVersion::new(NonZeroU64::new(version).unwrap()),
+            ModelCapabilities::text_only(ReasoningCapabilities::all(), true)
+                .with_structured_json_schema(),
+            EffectiveModelLimits::new(NonZeroU32::new(128_000), NonZeroU32::new(8_192))
+                .with_max_schema_bytes(max_schema_bytes),
+            TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1).unwrap(),
+            ModelGenerationDefaults::new(
+                NonZeroU32::new(default_max_output_tokens).unwrap(),
+                ModelReasoningSummary::ProviderDefault,
+                ModelServiceClass::Standard,
+            ),
+            adapter,
+        )
+        .unwrap()
+    }
+
+    fn text_definition_for_selection(
+        selection: ModelSelection,
+        version: u64,
+        default_max_output_tokens: u32,
+        adapter: Arc<dyn ProviderAdapter>,
+    ) -> ModelDefinition {
+        ModelDefinition::new(
+            selection,
+            ModelDefinitionVersion::new(NonZeroU64::new(version).unwrap()),
+            ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
+            EffectiveModelLimits::new(NonZeroU32::new(128_000), NonZeroU32::new(8_192)),
+            TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1).unwrap(),
+            ModelGenerationDefaults::new(
+                NonZeroU32::new(default_max_output_tokens).unwrap(),
+                ModelReasoningSummary::ProviderDefault,
+                ModelServiceClass::Standard,
+            ),
+            adapter,
+        )
+        .unwrap()
+    }
+
+    async fn structured_request(
+        model: &Arc<TurnModelSnapshot>,
+        contract: &StructuredOutputContract,
+    ) -> Arc<ModelCallRequest> {
+        let prompt_set = prompt_set_for_model(Arc::clone(model)).await;
+        let (live, revision) = live_user_context(&prompt_set);
+        let views = live.capture_conversation_views().unwrap();
+        let output_contract = OutputContract::Structured(contract.clone());
+        let input = Arc::new(
+            prompt_set
+                .assemble(PromptAssemblyInput::agent_run(
+                    views.conversation(),
+                    Some(&output_contract),
+                ))
+                .unwrap(),
+        );
+        Arc::new(
+            ModelCallRequest::new(
+                Arc::clone(model),
+                ModelCallPurpose::AgentRun,
+                input,
+                revision,
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn structured_output_contract_rejects_invalid_or_oversize_names() {
+        let model =
+            TurnModelSnapshot::test_fixture_with_structured(None, NonZeroU32::new(65_536).unwrap());
+        let schema = structured_schema(r#"{"type":"object"}"#);
+        for name in [
+            "",
+            "has/slash",
+            "has space",
+            "has\"quote",
+            "has\\backslash",
+            "unicode-\u{00e9}",
+        ] {
+            assert_eq!(
+                StructuredOutputContract::new(&model, Some(name), schema.clone()).unwrap_err(),
+                StructuredOutputContractError::InvalidName,
+                "name {name:?} was accepted"
+            );
+        }
+        let oversize = "x".repeat(65);
+        assert_eq!(
+            StructuredOutputContract::new(&model, Some(&oversize), schema.clone()).unwrap_err(),
+            StructuredOutputContractError::InvalidName
+        );
+        let boundary = "x".repeat(64);
+        let contract = StructuredOutputContract::new(&model, Some(&boundary), schema).unwrap();
+        assert_eq!(contract.name(), Some(boundary.as_str()));
+        assert!(!format!("{contract:?}").contains("xxx"));
+    }
+
+    #[test]
+    fn structured_output_contract_fails_closed_on_unsupported_model_and_schema_cap() {
+        let text_model = TurnModelSnapshot::test_fixture(None);
+        assert_eq!(
+            StructuredOutputContract::new(
+                &text_model,
+                None,
+                structured_schema(r#"{"type":"object"}"#),
+            )
+            .unwrap_err(),
+            StructuredOutputContractError::UnsupportedModel
+        );
+
+        let tight_schema = structured_schema(r#"{"type":"object"}"#);
+        let cap =
+            NonZeroU32::new(u32::try_from(tight_schema.canonical_bytes().len()).unwrap()).unwrap();
+        let boundary_model = TurnModelSnapshot::test_fixture_with_structured(None, cap);
+        assert!(
+            StructuredOutputContract::new(&boundary_model, None, tight_schema).is_ok(),
+            "a schema exactly at the model cap must be accepted"
+        );
+        let over_schema = structured_schema(r#"{"type":"object","description":"x"}"#);
+        assert_eq!(
+            StructuredOutputContract::new(&boundary_model, None, over_schema).unwrap_err(),
+            StructuredOutputContractError::SchemaTooLarge
+        );
+
+        let roomy_model =
+            TurnModelSnapshot::test_fixture_with_structured(None, NonZeroU32::new(65_536).unwrap());
+        let contract = StructuredOutputContract::new(
+            &roomy_model,
+            None,
+            structured_schema(r#"{"type":"object","description":"SECRET-DESCRIPTION"}"#),
+        )
+        .unwrap();
+        assert!(!format!("{contract:?}").contains("SECRET-DESCRIPTION"));
+    }
+
+    #[test]
+    fn structured_schema_subset_fails_closed_on_unsupported_keywords_and_roots() {
+        let model =
+            TurnModelSnapshot::test_fixture_with_structured(None, NonZeroU32::new(65_536).unwrap());
+        for schema_json in [
+            r#"{"type":"string"}"#,
+            r#"{}"#,
+            r#"{"type":"object","properties":{"a":{"type":"tuple"}}}"#,
+            r##"{"type":"object","$ref":"#"}"##,
+            r#"{"type":"object","$defs":{}}"#,
+            r#"{"type":"object","pattern":"x"}"#,
+            r#"{"type":"object","anyOf":[{"type":"string"}]}"#,
+            r#"{"type":"object","allOf":[]}"#,
+            r#"{"type":"object","minLength":1}"#,
+            r#"{"type":"object","format":"date"}"#,
+            r#"{"type":"object","$schema":"https://json-schema.org/draft/2020-12/other"}"#,
+            r#"{"type":"object","$schema":"https://json-schema.org/draft/07/schema"}"#,
+            r#"{"type":"object","$schema":"https://json-schema.org/draft/2020-12/schema","description":1}"#,
+            r#"{"type":"object","properties":{"a":{"$schema":"https://json-schema.org/draft/2020-12/schema"}}}"#,
+            r#"{"type":"object","properties":[]}"#,
+            r#"{"type":"object","properties":{"a":"string"}}"#,
+            r##"{"type":"object","properties":{"a":{"type":"string"},"b":{"$ref":"#/a"}}}"##,
+            r#"{"type":"object","required":"a"}"#,
+            r#"{"type":"object","required":[1]}"#,
+            r#"{"type":"object","required":["a","a"]}"#,
+            r#"{"type":"object","additionalProperties":{"type":"boolean"}}"#,
+            r#"{"type":"object","additionalProperties":"false"}"#,
+            r#"{"type":"object","items":[{"type":"string"}]}"#,
+            r#"{"type":"object","items":"x"}"#,
+            r#"{"type":"object","enum":[]}"#,
+            r#"{"type":"object","enum":[1,1]}"#,
+            r#"{"type":"object","enum":"x"}"#,
+        ] {
+            assert_eq!(
+                StructuredOutputContract::new(&model, None, structured_schema(schema_json))
+                    .unwrap_err(),
+                StructuredOutputContractError::UnsupportedSchema,
+                "schema {schema_json} was accepted"
+            );
+        }
+        // A non-object root is rejected by the bounded schema constructor before the contract.
+        assert!("42".parse::<BoundedJsonSchema>().is_err());
+        assert!("[]".parse::<BoundedJsonSchema>().is_err());
+    }
+
+    #[test]
+    fn structured_schema_subset_accepts_nested_objects_arrays_enum_and_const() {
+        let model =
+            TurnModelSnapshot::test_fixture_with_structured(None, NonZeroU32::new(65_536).unwrap());
+        let contract = StructuredOutputContract::new(
+            &model,
+            Some("report"),
+            structured_schema(
+                r#"{
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "description": "top level",
+                    "required": ["status", "tags"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "status": {"type": "string", "enum": ["ok", "pending"]},
+                        "kind": {"type": "string", "const": "report"},
+                        "count": {"type": "integer"},
+                        "ratio": {"type": "number"},
+                        "flag": {"type": "boolean"},
+                        "nothing": {"type": "null"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "meta": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {"nested": {"type": "array", "items": {"type": "integer"}}}
+                        }
+                    }
+                }"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(contract.name(), Some("report"));
+
+        for valid in [
+            r#"{"status":"ok","kind":"report","count":2,"ratio":1.5,"flag":true,"nothing":null,"tags":["a","b"],"meta":{"nested":[1,2]}}"#,
+            // Integer is judged by canonical decimal scale: 1.0 becomes 1, 1e2 becomes 100,
+            // and large-magnitude 1e30 remains scientific but still has no fractional part.
+            r#"{"status":"pending","kind":"report","count":1.0,"ratio":-0.5,"flag":false,"nothing":null,"tags":[],"meta":{"nested":[1e2,1e30]}}"#,
+        ] {
+            assert!(
+                contract.validate_instance(&bounded_object(valid)),
+                "instance {valid} should validate"
+            );
+        }
+
+        for invalid in [
+            r#"{"status":"ok","kind":"report","count":"2","ratio":1.5,"flag":true,"nothing":null,"tags":[],"meta":{}}"#,
+            r#"{"status":"ok","kind":"report","count":2,"ratio":1.5,"flag":"true","nothing":null,"tags":[],"meta":{}}"#,
+            r#"{"status":"ok","kind":"report","count":2,"ratio":1.5,"flag":true,"nothing":"x","tags":[],"meta":{}}"#,
+            r#"{"status":"ok","kind":"report","count":2,"ratio":1.5,"flag":true,"nothing":null,"tags":[1],"meta":{}}"#,
+            r#"{"status":"ok","kind":"report","count":2,"ratio":1.5,"flag":true,"nothing":null,"tags":[],"meta":{"nested":[1.5]}}"#,
+            r#"{"status":"ok","kind":"report","count":1.5,"ratio":1.5,"flag":true,"nothing":null,"tags":[],"meta":{}}"#,
+            r#"{"status":"ok","kind":"report","count":1e-30,"ratio":1.5,"flag":true,"nothing":null,"tags":[],"meta":{}}"#,
+            r#"{"status":"unknown","kind":"report","count":2,"ratio":1.5,"flag":true,"nothing":null,"tags":[],"meta":{}}"#,
+            r#"{"status":"ok","kind":"other","count":2,"ratio":1.5,"flag":true,"nothing":null,"tags":[],"meta":{}}"#,
+            r#"{"status":"ok","kind":"report","count":2,"ratio":1.5,"flag":true,"nothing":null,"meta":{}}"#,
+            r#"{"status":"ok","kind":"report","count":2,"ratio":1.5,"flag":true,"nothing":null,"tags":[],"meta":{},"extra":1}"#,
+            r#"{"status":"ok","kind":"report","count":2,"ratio":1.5,"flag":true,"nothing":null,"tags":[],"meta":{"nested":[1],"extra":2}}"#,
+        ] {
+            assert!(
+                !contract.validate_instance(&bounded_object(invalid)),
+                "instance {invalid} should be rejected"
+            );
+        }
+        assert!(!format!("{contract:?}").contains("top level"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn structured_output_end_to_end_validates_exact_terminal_json() {
+        let schema = structured_schema(
+            r#"{"type":"object","required":["summary"],"additionalProperties":false,"properties":{"summary":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}}}}"#,
+        );
+        let terminal = |text: &str| ProviderAttemptResult {
+            response_id: None,
+            content: Arc::from([ProviderAttemptContent::Text(Arc::from(text))]),
+            finish_reason: ModelFinishReason::Stop,
+            usage: None,
+            metadata: ProviderResponseMetadata::new(None, None, None),
+        };
+        let scripts = vec![
+            ScriptedProviderScript::success(
+                Vec::new(),
+                terminal(r#"{"summary":"SECRET hello","tags":["a","b"]}"#),
+            ),
+            ScriptedProviderScript::success(Vec::new(), terminal("not json at all")),
+            ScriptedProviderScript::success(
+                Vec::new(),
+                terminal("```json\n{\"summary\":\"fenced\"}\n```"),
+            ),
+            ScriptedProviderScript::success(Vec::new(), terminal("42")),
+            ScriptedProviderScript::success(Vec::new(), terminal(r#"{"summary":42}"#)),
+            ScriptedProviderScript::success(Vec::new(), terminal(r#"{"tags":[]}"#)),
+            ScriptedProviderScript::success(Vec::new(), terminal(r#"{"summary":"x","extra":1}"#)),
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([
+                        ProviderAttemptContent::Text(Arc::from(r#"{"summary":"first"}"#)),
+                        ProviderAttemptContent::Text(Arc::from("SECRET second")),
+                    ]),
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+        ];
+        let adapter = Arc::new(ScriptedProviderAdapter::new(scripts));
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let source = Arc::new(MutableModelSource::new(vec![structured_definition(
+            1,
+            4_096,
+            NonZeroU32::new(65_536).unwrap(),
+            provider,
+        )]));
+        let source_adapter: Arc<dyn ModelSourceAdapter> = source;
+        let gateway = ModelGateway::new(vec![source_adapter]);
+        let model = gateway
+            .resolve_for_turn(gateway.initialize().await.unwrap(), resolve_request(None))
+            .unwrap();
+        let contract = StructuredOutputContract::new(&model, Some("weather"), schema).unwrap();
+        let request = structured_request(&model, &contract).await;
+
+        let result = gateway
+            .generate_model_turn(
+                Arc::clone(&request),
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        match &result.response().content()[0] {
+            FinalizedAssistantContent::Text { text } => {
+                assert_eq!(&**text, r#"{"summary":"SECRET hello","tags":["a","b"]}"#);
+            }
+            _ => panic!("structured success changed content family"),
+        }
+
+        for _ in 0..7 {
+            let error = gateway
+                .generate_model_turn(
+                    Arc::clone(&request),
+                    ModelProgressPublisher::discard(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.reason(),
+                ModelCallErrorReason::InvalidStructuredOutput
+            );
+        }
+
+        let attempts = adapter.requests();
+        assert_eq!(attempts.len(), 8);
+        for attempt in &attempts {
+            assert!(Arc::ptr_eq(attempt, &request));
+            assert_eq!(
+                attempt.input().output_contract(),
+                Some(&OutputContract::Structured(contract.clone()))
+            );
+        }
+        for debug in [
+            format!("{contract:?}"),
+            format!("{request:?}"),
+            format!("{result:?}"),
+        ] {
+            assert!(!debug.contains("SECRET"));
+            assert!(!debug.contains("weather"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refused_nonempty_structured_response_bypasses_schema_validation() {
+        let adapter = Arc::new(ScriptedProviderAdapter::new(vec![
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::Text(Arc::from(
+                        "I cannot produce structured JSON",
+                    ))]),
+                    finish_reason: ModelFinishReason::Refused,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+        ]));
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let source = Arc::new(MutableModelSource::new(vec![structured_definition(
+            1,
+            4_096,
+            NonZeroU32::new(65_536).unwrap(),
+            provider,
+        )]));
+        let source_adapter: Arc<dyn ModelSourceAdapter> = source;
+        let gateway = ModelGateway::new(vec![source_adapter]);
+        let model = gateway
+            .resolve_for_turn(gateway.initialize().await.unwrap(), resolve_request(None))
+            .unwrap();
+        let contract =
+            StructuredOutputContract::new(&model, None, structured_schema(r#"{"type":"object"}"#))
+                .unwrap();
+        let request = structured_request(&model, &contract).await;
+
+        let result = gateway
+            .generate_model_turn(
+                request,
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.response().finish_reason(),
+            ModelFinishReason::Refused
+        );
+        match &result.response().content()[0] {
+            FinalizedAssistantContent::Text { text } => {
+                assert_eq!(&**text, "I cannot produce structured JSON");
+            }
+            _ => panic!("refused response changed content family"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn structured_contract_tool_call_is_unexpected() {
+        let adapter = Arc::new(ScriptedProviderAdapter::new(vec![
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::ToolCall {
+                        tool_call_id: "call_1".parse().unwrap(),
+                        name: "echo".parse().unwrap(),
+                        arguments: "{}".parse().unwrap(),
+                    }]),
+                    finish_reason: ModelFinishReason::ToolCalls,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+        ]));
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let source = Arc::new(MutableModelSource::new(vec![structured_definition(
+            1,
+            4_096,
+            NonZeroU32::new(65_536).unwrap(),
+            provider,
+        )]));
+        let source_adapter: Arc<dyn ModelSourceAdapter> = source;
+        let gateway = ModelGateway::new(vec![source_adapter]);
+        let model = gateway
+            .resolve_for_turn(gateway.initialize().await.unwrap(), resolve_request(None))
+            .unwrap();
+        let contract =
+            StructuredOutputContract::new(&model, None, structured_schema(r#"{"type":"object"}"#))
+                .unwrap();
+        let request = structured_request(&model, &contract).await;
+
+        let error = gateway
+            .generate_model_turn(
+                request,
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason(), ModelCallErrorReason::UnexpectedToolCall);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn structured_contract_cannot_cross_the_exact_model_boundary() {
+        let a_adapter: Arc<dyn ProviderAdapter> =
+            Arc::new(ScriptedProviderAdapter::new(Vec::new()));
+        let a_source = Arc::new(MutableModelSource::new(vec![structured_definition(
+            1,
+            4_096,
+            NonZeroU32::new(65_536).unwrap(),
+            a_adapter,
+        )]));
+        let a_source_adapter: Arc<dyn ModelSourceAdapter> = a_source;
+        let a_gateway = ModelGateway::new(vec![a_source_adapter]);
+        let a_model = a_gateway
+            .resolve_for_turn(a_gateway.initialize().await.unwrap(), resolve_request(None))
+            .unwrap();
+        let contract = StructuredOutputContract::new(
+            &a_model,
+            Some("weather"),
+            structured_schema(r#"{"type":"object"}"#),
+        )
+        .unwrap();
+
+        let b_selection =
+            ModelSelection::new("anthropic".parse().unwrap(), "claude".parse().unwrap());
+        let b_adapter: Arc<dyn ProviderAdapter> =
+            Arc::new(ScriptedProviderAdapter::new(Vec::new()));
+        let b_source = Arc::new(MutableModelSource::new(vec![
+            text_definition_for_selection(b_selection.clone(), 1, 4_096, b_adapter),
+        ]));
+        let b_source_adapter: Arc<dyn ModelSourceAdapter> = b_source;
+        let b_gateway = ModelGateway::new(vec![b_source_adapter]);
+        let b_model = b_gateway
+            .resolve_for_turn(
+                b_gateway.initialize().await.unwrap(),
+                ResolveTurnModelRequest::new(b_selection, ReasoningPreference::Auto, None),
+            )
+            .unwrap();
+
+        let b_prompt_set = prompt_set_for_model(Arc::clone(&b_model)).await;
+        let (live, revision) = live_user_context(&b_prompt_set);
+        let views = live.capture_conversation_views().unwrap();
+        let output_contract = OutputContract::Structured(contract.clone());
+        let input = Arc::new(
+            b_prompt_set
+                .assemble(PromptAssemblyInput::agent_run(
+                    views.conversation(),
+                    Some(&output_contract),
+                ))
+                .unwrap(),
+        );
+        let error =
+            ModelCallRequest::new(b_model, ModelCallPurpose::AgentRun, input, revision, None)
+                .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            ModelRequestValidationErrorKind::AssemblyMismatch
+        );
+
+        let a_request = structured_request(&a_model, &contract).await;
+        assert_eq!(
+            a_request.input().output_contract(),
+            Some(&OutputContract::Structured(contract))
+        );
     }
 }
