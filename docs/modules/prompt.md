@@ -1,6 +1,6 @@
 # Prompt 子系统架构设计
 
-状态：当前权威架构（M6.1 candidate/profile/Text composition与Workspace Prompt capture、M6.2 AgentRun assembly/proof及M10 CompactionSummary assembly/budget proof与async orchestration已实现；complete shared-root publication、具体source adapter、Skill contribution与Structured assembly待实现）
+状态：当前权威架构（M6.1 candidate/profile/Text composition与Workspace Prompt capture、M6.2 AgentRun assembly/proof、M10 CompactionSummary assembly/budget proof与async orchestration，以及Structured assembly/immutable contract/proof/canonical size estimate foundation已实现；complete shared-root publication、具体source adapter、Skill contribution、public requester/diagnostics与structured Runtime activation待实现）
 日期：2026-08-08
 
 ## 目的
@@ -30,7 +30,7 @@ PromptSet 是唯一可以组装模型可见上下文的对象
 - Historical PromptSet/rendered Prompt审计格式；MVP不执行exact same-Turn cold recovery，也不保存PromptContent resolver；
 - Prompt hook、远程 Prompt source 或插件协议的具体实现。
 
-当前AgentRun实现已接受captured ToolPromptView并由M8.1闭合最小ToolCall路径；M10进一步实现CompactionSummary required-only System、empty ToolSpec、`NoToolCalls`、plan budget proof、final context preflight及ActiveTurnTask orchestration。PromptSet持有pinned `Arc<TurnModelSnapshot>`，两种assembly均使用同一个estimator/context limit并保存opaque exact `TurnModelRef`。Structured output与完整Prompt diagnostics仍后置。
+当前AgentRun实现已接受captured ToolPromptView并由M8.1闭合最小ToolCall路径；M10进一步实现CompactionSummary required-only System、empty ToolSpec、`NoToolCalls`、plan budget proof、final context preflight及ActiveTurnTask orchestration。PromptSet持有pinned `Arc<TurnModelSnapshot>`，两种assembly均使用同一个estimator/context limit并保存opaque exact `TurnModelRef`。Structured assembly foundation已实现：PromptSet接受crate-private `OutputContract`（含`Structured(StructuredOutputContract)`）并把immutable contract与exact `TurnModelRef`/ConversationRevision一起绑定进`PromptAssemblyProof`，`ModelCallRequest::new`据此复验purpose/model/output-contract一致性；canonical size estimate（`canonical_model_context_bytes`）覆盖structured contract的name/schema规范化开销。contract由ModelGateway exact-model constructor创建并执行capability、schema byte cap与schema v1 subset校验，Prompt只保存并投影该contract。当前Runtime尚未调用该contract（ordinary AgentRun路径保持`output_contract=None`，Compaction固定`NoToolCalls`）；public requester、完整Prompt diagnostics、具体source adapter与Skill contribution仍后置。
 
 ## 决策摘要
 

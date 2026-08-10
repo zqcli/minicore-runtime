@@ -1585,6 +1585,18 @@ fn canonical_model_context_bytes(
     add_literal(&mut bytes, r#"],"outputContract":"#)?;
     match output_contract {
         Some(OutputContract::NoToolCalls) => add_json_string(&mut bytes, "no_tool_calls")?,
+        Some(OutputContract::Structured(contract)) => {
+            // Count the structured contract fact exactly: the type literal, the nullable name
+            // (escaped as a JSON string when present), and the canonical schema bytes.
+            add_literal(&mut bytes, r#"{"type":"structured","name":"#)?;
+            match contract.name() {
+                Some(name) => add_json_string(&mut bytes, name)?,
+                None => add_literal(&mut bytes, "null")?,
+            }
+            add_literal(&mut bytes, r#","schema":"#)?;
+            add_literal(&mut bytes, contract.schema().canonical_bytes())?;
+            add_literal(&mut bytes, "}")?;
+        }
         None => add_literal(&mut bytes, "null")?,
     }
     add_literal(&mut bytes, "}")?;
@@ -2471,7 +2483,7 @@ fn validate_prompt_text(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
+    use std::num::{NonZeroU32, NonZeroU64};
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2480,13 +2492,16 @@ mod tests {
     use crate::agent_session_lifecycle::AgentRevisionRef;
     use crate::conversation_storage::StoredUserMessage;
     use crate::live_conversation::LiveSessionState;
-    use crate::model_gateway::{ModelCallPurpose, ProviderItemId, TurnModelSnapshot};
+    use crate::model_gateway::{
+        ModelCallPurpose, ProviderItemId, StructuredOutputContract, TurnModelSnapshot,
+    };
     use crate::skills::SkillView;
     use crate::tools::{ToolCallId, ToolName, ToolResultContent, ToolSet};
     use crate::turn_item_interaction::UserMessageSource;
+    use crate::wire::lexical::canonical_json_string_len;
     use crate::wire::{
-        AgentRevision, BoundedJsonObject, ItemId, SessionDefinitionRevision, SessionId, Timestamp,
-        TurnId,
+        AgentRevision, BoundedJsonObject, BoundedJsonSchema, ItemId, SessionDefinitionRevision,
+        SessionId, Timestamp, TurnId,
     };
     use crate::workspace::prompt_candidate_for_test;
 
@@ -3814,5 +3829,165 @@ mod tests {
             &OutputContract::NoToolCalls
         );
         assert_eq!(summary_basis.estimator(), agent_basis.estimator());
+    }
+
+    #[test]
+    fn structured_contract_counts_type_nullable_name_and_canonical_schema_bytes() {
+        let model =
+            TurnModelSnapshot::test_fixture_with_structured(None, NonZeroU32::new(65_536).unwrap());
+        let described_schema: BoundedJsonSchema =
+            r#"{"type":"object","description":"SECRET description"}"#
+                .parse()
+                .unwrap();
+        let bare_schema: BoundedJsonSchema = r#"{"type":"object"}"#.parse().unwrap();
+        let named = OutputContract::Structured(
+            StructuredOutputContract::new(&model, Some("weather"), described_schema.clone())
+                .unwrap(),
+        );
+        let unnamed = OutputContract::Structured(
+            StructuredOutputContract::new(&model, None, described_schema.clone()).unwrap(),
+        );
+        let sparse = OutputContract::Structured(
+            StructuredOutputContract::new(&model, None, bare_schema.clone()).unwrap(),
+        );
+
+        let none = canonical_model_context_bytes(&[], &[], &[], None).unwrap();
+        let no_tool_calls =
+            canonical_model_context_bytes(&[], &[], &[], Some(&OutputContract::NoToolCalls))
+                .unwrap();
+        assert_eq!(
+            none,
+            r#"{"system":[],"messages":[],"tools":[],"outputContract":null}"#.len()
+        );
+        assert_eq!(
+            no_tool_calls,
+            r#"{"system":[],"messages":[],"tools":[],"outputContract":"no_tool_calls"}"#.len()
+        );
+
+        let named_bytes = canonical_model_context_bytes(&[], &[], &[], Some(&named)).unwrap();
+        let unnamed_bytes = canonical_model_context_bytes(&[], &[], &[], Some(&unnamed)).unwrap();
+        let sparse_bytes = canonical_model_context_bytes(&[], &[], &[], Some(&sparse)).unwrap();
+
+        // The nullable name is counted exactly: an escaped JSON string when present, "null" when
+        // absent, never folded into a fixed string.
+        assert_eq!(
+            named_bytes,
+            unnamed_bytes + canonical_json_string_len("weather").unwrap() - "null".len()
+        );
+        // The canonical schema bytes are counted raw and exactly.
+        assert_eq!(
+            unnamed_bytes,
+            sparse_bytes + described_schema.canonical_bytes().len()
+                - bare_schema.canonical_bytes().len()
+        );
+        // Exact envelope accounting for the whole structured fact.
+        let envelope = r#"{"system":[],"messages":[],"tools":[],"outputContract":"#;
+        assert_eq!(
+            named_bytes,
+            envelope.len()
+                + r#"{"type":"structured","name":"#.len()
+                + canonical_json_string_len("weather").unwrap()
+                + r#","schema":"#.len()
+                + described_schema.canonical_bytes().len()
+                + 1
+                + 1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_run_assembly_proves_the_exact_structured_contract() {
+        let model =
+            TurnModelSnapshot::test_fixture_with_structured(None, NonZeroU32::new(65_536).unwrap());
+        let contract = StructuredOutputContract::new(
+            &model,
+            Some("weather"),
+            r#"{"type":"object","description":"SECRET description","properties":{"summary":{"type":"string"}}}"#
+                .parse()
+                .unwrap(),
+        )
+        .unwrap();
+        let service = PromptService::new(
+            Arc::from("required system policy"),
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let resources = service.initialize().await.unwrap();
+        let tool_set = ToolSet::empty();
+        let skill_view = SkillView::empty();
+        let set = service
+            .for_turn(turn_context_with_model(
+                resources,
+                Vec::new(),
+                Vec::new(),
+                empty_workspace(session_id()),
+                &tool_set,
+                &skill_view,
+                Arc::clone(&model),
+            ))
+            .unwrap();
+
+        let user = set
+            .compose_user_message(
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("live user input").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut live = LiveSessionState::new(session_id(), []);
+        live.apply_user_message(
+            StoredUserMessage::reconstruct(
+                "itm_00000000000000000000000000000001"
+                    .parse::<ItemId>()
+                    .unwrap(),
+                UserMessageSource::Input,
+                user,
+            ),
+            "trn_00000000000000000000000000000001"
+                .parse::<TurnId>()
+                .unwrap(),
+            "2026-08-08T00:00:00.000Z".parse::<Timestamp>().unwrap(),
+        )
+        .unwrap();
+        let views = live.capture_conversation_views().unwrap();
+
+        let output_contract = OutputContract::Structured(contract.clone());
+        let assembled = set
+            .assemble(PromptAssemblyInput::agent_run(
+                views.conversation(),
+                Some(&output_contract),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            assembled.output_contract(),
+            Some(&OutputContract::Structured(contract.clone()))
+        );
+        assert_eq!(
+            assembled.assembly_proof().output_contract(),
+            Some(&OutputContract::Structured(contract.clone()))
+        );
+        assert!(
+            assembled
+                .assembly_proof()
+                .turn_model()
+                .is_exact(&model.turn_model_ref())
+        );
+        let estimated = canonical_model_context_bytes(
+            assembled.system(),
+            assembled.messages(),
+            set.tools.specs(),
+            assembled.output_contract(),
+        )
+        .unwrap();
+        assert!(estimated > 0);
+
+        for debug in [format!("{assembled:?}"), format!("{contract:?}")] {
+            assert!(!debug.contains("SECRET description"));
+            assert!(!debug.contains("weather"));
+        }
     }
 }

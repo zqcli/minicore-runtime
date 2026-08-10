@@ -196,6 +196,8 @@ cross-binding分工固定为：
 
 logical retry移动并复用同一个`Arc<ModelCallRequest>`，不重新assemble或复制request字段。Session record head或EntryId不参与retry proof。
 
+当前Structured contract foundation已闭合：`StructuredOutputContract` constructor绑定exact `TurnModelRef`并校验capability、schema byte cap与schema v1 subset，`ModelCallRequest::new`对Structured/NoToolCalls复验proof、empty tools与exact model绑定，Gateway terminal validation覆盖`Refused` bypass及`UnexpectedToolCall`/`IncompleteResponse`/`InvalidStructuredOutput` precedence，contract/gateway tests已通过；但Context/ActiveTurnTask尚无production requester——ordinary AgentRun仍以`output_contract=None`组装，toolful Turn在普通ToolRound后的第二次Structured call尚未激活。
+
 ## Async Loop Contract
 
 ActiveTurnTask直接使用Context：
