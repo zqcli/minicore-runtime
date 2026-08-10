@@ -61,8 +61,8 @@ use crate::session_execution::{
     SessionExecutorCloseError, SessionExecutorDependencies, SessionExecutorPrepareUnloadError,
     SessionExecutorSnapshot, SessionExecutorSnapshotError, SessionExecutorStartError,
     SessionExecutorSubscription, SessionFollowUpError, SessionInteractionError,
-    SessionPromptAvailabilityError, SessionQueuedMessageError, SessionSteerError, SessionSubmitError,
-    SessionWorkspaceDefinitionError,
+    SessionPromptAvailabilityError, SessionQueuedMessageError, SessionSecurityInvalidationError,
+    SessionSteerError, SessionSubmitError, SessionWorkspaceDefinitionError,
 };
 use crate::tools::ToolSet;
 use crate::turn_item_interaction::InteractionResolutionInput;
@@ -178,6 +178,21 @@ pub(crate) enum SessionResidencySnapshotError {
     #[error("Session is not loaded")]
     SessionNotLoaded,
     #[error("session residency dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+/// Redacted failures of one host security Workspace invalidation route.  The host has already
+/// published the hard restriction fact; the registry only looks up the loaded executor and
+/// awaits its out-of-band recovery API (never the per-Session operation gate).  An executor
+/// Closing is only the registry Closing when the registry itself is closing; otherwise it is a
+/// normal per-Session Unload / old exact executor race and reports SessionNotLoaded.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencySecurityInvalidationError {
+    #[error("runtime is closing")]
+    Closing,
+    #[error("Session is not loaded")]
+    SessionNotLoaded,
+    #[error("runtime dispatch is unavailable")]
     InternalDispatchUnavailable,
 }
 
@@ -2972,6 +2987,56 @@ impl SessionResidencyRegistry {
                     SessionResidencyCancelError::InternalDispatchUnavailable
                 }
             })
+    }
+
+    /// Routes one host security Workspace invalidation out-of-band: the loaded executor is
+    /// cloned directly from the residency loaded map (no per-Session operation gate is waited
+    /// on) and its out-of-band security invalidation API is awaited.  The request becomes owned
+    /// by the exact executor actor from the send point, so an Unload/close race settles inside
+    /// that actor and an old handle can never forward the signal to a future replacement.
+    pub(crate) async fn invalidate_workspace_authority(
+        &self,
+        session_id: SessionId,
+        timestamp: Timestamp,
+    ) -> Result<(), SessionResidencySecurityInvalidationError> {
+        if self.closing.is_cancelled() {
+            return Err(SessionResidencySecurityInvalidationError::Closing);
+        }
+        let executor = self
+            .shared
+            .executor(session_id)
+            .ok_or(SessionResidencySecurityInvalidationError::SessionNotLoaded)?;
+        let waiter = executor
+            .begin_security_invalidation(timestamp)
+            .map_err(|error| self.map_security_invalidation_error(error))?;
+        waiter
+            .wait()
+            .await
+            .map_err(|error| self.map_security_invalidation_error(error))
+    }
+
+    /// Maps one executor-layer security invalidation failure to the residency view.  An
+    /// executor Closing is only the residency Closing when the registry closing token is
+    /// already cancelled; otherwise it is a normal per-Session Unload / old exact executor race
+    /// and reports SessionNotLoaded (the host restriction stays published, and a later
+    /// reloaded Session can be re-invalidated).  Internal stays Internal.  The begin and wait
+    /// paths share this one mapping so both settle identically.
+    fn map_security_invalidation_error(
+        &self,
+        error: SessionSecurityInvalidationError,
+    ) -> SessionResidencySecurityInvalidationError {
+        match error {
+            SessionSecurityInvalidationError::Closing => {
+                if self.closing.is_cancelled() {
+                    SessionResidencySecurityInvalidationError::Closing
+                } else {
+                    SessionResidencySecurityInvalidationError::SessionNotLoaded
+                }
+            }
+            SessionSecurityInvalidationError::InternalDispatchUnavailable => {
+                SessionResidencySecurityInvalidationError::InternalDispatchUnavailable
+            }
+        }
     }
 
     pub(crate) async fn subscribe(

@@ -152,7 +152,9 @@ pub(crate) enum SessionExecutorEvent {
     },
     ReadinessChanged {
         timestamp: Timestamp,
-        command_id: CommandId,
+        // Agent/shared-resource reload sources carry their owning CommandId; the host security
+        // invalidation seam publishes the same event with `None` (no CommandId is generated).
+        command_id: Option<CommandId>,
         snapshot: Arc<SessionExecutorSnapshot>,
     },
     TurnTerminal {
@@ -182,8 +184,8 @@ impl SessionExecutorEvent {
             Self::DefinitionUpdated { command_id, .. }
             | Self::MetadataUpdated { command_id, .. }
             | Self::WorkspaceReloaded { command_id, .. }
-            | Self::ReadinessChanged { command_id, .. }
             | Self::TurnTerminal { command_id, .. } => Some(*command_id),
+            Self::ReadinessChanged { command_id, .. } => *command_id,
         }
     }
 
@@ -255,6 +257,11 @@ pub(crate) struct SessionExecutorSnapshot {
     prompt_available: bool,
     workspace_unavailable: Option<SessionUnavailableView>,
     workspace: Option<Arc<WorkspaceSnapshot>>,
+    // The host security invalidation seam holds the Session in Preparing while its Workspace
+    // recovery worker re-resolves the installed Workspace.  It outranks every other readiness
+    // fact (Agent/workspace cause/Prompt/Model), and Preparing always projects an Idle, empty,
+    // non-accepting snapshot with no WorkspaceSnapshot.
+    workspace_preparing: bool,
     metadata: Arc<SessionMetadata>,
     execution_state: SessionExecutionState,
     current_turn: Option<TurnId>,
@@ -289,6 +296,7 @@ impl SessionExecutorSnapshot {
             prompt_available,
             workspace_unavailable,
             workspace,
+            workspace_preparing: false,
             metadata,
             execution_state,
             current_turn: None,
@@ -338,6 +346,15 @@ impl SessionExecutorSnapshot {
     /// fact and rebuilds nothing.  A disabled Agent stays AgentUnavailable until it is
     /// re-enabled, and a model or selected Prompt that cannot serve a Turn stays
     /// ModelUnavailable/PromptUnavailable until a definition publication restores it.
+    ///
+    /// While the host security-invalidation Preparing flag is set, the supplied
+    /// WorkspaceSnapshot is deliberately not installed: a snapshot produced by a publication
+    /// that settles during the invalidation is superseded by the security recovery's exact
+    /// re-resolve (the recovery worker resolves the post-publication definition and installs
+    /// its own snapshot at completion), so the Session keeps `workspace: None` and stays
+    /// Preparing.  The new definition and its model/selected-Prompt availability facts are
+    /// still installed and the workspace cause is still cleared, so the recovery always
+    /// resolves the exact current definition.
     fn with_definition_and_workspace(
         &self,
         definition: Arc<SessionDefinition>,
@@ -351,7 +368,12 @@ impl SessionExecutorSnapshot {
             model_available,
             prompt_available,
             workspace_unavailable: None,
-            workspace: Some(workspace),
+            workspace: if self.workspace_preparing {
+                None
+            } else {
+                Some(workspace)
+            },
+            workspace_preparing: self.workspace_preparing,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -387,6 +409,7 @@ impl SessionExecutorSnapshot {
             prompt_available,
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
+            workspace_preparing: self.workspace_preparing,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -417,6 +440,7 @@ impl SessionExecutorSnapshot {
             prompt_available: self.prompt_available,
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
+            workspace_preparing: self.workspace_preparing,
             metadata: Arc::clone(&self.metadata),
             execution_state,
             current_turn,
@@ -445,6 +469,7 @@ impl SessionExecutorSnapshot {
             prompt_available: self.prompt_available,
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
+            workspace_preparing: self.workspace_preparing,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -475,6 +500,7 @@ impl SessionExecutorSnapshot {
             prompt_available: self.prompt_available,
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
+            workspace_preparing: self.workspace_preparing,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -505,6 +531,7 @@ impl SessionExecutorSnapshot {
             prompt_available: self.prompt_available,
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
+            workspace_preparing: self.workspace_preparing,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -535,6 +562,7 @@ impl SessionExecutorSnapshot {
             prompt_available: self.prompt_available,
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
+            workspace_preparing: self.workspace_preparing,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -564,6 +592,7 @@ impl SessionExecutorSnapshot {
             prompt_available: self.prompt_available,
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
+            workspace_preparing: self.workspace_preparing,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -599,6 +628,99 @@ impl SessionExecutorSnapshot {
             prompt_available,
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
+            workspace_preparing: self.workspace_preparing,
+            metadata: Arc::clone(&self.metadata),
+            execution_state: self.execution_state,
+            current_turn: self.current_turn,
+            current_turn_view: self.current_turn_view,
+            active_items: Arc::clone(&self.active_items),
+            public_pending_interactions: Arc::clone(&self.public_pending_interactions),
+            usage: self.usage.clone(),
+            recording: self.recording,
+            diagnostics: Arc::clone(&self.diagnostics),
+            last_terminal: self.last_terminal,
+            pending_interactions: Arc::clone(&self.pending_interactions),
+            active_submit_command_id: self.active_submit_command_id,
+            follow_up_command_ids: Arc::clone(&self.follow_up_command_ids),
+            steer_command_ids: Arc::clone(&self.steer_command_ids),
+        }
+    }
+
+    /// Enters the host security-invalidation Preparing state: the old WorkspaceSnapshot is
+    /// dropped and the workspace Unavailable cause is masked (cleared) while the flag is set,
+    /// so the derived public readiness is `Preparing` until the recovery final state explicitly
+    /// installs the new WorkspaceSnapshot or the new Workspace/Prompt Unavailable cause.  Every
+    /// other immutable observation fact (Agent/model/prompt facts, metadata, usage, recording,
+    /// diagnostics, terminal, queues) is preserved.
+    fn with_workspace_preparing(&self) -> Self {
+        Self {
+            definition: Arc::clone(&self.definition),
+            agent_available: self.agent_available,
+            model_available: self.model_available,
+            prompt_available: self.prompt_available,
+            workspace_unavailable: None,
+            workspace: None,
+            workspace_preparing: true,
+            metadata: Arc::clone(&self.metadata),
+            execution_state: self.execution_state,
+            current_turn: self.current_turn,
+            current_turn_view: self.current_turn_view,
+            active_items: Arc::clone(&self.active_items),
+            public_pending_interactions: Arc::clone(&self.public_pending_interactions),
+            usage: self.usage.clone(),
+            recording: self.recording,
+            diagnostics: Arc::clone(&self.diagnostics),
+            last_terminal: self.last_terminal,
+            pending_interactions: Arc::clone(&self.pending_interactions),
+            active_submit_command_id: self.active_submit_command_id,
+            follow_up_command_ids: Arc::clone(&self.follow_up_command_ids),
+            steer_command_ids: Arc::clone(&self.steer_command_ids),
+        }
+    }
+
+    /// Finishes one successful security Workspace recovery: clears the Preparing flag, installs
+    /// the exact re-resolved WorkspaceSnapshot, and clears the workspace Unavailable cause.
+    fn with_workspace_preparing_finished_success(&self, workspace: Arc<WorkspaceSnapshot>) -> Self {
+        Self {
+            definition: Arc::clone(&self.definition),
+            agent_available: self.agent_available,
+            model_available: self.model_available,
+            prompt_available: self.prompt_available,
+            workspace_unavailable: None,
+            workspace: Some(workspace),
+            workspace_preparing: false,
+            metadata: Arc::clone(&self.metadata),
+            execution_state: self.execution_state,
+            current_turn: self.current_turn,
+            current_turn_view: self.current_turn_view,
+            active_items: Arc::clone(&self.active_items),
+            public_pending_interactions: Arc::clone(&self.public_pending_interactions),
+            usage: self.usage.clone(),
+            recording: self.recording,
+            diagnostics: Arc::clone(&self.diagnostics),
+            last_terminal: self.last_terminal,
+            pending_interactions: Arc::clone(&self.pending_interactions),
+            active_submit_command_id: self.active_submit_command_id,
+            follow_up_command_ids: Arc::clone(&self.follow_up_command_ids),
+            steer_command_ids: Arc::clone(&self.steer_command_ids),
+        }
+    }
+
+    /// Finishes one ordinary-failure security Workspace recovery: clears the Preparing flag,
+    /// drops the WorkspaceSnapshot, and explicitly installs the new WorkspaceUnavailable or
+    /// PromptUnavailable cause.
+    fn with_workspace_preparing_finished_failure(
+        &self,
+        cause: SessionUnavailableView,
+    ) -> Self {
+        Self {
+            definition: Arc::clone(&self.definition),
+            agent_available: self.agent_available,
+            model_available: self.model_available,
+            prompt_available: self.prompt_available,
+            workspace_unavailable: Some(cause),
+            workspace: None,
+            workspace_preparing: false,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -650,13 +772,16 @@ impl SessionExecutorSnapshot {
         self.prompt_available
     }
 
-    /// The single public readiness projection derived from the four internal facts: a disabled
-    /// Agent always wins with AgentUnavailable, then the current workspace Unavailable cause
-    /// (including a workspace-source PromptUnavailable), then an unavailable selected Prompt,
-    /// then an unavailable model, then Ready.  Every mutation preserves the internal facts so
-    /// this projection can never diverge from them.
+    /// The single public readiness projection derived from the internal facts: the host
+    /// security-invalidation Preparing flag always wins, then a disabled Agent wins with
+    /// AgentUnavailable, then the current workspace Unavailable cause (including a
+    /// workspace-source PromptUnavailable), then an unavailable selected Prompt, then an
+    /// unavailable model, then Ready.  Every mutation preserves the internal facts so this
+    /// projection can never diverge from them.
     pub(crate) const fn readiness(&self) -> SessionReadinessView {
-        if !self.agent_available {
+        if self.workspace_preparing {
+            SessionReadinessView::Preparing
+        } else if !self.agent_available {
             SessionReadinessView::Unavailable(SessionUnavailableView::AgentUnavailable)
         } else {
             match self.workspace_unavailable {
@@ -672,6 +797,11 @@ impl SessionExecutorSnapshot {
                 }
             }
         }
+    }
+
+    /// Whether the host security invalidation currently holds this Session in Preparing.
+    pub(crate) const fn workspace_preparing(&self) -> bool {
+        self.workspace_preparing
     }
 
     /// The durable definition Workspace revision, which is authoritative for both Ready and
@@ -752,6 +882,7 @@ impl fmt::Debug for SessionExecutorSnapshot {
                 "workspace_revision",
                 &self.workspace.as_ref().map(|workspace| workspace.revision()),
             )
+            .field("workspace_preparing", &self.workspace_preparing)
             .field("metadata_revision", &self.metadata.revision())
             .field("execution_state", &self.execution_state)
             .field("current_turn", &self.current_turn)
@@ -1178,6 +1309,17 @@ pub(crate) enum SessionSecurityRevokedError {
     InternalDispatchUnavailable,
 }
 
+/// Redacted failures of one host security Workspace invalidation.  The invalidation itself is
+/// always accepted once the executor is loaded (the host has already published the hard
+/// restriction fact); these errors only cover executor/registry lifecycle impossibilities.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionSecurityInvalidationError {
+    #[error("session executor is closing")]
+    Closing,
+    #[error("session executor dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
 #[derive(Clone)]
 struct TurnResources {
     prompt_resources: Arc<PromptResourceView>,
@@ -1306,6 +1448,13 @@ impl TurnAdmissionGate {
 
     fn close(&self) {
         *lock(&self.open) = false;
+    }
+
+    /// Reopens the admission gate after a security Workspace recovery finishes.  Unavailable
+    /// Sessions are still rejected early by the readiness check, so the gate can be open while
+    /// the Session is not Ready.
+    fn open(&self) {
+        *lock(&self.open) = true;
     }
 
     fn try_enter(&self) -> Option<TurnAdmissionPermit<'_>> {
@@ -1703,6 +1852,8 @@ impl SessionExecutor {
             emergency: emergency.clone(),
             pending_availability: None,
             prepare_unload: None,
+            prepare_unload_accepted: false,
+            security_invalidation: None,
             #[cfg(test)]
             hooks: Arc::clone(&hooks),
         };
@@ -2335,6 +2486,44 @@ impl SessionExecutor {
         })
     }
 
+    /// Starts one host security Workspace invalidation.  The admission gate is closed
+    /// synchronously, then the request is handed to the actor over the unbounded emergency lane
+    /// so it can never be blocked behind the bounded work lane.  The returned waiter resolves
+    /// once the actor has installed the recovery final state (the re-resolved WorkspaceSnapshot
+    /// or the new Workspace/Prompt Unavailable cause); a duplicate invalidation joins the same
+    /// recovery without re-signaling or re-running it.  A dropped waiter never cancels the
+    /// admitted recovery, and an old handle can never forward its signal to a future
+    /// replacement executor: the request is owned by this exact actor from the send point.  A
+    /// send failure means the actor is already gone: it reports Closing, or
+    /// InternalDispatchUnavailable when the executor failed fatally (a fatal executor must not
+    /// be downgraded to an ordinary Closing by the residency mapping).
+    pub(crate) fn begin_security_invalidation(
+        &self,
+        timestamp: Timestamp,
+    ) -> Result<SecurityInvalidationWaiter, SessionSecurityInvalidationError> {
+        // The gate is the synchronous admission stop: no in-flight or future admission can pass
+        // it, so the actor only has to drain work that already entered.
+        self.turn_admission_gate.close();
+        let (response, receiver) = oneshot::channel();
+        let request = SessionExecutorRequest::SecurityInvalidation(SecurityInvalidationRequest {
+            timestamp,
+            response: Some(response),
+        });
+        if let Err(error) = self.emergency_sender.send(request) {
+            // The actor is gone and nobody will poll the receiver, so the failure_state is the
+            // truth here: a fatal executor reports Internal, an ordinary close reports Closing.
+            drop(error.0);
+            if self.failure_state.is_fatal() {
+                return Err(SessionSecurityInvalidationError::InternalDispatchUnavailable);
+            }
+            return Err(SessionSecurityInvalidationError::Closing);
+        }
+        Ok(SecurityInvalidationWaiter {
+            receiver,
+            failure_state: Arc::clone(&self.failure_state),
+        })
+    }
+
     /// Queues a FollowUp behind the active Turn.  Public Runtime routing is layered above this
     /// owner-local seam; snapshot queue projection remains a separate read-model slice.
     pub(crate) async fn follow_up(
@@ -2598,6 +2787,28 @@ impl PrepareUnloadWaiter {
     }
 }
 
+/// The host security-invalidation waiter.  It resolves once the actor has installed the
+/// recovery final state (the re-resolved WorkspaceSnapshot or the new Workspace/Prompt
+/// Unavailable cause), or settles Closing/Internal when the executor closes or fails first.
+/// A dropped host waiter never cancels the admitted recovery: the request is owned by the actor
+/// from the moment it is sent over the emergency lane.
+pub(crate) struct SecurityInvalidationWaiter {
+    receiver: oneshot::Receiver<Result<(), SessionSecurityInvalidationError>>,
+    failure_state: Arc<ActorFailureState>,
+}
+
+impl SecurityInvalidationWaiter {
+    pub(crate) async fn wait(self) -> Result<(), SessionSecurityInvalidationError> {
+        self.receiver.await.unwrap_or_else(|_| {
+            if self.failure_state.is_fatal() {
+                Err(SessionSecurityInvalidationError::InternalDispatchUnavailable)
+            } else {
+                Err(SessionSecurityInvalidationError::Closing)
+            }
+        })
+    }
+}
+
 struct SessionExecutorActor {
     receiver: mpsc::Receiver<SessionExecutorRequest>,
     emergency_receiver: mpsc::UnboundedReceiver<SessionExecutorRequest>,
@@ -2626,6 +2837,13 @@ struct SessionExecutorActor {
     emergency: EmergencyControlHandle,
     pending_availability: Option<PendingAvailability>,
     prepare_unload: Option<PrepareUnloadState>,
+    /// Sticky Unload-preparation marker: set by `accept_prepare_unload` and never cleared, so
+    /// every gate and rejection keeps its force until the actor is destroyed, even after the
+    /// Idle settlement takes the `prepare_unload` state.  `prepare_unload` is only the
+    /// deadline+waiters owner; `prepare_unload_accepted` is the lifecycle truth for "Unload
+    /// preparation was accepted".
+    prepare_unload_accepted: bool,
+    security_invalidation: Option<SecurityInvalidationState>,
     #[cfg(test)]
     hooks: Arc<SessionExecutorTestHooksInner>,
 }
@@ -2653,12 +2871,25 @@ struct PendingAvailability {
 /// deadline branch, so the fired deadline never re-triggers and a duplicate request only joins
 /// the waiters without shortening or extending anything.  (The timer itself is re-created from
 /// the copied deadline on every main-select iteration, so the state owns no pinned sleep.)  The
-/// state is cleared when the actor becomes Idle, but the admission gate stays closed until
-/// `close()`.
+/// state is cleared when the actor becomes Idle; the sticky `prepare_unload_accepted` bool keeps
+/// the admission gate closed and every gate/rejection in force until `close()`.
 struct PrepareUnloadState {
     deadline: tokio::time::Instant,
     deadline_fired: bool,
     waiters: Vec<oneshot::Sender<Result<(), SessionExecutorPrepareUnloadError>>>,
+}
+
+/// The single accepted host security Workspace invalidation.  The admission gate is already
+/// closed by the caller; the actor keeps the single sampled timestamp, the shared waiters, and
+/// the owner-tracked recovery worker.  A duplicate invalidation only joins the waiters: it
+/// never re-signals, never re-runs recovery, and never generates a CommandId.  The worker is
+/// spawned at the first Idle recovery start point and reaped exactly once at its completion or
+/// during close/reap; the waiters settle only after the recovery final state is installed (or
+/// the executor closes/fails first).
+struct SecurityInvalidationState {
+    timestamp: Timestamp,
+    waiters: Vec<oneshot::Sender<Result<(), SessionSecurityInvalidationError>>>,
+    worker_task: Option<TrackedTask>,
 }
 
 struct ActivePublication {
@@ -2881,6 +3112,25 @@ impl SessionExecutorActor {
                 let _ = waiter.send(outcome);
             }
         }
+        // A registered security invalidation without a running worker settles exactly once
+        // here (ordinary close -> Closing, fatal -> Internal); a running worker's completion
+        // is handled by the drain loop below, which settles its waiters through
+        // `handle_security_recovery_completion` before this function returns, so close never
+        // leaves a worker/task behind.
+        if let Some(state) = self.security_invalidation.take() {
+            if state.worker_task.is_some() {
+                self.security_invalidation = Some(state);
+            } else {
+                let outcome = if self.failure_state.is_fatal() {
+                    Err(SessionSecurityInvalidationError::InternalDispatchUnavailable)
+                } else {
+                    Err(SessionSecurityInvalidationError::Closing)
+                };
+                for waiter in state.waiters {
+                    let _ = waiter.send(outcome);
+                }
+            }
+        }
         // Only an executor that still has an active admission or Turn projects Finishing.  An
         // already-Idle prepared executor must not fabricate a Finishing ExecutionChanged event.
         if self.active_admission.is_some() || self.active_turn.is_some() {
@@ -2949,6 +3199,7 @@ impl SessionExecutorActor {
             if self.active_publication.is_none()
                 && self.active_admission.is_none()
                 && self.active_turn.is_none()
+                && !self.security_recovery_is_active()
                 && requests_drained
                 && emergency_requests_drained
             {
@@ -2960,7 +3211,7 @@ impl SessionExecutorActor {
 
             tokio::select! {
                 biased;
-                completion = self.completions.recv(), if self.active_publication.is_some() || self.active_admission.is_some() || self.active_turn.is_some() => match completion {
+                completion = self.completions.recv(), if self.active_publication.is_some() || self.active_admission.is_some() || self.active_turn.is_some() || self.security_recovery_is_active() => match completion {
                     Some(completion) => {
                         if let Err(fatality) = self.handle_completion(completion).await {
                             normal_exit = false;
@@ -2985,7 +3236,30 @@ impl SessionExecutorActor {
     }
 
     async fn reap_after_missing_completion(&mut self) {
+        // The completions channel closed while work was active: settle and reap every active
+        // owner exactly once, then the caller drains.  A running security recovery worker is
+        // reaped and its waiters settle Internal; the invalidation state is cleared so the
+        // drain loop cannot wait for a completion that can never arrive.
+        let mut security_reaped = false;
+        if let Some(mut state) = self.security_invalidation.take() {
+            security_reaped = true;
+            if let Some(worker_task) = state.worker_task.take() {
+                let _ = worker_task.wait().await;
+            }
+            for waiter in state.waiters {
+                let _ = waiter.send(Err(
+                    SessionSecurityInvalidationError::InternalDispatchUnavailable,
+                ));
+            }
+        }
         let Some(mut active) = self.active_publication.take() else {
+            if security_reaped {
+                self.turn_admission_gate.close();
+                self.closing.cancel();
+                self.failure_state.mark_fatal();
+                self.task_context.request_closing();
+                self.durable_state.request_closing();
+            }
             return;
         };
         if let Some(worker_task) = active.worker_task.take() {
@@ -3059,6 +3333,9 @@ impl SessionExecutorActor {
             SessionExecutorRequest::SecurityRevoked(request) => {
                 self.security_revoke_request(request).await?;
             }
+            SessionExecutorRequest::SecurityInvalidation(request) => {
+                self.begin_security_invalidation(request).await?;
+            }
             SessionExecutorRequest::SetAgentAvailability(request) => {
                 self.set_agent_availability(request)?;
             }
@@ -3077,13 +3354,18 @@ impl SessionExecutorActor {
     /// cleared and re-projected, and the request joins the shared deadline state: the effective
     /// deadline only shortens while it has not fired, and an already-Idle executor settles
     /// immediately.  Once the deadline has fired, a duplicate request only joins the waiters.
-    /// The actor keeps running until `close()`; new Submit/Steer/FollowUp requests are rejected
-    /// from now on, while ResolveInteraction, Cancel, SecurityRevoked, Snapshot, and accepted
-    /// publication completions remain processable.
+    /// The sticky `prepare_unload_accepted` marker is set here first and never cleared, so the
+    /// admission gate stays closed and every gate/rejection (Submit, Steer, FollowUp, security
+    /// invalidation, recovery-completion reopen, Turn-terminal FollowUp handoff) keeps its
+    /// force until the actor is destroyed, even after the Idle settlement takes the deadline
+    /// state.  The actor keeps running until `close()`; new Submit/Steer/FollowUp requests are
+    /// rejected from now on, while ResolveInteraction, Cancel, SecurityRevoked, Snapshot, and
+    /// accepted publication completions remain processable.
     fn accept_prepare_unload(
         &mut self,
         request: &mut PrepareUnloadRequest,
     ) -> Result<(), ActorFatality> {
+        self.prepare_unload_accepted = true;
         self.turn_admission_gate.close();
         self.follow_up.clear();
         self.steer.clear();
@@ -3197,8 +3479,18 @@ impl SessionExecutorActor {
     }
 
     /// Settles every accepted graceful-Unload waiter with Ok only when no active publication,
-    /// admission, or Turn remains.  The state is cleared, but the admission gate stays closed
-    /// until `close()`.
+    /// admission, or Turn remains.  The state is cleared, but the sticky
+    /// `prepare_unload_accepted` marker keeps the admission gate closed and every
+    /// gate/rejection in force until `close()`.
+    ///
+    /// A still-running security recovery worker is deliberately not a blocker here: `prepare`
+    /// must not wait for the recovery to finish, and `close()` is responsible for cancelling
+    /// and reaping it.  The recovery's resolve/capture/revalidate awaits are all
+    /// cancellation-aware against the executor closing token, so once prepare settles,
+    /// `close()` cancels that token and `close_and_drain` reaps the worker and settles its
+    /// waiters truthfully with Closing (or Internal on a fatal path), while the sticky
+    /// `prepare_unload_accepted` marker in the recovery completion handler keeps the admission
+    /// gate closed during the preparation.
     fn settle_prepare_unload_if_idle(&mut self) {
         if self.active_publication.is_some()
             || self.active_admission.is_some()
@@ -3215,7 +3507,7 @@ impl SessionExecutorActor {
     }
 
     fn enqueue_follow_up(&mut self, request: &mut FollowUpRequest) -> Result<(), ActorFatality> {
-        if self.prepare_unload.is_some() {
+        if self.prepare_unload_accepted {
             request.settle(Err(SessionFollowUpError::TurnNotRunning));
             return Ok(());
         }
@@ -3267,7 +3559,7 @@ impl SessionExecutorActor {
     }
 
     fn enqueue_steer(&mut self, request: &mut SteerRequest) -> Result<(), ActorFatality> {
-        if self.prepare_unload.is_some() {
+        if self.prepare_unload_accepted {
             request.settle(Err(SessionSteerError::TurnNotRunning));
             return Ok(());
         }
@@ -3350,7 +3642,7 @@ impl SessionExecutorActor {
                         .events
                         .send(Arc::new(SessionExecutorEvent::ReadinessChanged {
                             timestamp: request.timestamp,
-                            command_id: request.command_id,
+                            command_id: Some(request.command_id),
                             snapshot: Arc::clone(&self.current),
                         }));
                 }
@@ -3429,7 +3721,7 @@ impl SessionExecutorActor {
                         .events
                         .send(Arc::new(SessionExecutorEvent::ReadinessChanged {
                             timestamp: request.timestamp,
-                            command_id: request.command_id,
+                            command_id: Some(request.command_id),
                             snapshot: Arc::clone(&self.current),
                         }));
                 }
@@ -3499,7 +3791,7 @@ impl SessionExecutorActor {
                 .events
                 .send(Arc::new(SessionExecutorEvent::ReadinessChanged {
                     timestamp: pending.timestamp,
-                    command_id: pending.command_id,
+                    command_id: Some(pending.command_id),
                     snapshot: Arc::clone(&self.current),
                 }));
         }
@@ -3507,22 +3799,33 @@ impl SessionExecutorActor {
     }
 
     fn start_admission(&mut self, request: &mut SubmitRequest) -> Result<(), ActorFatality> {
-        if self.prepare_unload.is_some() {
+        if self.prepare_unload_accepted {
             // The admission gate is closed and the queues were cleared at PrepareForUnload
-            // accept; this Submit is rejected exactly like a closed admission gate.
+            // accept; this Submit is rejected exactly like a closed admission gate.  The
+            // sticky marker also rejects Submits that were already in the bounded lane and
+            // are handled after the preparation settled (the state was taken), so a queued
+            // Submit can never bypass the preparation.
             request.settle(Err(SessionSubmitError::Closing));
             return Ok(());
         }
         // Readiness is checked before any TurnId generation, execution mutation, or Workspace
         // clone.  An Unavailable Session is always Idle with no active admission/Turn/queues,
-        // so this settles before the SessionBusy path and before any Ready-only accessor.
+        // so this settles before the SessionBusy path and before any Ready-only accessor.  A
+        // security-invalidation Preparing Session follows the existing RuntimeDependency
+        // fallback contract: `SessionNotReady(RuntimeDependencyUnavailable)` maps to
+        // `SessionNotReady` + RetryWithBackoff publicly.
         match self.current.readiness() {
             SessionReadinessView::Ready => {}
             SessionReadinessView::Unavailable(cause) => {
                 request.settle(Err(SessionSubmitError::SessionNotReady(cause)));
                 return Ok(());
             }
-            SessionReadinessView::Preparing => return Err(ActorFatality::Integrity),
+            SessionReadinessView::Preparing => {
+                request.settle(Err(SessionSubmitError::SessionNotReady(
+                    SessionUnavailableView::RuntimeDependencyUnavailable,
+                )));
+                return Ok(());
+            }
         }
         if let Some(active) = self.active_admission.as_mut() {
             if active.command_id == request.command_id {
@@ -3690,6 +3993,9 @@ impl SessionExecutorActor {
                 self.apply_pending_availability()?;
                 active.settle(Err(error));
                 self.settle_prepare_unload_if_idle();
+                // A security invalidation that signaled this admission starts its Workspace
+                // recovery now that the admission failure cleanup is complete.
+                self.start_security_recovery_worker()?;
                 return Ok(());
             }
         };
@@ -4241,6 +4547,409 @@ impl SessionExecutorActor {
         Ok(())
     }
 
+    /// Accepts one host security Workspace invalidation.  The admission gate is already closed
+    /// synchronously by the caller; the request arrives over the unbounded emergency lane so it
+    /// can never be blocked behind the bounded work lane.  A duplicate invalidation joins the
+    /// same state (no re-signal, no re-recovery, no CommandId).  If graceful-Unload preparation
+    /// already started or the executor is closing, the request settles Closing.  Otherwise the
+    /// actor registers the state and either: (a) an active admission/Turn exists — the exact
+    /// current emergency target is signaled `SecurityRevoked` first-wins (an active
+    /// definition/Agent/reload publication never shields or blocks this signal), the
+    /// security_revocation/cancellation tokens are cancelled, and recovery starts after the
+    /// admission failure cleanup or Turn terminal; (b) only an active publication remains —
+    /// the publication is never blocked or cancelled, but the Idle Session still enters
+    /// Preparing immediately (dropping the old WorkspaceSnapshot and publishing the single
+    /// start `ReadinessChanged(command_id: None)`); the recovery worker itself starts with the
+    /// post-publication exact current definition at the publication settlement; or (c) the
+    /// Session is Idle — the actor enters Preparing immediately, publishes
+    /// `ReadinessChanged(command_id: None)`, and starts the owner-tracked recovery worker.
+    /// Waiters settle only after the recovery final state is installed.
+    async fn begin_security_invalidation(
+        &mut self,
+        request: &mut SecurityInvalidationRequest,
+    ) -> Result<(), ActorFatality> {
+        let Some(response) = request.response.take() else {
+            return Err(ActorFatality::Integrity);
+        };
+        if let Some(state) = self.security_invalidation.as_mut() {
+            // A duplicate invalidation joins the same state; the recovery already owns the
+            // signal and the worker, so nothing is re-signaled or re-run.
+            state.waiters.push(response);
+            return Ok(());
+        }
+        if self.closing.is_cancelled() || self.prepare_unload_accepted {
+            let _ = response.send(Err(SessionSecurityInvalidationError::Closing));
+            return Ok(());
+        }
+        let timestamp = request.timestamp;
+        self.security_invalidation = Some(SecurityInvalidationState {
+            timestamp,
+            waiters: vec![response],
+            worker_task: None,
+        });
+        // The exact emergency target is resolved from the active admission/Turn first: an
+        // active publication never shields or blocks the security signal, so an admission/Turn
+        // concurrent with a publication is still signaled SecurityRevoked now.  Only the
+        // recovery itself waits for the publication settlement (which re-invokes
+        // `start_security_recovery_worker` with the post-publication exact current definition).
+        let (emergency_target, cancellation, security_revocation) =
+            if let Some(active) = self.active_admission.as_ref() {
+                (
+                    active.emergency.target(),
+                    active.cancellation.clone(),
+                    Some(active.security_revocation.clone()),
+                )
+            } else if let Some(active) = self.active_turn.as_ref() {
+                (active.emergency.target(), active.cancellation.clone(), None)
+            } else if self.active_publication.is_some() {
+                // No active admission/Turn, only an active publication: the publication is
+                // never blocked or cancelled (it may already have crossed the durable
+                // barrier), but the Session is Idle and the host restriction is already
+                // current, so Preparing is entered immediately through the shared
+                // `start_security_recovery_worker` order (the old WorkspaceSnapshot is
+                // dropped and the single start `ReadinessChanged(command_id: None)` is
+                // published); the worker itself still waits for the publication settlement
+                // and re-resolves the post-publication exact current definition.
+                self.start_security_recovery_worker()?;
+                return Ok(());
+            } else {
+                // Idle with no active admission/Turn/publication: recovery starts immediately
+                // (Preparing + worker are entered by `start_security_recovery_worker`).
+                self.start_security_recovery_worker()?;
+                return Ok(());
+            };
+        if self.signal_security_revocation(emergency_target)? {
+            cancellation.cancel();
+            if let Some(security_revocation) = security_revocation {
+                security_revocation.cancel();
+            }
+            // Only a formed Turn projects Finishing; a pre-Input admission keeps Starting
+            // legal and leaves the truth to the admission completion.
+            let finishing_turn = match emergency_target {
+                EmergencyControlTarget::Turn(turn_id) => Some(turn_id),
+                EmergencyControlTarget::Submit(_) => {
+                    self.active_admission.as_ref().and_then(|active| {
+                        self.conversation.as_ref().and_then(|conversation| {
+                            (lock(&conversation.live_state).current_turn()
+                                == Some(active.turn_id))
+                                .then_some(active.turn_id)
+                        })
+                    })
+                }
+            };
+            if let Some(turn_id) = finishing_turn {
+                if self.execution_state != SessionExecutionState::Finishing {
+                    self.execution_state = SessionExecutionState::Finishing;
+                    self.publish_execution_state(
+                        SessionExecutionState::Finishing,
+                        Some(turn_id),
+                        self.current.last_terminal(),
+                    );
+                }
+                let pending = self
+                    .pending_interactions
+                    .iter()
+                    .filter_map(|(request_id, interaction)| {
+                        (interaction.turn_id == turn_id).then_some(*request_id)
+                    })
+                    .collect::<Vec<_>>();
+                for request_id in pending {
+                    self.cancel_pending_interaction(
+                        request_id,
+                        SystemClock.now(),
+                        InteractionCancelReason::SecurityRevoked,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Signals `SecurityRevoked` first-wins on the exact target.  Returns whether security won
+    /// the target; an earlier Cancel/SecurityRevoked/PrepareForUnload keeps its original signal
+    /// and reason.
+    fn signal_security_revocation(
+        &self,
+        target: EmergencyControlTarget,
+    ) -> Result<bool, ActorFatality> {
+        match self
+            .emergency
+            .signal(target, EmergencyControlSignal::SecurityRevoked)
+        {
+            EmergencyControlSignalOutcome::Accepted { .. } => Ok(true),
+            EmergencyControlSignalOutcome::AlreadySignaled { .. } => Ok(false),
+            EmergencyControlSignalOutcome::StaleTarget => Err(ActorFatality::Integrity),
+        }
+    }
+
+    /// Enters the security-invalidation Preparing snapshot.  The Session must be Idle with no
+    /// active admission or Turn; an in-flight publication is allowed because the host
+    /// restriction is already current and the old WorkspaceSnapshot must be dropped even while
+    /// the publication is still settling.  The old WorkspaceSnapshot is dropped and the
+    /// workspace cause is masked; the public queue projection is re-run so the Preparing
+    /// snapshot is legal: empty queues and accepting false.  The call is idempotent: it always
+    /// re-applies `with_workspace_preparing` so `workspace` stays None (a settled publication
+    /// cannot have reinstalled one while Preparing), but the single start
+    /// `ReadinessChanged(command_id: None)` event is published only on the transition into
+    /// Preparing — a re-entry after the publication settlement must not publish a second start
+    /// event.
+    fn enter_workspace_preparing(&mut self) -> Result<(), ActorFatality> {
+        if !self.execution_state.is_idle()
+            || self.active_admission.is_some()
+            || self.active_turn.is_some()
+        {
+            return Err(ActorFatality::Integrity);
+        }
+        let timestamp = self
+            .security_invalidation
+            .as_ref()
+            .map(|state| state.timestamp)
+            .ok_or(ActorFatality::Integrity)?;
+        let was_preparing = self.current.workspace_preparing();
+        self.publish_current(Arc::new(self.current.with_workspace_preparing()));
+        self.publish_queue_projection();
+        if !was_preparing {
+            let _ = self
+                .events
+                .send(Arc::new(SessionExecutorEvent::ReadinessChanged {
+                    timestamp,
+                    command_id: None,
+                    snapshot: Arc::clone(&self.current),
+                }));
+        }
+        Ok(())
+    }
+
+    /// Starts the owner-tracked security Workspace recovery worker at the first legal Idle
+    /// recovery start point.  It is a no-op when no invalidation is registered or when the
+    /// worker already runs.  Preparing is entered as soon as the Session is Idle with no active
+    /// admission/Turn — an in-flight publication does not block Preparing — and the worker
+    /// spawns only once the publication also settles (the admission failure cleanup, Turn
+    /// terminal, or publication settlement calls it again).  A closing executor settles the
+    /// waiters with Closing and clears the state; a rejected spawn drops the never-polled
+    /// future and its pre-constructed RAII guard reports the one typed fallback completion —
+    /// Closing when the shared task owner is already closing, otherwise Internal plus closing
+    /// both owners — without creating a second completion.
+    fn start_security_recovery_worker(&mut self) -> Result<(), ActorFatality> {
+        let Some(state) = self.security_invalidation.as_mut() else {
+            return Ok(());
+        };
+        if state.worker_task.is_some() {
+            return Ok(());
+        }
+        if self.closing.is_cancelled() {
+            let state = self
+                .security_invalidation
+                .take()
+                .expect("the registered invalidation state exists");
+            for waiter in state.waiters {
+                let _ = waiter.send(Err(SessionSecurityInvalidationError::Closing));
+            }
+            return Ok(());
+        }
+        if !self.execution_state.is_idle()
+            || self.active_admission.is_some()
+            || self.active_turn.is_some()
+        {
+            // Not Idle yet: the caller re-invokes this after the admission failure cleanup or
+            // the Turn terminal completes.
+            return Ok(());
+        }
+        // The Session is Idle with no active admission/Turn: enter Preparing (drops the old
+        // WorkspaceSnapshot, masks the workspace cause) before spawning the owner-tracked
+        // recovery worker.  An in-flight publication does not block Preparing — the host
+        // restriction is already current and the old WorkspaceSnapshot must be dropped even
+        // while the publication is still settling.  When the invalidation was registered
+        // during an active publication, Preparing was already entered at registration, so this
+        // re-entry is idempotent: it re-asserts `workspace: None` against the settled current
+        // snapshot (the publication completion cannot reinstall a WorkspaceSnapshot while
+        // Preparing) and does not publish a second start `ReadinessChanged` event.  The state
+        // timestamp is copied first so the `&mut self` call below is not aliased.
+        let timestamp = state.timestamp;
+        self.enter_workspace_preparing()?;
+        if self.active_publication.is_some() {
+            // The publication is still settling: the worker spawns only after the settlement,
+            // which re-invokes this with the post-publication exact current definition.
+            return Ok(());
+        }
+        let definition = Arc::clone(self.current.definition());
+        let context = WorkspacePublicationContext {
+            durable_state: self.durable_state.clone(),
+            resolver: Arc::clone(&self.resolver),
+            prompt_service: Arc::clone(&self.prompt_service),
+            executor_closing: self.closing.clone(),
+            candidate_cancellation: CancellationToken::new(),
+        };
+        #[cfg(test)]
+        let hooks = Arc::clone(&self.hooks);
+        // The RAII guard is created before the future is constructed.  If `spawn_tracked`
+        // rejects the worker (owner closing, unavailable, or a spawn panic), the never-polled
+        // future is dropped with the guard inside it, and the guard's Drop reports the one
+        // fallback completion through the single settlement path — so the invalidation waiters
+        // and the close drain can never wait for a completion that will not arrive.
+        let guard = SecurityRecoveryCompletionGuard::new(
+            self.completion_sender.clone(),
+            timestamp,
+            Arc::clone(&definition),
+            self.task_context.clone(),
+            self.durable_state.clone(),
+        );
+        let worker = async move {
+            // The RAII guard also reports one fallback completion if the worker unwinds
+            // mid-run, so the drain loop can never wait forever for a completion that will
+            // not arrive.
+            let mut guard = guard;
+            #[cfg(test)]
+            let result =
+                run_security_workspace_recovery(context, definition, hooks).await;
+            #[cfg(not(test))]
+            let result = run_security_workspace_recovery(context, definition).await;
+            guard.complete(result);
+        };
+        match self.task_context.spawn_tracked(worker) {
+            Ok(task) => {
+                self.security_invalidation
+                    .as_mut()
+                    .expect("the invalidation state remains installed")
+                    .worker_task = Some(task);
+            }
+            Err(RuntimeTaskError::OwnerClosing) => {
+                // The dropped worker future carries the RAII guard, whose Drop reports the one
+                // typed Closing completion through the single settlement path; the actor or the
+                // close drain settles the waiters exactly once.  Do not settle here or create a
+                // second completion.
+            }
+            Err(RuntimeTaskError::OperationPanicked | RuntimeTaskError::WorkerUnavailable) => {
+                // The dropped worker future carries the RAII guard, whose Drop reports the one
+                // InternalDispatchUnavailable completion and closes both owners through the
+                // single settlement path.  Do not settle here or create a second completion.
+            }
+        }
+        Ok(())
+    }
+
+    /// Handles one security Workspace recovery worker completion.  The exact worker task is
+    /// reaped first; a failed task, a fatal state, or an impossible shape settles every waiter
+    /// exactly once with Internal.  An executor that is closing settles every waiter with
+    /// Closing.  Otherwise the recovery final state is installed — the exact re-resolved
+    /// WorkspaceSnapshot (verified by Arc identity and SessionId/revision) or the explicit new
+    /// Workspace/Prompt Unavailable cause — one final `ReadinessChanged(command_id: None)` is
+    /// published, every waiter settles Ok, and the admission gate reopens only while the
+    /// executor is not closing and no graceful-Unload preparation was accepted (the sticky
+    /// marker, which survives the Idle settlement).  A queued FollowUp may then hand off under
+    /// the normal Ready rules.
+    async fn handle_security_recovery_completion(
+        &mut self,
+        completion: SecurityRecoveryCompletion,
+    ) -> Result<(), ActorFatality> {
+        let Some(mut state) = self.security_invalidation.take() else {
+            // A spawn-failed worker's RAII guard can deliver its fallback completion after the
+            // close path already settled the state; this is a benign close race, not corruption.
+            return Ok(());
+        };
+        let worker_result = match state.worker_task.take() {
+            Some(worker_task) => worker_task.wait().await,
+            None => Ok(()),
+        };
+        if worker_result.is_err() || self.failure_state.is_fatal() {
+            for waiter in state.waiters {
+                let _ = waiter.send(Err(
+                    SessionSecurityInvalidationError::InternalDispatchUnavailable,
+                ));
+            }
+            if !self.failure_state.is_fatal() {
+                self.close_for_fatal(ActorFatality::Internal);
+            }
+            return Err(ActorFatality::Internal);
+        }
+        if self.closing.is_cancelled() {
+            for waiter in state.waiters {
+                let _ = waiter.send(Err(SessionSecurityInvalidationError::Closing));
+            }
+            return Ok(());
+        }
+        match completion.result {
+            SecurityRecoveryResult::Snapshot(snapshot) => {
+                // The recovery must have resolved the exact definition it was spawned with: a
+                // definition publication can never interleave (publications are rejected while
+                // an invalidation is registered), so a mismatch is an integrity failure.
+                if !Arc::ptr_eq(self.current.definition(), &completion.definition)
+                    || snapshot.session_id() != completion.definition.session_id()
+                    || snapshot.revision() != completion.definition.workspace().revision()
+                {
+                    for waiter in state.waiters {
+                        let _ = waiter.send(Err(
+                            SessionSecurityInvalidationError::InternalDispatchUnavailable,
+                        ));
+                    }
+                    self.close_for_fatal(ActorFatality::Integrity);
+                    return Err(ActorFatality::Integrity);
+                }
+                self.publish_current(Arc::new(
+                    self.current.with_workspace_preparing_finished_success(snapshot),
+                ));
+            }
+            SecurityRecoveryResult::Unavailable(cause) => {
+                self.publish_current(Arc::new(
+                    self.current.with_workspace_preparing_finished_failure(cause),
+                ));
+            }
+            SecurityRecoveryResult::Closing => {
+                // Cancellation through the executor token is caught by the check above.  A
+                // resolver/task owner may also report Closing first; in that case transition
+                // this executor into closing as ordinary ReloadWorkspace does, rather than
+                // leaving a loaded Session permanently Preparing with its admission gate shut.
+                for waiter in state.waiters {
+                    let _ = waiter.send(Err(SessionSecurityInvalidationError::Closing));
+                }
+                self.turn_admission_gate.close();
+                self.closing.cancel();
+                return Ok(());
+            }
+            SecurityRecoveryResult::Internal => {
+                for waiter in state.waiters {
+                    let _ = waiter.send(Err(
+                        SessionSecurityInvalidationError::InternalDispatchUnavailable,
+                    ));
+                }
+                self.close_for_fatal(ActorFatality::Internal);
+                return Err(ActorFatality::Internal);
+            }
+        }
+        self.publish_queue_projection();
+        // The final derived readiness can differ from Preparing for an Agent/model/prompt fact
+        // (for example AgentUnavailable), so this final event is always published.
+        let _ = self
+            .events
+            .send(Arc::new(SessionExecutorEvent::ReadinessChanged {
+                timestamp: state.timestamp,
+                command_id: None,
+                snapshot: Arc::clone(&self.current),
+            }));
+        for waiter in state.waiters {
+            let _ = waiter.send(Ok(()));
+        }
+        // Reopen only while the executor is not closing and no graceful-Unload preparation was
+        // accepted; the sticky marker is never cleared, so a preparation that already settled
+        // its waiters (state taken) still keeps the gate closed until close.  An Unavailable
+        // Session is still rejected early by the readiness check.
+        if !self.prepare_unload_accepted {
+            self.turn_admission_gate.open();
+        }
+        self.settle_prepare_unload_if_idle();
+        self.start_queued_follow_up_after_publication()?;
+        Ok(())
+    }
+
+    /// Whether an owner-tracked security recovery worker is still running (its completion has
+    /// not been handled yet).
+    fn security_recovery_is_active(&self) -> bool {
+        self.security_invalidation
+            .as_ref()
+            .is_some_and(|state| state.worker_task.is_some())
+    }
+
     fn signal_emergency(
         &self,
         target: EmergencyControlTarget,
@@ -4376,13 +5085,16 @@ impl SessionExecutorActor {
         // A pending composite is never applied to a legal non-Idle snapshot.
         self.apply_pending_availability()?;
         // A FollowUp is only popped and started here when no publication is active, no
-        // graceful-Unload preparation is in flight, and the Session is Ready.  If a future-only
-        // definition publication is still in flight at terminal, or the Agent is unavailable, or
-        // the executor is preparing for unload, the FollowUp stays queued: the publication
-        // settlement or the next Enable starts it, so a queued FollowUp is never dropped (the
-        // prepare path has already cleared the queues).
+        // security Workspace recovery is pending, no graceful-Unload preparation has been
+        // accepted (the sticky marker, which survives the Idle settlement), and the Session is
+        // Ready.  If a future-only definition publication is still in flight at terminal, or
+        // the Agent is unavailable, or the executor is preparing for unload, or a security
+        // invalidation holds the Session, the FollowUp stays queued: the publication
+        // settlement, the recovery completion, or the next Enable starts it, so a queued
+        // FollowUp is never dropped (the prepare path has already cleared the queues).
         let queued_follow_up = if task_result.is_ok()
-            && self.prepare_unload.is_none()
+            && !self.prepare_unload_accepted
+            && self.security_invalidation.is_none()
             && self.active_publication.is_none()
             && matches!(self.current.readiness(), SessionReadinessView::Ready)
         {
@@ -4403,6 +5115,10 @@ impl SessionExecutorActor {
                 terminal: completion.terminal,
                 snapshot: Arc::clone(&self.current),
             }));
+        // The Turn terminal is published first (TurnInterrupted with SecurityRevoked or the
+        // earlier winner), then the security recovery enters Preparing and publishes
+        // ReadinessChanged(command_id: None) before any FollowUp handoff.
+        self.start_security_recovery_worker()?;
         if let Some(queued) = queued_follow_up {
             let (command_id, intent) = queued.into_parts();
             let mut request = SubmitRequest {
@@ -4425,6 +5141,14 @@ impl SessionExecutorActor {
         request: &mut WorkspaceDefinitionRequest,
     ) -> Result<(), ActorFatality> {
         if self.active_publication.is_some() {
+            request.settle(Err(SessionWorkspaceDefinitionError::SessionBusy));
+            return Ok(());
+        }
+        // While a security Workspace invalidation is registered (Preparing or recovery
+        // pending), no new publication is admitted: the recovery worker resolved the exact
+        // current definition and any interleaved definition install would break its Arc
+        // identity.  The host seam itself never blocks an already-active publication.
+        if self.security_invalidation.is_some() {
             request.settle(Err(SessionWorkspaceDefinitionError::SessionBusy));
             return Ok(());
         }
@@ -4576,6 +5300,12 @@ impl SessionExecutorActor {
             request.settle(Err(SessionDefinitionPublicationError::SessionBusy));
             return Ok(());
         }
+        // See `start_publication`: no new publication while a security invalidation is
+        // registered, so the recovery worker's exact definition Arc stays valid.
+        if self.security_invalidation.is_some() {
+            request.settle(Err(SessionDefinitionPublicationError::SessionBusy));
+            return Ok(());
+        }
         if self.current.definition().revision() != request.expected_revision {
             request.settle(Err(SessionDefinitionPublicationError::StaleRevision));
             return Ok(());
@@ -4674,6 +5404,12 @@ impl SessionExecutorActor {
         request: &mut ReloadWorkspaceRequest,
     ) -> Result<(), ActorFatality> {
         if self.active_publication.is_some() {
+            request.settle(Err(SessionDefinitionPublicationError::SessionBusy));
+            return Ok(());
+        }
+        // See `start_publication`: no new publication while a security invalidation is
+        // registered, so the recovery worker's exact definition Arc stays valid.
+        if self.security_invalidation.is_some() {
             request.settle(Err(SessionDefinitionPublicationError::SessionBusy));
             return Ok(());
         }
@@ -4787,6 +5523,9 @@ impl SessionExecutorActor {
                 self.handle_turn_phase_completion(completion)
             }
             ExecutorCompletion::Turn(completion) => self.handle_turn_completion(completion).await,
+            ExecutorCompletion::SecurityRecovery(completion) => {
+                self.handle_security_recovery_completion(completion).await
+            }
         }
     }
 
@@ -5011,6 +5750,9 @@ impl SessionExecutorActor {
                 self.finish_active_waiter(&active.waiter);
                 self.start_queued_follow_up_after_publication()?;
                 self.settle_prepare_unload_if_idle();
+                // A security invalidation registered while this publication was active starts
+                // its Workspace recovery with the post-publication exact current definition.
+                self.start_security_recovery_worker()?;
                 Ok(())
             }
             CompletionHandling::Ordinary(error) => {
@@ -5031,6 +5773,10 @@ impl SessionExecutorActor {
                     self.start_queued_follow_up_after_publication()?;
                 }
                 self.settle_prepare_unload_if_idle();
+                // A security invalidation registered while this publication was active starts
+                // its Workspace recovery after the ordinary settlement (the current definition
+                // is unchanged on an ordinary failure).
+                self.start_security_recovery_worker()?;
                 Ok(())
             }
             CompletionHandling::Fatal(fatality) => {
@@ -5041,14 +5787,16 @@ impl SessionExecutorActor {
         }
     }
 
-    /// Starts the next queued FollowUp after a publication settles or an Enable restores Ready,
-    /// when the Session is Idle, Ready, and no admission, Turn, or publication remains.  A
-    /// FollowUp left queued at Turn terminal because a future-only publication was still active
+    /// Starts the next queued FollowUp after a publication settles, a security Workspace
+    /// recovery completes, or an Enable restores Ready, when the Session is Idle, Ready, and no
+    /// admission, Turn, or publication remains.  A FollowUp left queued at Turn terminal
+    /// because a future-only publication was still active, a security invalidation was pending,
     /// or the Agent was unavailable is therefore never lost: it starts here against the
-    /// post-publication current definition or the next Enable.
+    /// post-publication current definition, the post-recovery readiness, or the next Enable.
     fn start_queued_follow_up_after_publication(&mut self) -> Result<(), ActorFatality> {
         if self.closing.is_cancelled()
-            || self.prepare_unload.is_some()
+            || self.prepare_unload_accepted
+            || self.security_invalidation.is_some()
             || self.active_publication.is_some()
             || self.active_admission.is_some()
             || self.active_turn.is_some()
@@ -5312,6 +6060,23 @@ impl SessionExecutorActor {
         self.failure_state.mark_fatal();
         self.task_context.request_closing();
         self.durable_state.request_closing();
+        // A security recovery worker is only running while the Session is Idle, so it cannot
+        // be running when most other owners fatal; the one exception is a Turn completion task
+        // failure that happens right after the terminal recovery start.  In that case the
+        // state is kept so the drain loop reaps the worker completion (which settles the
+        // waiters with Internal) and close never leaves the task behind.  A state without a
+        // worker settles its waiters exactly once with Internal here.
+        if let Some(state) = self.security_invalidation.take() {
+            if state.worker_task.is_some() {
+                self.security_invalidation = Some(state);
+            } else {
+                for waiter in state.waiters {
+                    let _ = waiter.send(Err(
+                        SessionSecurityInvalidationError::InternalDispatchUnavailable,
+                    ));
+                }
+            }
+        }
         if let Some(state) = self.prepare_unload.take() {
             for waiter in state.waiters {
                 let _ = waiter.send(Err(SessionExecutorPrepareUnloadError::Internal));
@@ -5984,6 +6749,7 @@ enum ExecutorCompletion {
     SteerSafePoint(SteerSafePointCompletion),
     TurnPhase(TurnPhaseCompletion),
     Turn(TurnCompletion),
+    SecurityRecovery(SecurityRecoveryCompletion),
 }
 
 struct InteractionRequestedCompletion {
@@ -6022,6 +6788,24 @@ struct AdmissionCompletion {
 struct TurnCompletion {
     turn_id: TurnId,
     terminal: SessionTurnTerminal,
+}
+
+/// One owner-tracked security Workspace recovery worker completion.  The worker re-resolves the
+/// exact definition it was spawned with; the actor verifies that exact Arc identity (and the
+/// returned snapshot SessionId/revision) before installing any final state.
+struct SecurityRecoveryCompletion {
+    timestamp: Timestamp,
+    definition: Arc<SessionDefinition>,
+    result: SecurityRecoveryResult,
+}
+
+/// The closed result of one security Workspace recovery worker.
+#[allow(clippy::large_enum_variant)]
+enum SecurityRecoveryResult {
+    Snapshot(Arc<WorkspaceSnapshot>),
+    Unavailable(SessionUnavailableView),
+    Closing,
+    Internal,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -7495,7 +8279,10 @@ async fn run_agent_upgrade_publication(
 /// Reloads one loaded Session's installed Workspace.  It re-resolves the exact currently
 /// installed definition Workspace, captures the Workspace Prompt sources, revalidates the
 /// required authority, and finishes one exact WorkspaceSnapshot; it never calls DurableState and
-/// never changes the durable definition, metadata, conversation, or Recorder.
+/// never changes the durable definition, metadata, conversation, or Recorder.  The
+/// resolve/capture/revalidate/finish body is the shared [`resolve_reload_workspace_snapshot`]
+/// helper; this worker keeps the ordinary ReloadWorkspace error mapping (AuthorityDenied →
+/// Unauthorized, shape failures → WorkspaceRejected, SourceDiscovery → WorkspaceUnavailable).
 async fn run_workspace_reload(
     context: WorkspacePublicationContext,
     definition: Arc<SessionDefinition>,
@@ -7504,24 +8291,66 @@ async fn run_workspace_reload(
     if context.is_cancelled() {
         return PublicationCompletionResult::Error(SessionDefinitionPublicationError::Closing);
     }
-    let candidate = match context
+    let snapshot = {
+        #[cfg(test)]
+        let resolved =
+            resolve_reload_workspace_snapshot(&context, definition.as_ref(), &hooks).await;
+        #[cfg(not(test))]
+        let resolved = resolve_reload_workspace_snapshot(&context, definition.as_ref()).await;
+        match resolved {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return PublicationCompletionResult::Error(map_reload_recovery_error(error));
+            }
+        }
+    };
+    PublicationCompletionResult::Reload { snapshot }
+}
+
+/// The neutral classification of one shared Workspace resolve/capture/revalidate/finish attempt.
+/// The ordinary ReloadWorkspace worker keeps its finer public mapping while the security
+/// Workspace recovery worker collapses every resolver/validation failure into WorkspaceUnavailable
+/// and every workspace Prompt capture failure into PromptUnavailable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceReloadErrorKind {
+    Closing,
+    WorkspaceUnavailable,
+    AuthorityDenied,
+    WorkspaceRejected,
+    PromptUnavailable,
+    PromptRejected,
+    Internal,
+}
+
+/// The minimal shared resolve→capture→revalidate→finish body reused by the ordinary
+/// ReloadWorkspace worker and the security Workspace recovery worker.  It never calls
+/// DurableState and never changes the durable definition, metadata, conversation, or Recorder.
+/// Every await races the executor closing token: resolve, capture, and revalidation each return
+/// Closing on cancellation, so both workers are cancellable and `close()`/Unload can never wait
+/// on a hung resolver or prompt service.
+async fn resolve_reload_workspace_snapshot(
+    context: &WorkspacePublicationContext,
+    definition: &SessionDefinition,
+    #[cfg(test)] hooks: &Arc<SessionExecutorTestHooksInner>,
+) -> Result<Arc<WorkspaceSnapshot>, WorkspaceReloadErrorKind> {
+    let resolve = context
         .resolver
-        .resolve(definition.session_id(), definition.workspace())
-        .await
-    {
+        .resolve(definition.session_id(), definition.workspace());
+    tokio::pin!(resolve);
+    let candidate = match tokio::select! {
+        biased;
+        _ = context.cancelled() => return Err(WorkspaceReloadErrorKind::Closing),
+        result = &mut resolve => result,
+    } {
         Ok(candidate) => candidate,
-        Err(error) => return PublicationCompletionResult::Error(map_reload_workspace_error(error)),
+        Err(error) => return Err(map_reload_resolve_error(error)),
     };
     if candidate.revision() != definition.workspace().revision() {
-        return PublicationCompletionResult::Error(
-            SessionDefinitionPublicationError::InternalDispatchUnavailable,
-        );
+        return Err(WorkspaceReloadErrorKind::Internal);
     }
     let skill_context = candidate.skill_capture_context();
     if !skill_context.roots().is_empty() {
-        return PublicationCompletionResult::Error(
-            SessionDefinitionPublicationError::InternalDispatchUnavailable,
-        );
+        return Err(WorkspaceReloadErrorKind::Internal);
     }
     let prompt_context = candidate.prompt_capture_context();
     let requires_revalidation = !prompt_context.roots().is_empty();
@@ -7531,13 +8360,11 @@ async fn run_workspace_reload(
     tokio::pin!(capture);
     let prompt_sources = match tokio::select! {
         biased;
-        _ = context.cancelled() => return PublicationCompletionResult::Error(
-            SessionDefinitionPublicationError::Closing,
-        ),
+        _ = context.cancelled() => return Err(WorkspaceReloadErrorKind::Closing),
         result = &mut capture => result,
     } {
         Ok(sources) => sources,
-        Err(error) => return PublicationCompletionResult::Error(map_reload_prompt_error(error)),
+        Err(error) => return Err(map_reload_prompt_error_kind(error)),
     };
     if requires_revalidation {
         let revalidation_result = {
@@ -7547,69 +8374,92 @@ async fn run_workspace_reload(
             tokio::pin!(revalidation);
             tokio::select! {
                 biased;
-                _ = context.cancelled() => return PublicationCompletionResult::Error(
-                    SessionDefinitionPublicationError::Closing,
-                ),
+                _ = context.cancelled() => return Err(WorkspaceReloadErrorKind::Closing),
                 result = &mut revalidation => result,
             }
         };
         match revalidation_result {
             Ok(true) => {}
-            Ok(false) => {
-                return PublicationCompletionResult::Error(
-                    SessionDefinitionPublicationError::WorkspaceUnavailable,
-                );
-            }
-            Err(error) => {
-                return PublicationCompletionResult::Error(map_reload_workspace_error(error));
-            }
+            Ok(false) => return Err(WorkspaceReloadErrorKind::WorkspaceUnavailable),
+            Err(error) => return Err(map_reload_resolve_error(error)),
         }
     }
     let skill_sources = Arc::from(Vec::new().into_boxed_slice());
     if context.is_cancelled() {
-        return PublicationCompletionResult::Error(SessionDefinitionPublicationError::Closing);
+        return Err(WorkspaceReloadErrorKind::Closing);
     }
     let snapshot = match candidate.finish(prompt_sources, skill_sources) {
         Ok(snapshot) => snapshot,
         Err(WorkspaceSnapshotFinishError::AuthorizationMismatch) => {
-            return PublicationCompletionResult::Error(
-                SessionDefinitionPublicationError::InternalDispatchUnavailable,
-            );
+            return Err(WorkspaceReloadErrorKind::Internal);
         }
     };
-
     #[cfg(test)]
     hooks.after_candidate_snapshot_finish_before_durable().await;
-    PublicationCompletionResult::Reload { snapshot }
+    Ok(snapshot)
 }
 
-fn map_reload_workspace_error(error: WorkspaceResolveError) -> SessionDefinitionPublicationError {
+/// One security Workspace recovery worker.  It re-resolves the exact definition it was spawned
+/// with through the shared helper and classifies per the security contract: every resolver
+/// Root/authority/canonical/validation failure (including AuthorityDenied, which leaves the hard
+/// restriction in the current policy) is WorkspaceUnavailable; every workspace Prompt
+/// SourceDiscovery/ContentLoad/DuplicateKey failure is PromptUnavailable; Closing is typed
+/// Closing; shape/channel/task mismatch (including non-empty Skill roots) is Internal.
+async fn run_security_workspace_recovery(
+    context: WorkspacePublicationContext,
+    definition: Arc<SessionDefinition>,
+    #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
+) -> SecurityRecoveryResult {
+    if context.is_cancelled() {
+        return SecurityRecoveryResult::Closing;
+    }
+    let resolved = {
+        #[cfg(test)]
+        let result =
+            resolve_reload_workspace_snapshot(&context, definition.as_ref(), &hooks).await;
+        #[cfg(not(test))]
+        let result = resolve_reload_workspace_snapshot(&context, definition.as_ref()).await;
+        result
+    };
+    match resolved {
+        Ok(snapshot) => SecurityRecoveryResult::Snapshot(snapshot),
+        Err(WorkspaceReloadErrorKind::Closing) => SecurityRecoveryResult::Closing,
+        Err(
+            WorkspaceReloadErrorKind::WorkspaceUnavailable
+            | WorkspaceReloadErrorKind::AuthorityDenied
+            | WorkspaceReloadErrorKind::WorkspaceRejected,
+        ) => SecurityRecoveryResult::Unavailable(SessionUnavailableView::WorkspaceUnavailable),
+        Err(
+            WorkspaceReloadErrorKind::PromptUnavailable
+            | WorkspaceReloadErrorKind::PromptRejected,
+        ) => SecurityRecoveryResult::Unavailable(SessionUnavailableView::PromptUnavailable),
+        Err(WorkspaceReloadErrorKind::Internal) => SecurityRecoveryResult::Internal,
+    }
+}
+
+fn map_reload_resolve_error(error: WorkspaceResolveError) -> WorkspaceReloadErrorKind {
     match error {
-        WorkspaceResolveError::Closing => SessionDefinitionPublicationError::Closing,
+        WorkspaceResolveError::Closing => WorkspaceReloadErrorKind::Closing,
         WorkspaceResolveError::RootUnavailable
         | WorkspaceResolveError::AuthorityUnavailable
         | WorkspaceResolveError::CanonicalizationFailed => {
-            SessionDefinitionPublicationError::WorkspaceUnavailable
+            WorkspaceReloadErrorKind::WorkspaceUnavailable
         }
-        WorkspaceResolveError::AuthorityDenied => SessionDefinitionPublicationError::Unauthorized,
+        WorkspaceResolveError::AuthorityDenied => WorkspaceReloadErrorKind::AuthorityDenied,
         WorkspaceResolveError::RootNotDirectory
         | WorkspaceResolveError::DuplicateRoot
         | WorkspaceResolveError::OverlappingRoots
         | WorkspaceResolveError::CwdOutsideRoots
-        | WorkspaceResolveError::CwdRootMismatch => {
-            SessionDefinitionPublicationError::WorkspaceRejected
-        }
-        WorkspaceResolveError::InternalDispatchUnavailable => {
-            SessionDefinitionPublicationError::InternalDispatchUnavailable
-        }
+        | WorkspaceResolveError::CwdRootMismatch => WorkspaceReloadErrorKind::WorkspaceRejected,
+        WorkspaceResolveError::InternalDispatchUnavailable => WorkspaceReloadErrorKind::Internal,
     }
 }
 
-fn map_reload_prompt_error(error: PromptError) -> SessionDefinitionPublicationError {
+fn map_reload_prompt_error_kind(error: PromptError) -> WorkspaceReloadErrorKind {
     match error.kind() {
-        PromptErrorKind::SourceDiscovery => SessionDefinitionPublicationError::WorkspaceUnavailable,
+        PromptErrorKind::SourceDiscovery => WorkspaceReloadErrorKind::PromptUnavailable,
         PromptErrorKind::ContentLoad | PromptErrorKind::DuplicateKey => {
-            SessionDefinitionPublicationError::WorkspaceRejected
+            WorkspaceReloadErrorKind::PromptRejected
         }
         PromptErrorKind::PromptUnavailable
         | PromptErrorKind::InvalidRole
@@ -7617,7 +8467,33 @@ fn map_reload_prompt_error(error: PromptError) -> SessionDefinitionPublicationEr
         | PromptErrorKind::InvalidIntent
         | PromptErrorKind::InvalidContribution
         | PromptErrorKind::ContextLimitExceeded
-        | PromptErrorKind::Internal => SessionDefinitionPublicationError::InternalDispatchUnavailable,
+        | PromptErrorKind::Internal => WorkspaceReloadErrorKind::Internal,
+    }
+}
+
+/// Maps one shared recovery classification to the ordinary ReloadWorkspace public error
+/// contract: AuthorityDenied → Unauthorized, shape/validation failures → WorkspaceRejected,
+/// workspace Prompt SourceDiscovery → WorkspaceUnavailable, ContentLoad/DuplicateKey →
+/// WorkspaceRejected, Closing/Internal unchanged.
+fn map_reload_recovery_error(error: WorkspaceReloadErrorKind) -> SessionDefinitionPublicationError {
+    match error {
+        WorkspaceReloadErrorKind::Closing => SessionDefinitionPublicationError::Closing,
+        WorkspaceReloadErrorKind::WorkspaceUnavailable => {
+            SessionDefinitionPublicationError::WorkspaceUnavailable
+        }
+        WorkspaceReloadErrorKind::AuthorityDenied => SessionDefinitionPublicationError::Unauthorized,
+        WorkspaceReloadErrorKind::WorkspaceRejected => {
+            SessionDefinitionPublicationError::WorkspaceRejected
+        }
+        WorkspaceReloadErrorKind::PromptUnavailable => {
+            SessionDefinitionPublicationError::WorkspaceUnavailable
+        }
+        WorkspaceReloadErrorKind::PromptRejected => {
+            SessionDefinitionPublicationError::WorkspaceRejected
+        }
+        WorkspaceReloadErrorKind::Internal => {
+            SessionDefinitionPublicationError::InternalDispatchUnavailable
+        }
     }
 }
 
@@ -8087,6 +8963,29 @@ impl Drop for SecurityRevokedRequest {
     }
 }
 
+struct SecurityInvalidationRequest {
+    timestamp: Timestamp,
+    response: Option<oneshot::Sender<Result<(), SessionSecurityInvalidationError>>>,
+}
+
+impl SecurityInvalidationRequest {
+    fn settle(&mut self, outcome: Result<(), SessionSecurityInvalidationError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionSecurityInvalidationError::Closing));
+    }
+}
+
+impl Drop for SecurityInvalidationRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
 impl ResolveInteractionRequest {
     fn settle(&mut self, outcome: Result<(), SessionInteractionError>) {
         if let Some(response) = self.response.take() {
@@ -8208,6 +9107,7 @@ enum SessionExecutorRequest {
     ResolveInteraction(ResolveInteractionRequest),
     Cancel(CancelRequest),
     SecurityRevoked(SecurityRevokedRequest),
+    SecurityInvalidation(SecurityInvalidationRequest),
     Subscribe(SubscribeRequest),
     SetAgentAvailability(AgentAvailabilityRequest),
     UpdateSharedResources(SharedResourceUpdateRequest),
@@ -8231,6 +9131,7 @@ impl SessionExecutorRequest {
             Self::ResolveInteraction(request) => request.reject_closing(),
             Self::Cancel(request) => request.reject_closing(),
             Self::SecurityRevoked(request) => request.reject_closing(),
+            Self::SecurityInvalidation(request) => request.reject_closing(),
             Self::Subscribe(request) => request.reject_closing(),
             Self::SetAgentAvailability(request) => request.reject_closing(),
             Self::UpdateSharedResources(request) => request.reject_closing(),
@@ -8443,6 +9344,82 @@ impl Drop for TurnCompletionGuard {
             .send(ExecutorCompletion::Turn(TurnCompletion {
                 turn_id: self.turn_id,
                 terminal: SessionTurnTerminal::Failed(SessionTurnFailure::Internal),
+            }));
+    }
+}
+
+/// The RAII completion guard of one security Workspace recovery worker.  A normal completion
+/// sends the exact result once; an unwinding or dropped worker sends one fallback completion on
+/// drop — typed Closing when the shared task owner is already closing, otherwise Internal plus
+/// closing both owners — so the actor always receives exactly one completion and the drain loop
+/// can never wait forever.
+struct SecurityRecoveryCompletionGuard {
+    completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    timestamp: Timestamp,
+    definition: Option<Arc<SessionDefinition>>,
+    task_context: RuntimeTaskContext,
+    durable_state: DurableState,
+    completed: bool,
+}
+
+impl SecurityRecoveryCompletionGuard {
+    fn new(
+        completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+        timestamp: Timestamp,
+        definition: Arc<SessionDefinition>,
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+    ) -> Self {
+        Self {
+            completion_sender,
+            timestamp,
+            definition: Some(definition),
+            task_context,
+            durable_state,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self, result: SecurityRecoveryResult) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let Some(definition) = self.definition.take() else {
+            return;
+        };
+        let _ = self
+            .completion_sender
+            .send(ExecutorCompletion::SecurityRecovery(SecurityRecoveryCompletion {
+                timestamp: self.timestamp,
+                definition,
+                result,
+            }));
+    }
+}
+
+impl Drop for SecurityRecoveryCompletionGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let Some(definition) = self.definition.take() else {
+            return;
+        };
+        let result = if self.task_context.is_closing() {
+            SecurityRecoveryResult::Closing
+        } else {
+            self.task_context.request_closing();
+            self.durable_state.request_closing();
+            SecurityRecoveryResult::Internal
+        };
+        let _ = self
+            .completion_sender
+            .send(ExecutorCompletion::SecurityRecovery(SecurityRecoveryCompletion {
+                timestamp: self.timestamp,
+                definition,
+                result,
             }));
     }
 }

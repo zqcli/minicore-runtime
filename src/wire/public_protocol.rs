@@ -2032,13 +2032,11 @@ impl SessionSnapshot {
         if !matches!(value.load_state, SessionLoadStateInput::Loaded) {
             return Err(TypedJsonError::PendingPublicTarget);
         }
-        // Ready and Unavailable are owned semantic shapes; the general constructor enforces the
-        // legal matrix (a non-Ready Session must be an empty Idle projection).  Preparing stays
-        // a pending public target until the readiness milestone that produces it.
+        // Ready, Preparing, and Unavailable are all owned semantic shapes; the general
+        // constructor enforces the legal matrix (a non-Ready Session must be an empty Idle
+        // projection, and a Preparing Session must have no current turn, items, interactions,
+        // queues, or accepting state).
         let readiness = value.readiness.into_semantic()?;
-        if matches!(readiness, SessionReadinessView::Preparing) {
-            return Err(TypedJsonError::PendingPublicTarget);
-        }
         let current_turn = value
             .current_turn
             .map(CurrentTurnInput::into_semantic)
