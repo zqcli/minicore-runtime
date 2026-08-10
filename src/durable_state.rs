@@ -15360,7 +15360,7 @@ mod tests {
         let workspace_input = WorkspaceDefinitionInput::new(
             WorkspaceRootInput::new(
                 root_key,
-                "file:///Users/example/project".parse().unwrap(),
+                current_host_session_fixture_uri().parse().unwrap(),
                 RequestedFilesystemAccess::ReadWrite,
                 WorkspaceSourcePolicy::new(true, true),
             ),
@@ -23130,9 +23130,15 @@ mod tests {
         include_bytes!("../docs/fixtures/durable-store-v1/session-head.json")
     }
 
-    #[cfg(windows)]
     fn current_host_session_fixture_uri() -> &'static str {
-        "file:///C:/work/project"
+        #[cfg(windows)]
+        {
+            "file:///C:/work/project"
+        }
+        #[cfg(not(windows))]
+        {
+            "file:///Users/example/project"
+        }
     }
 
     fn session_definition_fixture_from(fixture: &[u8]) -> Vec<u8> {
