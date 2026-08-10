@@ -10077,8 +10077,8 @@ impl DurableState {
     }
 
     /// Opens one published conversation as an opaque append-capable target. The target's
-    /// same-open `into_parts` consumer issues the paired writable proof. The root lease is
-    /// retained by the owner-tracked blocking operation until the target handle and its final
+    /// `into_parts` consumer receives the proven same-file truncation proof. The root lease is
+    /// retained by the owner-tracked blocking operation until both target handles and their final
     /// physical observations have settled.
     #[allow(
         dead_code,
@@ -10425,8 +10425,11 @@ fn open_published_conversation_target_blocking(
     )
     .map_err(map_conversation_target_open_error)?;
 
+    // The target/recorder handle stays append-only: read+append. On Windows an append-mode
+    // handle carries FILE_APPEND_DATA but no FILE_WRITE_DATA, so it can never truncate; the
+    // separate read+write handle below is the sole truncation seam.
     let mut options = OpenOptions::new();
-    options.read(true).write(true).append(true);
+    options.read(true).append(true);
     let mut file = match options.open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -10450,6 +10453,36 @@ fn open_published_conversation_target_blocking(
         &opened_path_metadata,
     )
     .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
+
+    // A second same-path handle carries the truncation capability: read+write, no append. Its
+    // metadata/type/length must match the same initial and current path observations with the
+    // same error mapping as the append handle above.
+    let mut truncation_options = OpenOptions::new();
+    truncation_options.read(true).write(true);
+    let truncation_file = match truncation_options.open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(DurableConversationTargetError::Corrupt);
+        }
+        Err(_) => return Err(DurableConversationTargetError::StorageUnavailable),
+    };
+    let truncation_handle_metadata = truncation_file
+        .metadata()
+        .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
+    let truncation_opened_path_metadata = fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            DurableConversationTargetError::Corrupt
+        } else {
+            DurableConversationTargetError::StorageUnavailable
+        }
+    })?;
+    validate_open_file_observation(
+        &initial_path_metadata,
+        &truncation_handle_metadata,
+        &truncation_opened_path_metadata,
+    )
+    .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
+    prove_same_target_identity(&file, &truncation_file, &path)?;
 
     let final_handle_metadata = file
         .metadata()
@@ -10489,15 +10522,48 @@ fn open_published_conversation_target_blocking(
     file.seek(SeekFrom::Start(0))
         .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
 
-    let writable_file = file
-        .try_clone()
-        .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
     Ok(PublishedConversationTarget::from_durable_state(
         session_id,
         initial_path_metadata.len(),
         file,
-        writable_file,
+        truncation_file,
     ))
+}
+
+/// Proves the append handle, the truncation handle, and the current path all identify the same
+/// physical file.
+///
+/// The metadata-based `validate_same_file_identity` comparison is a no-op off Unix, which would
+/// otherwise weaken this two-handle proof, so identity is proven with safe `same_file::Handle`,
+/// defined on every supported platform. The proof handles are temporary: each open File is only
+/// `try_clone`d for identity capture and every `Handle` is dropped before returning, so no third
+/// handle is retained by the target.
+fn prove_same_target_identity(
+    append_file: &File,
+    truncation_file: &File,
+    path: &Path,
+) -> Result<(), DurableConversationTargetError> {
+    let append_identity = same_file::Handle::from_file(
+        append_file
+            .try_clone()
+            .map_err(|_| DurableConversationTargetError::StorageUnavailable)?,
+    )
+    .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
+    let truncation_identity = same_file::Handle::from_file(
+        truncation_file
+            .try_clone()
+            .map_err(|_| DurableConversationTargetError::StorageUnavailable)?,
+    )
+    .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
+    let path_identity = same_file::Handle::from_path(path)
+        .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
+    if append_identity != truncation_identity
+        || append_identity != path_identity
+        || truncation_identity != path_identity
+    {
+        return Err(DurableConversationTargetError::StorageUnavailable);
+    }
+    Ok(())
 }
 
 #[allow(
@@ -26410,7 +26476,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn published_conversation_target_issues_same_open_writable_proof() {
+    async fn published_conversation_target_issues_same_file_append_and_truncation_handles() {
         let root = TempRoot::existing();
         create_marked_empty_store(root.path());
         create_valid_g1_agent(root.path());
@@ -26434,7 +26500,7 @@ mod tests {
         );
         let writable_file = writable_lease
             .into_file()
-            .expect("a production lease retains its same-open file");
+            .expect("a production lease retains its same-file truncation handle");
         let target_metadata = target_file.metadata().unwrap();
         let writable_metadata = writable_file.metadata().unwrap();
         assert_eq!(target_metadata.len(), conversation.len() as u64);

@@ -76,12 +76,12 @@ pub(crate) enum StoredValueError {
 /// writable use.
 ///
 /// DurableState is the sole production issuer: while holding the root lease, it binds the Session
-/// identity and physical length observed from the same-open file into this proof. The proof does
-/// not acquire, hold, or emulate an OS lock; Conversation Storage only consumes its private
-/// append-capable handle when it needs to perform the corresponding write work.
+/// identity and physical length across a proven same-file append/truncation handle pair. The proof
+/// does not acquire, hold, or emulate an OS lock; Conversation Storage only consumes its private
+/// truncation-capable handle when it needs to perform the corresponding write work.
 #[allow(
     dead_code,
-    reason = "the DurableState-issued append handle is consumed by the pending Recorder seam"
+    reason = "the DurableState-issued truncation handle is consumed by the pending Recorder seam"
 )]
 pub(crate) struct ExclusiveWritableConversationLease {
     session_id: SessionId,
@@ -91,10 +91,10 @@ pub(crate) struct ExclusiveWritableConversationLease {
 
 #[allow(
     dead_code,
-    reason = "the DurableState-issued append handle is consumed by the pending Recorder seam"
+    reason = "the DurableState-issued truncation handle is consumed by the pending Recorder seam"
 )]
 impl ExclusiveWritableConversationLease {
-    /// Constructs the production proof from DurableState's same-open append-capable handle.
+    /// Constructs the production proof from DurableState's same-file truncation-capable handle.
     pub(crate) fn from_durable_state(
         session_id: SessionId,
         declared_file_bytes: u64,
@@ -115,12 +115,12 @@ impl ExclusiveWritableConversationLease {
         self.declared_file_bytes
     }
 
-    /// Gives the append handle only to Conversation Storage's internal consumer.
+    /// Gives the truncation handle only to Conversation Storage's internal consumer.
     pub(crate) fn into_file(self) -> Option<File> {
         self.file
     }
 
-    /// Truncates only the final partial tail offset returned by the same-open writable scan and
+    /// Truncates only the final partial tail offset returned by the paired writable scan and
     /// updates the proof's declared length for the Recorder that will consume these exact parts.
     /// No caller can provide an arbitrary writable proof or offset.
     fn truncate_to(&mut self, offset: u64) -> Result<(), ()> {
@@ -161,10 +161,9 @@ impl fmt::Debug for ExclusiveWritableConversationLease {
 
 /// Opaque physical target for one published conversation opened by DurableState.
 ///
-/// The target keeps only the Session identity, the same-open declared length, and an
-/// append-capable handle. It never stores or exposes the target path. Conversation Storage may
-/// consume it into the file and its paired writable proof; lifecycle callers see only this opaque
-/// capability.
+/// The target keeps only the Session identity, the declared length, an append-capable handle, and
+/// its proven same-file truncation proof. It never stores or exposes the target path. Conversation
+/// Storage may consume the pair; lifecycle callers see only this opaque capability.
 #[allow(
     dead_code,
     reason = "the DurableState-issued target is consumed by the pending Recorder seam"
@@ -181,7 +180,7 @@ pub(crate) struct PublishedConversationTarget {
     reason = "the DurableState-issued target is consumed by the pending Recorder seam"
 )]
 impl PublishedConversationTarget {
-    /// Constructs the production target and paired proof from DurableState's same-open handles.
+    /// Constructs the production target and paired proof from DurableState's same-file handles.
     pub(crate) fn from_durable_state(
         session_id: SessionId,
         declared_file_bytes: u64,
@@ -3771,7 +3770,7 @@ impl SessionRecorder {
         writable_lease: ExclusiveWritableConversationLease,
         task_context: RuntimeTaskContext,
     ) -> Self {
-        // The writable lease is only a same-open binding proof. Its private File is deliberately
+        // The writable lease is only a same-file binding proof. Its private File is deliberately
         // not consumed here; the published target File remains the recorder's sole append handle.
         let validation = if writable_lease.session_id() != target_session_id
             || writable_lease.declared_file_bytes() != target_file_bytes
@@ -4719,7 +4718,11 @@ mod tests {
             .open(path)
             .expect("recorder test target opens");
         let file_bytes = file.metadata().expect("recorder test metadata reads").len();
-        let writable_file = file.try_clone().expect("recorder test file clones");
+        let writable_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("recorder test writable lease opens");
         let target = PublishedConversationTarget::from_durable_state(
             standard_header().session_id(),
             file_bytes,
