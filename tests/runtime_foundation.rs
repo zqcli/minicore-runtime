@@ -2,7 +2,9 @@ use std::error::Error;
 use std::fs;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use minicore_runtime::agent_session_lifecycle::{
     AgentDefinitionPatch, AgentMetadataPatch, AgentRevisionRef, AgentStatus, AgentUsableStatus,
@@ -4307,4 +4309,166 @@ async fn public_workspace_reload_errors_preserve_state_and_map_typed_failures() 
     }
 
     runtime.shutdown().await;
+}
+
+const ROOT_LEASE_HOLDER_CHILD: &str = "root_lease_holder_child";
+const ROOT_LEASE_READY_PROOF: &[u8] = b"minicore-runtime root lease holder ready\n";
+const ROOT_LEASE_RELEASE_MARKER: &[u8] = b"minicore-runtime root lease release\n";
+const ROOT_LEASE_CHILD_DEADLINE: Duration = Duration::from_secs(30);
+const ROOT_LEASE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+struct HolderChild {
+    child: Child,
+}
+
+impl HolderChild {
+    fn spawn(root: &Path, mode: &'static str) -> (Self, PathBuf, PathBuf) {
+        let proof = root.with_extension("holder-ready-proof");
+        let release = root.with_extension("holder-release-marker");
+        let child =
+            Command::new(std::env::current_exe().expect("the test binary path is available"))
+                .arg("--exact")
+                .arg(ROOT_LEASE_HOLDER_CHILD)
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env("MINICORE_TEST_ROOT_LEASE_ROOT", root)
+                .env("MINICORE_TEST_ROOT_LEASE_PROOF", &proof)
+                .env("MINICORE_TEST_ROOT_LEASE_RELEASE", &release)
+                .env("MINICORE_TEST_ROOT_LEASE_MODE", mode)
+                .spawn()
+                .expect("the holder child test spawns");
+        (Self { child }, proof, release)
+    }
+
+    async fn wait_exit(&mut self, deadline: Instant) -> ExitStatus {
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait observes the child") {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the holder child did not exit before the deadline"
+            );
+            tokio::time::sleep(ROOT_LEASE_POLL_INTERVAL).await;
+        }
+    }
+}
+
+impl Drop for HolderChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+async fn wait_for_exact_ready_proof(child: &mut HolderChild, proof: &Path, deadline: Instant) {
+    loop {
+        if fs::read(proof).is_ok_and(|contents| contents == ROOT_LEASE_READY_PROOF) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let state = child
+                .child
+                .try_wait()
+                .expect("try_wait observes the child")
+                .map(|status| format!("exited with {status}"))
+                .unwrap_or_else(|| "still running".to_owned());
+            panic!("the holder child never wrote its exact ready proof ({state})");
+        }
+        tokio::time::sleep(ROOT_LEASE_POLL_INTERVAL).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cross_process_lock_contention_returns_store_in_use_then_clean_child_shutdown_reacquires() {
+    let root = TempRoot::new();
+    let (mut child, proof, release) = HolderChild::spawn(root.path(), "release");
+    let deadline = Instant::now() + ROOT_LEASE_CHILD_DEADLINE;
+    wait_for_exact_ready_proof(&mut child, &proof, deadline).await;
+
+    let contended = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect_err("a second open contends on the child-owned root lease");
+    assert_eq!(contended, RuntimeInitializationError::StoreInUse);
+
+    fs::write(&release, ROOT_LEASE_RELEASE_MARKER).expect("the release marker is written");
+    let status = child.wait_exit(deadline).await;
+    assert!(status.success(), "the holder child shuts down cleanly");
+
+    let reopened = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the released root lease is reacquired after clean child shutdown");
+    reopened.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn killing_the_root_lease_holder_releases_the_os_lease_and_reopens() {
+    let root = TempRoot::new();
+    let (mut child, proof, _release) = HolderChild::spawn(root.path(), "hold");
+    let deadline = Instant::now() + ROOT_LEASE_CHILD_DEADLINE;
+    wait_for_exact_ready_proof(&mut child, &proof, deadline).await;
+
+    child.child.kill().expect("the holder child is killed");
+    let status = child.wait_exit(deadline).await;
+    assert!(
+        !status.success(),
+        "the killed holder child exits with a non-success status"
+    );
+
+    let reopened = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the OS lease releases when the holder process dies");
+    reopened.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "launched only by the root-lease parent tests through --exact --ignored"]
+async fn root_lease_holder_child() {
+    let root = PathBuf::from(
+        std::env::var_os("MINICORE_TEST_ROOT_LEASE_ROOT")
+            .expect("the parent supplies the holder root"),
+    );
+    let proof = PathBuf::from(
+        std::env::var_os("MINICORE_TEST_ROOT_LEASE_PROOF")
+            .expect("the parent supplies the ready-proof path"),
+    );
+    let release = PathBuf::from(
+        std::env::var_os("MINICORE_TEST_ROOT_LEASE_RELEASE")
+            .expect("the parent supplies the release-marker path"),
+    );
+    let mode = std::env::var("MINICORE_TEST_ROOT_LEASE_MODE")
+        .expect("the parent supplies the holder mode");
+
+    let runtime = MiniCoreRuntime::open(MiniCoreRuntimeConfig::new(root), Handle::current())
+        .await
+        .expect("the holder child opens the parent-supplied root");
+    fs::write(&proof, ROOT_LEASE_READY_PROOF)
+        .expect("the holder child writes its exact ready proof");
+
+    let deadline = Instant::now() + ROOT_LEASE_CHILD_DEADLINE;
+    match mode.as_str() {
+        "release" => {
+            while !release.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the holder child never observed the release marker"
+                );
+                tokio::time::sleep(ROOT_LEASE_POLL_INTERVAL).await;
+            }
+            runtime.shutdown().await;
+        }
+        "hold" => loop {
+            tokio::time::sleep(ROOT_LEASE_POLL_INTERVAL).await;
+        },
+        other => panic!("unknown holder child mode {other:?}"),
+    }
 }
