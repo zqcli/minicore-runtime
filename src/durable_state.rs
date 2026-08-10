@@ -14076,10 +14076,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-    use std::collections::BTreeMap;
-    #[cfg(unix)]
-    use std::collections::VecDeque;
-    #[cfg(unix)]
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
 
     use tokio::runtime::Handle;
@@ -14093,11 +14090,12 @@ mod tests {
         SESSIONS_DIRECTORY, StorageGeneration, parse_agent_id_name, read_durable_document,
         read_entries_bounded, recover_marked_root_with_caps,
     };
-    #[cfg(unix)]
     use super::{
         CapturedForkConversation, DirectorySync, DurableFilesystem, ForkAnchorResolutionError,
-        SessionHeader, classify_directory_sync, open_root, open_root_with_durable_filesystem,
+        SessionHeader,
     };
+    #[cfg(unix)]
+    use super::{classify_directory_sync, open_root, open_root_with_durable_filesystem};
     use crate::agent_session_lifecycle::{
         AgentMetadataDescriptionPatch, AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind,
         SealedAgentDefinitionAttempt, SealedAgentMetadataAttempt, SealedAgentStatusAttempt,
@@ -14161,13 +14159,11 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     struct NativeCrashProof {
         path: PathBuf,
         armed: bool,
     }
 
-    #[cfg(unix)]
     impl NativeCrashProof {
         fn new(path: PathBuf) -> Self {
             assert!(!path.exists(), "the crash proof path starts absent");
@@ -14188,7 +14184,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     impl Drop for NativeCrashProof {
         fn drop(&mut self) {
             if self.armed && self.path.exists() {
@@ -14197,7 +14192,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum CleanupOperation {
         RemoveCommitted,
@@ -14213,14 +14207,12 @@ mod tests {
         SyncCollectionDirectory,
     }
 
-    #[cfg(unix)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum CleanupFault {
         Before(CleanupOperation),
         After(CleanupOperation),
     }
 
-    #[cfg(unix)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum PublicationOperation {
         CreateEntityDirectory,
@@ -14261,7 +14253,6 @@ mod tests {
         SyncPublishedSessionsDirectory,
     }
 
-    #[cfg(unix)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum PublicationFault {
         Before(PublicationOperation),
@@ -14271,23 +14262,19 @@ mod tests {
         Panic(PublicationOperation),
     }
 
-    #[cfg(unix)]
     #[derive(Clone)]
     struct PublicationMarkerSyncTarget {
         entity: PathBuf,
         collection: PathBuf,
     }
 
-    #[cfg(unix)]
     /// One named synchronous test gate around the physical reservation attempt. It never
     /// synthesizes an outcome: the production attempt helper still reads real files.
-    #[cfg(unix)]
     struct ReservationBarrier {
         entered: std::sync::mpsc::Sender<()>,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
-    #[cfg(unix)]
     impl ReservationBarrier {
         fn new(
             entered: std::sync::mpsc::Sender<()>,
@@ -14311,13 +14298,11 @@ mod tests {
 
     /// A final-readback gate keeps a successful physical attempt owner-retained while shutdown
     /// races the already-crossed worker. The common readback helper still performs the real I/O.
-    #[cfg(unix)]
     struct ReservationFinalReadback {
         entered: std::sync::mpsc::Sender<()>,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
-    #[cfg(unix)]
     impl ReservationFinalReadback {
         fn new(
             entered: std::sync::mpsc::Sender<()>,
@@ -14339,7 +14324,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     impl CleanupFault {
         const fn operation(self) -> CleanupOperation {
             match self {
@@ -14350,7 +14334,6 @@ mod tests {
 
     /// A deliberately narrow persistent fault adapter: it performs the real cleanup operation
     /// against the same temporary root, then can report failure before or after that effect.
-    #[cfg(unix)]
     struct DeterministicPersistentFaultFilesystem {
         faults: Mutex<VecDeque<CleanupFault>>,
         operations: Mutex<Vec<CleanupOperation>>,
@@ -14372,7 +14355,6 @@ mod tests {
         reservation_path: Mutex<Option<PathBuf>>,
     }
 
-    #[cfg(unix)]
     impl DeterministicPersistentFaultFilesystem {
         fn new(faults: impl IntoIterator<Item = CleanupFault>) -> Self {
             Self {
@@ -14649,7 +14631,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn publication_directory_create_operation(path: &Path) -> Option<PublicationOperation> {
         match path.file_name().and_then(|name| name.to_str()) {
             Some("generations") => Some(PublicationOperation::CreateGenerationsDirectory),
@@ -14663,7 +14644,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn publication_directory_sync_operation(
         path: &Path,
         target: Option<&PublicationMarkerSyncTarget>,
@@ -14721,7 +14701,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn publication_write_operation(path: &Path) -> Option<PublicationOperation> {
         match path.file_name().and_then(|name| name.to_str()) {
             Some("head.json") => Some(PublicationOperation::WriteHead),
@@ -14731,7 +14710,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn publication_sync_file_operation(path: &Path) -> Option<PublicationOperation> {
         match path.file_name().and_then(|name| name.to_str()) {
             Some("head.json") => Some(PublicationOperation::SyncHead),
@@ -14743,7 +14721,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn publication_readback_operation(path: &Path) -> Option<PublicationOperation> {
         if path
             .file_name()
@@ -14772,7 +14749,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     impl DurableFilesystem for DeterministicPersistentFaultFilesystem {
         fn create_private_directory(&self, path: &Path) -> Result<(), ()> {
             match publication_directory_create_operation(path) {
@@ -15213,7 +15189,6 @@ mod tests {
         result
     }
 
-    #[cfg(unix)]
     async fn open_with_reservation_filesystem(
         root: &Path,
         filesystem: Arc<DeterministicPersistentFaultFilesystem>,
@@ -15229,21 +15204,18 @@ mod tests {
         state
     }
 
-    #[cfg(unix)]
     fn agent_candidate(value: u128) -> AgentId {
         format!("agt_{value:032x}")
             .parse()
             .expect("a nonzero test AgentId is canonical")
     }
 
-    #[cfg(unix)]
     fn session_candidate(value: u128) -> SessionId {
         format!("ses_{value:032x}")
             .parse()
             .expect("a nonzero test SessionId is canonical")
     }
 
-    #[cfg(unix)]
     fn ordinary_session_create_attempt(agent_id: AgentId) -> SealedSessionCreateAttempt {
         let root_key: WorkspaceRootKey = "repo".parse().unwrap();
         let workspace_input = WorkspaceDefinitionInput::new(
@@ -15296,7 +15268,6 @@ mod tests {
         .await
     }
 
-    #[cfg(unix)]
     fn kill_and_reap_native_child(child: &mut std::process::Child) -> bool {
         let _ = child.kill();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -15311,10 +15282,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn run_native_abort_child(root: &Path, candidate: AgentId, point: &str) {
-        use std::os::unix::process::ExitStatusExt;
-
         let proof_file = NativeCrashProof::new(root.with_extension(format!("{point}.crash-proof")));
         let proof = format!("minicore-native-abort-v1:{point}:{candidate}");
         let mut command = std::process::Command::new(
@@ -15359,9 +15327,17 @@ mod tests {
         let proof_bytes = fs::read(proof_file.path());
         proof_file.remove();
         assert!(
-            status.signal().is_some(),
-            "the child must terminate by signal at the explicit process-abort coordinate"
+            !status.success(),
+            "the child must terminate unsuccessfully at the explicit process-abort coordinate"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(
+                status.signal().is_some(),
+                "the child must terminate by signal at the explicit process-abort coordinate"
+            );
+        }
         assert_eq!(
             proof_bytes.expect("the child writes its exact crash-hook proof"),
             proof.as_bytes(),
@@ -15369,10 +15345,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     fn run_native_abort_session_child(root: &Path, candidate: SessionId, point: &str) {
-        use std::os::unix::process::ExitStatusExt;
-
         let proof_file =
             NativeCrashProof::new(root.with_extension(format!("session-{point}.crash-proof")));
         let proof = format!("minicore-native-session-abort-v1:{point}:{candidate}");
@@ -15420,9 +15393,17 @@ mod tests {
         let proof_bytes = fs::read(proof_file.path());
         proof_file.remove();
         assert!(
-            status.signal().is_some(),
-            "the Session child terminates by signal at the explicit abort coordinate"
+            !status.success(),
+            "the Session child must terminate unsuccessfully at the explicit abort coordinate"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(
+                status.signal().is_some(),
+                "the Session child terminates by signal at the explicit abort coordinate"
+            );
+        }
         assert_eq!(
             proof_bytes.expect("the Session child writes its exact crash-hook proof"),
             proof.as_bytes(),
@@ -15430,10 +15411,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     fn run_native_abort_session_fork_child(root: &Path, candidate: SessionId, point: &str) {
-        use std::os::unix::process::ExitStatusExt;
-
         let proof_file =
             NativeCrashProof::new(root.with_extension(format!("session-fork-{point}.crash-proof")));
         let proof = format!("minicore-native-session-fork-abort-v1:{point}:{candidate}");
@@ -15481,9 +15459,17 @@ mod tests {
         let proof_bytes = fs::read(proof_file.path());
         proof_file.remove();
         assert!(
-            status.signal().is_some(),
-            "the Session Fork child terminates by signal at the explicit abort coordinate"
+            !status.success(),
+            "the Session Fork child must terminate unsuccessfully at the explicit abort coordinate"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(
+                status.signal().is_some(),
+                "the Session Fork child terminates by signal at the explicit abort coordinate"
+            );
+        }
         assert_eq!(
             proof_bytes.expect("the Session Fork child writes its exact crash-hook proof"),
             proof.as_bytes(),
@@ -21659,7 +21645,6 @@ mod tests {
         reopened.close().await;
     }
 
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "spawned as a controlled native process-abort child"]
     async fn native_process_abort_agent_create_child() {
@@ -21710,7 +21695,6 @@ mod tests {
         panic!("the native crash hook did not abort publication: {result:?}");
     }
 
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn native_process_abort_reopens_agent_create_as_invisible_or_published() {
         for (point, candidate, published) in [
@@ -21752,7 +21736,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "spawned as a controlled native process-abort child"]
     async fn native_process_abort_session_create_child() {
@@ -21791,7 +21774,6 @@ mod tests {
         panic!("the native Session crash hook did not abort publication: {result:?}");
     }
 
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn native_process_abort_reopens_session_create_as_invisible_or_published() {
         for (point, candidate, published) in [
@@ -21835,7 +21817,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "spawned as a controlled native process-abort child"]
     async fn native_process_abort_session_fork_child() {
@@ -21878,7 +21859,6 @@ mod tests {
         panic!("the native Session Fork crash hook did not abort publication: {result:?}");
     }
 
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn native_process_abort_reopens_session_fork_as_invisible_or_published() {
         for (point, candidate, published) in [
