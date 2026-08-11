@@ -1,0 +1,536 @@
+{
+  "version": 1,
+  "protocols": [
+    "openai_responses",
+    "anthropic_messages"
+  ],
+  "sources": [
+    "https://platform.openai.com/docs/guides/error-codes",
+    "https://platform.openai.com/docs/guides/rate-limits",
+    "https://platform.claude.com/docs/en/api/errors.md",
+    "https://platform.claude.com/docs/en/build-with-claude/streaming.md",
+    "rig-core=0.40.0"
+  ],
+  "cases": [
+    {
+      "id": "openai_connect_failure",
+      "protocol": "openai_responses",
+      "category": "transport",
+      "observation": {
+        "stage": "connect",
+        "httpStatus": null,
+        "errorType": null,
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": false,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "transport_unavailable",
+        "delivery": "not_sent",
+        "normalizedReason": "transport_unavailable",
+        "policy": "logical_retry"
+      }
+    },
+    {
+      "id": "openai_context_length_exceeded",
+      "protocol": "openai_responses",
+      "category": "context_overflow",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 400,
+        "errorType": "invalid_request_error",
+        "errorCode": "context_length_exceeded",
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "context_overflow",
+        "delivery": "rejected_before_execution",
+        "normalizedReason": "context_overflow",
+        "policy": "compaction"
+      }
+    },
+    {
+      "id": "openai_invalid_request",
+      "protocol": "openai_responses",
+      "category": "invalid_request",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 400,
+        "errorType": "invalid_request_error",
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "invalid_request",
+        "delivery": "rejected_before_execution",
+        "normalizedReason": "invalid_request",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "openai_auth_rejected",
+      "protocol": "openai_responses",
+      "category": "auth",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 401,
+        "errorType": "authentication_error",
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "auth_rejected",
+        "delivery": "rejected_before_execution",
+        "normalizedReason": "auth_rejected",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "openai_temporary_rate_limit",
+      "protocol": "openai_responses",
+      "category": "rate_limit",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 429,
+        "errorType": "rate_limit_error",
+        "errorCode": "rate_limit_exceeded",
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": 17
+      },
+      "expected": {
+        "reason": "rate_limited",
+        "delivery": "rejected_before_execution",
+        "normalizedReason": "rate_limited",
+        "policy": "logical_retry"
+      }
+    },
+    {
+      "id": "openai_rate_limit_hint_too_long",
+      "protocol": "openai_responses",
+      "category": "rate_limit",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 429,
+        "errorType": "rate_limit_error",
+        "errorCode": "rate_limit_exceeded",
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": 61
+      },
+      "expected": {
+        "reason": "rate_limited",
+        "delivery": "rejected_before_execution",
+        "normalizedReason": "rate_limited",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "openai_quota_exhausted",
+      "protocol": "openai_responses",
+      "category": "quota",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 429,
+        "errorType": "insufficient_quota",
+        "errorCode": "credit_balance_exhausted",
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "quota_exceeded",
+        "delivery": "rejected_before_execution",
+        "normalizedReason": "quota_exceeded",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "openai_service_unavailable",
+      "protocol": "openai_responses",
+      "category": "provider_unavailable",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 503,
+        "errorType": "server_error",
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "provider_unavailable",
+        "delivery": "unknown",
+        "normalizedReason": "request_outcome_unknown",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "openai_internal_server_error",
+      "protocol": "openai_responses",
+      "category": "provider_unavailable",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 500,
+        "errorType": "server_error",
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "provider_unavailable",
+        "delivery": "unknown",
+        "normalizedReason": "request_outcome_unknown",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "openai_malformed_success_body",
+      "protocol": "openai_responses",
+      "category": "malformed_response",
+      "observation": {
+        "stage": "completed_response",
+        "httpStatus": 200,
+        "errorType": null,
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "invalid_provider_response",
+        "delivery": "accepted_no_output",
+        "normalizedReason": "invalid_provider_response",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "openai_early_eof_before_output",
+      "protocol": "openai_responses",
+      "category": "early_eof",
+      "observation": {
+        "stage": "stream",
+        "httpStatus": 200,
+        "errorType": null,
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": false,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "transport_unavailable",
+        "delivery": "accepted_no_output",
+        "normalizedReason": "request_outcome_unknown",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "openai_early_eof_after_output",
+      "protocol": "openai_responses",
+      "category": "early_eof",
+      "observation": {
+        "stage": "stream",
+        "httpStatus": 200,
+        "errorType": null,
+        "errorCode": null,
+        "semanticOutputStarted": true,
+        "terminalObserved": false,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "transport_unavailable",
+        "delivery": "output_started",
+        "normalizedReason": "stream_interrupted",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "openai_stream_error_after_output",
+      "protocol": "openai_responses",
+      "category": "stream_error",
+      "observation": {
+        "stage": "stream",
+        "httpStatus": 200,
+        "errorType": "server_error",
+        "errorCode": null,
+        "semanticOutputStarted": true,
+        "terminalObserved": false,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "provider_unavailable",
+        "delivery": "output_started",
+        "normalizedReason": "stream_interrupted",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "anthropic_connect_failure",
+      "protocol": "anthropic_messages",
+      "category": "transport",
+      "observation": {
+        "stage": "connect",
+        "httpStatus": null,
+        "errorType": null,
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": false,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "transport_unavailable",
+        "delivery": "not_sent",
+        "normalizedReason": "transport_unavailable",
+        "policy": "logical_retry"
+      }
+    },
+    {
+      "id": "anthropic_invalid_request",
+      "protocol": "anthropic_messages",
+      "category": "invalid_request",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 400,
+        "errorType": "invalid_request_error",
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "invalid_request",
+        "delivery": "rejected_before_execution",
+        "normalizedReason": "invalid_request",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "anthropic_auth_rejected",
+      "protocol": "anthropic_messages",
+      "category": "auth",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 401,
+        "errorType": "authentication_error",
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "auth_rejected",
+        "delivery": "rejected_before_execution",
+        "normalizedReason": "auth_rejected",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "anthropic_billing_error",
+      "protocol": "anthropic_messages",
+      "category": "quota",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 402,
+        "errorType": "billing_error",
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "quota_exceeded",
+        "delivery": "rejected_before_execution",
+        "normalizedReason": "quota_exceeded",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "anthropic_request_too_large",
+      "protocol": "anthropic_messages",
+      "category": "invalid_request",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 413,
+        "errorType": "request_too_large",
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "invalid_request",
+        "delivery": "rejected_before_execution",
+        "normalizedReason": "invalid_request",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "anthropic_temporary_rate_limit",
+      "protocol": "anthropic_messages",
+      "category": "rate_limit",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 429,
+        "errorType": "rate_limit_error",
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": 3
+      },
+      "expected": {
+        "reason": "rate_limited",
+        "delivery": "rejected_before_execution",
+        "normalizedReason": "rate_limited",
+        "policy": "logical_retry"
+      }
+    },
+    {
+      "id": "anthropic_overloaded",
+      "protocol": "anthropic_messages",
+      "category": "provider_unavailable",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 529,
+        "errorType": "overloaded_error",
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": 3
+      },
+      "expected": {
+        "reason": "provider_unavailable",
+        "delivery": "rejected_before_execution",
+        "normalizedReason": "provider_unavailable",
+        "policy": "logical_retry"
+      }
+    },
+    {
+      "id": "anthropic_internal_server_error",
+      "protocol": "anthropic_messages",
+      "category": "provider_unavailable",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 500,
+        "errorType": "api_error",
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "provider_unavailable",
+        "delivery": "unknown",
+        "normalizedReason": "request_outcome_unknown",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "anthropic_processing_timeout",
+      "protocol": "anthropic_messages",
+      "category": "timeout",
+      "observation": {
+        "stage": "http_response",
+        "httpStatus": 504,
+        "errorType": "timeout_error",
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "timeout",
+        "delivery": "unknown",
+        "normalizedReason": "request_outcome_unknown",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "anthropic_malformed_success_body",
+      "protocol": "anthropic_messages",
+      "category": "malformed_response",
+      "observation": {
+        "stage": "completed_response",
+        "httpStatus": 200,
+        "errorType": null,
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": true,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "invalid_provider_response",
+        "delivery": "accepted_no_output",
+        "normalizedReason": "invalid_provider_response",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "anthropic_stream_overloaded_before_output",
+      "protocol": "anthropic_messages",
+      "category": "stream_error",
+      "observation": {
+        "stage": "stream",
+        "httpStatus": 200,
+        "errorType": "overloaded_error",
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": false,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "provider_unavailable",
+        "delivery": "accepted_no_output",
+        "normalizedReason": "request_outcome_unknown",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "anthropic_early_eof_before_output",
+      "protocol": "anthropic_messages",
+      "category": "early_eof",
+      "observation": {
+        "stage": "stream",
+        "httpStatus": 200,
+        "errorType": null,
+        "errorCode": null,
+        "semanticOutputStarted": false,
+        "terminalObserved": false,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "transport_unavailable",
+        "delivery": "accepted_no_output",
+        "normalizedReason": "request_outcome_unknown",
+        "policy": "terminal"
+      }
+    },
+    {
+      "id": "anthropic_early_eof_after_output",
+      "protocol": "anthropic_messages",
+      "category": "early_eof",
+      "observation": {
+        "stage": "stream",
+        "httpStatus": 200,
+        "errorType": null,
+        "errorCode": null,
+        "semanticOutputStarted": true,
+        "terminalObserved": false,
+        "retryAfterSeconds": null
+      },
+      "expected": {
+        "reason": "transport_unavailable",
+        "delivery": "output_started",
+        "normalizedReason": "stream_interrupted",
+        "policy": "terminal"
+      }
+    }
+  ]
+}
