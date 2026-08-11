@@ -2,7 +2,7 @@
 
 ## Current
 
-- [第四轮设计评审](v2-design-review-4.md)：全部P0、P1-1/P1-2/P1-4已关闭；V4-P1-3与V4-C0-1仍门禁production adapters。
+- [第四轮设计评审](v2-design-review-4.md)：全部普通P0/P1已关闭；仅V4-C0-1继续门禁production Tool/Sandbox adapters。
 
 ## Historical
 

@@ -1,13 +1,13 @@
 # MiniCore V2 设计评审（第四轮）
 
-状态：Open；Rust internal spine所需P0与P1-1/P1-2/P1-4已关闭，剩余P1-3/C0-1分别门禁production ProviderAdapter与Tool/Sandbox adapter
+状态：Open；全部普通P0/P1已关闭，仅V4-C0-1继续门禁production Tool/Sandbox adapter
 日期：2026-07-31
 范围：全部current、非归档V2文档，包括`README.md`、`CONTEXT.md`、`docs/architecture.md`、module设计、ADR 0100–0134、migration、research和前三轮review/handoff
 方式：主审逐份通读并交叉核对canonical owner；subagent结论仅作查漏线索，本文finding均由主审在current文档中独立复现
 
-关闭进度：V4-P0-1至P0-5、V4-P1-1、V4-P1-2与V4-P1-4 Closed；V4-P1-3和V4-C0-1 Open。ADR 0130–0134是本review关闭过程中新增的Accepted决议。
+关闭进度：V4-P0-1至P0-5、V4-P1-1至P1-4全部Closed；V4-C0-1 Open。ADR 0130–0134与0138是本review关闭过程中新增的Accepted决议。
 
-> 进度说明（2026-08-03）：本文后续里程碑/暂停措辞是第四轮评审当时的dated snapshot；当前实施状态以[Development Plan](../development-plan.md)为准。当前仍具约束力的open gate只有V4-P1-3与conditional V4-C0-1。
+> 进度说明（2026-08-11）：本文后续里程碑/暂停措辞是第四轮评审当时的dated snapshot；当前实施状态以[Development Plan](../development-plan.md)为准。V4-P1-3已由M12/ADR 0138关闭，当前仍具约束力的open gate只有conditional V4-C0-1。
 
 ## 总体结论
 
@@ -25,7 +25,7 @@ Rig = ModelGateway private ProviderAdapter
 
 本轮没有发现需要恢复同步AgentLoop、SessionWriter durable commit barrier、Turn lifecycle JSONL、PromptContent resolver或字符offset provenance的理由。
 
-本review创建时识别出的五个P0现已全部关闭。V4-P1-1/2/4也已关闭，剩余P1只在production provider scope；Sandbox enforcement继续作为首个production Tool/Sandbox adapter前的条件性P0。
+本review创建时识别出的五个P0与四个P1现已全部关闭；Sandbox enforcement继续作为首个production Tool/Sandbox adapter前的条件性P0。
 
 严重度定义：
 
@@ -44,7 +44,7 @@ Rig = ModelGateway private ProviderAdapter
 | V4-P0-5 | P0 | Closed | Compaction source无法产生`first_kept_entry_id`，settings/provenance schema也未闭合 | Compaction vertical slice前 |
 | V4-P1-1 | P1 | Closed | Runtime public protocol缺少可恢复、可操作的完整payload | public protocol crate前 |
 | V4-P1-2 | P1 | Closed | 通用wire/storage envelope与限制未冻结 | serde fixture与format v1前 |
-| V4-P1-3 | P1 | Open | Provider首版scope、Rig现实映射和旧permit/retry措辞未统一 | production ProviderAdapter前 |
+| V4-P1-3 | P1 | Closed | Provider首版scope、Rig现实映射和旧permit/retry措辞未统一 | production ProviderAdapter前 |
 | V4-P1-4 | P1 | Closed | Workspace Test Matrix要求与ADR 0116相反的跨Session文件锁 | Workspace/Tool tests前 |
 | V4-C0-1 | 条件性P0 | Open | Sandbox不可强制capability时的pre-execution fail-closed门禁 | production Tool/Sandbox adapter前 |
 
@@ -437,7 +437,9 @@ Conversation JSONL首行strict Header，后续entry required SessionId/TurnId并
 
 ## V4-P1-3 · Provider首版scope、Rig映射和旧措辞未统一
 
-### 首版scope
+状态：Closed（2026-08-11；ADR 0138）。首版baseline只保留OpenAI Responses与Anthropic Messages；Rig 0.40.0真实loopback、stream terminal、metadata与delivery/error evidence已冻结，旧permit/retry冲突已清除。
+
+### 关闭前首版scope
 
 `ProviderProtocol`当前公开四个variants（`model-gateway.md:1381-1386`）：
 
@@ -452,11 +454,11 @@ Gemini
 
 推荐冻结首版支持集。最保守方案是首版enum只保留经contract test的protocol；也可以保留variant但candidate validation必须明确返回`UnsupportedProviderProtocol`，safe catalog不得把它显示为available。
 
-### Rig spike
+### 关闭前Rig spike
 
 Rig 0.40.0 spike仍需验证：system/instructions、message/tool schema、Anthropic thinking/signature/cache control、stream cancellation、finish、usage、error delivery proof、SDK retry=0、base URL和mock server。Spike只允许调整private adapter/mapping或暴露真实缺失的provider-neutral字段，不能把Rig Agent/Conversation类型引入MiniCore seam。
 
-### current residue
+### 关闭前current residue
 
 ModelGateway current文档仍有被ADR 0125/0126取代的现行措辞：
 
@@ -466,13 +468,26 @@ ModelGateway current文档仍有被ADR 0125/0126取代的现行措辞：
 
 这些句子会让实现或测试重新引入本地permit，或在queued Steer时错误放弃安全retry。
 
-### 关闭条件
+### 已采纳决议
 
-- 首版protocol enum与实际adapter/test范围一致；
-- Rig spike和两个mock-server contract tests通过；
-- SDK retry确认为0；
-- current modules不再出现Gateway-local concurrency wait/per-principal permit；
-- queued Steer对in-flight result、retry backoff和safe-point consumption只有一套规则。
+1. `ProviderProtocol`首个production baseline只有`OpenAiResponses | AnthropicMessages`；未经同等级contract gate验证的OpenAI Chat Completions、Gemini等variant不接受为首版config，也不显示为available。M12关闭不代表production adapter已经存在。
+2. Rig保持exact 0.40.0 private implementation dependency。M12只以dev-dependency和`tests/m12_*`验证公开API；Rig Agent/Conversation/message/retry/provider type不能进入`src/`domain、Prompt、Conversation或Runtime public DTO。
+3. 一次completion/stream invocation最多一个HTTP request。Rig synthetic `Final`不能替代protocol terminal；OpenAI要求`response.completed`，Anthropic要求non-empty `message_delta.stop_reason`。公开`HttpClientExt` wrapper可以在原样转发bytes时增量保存terminal与allowlisted headers。
+4. error/delivery只按typed status/type/code、transport stage、semantic-output-started、terminal evidence与bounded retry hint分类，不匹配human message。只有`NotSent | RejectedBeforeExecution`可保留delivery-safe transient reason；unknown/accepted/partial outcome分别fail closed为`RequestOutcomeUnknown | StreamInterrupted`。
+5. Gateway没有local model/route/principal permit wait。queued Steer不改变in-flight revision或retry basis；只在safe point成功apply后使旧basis失效。
+
+权威决议见[ADR 0138](../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)，closed mapping见[M12 fixture](../fixtures/provider-gate-m12/README.md)。
+
+### 关闭验证
+
+- [x] canonical enum与实际验证范围都只有OpenAI Responses/Anthropic Messages；
+- [x] 两协议real unary/stream loopback tests覆盖system/messages/tools/reasoning/thinking/signature/cache-control、usage、identity、base URL、cancel和EOF；
+- [x] unary/stream 5xx probes及429/529 error probes都只产生一个HTTP request；
+- [x] terminal evidence seam区分completed、early EOF、transport error和drop，provider error优先否决success；
+- [x] metadata seam只保留OpenAI `x-request-id/retry-after/openai-processing-ms`与Anthropic `request-id/retry-after`，canary header不可表示；
+- [x] 400/401 typed envelopes和malformed 200 real loopback fail closed；26-case fixture覆盖context/rate/auth/transport/malformed/EOF mapping；
+- [x] `rg`确认Rig只存在于dev dependency/tests，`src/`与public DTO无Rig type；
+- [x] current modules无Gateway-local concurrency wait/per-principal permit，queued Steer focused test通过。
 
 ## V4-P1-4 · Workspace Test Matrix与跨Session规则相反
 
@@ -528,13 +543,13 @@ production Tool/Sandbox adapter必须在ToolStartGate前声明可强制的capabi
 
 ## 当前继续顺序
 
-已完成：V4-P0-1 → P0-2/P1-4 → P0-3 → P0-4 → P0-5 → P1-1 → P1-2；Rust crate与typed scalar/value/path carriers已经建立。
+已完成：V4-P0-1 → P0-2/P1-4 → P0-3 → P0-4 → P0-5 → P1-1 → P1-2 → P1-3；Rust crate、typed scalar/value/path carriers与production provider baseline gate已经建立。
 
-后续以[MiniCore V2开发计划](../development-plan.md)为实施入口：M0与M1已经完成，当前暂停于M2前等待review；恢复后再完成incremental public codec、Conversation codec/scanner与LiveConversation reducer，关闭M5.0 durable foundations gate并完成Recorder/replay与M6 resources后，才进入ScriptedProvider vertical slice。V4-P1-3继续门禁production ProviderAdapter；V4-C0-1继续门禁production Tool/Sandbox adapter。
+后续以[MiniCore V2开发计划](../development-plan.md)为实施入口：M0–M12已经完成。下一步先以M13关闭V4-C0-1，再进入M14 production Provider与Tool/Sandbox adapters；M12只解除provider gate，不替代production adapter contract suite。
 
 ## 第四轮关闭定义
 
-本文全部P0/P1关闭需要：
+本文全部普通P0/P1已经满足以下关闭定义；conditional V4-C0-1继续独立开放：
 
 - canonical owner文档已修订，非owner只保留摘要与链接；
 - architecture INV索引仅在不变量语义变化时更新；

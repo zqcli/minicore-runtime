@@ -1,7 +1,7 @@
 # MiniCore V1 → V2 版本迁移记录
 
-状态：V2目标架构已推进至ADR 0134；全部V4-P0、V4-P1-1、P1-2与P1-4已关闭，P1-3待关闭，生产实现未启动
-日期：2026-07-31
+状态：V2目标架构已推进至ADR 0138；全部普通V4-P0/P1已关闭，production Provider/Tool adapters仍未实现
+日期：2026-08-11
 
 ## 目的
 
@@ -208,7 +208,7 @@ Prompt Q1/Q4已分别由ADR 0128/0129关闭。待完成：Tool/Sandbox O1/R7。
 
 ### 阶段6–8：Async模型调用协同交付束
 
-状态：目标设计完成，生产实现、Rig spike和自动化测试未开始。
+状态：M6–M10 scripted async spine与M12 Rig reality gate已完成；production Rig adapter仍属于M14。
 
 共享spine：
 
@@ -225,35 +225,36 @@ SessionExecutor admits Turn
 
 实现顺序：
 
-V4-P1-2 wire/storage format门禁已经关闭；全部P0、P1-1、P1-2与P1-4已关闭。Rust typed carriers已经进入`dev`。后续阶段、依赖、测试分层与production gate以[MiniCore V2开发计划](../development-plan.md)为准；V4-P1-3在production ProviderAdapter前关闭，V4-C0-1在production Tool/Sandbox adapter开始前关闭。
+V4-P1-2 wire/storage format门禁已经关闭；全部普通P0/P1（含V4-P1-3）已关闭。Rust typed carriers与scripted async spine已经进入`dev`。后续阶段、依赖、测试分层与production gate以[MiniCore V2开发计划](../development-plan.md)为准；V4-C0-1继续在production Tool/Sandbox adapter开始前关闭，production Provider/Tool adapters属于M14。
 
 共同完成门槛：
 
-- [ ] 每Session最多一个ActiveTurnTask；
-- [ ] control actor在Model/Tool/Interaction await期间响应；
-- [ ] AgentRun和CompactionSummary只通过ModelCallRequest/ModelGateway；
-- [ ] SDK retry=0，Gateway single attempt；
-- [ ] logical retry可被Cancel打断；
-- [ ] complete Tool exchange按call order进入next Model；
-- [ ] recording failure不重放Model/Tool；
-- [ ] recording Degraded/crash时Snapshot可以领先可恢复recorded prefix，Healthy状态无queue lag；
-- [ ] restart只恢复recorded prefix；
-- [ ] Rig spike覆盖OpenAI Responses与Anthropic Messages。
+- [x] 每Session最多一个ActiveTurnTask；
+- [x] control actor在Model/Tool/Interaction await期间响应；
+- [x] AgentRun和CompactionSummary只通过ModelCallRequest/ModelGateway；
+- [x] SDK retry=0，Gateway single attempt；
+- [x] logical retry可被Cancel打断；
+- [x] complete Tool exchange按call order进入next Model；
+- [x] recording failure不重放Model/Tool；
+- [x] recording Degraded/crash时Snapshot可以领先可恢复recorded prefix，Healthy状态无queue lag；
+- [x] restart只恢复recorded prefix；
+- [x] Rig spike覆盖OpenAI Responses与Anthropic Messages。
 
 ## Rig 0.40.0 Spike
 
-已完成静态源码审计：Rig适合作为private ProviderAdapter，不适合作为MiniCore domain/interface来源。
+静态源码审计与真实M12 loopback spike均已完成：Rig适合作为private ProviderAdapter，不适合作为MiniCore domain/interface来源。Accepted baseline见[ADR 0138](../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)，delivery/error contract见[M12 fixture](../fixtures/provider-gate-m12/README.md)。
 
-实际spike仍需验证：
+已验证：
 
-- OpenAI Responses instructions/messages/tool schema；
+- OpenAI Responses instructions/messages/tool schema/reasoning/structured request；
 - Anthropic Messages system/thinking/signature/cache control；
-- streaming cancellation bridge；
-- finish reason提取；
-- usage mapping；
-- provider-specific error mapping；
-- SDK automatic retry确认为0；
-- base URL override和mock HTTP server。
+- streaming cancellation、fragmented SSE、terminal、drop与early EOF；
+- provider-specific finish/terminal、usage和body/header identity；
+- 400/401/429/500/529 typed envelope与malformed 200 fail-closed；
+- automatic retry为0的single-request evidence；
+- base URL override和两协议real mock HTTP server；
+- Rig synthetic zero-usage `Final`不能替代protocol terminal；
+- Rig类型只存在于dev dependency/tests，不进入production/public DTO。
 
 ## 开放问题
 
@@ -261,10 +262,10 @@ Recorder问题见[`docs/review/async-loop-best-effort-recording-open-questions.m
 
 其他门禁：
 
-- 第四轮V4-P1-3 provider scope/Rig现实映射仍开放；全部V4-P0、V4-P1-1、P1-2与P1-4已关闭；
-- 首个Rust crate消费ADR 0134/Format V1/Wire V1 fixtures并实现semantic conformance runner；
-- Rig provider spike；
-- production Tool/Sandbox adapter前关闭O1/R7。
+- 第四轮全部普通V4-P0/P1已关闭；V4-P1-3由M12/ADR 0138关闭；
+- 首个Rust crate已经消费ADR 0134/Format V1/Wire V1 fixtures并实现semantic conformance runner；
+- production Rig provider adapters仍属于M14，必须消费M12 contract suite；
+- production Tool/Sandbox adapter前关闭O1/R7/V4-C0-1。
 
 ## 文档治理
 

@@ -19,6 +19,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0135](0135-workspace-public-input-is-host-neutral.md) | Workspace public input在command application前保持host-neutral |
 | [0136](0136-durablestate-operation-owned-generations.md) | DurableState使用operation-owned immutable generations、permanent reservations与root lease；read with ADR 0137 |
 | [0137](0137-tokio-owner-tracked-async-foundation.md) | Tokio owner-tracked async foundation与deterministic persistent seams；refines ADR 0117 and supports ADR 0136 |
+| [0138](0138-production-provider-baseline-uses-verified-rig-contracts.md) | Production Provider baseline只采用已验证的OpenAI Responses与Anthropic Messages Rig合同 |
 
 ## Current With Later Refinements
 
