@@ -31,12 +31,17 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::{Stream, StreamExt};
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
+use futures_util::StreamExt;
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::model_gateway::provider_transport::{
+    SseParser, build_client, cancelled, classify_send_error, invalid_provider_response,
+    invalid_request_not_sent, is_event_stream, parse_retry_after, read_bounded_envelope,
+    response_byte_limit, transport_read_error,
+};
 use crate::model_gateway::{
     ModelCallErrorReason, ModelContentDelta, ModelFinishReason, ModelProgressEvent,
     ModelProgressPublisher, ModelReasoningSummary, ModelServiceClass, ModelUsage, OutputContract,
@@ -103,12 +108,9 @@ impl OpenAiResponsesProviderAdapter {
         }
         validate_opaque_ascii(credential, 256)
             .map_err(|_| OpenAiProviderConfigError::InvalidCredential)?;
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_proxy()
-            .build()
-            .map_err(|_| OpenAiProviderConfigError::ClientBuild)?;
+        // The locked-down client (no redirects, no retries, no ambient proxy) is the
+        // shared production constructor; the typed ClientBuild mapping is preserved.
+        let client = build_client().map_err(|_| OpenAiProviderConfigError::ClientBuild)?;
         Ok(Self {
             client,
             endpoint,
@@ -161,6 +163,14 @@ impl OpenAiResponsesProviderAdapter {
             .build()
             .map_err(|_| invalid_request_not_sent())?;
 
+        // Second cancellation check after encoding/building but before the send
+        // select: the request provably never left, so a cancellation that landed
+        // during that synchronous window stays NotSent. Races once the send select
+        // is polled keep the conservative Unknown below.
+        if cancel.is_cancelled() {
+            return Err(cancelled(ProviderRequestDeliveryState::NotSent));
+        }
+
         // Cancellation while the POST is in flight: the request may have been received,
         // so the conservative delivery is Unknown.
         let response = tokio::select! {
@@ -183,7 +193,11 @@ impl OpenAiResponsesProviderAdapter {
             .and_then(|value| value.parse::<ProviderRequestId>().ok());
         let retry_after = parse_retry_after(response.headers());
         if !status.is_success() {
-            let envelope = read_bounded_envelope(response, &cancel, status.as_u16()).await?;
+            let delivery = match status.as_u16() {
+                400 | 401 | 429 => ProviderRequestDeliveryState::RejectedBeforeExecution,
+                _ => ProviderRequestDeliveryState::Unknown,
+            };
+            let envelope = read_bounded_envelope(response, &cancel, delivery).await?;
             return Err(classify_http_error(
                 status.as_u16(),
                 envelope.as_ref(),
@@ -238,69 +252,6 @@ impl OpenAiResponsesProviderAdapter {
                 }
             }
         }
-    }
-}
-
-fn response_byte_limit() -> usize {
-    usize::try_from(ProtocolLimits::v1_0().transport.max_response_bytes).unwrap_or(usize::MAX)
-}
-
-fn cancelled(delivery: ProviderRequestDeliveryState) -> ProviderAttemptError {
-    ProviderAttemptError {
-        reason: ModelCallErrorReason::Cancelled,
-        retry_after: None,
-        delivery,
-    }
-}
-
-fn invalid_provider_response(delivery: ProviderRequestDeliveryState) -> ProviderAttemptError {
-    ProviderAttemptError {
-        reason: ModelCallErrorReason::InvalidProviderResponse,
-        retry_after: None,
-        delivery,
-    }
-}
-
-fn invalid_request_not_sent() -> ProviderAttemptError {
-    ProviderAttemptError {
-        reason: ModelCallErrorReason::InvalidRequest,
-        retry_after: None,
-        delivery: ProviderRequestDeliveryState::NotSent,
-    }
-}
-
-fn transport_read_error(delivery: ProviderRequestDeliveryState) -> ProviderAttemptError {
-    ProviderAttemptError {
-        reason: ModelCallErrorReason::TransportUnavailable,
-        retry_after: None,
-        delivery,
-    }
-}
-
-/// Send-phase transport failure: a connect failure proves nothing was sent; a send
-/// timeout is typed `Timeout` (NotSent when it also proves no connect, otherwise
-/// Unknown); any other send-phase error may have reached the provider, so delivery
-/// is conservatively Unknown.
-fn classify_send_error(error: &reqwest::Error) -> ProviderAttemptError {
-    if error.is_timeout() {
-        return ProviderAttemptError {
-            reason: ModelCallErrorReason::Timeout,
-            retry_after: None,
-            delivery: if error.is_connect() {
-                ProviderRequestDeliveryState::NotSent
-            } else {
-                ProviderRequestDeliveryState::Unknown
-            },
-        };
-    }
-    ProviderAttemptError {
-        reason: ModelCallErrorReason::TransportUnavailable,
-        retry_after: None,
-        delivery: if error.is_connect() {
-            ProviderRequestDeliveryState::NotSent
-        } else {
-            ProviderRequestDeliveryState::Unknown
-        },
     }
 }
 
@@ -372,91 +323,6 @@ fn classify_http_error(
         },
         delivery,
     }
-}
-
-/// Drains a chunk stream up to a byte bound while remaining cancellation-aware.
-///
-/// This is the production owner of bounded body drains. Cancellation wins mid-drain
-/// and returns a typed `Cancelled` carrying the caller-supplied conservative
-/// `delivery` — 400/401/429 may claim `RejectedBeforeExecution`, every other status
-/// is `Unknown` — without reading any further. A stream item error or an over-bound
-/// body returns `Ok(None)` so the caller can fall back to status-only
-/// classification. Only a complete, in-bound body returns `Ok(Some(bytes))`.
-async fn drain_bounded<C, E, S>(
-    stream: S,
-    cancel: &CancellationToken,
-    maximum: usize,
-    delivery: ProviderRequestDeliveryState,
-) -> Result<Option<Vec<u8>>, ProviderAttemptError>
-where
-    S: Stream<Item = Result<C, E>>,
-    C: AsRef<[u8]>,
-{
-    let mut bytes = Vec::new();
-    let mut stream = std::pin::pin!(stream);
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(cancelled(delivery)),
-            chunk = stream.next() => {
-                let Some(chunk) = chunk else { return Ok(Some(bytes)) };
-                // A transport failure while reading the body falls back to
-                // status-only classification.
-                let Ok(chunk) = chunk else { return Ok(None) };
-                let chunk = chunk.as_ref();
-                if chunk.len() > maximum.saturating_sub(bytes.len()) {
-                    return Ok(None);
-                }
-                bytes.extend_from_slice(chunk);
-            }
-        }
-    }
-}
-
-/// Reads at most `max_response_bytes` of an error body and parses it as JSON while
-/// remaining cancellation-aware (see [`drain_bounded`]): cancellation wins mid-read
-/// and returns `Cancelled` with a conservative delivery — 400/401/429 may use
-/// `RejectedBeforeExecution`, every other status is `Unknown` — without reading any
-/// further. Unparseable or oversized bodies yield `None`; classification then falls
-/// back to status alone, still structurally.
-async fn read_bounded_envelope(
-    response: reqwest::Response,
-    cancel: &CancellationToken,
-    status: u16,
-) -> Result<Option<Value>, ProviderAttemptError> {
-    let delivery = match status {
-        400 | 401 | 429 => ProviderRequestDeliveryState::RejectedBeforeExecution,
-        _ => ProviderRequestDeliveryState::Unknown,
-    };
-    let body = drain_bounded(
-        response.bytes_stream(),
-        cancel,
-        response_byte_limit(),
-        delivery,
-    )
-    .await?;
-    Ok(body.and_then(|bytes| serde_json::from_slice(&bytes).ok()))
-}
-
-fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
-    headers
-        .get("retry-after")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
-}
-
-fn is_event_stream(content_type: Option<&HeaderValue>) -> bool {
-    content_type
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .eq_ignore_ascii_case("text/event-stream")
-        })
 }
 
 // ---------------------------------------------------------------------------
@@ -705,133 +571,6 @@ fn sanitize_schema_node(node: &Value) -> Value {
         sanitized.insert("items".into(), sanitize_schema_node(items));
     }
     Value::Object(sanitized)
-}
-
-// ---------------------------------------------------------------------------
-// Incremental bounded SSE parser
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SseParseError {
-    /// A response-byte, line, or frame bound (max_response_bytes) was exceeded.
-    LimitExceeded,
-    /// A data payload was not valid UTF-8.
-    InvalidUtf8,
-}
-
-/// One completed SSE event frame's data payload.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SseEvent {
-    data: String,
-}
-
-/// Incremental SSE parser: accepts CR, LF, and CRLF line endings, multi-line `data:`
-/// frames joined with `\n`, comment lines, and arbitrary byte fragmentation. Bounds the
-/// cumulative response bytes, the current line, and the current frame by
-/// `ProtocolLimits::transport.max_response_bytes`. A frame completes at a blank line;
-/// a trailing partial line at EOF is dropped (never synthesized into an event).
-struct SseParser {
-    line: Vec<u8>,
-    frame: Vec<u8>,
-    frame_has_data: bool,
-    pending_cr: bool,
-    total_bytes: usize,
-    maximum: usize,
-}
-
-impl SseParser {
-    fn new(maximum: usize) -> Self {
-        Self {
-            line: Vec::new(),
-            frame: Vec::new(),
-            frame_has_data: false,
-            pending_cr: false,
-            total_bytes: 0,
-            maximum,
-        }
-    }
-
-    fn feed(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, SseParseError> {
-        self.total_bytes = self
-            .total_bytes
-            .checked_add(chunk.len())
-            .ok_or(SseParseError::LimitExceeded)?;
-        if self.total_bytes > self.maximum {
-            return Err(SseParseError::LimitExceeded);
-        }
-        let mut events = Vec::new();
-        for &byte in chunk {
-            if self.pending_cr {
-                self.pending_cr = false;
-                if byte == b'\n' {
-                    continue;
-                }
-            }
-            match byte {
-                b'\r' => {
-                    self.pending_cr = true;
-                    self.end_line(&mut events)?;
-                }
-                b'\n' => self.end_line(&mut events)?,
-                _ => {
-                    self.line.push(byte);
-                    if self.line.len() > self.maximum {
-                        return Err(SseParseError::LimitExceeded);
-                    }
-                }
-            }
-        }
-        Ok(events)
-    }
-
-    fn end_line(&mut self, events: &mut Vec<SseEvent>) -> Result<(), SseParseError> {
-        let line = std::mem::take(&mut self.line);
-        if line.is_empty() {
-            // Blank line: frame boundary.
-            if self.frame_has_data {
-                let data = std::mem::take(&mut self.frame);
-                self.frame_has_data = false;
-                events.push(SseEvent::finish(data)?);
-            }
-            return Ok(());
-        }
-        if line[0] == b':' {
-            return Ok(()); // comment line: ignored, does not start a frame
-        }
-        let Some(colon) = line.iter().position(|&byte| byte == b':') else {
-            return Ok(()); // field without a colon is invalid and ignored
-        };
-        let field = &line[..colon];
-        let mut value = &line[colon + 1..];
-        if value.first() == Some(&b' ') {
-            value = &value[1..];
-        }
-        if field == b"data" {
-            if !self.frame_has_data {
-                self.frame_has_data = true;
-            }
-            self.frame.extend_from_slice(value);
-            self.frame.push(b'\n');
-            if self.frame.len() > self.maximum {
-                return Err(SseParseError::LimitExceeded);
-            }
-        }
-        // `event`, `id`, and `retry` fields are not consumed by this adapter.
-        Ok(())
-    }
-}
-
-impl SseEvent {
-    fn finish(mut frame: Vec<u8>) -> Result<Self, SseParseError> {
-        // The spec joins data lines with a trailing newline; strip exactly one so the
-        // payload is the clean joined text.
-        if frame.last() == Some(&b'\n') {
-            frame.pop();
-        }
-        Ok(Self {
-            data: String::from_utf8(frame).map_err(|_| SseParseError::InvalidUtf8)?,
-        })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1492,285 +1231,6 @@ fn optional_usage_u64(usage: &Map<String, Value>, key: &str) -> Result<Option<u6
 }
 
 // ---------------------------------------------------------------------------
-// Loopback contract tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod loopback {
-    use std::io::{Read, Write};
-    use std::net::{Shutdown, TcpListener, TcpStream};
-    use std::sync::mpsc::{Receiver, Sender, channel};
-    use std::sync::{Arc, Mutex};
-    use std::thread::{self, JoinHandle};
-
-    use serde_json::Value;
-
-    /// A captured client request: request line, headers (names lowercased), and the
-    /// exact body bytes read per `Content-Length`.
-    #[derive(Debug)]
-    pub(super) struct CapturedRequest {
-        request_line: String,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
-    }
-
-    impl CapturedRequest {
-        pub(super) fn header(&self, name: &str) -> Option<&str> {
-            self.headers
-                .iter()
-                .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
-        }
-
-        pub(super) fn method(&self) -> &str {
-            self.request_line
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-        }
-
-        pub(super) fn path(&self) -> &str {
-            self.request_line
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or_default()
-        }
-
-        pub(super) fn json_body(&self) -> Value {
-            serde_json::from_slice(&self.body).expect("captured request body must be JSON")
-        }
-
-        pub(super) fn body_len(&self) -> usize {
-            self.body.len()
-        }
-    }
-
-    /// Byte marking the test-owned shutdown connection. Real requests always start with
-    /// a method letter, so the first byte unambiguously distinguishes them.
-    const POISON_BYTE: u8 = 0x00;
-
-    const MAX_HEADER_BYTES: usize = 64 * 1024;
-
-    /// One scripted response. `gate` splits the body after the first event boundary and
-    /// holds the server thread until the test releases it (deterministic cancellation
-    /// probes). Writes after the release may fail because the client already aborted;
-    /// they are intentionally ignored.
-    pub(super) struct ScriptedResponse {
-        pub(super) status: u16,
-        pub(super) content_type: &'static str,
-        pub(super) headers: Vec<(String, String)>,
-        pub(super) body: String,
-        pub(super) gate: bool,
-    }
-
-    pub(super) struct LoopbackServer {
-        base_url: String,
-        captured: Arc<Mutex<Vec<CapturedRequest>>>,
-        release: Option<Sender<()>>,
-        handle: Option<JoinHandle<()>>,
-    }
-
-    impl LoopbackServer {
-        pub(super) fn spawn(scripted: Vec<ScriptedResponse>) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind");
-            let base_url = format!("http://{}", listener.local_addr().expect("loopback addr"));
-            let captured = Arc::new(Mutex::new(Vec::new()));
-            let thread_captured = Arc::clone(&captured);
-            let (release_tx, release_rx) = channel::<()>();
-            let handle = thread::spawn(move || {
-                let mut scripted = scripted.into_iter();
-                loop {
-                    let (mut stream, _peer) = listener.accept().expect("loopback accept");
-                    let mut first = [0u8; 1];
-                    let n = stream.read(&mut first).expect("read first request byte");
-                    if n == 1 && first[0] == POISON_BYTE {
-                        return; // test-owned shutdown signal
-                    }
-                    if n == 0 {
-                        panic!("connection closed before any request bytes");
-                    }
-                    let scripted = scripted.next().unwrap_or_else(|| {
-                        panic!("unexpected HTTP request: no scripted response left")
-                    });
-                    serve_one(
-                        &mut stream,
-                        first[0],
-                        &scripted,
-                        thread_captured.as_ref(),
-                        &release_rx,
-                    );
-                }
-            });
-            Self {
-                base_url,
-                captured,
-                release: Some(release_tx),
-                handle: Some(handle),
-            }
-        }
-
-        /// The full `/responses` endpoint exercised by the adapter in every loopback
-        /// test: the production constructor stores the endpoint exactly as given, and
-        /// the wire contract is the OpenAI path, so requests must land on `/responses`.
-        pub(super) fn responses_endpoint(&self) -> String {
-            format!("{}/responses", self.base_url)
-        }
-
-        pub(super) fn release(&self) -> &Sender<()> {
-            self.release.as_ref().expect("release channel present")
-        }
-
-        /// Release any gate (idempotent), poison the thread, join it, and return the
-        /// captured requests. Always called before assertions so the thread can never
-        /// outlive the test whatever the outcome.
-        pub(super) fn join(mut self) -> Vec<CapturedRequest> {
-            if let Some(release) = &self.release {
-                let _ = release.send(());
-            }
-            let handle = self.handle.take().expect("server must be joined once");
-            if let Ok(mut stream) =
-                TcpStream::connect(self.base_url.strip_prefix("http://").unwrap())
-            {
-                let _ = stream.write_all(&[POISON_BYTE]);
-            }
-            handle
-                .join()
-                .expect("loopback server thread must not panic");
-            Arc::try_unwrap(std::mem::take(&mut self.captured))
-                .expect("captured requests must have no other owners")
-                .into_inner()
-                .expect("capture mutex must not be poisoned")
-        }
-    }
-
-    impl Drop for LoopbackServer {
-        fn drop(&mut self) {
-            // Best-effort settle if the test failed before `join`.
-            if let Some(release) = &self.release {
-                let _ = release.send(());
-            }
-            if let Some(handle) = self.handle.take() {
-                if let Ok(mut stream) =
-                    TcpStream::connect(self.base_url.strip_prefix("http://").unwrap())
-                {
-                    let _ = stream.write_all(&[POISON_BYTE]);
-                }
-                let _ = handle.join();
-            }
-        }
-    }
-
-    /// Read one request off the accepted stream (whose first byte was already consumed)
-    /// and respond with the scripted body.
-    fn serve_one(
-        stream: &mut TcpStream,
-        first_byte: u8,
-        scripted: &ScriptedResponse,
-        captured: &Mutex<Vec<CapturedRequest>>,
-        release_rx: &Receiver<()>,
-    ) {
-        let mut buf = vec![first_byte];
-        let mut scratch = [0u8; 4096];
-        let header_end = loop {
-            assert!(
-                buf.len() <= MAX_HEADER_BYTES,
-                "request headers exceed {MAX_HEADER_BYTES} bytes"
-            );
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                break pos;
-            }
-            let n = stream.read(&mut scratch).expect("read request bytes");
-            if n == 0 {
-                panic!("connection closed before request headers were complete");
-            }
-            buf.extend_from_slice(&scratch[..n]);
-        };
-
-        let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-        let mut lines = head.split("\r\n");
-        let request_line = lines.next().expect("request line").to_string();
-        let headers: Vec<(String, String)> = lines
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                let (name, value) = line
-                    .split_once(':')
-                    .unwrap_or_else(|| panic!("malformed header line: {line:?}"));
-                (name.trim().to_ascii_lowercase(), value.trim().to_string())
-            })
-            .collect();
-        let content_length: usize = headers
-            .iter()
-            .find_map(|(name, value)| {
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap_or_else(|| panic!("request missing numeric Content-Length: {headers:?}"));
-
-        let mut body = buf[header_end + 4..].to_vec();
-        assert!(
-            body.len() <= content_length,
-            "request body exceeds declared Content-Length"
-        );
-        let mut rest = vec![0u8; content_length - body.len()];
-        stream.read_exact(&mut rest).expect("read request body");
-        body.extend_from_slice(&rest);
-
-        captured
-            .lock()
-            .expect("captured requests mutex")
-            .push(CapturedRequest {
-                request_line,
-                headers,
-                body,
-            });
-
-        let reason = match scripted.status {
-            200 => "OK",
-            400 => "Bad Request",
-            401 => "Unauthorized",
-            429 => "Too Many Requests",
-            500 => "Internal Server Error",
-            other => panic!("unscripted response status {other}"),
-        };
-        let mut head = format!(
-            "HTTP/1.1 {} {reason}\r\n\
-             Content-Type: {}\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n",
-            scripted.status,
-            scripted.content_type,
-            scripted.body.len(),
-        );
-        for (name, value) in &scripted.headers {
-            head.push_str(name);
-            head.push_str(": ");
-            head.push_str(value);
-            head.push_str("\r\n");
-        }
-        head.push_str("\r\n");
-        stream
-            .write_all(head.as_bytes())
-            .expect("write scripted response head");
-        if scripted.gate {
-            let (first_event, rest) = scripted
-                .body
-                .split_once("\n\n")
-                .expect("gated body must contain an event boundary");
-            let first_event = format!("{first_event}\n\n");
-            stream
-                .write_all(first_event.as_bytes())
-                .expect("write gated first event");
-            let _ = release_rx.recv();
-            // The client may have aborted after cancellation: best-effort only.
-            let _ = stream.write_all(rest.as_bytes());
-        } else {
-            stream
-                .write_all(scripted.body.as_bytes())
-                .expect("write scripted response body");
-        }
-        let _ = stream.shutdown(Shutdown::Write);
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1779,8 +1239,11 @@ mod tests {
 
     use serde_json::{Value, json};
 
-    use super::loopback::{CapturedRequest, LoopbackServer, ScriptedResponse};
     use super::*;
+    use crate::model_gateway::provider_transport::loopback::{
+        CapturedRequest, LoopbackServer, ScriptedResponse,
+    };
+    use crate::model_gateway::provider_transport::{SseParseError, drain_bounded};
     use crate::model_gateway::tests::{
         request_for_model, request_for_model_with_tools, request_with_output_contract,
         resolve_request, scripted_tool_set, structured_definition, structured_request,
@@ -2328,7 +1791,7 @@ mod tests {
                     "service_tier": "priority",
                 }}),
             ]),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test-credential")
@@ -2487,7 +1950,7 @@ mod tests {
                     "usage": {"input_tokens": 9, "output_tokens": 7, "total_tokens": 16},
                 }}),
             ]),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -2580,7 +2043,7 @@ mod tests {
                                "response": {"id": "resp_1", "object": "response",
                                             "created_at": 1752000000, "status": "in_progress",
                                             "model": "gpt-5"}})]),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -2625,7 +2088,7 @@ mod tests {
                                 "status": "completed",
                                 "content": [{"type": "output_text", "text": "partial "}]}}),
             ]),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -2677,7 +2140,7 @@ mod tests {
                 content_type: "text/event-stream",
                 headers: vec![],
                 body,
-                gate: false,
+                gate: 0,
             }]);
             let adapter = Arc::new(
                 OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test")
@@ -2719,7 +2182,7 @@ mod tests {
             body: r#"{"error":{"message":"context too long","type":"invalid_request_error",
                         "param":"messages","code":"context_length_exceeded"}}"#
                 .to_owned(),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -2756,7 +2219,7 @@ mod tests {
             body: r#"{"error":{"message":"rate limited","type":"rate_limit_error",
                         "code":"rate_limit_exceeded","param":null}}"#
                 .to_owned(),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -2791,7 +2254,7 @@ mod tests {
             content_type: "application/json",
             headers: vec![],
             body: r#"{"error":{"message":"provider exploded","type":"server_error"}}"#.to_owned(),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -2834,7 +2297,7 @@ mod tests {
                 content_type,
                 headers: vec![],
                 body,
-                gate: false,
+                gate: 0,
             }]);
             let adapter = Arc::new(
                 OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test")
@@ -2880,7 +2343,7 @@ mod tests {
                 ("set-cookie".to_owned(), "session=SECRET".to_owned()),
             ],
             body: sse(&[completed_simple("hello")]),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test-credential")
@@ -2932,6 +2395,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn loopback_cancellation_before_send_returns_not_sent_without_any_request() {
+        // A cancellation that is already observable before the adapter sends must
+        // be Cancelled/NotSent, and no POST may ever be issued. The second
+        // is_cancelled check after encoding/building closes the synchronous
+        // race where a cancellation lands in that window: with no await between
+        // the two checks it cannot be observed deterministically from a test
+        // without sleeps, so this deterministic pre-send regression pins the
+        // surrounding contract and the branch itself is guarded by review.
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: sse(&[completed_simple("ok")]),
+            gate: 0,
+        }]);
+        let adapter = Arc::new(
+            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
+        );
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let (_gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
+        let request = request_for_model(model).await;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        // Drive the adapter directly (bypassing the gateway's own pre-cancel
+        // short-circuit) so the adapter's pre-send NotSent contract is proven.
+        let attempt = ProviderAttemptRequest {
+            effective_max_output_tokens: request.effective_max_output_tokens(),
+            call: Arc::clone(&request),
+        };
+        let error = adapter
+            .execute(attempt, ModelProgressPublisher::discard(), cancel)
+            .await
+            .unwrap_err();
+        let requests = server.join();
+        assert!(
+            requests.is_empty(),
+            "a pre-send cancellation must never issue the POST"
+        );
+        assert_eq!(error.reason, ModelCallErrorReason::Cancelled);
+        assert_eq!(error.delivery, ProviderRequestDeliveryState::NotSent);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn loopback_cancellation_after_first_delta_returns_cancelled_with_output_started() {
         let server = LoopbackServer::spawn(vec![ScriptedResponse {
             status: 200,
@@ -2941,7 +2448,7 @@ mod tests {
                 output_text_delta(0, "partial "),
                 completed_simple("partial "),
             ]),
-            gate: true,
+            gate: 1,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -3004,7 +2511,7 @@ mod tests {
             content_type: "text/event-stream",
             headers: vec![],
             body: sse(&[completed_simple("compact")]),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -3059,7 +2566,7 @@ mod tests {
                     }],
                 },
             })]),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -3121,7 +2628,7 @@ mod tests {
                     },
                 },
             })]),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -3199,7 +2706,7 @@ mod tests {
                     ],
                 },
             })]),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -3324,7 +2831,7 @@ mod tests {
                 headers: vec![],
                 body: sse(&[json!({"type": "response.completed", "sequence_number": 1,
                                    "response": terminal})]),
-                gate: false,
+                gate: 0,
             }]);
             let adapter = Arc::new(
                 OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test")
@@ -3364,7 +2871,7 @@ mod tests {
             content_type: "text/event-stream",
             headers: vec![],
             body: sse(&[output_text_delta(0, "")]),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -3476,7 +2983,7 @@ mod tests {
                     &[json!({"type": "response.output_item.done", "item_id": "i",
                                    "output_index": 0, "sequence_number": 1, "item": item})],
                 ),
-                gate: false,
+                gate: 0,
             }]);
             let adapter = Arc::new(
                 OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test")
@@ -3535,7 +3042,7 @@ mod tests {
                                 "content": [{"type": "output_text", "text": "hello"}]}],
                 }}),
             ]),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -3593,7 +3100,7 @@ mod tests {
                     ],
                 }}),
             ]),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -3650,7 +3157,7 @@ mod tests {
                     ],
                 }}),
             ]),
-            gate: false,
+            gate: 0,
         }]);
         let adapter = Arc::new(
             OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
@@ -3747,7 +3254,7 @@ mod tests {
                 content_type: "application/json",
                 headers: vec![("retry-after".to_owned(), "17".to_owned())],
                 body: body.to_owned(),
-                gate: false,
+                gate: 0,
             }]);
             let adapter = Arc::new(
                 OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test")
