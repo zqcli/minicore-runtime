@@ -3,9 +3,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use thiserror::Error;
-use tokio::sync::oneshot;
 
 use crate::turn_item_interaction::{
     InteractionRequest, InteractionResolution, ResolvedInteraction,
@@ -245,11 +245,18 @@ impl ToolExecutionRequest {
     pub(crate) const fn call(&self) -> &Arc<ToolCall> {
         &self.call
     }
+
+    /// Exact captured identity: the same ItemId and the same `Arc<ToolCall>` (not merely an
+    /// equal call).  The start gate binds one exact request capture, so a foreign request that
+    /// merely copies the ids fails the exact-binding invariant.
+    pub(crate) fn is_exact_capture(&self, other: &Self) -> bool {
+        self.item_id == other.item_id && Arc::ptr_eq(&self.call, &other.call)
+    }
 }
 
 #[allow(
     dead_code,
-    reason = "abandoned settlement is consumed by M8 cancel/control lanes"
+    reason = "executor results are produced by cfg(test) scripted executors until the M8 executor lands"
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ToolExecutionResult {
@@ -260,12 +267,6 @@ pub(crate) enum ToolExecutionResult {
     PreExecution {
         disposition: ToolResultDisposition,
         content: ToolResultContent,
-    },
-    Interaction {
-        request_id: crate::wire::RequestId,
-        request: InteractionRequest,
-        allowed: Box<ToolExecutionResult>,
-        denied: Box<ToolExecutionResult>,
     },
     Abandoned {
         reason: ToolAbandonReason,
@@ -285,6 +286,257 @@ impl ToolExecutionResult {
 pub(crate) type ToolExecutionFuture =
     Pin<Box<dyn Future<Output = ToolExecutionResult> + Send + 'static>>;
 
+/// The synchronous pre-start plan one Tool executor produces for one exact request.
+///
+/// The plan is produced before any start-gate reservation and is never polled by the plan
+/// producer: an `Execute` plan holds its executor future unpolled, an `Interaction` plan is
+/// presented to the host before the start gate is ever involved, and a `PreExecution` plan
+/// carries a frozen preflight result that never reaches the start gate.  The start gate
+/// decides whether an unpolled future may begin; this slice covers exactly that start seam,
+/// not a fuller operation slot.
+#[allow(
+    dead_code,
+    reason = "concrete executors/plans are cfg(test) until the M8 executor lands; production ToolSets are empty"
+)]
+pub(crate) enum ToolExecutionPlan {
+    Execute(ToolExecutionFuture),
+    Interaction {
+        request_id: crate::wire::RequestId,
+        request: InteractionRequest,
+        allowed: ToolExecutionFuture,
+        denied: ToolExecutionResult,
+    },
+    /// A frozen known-tool preflight result (schema, policy, hook, or sandbox preflight): the
+    /// request settles as PreExecution without any start-gate reservation and the executor is
+    /// never consulted.  Only a truthful pre-execution shape belongs here; a malformed
+    /// `Completed` settles under the same fail-closed binding as any other unstarted result.
+    PreExecution(ToolExecutionResult),
+}
+
+/// Why a start reservation was refused.
+///
+/// The closed gate distinguishes the two causes so callers can settle truthfully: a
+/// cancellation before start produces a matching PreExecution Cancelled ToolResult, while an
+/// exact-binding violation is an invariant that fails closed to Abandoned.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum ToolStartError {
+    #[error("the tool start gate is closed by a cancellation before start")]
+    CancelledBeforeStart,
+    #[error("the tool start gate is closed by an invalid or exact-binding invariant")]
+    InvalidBinding,
+}
+
+/// The owner-local first-wins start seam for one exact Tool execution.
+///
+/// The gate owns a single reserve entry per exact `ToolExecutionRequest` capture as one
+/// lock-free atomic slot and knows nothing about EmergencyControl: the Session Execution
+/// concrete gate orders reservation against the emergency signal by running the atomic
+/// reservation while the emergency owner mutex is held, so `signal` and `reserve` linearize
+/// on one mutex.
+#[derive(Clone)]
+pub(crate) struct ToolStartGate {
+    inner: Arc<ToolStartGateInner>,
+}
+
+struct ToolStartGateInner {
+    request: ToolExecutionRequest,
+    state: AtomicU8,
+}
+
+/// The four closed gate states as one lock-free slot.
+///
+/// Every transition is a compare-and-swap on the single `AtomicU8` (the exact transitions
+/// are documented on the gate methods).  The slot is never locked, so the gate has no mutex
+/// to poison and holds no sibling lock next to the Emergency owner mutex.  All transitions
+/// are read-modify-write operations on the one atomic, so they linearize in a single
+/// modification order; the `AcqRel`/`Acquire` orderings make each transition visible to
+/// later readers without any stronger fence, and the bound request is immutable beside the
+/// slot, so no payload ordering is needed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum ToolStartGateState {
+    Prepared = 0,
+    Reserved = 1,
+    Started = 2,
+    Cancelled = 3,
+}
+
+impl ToolStartGateState {
+    fn from_u8(value: u8) -> Self {
+        // Discriminants are declared on the enum above.
+        match value {
+            0 => Self::Prepared,
+            1 => Self::Reserved,
+            2 => Self::Started,
+            3 => Self::Cancelled,
+            _ => unreachable!("the gate atomic only ever stores one of the four closed states"),
+        }
+    }
+}
+
+impl ToolStartGate {
+    pub(crate) fn new(request: ToolExecutionRequest) -> Self {
+        Self {
+            inner: Arc::new(ToolStartGateInner {
+                request,
+                state: AtomicU8::new(ToolStartGateState::Prepared as u8),
+            }),
+        }
+    }
+
+    /// Reserves the single start entry for the exact bound request.
+    ///
+    /// A foreign request, a duplicate reservation, or a reservation after start is an
+    /// exact-binding invariant (`InvalidBinding`); a gate explicitly closed before start
+    /// returns `CancelledBeforeStart`.  The reservation is an exact-capture check plus one
+    /// lock-free Prepared→Reserved compare-and-swap: it never locks (no poison) and performs
+    /// no caller work.
+    pub(crate) fn reserve(
+        &self,
+        request: &ToolExecutionRequest,
+    ) -> Result<ToolStartPermit, ToolStartError> {
+        if !request.is_exact_capture(&self.inner.request) {
+            return Err(ToolStartError::InvalidBinding);
+        }
+        match self.inner.state.compare_exchange(
+            ToolStartGateState::Prepared as u8,
+            ToolStartGateState::Reserved as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(ToolStartPermit {
+                inner: Arc::clone(&self.inner),
+            }),
+            Err(actual) => match ToolStartGateState::from_u8(actual) {
+                ToolStartGateState::Cancelled => Err(ToolStartError::CancelledBeforeStart),
+                ToolStartGateState::Reserved | ToolStartGateState::Started => {
+                    Err(ToolStartError::InvalidBinding)
+                }
+                ToolStartGateState::Prepared => {
+                    unreachable!("a failed Prepared→Reserved CAS cannot observe Prepared")
+                }
+            },
+        }
+    }
+
+    /// Explicitly closes the gate before start.  First-wins with any reservation as lock-free
+    /// compare-and-swaps on the one slot: returns whether this call closed a still-reservable
+    /// gate (Prepared or Reserved; an outstanding permit then fails to start with
+    /// `CancelledBeforeStart` and its drop cannot roll the Cancelled gate back).
+    #[allow(
+        dead_code,
+        reason = "the explicit pre-start close is the M8.3 signal-first seam exercised by Tools unit tests"
+    )]
+    pub(crate) fn cancel_before_start(&self) -> bool {
+        let state = &self.inner.state;
+        if state
+            .compare_exchange(
+                ToolStartGateState::Prepared as u8,
+                ToolStartGateState::Cancelled as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+        state
+            .compare_exchange(
+                ToolStartGateState::Reserved as u8,
+                ToolStartGateState::Cancelled as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+impl fmt::Debug for ToolStartGate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ToolStartGate { .. }")
+    }
+}
+
+/// The move-only, single-use start permit for one exact reserved Tool execution.
+///
+/// `start` consumes the permit and transitions the gate to Started, producing the typed
+/// `ToolStartedExecution` proof; dropping an unused permit rolls the reservation back to
+/// Prepared.  The permit never outlives its gate.
+pub(crate) struct ToolStartPermit {
+    inner: Arc<ToolStartGateInner>,
+}
+
+impl ToolStartPermit {
+    /// Consumes the permit: the gate transitions Reserved→Started and only a successful
+    /// transition constructs the typed started proof.  The start is one lock-free
+    /// compare-and-swap: it never locks (no poison) and performs no caller work.
+    pub(crate) fn start(self) -> Result<ToolStartedExecution, ToolStartError> {
+        match self.inner.state.compare_exchange(
+            ToolStartGateState::Reserved as u8,
+            ToolStartGateState::Started as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(ToolStartedExecution {
+                inner: Arc::clone(&self.inner),
+            }),
+            Err(actual) => match ToolStartGateState::from_u8(actual) {
+                ToolStartGateState::Cancelled => Err(ToolStartError::CancelledBeforeStart),
+                ToolStartGateState::Prepared | ToolStartGateState::Started => {
+                    Err(ToolStartError::InvalidBinding)
+                }
+                ToolStartGateState::Reserved => {
+                    unreachable!("a failed Reserved→Started CAS cannot observe Reserved")
+                }
+            },
+        }
+    }
+}
+
+impl Drop for ToolStartPermit {
+    fn drop(&mut self) {
+        // An unused permit rolls the reservation back; a Cancelled or Started gate stays
+        // closed so a dropped permit can never resurrect a start the signal already won.
+        let _ = self.inner.state.compare_exchange(
+            ToolStartGateState::Reserved as u8,
+            ToolStartGateState::Prepared as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+impl fmt::Debug for ToolStartPermit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ToolStartPermit { .. }")
+    }
+}
+
+/// The move-only, typed proof that one exact Tool execution started.
+///
+/// Only a successful Reserved→Started transition constructs it, and it binds the exact
+/// `ToolExecutionRequest` capture of the started gate.  `ToolSet::run_started_execution`
+/// revalidates that exact capture before it polls the executor future, so a foreign proof can
+/// never drive a future to an executed outcome.  The proof is single-use and never outlives
+/// its gate.
+pub(crate) struct ToolStartedExecution {
+    inner: Arc<ToolStartGateInner>,
+}
+
+impl ToolStartedExecution {
+    /// The exact started request capture, read only by the Tools owner's started-binding
+    /// path.
+    fn request(&self) -> &ToolExecutionRequest {
+        &self.inner.request
+    }
+}
+
+impl fmt::Debug for ToolStartedExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ToolStartedExecution { .. }")
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ToolExecutionOutcome {
     Completed {
@@ -294,16 +546,6 @@ pub(crate) enum ToolExecutionOutcome {
         disposition: ToolResultDisposition,
         content: ToolResultContent,
     },
-    Interaction {
-        item_id: ItemId,
-        tool_call_id: ToolCallId,
-        request_id: crate::wire::RequestId,
-        request: InteractionRequest,
-        resolution_sender: oneshot::Sender<ResolvedInteraction>,
-        resolution_receiver: oneshot::Receiver<ResolvedInteraction>,
-        allowed: Box<ToolExecutionResult>,
-        denied: Box<ToolExecutionResult>,
-    },
     Abandoned {
         item_id: ItemId,
         tool_call_id: ToolCallId,
@@ -311,7 +553,17 @@ pub(crate) enum ToolExecutionOutcome {
     },
 }
 
-type ToolExecutor = dyn Fn(ToolExecutionRequest) -> ToolExecutionFuture + Send + Sync;
+/// The identity-bound fail-closed outcome for one exact request that never ran: a foreign
+/// started proof, a panicking settlement task, or any other started-path invariant.
+fn abandoned_runtime_failure(request: &ToolExecutionRequest) -> ToolExecutionOutcome {
+    ToolExecutionOutcome::Abandoned {
+        item_id: request.item_id(),
+        tool_call_id: request.call().tool_call_id().clone(),
+        reason: ToolAbandonReason::RuntimeFailure,
+    }
+}
+
+type ToolExecutor = dyn Fn(ToolExecutionRequest) -> ToolExecutionPlan + Send + Sync;
 
 /// The immutable Tool set captured for one Turn.
 #[derive(Clone)]
@@ -355,6 +607,26 @@ impl ToolSet {
         definitions: Vec<ToolDefinition>,
         executor: impl Fn(ToolExecutionRequest) -> ToolExecutionFuture + Send + Sync + 'static,
     ) -> Arc<Self> {
+        Self::with_plans(
+            definitions,
+            Arc::new(move |request| ToolExecutionPlan::Execute(executor(request))),
+        )
+    }
+
+    /// Test-only planner constructor for scripted pre-start plans.  The planner returns the
+    /// exact plan synchronously: an `Interaction` plan is produced before any start-gate
+    /// reservation, so the host interaction is presented first and the gate is only involved
+    /// at approval resume.
+    #[cfg(test)]
+    pub(crate) fn with_interaction_planner(
+        definitions: Vec<ToolDefinition>,
+        planner: impl Fn(ToolExecutionRequest) -> ToolExecutionPlan + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Self::with_plans(definitions, Arc::new(planner))
+    }
+
+    #[cfg(test)]
+    fn with_plans(definitions: Vec<ToolDefinition>, executor: Arc<ToolExecutor>) -> Arc<Self> {
         let specs = definitions
             .iter()
             .map(|definition| definition.spec.clone())
@@ -363,7 +635,7 @@ impl ToolSet {
             inner: Arc::new(ToolSetInner {
                 definitions: definitions.into(),
                 specs: specs.into(),
-                executor: Some(Arc::new(executor)),
+                executor: Some(executor),
             }),
         })
     }
@@ -372,33 +644,106 @@ impl ToolSet {
         &self.inner.definitions
     }
 
-    pub(crate) async fn execute(&self, request: ToolExecutionRequest) -> ToolExecutionOutcome {
-        let item_id = request.item_id();
-        let tool_call_id = request.call().tool_call_id().clone();
+    /// The synchronous pre-start plan for one exact request, or `None` when the tool is
+    /// unknown or this ToolSet carries no executor: the caller then settles the identity-bound
+    /// unavailable PreExecution result without ever consulting a start gate.
+    pub(crate) fn plan(&self, request: &ToolExecutionRequest) -> Option<ToolExecutionPlan> {
+        let executor = self.inner.executor.as_ref()?;
         if !self
             .inner
             .definitions
             .iter()
             .any(|definition| definition.name() == request.call().name())
         {
-            return ToolExecutionOutcome::Completed {
-                item_id,
-                tool_call_id,
-                source: ToolOutcomeSource::PreExecution,
-                disposition: ToolResultDisposition::Failed,
-                content: ToolResultContent::tool_unavailable(),
-            };
+            return None;
         }
-        let Some(executor) = self.inner.executor.as_ref() else {
-            return ToolExecutionOutcome::Completed {
-                item_id,
-                tool_call_id,
-                source: ToolOutcomeSource::PreExecution,
-                disposition: ToolResultDisposition::Failed,
-                content: ToolResultContent::tool_unavailable(),
-            };
-        };
-        let result = executor(request.clone()).await;
+        Some(executor(request.clone()))
+    }
+
+    /// The identity-bound unavailable outcome: unknown tool or no executor.  No start-gate
+    /// permit is involved.
+    pub(crate) fn unavailable_outcome(request: &ToolExecutionRequest) -> ToolExecutionOutcome {
+        ToolExecutionOutcome::Completed {
+            item_id: request.item_id(),
+            tool_call_id: request.call().tool_call_id().clone(),
+            source: ToolOutcomeSource::PreExecution,
+            disposition: ToolResultDisposition::Failed,
+            content: ToolResultContent::tool_unavailable(),
+        }
+    }
+
+    /// The identity-bound cancelled-before-start outcome for one exact request.  Generated by
+    /// the Tools owner when the start reservation loses to a signal (or a stale basis): the
+    /// executor is never polled, so the round still records a matching PreExecution Cancelled
+    /// ToolResult instead of abandoning the whole exchange.
+    pub(crate) fn cancelled_before_start_outcome(
+        request: &ToolExecutionRequest,
+    ) -> ToolExecutionOutcome {
+        ToolExecutionOutcome::Completed {
+            item_id: request.item_id(),
+            tool_call_id: request.call().tool_call_id().clone(),
+            source: ToolOutcomeSource::PreExecution,
+            disposition: ToolResultDisposition::Cancelled,
+            content: ToolResultContent::cancelled_before_start(),
+        }
+    }
+
+    /// Runs one already-started execution to its identity-bound outcome.
+    ///
+    /// The typed proof is the only entrance to the started path: it is constructed only by a
+    /// successful Reserved→Started transition and binds the exact started request capture.
+    /// A foreign proof (one whose exact capture is not `request`) is an invariant that fails
+    /// closed to identity-bound Abandoned RuntimeFailure with the future dropped unpolled.
+    ///
+    /// The future is awaited directly: every production caller settles inside its
+    /// per-request outer settle task, whose join converts a panicking executor to the exact
+    /// Abandoned RuntimeFailure, so the started path spawns no detached task of its own.
+    pub(crate) async fn run_started_execution(
+        &self,
+        request: &ToolExecutionRequest,
+        proof: ToolStartedExecution,
+        future: ToolExecutionFuture,
+    ) -> ToolExecutionOutcome {
+        if !request.is_exact_capture(proof.request()) {
+            return abandoned_runtime_failure(request);
+        }
+        Self::bind_started_result(request, future.await)
+    }
+
+    /// The pre-start settlement decision for one resolved Interaction.
+    ///
+    /// `Resume` means the host allowed: the caller must revalidate the exact request's start
+    /// gate and only then execute the allowed future.  Deny and owner cancellation never
+    /// reserve the gate; they settle the exact denied (or cancelled) PreExecution result
+    /// directly.
+    pub(crate) fn interaction_settlement(
+        resolution: &ResolvedInteraction,
+        denied: &ToolExecutionResult,
+    ) -> InteractionSettlement {
+        match resolution.live() {
+            InteractionResolution::ToolApproval(ToolApprovalDecision::Deny) => {
+                InteractionSettlement::PreExecution(denied.clone())
+            }
+            InteractionResolution::Cancelled(_) => {
+                InteractionSettlement::PreExecution(Self::cancelled_result(denied.clone()))
+            }
+            InteractionResolution::ToolApproval(_) | InteractionResolution::UserAnswer(_) => {
+                InteractionSettlement::Resume
+            }
+        }
+    }
+
+    /// Binds one exact started executor result to its identity-bound outcome.  Only the
+    /// typed started-proof path may call this: the proof revalidated the exact capture, so a
+    /// `Completed` result truthfully maps to an Executed outcome.  A `Denied` Completed shape
+    /// and a `PreExecution` shape after start are invariants that fail closed to Abandoned
+    /// OutcomeUnknown.
+    fn bind_started_result(
+        request: &ToolExecutionRequest,
+        result: ToolExecutionResult,
+    ) -> ToolExecutionOutcome {
+        let item_id = request.item_id();
+        let tool_call_id = request.call().tool_call_id().clone();
         match result {
             ToolExecutionResult::Completed {
                 disposition: ToolResultDisposition::Denied,
@@ -418,6 +763,37 @@ impl ToolSet {
                 disposition,
                 content,
             },
+            ToolExecutionResult::PreExecution { .. } => ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: ToolAbandonReason::OutcomeUnknown,
+            },
+            ToolExecutionResult::Abandoned { reason } => ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason,
+            },
+        }
+    }
+
+    /// Binds one exact pre-execution result to its identity-bound outcome without any start
+    /// proof: a frozen preflight result, an Interaction deny/owner-cancellation, or the
+    /// cancelled-before-start settlement.  The executor was never polled, so a `PreExecution`
+    /// shape truthfully maps to a PreExecution outcome; a malformed `Completed` shape
+    /// (including Denied) is an invariant that fails closed to Abandoned OutcomeUnknown so a
+    /// never-started operation can never be disguised as an executed ToolResult.
+    pub(crate) fn bind_preexecution_result(
+        request: &ToolExecutionRequest,
+        result: ToolExecutionResult,
+    ) -> ToolExecutionOutcome {
+        let item_id = request.item_id();
+        let tool_call_id = request.call().tool_call_id().clone();
+        match result {
+            ToolExecutionResult::Completed { .. } => ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: ToolAbandonReason::OutcomeUnknown,
+            },
             ToolExecutionResult::PreExecution {
                 disposition,
                 content,
@@ -428,47 +804,12 @@ impl ToolSet {
                 disposition,
                 content,
             },
-            ToolExecutionResult::Interaction {
-                request_id,
-                request,
-                allowed,
-                denied,
-            } => {
-                let (resolution_sender, resolution_receiver) = oneshot::channel();
-                ToolExecutionOutcome::Interaction {
-                    item_id,
-                    tool_call_id,
-                    request_id,
-                    request,
-                    resolution_sender,
-                    resolution_receiver,
-                    allowed,
-                    denied,
-                }
-            }
             ToolExecutionResult::Abandoned { reason } => ToolExecutionOutcome::Abandoned {
                 item_id,
                 tool_call_id,
                 reason,
             },
         }
-    }
-
-    pub(crate) fn settle_interaction(
-        item_id: ItemId,
-        tool_call_id: ToolCallId,
-        allowed: ToolExecutionResult,
-        denied: ToolExecutionResult,
-        resolution: ResolvedInteraction,
-    ) -> ToolExecutionOutcome {
-        let result = match resolution.live() {
-            InteractionResolution::ToolApproval(ToolApprovalDecision::Deny) => denied,
-            InteractionResolution::Cancelled(_) => Self::cancelled_result(denied),
-            InteractionResolution::ToolApproval(_) | InteractionResolution::UserAnswer(_) => {
-                allowed
-            }
-        };
-        Self::bind_result(item_id, tool_call_id, result)
     }
 
     fn cancelled_result(result: ToolExecutionResult) -> ToolExecutionResult {
@@ -480,103 +821,8 @@ impl ToolSet {
                     content,
                 }
             }
-            ToolExecutionResult::Interaction { .. } | ToolExecutionResult::Abandoned { .. } => {
-                result
-            }
+            ToolExecutionResult::Abandoned { reason } => ToolExecutionResult::Abandoned { reason },
         }
-    }
-
-    fn bind_result(
-        item_id: ItemId,
-        tool_call_id: ToolCallId,
-        result: ToolExecutionResult,
-    ) -> ToolExecutionOutcome {
-        match result {
-            ToolExecutionResult::Completed {
-                disposition: ToolResultDisposition::Denied,
-                content: _,
-            }
-            | ToolExecutionResult::Interaction { .. } => ToolExecutionOutcome::Abandoned {
-                item_id,
-                tool_call_id,
-                reason: ToolAbandonReason::OutcomeUnknown,
-            },
-            ToolExecutionResult::Completed {
-                disposition,
-                content,
-            } => ToolExecutionOutcome::Completed {
-                item_id,
-                tool_call_id,
-                source: ToolOutcomeSource::Executed,
-                disposition,
-                content,
-            },
-            ToolExecutionResult::PreExecution {
-                disposition,
-                content,
-            } => ToolExecutionOutcome::Completed {
-                item_id,
-                tool_call_id,
-                source: ToolOutcomeSource::PreExecution,
-                disposition,
-                content,
-            },
-            ToolExecutionResult::Abandoned { reason } => ToolExecutionOutcome::Abandoned {
-                item_id,
-                tool_call_id,
-                reason,
-            },
-        }
-    }
-
-    pub(crate) async fn execute_round(
-        &self,
-        mut calls: Vec<ToolExecutionRequest>,
-    ) -> Vec<ToolExecutionOutcome> {
-        calls.sort_by_key(|call| call.call().call_index());
-        let is_serial = calls.iter().any(|call| {
-            self.inner
-                .definitions
-                .iter()
-                .find(|definition| definition.name() == call.call().name())
-                .is_some_and(|definition| definition.mode() == ToolExecutionMode::Serial)
-        });
-        if is_serial {
-            let mut results = Vec::with_capacity(calls.len());
-            for call in calls {
-                let (item_id, tool_call_id, join) = self.spawn_execution(call);
-                results.push(settle_execution(item_id, tool_call_id, join).await);
-            }
-            return results;
-        }
-
-        let mut joins = Vec::with_capacity(calls.len());
-        for call in calls {
-            joins.push(self.spawn_execution(call));
-        }
-        let mut results = Vec::with_capacity(joins.len());
-        for (item_id, tool_call_id, join) in joins {
-            results.push(settle_execution(item_id, tool_call_id, join).await);
-        }
-        results
-    }
-
-    fn spawn_execution(
-        &self,
-        request: ToolExecutionRequest,
-    ) -> (
-        ItemId,
-        ToolCallId,
-        tokio::task::JoinHandle<ToolExecutionOutcome>,
-    ) {
-        let item_id = request.item_id();
-        let tool_call_id = request.call().tool_call_id().clone();
-        let set = self.clone();
-        (
-            item_id,
-            tool_call_id,
-            tokio::spawn(async move { set.execute(request).await }),
-        )
     }
 
     pub(crate) fn prompt_view(&self) -> ToolPromptView {
@@ -590,19 +836,14 @@ impl ToolSet {
     }
 }
 
-async fn settle_execution(
-    item_id: ItemId,
-    tool_call_id: ToolCallId,
-    join: tokio::task::JoinHandle<ToolExecutionOutcome>,
-) -> ToolExecutionOutcome {
-    match join.await {
-        Ok(result) => result,
-        Err(_) => ToolExecutionOutcome::Abandoned {
-            item_id,
-            tool_call_id,
-            reason: ToolAbandonReason::RuntimeFailure,
-        },
-    }
+/// The pre-start settlement decision for one resolved Interaction.
+pub(crate) enum InteractionSettlement {
+    /// The host allowed: resume through the exact request's start gate and only then execute
+    /// the allowed future.
+    Resume,
+    /// The host denied or owner-cancelled: settle as pre-execution without any start-gate
+    /// reservation.
+    PreExecution(ToolExecutionResult),
 }
 
 #[allow(
@@ -683,6 +924,16 @@ impl ToolResultContent {
         Self {
             parts: Arc::from([ToolResultContentPart::Text(ToolResultText(Arc::from(
                 "tool is unavailable",
+            )))]),
+        }
+    }
+
+    /// The bounded generic content for one exact tool that was cancelled before its start
+    /// gate reservation: the executor was never polled, so no domain content exists.
+    fn cancelled_before_start() -> Self {
+        Self {
+            parts: Arc::from([ToolResultContentPart::Text(ToolResultText(Arc::from(
+                "tool did not start",
             )))]),
         }
     }
@@ -1689,12 +1940,69 @@ fn strictly_increasing(values: impl IntoIterator<Item = u32>) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
-    use crate::turn_item_interaction::InteractionCancelReason;
+    use crate::turn_item_interaction::{InteractionCancelReason, InteractionResolutionInput};
+
+    async fn run_planned_execution(
+        set: Arc<ToolSet>,
+        request: ToolExecutionRequest,
+    ) -> ToolExecutionOutcome {
+        let ToolExecutionPlan::Execute(future) = set
+            .plan(&request)
+            .expect("a known tool produces an execution plan")
+        else {
+            panic!("unexpected interaction plan");
+        };
+        let proof = ToolStartGate::new(request.clone())
+            .reserve(&request)
+            .expect("the exact request reserves its gate")
+            .start()
+            .expect("the reserved gate starts");
+        // The production started path settles inside a per-request outer settle task whose
+        // join isolates a panicking executor; direct tests reproduce that isolation with one
+        // spawn of their own.
+        let outcome = tokio::spawn({
+            let request = request.clone();
+            async move { set.run_started_execution(&request, proof, future).await }
+        })
+        .await;
+        match outcome {
+            Ok(outcome) => outcome,
+            Err(_) => abandoned_runtime_failure(&request),
+        }
+    }
+
+    /// Runs one scripted result through the exact proof path: fresh gate, exact reservation,
+    /// typed started proof, then the started binding, isolated by one spawn like the
+    /// per-request outer settle task.
+    async fn run_started_with(
+        set: Arc<ToolSet>,
+        request: ToolExecutionRequest,
+        result: ToolExecutionResult,
+    ) -> ToolExecutionOutcome {
+        let proof = ToolStartGate::new(request.clone())
+            .reserve(&request)
+            .expect("the exact request reserves its gate")
+            .start()
+            .expect("the reserved gate starts");
+        let outcome = tokio::spawn({
+            let request = request.clone();
+            async move {
+                set.run_started_execution(&request, proof, Box::pin(async move { result }))
+                    .await
+            }
+        })
+        .await;
+        match outcome {
+            Ok(outcome) => outcome,
+            Err(_) => abandoned_runtime_failure(&request),
+        }
+    }
 
     #[tokio::test]
-    async fn captured_tool_set_executes_only_known_tools() {
+    async fn captured_tool_set_plans_only_known_tools_and_binds_exact_results() {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let observed_by_executor = Arc::clone(&observed);
         let set = ToolSet::with_executor(
@@ -1721,17 +2029,16 @@ mod tests {
             },
         );
 
-        let outcome = set
-            .execute(ToolExecutionRequest::new(
-                "itm_00000000000000000000000000000001".parse().unwrap(),
-                ToolCall::new(
-                    "call_1".parse().unwrap(),
-                    "echo".parse().unwrap(),
-                    "{\"value\":1}".parse().unwrap(),
-                    0,
-                ),
-            ))
-            .await;
+        let known = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000001".parse().unwrap(),
+            ToolCall::new(
+                "call_1".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{\"value\":1}".parse().unwrap(),
+                0,
+            ),
+        );
+        let outcome = run_planned_execution(Arc::clone(&set), known).await;
         assert!(matches!(
             outcome,
             ToolExecutionOutcome::Completed {
@@ -1752,19 +2059,19 @@ mod tests {
             )]
         );
 
-        let unknown = set
-            .execute(ToolExecutionRequest::new(
-                "itm_00000000000000000000000000000002".parse().unwrap(),
-                ToolCall::new(
-                    "call_2".parse().unwrap(),
-                    "missing".parse().unwrap(),
-                    "{}".parse().unwrap(),
-                    0,
-                ),
-            ))
-            .await;
+        let unknown = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000002".parse().unwrap(),
+            ToolCall::new(
+                "call_2".parse().unwrap(),
+                "missing".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        assert!(set.plan(&unknown).is_none());
+        let unknown_outcome = ToolSet::unavailable_outcome(&unknown);
         assert!(matches!(
-            unknown,
+            unknown_outcome,
             ToolExecutionOutcome::Completed {
                 item_id,
                 ref tool_call_id,
@@ -1779,60 +2086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_round_preserves_call_order_for_parallel_execution() {
-        let set = ToolSet::with_executor(
-            vec![
-                ToolDefinition::new(
-                    "echo".parse().unwrap(),
-                    "Echo a bounded JSON request",
-                    "{}".parse().unwrap(),
-                    ToolExecutionMode::Parallel,
-                )
-                .unwrap(),
-            ],
-            |request| {
-                Box::pin(async move {
-                    ToolExecutionResult::completed_text(request.call().tool_call_id().as_str())
-                        .unwrap()
-                })
-            },
-        );
-        let results = set
-            .execute_round(
-                [("call_c", 2_u32), ("call_a", 0), ("call_b", 1)]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(item_index, (id, call_index))| {
-                        ToolExecutionRequest::new(
-                            format!("itm_{:032x}", item_index + 1).parse().unwrap(),
-                            ToolCall::new(
-                                id.parse().unwrap(),
-                                "echo".parse().unwrap(),
-                                "{}".parse().unwrap(),
-                                call_index,
-                            ),
-                        )
-                    })
-                    .collect(),
-            )
-            .await;
-        let contents = results
-            .into_iter()
-            .map(|result| match result {
-                ToolExecutionOutcome::Completed { content, .. } => {
-                    content.parts()[0].as_text().to_owned()
-                }
-                ToolExecutionOutcome::Interaction { .. } => {
-                    panic!("unexpected interaction result")
-                }
-                ToolExecutionOutcome::Abandoned { .. } => panic!("unexpected abandoned result"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(contents, ["call_a", "call_b", "call_c"]);
-    }
-
-    #[tokio::test]
-    async fn tool_round_maps_executor_panics_to_identity_bound_abandoned_outcomes() {
+    async fn started_executor_panics_map_to_identity_bound_abandoned_outcomes() {
         for mode in [ToolExecutionMode::Parallel, ToolExecutionMode::Serial] {
             let set = ToolSet::with_executor(
                 vec![
@@ -1847,25 +2101,23 @@ mod tests {
                 |_| Box::pin(async { panic!("scripted executor panic") }),
             );
             let item_id = "itm_00000000000000000000000000000009".parse().unwrap();
-            let results = set
-                .execute_round(vec![ToolExecutionRequest::new(
-                    item_id,
-                    ToolCall::new(
-                        "call_panic".parse().unwrap(),
-                        "echo".parse().unwrap(),
-                        "{}".parse().unwrap(),
-                        0,
-                    ),
-                )])
-                .await;
-
+            let request = ToolExecutionRequest::new(
+                item_id,
+                ToolCall::new(
+                    "call_panic".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    0,
+                ),
+            );
+            let outcome = run_planned_execution(Arc::clone(&set), request).await;
             assert!(matches!(
-                results.as_slice(),
-                [ToolExecutionOutcome::Abandoned {
+                outcome,
+                ToolExecutionOutcome::Abandoned {
                     item_id: actual_item_id,
                     tool_call_id,
                     reason: ToolAbandonReason::RuntimeFailure,
-                }] if *actual_item_id == item_id && tool_call_id.as_str() == "call_panic"
+                } if actual_item_id == item_id && tool_call_id.as_str() == "call_panic"
             ));
         }
     }
@@ -1893,17 +2145,16 @@ mod tests {
             },
         );
         let item_id = "itm_0000000000000000000000000000000a".parse().unwrap();
-        let outcome = set
-            .execute(ToolExecutionRequest::new(
-                item_id,
-                ToolCall::new(
-                    "call_denied".parse().unwrap(),
-                    "echo".parse().unwrap(),
-                    "{}".parse().unwrap(),
-                    0,
-                ),
-            ))
-            .await;
+        let request = ToolExecutionRequest::new(
+            item_id,
+            ToolCall::new(
+                "call_denied".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        let outcome = run_planned_execution(Arc::clone(&set), request).await;
         assert!(matches!(
             outcome,
             ToolExecutionOutcome::Abandoned {
@@ -1914,29 +2165,445 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn cancelled_interaction_is_a_pre_execution_cancelled_result() {
-        let item_id = "itm_0000000000000000000000000000000b".parse().unwrap();
-        let tool_call_id = "call_cancelled".parse().unwrap();
-        let content = ToolResultContent::from_text_parts(vec!["cancelled".to_owned()]).unwrap();
-        let outcome = ToolSet::settle_interaction(
-            item_id,
-            tool_call_id,
-            ToolExecutionResult::completed_text("allowed").unwrap(),
-            ToolExecutionResult::PreExecution {
-                disposition: ToolResultDisposition::Denied,
-                content,
-            },
-            ResolvedInteraction::cancelled_by_owner(InteractionCancelReason::TurnCancelled)
-                .unwrap(),
+    #[tokio::test]
+    async fn started_binding_fails_closed_on_untruthful_shapes_through_the_typed_proof() {
+        // The started binding is only reachable through the typed proof: a fresh gate, an
+        // exact reservation, and a successful Reserved→Started transition.
+        let set = ToolSet::empty();
+        let request = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000001".parse().unwrap(),
+            ToolCall::new(
+                "call_1".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
         );
+        assert!(matches!(
+            run_started_with(Arc::clone(&set), request.clone(), ToolExecutionResult::completed_text("ran").unwrap()).await,
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: ToolResultDisposition::Succeeded,
+                ..
+            } if item_id == request.item_id()
+                && tool_call_id == *request.call().tool_call_id()
+        ));
+        // A Denied Completed shape is never a truthful started result.
+        assert!(matches!(
+            run_started_with(Arc::clone(&set), request.clone(), ToolExecutionResult::Completed {
+                disposition: ToolResultDisposition::Denied,
+                content: ToolResultContent::from_text_parts(vec!["denied".to_owned()]).unwrap(),
+            })
+            .await,
+            ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: ToolAbandonReason::OutcomeUnknown,
+            } if item_id == request.item_id()
+                && tool_call_id == *request.call().tool_call_id()
+        ));
+        // A PreExecution shape after start is an invariant: a started operation can never be
+        // disguised as pre-execution.
+        assert!(matches!(
+            run_started_with(Arc::clone(&set), request.clone(), ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Denied,
+                content: ToolResultContent::from_text_parts(vec!["denied".to_owned()]).unwrap(),
+            })
+            .await,
+            ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: ToolAbandonReason::OutcomeUnknown,
+            } if item_id == request.item_id()
+                && tool_call_id == *request.call().tool_call_id()
+        ));
+        // An Abandoned result passes through unchanged.
+        assert!(matches!(
+            run_started_with(Arc::clone(&set), request.clone(), ToolExecutionResult::Abandoned {
+                reason: ToolAbandonReason::RuntimeFailure,
+            })
+            .await,
+            ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: ToolAbandonReason::RuntimeFailure,
+            } if item_id == request.item_id()
+                && tool_call_id == *request.call().tool_call_id()
+        ));
+    }
+
+    #[tokio::test]
+    async fn foreign_started_proof_never_polls_the_future_and_fails_closed_identity_bound() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let polled_by_future = Arc::clone(&polled);
+        let set = ToolSet::empty();
+        let request = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000001".parse().unwrap(),
+            ToolCall::new(
+                "call_1".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        // A foreign request carrying the same ids but a different capture: the proof is bound
+        // to the started gate's exact capture, so this request is not that capture.
+        let foreign = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000001".parse().unwrap(),
+            ToolCall::new(
+                "call_1".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        assert!(!request.is_exact_capture(&foreign));
+        let proof = ToolStartGate::new(request.clone())
+            .reserve(&request)
+            .expect("the exact request reserves its gate")
+            .start()
+            .expect("the reserved gate starts");
+        let outcome = set
+            .run_started_execution(
+                &foreign,
+                proof,
+                Box::pin(async move {
+                    polled_by_future.store(true, Ordering::Release);
+                    ToolExecutionResult::completed_text("must not run").unwrap()
+                }),
+            )
+            .await;
+        // The foreign proof fails closed to the identity-bound Abandoned RuntimeFailure and
+        // the future was never polled: no foreign proof can drive a future to an executed
+        // outcome.
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: ToolAbandonReason::RuntimeFailure,
+            } if item_id == foreign.item_id()
+                && tool_call_id == *foreign.call().tool_call_id()
+        ));
+        assert!(!polled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn preexecution_binding_fails_closed_on_malformed_completed_shapes() {
+        let request = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000001".parse().unwrap(),
+            ToolCall::new(
+                "call_1".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        let pre = ToolExecutionResult::PreExecution {
+            disposition: ToolResultDisposition::Denied,
+            content: ToolResultContent::from_text_parts(vec!["denied".to_owned()]).unwrap(),
+        };
+        assert!(matches!(
+            ToolSet::bind_preexecution_result(&request, pre),
+            ToolExecutionOutcome::Completed {
+                source: ToolOutcomeSource::PreExecution,
+                disposition: ToolResultDisposition::Denied,
+                ..
+            }
+        ));
+        // A malformed Completed shape (including Denied) without a start proof is an
+        // invariant: it fails closed to Abandoned OutcomeUnknown instead of fabricating an
+        // Executed outcome.
+        for malformed in [
+            ToolExecutionResult::completed_text("ran").unwrap(),
+            ToolExecutionResult::Completed {
+                disposition: ToolResultDisposition::Denied,
+                content: ToolResultContent::from_text_parts(vec!["denied".to_owned()]).unwrap(),
+            },
+        ] {
+            assert!(matches!(
+                ToolSet::bind_preexecution_result(&request, malformed),
+                ToolExecutionOutcome::Abandoned {
+                    reason: ToolAbandonReason::OutcomeUnknown,
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            ToolSet::bind_preexecution_result(
+                &request,
+                ToolExecutionResult::Abandoned {
+                    reason: ToolAbandonReason::RuntimeFailure,
+                },
+            ),
+            ToolExecutionOutcome::Abandoned {
+                reason: ToolAbandonReason::RuntimeFailure,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pre_execution_plan_settles_without_reserving_the_start_gate_or_polling_an_executor() {
+        for (disposition, text) in [
+            (ToolResultDisposition::Denied, "policy preflight denied"),
+            (ToolResultDisposition::Failed, "schema preflight failed"),
+        ] {
+            let preflight = ToolExecutionResult::PreExecution {
+                disposition,
+                content: ToolResultContent::from_text_parts(vec![text.to_owned()]).unwrap(),
+            };
+            let set = ToolSet::with_interaction_planner(
+                vec![
+                    ToolDefinition::new(
+                        "echo".parse().unwrap(),
+                        "Echo a bounded JSON request",
+                        "{}".parse().unwrap(),
+                        ToolExecutionMode::Serial,
+                    )
+                    .unwrap(),
+                ],
+                move |_| ToolExecutionPlan::PreExecution(preflight.clone()),
+            );
+            let request = ToolExecutionRequest::new(
+                "itm_0000000000000000000000000000000b".parse().unwrap(),
+                ToolCall::new(
+                    "call_preflight".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    0,
+                ),
+            );
+            let Some(ToolExecutionPlan::PreExecution(result)) = set.plan(&request) else {
+                panic!("a known tool with a frozen preflight produces a PreExecution plan");
+            };
+            // The PreExecution plan carries no executor future, so settlement can never poll
+            // one; bind it exactly the way settle_one_plan does, under the pre-execution
+            // binding.
+            let outcome = ToolSet::bind_preexecution_result(&request, result);
+            assert!(matches!(
+                outcome,
+                ToolExecutionOutcome::Completed {
+                    item_id,
+                    ref tool_call_id,
+                    source: ToolOutcomeSource::PreExecution,
+                    disposition: actual_disposition,
+                    ..
+                } if item_id == request.item_id()
+                    && tool_call_id == request.call().tool_call_id()
+                    && actual_disposition == disposition
+            ));
+            // No reservation happened: the exact request's gate still accepts its single
+            // reservation and start.
+            let gate = ToolStartGate::new(request.clone());
+            assert!(gate.reserve(&request).unwrap().start().is_ok());
+        }
+    }
+
+    #[test]
+    fn interaction_settlement_denies_and_cancels_without_resume_and_allows_resume() {
+        let interaction = InteractionRequest::tool_approval(live_approval_request_fixture());
+        let denied_result = ToolExecutionResult::PreExecution {
+            disposition: ToolResultDisposition::Denied,
+            content: ToolResultContent::from_text_parts(vec!["approval denied".to_owned()])
+                .unwrap(),
+        };
+        let denied = interaction
+            .resolve_host(InteractionResolutionInput::ToolApproval(
+                ToolApprovalDecisionInput::Deny,
+            ))
+            .unwrap();
+        let cancelled =
+            ResolvedInteraction::cancelled_by_owner(InteractionCancelReason::TurnCancelled)
+                .unwrap();
+        let allowed = interaction
+            .resolve_host(InteractionResolutionInput::ToolApproval(
+                ToolApprovalDecisionInput::Allow { option_index: 0 },
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            ToolSet::interaction_settlement(&denied, &denied_result),
+            InteractionSettlement::PreExecution(result)
+                if matches!(result, ToolExecutionResult::PreExecution {
+                    disposition: ToolResultDisposition::Denied,
+                    ..
+                })
+        ));
+        assert!(matches!(
+            ToolSet::interaction_settlement(&cancelled, &denied_result),
+            InteractionSettlement::PreExecution(result)
+                if matches!(result, ToolExecutionResult::PreExecution {
+                    disposition: ToolResultDisposition::Cancelled,
+                    ..
+                })
+        ));
+        assert!(matches!(
+            ToolSet::interaction_settlement(&allowed, &denied_result),
+            InteractionSettlement::Resume
+        ));
+    }
+
+    #[test]
+    fn tool_start_gate_reserves_once_starts_once_and_rejects_foreign_or_duplicate_requests() {
+        let item_id = "itm_00000000000000000000000000000001".parse().unwrap();
+        let request = ToolExecutionRequest::new(
+            item_id,
+            ToolCall::new(
+                "call_1".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        let gate = ToolStartGate::new(request.clone());
+        assert_eq!(format!("{gate:?}"), "ToolStartGate { .. }");
+
+        let permit = gate.reserve(&request).unwrap();
+        assert_eq!(format!("{permit:?}"), "ToolStartPermit { .. }");
+        // The single reserve entry cannot be reserved twice.
+        assert!(matches!(
+            gate.reserve(&request),
+            Err(ToolStartError::InvalidBinding)
+        ));
+        let proof = permit.start().unwrap();
+        assert_eq!(format!("{proof:?}"), "ToolStartedExecution { .. }");
+        // The started gate is closed: a later reservation is a duplicate/after-start invariant.
+        assert!(matches!(
+            gate.reserve(&request),
+            Err(ToolStartError::InvalidBinding)
+        ));
+
+        // A foreign request carrying the same ids but a different capture fails the invariant.
+        let foreign = ToolExecutionRequest::new(
+            item_id,
+            ToolCall::new(
+                "call_1".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        assert!(!request.is_exact_capture(&foreign));
+        assert!(matches!(
+            gate.reserve(&foreign),
+            Err(ToolStartError::InvalidBinding)
+        ));
+
+        let other_item = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000002".parse().unwrap(),
+            ToolCall::new(
+                "call_1".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        assert!(matches!(
+            gate.reserve(&other_item),
+            Err(ToolStartError::InvalidBinding)
+        ));
+    }
+
+    #[test]
+    fn unused_tool_start_permit_rolls_back_the_reservation() {
+        let request = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000003".parse().unwrap(),
+            ToolCall::new(
+                "call_rollback".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        let gate = ToolStartGate::new(request.clone());
+        drop(gate.reserve(&request).unwrap());
+        assert!(gate.reserve(&request).unwrap().start().is_ok());
+    }
+
+    #[test]
+    fn cancelled_before_start_gate_never_polls_the_executor_and_generates_matching_outcome() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let polled_by_executor = Arc::clone(&polled);
+        let set = ToolSet::with_executor(
+            vec![
+                ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON request",
+                    "{}".parse().unwrap(),
+                    ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            move |_| {
+                let polled = Arc::clone(&polled_by_executor);
+                Box::pin(async move {
+                    polled.store(true, Ordering::Release);
+                    ToolExecutionResult::completed_text("must not run").unwrap()
+                })
+            },
+        );
+        let request = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000004".parse().unwrap(),
+            ToolCall::new(
+                "call_signal_first".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        assert!(matches!(
+            set.plan(&request),
+            Some(ToolExecutionPlan::Execute(_))
+        ));
+        let gate = ToolStartGate::new(request.clone());
+        assert!(gate.cancel_before_start());
+        assert!(!gate.cancel_before_start());
+        assert!(matches!(
+            gate.reserve(&request),
+            Err(ToolStartError::CancelledBeforeStart)
+        ));
+        let outcome = ToolSet::cancelled_before_start_outcome(&request);
         assert!(matches!(
             outcome,
             ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
                 source: ToolOutcomeSource::PreExecution,
                 disposition: ToolResultDisposition::Cancelled,
-                ..
-            }
+                ref content,
+            } if item_id == request.item_id()
+                && tool_call_id == *request.call().tool_call_id()
+                && content.parts()[0].as_text() == "tool did not start"
+        ));
+        // The plan was created synchronously but its executor future was never polled.
+        assert!(!polled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancelled_gate_keeps_an_outstanding_permit_closed_after_start_attempt() {
+        let request = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000005".parse().unwrap(),
+            ToolCall::new(
+                "call_cancelled_permit".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        let gate = ToolStartGate::new(request.clone());
+        let permit = gate.reserve(&request).unwrap();
+        assert!(gate.cancel_before_start());
+        assert!(matches!(
+            permit.start(),
+            Err(ToolStartError::CancelledBeforeStart)
+        ));
+        // The consumed permit cannot roll a Cancelled gate back to Prepared.
+        assert!(matches!(
+            gate.reserve(&request),
+            Err(ToolStartError::CancelledBeforeStart)
         ));
     }
 
