@@ -2,7 +2,7 @@
 
 ## 换机交接（2026-08-11）
 
-当前开发分支是`dev`。M12 Production Provider Gate（V4-P1-3）已完成；Rig 0.40.0已因真实Rust 1.85冷编译失败被拒绝进入production baseline，协议证据保留在standalone `provider-gate/` package。换机后执行`git switch dev && git pull --ff-only origin dev`，再用`git status --short --branch`确认工作树。与本任务无关的`stash@{0}: On refactor/async-loop-eventual-session-log: wip: paused bounded JSON implementation before dev merge`仍保留，不要自动apply/drop。
+当前开发分支是`dev`。M12 Production Provider Gate（V4-P1-3）已完成；accepted implementation HEAD为`476287d fix: isolate Rig from Rust 1.85 baseline`。Rig 0.40.0已因真实Rust 1.85冷编译失败被拒绝进入production baseline，协议证据保留在standalone `provider-gate/` package。换机后执行`git switch dev && git pull --ff-only origin dev`，再用`git status --short --branch`确认工作树。与本任务无关的`stash@{0}: On refactor/async-loop-eventual-session-log: wip: paused bounded JSON implementation before dev merge`仍保留，不要自动apply/drop。
 
 M12 checkpoint series：
 
@@ -14,7 +14,8 @@ M12 checkpoint series：
 - `d38d8ed test: preserve Rig response metadata evidence`；
 - `096cce1 test: freeze provider error delivery matrix`；
 - `64228e8 test: probe Rig provider error envelopes`。
-- `16fa1c8 docs: close M12 provider gate`。
+- `16fa1c8 docs: close M12 provider gate`；
+- `476287d fix: isolate Rig from Rust 1.85 baseline`。
 
 已冻结的production baseline：
 
@@ -28,7 +29,7 @@ M12 checkpoint series：
 - queued Steer在retry backoff只排队、不改变revision；safe point成功apply后才使旧basis失效；Gateway继续无local route/model/principal permits；
 - ADR 0138/0139 Accepted：协议合同继续有效，M14不实现`RigProviderAdapter`，改为`OpenAiResponsesProviderAdapter`与`AnthropicMessagesProviderAdapter`直接拥有各自HTTP/SSE、terminal、metadata与typed error mapping；第四轮全部普通P0/P1 Closed，仅V4-C0-1继续门禁production Tool/Sandbox adapter。
 
-最终本地门禁已通过：`./scripts/check.sh`运行主crate748个library tests（3 ignored）、160个integration tests及standalone provider-gate 25个tests；`./scripts/check-msrv.sh`显式锁定真实Rust 1.85 compiler并在隔离target运行主crate全部targets，结果为748个library tests（3 ignored）与160个integration tests。Clippy、format、current/archive docs、Wire V1 144 active/0 pending与Durable Store fixtures通过。最新架构转向commit push后，remote acceptance仍需等待Ubuntu stable、Rust 1.85、macOS和Windows四个CI job全部success。
+最终本地门禁已通过：`./scripts/check.sh`运行主crate748个library tests（3 ignored）、160个integration tests及standalone provider-gate 25个tests；`./scripts/check-msrv.sh`显式锁定真实Rust 1.85 compiler并在隔离target运行主crate全部targets，结果为748个library tests（3 ignored）与160个integration tests。Clippy、format、current/archive docs、Wire V1 144 active/0 pending与Durable Store fixtures通过。GitHub Actions run `31503035476`对应`476287d`，Ubuntu stable、Rust 1.85、macOS与Windows四个job全部success。
 
 未实现边界不要误判为回归：M12没有实现production provider adapter、credential/client factory、connection/cache/continuation或provider-native Structured schema mapping；这些属于M14。production ask-user builtin的ToolName、input schema和answer→model-visible ToolResult text/render格式仍未冻结；production ToolService/executor/adapters、完整schema/hooks/policy/Sandbox/permission enforcement、Session-local mutation queue/mutation permit、public Tool DTO、具体Prompt/Skill source与Skill composition仍pending。没有真实producer前，不要伪造`DurableStateCorrupt`/`DurableStateTooLarge` loaded readiness；没有production file Tool/canonical target consumer前，不要先造mutation queue；Prompt/Skill authoring grammar与Runtime consumer未冻结前，不要实现filesystem adapter。
 
