@@ -166,7 +166,7 @@ pub enum WorkspaceInputError {
 }
 ```
 
-`WorkspaceRootInput::new(...)`与`WorkspaceDefinitionInput::new(primary, additional, cwd)`是公开validated constructors，后者固定使用V1 hard maxima；fields只通过read-only accessors暴露。绑定selected `WireV1Codec`的crate-internal projection使用`WorkspaceDefinitionInput::new_with_limits(..., selected_limits)`，外部caller不能提供放宽hard maxima的limits。`CanonicalFileUri`是Wire-owned shared typed carrier；两个input type仍由Workspace owner构造并验证。它们不是Wire shadow DTO，也不进入durable SessionDefinition。aggregate constructor验证root count、duplicate key、duplicate canonical URI、cwd root引用以及applicable hard/selected absolute/relative path limits；不访问filesystem。constructor失败时typed `RuntimeCommand`尚未形成，属于input decode/validation failure；它不产生`CommandCompletion::Rejected`。
+`WorkspaceRootInput::new(...)`与`WorkspaceDefinitionInput::new(primary, additional, cwd)`是公开validated constructors，后者固定使用V1 hard maxima；fields只通过read-only accessors暴露。绑定selected `WireV1Codec`的crate-internal projection使用`WorkspaceDefinitionInput::new_with_limits(..., selected_limits)`，外部caller不能提供放宽hard maxima的limits。`CanonicalFileUri`是Wire-owned shared typed carrier；trusted host从already-decoded POSIX/drive/UNC parts构造它时使用public `CanonicalFileUri::from_decoded_parts(...)`，由Wire owner完成canonical percent encoding，不能直接插值native path拼URI。两个input type仍由Workspace owner构造并验证。它们不是Wire shadow DTO，也不进入durable SessionDefinition。aggregate constructor验证root count、duplicate key、duplicate canonical URI、cwd root引用以及applicable hard/selected absolute/relative path limits；不访问filesystem。constructor失败时typed `RuntimeCommand`尚未形成，属于input decode/validation failure；它不产生`CommandCompletion::Rejected`。
 
 checked command application把input lowering为durable spec：
 

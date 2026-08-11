@@ -10,9 +10,12 @@
 //! - one `generate_model_turn` issues at most one POST; the reqwest client is
 //!   built with `redirect::Policy::none()`, `retry::never()` and `no_proxy()`;
 //! - success is exactly an SSE `message_delta` whose `delta.stop_reason` is a
-//!   non-empty string, preceded by a valid `message_start` with all content
-//!   blocks closed; `message_stop` alone is never success, and early EOF is a
-//!   truthful transport failure, never a synthetic success;
+//!   non-empty string, preceded by a valid `message_start` whose `message.model`
+//!   is a non-empty string exactly equal to the pinned private API model name of
+//!   the request's definition (mismatch, missing, non-string, or empty fails
+//!   closed as `InvalidProviderResponse`) and with all content blocks closed;
+//!   `message_stop` alone is never success, and early EOF is a truthful transport
+//!   failure, never a synthetic success;
 //! - request headers are exactly `x-api-key`, `anthropic-version`,
 //!   `Content-Type: application/json` and `Accept: text/event-stream`; the
 //!   metadata header allowlist is `request-id` / `retry-after` only;
@@ -32,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -43,7 +46,7 @@ use crate::model_gateway::provider_transport::{
     response_byte_limit, transport_read_error,
 };
 use crate::model_gateway::{
-    ModelCallErrorReason, ModelContentDelta, ModelFinishReason, ModelProgressEvent,
+    ApiModelName, ModelCallErrorReason, ModelContentDelta, ModelFinishReason, ModelProgressEvent,
     ModelProgressPublisher, ModelReasoningSummary, ModelServiceClass, ModelUsage, OutputContract,
     ProviderAttemptContent, ProviderAttemptError, ProviderAttemptRequest, ProviderAttemptResult,
     ProviderRequestDeliveryState, ProviderRequestId, ProviderResponseId, ProviderResponseMetadata,
@@ -54,8 +57,10 @@ use crate::tools::{ToolCallId, ToolName, ToolSpec};
 use crate::wire::lexical::validate_opaque_ascii;
 use crate::wire::{BoundedJsonObject, ProtocolLimits};
 
-/// Typed, payload-free configuration error. The credential, the version, and the
-/// rejected endpoint details are never stored, so Debug/Display can never leak them.
+/// Typed, payload-free configuration error. The version and the rejected endpoint
+/// details are never stored, so Debug/Display can never leak them. The API key is
+/// not part of adapter configuration: it is resolved per attempt by the gateway
+/// and owned by the attempt request.
 #[cfg_attr(
     not(test),
     allow(
@@ -69,8 +74,6 @@ pub(crate) enum AnthropicProviderConfigError {
         "Anthropic endpoint must be an absolute http(s) URL without query, fragment, or userinfo"
     )]
     InvalidEndpoint,
-    #[error("Anthropic API key must be non-empty printable ASCII within 256 bytes")]
-    InvalidCredential,
     #[error("Anthropic version header must be non-empty printable ASCII within 64 bytes")]
     InvalidVersion,
     #[error("Anthropic HTTP client construction failed")]
@@ -80,20 +83,21 @@ pub(crate) enum AnthropicProviderConfigError {
 /// Direct private Anthropic Messages adapter.
 ///
 /// The endpoint is stored exactly as validated: scheme http/https, no userinfo, no
-/// query, no fragment (all rejected at construction), so the stored URL is already
-/// safe for Debug. The API key is stored but never printed; the validated
-/// `anthropic-version` header is public metadata and prints in Debug.
+/// query, and no fragment (all rejected at construction), but remains private and
+/// is always redacted from Debug. The adapter owns no API key: the gateway resolves
+/// the credential source on every attempt and the attempt request carries it for
+/// header injection; the validated `anthropic-version` header is public metadata
+/// and prints in Debug.
 pub(crate) struct AnthropicMessagesProviderAdapter {
     client: reqwest::Client,
     endpoint: reqwest::Url,
-    credential: Box<str>,
     version: Box<str>,
 }
 
 impl AnthropicMessagesProviderAdapter {
     /// Builds the adapter against an explicit full `/v1/messages` endpoint URL with
-    /// an explicit API key and explicit `anthropic-version` header value. No
-    /// environment or home-directory lookup ever runs.
+    /// an explicit `anthropic-version` header value. No environment or
+    /// home-directory lookup ever runs.
     #[cfg_attr(
         not(test),
         allow(
@@ -101,11 +105,7 @@ impl AnthropicMessagesProviderAdapter {
             reason = "constructed by the adjacent M14 model source/catalog slice"
         )
     )]
-    pub(crate) fn new(
-        endpoint: &str,
-        credential: &str,
-        version: &str,
-    ) -> Result<Self, AnthropicProviderConfigError> {
+    pub(crate) fn new(endpoint: &str, version: &str) -> Result<Self, AnthropicProviderConfigError> {
         let endpoint = reqwest::Url::parse(endpoint)
             .map_err(|_| AnthropicProviderConfigError::InvalidEndpoint)?;
         if !matches!(endpoint.scheme(), "http" | "https")
@@ -117,15 +117,12 @@ impl AnthropicMessagesProviderAdapter {
         {
             return Err(AnthropicProviderConfigError::InvalidEndpoint);
         }
-        validate_opaque_ascii(credential, 256)
-            .map_err(|_| AnthropicProviderConfigError::InvalidCredential)?;
         validate_opaque_ascii(version, 64)
             .map_err(|_| AnthropicProviderConfigError::InvalidVersion)?;
         let client = build_client().map_err(|_| AnthropicProviderConfigError::ClientBuild)?;
         Ok(Self {
             client,
             endpoint,
-            credential: credential.into(),
             version: version.into(),
         })
     }
@@ -133,10 +130,12 @@ impl AnthropicMessagesProviderAdapter {
 
 impl fmt::Debug for AnthropicMessagesProviderAdapter {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The endpoint path is private route metadata and never prints: only a
+        // redacted marker is reported. The validated anthropic-version header is
+        // public metadata and continues to print.
         formatter
             .debug_struct("AnthropicMessagesProviderAdapter")
-            .field("endpoint", &self.endpoint.as_str())
-            .field("credential", &"<redacted>")
+            .field("endpoint", &"<redacted>")
             .field("version", &self.version.as_ref())
             .finish()
     }
@@ -166,10 +165,11 @@ impl AnthropicMessagesProviderAdapter {
         }
 
         let body = encode_request(&request)?;
+        let api_key = sensitive_api_key_header(request.credential().for_header())?;
         let http_request = self
             .client
             .post(self.endpoint.clone())
-            .header("x-api-key", &*self.credential)
+            .header("x-api-key", api_key)
             .header("anthropic-version", &*self.version)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "text/event-stream")
@@ -227,6 +227,7 @@ impl AnthropicMessagesProviderAdapter {
         let mut delivery = ProviderRequestDeliveryState::AcceptedNoOutput;
         let mut parser = SseParser::new(response_byte_limit());
         let mut state = AnthropicStreamState::default();
+        let expected_model = request.call().model.api_model_name();
         let mut stream = response.bytes_stream();
         loop {
             tokio::select! {
@@ -255,6 +256,7 @@ impl AnthropicMessagesProviderAdapter {
                             &request_id,
                             &mut delivery,
                             &mut state,
+                            expected_model,
                         )? {
                             Dispatch::Continue => {}
                             Dispatch::Success(result) => return Ok(*result),
@@ -265,6 +267,17 @@ impl AnthropicMessagesProviderAdapter {
             }
         }
     }
+}
+
+/// Builds the Anthropic credential header as an explicitly sensitive value so
+/// reqwest request/debug instrumentation cannot render the secret. Credential
+/// validation already guarantees header-safe opaque ASCII; conversion still
+/// fails closed as an unsent invalid request if that invariant is ever violated.
+fn sensitive_api_key_header(value: &str) -> Result<HeaderValue, ProviderAttemptError> {
+    let mut header =
+        HeaderValue::from_bytes(value.as_bytes()).map_err(|_| invalid_request_not_sent())?;
+    header.set_sensitive(true);
+    Ok(header)
 }
 
 /// Provider-declared pre-execution rejection statuses for the Anthropic HTTP
@@ -396,19 +409,16 @@ fn required_u64_field(usage: &Map<String, Value>, key: &str) -> Result<u64, ()> 
 // Request encoding
 // ---------------------------------------------------------------------------
 
-/// Encodes the exact provider request body. The model name comes from the exact
-/// `ModelDefinitionRef` bound to the request; the adapter carries no model name.
-/// No cache_control, beta, temperature, store/include, or speculative fields are
-/// ever emitted.
+/// Encodes the exact provider request body. The wire model name is the private
+/// provider API model name of the exact definition bound to the request (never the
+/// stable `ModelId`); the adapter carries no model name. No cache_control, beta,
+/// temperature, store/include, or speculative fields are ever emitted.
 fn encode_request(request: &ProviderAttemptRequest) -> Result<Vec<u8>, ProviderAttemptError> {
     let call = request.call();
     let input = call.input();
 
     let mut body = Map::new();
-    body.insert(
-        "model".into(),
-        json!(call.model.definition().model_id().as_str()),
-    );
+    body.insert("model".into(), json!(call.model.api_model_name().as_str()));
     body.insert(
         "max_tokens".into(),
         json!(request.effective_max_output_tokens.get()),
@@ -737,14 +747,16 @@ enum OpenBlockKind {
 /// event or a malformed required event field fails closed as
 /// `InvalidProviderResponse` with the current delivery. Success is only a
 /// `message_delta` with a non-empty `delta.stop_reason` after a valid
-/// `message_start` with all content blocks closed — `message_stop` is never
-/// required and never sufficient.
+/// `message_start` whose `message.model` exactly equals the pinned private API
+/// model name of the request's definition, with all content blocks closed —
+/// `message_stop` is never required and never sufficient.
 fn dispatch(
     data: &str,
     progress: &ModelProgressPublisher,
     request_id: &Option<ProviderRequestId>,
     delivery: &mut ProviderRequestDeliveryState,
     state: &mut AnthropicStreamState,
+    expected_model: &ApiModelName,
 ) -> Result<Dispatch, ProviderAttemptError> {
     let value: Value =
         serde_json::from_str(data).map_err(|_| invalid_provider_response(*delivery))?;
@@ -753,7 +765,7 @@ fn dispatch(
     };
     match event_type {
         "message_start" => {
-            handle_message_start(&value, state)
+            handle_message_start(&value, state, expected_model)
                 .map_err(|_| invalid_provider_response(*delivery))?;
         }
         "content_block_start" => {
@@ -798,7 +810,16 @@ fn dispatch(
     Ok(Dispatch::Continue)
 }
 
-fn handle_message_start(value: &Value, state: &mut AnthropicStreamState) -> Result<(), ()> {
+/// Parses and freezes the required `message_start` identity: exactly one valid
+/// start per attempt, `message.type`/`message.role` exact, `message.model` a
+/// non-empty string exactly equal to the pinned private API model name of the
+/// request's definition (mismatch, missing, non-string, or empty fails), empty
+/// content, null stop fields, a valid response id, and the required usage base.
+fn handle_message_start(
+    value: &Value,
+    state: &mut AnthropicStreamState,
+    expected_model: &ApiModelName,
+) -> Result<(), ()> {
     if state.start_seen {
         return Err(());
     }
@@ -811,8 +832,11 @@ fn handle_message_start(value: &Value, state: &mut AnthropicStreamState) -> Resu
     if message.get("role").and_then(Value::as_str) != Some("assistant") {
         return Err(());
     }
+    // Bind the provider-reported identity to the pinned private API model name:
+    // the start must carry a non-empty string exactly equal to the requested API
+    // model. Missing, non-string, empty, or mismatched fails closed.
     let model = message.get("model").and_then(Value::as_str).ok_or(())?;
-    if model.is_empty() {
+    if model.is_empty() || model != expected_model.as_str() {
         return Err(());
     }
     let content = message.get("content").and_then(Value::as_array).ok_or(())?;
@@ -1296,7 +1320,7 @@ mod tests {
         ModelDefinitionVersion, ModelGateway, ModelGenerationDefaults, ModelSelection,
         ModelSourceAdapter, ModelSourceFuture, ProviderAdapter, ReasoningCapabilities,
         ReasoningPreference, ResolveTurnModelRequest, StructuredOutputContract, TokenEstimateRate,
-        TurnModelSnapshot,
+        TurnModelSnapshot, fixed_credential_source,
     };
     use crate::prompt::{ModelAssistantContent, ModelMessage};
     use crate::tools::ToolResultContent;
@@ -1333,6 +1357,22 @@ mod tests {
         max_schema_bytes: Option<NonZeroU32>,
         adapter: Arc<dyn ProviderAdapter>,
     ) -> ModelDefinition {
+        definition_with_credential(
+            reasoning,
+            service_class,
+            max_schema_bytes,
+            adapter,
+            "sk-test",
+        )
+    }
+
+    fn definition_with_credential(
+        reasoning: ModelReasoningSummary,
+        service_class: ModelServiceClass,
+        max_schema_bytes: Option<NonZeroU32>,
+        adapter: Arc<dyn ProviderAdapter>,
+        credential: &str,
+    ) -> ModelDefinition {
         let capabilities = ModelCapabilities::text_only(ReasoningCapabilities::all(), true);
         let limits = match max_schema_bytes {
             Some(maximum) => {
@@ -1344,6 +1384,7 @@ mod tests {
         ModelDefinition::new(
             anthropic_selection(),
             ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
+            "claude-sonnet-4-6".parse().unwrap(),
             match max_schema_bytes {
                 Some(_) => capabilities.with_structured_json_schema(),
                 None => capabilities,
@@ -1352,6 +1393,7 @@ mod tests {
             TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1).unwrap(),
             ModelGenerationDefaults::new(NonZeroU32::new(4_096).unwrap(), reasoning, service_class),
             adapter,
+            fixed_credential_source(credential),
         )
         .unwrap()
     }
@@ -1386,11 +1428,20 @@ mod tests {
     }
 
     fn message_start(id: &str, service_tier: Option<&str>, input_tokens: u64) -> Value {
+        message_start_with_model(id, service_tier, input_tokens, "claude-sonnet-4-6")
+    }
+
+    fn message_start_with_model(
+        id: &str,
+        service_tier: Option<&str>,
+        input_tokens: u64,
+        model: &str,
+    ) -> Value {
         let mut message = serde_json::Map::new();
         message.insert("id".into(), json!(id));
         message.insert("type".into(), json!("message"));
         message.insert("role".into(), json!("assistant"));
-        message.insert("model".into(), json!("claude-sonnet-4-6"));
+        message.insert("model".into(), json!(model));
         message.insert("content".into(), Value::Array(Vec::new()));
         message.insert("stop_reason".into(), Value::Null);
         message.insert("stop_sequence".into(), Value::Null);
@@ -1405,6 +1456,21 @@ mod tests {
         }
         message.insert("usage".into(), Value::Object(usage));
         json!({"type": "message_start", "message": Value::Object(message)})
+    }
+
+    /// The pinned private API model name every fixture definition installs.
+    fn expected_api_model() -> ApiModelName {
+        "claude-sonnet-4-6".parse().unwrap()
+    }
+
+    /// Removes `message.model` from a message_start event entirely.
+    fn without_start_model(start: Value) -> Value {
+        let mut start = start;
+        start["message"]
+            .as_object_mut()
+            .expect("the start message is an object")
+            .remove("model");
+        start
     }
 
     fn content_block_start(index: u64, block: Value) -> Value {
@@ -1532,7 +1598,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn adapter_configuration_rejects_unsafe_endpoints_credentials_and_versions() {
+    fn adapter_configuration_rejects_unsafe_endpoints_and_versions() {
         for endpoint in [
             "ftp://api.anthropic.com/v1/messages",
             "ws://api.anthropic.com/v1/messages",
@@ -1545,28 +1611,9 @@ mod tests {
             "",
         ] {
             assert_eq!(
-                AnthropicMessagesProviderAdapter::new(endpoint, "sk-test", "2023-06-01")
-                    .unwrap_err(),
+                AnthropicMessagesProviderAdapter::new(endpoint, "2023-06-01").unwrap_err(),
                 AnthropicProviderConfigError::InvalidEndpoint,
                 "endpoint {endpoint:?} was accepted"
-            );
-        }
-        let oversize_credential = "x".repeat(257);
-        for credential in [
-            "",
-            "has space",
-            "bad\ncredential",
-            oversize_credential.as_str(),
-        ] {
-            assert_eq!(
-                AnthropicMessagesProviderAdapter::new(
-                    "https://api.anthropic.com/v1/messages",
-                    credential,
-                    "2023-06-01",
-                )
-                .unwrap_err(),
-                AnthropicProviderConfigError::InvalidCredential,
-                "credential {credential:?} was accepted"
             );
         }
         let oversize_version = "x".repeat(65);
@@ -1574,7 +1621,6 @@ mod tests {
             assert_eq!(
                 AnthropicMessagesProviderAdapter::new(
                     "https://api.anthropic.com/v1/messages",
-                    "sk-test",
                     version,
                 )
                 .unwrap_err(),
@@ -1584,28 +1630,58 @@ mod tests {
         }
         let adapter = AnthropicMessagesProviderAdapter::new(
             "https://api.anthropic.com/v1/messages",
-            "sk-SECRET-CREDENTIAL",
             "2023-06-01",
         )
         .unwrap();
         let debug = format!("{adapter:?}");
         assert!(
-            !debug.contains("sk-SECRET-CREDENTIAL"),
-            "credential leaked: {debug}"
+            !debug.contains("sk-"),
+            "the adapter must never store or print an API key: {debug}"
         );
         assert!(
             debug.contains("2023-06-01"),
             "the validated anthropic-version is public metadata and must be printed: {debug}"
         );
-        assert!(debug.contains("api.anthropic.com"));
-        // Loopback http endpoints are accepted.
+        assert!(
+            !debug.contains("api.anthropic.com") && !debug.contains("/v1/messages"),
+            "the adapter Debug must redact the endpoint path: {debug}"
+        );
+        // Loopback http endpoints are accepted by the adapter; the explicit endpoint
+        // policy lives at the provider-installation boundary.
         assert!(
             AnthropicMessagesProviderAdapter::new(
                 "http://127.0.0.1:1234/v1/messages",
-                "sk-ok",
                 "2023-06-01",
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn api_key_header_is_sensitive_and_request_debug_redacts_it() {
+        let secret = "sk-ANTHROPIC-SECRET";
+        let header = sensitive_api_key_header(secret).expect("the test API key is header-safe");
+        assert!(
+            header.is_sensitive(),
+            "the Anthropic credential header must be explicitly sensitive"
+        );
+        let request = build_client()
+            .expect("the locked-down test client builds")
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", header)
+            .build()
+            .expect("the test request builds");
+        assert!(
+            request
+                .headers()
+                .get("x-api-key")
+                .is_some_and(HeaderValue::is_sensitive),
+            "request construction must preserve the sensitive marker"
+        );
+        let debug = format!("{request:?}");
+        assert!(
+            !debug.contains(secret),
+            "reqwest Request Debug leaked the Anthropic credential: {debug}"
         );
     }
 
@@ -1914,8 +1990,15 @@ mod tests {
         // Arbitrary byte-by-byte fragmentation through the shared SSE framing.
         for byte in body.bytes() {
             for event in parser.feed(&[byte]).expect("fragmented feed must parse") {
-                match dispatch(&event.data, &progress, &None, &mut delivery, &mut state)
-                    .expect("fragmented terminal events must dispatch")
+                match dispatch(
+                    &event.data,
+                    &progress,
+                    &None,
+                    &mut delivery,
+                    &mut state,
+                    &expected_api_model(),
+                )
+                .expect("fragmented terminal events must dispatch")
                 {
                     Dispatch::Continue => {}
                     Dispatch::Success(result) => terminal = Some(*result),
@@ -2121,6 +2204,7 @@ mod tests {
                 &None,
                 &mut delivery,
                 &mut state,
+                &expected_api_model(),
             ) {
                 Ok(Dispatch::Continue) => {}
                 Ok(Dispatch::Success(result)) => terminal = Some(*result),
@@ -2145,6 +2229,7 @@ mod tests {
                 &None,
                 &mut delivery,
                 &mut state,
+                &expected_api_model(),
             ) {
                 Ok(Dispatch::Continue) => {}
                 Ok(Dispatch::Success(_)) => panic!("expected an error, got a terminal success"),
@@ -2205,6 +2290,22 @@ mod tests {
                 start_with({
                     let mut message = base_message();
                     message.insert("model".into(), json!(""));
+                    message
+                }),
+            ),
+            (
+                "model mismatched",
+                start_with({
+                    let mut message = base_message();
+                    message.insert("model".into(), json!("claude-sonnet-4-5"));
+                    message
+                }),
+            ),
+            (
+                "model non-string",
+                start_with({
+                    let mut message = base_message();
+                    message.insert("model".into(), json!(42));
                     message
                 }),
             ),
@@ -2824,19 +2925,16 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &server.messages_endpoint(),
-                "sk-test-credential",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
-        let (gateway, model) = gateway_and_model(definition_with(
+        let (gateway, model) = gateway_and_model(definition_with_credential(
             ModelReasoningSummary::Low,
             ModelServiceClass::Priority,
             None,
             provider,
+            "sk-test-credential",
         ))
         .await;
         let request = request_for_model_with_tools(Arc::clone(&model), scripted_tool_set()).await;
@@ -2988,12 +3086,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &server.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -3100,12 +3194,8 @@ mod tests {
                 gate: 0,
             }]);
             let adapter = Arc::new(
-                AnthropicMessagesProviderAdapter::new(
-                    &server.messages_endpoint(),
-                    "sk-test",
-                    "2023-06-01",
-                )
-                .unwrap(),
+                AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                    .unwrap(),
             );
             let provider: Arc<dyn ProviderAdapter> = adapter.clone();
             let (gateway, model) = gateway_and_model(definition_with(
@@ -3156,12 +3246,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &server.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -3210,12 +3296,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &server.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -3265,12 +3347,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &before.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&before.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -3317,12 +3395,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &after.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&after.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -3445,12 +3519,8 @@ mod tests {
                 gate: 0,
             }]);
             let adapter = Arc::new(
-                AnthropicMessagesProviderAdapter::new(
-                    &server.messages_endpoint(),
-                    "sk-test",
-                    "2023-06-01",
-                )
-                .unwrap(),
+                AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                    .unwrap(),
             );
             let provider: Arc<dyn ProviderAdapter> = adapter.clone();
             let (gateway, model) = gateway_and_model(definition_with(
@@ -3527,12 +3597,8 @@ mod tests {
             },
         ]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &server.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -3585,9 +3651,8 @@ mod tests {
         // `classify_send_error` maps to TransportUnavailable/NotSent.
         let endpoint = "http://127.0.0.1:0/v1/messages";
 
-        let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(endpoint, "sk-test", "2023-06-01").unwrap(),
-        );
+        let adapter =
+            Arc::new(AnthropicMessagesProviderAdapter::new(endpoint, "2023-06-01").unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
             ModelReasoningSummary::ProviderDefault,
@@ -3625,12 +3690,8 @@ mod tests {
                 gate: 0,
             }]);
             let adapter = Arc::new(
-                AnthropicMessagesProviderAdapter::new(
-                    &server.messages_endpoint(),
-                    "sk-test",
-                    "2023-06-01",
-                )
-                .unwrap(),
+                AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                    .unwrap(),
             );
             let provider: Arc<dyn ProviderAdapter> = adapter.clone();
             let (gateway, model) = gateway_and_model(definition_with(
@@ -3681,12 +3742,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &empty.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&empty.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -3736,12 +3793,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &non_empty.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&non_empty.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -3784,12 +3837,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &semantic.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&semantic.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -3838,19 +3887,16 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &server.messages_endpoint(),
-                "sk-test-credential",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
-        let (gateway, model) = gateway_and_model(definition_with(
+        let (gateway, model) = gateway_and_model(definition_with_credential(
             ModelReasoningSummary::ProviderDefault,
             ModelServiceClass::Standard,
             None,
             provider,
+            "sk-test-credential",
         ))
         .await;
         let request = request_for_model(model).await;
@@ -3924,12 +3970,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &server.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -3962,6 +4004,68 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn loopback_message_start_model_mismatch_fails_closed_without_success() {
+        // The pinned API model is "claude-sonnet-4-6", but the start reports a
+        // different model (or no model): the attempt must fail closed as
+        // InvalidProviderResponse before any block, never succeed, and never
+        // produce provenance.
+        for start in [
+            message_start_with_model("msg_mismatch", None, 5, "claude-sonnet-4-5"),
+            without_start_model(message_start_with_model(
+                "msg_mismatch",
+                None,
+                5,
+                "claude-sonnet-4-6",
+            )),
+        ] {
+            let server = LoopbackServer::spawn(vec![ScriptedResponse {
+                status: 200,
+                content_type: "text/event-stream",
+                headers: vec![],
+                body: sse(&[start, message_delta("end_turn", 1)]),
+                gate: 0,
+            }]);
+            let adapter = Arc::new(
+                AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                    .unwrap(),
+            );
+            let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+            let (gateway, model) = gateway_and_model(definition_with(
+                ModelReasoningSummary::ProviderDefault,
+                ModelServiceClass::Standard,
+                None,
+                provider,
+            ))
+            .await;
+            let error = gateway
+                .generate_model_turn(
+                    request_for_model(model).await,
+                    ModelProgressPublisher::discard(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            let requests = server.join();
+
+            assert_eq!(
+                requests.len(),
+                1,
+                "a mismatched start must make exactly one HTTP request"
+            );
+            assert_eq!(
+                error.reason(),
+                ModelCallErrorReason::InvalidProviderResponse,
+                "a start that does not echo the pinned API model must fail closed"
+            );
+            assert_eq!(
+                error.delivery(),
+                ProviderRequestDeliveryState::AcceptedNoOutput,
+                "a start mismatch fails at the current delivery, never success"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn loopback_usage_total_overflow_fails_closed_with_current_delivery() {
         // The checked provider-total sum overflows (u64::MAX input + 1 output):
         // InvalidProviderResponse with the current delivery, never a silent
@@ -3980,12 +4084,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &server.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -4061,12 +4161,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &server.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -4120,12 +4216,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &server.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (_gateway, model) = gateway_and_model(definition_with(
@@ -4144,6 +4236,7 @@ mod tests {
         let attempt = ProviderAttemptRequest {
             effective_max_output_tokens: request.effective_max_output_tokens(),
             call: Arc::clone(&request),
+            credential: "sk-test".parse().unwrap(),
         };
         let error = adapter
             .execute(attempt, ModelProgressPublisher::discard(), cancel)
@@ -4182,12 +4275,8 @@ mod tests {
             gate: 7,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &server.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -4265,12 +4354,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &server.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -4402,12 +4487,8 @@ mod tests {
                 gate: 0,
             }]);
             let adapter = Arc::new(
-                AnthropicMessagesProviderAdapter::new(
-                    &server.messages_endpoint(),
-                    "sk-test",
-                    "2023-06-01",
-                )
-                .unwrap(),
+                AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                    .unwrap(),
             );
             let provider: Arc<dyn ProviderAdapter> = adapter.clone();
             let (gateway, model) = gateway_and_model(definition_with(
@@ -4471,12 +4552,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &server.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(
@@ -4518,12 +4595,8 @@ mod tests {
             gate: 0,
         }]);
         let adapter = Arc::new(
-            AnthropicMessagesProviderAdapter::new(
-                &server.messages_endpoint(),
-                "sk-test",
-                "2023-06-01",
-            )
-            .unwrap(),
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
         );
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(definition_with(

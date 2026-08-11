@@ -23,7 +23,10 @@ use crate::durable_state::{
     DurableAgentStatusError, DurableAgentStatusOutcome, DurableOpenError,
     DurableSessionCreateError, DurableSessionHead, DurableState,
 };
-use crate::model_gateway::{ModelCatalogView, ModelGateway};
+use crate::model_gateway::{
+    ModelCatalogView, ModelGateway, ModelProviderConfig, ModelResolutionErrorKind,
+    ModelSourceAdapter, ProviderSourceBuildError,
+};
 use crate::prompt::{PromptResourceView, PromptService};
 use crate::runtime_interface::{
     AgentCommand, AgentMetadataView, AgentQuery, AgentQueryResult, AgentSummary, CommandCompletion,
@@ -84,6 +87,7 @@ pub struct MiniCoreRuntimeConfig {
     durable_root: PathBuf,
     compaction: CompactionSettings,
     unload_grace: StdDuration,
+    model_providers: Vec<ModelProviderConfig>,
 }
 
 impl MiniCoreRuntimeConfig {
@@ -92,11 +96,24 @@ impl MiniCoreRuntimeConfig {
             durable_root,
             compaction: CompactionSettings::default(),
             unload_grace: DEFAULT_UNLOAD_GRACE,
+            model_providers: Vec::new(),
         }
     }
 
     pub fn with_compaction_settings(mut self, compaction: CompactionSettings) -> Self {
         self.compaction = compaction;
+        self
+    }
+
+    /// Adds one validated host-only provider installation. `open` materializes
+    /// each installation's single direct adapter/client and static model source
+    /// into the Runtime-owned Model catalog; with no installations the catalog
+    /// stays empty exactly as before. A client/adapter build failure fails `open`
+    /// with `RuntimeInitializationError::RuntimeDependencyUnavailable`; duplicate
+    /// stable model selections across installations (or invalid definitions) fail
+    /// `open` with `RuntimeInitializationError::InvalidConfiguration`.
+    pub fn with_model_provider(mut self, provider: ModelProviderConfig) -> Self {
+        self.model_providers.push(provider);
         self
     }
 
@@ -225,12 +242,45 @@ impl MiniCoreRuntime {
         let (model_gateway, model_catalog) = match model_resources {
             Some(resources) => resources,
             None => {
-                let model_gateway = Arc::new(ModelGateway::new(Vec::new()));
+                // The private test fixture path never reads provider config; the host
+                // installation path materializes one static source per validated
+                // provider config at `open` (with none, the catalog stays empty
+                // exactly as before). Each installation builds exactly one direct
+                // adapter/client here; shared-resource reload reuses the installed
+                // sources and never rebuilds a client. A client/adapter build
+                // failure is a runtime dependency failure; only invalid/duplicate
+                // definitions are configuration errors.
+                let mut sources: Vec<Arc<dyn ModelSourceAdapter>> = Vec::new();
+                for provider in &config.model_providers {
+                    let source = match provider.build_source() {
+                        Ok(source) => source,
+                        Err(error) => {
+                            task_context.shutdown().await;
+                            return Err(match error {
+                                ProviderSourceBuildError::ClientBuild => {
+                                    RuntimeInitializationError::RuntimeDependencyUnavailable
+                                }
+                                ProviderSourceBuildError::InvalidDefinition => {
+                                    RuntimeInitializationError::InvalidConfiguration
+                                }
+                            });
+                        }
+                    };
+                    sources.push(source);
+                }
+                let model_gateway = Arc::new(ModelGateway::new(sources));
                 let model_catalog = match model_gateway.initialize().await {
                     Ok(catalog) => catalog,
-                    Err(_) => {
+                    Err(error) => {
                         task_context.shutdown().await;
-                        return Err(RuntimeInitializationError::RuntimeDependencyUnavailable);
+                        return Err(match error.kind() {
+                            // Invalid definitions and duplicate stable selections
+                            // across installations are host configuration errors.
+                            ModelResolutionErrorKind::InvalidDefinition => {
+                                RuntimeInitializationError::InvalidConfiguration
+                            }
+                            _ => RuntimeInitializationError::RuntimeDependencyUnavailable,
+                        });
                     }
                 };
                 (model_gateway, model_catalog)
@@ -4027,12 +4077,13 @@ mod tests {
     };
     use crate::conversation_storage::{RecordOutcome, RecorderWriteBarrier, SessionHeader};
     use crate::model_gateway::{
-        EffectiveModelLimits, ModelCallErrorReason, ModelCapabilities, ModelCatalogView,
-        ModelDefinition, ModelDefinitionVersion, ModelGateway, ModelGenerationDefaults,
-        ModelProgressPublisher, ModelReasoningSummary, ModelSelection, ModelServiceClass,
+        CredentialSource, CredentialSourceFuture, EffectiveModelLimits, ModelCallErrorReason,
+        ModelCapabilities, ModelCatalogView, ModelDefinition, ModelDefinitionVersion, ModelGateway,
+        ModelGenerationDefaults, ModelProgressPublisher, ModelProviderConfig,
+        ModelProviderDescriptor, ModelReasoningSummary, ModelSelection, ModelServiceClass,
         ModelSourceAdapter, ModelSourceFuture, ProviderAdapter, ProviderAttemptFuture,
-        ProviderAttemptRequest, ReasoningCapabilities, ReasoningPreference, ScriptedModelFixture,
-        TokenEstimateRate,
+        ProviderAttemptRequest, ProviderEndpointPolicy, ReasoningCapabilities, ReasoningPreference,
+        ScriptedModelFixture, TokenEstimateRate, fixed_credential_source,
     };
     use crate::prompt::{
         AgentPromptSelection, PromptBodyIntent, PromptIntent, SessionPromptSelection, TextIntent,
@@ -4344,6 +4395,7 @@ mod tests {
         let definition = ModelDefinition::new(
             ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
             ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
+            "gpt-5".parse().unwrap(),
             ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
             EffectiveModelLimits::new(NonZeroU32::new(128_000), NonZeroU32::new(8_192)),
             TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1)
@@ -4354,6 +4406,7 @@ mod tests {
                 ModelServiceClass::Standard,
             ),
             Arc::new(ReloadOnlyStubProvider),
+            fixed_credential_source("test-credential"),
         )
         .unwrap_or_else(|_| panic!("the fixed model definition validates"));
         let gateway = Arc::new(ModelGateway::new(vec![Arc::new(FixedModelSource {
@@ -6806,6 +6859,138 @@ mod tests {
         .await
         .expect("shutdown releases the root after unloading the Session");
         reopened.shutdown().await;
+    }
+
+    /// A credential source that always reports a missing credential. Model
+    /// availability must never depend on it.
+    struct MissingCredentialSource;
+
+    impl CredentialSource for MissingCredentialSource {
+        fn resolve(&self) -> CredentialSourceFuture<'_> {
+            Box::pin(async { None })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_without_provider_config_opens_an_empty_model_catalog() {
+        let root = TempRoot::new();
+        let runtime = MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+        )
+        .await
+        .expect("the Runtime opens without provider config");
+        let (model_gateway, model_catalog) = runtime.inner.model_resources();
+        assert_eq!(
+            model_catalog.definition_count(),
+            0,
+            "no provider config keeps the existing empty-catalog behavior"
+        );
+        assert_eq!(
+            model_gateway
+                .build_reload_candidate()
+                .await
+                .expect("the empty Model catalog candidate rebuilds")
+                .definition_count(),
+            0
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_provider_installation_installs_models_independent_of_credentials() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        // The credential source reports None, yet the installed model definition must
+        // resolve and the Session model availability must stay true: only the actual
+        // attempt would surface AuthMissing.
+        let config = MiniCoreRuntimeConfig::new(root.path().to_owned()).with_model_provider(
+            ModelProviderConfig::openai_responses(
+                "https://api.openai.com/v1/responses",
+                ProviderEndpointPolicy::HttpsOnly,
+                Arc::new(MissingCredentialSource),
+                vec![
+                    ModelProviderDescriptor::new(
+                        ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+                        NonZeroU64::new(1).unwrap(),
+                        "gpt-5",
+                        NonZeroU32::new(4_096).unwrap(),
+                        NonZeroU32::new(3).unwrap(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .expect("the provider installation validates"),
+        );
+        let runtime = MiniCoreRuntime::open(config, Handle::current())
+            .await
+            .expect("the Runtime opens with the installed provider");
+        let (_model_gateway, catalog) = runtime.inner.model_resources();
+        assert_eq!(
+            catalog.definition_count(),
+            1,
+            "the installed definition resolves without resolving any credential"
+        );
+        let (model_gateway, _catalog) = runtime.inner.model_resources();
+        assert_eq!(
+            model_gateway
+                .build_reload_candidate()
+                .await
+                .expect("the shared-resource reload candidate rebuilds")
+                .definition_count(),
+            1,
+            "reload reuses the installed source and never rebuilds a client"
+        );
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let SnapshotResponse::Session(snapshot) = runtime
+            .snapshot(SnapshotRequest::Session { session_id })
+            .await
+            .expect("the Session snapshot is available")
+        else {
+            panic!("the snapshot is a Session snapshot");
+        };
+        assert_eq!(
+            snapshot.readiness(),
+            SessionReadinessView::Ready,
+            "model availability must stay independent from the dynamic credential source"
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_duplicate_selections_across_installations_fail_open() {
+        let root = TempRoot::new();
+        let descriptor = ModelProviderDescriptor::new(
+            ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+            NonZeroU64::new(1).unwrap(),
+            "gpt-5",
+            NonZeroU32::new(4_096).unwrap(),
+            NonZeroU32::new(3).unwrap(),
+        )
+        .unwrap();
+        let config = MiniCoreRuntimeConfig::new(root.path().to_owned())
+            .with_model_provider(
+                ModelProviderConfig::openai_responses(
+                    "https://api.openai.com/v1/responses",
+                    ProviderEndpointPolicy::HttpsOnly,
+                    Arc::new(MissingCredentialSource),
+                    vec![descriptor.clone()],
+                )
+                .expect("the first installation validates"),
+            )
+            .with_model_provider(
+                ModelProviderConfig::openai_responses(
+                    "https://api.openai.com/v1/responses",
+                    ProviderEndpointPolicy::HttpsOnly,
+                    Arc::new(MissingCredentialSource),
+                    vec![descriptor],
+                )
+                .expect("the second installation validates"),
+            );
+        let error = MiniCoreRuntime::open(config, Handle::current())
+            .await
+            .expect_err("duplicate selections across installations must fail open");
+        assert_eq!(error, RuntimeInitializationError::InvalidConfiguration);
     }
 
     #[tokio::test(flavor = "current_thread")]

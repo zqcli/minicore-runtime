@@ -9,8 +9,11 @@
 //! - one `generate_model_turn` issues at most one POST; the reqwest client is built
 //!   with `redirect::Policy::none()`, `retry::never()` and `no_proxy()`;
 //! - success is exactly an SSE `response.completed` whose `response.status` is
-//!   `completed`; `response.failed` / `response.incomplete` / `error` are non-success;
-//!   early EOF is a truthful transport failure, never a synthetic success;
+//!   `completed` and whose `response.model` is a non-empty string exactly equal to
+//!   the pinned private API model name of the request's definition (mismatch,
+//!   missing, or non-string fails closed as `InvalidProviderResponse`);
+//!   `response.failed` / `response.incomplete` / `error` are non-success; early EOF
+//!   is a truthful transport failure, never a synthetic success;
 //! - response metadata allowlist is exactly `x-request-id` / `retry-after` /
 //!   `openai-processing-ms`; only `x-request-id` (validated) enters success metadata,
 //!   only numeric `retry-after` enters typed rate-limit hints, and processing time is
@@ -43,7 +46,7 @@ use crate::model_gateway::provider_transport::{
     response_byte_limit, transport_read_error,
 };
 use crate::model_gateway::{
-    ModelCallErrorReason, ModelContentDelta, ModelFinishReason, ModelProgressEvent,
+    ApiModelName, ModelCallErrorReason, ModelContentDelta, ModelFinishReason, ModelProgressEvent,
     ModelProgressPublisher, ModelReasoningSummary, ModelServiceClass, ModelUsage, OutputContract,
     ProviderAttemptContent, ProviderAttemptError, ProviderAttemptRequest, ProviderAttemptResult,
     ProviderItemId, ProviderRequestDeliveryState, ProviderRequestId, ProviderResponseId,
@@ -51,11 +54,12 @@ use crate::model_gateway::{
 };
 use crate::prompt::{ModelAssistantContentRef, ModelMessage, ModelMessageRef, PromptSection};
 use crate::tools::{ToolCallId, ToolName, ToolSpec};
-use crate::wire::lexical::validate_opaque_ascii;
 use crate::wire::{BoundedJsonObject, ProtocolLimits};
 
-/// Typed, payload-free configuration error. The credential and the rejected endpoint
-/// details are never stored, so Debug/Display can never leak them.
+/// Typed, payload-free configuration error. The rejected endpoint details are
+/// never stored, so Debug/Display can never leak them. The credential is not part
+/// of adapter configuration: it is resolved per attempt by the gateway and owned
+/// by the attempt request.
 #[cfg_attr(
     not(test),
     allow(
@@ -67,8 +71,6 @@ use crate::wire::{BoundedJsonObject, ProtocolLimits};
 pub(crate) enum OpenAiProviderConfigError {
     #[error("OpenAI endpoint must be an absolute http(s) URL without query, fragment, or userinfo")]
     InvalidEndpoint,
-    #[error("OpenAI bearer credential must be non-empty printable ASCII within 256 bytes")]
-    InvalidCredential,
     #[error("OpenAI HTTP client construction failed")]
     ClientBuild,
 }
@@ -76,17 +78,18 @@ pub(crate) enum OpenAiProviderConfigError {
 /// Direct private OpenAI Responses adapter.
 ///
 /// The endpoint is stored exactly as validated: scheme http/https, no userinfo, no
-/// query, no fragment (all rejected at construction), so the stored URL is already
-/// safe for Debug. The bearer credential is stored but never printed.
+/// query, and no fragment (all rejected at construction), but remains private and
+/// is always redacted from Debug. The adapter owns no credential: the gateway
+/// resolves the credential source on every attempt and the attempt request carries
+/// it for header injection.
 pub(crate) struct OpenAiResponsesProviderAdapter {
     client: reqwest::Client,
     endpoint: reqwest::Url,
-    credential: Box<str>,
 }
 
 impl OpenAiResponsesProviderAdapter {
-    /// Builds the adapter against an explicit full `/responses` endpoint URL with an
-    /// explicit bearer credential. No environment or home-directory lookup ever runs.
+    /// Builds the adapter against an explicit full `/responses` endpoint URL. No
+    /// environment or home-directory lookup ever runs.
     #[cfg_attr(
         not(test),
         allow(
@@ -94,7 +97,7 @@ impl OpenAiResponsesProviderAdapter {
             reason = "constructed by the adjacent M14 model source/catalog slice"
         )
     )]
-    pub(crate) fn new(endpoint: &str, credential: &str) -> Result<Self, OpenAiProviderConfigError> {
+    pub(crate) fn new(endpoint: &str) -> Result<Self, OpenAiProviderConfigError> {
         let endpoint = reqwest::Url::parse(endpoint)
             .map_err(|_| OpenAiProviderConfigError::InvalidEndpoint)?;
         if !matches!(endpoint.scheme(), "http" | "https")
@@ -106,25 +109,20 @@ impl OpenAiResponsesProviderAdapter {
         {
             return Err(OpenAiProviderConfigError::InvalidEndpoint);
         }
-        validate_opaque_ascii(credential, 256)
-            .map_err(|_| OpenAiProviderConfigError::InvalidCredential)?;
         // The locked-down client (no redirects, no retries, no ambient proxy) is the
         // shared production constructor; the typed ClientBuild mapping is preserved.
         let client = build_client().map_err(|_| OpenAiProviderConfigError::ClientBuild)?;
-        Ok(Self {
-            client,
-            endpoint,
-            credential: credential.into(),
-        })
+        Ok(Self { client, endpoint })
     }
 }
 
 impl fmt::Debug for OpenAiResponsesProviderAdapter {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The endpoint path is private route metadata and never prints: only a
+        // redacted marker is reported.
         formatter
             .debug_struct("OpenAiResponsesProviderAdapter")
-            .field("endpoint", &self.endpoint.as_str())
-            .field("credential", &"<redacted>")
+            .field("endpoint", &"<redacted>")
             .finish()
     }
 }
@@ -156,7 +154,7 @@ impl OpenAiResponsesProviderAdapter {
         let http_request = self
             .client
             .post(self.endpoint.clone())
-            .bearer_auth(&*self.credential)
+            .bearer_auth(request.credential().for_header())
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "text/event-stream")
             .body(body)
@@ -215,6 +213,7 @@ impl OpenAiResponsesProviderAdapter {
         // with the terminal output array when response.completed arrives.
         let mut streamed_text_indexes = Vec::new();
         let mut parser = SseParser::new(response_byte_limit());
+        let expected_model = request.call().model.api_model_name();
         let mut stream = response.bytes_stream();
         loop {
             tokio::select! {
@@ -243,6 +242,7 @@ impl OpenAiResponsesProviderAdapter {
                             &request_id,
                             &mut delivery,
                             &mut streamed_text_indexes,
+                            expected_model,
                         )? {
                             Dispatch::Continue => {}
                             Dispatch::Success(result) => return Ok(*result),
@@ -329,17 +329,15 @@ fn classify_http_error(
 // Request encoding
 // ---------------------------------------------------------------------------
 
-/// Encodes the exact provider request body. The model name comes from the exact
-/// `ModelDefinitionRef` bound to the request; the adapter carries no model name.
+/// Encodes the exact provider request body. The wire model name is the private
+/// provider API model name of the exact definition bound to the request (never the
+/// stable `ModelId`); the adapter carries no model name.
 fn encode_request(request: &ProviderAttemptRequest) -> Result<Vec<u8>, ProviderAttemptError> {
     let call = request.call();
     let input = call.input();
 
     let mut body = Map::new();
-    body.insert(
-        "model".into(),
-        json!(call.model.definition().model_id().as_str()),
-    );
+    body.insert("model".into(), json!(call.model.api_model_name().as_str()));
     body.insert(
         "max_output_tokens".into(),
         json!(request.effective_max_output_tokens.get()),
@@ -589,13 +587,16 @@ enum Dispatch {
 /// field fails closed as `InvalidProviderResponse` with the current delivery.
 /// Non-empty text deltas record their validated output index in
 /// `streamed_text_indexes` so the terminal can verify the published `content_index`
-/// contract.
+/// contract. The pinned private API model name of the request's definition is
+/// threaded through every terminal: a successful `response.completed` must echo it
+/// exactly.
 fn dispatch(
     data: &str,
     progress: &ModelProgressPublisher,
     request_id: &Option<ProviderRequestId>,
     delivery: &mut ProviderRequestDeliveryState,
     streamed_text_indexes: &mut Vec<u32>,
+    expected_model: &ApiModelName,
 ) -> Result<Dispatch, ProviderAttemptError> {
     let value: Value =
         serde_json::from_str(data).map_err(|_| invalid_provider_response(*delivery))?;
@@ -712,6 +713,17 @@ fn dispatch(
                 .get("response")
                 .and_then(Value::as_object)
                 .ok_or_else(|| invalid_provider_response(*delivery))?;
+            // Bind the provider-reported identity to the pinned private API model
+            // name: a successful completed response must carry a non-empty string
+            // exactly equal to the requested API model. Missing, non-string, or
+            // mismatched fails closed at the current delivery — never success.
+            if !response
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(|model| model == expected_model.as_str())
+            {
+                return Err(invalid_provider_response(*delivery));
+            }
             let status = response
                 .get("status")
                 .and_then(Value::as_str)
@@ -1246,14 +1258,15 @@ mod tests {
     use crate::model_gateway::provider_transport::{SseParseError, drain_bounded};
     use crate::model_gateway::tests::{
         request_for_model, request_for_model_with_tools, request_with_output_contract,
-        resolve_request, scripted_tool_set, structured_definition, structured_request,
-        structured_schema, text_definition,
+        resolve_request, scripted_tool_set, structured_definition_with_credential,
+        structured_request, structured_schema, text_definition, text_definition_with_credential,
     };
     use crate::model_gateway::{
         EffectiveModelLimits, FinalizedAssistantContent, ModelCapabilities, ModelDefinition,
         ModelDefinitionVersion, ModelGateway, ModelGenerationDefaults, ModelSelection,
         ModelSourceAdapter, ModelSourceFuture, OutputContract, ProviderAdapter,
-        ReasoningCapabilities, StructuredOutputContract, TokenEstimateRate, TurnModelSnapshot,
+        ReasoningCapabilities, ReasoningPreference, ResolveTurnModelRequest,
+        StructuredOutputContract, TokenEstimateRate, TurnModelSnapshot, fixed_credential_source,
     };
     use crate::prompt::{ModelAssistantContent, ModelMessage};
     use crate::tools::ToolResultContent;
@@ -1291,10 +1304,14 @@ mod tests {
 
     /// Definition with explicit Low reasoning and Priority service class so the request
     /// encoder's reasoning/service mapping is exercised end to end.
-    fn priority_low_reasoning_definition(adapter: Arc<dyn ProviderAdapter>) -> ModelDefinition {
+    fn priority_low_reasoning_definition(
+        adapter: Arc<dyn ProviderAdapter>,
+        credential: &str,
+    ) -> ModelDefinition {
         ModelDefinition::new(
             ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
             ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
+            "gpt-5".parse().unwrap(),
             ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
             EffectiveModelLimits::new(NonZeroU32::new(128_000), NonZeroU32::new(8_192)),
             TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1).unwrap(),
@@ -1304,6 +1321,7 @@ mod tests {
                 ModelServiceClass::Priority,
             ),
             adapter,
+            fixed_credential_source(credential),
         )
         .unwrap()
     }
@@ -1330,6 +1348,10 @@ mod tests {
     }
 
     fn completed_simple(text: &str) -> Value {
+        completed_with_model(text, "gpt-5")
+    }
+
+    fn completed_with_model(text: &str, model: &str) -> Value {
         json!({
             "type": "response.completed",
             "sequence_number": 1,
@@ -1338,7 +1360,7 @@ mod tests {
                 "object": "response",
                 "created_at": 1752000000,
                 "status": "completed",
-                "model": "gpt-5",
+                "model": model,
                 "output": [{
                     "type": "message",
                     "id": "msg_1",
@@ -1349,6 +1371,24 @@ mod tests {
                 "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
             }
         })
+    }
+
+    /// Replaces the terminal `response.model` value (used to prove that a
+    /// non-string or empty reported model fails closed).
+    fn with_terminal_model(terminal: Value, model: Value) -> Value {
+        let mut terminal = terminal;
+        terminal["response"]["model"] = model;
+        terminal
+    }
+
+    /// Removes the terminal `response.model` field entirely.
+    fn without_terminal_model(terminal: Value) -> Value {
+        let mut terminal = terminal;
+        terminal["response"]
+            .as_object_mut()
+            .expect("the terminal response is an object")
+            .remove("model");
+        terminal
     }
 
     fn drain(
@@ -1689,7 +1729,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_configuration_rejects_unsafe_endpoints_and_credentials() {
+    fn adapter_configuration_rejects_unsafe_endpoints() {
         for endpoint in [
             "ftp://api.openai.com/v1/responses",
             "ws://api.openai.com/v1/responses",
@@ -1702,38 +1742,25 @@ mod tests {
             "",
         ] {
             assert_eq!(
-                OpenAiResponsesProviderAdapter::new(endpoint, "sk-test").unwrap_err(),
+                OpenAiResponsesProviderAdapter::new(endpoint).unwrap_err(),
                 OpenAiProviderConfigError::InvalidEndpoint,
                 "endpoint {endpoint:?} was accepted"
             );
         }
-        let oversize = "x".repeat(257);
-        for credential in ["", "has space", "bad\ncredential", oversize.as_str()] {
-            assert_eq!(
-                OpenAiResponsesProviderAdapter::new(
-                    "https://api.openai.com/v1/responses",
-                    credential
-                )
-                .unwrap_err(),
-                OpenAiProviderConfigError::InvalidCredential,
-                "credential {credential:?} was accepted"
-            );
-        }
-        let adapter = OpenAiResponsesProviderAdapter::new(
-            "https://api.openai.com/v1/responses",
-            "sk-SECRET-CREDENTIAL",
-        )
-        .unwrap();
+        let adapter =
+            OpenAiResponsesProviderAdapter::new("https://api.openai.com/v1/responses").unwrap();
         let debug = format!("{adapter:?}");
         assert!(
-            !debug.contains("sk-SECRET-CREDENTIAL"),
-            "credential leaked: {debug}"
+            !debug.contains("sk-"),
+            "the adapter must never store or print a credential: {debug}"
         );
-        assert!(debug.contains("api.openai.com"));
-        // Loopback http endpoints are accepted.
         assert!(
-            OpenAiResponsesProviderAdapter::new("http://127.0.0.1:1234/responses", "sk-ok").is_ok()
+            !debug.contains("api.openai.com") && !debug.contains("/v1/responses"),
+            "the adapter Debug must redact the endpoint path: {debug}"
         );
+        // Loopback http endpoints are accepted by the adapter; the explicit endpoint
+        // policy lives at the provider-installation boundary.
+        assert!(OpenAiResponsesProviderAdapter::new("http://127.0.0.1:1234/responses").is_ok());
     }
 
     // ------------------------------------------------------------------
@@ -1793,12 +1820,14 @@ mod tests {
             ]),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test-credential")
-                .unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
-        let (gateway, model) = gateway_and_model(priority_low_reasoning_definition(provider)).await;
+        let (gateway, model) = gateway_and_model(priority_low_reasoning_definition(
+            provider,
+            "sk-test-credential",
+        ))
+        .await;
         let request = request_for_model_with_tools(Arc::clone(&model), scripted_tool_set()).await;
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
         let progress = ModelProgressPublisher::new(move |event| {
@@ -1930,6 +1959,171 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn loopback_wire_model_uses_api_name_while_provenance_keeps_stable_id() {
+        // The stable ModelSelection identity and the private provider API model name
+        // are deliberately distinct: the wire request must carry the API name, and
+        // the terminal must report the configured API model exactly, while the
+        // final response summary keeps the stable id.
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: sse(&[completed_with_model("hello", "gpt-5.2-api")]),
+            gate: 0,
+        }]);
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let definition = ModelDefinition::new(
+            ModelSelection::new("openai".parse().unwrap(), "stable-model-7".parse().unwrap()),
+            ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
+            "gpt-5.2-api".parse().unwrap(),
+            ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
+            EffectiveModelLimits::new(NonZeroU32::new(128_000), NonZeroU32::new(8_192)),
+            TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1).unwrap(),
+            ModelGenerationDefaults::new(
+                NonZeroU32::new(4_096).unwrap(),
+                ModelReasoningSummary::ProviderDefault,
+                ModelServiceClass::Standard,
+            ),
+            provider,
+            fixed_credential_source("sk-test"),
+        )
+        .unwrap();
+        let source = Arc::new(SingleModelSource::new(definition));
+        let source_adapter: Arc<dyn ModelSourceAdapter> = source;
+        let gateway = Arc::new(ModelGateway::new(vec![source_adapter]));
+        let model = gateway
+            .resolve_for_turn(
+                gateway.initialize().await.unwrap(),
+                ResolveTurnModelRequest::new(
+                    ModelSelection::new(
+                        "openai".parse().unwrap(),
+                        "stable-model-7".parse().unwrap(),
+                    ),
+                    ReasoningPreference::Auto,
+                    None,
+                ),
+            )
+            .unwrap();
+        let request = request_for_model(model).await;
+
+        let result = gateway
+            .generate_model_turn(
+                request,
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let requests = server.join();
+
+        assert_eq!(requests.len(), 1);
+        assert_request_shape(&requests[0], "sk-test");
+        let wire: Value = requests[0].json_body();
+        assert_eq!(
+            wire["model"], "gpt-5.2-api",
+            "the wire body must carry the private provider API model name"
+        );
+        assert_eq!(
+            result.response().model().model_id().as_str(),
+            "stable-model-7",
+            "the final provenance must keep the stable ModelSelection id"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loopback_completed_model_mismatch_fails_closed_without_success() {
+        // The pinned API model is "gpt-5", but the terminal reports a different
+        // model (or no model at all): the attempt must fail closed as
+        // InvalidProviderResponse at the terminal delivery, never succeed, and
+        // never produce provenance.
+        for terminal in [
+            completed_with_model("hello", "different-model"),
+            without_terminal_model(completed_with_model("hello", "gpt-5")),
+        ] {
+            let server = LoopbackServer::spawn(vec![ScriptedResponse {
+                status: 200,
+                content_type: "text/event-stream",
+                headers: vec![],
+                body: sse(&[terminal]),
+                gate: 0,
+            }]);
+            let adapter = Arc::new(
+                OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap(),
+            );
+            let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+            let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
+            let request = request_for_model(model).await;
+
+            let error = gateway
+                .generate_model_turn(
+                    request,
+                    ModelProgressPublisher::discard(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            let requests = server.join();
+
+            assert_eq!(
+                requests.len(),
+                1,
+                "a mismatched terminal must make exactly one HTTP request"
+            );
+            assert_eq!(
+                error.reason(),
+                ModelCallErrorReason::InvalidProviderResponse,
+                "a terminal that does not echo the pinned API model must fail closed"
+            );
+            assert_eq!(
+                error.delivery(),
+                ProviderRequestDeliveryState::AcceptedNoOutput,
+                "a terminal mismatch fails at the current delivery, never success"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loopback_completed_model_non_string_and_empty_fail_closed() {
+        for reported_model in [serde_json::Value::Null, Value::from(7), Value::from("")] {
+            let terminal = with_terminal_model(
+                completed_with_model("hello", "gpt-5"),
+                reported_model.clone(),
+            );
+            let server = LoopbackServer::spawn(vec![ScriptedResponse {
+                status: 200,
+                content_type: "text/event-stream",
+                headers: vec![],
+                body: sse(&[terminal]),
+                gate: 0,
+            }]);
+            let adapter = Arc::new(
+                OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap(),
+            );
+            let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+            let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
+            let request = request_for_model(model).await;
+
+            let error = gateway
+                .generate_model_turn(
+                    request,
+                    ModelProgressPublisher::discard(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            let _requests = server.join();
+
+            assert_eq!(
+                error.reason(),
+                ModelCallErrorReason::InvalidProviderResponse,
+                "a non-string or empty terminal model ({reported_model}) must fail closed"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn loopback_structured_request_maps_sanitized_schema_and_validates_terminal() {
         let server = LoopbackServer::spawn(vec![ScriptedResponse {
             status: 200,
@@ -1952,12 +2146,16 @@ mod tests {
             ]),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
-        let definition =
-            structured_definition(1, 4_096, NonZeroU32::new(65_536).unwrap(), provider);
+        let definition = structured_definition_with_credential(
+            1,
+            4_096,
+            NonZeroU32::new(65_536).unwrap(),
+            provider,
+            "sk-test",
+        );
         let (gateway, model) = gateway_and_model(definition).await;
         let contract = StructuredOutputContract::new(
             &model,
@@ -2045,9 +2243,8 @@ mod tests {
                                             "model": "gpt-5"}})]),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
         let request = request_for_model(model).await;
@@ -2090,9 +2287,8 @@ mod tests {
             ]),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
         let request = request_for_model(model).await;
@@ -2143,8 +2339,7 @@ mod tests {
                 gate: 0,
             }]);
             let adapter = Arc::new(
-                OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test")
-                    .unwrap(),
+                OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap(),
             );
             let provider: Arc<dyn ProviderAdapter> = adapter.clone();
             let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
@@ -2184,9 +2379,8 @@ mod tests {
                 .to_owned(),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
         let request = request_for_model(model).await;
@@ -2221,9 +2415,8 @@ mod tests {
                 .to_owned(),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
         let request = request_for_model(model).await;
@@ -2256,9 +2449,8 @@ mod tests {
             body: r#"{"error":{"message":"provider exploded","type":"server_error"}}"#.to_owned(),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
         let request = request_for_model(model).await;
@@ -2300,8 +2492,7 @@ mod tests {
                 gate: 0,
             }]);
             let adapter = Arc::new(
-                OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test")
-                    .unwrap(),
+                OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap(),
             );
             let provider: Arc<dyn ProviderAdapter> = adapter.clone();
             let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
@@ -2345,12 +2536,17 @@ mod tests {
             body: sse(&[completed_simple("hello")]),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test-credential")
-                .unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
-        let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
+        let (gateway, model) = gateway_and_model(text_definition_with_credential(
+            1,
+            4_096,
+            128_000,
+            provider,
+            "sk-test-credential",
+        ))
+        .await;
         let request = request_for_model(model).await;
 
         let result = gateway
@@ -2410,9 +2606,8 @@ mod tests {
             body: sse(&[completed_simple("ok")]),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (_gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
         let request = request_for_model(model).await;
@@ -2424,7 +2619,12 @@ mod tests {
         let attempt = ProviderAttemptRequest {
             effective_max_output_tokens: request.effective_max_output_tokens(),
             call: Arc::clone(&request),
+            credential: "sk-test".parse().unwrap(),
         };
+        assert!(
+            !format!("{attempt:?}").contains("sk-test"),
+            "ProviderAttemptRequest Debug must never reveal the resolved credential"
+        );
         let error = adapter
             .execute(attempt, ModelProgressPublisher::discard(), cancel)
             .await
@@ -2450,9 +2650,8 @@ mod tests {
             ]),
             gate: 1,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
         let request = request_for_model(model).await;
@@ -2513,11 +2712,13 @@ mod tests {
             body: sse(&[completed_simple("compact")]),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
-        let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
+        let (gateway, model) = gateway_and_model(text_definition_with_credential(
+            1, 4_096, 128_000, provider, "sk-test",
+        ))
+        .await;
         let request =
             request_with_output_contract(&model, Some(&OutputContract::NoToolCalls)).await;
 
@@ -2568,9 +2769,8 @@ mod tests {
             })]),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
         let request = request_for_model(model).await;
@@ -2630,9 +2830,8 @@ mod tests {
             })]),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
         let request = request_for_model(model).await;
@@ -2708,9 +2907,8 @@ mod tests {
             })]),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
         let request = request_for_model_with_tools(Arc::clone(&model), scripted_tool_set()).await;
@@ -2834,8 +3032,7 @@ mod tests {
                 gate: 0,
             }]);
             let adapter = Arc::new(
-                OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test")
-                    .unwrap(),
+                OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap(),
             );
             let provider: Arc<dyn ProviderAdapter> = adapter.clone();
             let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
@@ -2873,9 +3070,8 @@ mod tests {
             body: sse(&[output_text_delta(0, "")]),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
         let request = request_for_model(model).await;
@@ -2986,8 +3182,7 @@ mod tests {
                 gate: 0,
             }]);
             let adapter = Arc::new(
-                OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test")
-                    .unwrap(),
+                OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap(),
             );
             let provider: Arc<dyn ProviderAdapter> = adapter.clone();
             let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
@@ -3044,9 +3239,8 @@ mod tests {
             ]),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
         let request = request_for_model(model).await;
@@ -3102,9 +3296,8 @@ mod tests {
             ]),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
         let request = request_for_model(model).await;
@@ -3159,9 +3352,8 @@ mod tests {
             ]),
             gate: 0,
         }]);
-        let adapter = Arc::new(
-            OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test").unwrap(),
-        );
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
         let request = request_for_model(model).await;
@@ -3257,8 +3449,7 @@ mod tests {
                 gate: 0,
             }]);
             let adapter = Arc::new(
-                OpenAiResponsesProviderAdapter::new(&server.responses_endpoint(), "sk-test")
-                    .unwrap(),
+                OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap(),
             );
             let provider: Arc<dyn ProviderAdapter> = adapter.clone();
             let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
