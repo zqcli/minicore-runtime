@@ -672,6 +672,8 @@ RuntimeDependencyUnavailable readiness与probe recovery纵向切片已实现：`
 
 ## M13 · Production Tool/Sandbox Gate（V4-C0-1）
 
+状态：In Progress。M13.1已实现closed `FilesystemRead | FilesystemWrite | Network | Process` class set、final `ToolPermissionSet` narrowing、adapter `Available(enforceable) | Unavailable` contract、exact capability gap与fixed `PreExecution + Denied` mapping；尚未接入approval resume、ToolStartGate或production adapter。
+
 在开始任何production Tool/Sandbox adapter实现前，先用contract types与fake capability backend关闭本门禁：
 
 1. adapter contract声明可强制capability classes；

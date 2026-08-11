@@ -715,6 +715,190 @@ impl fmt::Debug for ToolStartedExecution {
     }
 }
 
+/// The frozen, closed set of capability classes one Tool Sandbox can enforce: the M13.1
+/// surface, class-level only, closed by construction.
+#[allow(dead_code, reason = "M13.1 conformance tests")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ToolCapabilityClass {
+    FilesystemRead,
+    FilesystemWrite,
+    Network,
+    Process,
+}
+
+/// The private class-level value set: one `u8` bitmask with module-private raw bits.
+#[allow(dead_code, reason = "M13.1 conformance tests")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ToolCapabilitySet(u8);
+
+#[allow(dead_code, reason = "the M13.1 admission algebra")]
+impl ToolCapabilitySet {
+    fn from_classes(classes: impl IntoIterator<Item = ToolCapabilityClass>) -> Self {
+        Self(classes.into_iter().fold(0, |b, c| b | (1 << c as u8)))
+    }
+
+    const fn contains(&self, class: ToolCapabilityClass) -> bool {
+        self.0 & (1 << class as u8) != 0
+    }
+
+    const fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    const fn is_subset_of(&self, other: &Self) -> bool {
+        self.0 & !other.0 == 0
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// The final class-level permission set for one Tool execution: the admission input.
+#[allow(dead_code, reason = "M13.1 conformance tests")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ToolPermissionSet(ToolCapabilitySet);
+
+#[allow(dead_code, reason = "used by M13.1 tests and the M13 wiring slice")]
+impl ToolPermissionSet {
+    pub(crate) fn new(classes: impl IntoIterator<Item = ToolCapabilityClass>) -> Self {
+        Self(ToolCapabilitySet::from_classes(classes))
+    }
+
+    pub(crate) const fn contains(&self, class: ToolCapabilityClass) -> bool {
+        self.0.contains(class)
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The restricted-option candidate: may equal or narrow the ceiling, never widen it.
+    pub(crate) fn restricted_candidate(
+        &self,
+        candidate: impl IntoIterator<Item = ToolCapabilityClass>,
+    ) -> Result<Self, ToolPermissionRestrictionError> {
+        let candidate = Self::new(candidate);
+        candidate
+            .0
+            .is_subset_of(&self.0)
+            .then_some(candidate)
+            .ok_or(ToolPermissionRestrictionError::ElevatesCapabilities)
+    }
+}
+
+/// The closed typed error for a restricted candidate that would widen its ceiling.
+#[allow(dead_code, reason = "M13.1 conformance tests")]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum ToolPermissionRestrictionError {
+    #[error(
+        "a restricted permission candidate must not add capability classes beyond the current ceiling"
+    )]
+    ElevatesCapabilities,
+}
+
+/// The adapter's value contract for one Tool Sandbox: availability plus the enforceable
+/// class-level set; an unavailable Sandbox carries no set.
+#[allow(dead_code, reason = "filled by the M13.1 fake backend")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ToolSandboxContract {
+    Available(ToolCapabilitySet),
+    Unavailable,
+}
+
+#[allow(dead_code, reason = "exercised by the M13.1 fake backend")]
+impl ToolSandboxContract {
+    pub(crate) fn available(classes: impl IntoIterator<Item = ToolCapabilityClass>) -> Self {
+        Self::Available(ToolCapabilitySet::from_classes(classes))
+    }
+
+    pub(crate) const fn unavailable() -> Self {
+        Self::Unavailable
+    }
+
+    /// The single admission method: admits only when available and every final class is
+    /// enforceable, failing a gap as exactly `required − enforceable`.
+    pub(crate) fn admit(
+        &self,
+        permissions: ToolPermissionSet,
+    ) -> Result<ToolSandboxProof, ToolSandboxAdmissionError> {
+        match self {
+            Self::Unavailable => Err(ToolSandboxAdmissionError::Unavailable),
+            Self::Available(enforceable) if permissions.0.is_subset_of(enforceable) => {
+                Ok(ToolSandboxProof { permissions })
+            }
+            Self::Available(enforceable) => {
+                let missing = ToolPermissionSet(permissions.0.difference(*enforceable));
+                Err(ToolSandboxAdmissionError::CapabilityGap { missing })
+            }
+        }
+    }
+}
+
+/// The closed admission failure: an unavailable Sandbox and a capability gap are distinct.
+#[allow(dead_code, reason = "M13.1 conformance tests")]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum ToolSandboxAdmissionError {
+    #[error("the Tool Sandbox is unavailable")]
+    Unavailable,
+    #[error("the Tool Sandbox cannot enforce the required capability classes")]
+    CapabilityGap { missing: ToolPermissionSet },
+}
+
+#[allow(dead_code, reason = "M13.1 conformance tests")]
+impl ToolSandboxAdmissionError {
+    pub(crate) fn missing(&self) -> Option<ToolPermissionSet> {
+        match self {
+            Self::Unavailable => None,
+            Self::CapabilityGap { missing } => Some(*missing),
+        }
+    }
+
+    /// The owner-side conversion: any admission failure becomes one fixed, bounded,
+    /// non-secret `PreExecution { Denied }` text, never naming the missing classes.
+    pub(crate) fn denied_result(&self) -> ToolExecutionResult {
+        ToolExecutionResult::PreExecution {
+            disposition: ToolResultDisposition::Denied,
+            content: ToolResultContent::sandbox_denied(match self {
+                Self::Unavailable => TOOL_SANDBOX_UNAVAILABLE_TEXT,
+                Self::CapabilityGap { .. } => TOOL_CAPABILITY_GAP_TEXT,
+            }),
+        }
+    }
+}
+
+/// The move-only proof of admission, binding exactly the admitted final permission set.
+#[allow(dead_code, reason = "produced by the M13.1 admission contract")]
+pub(crate) struct ToolSandboxProof {
+    permissions: ToolPermissionSet,
+}
+
+#[allow(dead_code, reason = "read by the M13 gate wiring slice")]
+impl ToolSandboxProof {
+    pub(crate) fn permissions(&self) -> ToolPermissionSet {
+        self.permissions
+    }
+}
+
+impl fmt::Debug for ToolSandboxProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ToolSandboxProof { .. }")
+    }
+}
+
+impl ToolResultContent {
+    #[allow(dead_code, reason = "consumed by the M13 gate wiring slice")]
+    fn sandbox_denied(text: &'static str) -> Self {
+        Self::from_text_parts(vec![text.to_owned()]).expect("the frozen denial texts are valid")
+    }
+}
+
+#[allow(dead_code, reason = "consumed by the M13 gate wiring slice")]
+const TOOL_CAPABILITY_GAP_TEXT: &str = "tool capabilities cannot be enforced";
+
+#[allow(dead_code, reason = "consumed by the M13 gate wiring slice")]
+const TOOL_SANDBOX_UNAVAILABLE_TEXT: &str = "tool sandbox is unavailable";
+
 #[derive(Debug)]
 pub(crate) enum ToolExecutionOutcome {
     Completed {
@@ -3695,5 +3879,126 @@ mod tests {
         }))
         .unwrap()
         .len()
+    }
+
+    use ToolCapabilityClass as C;
+
+    const ALL: [ToolCapabilityClass; 4] = [
+        C::FilesystemRead,
+        C::FilesystemWrite,
+        C::Network,
+        C::Process,
+    ];
+
+    /// Test-local adapter side filling the small value contract; no trait abstraction.
+    struct FakeCapabilityBackend(ToolSandboxContract);
+
+    impl FakeCapabilityBackend {
+        fn enforcing(classes: impl IntoIterator<Item = ToolCapabilityClass>) -> Self {
+            Self(ToolSandboxContract::available(classes))
+        }
+
+        fn unavailable() -> Self {
+            Self(ToolSandboxContract::unavailable())
+        }
+
+        fn admit(
+            &self,
+            permissions: ToolPermissionSet,
+        ) -> Result<ToolSandboxProof, ToolSandboxAdmissionError> {
+            self.0.admit(permissions)
+        }
+    }
+
+    #[test]
+    fn tool_sandbox_available_backend_admits_full_coverage_and_keeps_exact_proof() {
+        let rw_net = [C::FilesystemRead, C::FilesystemWrite, C::Network];
+        let final_set = ToolPermissionSet::new(rw_net);
+        let exact = FakeCapabilityBackend::enforcing(rw_net).admit(final_set);
+        let superset = FakeCapabilityBackend::enforcing(ALL).admit(final_set);
+        assert_eq!(exact.unwrap().permissions(), final_set);
+        assert_eq!(superset.unwrap().permissions(), final_set);
+        let gap = FakeCapabilityBackend::enforcing([C::FilesystemRead]).admit(final_set);
+        assert!(gap.is_err());
+    }
+
+    #[test]
+    fn tool_sandbox_gap_is_exact_and_binds_to_a_denied_preexecution_outcome() {
+        let required = ToolPermissionSet::new([C::FilesystemRead, C::FilesystemWrite, C::Network]);
+        let error = FakeCapabilityBackend::enforcing([C::FilesystemRead, C::Process])
+            .admit(required)
+            .unwrap_err();
+        let missing = error
+            .missing()
+            .expect("a gap failure carries its exact missing set");
+        let expected = ToolPermissionSet::new([C::FilesystemWrite, C::Network]);
+        assert_eq!(missing, expected);
+        let request = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000001".parse().unwrap(),
+            ToolCall::new(
+                "call_sandbox_gap".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        assert!(matches!(
+            ToolSet::bind_preexecution_result(&request, error.denied_result()),
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: ToolResultDisposition::Denied,
+                ref content,
+            } if item_id == request.item_id() && tool_call_id == *request.call().tool_call_id()
+                && content.parts()[0].as_text() == TOOL_CAPABILITY_GAP_TEXT
+        ));
+    }
+
+    #[test]
+    fn tool_sandbox_unavailable_fails_closed_even_with_full_coverage() {
+        let error = FakeCapabilityBackend::unavailable()
+            .admit(ToolPermissionSet::new(ALL))
+            .unwrap_err();
+        assert!(matches!(error, ToolSandboxAdmissionError::Unavailable));
+        assert!(error.missing().is_none());
+        assert!(matches!(
+            error.denied_result(),
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Denied,
+                content,
+            } if content.parts()[0].as_text() == TOOL_SANDBOX_UNAVAILABLE_TEXT
+        ));
+    }
+
+    #[test]
+    fn tool_sandbox_restricted_candidate_may_narrow_but_never_widen_the_ceiling() {
+        let rw_net = [C::FilesystemRead, C::FilesystemWrite, C::Network];
+        let ceiling = ToolPermissionSet::new(rw_net);
+        let equal = ceiling.restricted_candidate(rw_net).unwrap();
+        let subset = ceiling
+            .restricted_candidate(rw_net[..2].iter().copied())
+            .unwrap();
+        assert_eq!(equal, ceiling);
+        assert_eq!(subset, ToolPermissionSet::new(rw_net[..2].iter().copied()));
+        let narrowed = ceiling.restricted_candidate([]).unwrap();
+        assert!(narrowed.is_empty());
+        for elevated in [
+            vec![C::FilesystemRead, C::Process],
+            ALL.to_vec(),
+            vec![C::Process],
+        ] {
+            assert!(ceiling.restricted_candidate(elevated).is_err());
+        }
+    }
+
+    #[test]
+    fn tool_sandbox_empty_permissions_admit_when_available_but_not_when_unavailable() {
+        let empty = ToolPermissionSet::new([]);
+        let proof = FakeCapabilityBackend::enforcing([C::FilesystemRead])
+            .admit(empty)
+            .unwrap();
+        assert_eq!(proof.permissions(), empty);
+        assert!(FakeCapabilityBackend::unavailable().admit(empty).is_err());
     }
 }
