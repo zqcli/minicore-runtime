@@ -1,6 +1,6 @@
 # Tool 子系统架构设计
 
-状态：当前权威架构；M8.1最小Scripted Tool round-trip与ToolStartGate crate-private correctness slice已实现（per-round first-wins start gate、typed started proof、PreExecution/Executed/Abandoned truthful settlement），完整ToolService/source/schema/hooks/policy/approval、ToolOperationSlot Running/Settling/Terminal owner state与production executor仍待实现
+状态：当前权威架构；M8.1最小Scripted Tool round-trip与crate-private `ToolOperationSlot`完整生命周期已实现（Prepared→Running→Settling→Terminal：per-request slot-owned `ToolStartGate` first-wins start gate、typed started proof、Running cancellation pair、signal先赢→PreExecution Cancelled且不调用factory、start先赢→Settling继续await same run后truthful settle、PreExecution/Executed/Abandoned truthful settlement），完整ToolService/source/schema/hooks/policy/approval、production executor/adapter（返回前须提供有界、可确认cleanup）与Session-local mutation queue/mutation permit attachment to Settling仍待实现
 日期：2026-07-31
 
 ## 目的
@@ -506,7 +506,7 @@ approval不替代Sandbox。无法强制required capability时production executor
 
 ### Tool Execution Control
 
-以下完整trait仍是future target，尚未作为单一interface落地。当前已实现的是Session Execution/Tools组合的窄seam：Session Execution在assistant ToolCall apply后、record await前为每个exact `ToolExecutionRequest` capture构建per-round `RoundToolStartGate`（绑定exact `EmergencyControlHandle` + observation），每个request对应一个`ToolStartGate` lock-free atomic slot（`Prepared → Reserved → Started | Cancelled`，无mutex、无poison、与Emergency owner mutex无锁序）；reservation（Prepared→Reserved CAS）在EmergencyControl owner mutex内对exact unsignaled target/epoch执行，与`signal`在同一mutex上线性化（first-wins）；move-only `ToolStartPermit`经`start()`（Reserved→Started CAS）产生typed `ToolStartedExecution` proof，executor future只在proof存在后poll，drop未用permit回滚reservation；signal/stale先赢→matching PreExecution Cancelled ToolResult，reservation/start先赢后只能truthful settle。approval/UserQuestion的control lane仍pending。
+以下完整trait仍是future target，尚未作为单一interface落地；其start/cancel部分已由Session Execution/Tools组合的concrete seam实现，approval/UserQuestion lane仍pending。Session Execution在assistant ToolCall live apply后、record await前为每个exact `ToolExecutionRequest` capture构造`ToolOperationSlot::Prepared`（绑定exact `EmergencyControlHandle` + observation），每个request对应slot自己的`ToolStartGate` lock-free atomic slot（`Prepared → Reserved → Started | Cancelled`，无mutex、无poison、与Emergency owner mutex无锁序）；reservation（Prepared→Reserved CAS）在EmergencyControl owner mutex内对exact unsignaled target/epoch执行，与`signal`在同一mutex上线性化（first-wins）；move-only `ToolStartPermit`经`start()`（Reserved→Started CAS）产生typed `ToolStartedExecution` proof，`ToolSet::run_started_execution`先复验proof的exact capture再调用move-only `ToolExecutionStart` factory构造future（foreign proof fail-closed为identity-bound Abandoned），executor future只在proof存在后poll，drop未用permit回滚reservation；signal/stale先赢→不调用factory、matching PreExecution Cancelled ToolResult；reservation/start先赢后slot进入Running（持有operation自己的`ToolCancellationHandle`），signal只触发cancellation observer、slot经Settling继续await same run至executor cooperative cleanup/result后truthful settle（started run不因signal drop）。approval/UserQuestion的control lane仍pending。
 
 ```rust
 pub(crate) trait ToolExecutionControl: Send + Sync {
@@ -532,7 +532,7 @@ pub(crate) trait ToolExecutionControl: Send + Sync {
 
 `ToolStartPermit`是current-Runtime typed permit，不持久化：
 
-- Session Execution拥有唯一`ToolOperationSlot`类型（完整slot仍target，当前由round-local gate + typed proof替代）；Turn-scoped control handle验证current Turn/Item/call；
+- Session Execution拥有唯一`ToolOperationSlot`类型（Prepared→Running→Settling→Terminal完整生命周期已实现）；Turn-scoped control handle验证current Turn/Item/call；
 - 观察latest EmergencyControl；
 - 原子把ToolOperationSlot从Prepared变为Running；
 - permit只允许对应executor开始一次；
@@ -671,8 +671,8 @@ ToolSet只产出typed terminal outcome，不拥有conversation reducer。live co
 ## Cancellation 与 SecurityRevoked
 
 - Prepared：Emergency先赢，不发permit，产生PreExecution Cancelled ToolResult（已实现）；
-- Running：发送best-effort cancellation，等待executor teardown/result（best-effort cancellation handle/teardown仍pending，当前Running Tool只等待truthful result或Abandoned）；
-- Settling：等待resource/mutation permit安全释放；
+- Running：发送best-effort cancellation，等待executor teardown/result（已实现：Running slot持有operation自己的`ToolCancellationHandle`，signal先赢后cancel该pair并经Settling继续await same run至executor cooperative cleanup/result；production executor/adapter teardown仍未实现，production adapter返回前必须提供有界、可确认cleanup）；
+- Settling：等待resource/mutation permit安全释放（mutation permit attachment to Settling仍pending）；
 - exact outcome可得：保存ToolResult；
 - outcome unknown：Abandoned；
 - 不声称回滚OS/provider side effect；
@@ -829,6 +829,6 @@ ToolStartPermit使用actor message、owner-local CAS或等价private实现属于
 - [x] 删除durable ToolExecutionStarted和ToolRoundCompleted；
 - [x] 统一ToolCall/ToolExecutionRequest/ToolExecutionOutcome canonical owner与pre-execution result；
 - [x] complete Tool exchange自动projection；
-- [x] ToolStartGate first-wins start gate与typed started proof（round-local narrow slice，M8.3 foundation；Running Tool best-effort cancellation与完整ToolOperationSlot Running/Settling/Terminal仍pending）；
+- [x] ToolStartGate first-wins start gate与typed started proof，及完整`ToolOperationSlot`生命周期（Prepared→Running→Settling→Terminal、Running cancellation pair与truthful settle；M8.3 foundation已从round-local narrow slice升级为slot）；
 - [ ] O1 production Sandbox gate；
 - [ ] production implementation/tests。

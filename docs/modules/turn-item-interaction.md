@@ -1,6 +1,6 @@
 # Turn、Item 与 Interaction 架构设计
 
-状态：当前权威架构（ADR 0134后；当前implemented scope为crate-private Scripted vertical slice——Tool/Interaction/Cancel与ToolStartGate first-wins start gate已实现，生产实现未启动）
+状态：当前权威架构（ADR 0134后；当前implemented scope为crate-private Scripted vertical slice——Tool/Interaction/Cancel与crate-private `ToolOperationSlot`完整生命周期（first-wins start gate、Running best-effort cancellation与truthful settle）已实现，生产实现未启动）
 日期：2026-07-31
 
 ## 目的
@@ -210,7 +210,7 @@ policy/approval/sandbox validation
 
 start reservation前Cancel/SecurityRevoked获胜时Tool不执行。Running后获胜只能best-effort cancel并truthful settle或Abandoned。
 
-INV-401 start first-wins已落地（round-local gate）：每个exact `ToolExecutionRequest` capture（ItemId + same `Arc<ToolCall>`）绑定一个`ToolStartGate` lock-free slot，reservation在EmergencyControl owner mutex内对exact unsignaled target/epoch执行、与`signal`在同一mutex线性化，move-only `ToolStartPermit`→`ToolStartedExecution` proof后executor future才poll；signal/stale先赢→matching PreExecution Cancelled ToolResult，reservation/start先赢→exact Executed/Abandoned truthful settle。Running Tool best-effort cancellation handle/teardown与完整`ToolOperationSlot` Running/Settling状态仍pending。
+INV-401 start first-wins已落地：每个exact `ToolExecutionRequest` capture（ItemId + same `Arc<ToolCall>`）绑定slot自己的`ToolStartGate` lock-free slot（`ToolOperationSlot::Prepared`，不存在第二层round-level gate），reservation在EmergencyControl owner mutex内对exact unsignaled target/epoch执行、与`signal`在同一mutex线性化，move-only `ToolStartPermit`→`ToolStartedExecution` proof后`run_started_execution`复验exact capture并调用factory构造future；signal/stale先赢→不调用factory、matching PreExecution Cancelled ToolResult，reservation/start先赢→signal只触发operation cancellation observer、slot经Settling继续await same run后truthful settle（started run不因signal drop），exact Executed/Abandoned。Running best-effort cancellation已由`ToolOperationSlot` Running（`ToolCancellationHandle`）+ Settling实现；production ToolService/executor/adapter teardown与mutation permit attachment to Settling仍pending。
 
 SessionRecorder不参与Tool start，不记录`ToolExecutionStarted`。process crash可能丢失side-effect事实，restart不自动重跑Tool。
 

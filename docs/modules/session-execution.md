@@ -1,6 +1,6 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn、M8 Tool/Interaction/Cancel与ToolStartGate first-wins start gate（round-local narrow slice）、M9.1–M9.21当前control/observation范围及M10完整Compaction vertical slice已接通，包括queue/Steer/FollowUp、logical retry、EmergencyControl/SecurityRevoked、public command/outcome、Starting/Running/Finishing Snapshot、`session_execution_changed`与terminal StateEvent；current Turn/active Item/Pending Interaction安全摘要、usage read model与Degraded recording/diagnostics projection已接通；具体Prompt/Skill source adapter、完整Tool policy/approval、完整ToolOperationSlot Running/Settling/Terminal owner state与Running Tool best-effort cancellation teardown仍后置）
+状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn、M8 Tool/Interaction/Cancel与crate-private `ToolOperationSlot`完整生命周期（Prepared→Running→Settling→Terminal：per-slot first-wins start gate、typed started proof、Running cancellation pair与truthful settle）、M9.1–M9.21当前control/observation范围及M10完整Compaction vertical slice已接通，包括queue/Steer/FollowUp、logical retry、EmergencyControl/SecurityRevoked、public command/outcome、Starting/Running/Finishing Snapshot、`session_execution_changed`与terminal StateEvent；current Turn/active Item/Pending Interaction安全摘要、usage read model与Degraded recording/diagnostics projection已接通；具体Prompt/Skill source adapter、完整Tool policy/approval、production ToolService/executor/adapters（返回前须提供有界、可确认cleanup）与Session-local mutation queue/mutation permit attachment to Settling仍后置）
 日期：2026-07-31
 
 M9 当前补充：Session Snapshot 已公开投影 current Turn、active Items 与 Pending Interaction 的最小安全摘要，并与 Running/approval Wire V1 fixtures 对齐。
@@ -9,7 +9,7 @@ M9 当前补充：Session Snapshot 已公开投影 current Turn、active Items �
 
 本文定义loaded Session的control actor、ActiveTurnTask、async run loop、SessionIngress、Steer/FollowUp、Cancel、Interaction routing、logical retry和restart行为。
 
-当前实现进度：M10已在M9 control/observation基础上接通proactive/Prompt/provider overflow、CompactionSummary至多一次logical retry、exact control/plan/request arbitration、live Replace、same-Arc inline record、post-compaction Steer safe point、`Compacting` phase及Snapshot usage/recording refresh。M9.18 的 `SessionQueueView` 仍保留 lane-local FIFO、exact `CommandId`/expected `TurnId` 和 `acceptingInput`，不携带 queued intent 正文。current Turn、active Items 与 Pending Interaction 已以最小安全摘要接入 Session Snapshot/Wire V1。ToolStartGate crate-private correctness slice已实现：assistant ToolCall apply后在同一no-await步骤构建round-local `RoundToolStartGate`，每个exact `ToolExecutionRequest`（ItemId + same `Arc<ToolCall>`）绑定一个`ToolStartGate` lock-free slot，reservation在EmergencyControl owner mutex内对exact unsignaled target/epoch执行lock-free CAS（与`signal`同一mutex线性化，first-wins），move-only `ToolStartPermit`→typed `ToolStartedExecution` proof后executor future才poll；signal/stale先赢→matching PreExecution Cancelled ToolResult apply+inline record后Turn Interrupted且不发起下一次Model；reservation/start先赢→exact Executed/Abandoned truthful settle；serial/parallel按call_index order；parent-owned join_all+catch_unwind使panic恰好映射Abandoned。完整ToolOperationSlot Running/Settling/Terminal owner state、Running Tool best-effort cancellation teardown与完整Tool policy/approval仍后置。
+当前实现进度：M10已在M9 control/observation基础上接通proactive/Prompt/provider overflow、CompactionSummary至多一次logical retry、exact control/plan/request arbitration、live Replace、same-Arc inline record、post-compaction Steer safe point、`Compacting` phase及Snapshot usage/recording refresh。M9.18 的 `SessionQueueView` 仍保留 lane-local FIFO、exact `CommandId`/expected `TurnId` 和 `acceptingInput`，不携带 queued intent 正文。current Turn、active Items 与 Pending Interaction 已以最小安全摘要接入 Session Snapshot/Wire V1。crate-private `ToolOperationSlot`完整生命周期已实现：assistant ToolCall live apply后、record await前在同一no-await步骤为每个exact `ToolExecutionRequest`（ItemId + same `Arc<ToolCall>`）构造`Prepared` slot（绑定exact request + round EmergencyControl handle/observation + per-slot `ToolStartGate`），reservation在EmergencyControl owner mutex内对exact unsignaled target/epoch执行lock-free CAS（与`signal`同一mutex线性化，first-wins），move-only `ToolStartPermit`→typed `ToolStartedExecution` proof后`ToolSet::run_started_execution`复验exact capture并调用move-only `ToolExecutionStart` factory构造future；signal/stale先赢→不调用factory、产出matching PreExecution Cancelled ToolResult apply+inline record后Turn Interrupted且不发起下一次Model；start先赢→signal只触发operation cancellation observer，slot进入Settling并继续await same run至executor cooperative cleanup/result后truthful settle（started run不因signal drop），exact Executed/Abandoned；serial/parallel按call_index order；parent-owned join_all+catch_unwind使panic恰好映射Abandoned。production ToolService/executor/adapters、Session-local mutation queue/mutation permit attachment to Settling与完整Tool policy/approval仍后置。
 
 核心目标：
 
@@ -323,7 +323,7 @@ Steer在RetryBackoff期间只排队，不改变conversation revision；Cancel/Se
 validated assistant ToolCall content
 → normalize Tools-owned ToolCalls + allocate ItemIds + build ToolExecutionRequests
 → owner-local apply Assistant(intermediate) + Started Items + expected call set
-→ 在同一no-await步骤构建round-local `RoundToolStartGate`（每个exact request一个`ToolStartGate`；完整Prepared `ToolOperationSlot`仍target）
+→ 在同一no-await步骤为每个exact request构造`ToolOperationSlot::Prepared`（绑定exact request + round EmergencyControl handle/observation + per-slot `ToolStartGate`）
 → await inline record assistant attempt
 → phase ExecutingTools
 → execute calls through captured ToolSet
@@ -337,7 +337,7 @@ Tool futures可以并行，但属于同一个ActiveTurnTask。它们不能直接
 ### Tool Operation Slot
 
 ```rust
-pub(crate) enum ToolOperationSlot {
+enum ToolOperationSlot {
     Prepared { request: ToolExecutionRequest },
     Running {
         request: ToolExecutionRequest,
@@ -348,7 +348,14 @@ pub(crate) enum ToolOperationSlot {
 }
 ```
 
-上述完整enum（含Running cancellation handle与Settling/Terminal推进）仍是future target，当前未安装完整slot。当前实现的是round-local start gate + typed proof窄seam：assistant ToolCall apply后在同一no-await步骤构建`RoundToolStartGate`，每个exact `ToolExecutionRequest` capture一个`ToolStartGate`（lock-free `Prepared → Reserved → Started | Cancelled` atomic slot），reservation在EmergencyControl owner mutex内对exact unsignaled target/epoch执行（与`signal`同一mutex线性化，first-wins），move-only `ToolStartPermit`经`start()`产生typed `ToolStartedExecution` proof，executor future只在proof存在后poll；settlement直接产出`ToolExecutionOutcome`（PreExecution result / Executed / Abandoned），不经Settling状态。Session Execution仍是`ToolOperationSlot`（完整形态）的唯一type owner；Turn/Item只投影`Started | Completed | Abandoned`。pre-execution exact outcome允许`Prepared → Terminal(Completed)`、只有possible-start且outcome unknown才能进入`Terminal(Abandoned)`保持为target contract。Tool start遵守INV-401，recording不是Tool start marker。
+上述enum即当前实现（implementation-only字段——`emergency_control`/`observation`/`gate`/`run`——省略，变体形态与生命周期语义不变）。Session Execution是`ToolOperationSlot`的唯一type owner；每个exact request恰好一个slot。
+
+- `Prepared`：assistant ToolCall live apply后、record await前构造，绑定exact request、round的`EmergencyControlHandle` + observation与slot自己的`ToolStartGate`（sole operation owner，不存在第二层round-level gate）；
+- `Running`：只在typed `ToolStartedExecution` proof存在后进入，持有operation自己的`ToolCancellationHandle`与still-owned started run future（observer已move进该run）；
+- `Settling`：当前等待点——signal先赢时先cancel自己的cancellation pair、在executor result前进入Settling并继续await same run至executor cooperative cleanup/result（started future绝不因signal被drop），自然完成则先绑定result再短暂经过Settling；
+- `Terminal`：绑定exact identity-bound `ToolExecutionOutcome`，唯一extraction路径。
+
+执行细节：`ToolExecutionPlan::Execute`/`Interaction`携带move-only `ToolExecutionStart` factory；`ToolSet::run_started_execution`先复验typed proof的exact capture（foreign proof fail-closed为identity-bound Abandoned RuntimeFailure）再调用factory构造future。signal-before-start不调用factory（matching PreExecution Cancelled）；start先赢后signal只触发operation cancellation observer，slot进入Settling并继续await same run，executor返回truthful Executed/Abandoned。serial后续未启动calls各自PreExecution Cancelled；parallel Running calls各自收到cancel，parent-owned join_all、call_index order；per-slot catch_unwind使panic恰好映射exact Abandoned。future mutation permit step（Session-local mutation queue/mutation permit attachment to Settling）仍后置，不属于当前slot。Turn/Item只投影`Started | Completed | Abandoned`。pre-execution exact outcome允许`Prepared → Terminal(Completed)`、只有possible-start且outcome unknown才能进入`Terminal(Abandoned)`。Tool start遵守INV-401，recording不是Tool start marker。
 
 ## Interaction
 
@@ -433,7 +440,7 @@ Starting candidate尚未spawn ActiveTurnTask时，accepted Cancel阻止spawn，�
 
 - 停止新Model、Tool、Compaction和Steer消费；
 - Prepared Tool不启动；
-- Running Toolbest-effort cancel并等待truthful outcome或Abandoned（best-effort cancellation handle/teardown仍pending：当前Running Tool只等待truthful result或Abandoned，不持有独立cancellation handle）；
+- Running Toolbest-effort cancel并等待truthful outcome或Abandoned（已实现：Running slot持有operation自己的`ToolCancellationHandle`，signal先赢后cancel该cancellation pair并经Settling继续await same run至executor cooperative cleanup/result，started run不因signal drop；production ToolService/executor/adapter teardown仍后置，production adapter返回前必须提供有界、可确认cleanup）；
 - Pending Interaction在live state中Cancelled并resume waiter；
 - apply live TurnInterrupted(UserCancelled)；
 - publish TurnInterrupted StateEvent；
