@@ -6,6 +6,11 @@
 //! arrives on a fresh connection and no keep-alive reuse can hide a second
 //! request. The test settles the thread through a dedicated poison connection
 //! and joins it before asserting, so nothing here sleeps, spins, or times out.
+//!
+//! Responses are served either as JSON ([`LoopbackServer::spawn`]) or as an
+//! SSE stream ([`LoopbackServer::spawn_sse`], `Content-Type:
+//! text/event-stream`); both share the identical blocking, no-sleep,
+//! no-timeout lifecycle.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -62,6 +67,26 @@ const POISON_BYTE: u8 = 0x00;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 
+/// The wire content type a scripted response is served as.
+///
+/// Each integration-test binary compiles this shared module standalone and
+/// uses only one of the two constructors, so both variants are `#[allow(dead_code)]`.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum ResponseKind {
+    /// `Content-Type: application/json` (the original contract).
+    Json,
+    /// `Content-Type: text/event-stream` for SSE streaming probes.
+    Sse,
+}
+
+/// One scripted response: status, wire content type, and exact body.
+struct ScriptedResponse {
+    status: u16,
+    kind: ResponseKind,
+    body: String,
+}
+
 /// Serves one scripted response per accepted connection, in order, until the
 /// test opens a poison connection carrying [`POISON_BYTE`]. A real request
 /// with no scripted response left (a protocol violation) panics the thread,
@@ -73,7 +98,41 @@ pub struct LoopbackServer {
 }
 
 impl LoopbackServer {
+    /// Serve one JSON response per accepted connection, in order.
+    #[allow(dead_code)] // unused by the SSE-only test binary
     pub fn spawn(scripted: &[(u16, &str)]) -> Self {
+        let scripted = scripted
+            .iter()
+            .map(|(status, body)| ScriptedResponse {
+                status: *status,
+                kind: ResponseKind::Json,
+                body: body.to_string(),
+            })
+            .collect();
+        Self::spawn_scripted(scripted)
+    }
+
+    /// Same contract as [`Self::spawn`], but every response is served with
+    /// `Content-Type: text/event-stream` so rig's reqwest SSE event source
+    /// accepts the body (its `check_response` requires status 200 and the
+    /// `text/event-stream` mime type). Everything else — exact
+    /// `Content-Length`, `Connection: close`, one blocking write per
+    /// connection, the poison/join lifecycle — is identical, and there is no
+    /// sleep, timeout, yield, or polling.
+    #[allow(dead_code)] // unused by the JSON-only test binaries
+    pub fn spawn_sse(scripted: &[(u16, &str)]) -> Self {
+        let scripted = scripted
+            .iter()
+            .map(|(status, body)| ScriptedResponse {
+                status: *status,
+                kind: ResponseKind::Sse,
+                body: body.to_string(),
+            })
+            .collect();
+        Self::spawn_scripted(scripted)
+    }
+
+    fn spawn_scripted(scripted: Vec<ScriptedResponse>) -> Self {
         let listener =
             TcpListener::bind("127.0.0.1:0").expect("loopback server must bind an ephemeral port");
         let base_url = format!(
@@ -83,10 +142,6 @@ impl LoopbackServer {
 
         let captured = Arc::new(Mutex::new(Vec::new()));
         let thread_captured = Arc::clone(&captured);
-        let scripted: Vec<(u16, String)> = scripted
-            .iter()
-            .map(|(status, body)| (*status, body.to_string()))
-            .collect();
 
         let handle = thread::spawn(move || {
             let mut scripted = scripted.into_iter();
@@ -100,16 +155,10 @@ impl LoopbackServer {
                 if n == 0 {
                     panic!("connection closed before any request bytes");
                 }
-                let (status, body) = scripted.next().unwrap_or_else(|| {
+                let scripted = scripted.next().unwrap_or_else(|| {
                     panic!("unexpected HTTP request: no scripted response left")
                 });
-                serve_one(
-                    &mut stream,
-                    first[0],
-                    status,
-                    &body,
-                    thread_captured.as_ref(),
-                );
+                serve_one(&mut stream, first[0], &scripted, thread_captured.as_ref());
             }
         });
 
@@ -163,8 +212,7 @@ impl Drop for LoopbackServer {
 fn serve_one(
     stream: &mut TcpStream,
     first_byte: u8,
-    status: u16,
-    response_body: &str,
+    scripted: &ScriptedResponse,
     captured: &Mutex<Vec<CapturedRequest>>,
 ) {
     let mut buf = vec![first_byte];
@@ -225,19 +273,25 @@ fn serve_one(
             body,
         });
 
-    let reason = match status {
+    let reason = match scripted.status {
         200 => "OK",
         500 => "Internal Server Error",
         other => panic!("unscripted response status {other}"),
     };
+    let content_type = match scripted.kind {
+        ResponseKind::Json => "application/json",
+        ResponseKind::Sse => "text/event-stream",
+    };
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: application/json\r\n\
+        "HTTP/1.1 {} {reason}\r\n\
+         Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n\
-         {response_body}",
-        response_body.len()
+         {}",
+        scripted.status,
+        scripted.body.len(),
+        scripted.body
     );
     stream
         .write_all(response.as_bytes())
