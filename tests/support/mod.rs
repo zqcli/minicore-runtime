@@ -7,10 +7,11 @@
 //! request. The test settles the thread through a dedicated poison connection
 //! and joins it before asserting, so nothing here sleeps, spins, or times out.
 //!
-//! Responses are served either as JSON ([`LoopbackServer::spawn`]) or as an
-//! SSE stream ([`LoopbackServer::spawn_sse`], `Content-Type:
-//! text/event-stream`); both share the identical blocking, no-sleep,
-//! no-timeout lifecycle.
+//! Responses are served either as JSON ([`LoopbackServer::spawn`] or
+//! [`LoopbackServer::spawn_with_headers`], the latter with extra response
+//! headers) or as an SSE stream ([`LoopbackServer::spawn_sse`],
+//! `Content-Type: text/event-stream`); all share the identical blocking,
+//! no-sleep, no-timeout lifecycle.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -70,7 +71,7 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// The wire content type a scripted response is served as.
 ///
 /// Each integration-test binary compiles this shared module standalone and
-/// uses only one of the two constructors, so both variants are `#[allow(dead_code)]`.
+/// uses only one of the three constructors, so both variants are `#[allow(dead_code)]`.
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 enum ResponseKind {
@@ -80,10 +81,17 @@ enum ResponseKind {
     Sse,
 }
 
-/// One scripted response: status, wire content type, and exact body.
+/// One scripted JSON entry with extra response headers: `(status, body, headers)`.
+/// Keeps [`LoopbackServer::spawn_with_headers`]'s signature under clippy's
+/// type-complexity budget.
+pub type ScriptedJsonWithHeaders<'a> = (u16, &'a str, &'a [(&'a str, &'a str)]);
+
+/// One scripted response: status, wire content type, extra response headers
+/// (names lowercased, written after the fixed headers), and exact body.
 struct ScriptedResponse {
     status: u16,
     kind: ResponseKind,
+    headers: Vec<(String, String)>,
     body: String,
 }
 
@@ -106,6 +114,29 @@ impl LoopbackServer {
             .map(|(status, body)| ScriptedResponse {
                 status: *status,
                 kind: ResponseKind::Json,
+                headers: Vec::new(),
+                body: body.to_string(),
+            })
+            .collect();
+        Self::spawn_scripted(scripted)
+    }
+
+    /// Same contract as [`Self::spawn`], but each scripted entry additionally
+    /// carries extra response headers (names lowercased, values as given)
+    /// written verbatim after the fixed headers, so a test can script
+    /// provider response metadata (request IDs, retry hints, timing markers)
+    /// alongside a JSON body. The lifecycle is identical to [`Self::spawn`].
+    #[allow(dead_code)] // unused by test binaries that script no response headers
+    pub fn spawn_with_headers(scripted: &[ScriptedJsonWithHeaders<'_>]) -> Self {
+        let scripted = scripted
+            .iter()
+            .map(|(status, body, headers)| ScriptedResponse {
+                status: *status,
+                kind: ResponseKind::Json,
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| (name.to_ascii_lowercase(), value.to_string()))
+                    .collect(),
                 body: body.to_string(),
             })
             .collect();
@@ -126,6 +157,7 @@ impl LoopbackServer {
             .map(|(status, body)| ScriptedResponse {
                 status: *status,
                 kind: ResponseKind::Sse,
+                headers: Vec::new(),
                 body: body.to_string(),
             })
             .collect();
@@ -275,24 +307,31 @@ fn serve_one(
 
     let reason = match scripted.status {
         200 => "OK",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
+        529 => "Overloaded",
         other => panic!("unscripted response status {other}"),
     };
     let content_type = match scripted.kind {
         ResponseKind::Json => "application/json",
         ResponseKind::Sse => "text/event-stream",
     };
-    let response = format!(
+    let mut head = format!(
         "HTTP/1.1 {} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
+         Connection: close\r\n",
         scripted.status,
         scripted.body.len(),
-        scripted.body
     );
+    for (name, value) in &scripted.headers {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    let response = format!("{head}{}", scripted.body);
     stream
         .write_all(response.as_bytes())
         .expect("write scripted response");
