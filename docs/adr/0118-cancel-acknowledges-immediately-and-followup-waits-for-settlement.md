@@ -3,6 +3,8 @@
 状态：Partially Superseded by ADRs 0124, 0126, 0127 and 0133
 日期：2026-07-27
 
+> 2026-08-11 current refinement：signal-first all-unstarted settlement已落地——Cancel/SecurityRevoked/Unload signal先赢时跳过UserQuestion binding与一切start factory，全部未启动calls（含pending question）settle matching PreExecution Cancelled；Interaction host resolution与UserQuestion binding分别经`InteractionResolutionPermit`/`UserQuestionBindingPermit`在apply/bind前与signal first-wins（permit先赢则signal随后仍授权该精确步骤并truthful settle）。历史正文不变。
+
 > [ADR 0133](0133-runtime-public-payload-is-snapshot-recoverable.md)冻结Starting Submit两条public completion：Input apply前user Cancel先赢为`Completed(SubmitCancelled)`且无Turn；Input apply先赢为`Completed(TurnStarted)`，随后观察同一Turn Interrupted。
 
 > 2026-07-31：CancelAccepted、Finishing、truthful Tool settlement、live TurnInterrupted和FollowUp handoff继续有效；ADR 0127删除TurnInterrupted JSONL entry，并使`Cancel(Submit)`在整个Starting阶段保持有效。Input已live apply时Cancel绑定同一Turn并阻止task spawn，不再按正文旧start-commit reservation规则返回transition error。Terminal完成由current-process StateEvent/Snapshot表达。

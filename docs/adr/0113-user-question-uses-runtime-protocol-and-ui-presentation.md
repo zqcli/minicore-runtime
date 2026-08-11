@@ -3,6 +3,8 @@
 状态：Partially Superseded by ADRs 0124, 0126, 0127 and 0133
 日期：2026-07-25
 
+> 2026-08-11 implementation refinement：crate-private scripted UserQuestion控制正确性seam已实现——typed `ToolExecutionPlan::UserQuestion` + Tools-owned move-only/redacted `UserQuestionAnswerBinding`（仅truthful `PreExecution + Succeeded`接受为answer，malformed/panic fail closed为identity-bound Abandoned）、Session-private concrete `ToolExecutionControl`复用既有Interaction actor/wire/storage owner（无public interface/trait冻结）、question按typed plan shape hoisted到全部ordinary sibling之前（call_index串行、至多一个pending、不预留ToolStartGate/mutation ticket、每个question outcome先apply+inline record再继续）、Cancel/SecurityRevoked/Unload signal-first跳过binding并settle全部unstarted calls为matching PreExecution Cancelled、valid answer产生identity-bound PreExecution Succeeded。本ADR的MiniCore-owned protocol与UI-presentation职责分离继续有效；public ask-user builtin ToolName、schema与answer→model-visible ToolResult text/render格式仍未冻结/实现，production ToolService/executor/adapters仍pending。
+
 > [ADR 0133](0133-runtime-public-payload-is-snapshot-recoverable.md)冻结request-scoped approval options、non-secret Text/SingleChoice question payload、safe Runtime view和random request-scoped resolution key；host不能构造PermissionSet或通过Interaction收集credential。
 
 > 2026-07-31：typed Interaction、MiniCore-owned live request/resolution与Presentation Adapter职责继续有效；ADR 0127规定restart不恢复Pending waiter/state，也不合成Cancelled resolution或Turn terminal。Recorded request/resolution只作为historical facts。

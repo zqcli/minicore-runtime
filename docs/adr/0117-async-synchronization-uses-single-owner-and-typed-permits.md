@@ -3,6 +3,8 @@
 状态：Partially Superseded by ADRs 0124, 0125, 0126, 0127 and 0137
 日期：2026-07-27
 
+> 2026-08-11 current refinement：opaque owner-bound permits已落地——`EmergencyControlObservation`携带opaque `Arc<EmergencyControlOwner>` identity（`Arc::ptr_eq`验证，foreign observation无法通过），presentation/resolution/UserQuestion binding/unstarted-settlement均为move-only typed permit并绑定owner+target/epoch+同一`ToolExecutionRequest` capture，在Emergency owner mutex内与`signal`/close first-wins线性化；Submit→Turn signal迁移（`migrate_target`）在同一owner mutex内原子进行并保留旧signal到new basis。历史正文不变。
+
 > 2026-08-03 refinement: ADR 0137 owns the current Tokio owner-tracked job, barrier, shutdown, and permit details; ADR 0136 owns durable-root publication. Read those current ADRs and their canonical modules for any current rule. The historical decision below is retained unchanged.
 >
 > 2026-07-31：single owner、短guard、ToolStartGate、file mutation permit和release-before-fan-out继续有效。ADR 0127把Turn start线性化点收缩为final Enabled check + Input live apply；Agent lifecycle permit不跨SessionRecorder await，旧start-commit/controlled terminal append语义删除。

@@ -231,14 +231,23 @@ pub(crate) enum HostInteractionResolutionError {
 pub(crate) struct InteractionRequestCandidate {
     request_id: RequestId,
     item_id: ItemId,
+    tool_call_id: crate::tools::ToolCallId,
     request: InteractionRequest,
 }
 
 impl InteractionRequestCandidate {
-    pub(crate) fn new(request_id: RequestId, item_id: ItemId, request: InteractionRequest) -> Self {
+    /// The exact owner value for one interaction presentation: the pending request binds its
+    /// exact item, the exact started Tool call it belongs to, and the request body.
+    pub(crate) fn new(
+        request_id: RequestId,
+        item_id: ItemId,
+        tool_call_id: crate::tools::ToolCallId,
+        request: InteractionRequest,
+    ) -> Self {
         Self {
             request_id,
             item_id,
+            tool_call_id,
             request,
         }
     }
@@ -250,6 +259,7 @@ impl fmt::Debug for InteractionRequestCandidate {
             .debug_struct("InteractionRequestCandidate")
             .field("request_id", &self.request_id)
             .field("item_id", &self.item_id)
+            .field("tool_call_id", &"redacted")
             .field("request", &"redacted")
             .finish()
     }
@@ -876,7 +886,7 @@ impl LiveSessionState {
         timestamp: Timestamp,
     ) -> Result<AppliedConversationFact, LiveConversationError> {
         self.require_current_turn(turn_id)?;
-        if !self.is_started_tool_invocation(candidate.item_id, turn_id) {
+        if !self.is_started_tool_invocation(candidate.item_id, candidate.tool_call_id, turn_id) {
             return Err(LiveConversationError::new(
                 LiveConversationErrorReason::InvalidRelation,
             ));
@@ -1377,16 +1387,23 @@ impl LiveSessionState {
         )
     }
 
-    fn is_started_tool_invocation(&self, item_id: ItemId, turn_id: TurnId) -> bool {
+    fn is_started_tool_invocation(
+        &self,
+        item_id: ItemId,
+        tool_call_id: crate::tools::ToolCallId,
+        turn_id: TurnId,
+    ) -> bool {
         self.relations.iter().any(|relation| {
             relation.item_id() == item_id
                 && relation.turn_id() == turn_id
                 && relation.family() == ItemContentFamily::ToolInvocation
+                && relation.tool_call_id() == Some(&tool_call_id)
         }) && self.tool_exchange.as_ref().is_some_and(|exchange| {
-            exchange
-                .expected
-                .iter()
-                .any(|expected| expected.item_id == item_id && expected.terminal.is_none())
+            exchange.expected.iter().any(|expected| {
+                expected.item_id == item_id
+                    && expected.tool_call_id == tool_call_id
+                    && expected.terminal.is_none()
+            })
         })
     }
 
@@ -1802,7 +1819,12 @@ mod tests {
             .unwrap();
         state
             .apply_interaction_request(
-                InteractionRequestCandidate::new(request(1), item(2), approval_request()),
+                InteractionRequestCandidate::new(
+                    request(1),
+                    item(2),
+                    "call_a".parse().unwrap(),
+                    approval_request(),
+                ),
                 turn_id,
                 timestamp(),
             )
@@ -2419,7 +2441,12 @@ mod tests {
             .unwrap();
         state
             .apply_interaction_request(
-                InteractionRequestCandidate::new(request_id, item(2), approval_request()),
+                InteractionRequestCandidate::new(
+                    request_id,
+                    item(2),
+                    "call_a".parse().unwrap(),
+                    approval_request(),
+                ),
                 turn_id,
                 timestamp(),
             )
@@ -2487,7 +2514,12 @@ mod tests {
         };
         let requested = state
             .apply_interaction_request(
-                InteractionRequestCandidate::new(request_id, item(2), exact_request),
+                InteractionRequestCandidate::new(
+                    request_id,
+                    item(2),
+                    "call_a".parse().unwrap(),
+                    exact_request,
+                ),
                 turn_id,
                 timestamp(),
             )
@@ -2578,7 +2610,12 @@ mod tests {
             .unwrap();
         owner_cancelled
             .apply_interaction_request(
-                InteractionRequestCandidate::new(request_id, item(2), approval_request()),
+                InteractionRequestCandidate::new(
+                    request_id,
+                    item(2),
+                    "call_a".parse().unwrap(),
+                    approval_request(),
+                ),
                 turn_id,
                 timestamp(),
             )
@@ -2606,6 +2643,59 @@ mod tests {
             calls_before,
             result,
             LiveConversationErrorReason::InteractionConflict,
+        );
+    }
+
+    #[test]
+    fn interaction_request_binds_the_exact_started_tool_call_id_and_rejects_a_mismatch() {
+        let turn_id = turn(1);
+        let mut state = scripted_state(session(1), (1..=6).map(entry));
+        start(&mut state, turn_id);
+        state
+            .apply_assistant_message(
+                assistant_with_calls(&[(item(2), "call_a")]),
+                turn_id,
+                timestamp(),
+            )
+            .unwrap();
+
+        // The exact owner value binds the started invocation's exact call id: a candidate
+        // that names the started item but a different Tool call is not the started
+        // invocation and is rejected before any allocation or mutation.
+        let snapshot = StateSnapshot::capture(&state);
+        let calls_before = state.scripted_allocation_calls();
+        let result = state.apply_interaction_request(
+            InteractionRequestCandidate::new(
+                request(1),
+                item(2),
+                "call_wrong".parse().unwrap(),
+                approval_request(),
+            ),
+            turn_id,
+            timestamp(),
+        );
+        assert_validation_rejection_unchanged(
+            &state,
+            &snapshot,
+            calls_before,
+            result,
+            LiveConversationErrorReason::InvalidRelation,
+        );
+
+        // The matching exact call id still applies.
+        assert!(
+            state
+                .apply_interaction_request(
+                    InteractionRequestCandidate::new(
+                        request(1),
+                        item(2),
+                        "call_a".parse().unwrap(),
+                        approval_request(),
+                    ),
+                    turn_id,
+                    timestamp(),
+                )
+                .is_ok()
         );
     }
 
@@ -2688,7 +2778,12 @@ mod tests {
         };
         let requested = state
             .apply_interaction_request(
-                InteractionRequestCandidate::new(request_id, item(2), exact_question),
+                InteractionRequestCandidate::new(
+                    request_id,
+                    item(2),
+                    "call_a".parse().unwrap(),
+                    exact_question,
+                ),
                 turn_id,
                 timestamp(),
             )
@@ -3179,7 +3274,12 @@ mod tests {
             .revision();
         let interaction_request = state
             .apply_interaction_request(
-                InteractionRequestCandidate::new(request_id, item(4), approval_request()),
+                InteractionRequestCandidate::new(
+                    request_id,
+                    item(4),
+                    "call_a".parse().unwrap(),
+                    approval_request(),
+                ),
                 turn_id,
                 timestamp(),
             )
@@ -3408,7 +3508,12 @@ mod tests {
             .unwrap();
         let request_fact = state
             .apply_interaction_request(
-                InteractionRequestCandidate::new(request_id, item(2), approval_request()),
+                InteractionRequestCandidate::new(
+                    request_id,
+                    item(2),
+                    "call_a".parse().unwrap(),
+                    approval_request(),
+                ),
                 turn_id,
                 timestamp(),
             )
@@ -3430,7 +3535,12 @@ mod tests {
         let second_pending_calls = state.scripted_allocation_calls();
         assert_eq!(
             live_error(state.apply_interaction_request(
-                InteractionRequestCandidate::new(request(2), item(2), approval_request()),
+                InteractionRequestCandidate::new(
+                    request(2),
+                    item(2),
+                    "call_a".parse().unwrap(),
+                    approval_request()
+                ),
                 turn_id,
                 timestamp(),
             ))
@@ -3480,7 +3590,12 @@ mod tests {
 
         let sequential = state
             .apply_interaction_request(
-                InteractionRequestCandidate::new(request(2), item(2), approval_request()),
+                InteractionRequestCandidate::new(
+                    request(2),
+                    item(2),
+                    "call_a".parse().unwrap(),
+                    approval_request(),
+                ),
                 turn_id,
                 timestamp(),
             )
@@ -3526,14 +3641,24 @@ mod tests {
             .unwrap();
         state
             .apply_interaction_request(
-                InteractionRequestCandidate::new(request(1), item(2), approval_request()),
+                InteractionRequestCandidate::new(
+                    request(1),
+                    item(2),
+                    "call_a".parse().unwrap(),
+                    approval_request(),
+                ),
                 turn_id,
                 timestamp(),
             )
             .unwrap();
         state
             .apply_interaction_request(
-                InteractionRequestCandidate::new(request(2), item(3), approval_request()),
+                InteractionRequestCandidate::new(
+                    request(2),
+                    item(3),
+                    "call_b".parse().unwrap(),
+                    approval_request(),
+                ),
                 turn_id,
                 timestamp(),
             )
@@ -3591,7 +3716,12 @@ mod tests {
 
         state
             .apply_interaction_request(
-                InteractionRequestCandidate::new(request(3), item(3), question_request()),
+                InteractionRequestCandidate::new(
+                    request(3),
+                    item(3),
+                    "call_b".parse().unwrap(),
+                    question_request(),
+                ),
                 turn_id,
                 timestamp(),
             )

@@ -1,6 +1,6 @@
 # Tool 子系统架构设计
 
-状态：当前权威架构；M8.1最小Scripted Tool round-trip与crate-private `ToolOperationSlot`完整生命周期已实现（Prepared→Running→Settling→Terminal：per-request slot-owned `ToolStartGate` first-wins start gate、typed started proof、Running cancellation pair、signal先赢→PreExecution Cancelled且不调用factory、start先赢→Settling继续await same run后truthful settle、PreExecution/Executed/Abandoned truthful settlement），完整ToolService/source/schema/hooks/policy/approval、production executor/adapter（返回前须提供有界、可确认cleanup）与Session-local mutation queue/mutation permit attachment to Settling仍待实现
+状态：当前权威架构；M8.1最小Scripted Tool round-trip与crate-private `ToolOperationSlot`完整生命周期已实现（Prepared→Running→Settling→Terminal：per-request slot-owned `ToolStartGate` first-wins start gate、typed started proof、Running cancellation pair、signal先赢→PreExecution Cancelled且不调用factory、start先赢→Settling继续await same run后truthful settle、PreExecution/Executed/Abandoned truthful settlement），crate-private scripted approval/UserQuestion控制正确性seam亦已实现（typed `ToolExecutionPlan::{Approval, UserQuestion}`拆分、Session-private concrete `ToolExecutionControl`、Tools-owned move-only `UserQuestionAnswerBinding`、hoisted exclusive question调度与signal-first settlement），完整ToolService/source/schema/hooks/policy/approval enforcement、production ask-user builtin ToolName/schema与answer→model-visible ToolResult text/render格式、production executor/adapter（返回前须提供有界、可确认cleanup）与Session-local mutation queue/mutation permit attachment to Settling仍待实现
 日期：2026-07-31
 
 ## 目的
@@ -301,12 +301,12 @@ pub struct ToolTurnContext {
     pub session_revision: SessionDefinitionRevision,
     pub workspace: WorkspaceToolContext,
     pub tool_calling: ToolCallingCapabilities,
-    execution_control: Arc<dyn ToolExecutionControl>,
+    execution_control: Arc<ToolExecutionControl>,
     mutation_queue: Arc<SessionFileMutationQueue>,
 }
 ```
 
-`execution_control`与`mutation_queue`均为crate-private capture输入。SessionExecutor在reserve candidate TurnId/control_generation后创建一个绑定该candidate与EmergencyControl的Turn-scoped control handle，并克隆本loaded Session拥有的mutation queue；两者在ActiveTurnTask spawn前进入`ToolTurnContext`。同一个control handle随后交给ActiveTurnTask使用，禁止task spawn后替换或二次注入。
+`execution_control`与`mutation_queue`均为crate-private capture输入。SessionExecutor在reserve candidate TurnId/control_generation后创建绑定该candidate与EmergencyControl的Turn-scoped concrete control handle（crate-private `ToolExecutionControl`，Session Execution私有类型，不冻结public trait），并克隆本loaded Session拥有的mutation queue；两者在ActiveTurnTask spawn前进入`ToolTurnContext`。同一个control handle随后交给ActiveTurnTask使用，禁止task spawn后替换或二次注入。
 
 `for_turn`：
 
@@ -502,33 +502,37 @@ questions/options按index严格递增且唯一。answer必须无duplicate/unknow
 
 MVP没有`secret`、password、credential、file upload或arbitrary JSON answer variant。producer和Presentation Adapter必须明确告知用户：answer会进入live state、conversation JSONL、event/history和ask-user ToolResult，并可能发送给模型，不能输入API key、password、token或其他secret。`NonSecret`是协议约束，不是Runtime对自然语言的secret classifier。需要credential时必须未来新增独立secure host capability/one-time secret reference，raw value不得经过Interaction/ToolResult/model context。
 
+当前crate-private scripted实现状态：typed `ToolExecutionPlan::UserQuestion`与Tools-owned move-only/redacted `UserQuestionAnswerBinding`已实现（binding只接受truthful `PreExecution + Succeeded`作为answer、显式Abandoned直通、其余malformed形状fail closed为identity-bound Abandoned OutcomeUnknown）；question由typed plan shape识别、hoisted到全部ordinary sibling之前按call_index串行驱动、至多一个pending，不预留ToolStartGate或mutation ticket；每个question outcome先apply live+inline record attempt再继续；Cancel/SecurityRevoked/Unload signal-first跳过binding并settle全部unstarted calls为matching PreExecution Cancelled。production ask-user builtin ToolName、公开schema与answer→model-visible ToolResult的text/render格式仍未冻结/实现；上述字段类型是crate-private scripted carrier，不代表production Tool DTO已冻结。
+
 approval不替代Sandbox。无法强制required capability时production executor必须在side effect前拒绝；该能力声明和差集算法由O1在production Tool/Sandbox adapter开始前冻结。
 
 ### Tool Execution Control
 
-以下完整trait仍是future target，尚未作为单一interface落地；其start/cancel部分已由Session Execution/Tools组合的concrete seam实现，approval/UserQuestion lane仍pending。Session Execution在assistant ToolCall live apply后、record await前为每个exact `ToolExecutionRequest` capture构造`ToolOperationSlot::Prepared`（绑定exact `EmergencyControlHandle` + observation），每个request对应slot自己的`ToolStartGate` lock-free atomic slot（`Prepared → Reserved → Started | Cancelled`，无mutex、无poison、与Emergency owner mutex无锁序）；reservation（Prepared→Reserved CAS）在EmergencyControl owner mutex内对exact unsignaled target/epoch执行，与`signal`在同一mutex上线性化（first-wins）；move-only `ToolStartPermit`经`start()`（Reserved→Started CAS）产生typed `ToolStartedExecution` proof，`ToolSet::run_started_execution`先复验proof的exact capture再调用move-only `ToolExecutionStart` factory构造future（foreign proof fail-closed为identity-bound Abandoned），executor future只在proof存在后poll，drop未用permit回滚reservation；signal/stale先赢→不调用factory、matching PreExecution Cancelled ToolResult；reservation/start先赢后slot进入Running（持有operation自己的`ToolCancellationHandle`），signal只触发cancellation observer、slot经Settling继续await same run至executor cooperative cleanup/result后truthful settle（started run不因signal drop）。approval/UserQuestion的control lane仍pending。
+approval与UserQuestion控制现由Session-private concrete `ToolExecutionControl`实现（crate-private、`Clone`的Turn-scoped handle，携带exact TurnId与既有`InteractionRequested` completion lane sender），复用既有Interaction actor/wire/storage owner完成apply+record+notify与resolution-before-resume，不冻结public interface/trait（完整trait不再作为future target承诺）。start/cancel部分继续由Session Execution/Tools组合的concrete seam实现。Session Execution在assistant ToolCall live apply后、record await前为每个exact `ToolExecutionRequest` capture构造`ToolOperationSlot::Prepared`（绑定exact `EmergencyControlHandle` + observation），每个request对应slot自己的`ToolStartGate` lock-free atomic slot（`Prepared → Reserved → Started | Cancelled`，无mutex、无poison、与Emergency owner mutex无锁序）；reservation（Prepared→Reserved CAS）在EmergencyControl owner mutex内对exact unsignaled target/epoch执行，与`signal`在同一mutex上线性化（first-wins）；move-only `ToolStartPermit`经`start()`（Reserved→Started CAS）产生typed `ToolStartedExecution` proof，`ToolSet::run_started_execution`先复验proof的exact capture再调用move-only `ToolExecutionStart` factory构造future（foreign proof fail-closed为identity-bound Abandoned），executor future只在proof存在后poll，drop未用permit回滚reservation；signal/stale先赢→不调用factory、matching PreExecution Cancelled ToolResult；reservation/start先赢后slot进入Running（持有operation自己的`ToolCancellationHandle`），signal只触发cancellation observer、slot经Settling继续await same run至executor cooperative cleanup/result后truthful settle（started run不因signal drop）。approval/UserQuestion控制seam已完成（crate-private scripted）：
+
+- Emergency observation携带opaque owner identity（`Arc<EmergencyControlOwner>`，`Arc::ptr_eq`验证，foreign observation无法通过）；
+- interaction presentation、host resolution、UserQuestion answer binding与unstarted settlement均为move-only typed permit，每个permit绑定owner+target/epoch+同一`ToolExecutionRequest` capture，在Emergency owner mutex内与`signal`/close first-wins线性化（signal-first→不present/bind/settle固定结果，permit-first→signal随后到达仍授权该精确步骤并truthful settle）；
+- Submit→Turn signal迁移（`migrate_target`）在同一owner mutex内原子进行，旧basis的signal保留到new basis；
+- typed `ToolExecutionPlan`四路结构（旧generic Interaction plan删除）：
 
 ```rust
-pub(crate) trait ToolExecutionControl: Send + Sync {
-    async fn request_approval(
-        &self,
-        item_id: ItemId,
+pub(crate) enum ToolExecutionPlan {
+    Execute(ToolExecutionStart),
+    Approval {
         request: ToolApprovalRequest,
-    ) -> Result<ToolApprovalDecision, ToolExecutionControlError>;
-
-    async fn request_user_question(
-        &self,
-        item_id: ItemId,
+        allowed: ToolExecutionStart,
+        denied: ToolExecutionResult,
+    },
+    UserQuestion {
         request: UserQuestionRequest,
-    ) -> Result<UserQuestionAnswer, ToolExecutionControlError>;
-
-    async fn reserve_execution_start(
-        &self,
-        item_id: ItemId,
-        tool_call_id: ToolCallId,
-    ) -> Result<ToolStartPermit, ToolExecutionControlError>;
+        answer: UserQuestionAnswerBinding,
+    },
+    PreExecution(ToolExecutionResult),
 }
 ```
+
+- UserQuestion由typed plan shape识别：hoisted到全部ordinary sibling之前、按call_index串行驱动、至多一个pending；每个question outcome（answer或owner cancellation）先apply live+inline record attempt再呈现下一个question或启动ordinary sibling；question绝不预留`ToolStartGate`或mutation ticket、绝不构造start factory；
+- valid answer经move-only `UserQuestionAnswerBinding::bind`产生identity-bound `PreExecution + Succeeded` ToolResult；Cancel/SecurityRevoked/Unload signal-first跳过binding并settle全部unstarted calls为matching PreExecution Cancelled；presentation/resolution/binding permit-first各阶段settle truthfully；abandoned question对remaining无副作用（known preflight保留、其余unstarted settle为PreExecution Failed）。
 
 `ToolStartPermit`是current-Runtime typed permit，不持久化：
 
@@ -549,7 +553,7 @@ pub(crate) trait ToolExecutionControl: Send + Sync {
 
 - call按canonical `call_index`规范化；
 - preflight/schema/policy按call order；
-- ask-user route独占并先完成；
+- UserQuestion/ask-user由typed plan shape识别并独占先完成（hoisted到全部ordinary sibling之前、按call_index串行、至多一个pending；每个question outcome先apply live+inline record attempt再继续；question不涉及ToolStartGate或mutation ticket）；
 - `Serial`、multi-file或open-world Tool使batch按call order串行；
 - 普通single-file Tool按canonical file key取得Session-local FIFO ticket；
 - 不同key可以并发；
@@ -569,6 +573,8 @@ mutation permit：
 - underlying I/O settle前不释放；
 - Cancel可以忽略业务结果，但不能提前释放permit；
 - 不跨Session/Runtime/process协调。
+
+实现状态：Session-local file mutation queue与mutation permit仍未实现（mutation permit attachment to Settling仍pending）；上述调度规则中的question部分已由crate-private scripted control seam落地，file queue部分仍只是设计。
 
 ## Tool 执行流程
 
@@ -596,7 +602,7 @@ Completed {
 }
 ```
 
-`PreExecution + Succeeded`只用于ask-user等built-in control route已经truthfully完成且没有executor side effect的结果；普通Tool不得用它绕过executor。`CancelledBeforeStart`不是独立terminal outcome variant。只要start reservation尚未获胜且可以证明没有side effect，Cancel/SecurityRevoked也返回`Completed { source = PreExecution, result.disposition = Cancelled }`。ActiveTurnTask把truthful outcome apply为live role=tool message，并完成inline record attempt。
+`PreExecution + Succeeded`只用于ask-user等built-in control route已经truthfully完成且没有executor side effect的结果；普通Tool不得用它绕过executor。UserQuestion的valid answer经move-only `UserQuestionAnswerBinding::bind`产生identity-bound `PreExecution + Succeeded`（malformed/panic fail closed为identity-bound Abandoned OutcomeUnknown）。`CancelledBeforeStart`不是独立terminal outcome variant。只要start reservation尚未获胜且可以证明没有side effect，Cancel/SecurityRevoked也返回`Completed { source = PreExecution, result.disposition = Cancelled }`；signal-first对全部unstarted calls（含pending question）跳过binding并settle matching Cancelled，abandoned question下known preflight保留、其余unstarted settle为`PreExecution Failed`。ActiveTurnTask把truthful outcome apply为live role=tool message，并完成inline record attempt。
 
 ### Executed Result
 
@@ -670,9 +676,10 @@ ToolSet只产出typed terminal outcome，不拥有conversation reducer。live co
 
 ## Cancellation 与 SecurityRevoked
 
-- Prepared：Emergency先赢，不发permit，产生PreExecution Cancelled ToolResult（已实现）；
+- Prepared：Emergency先赢，不发permit，产生PreExecution Cancelled ToolResult（已实现；含pending UserQuestion：signal-first跳过binding，全部unstarted calls settle matching PreExecution Cancelled）；
 - Running：发送best-effort cancellation，等待executor teardown/result（已实现：Running slot持有operation自己的`ToolCancellationHandle`，signal先赢后cancel该pair并经Settling继续await same run至executor cooperative cleanup/result；production executor/adapter teardown仍未实现，production adapter返回前必须提供有界、可确认cleanup）；
 - Settling：等待resource/mutation permit安全释放（mutation permit attachment to Settling仍pending）；
+- UserQuestion/ask-user（已实现）：presentation/resolution/binding各阶段经move-only permit与signal first-wins，signal-first跳过binding并settle全部unstarted为PreExecution Cancelled，abandoned question对remaining无副作用（known preflight保留、其余unstarted为PreExecution Failed）；question不持mutation permit或ToolStartGate；
 - exact outcome可得：保存ToolResult；
 - outcome unknown：Abandoned；
 - 不声称回滚OS/provider side effect；
@@ -736,7 +743,7 @@ ToolPromptView
 ToolDefinition/ToolSpec
 ToolCall/ToolResult
 ToolExecutionOutcome
-ToolExecutionControl
+ToolExecutionControl（Session-private concrete，非public trait）
 ToolStartPermit（process-local）
 SessionFileMutationQueue
 ```
@@ -765,7 +772,7 @@ Tool grant store
 - ToolResult recording失败不重放Tool；
 - complete call/result集合才进入model conversation；
 - ToolSet不修改LiveSessionState、不写SessionRecorder、不推进async loop；
-- ask-user不持mutation permit；
+- ask-user不持mutation permit、不预留ToolStartGate（hoisted exclusive question调度）；
 - 同Session同file mutation FIFO；
 - 跨Session不协调；
 - restart不自动重放Tool；
@@ -790,7 +797,7 @@ Tool grant store
 - approval public view redaction，request-scoped option index映射AllowOnce/AllowWith且restricted不能扩大权限；
 - unknown/cross-request option拒绝，resolution后重新执行Sandbox enforceability与ToolStartGate；
 - UserQuestion Text/SingleChoice index/required/family validation且protocol无secret variant；
-- UserQuestion在mutation/start前；
+- UserQuestion在mutation/start前；typed plan hoisting/exclusive scheduling（call_index串行、至多一个pending）、answer binding与signal first-wins、signal-first全部unstarted settle为PreExecution Cancelled；
 - ToolSet在task spawn前由captured control handle与Session-local queue完整构造；
 - ToolStartPermit只使用一次；
 - start permit vs Cancel/Security双向race；
@@ -825,10 +832,11 @@ ToolStartPermit使用actor message、owner-local CAS或等价private实现属于
 - [x] ToolSpec-only prompt view；
 - [x] ToolCall/Item identity；
 - [x] policy/approval/UserQuestion/Sandbox顺序；
-- [x] Session-local file mutation queue；
+- [ ] Session-local file mutation queue（设计已冻结，实现与mutation permit attachment to Settling仍pending）；
 - [x] 删除durable ToolExecutionStarted和ToolRoundCompleted；
 - [x] 统一ToolCall/ToolExecutionRequest/ToolExecutionOutcome canonical owner与pre-execution result；
 - [x] complete Tool exchange自动projection；
 - [x] ToolStartGate first-wins start gate与typed started proof，及完整`ToolOperationSlot`生命周期（Prepared→Running→Settling→Terminal、Running cancellation pair与truthful settle；M8.3 foundation已从round-local narrow slice升级为slot）；
+- [x] UserQuestion producer与exclusive scheduler正确性（typed `ToolExecutionPlan::UserQuestion`、move-only `UserQuestionAnswerBinding`（仅truthful PreExecution+Succeeded为answer）、hoisted exclusive question调度（call_index串行、至多一个pending、不涉及ToolStartGate/mutation ticket）、signal-first settlement与abandoned question无副作用）；
 - [ ] O1 production Sandbox gate；
-- [ ] production implementation/tests。
+- [ ] production implementation/tests（含production ask-user builtin ToolName/schema与answer→model-visible ToolResult text/render格式、完整schema/hooks/policy/Sandbox enforcement、production ToolService/executor/adapters与Session-local file mutation queue）。
