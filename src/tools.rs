@@ -925,7 +925,11 @@ fn abandoned_runtime_failure(request: &ToolExecutionRequest) -> ToolExecutionOut
     }
 }
 
-type ToolExecutor = dyn Fn(ToolExecutionRequest) -> ToolExecutionPlan + Send + Sync;
+/// The owner-internal per-request planner: one request produces its final permission set
+/// (the admission input) and its pre-start plan; Session Execution only sees the plan.
+/// The M14 production adapter fills this seam with the production per-request planner.
+type ToolPlanner =
+    dyn Fn(ToolExecutionRequest) -> (ToolPermissionSet, ToolExecutionPlan) + Send + Sync;
 
 /// The immutable Tool set captured for one Turn.
 #[derive(Clone)]
@@ -936,7 +940,9 @@ pub(crate) struct ToolSet {
 struct ToolSetInner {
     definitions: Arc<[ToolDefinition]>,
     specs: Arc<[ToolSpec]>,
-    executor: Option<Arc<ToolExecutor>>,
+    planner: Option<Arc<ToolPlanner>>,
+    /// The captured sandbox contract (empty enforceable set by default).
+    sandbox: ToolSandboxContract,
 }
 
 /// The model-safe projection of one exact captured [`ToolSet`].
@@ -959,7 +965,8 @@ impl ToolSet {
             inner: Arc::new(ToolSetInner {
                 definitions: Arc::from([]),
                 specs: Arc::from([]),
-                executor: None,
+                planner: None,
+                sandbox: ToolSandboxContract::available([]),
             }),
         })
     }
@@ -971,15 +978,19 @@ impl ToolSet {
     ) -> Arc<Self> {
         let executor: Arc<dyn Fn(ToolExecutionRequest) -> ToolExecutionFuture + Send + Sync> =
             Arc::new(executor);
-        Self::with_plans(
+        Self::with_sandbox_plans(
             definitions,
+            ToolSandboxContract::available([]),
             Arc::new(move |request| {
                 let executor = Arc::clone(&executor);
                 // The ignore-cancellation test wrapper: the start factory never surfaces the
                 // observer to the scripted executor.
-                ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
-                    executor(request)
-                }))
+                (
+                    ToolPermissionSet::new([]),
+                    ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                        executor(request)
+                    })),
+                )
             }),
         )
     }
@@ -999,13 +1010,17 @@ impl ToolSet {
                 + Send
                 + Sync,
         > = Arc::new(executor);
-        Self::with_plans(
+        Self::with_sandbox_plans(
             definitions,
+            ToolSandboxContract::available([]),
             Arc::new(move |request| {
                 let executor = Arc::clone(&executor);
-                ToolExecutionPlan::Execute(ToolExecutionStart::new(move |observer| {
-                    executor(request, observer)
-                }))
+                (
+                    ToolPermissionSet::new([]),
+                    ToolExecutionPlan::Execute(ToolExecutionStart::new(move |observer| {
+                        executor(request, observer)
+                    })),
+                )
             }),
         )
     }
@@ -1019,11 +1034,33 @@ impl ToolSet {
         definitions: Vec<ToolDefinition>,
         planner: impl Fn(ToolExecutionRequest) -> ToolExecutionPlan + Send + Sync + 'static,
     ) -> Arc<Self> {
-        Self::with_plans(definitions, Arc::new(planner))
+        Self::with_sandbox_plans(
+            definitions,
+            ToolSandboxContract::available([]),
+            Arc::new(move |request| (ToolPermissionSet::new([]), planner(request))),
+        )
+    }
+
+    /// Test-only constructor for the M13.2 admission tests: injects the captured sandbox
+    /// contract and a per-request planner producing the final permission set plus the plan.
+    #[cfg(test)]
+    pub(crate) fn with_sandbox_contract(
+        definitions: Vec<ToolDefinition>,
+        sandbox: ToolSandboxContract,
+        planner: impl Fn(ToolExecutionRequest) -> (ToolPermissionSet, ToolExecutionPlan)
+        + Send
+        + Sync
+        + 'static,
+    ) -> Arc<Self> {
+        Self::with_sandbox_plans(definitions, sandbox, Arc::new(planner))
     }
 
     #[cfg(test)]
-    fn with_plans(definitions: Vec<ToolDefinition>, executor: Arc<ToolExecutor>) -> Arc<Self> {
+    fn with_sandbox_plans(
+        definitions: Vec<ToolDefinition>,
+        sandbox: ToolSandboxContract,
+        planner: Arc<ToolPlanner>,
+    ) -> Arc<Self> {
         let specs = definitions
             .iter()
             .map(|definition| definition.spec.clone())
@@ -1032,7 +1069,8 @@ impl ToolSet {
             inner: Arc::new(ToolSetInner {
                 definitions: definitions.into(),
                 specs: specs.into(),
-                executor: Some(executor),
+                planner: Some(planner),
+                sandbox,
             }),
         })
     }
@@ -1042,10 +1080,15 @@ impl ToolSet {
     }
 
     /// The synchronous pre-start plan for one exact request, or `None` when the tool is
-    /// unknown or this ToolSet carries no executor: the caller then settles the identity-bound
+    /// unknown or this ToolSet carries no planner: the caller then settles the identity-bound
     /// unavailable PreExecution result without ever consulting a start gate.
+    ///
+    /// The known-tool planner runs exactly once per call; an `Execute` plan is admitted
+    /// against the captured sandbox contract before leaving the Tools owner.  A denied
+    /// admission yields a frozen `PreExecution` (the uninvoked start factory is dropped,
+    /// no gate, no poll); every other plan shape is returned unchanged.
     pub(crate) fn plan(&self, request: &ToolExecutionRequest) -> Option<ToolExecutionPlan> {
-        let executor = self.inner.executor.as_ref()?;
+        let planner = self.inner.planner.as_ref()?;
         if !self
             .inner
             .definitions
@@ -1054,7 +1097,16 @@ impl ToolSet {
         {
             return None;
         }
-        Some(executor(request.clone()))
+        let (permissions, plan) = planner(request.clone());
+        match plan {
+            // Only Execute plans are admitted; the bound proof is consumed here, and the
+            // M13 approval wiring will carry the proof forward.
+            ToolExecutionPlan::Execute(start) => match self.inner.sandbox.admit(permissions) {
+                Ok(_) => Some(ToolExecutionPlan::Execute(start)),
+                Err(error) => Some(ToolExecutionPlan::PreExecution(error.denied_result())),
+            },
+            plan => Some(plan),
+        }
     }
 
     /// The identity-bound unavailable outcome: unknown tool or no executor.  No start-gate
@@ -2443,7 +2495,7 @@ fn strictly_increasing(values: impl IntoIterator<Item = u32>) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
 
@@ -4000,5 +4052,201 @@ mod tests {
             .unwrap();
         assert_eq!(proof.permissions(), empty);
         assert!(FakeCapabilityBackend::unavailable().admit(empty).is_err());
+    }
+
+    /// One bounded echo definition shared by the focused sandbox-plan tests.
+    fn echo_definition(mode: ToolExecutionMode) -> ToolDefinition {
+        ToolDefinition::new(
+            "echo".parse().unwrap(),
+            "Echo a bounded JSON request",
+            "{}".parse().unwrap(),
+            mode,
+        )
+        .unwrap()
+    }
+
+    fn sandbox_request(suffix: u8, call: &str, name: &str) -> ToolExecutionRequest {
+        ToolExecutionRequest::new(
+            format!("itm_000000000000000000000000000000{suffix:02x}")
+                .parse()
+                .unwrap(),
+            ToolCall::new(
+                call.parse().unwrap(),
+                name.parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        )
+    }
+
+    /// The focused sandbox-plan rig: one echo definition, one scripted planner/factory
+    /// pair producing the given final permissions, and the admission call counters.
+    fn sandbox_plan_set(
+        mode: ToolExecutionMode,
+        sandbox: ToolSandboxContract,
+        permissions: ToolPermissionSet,
+        response: &'static str,
+    ) -> (Arc<ToolSet>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let planner_calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let set = ToolSet::with_sandbox_contract(vec![echo_definition(mode)], sandbox, {
+            let planner_calls = Arc::clone(&planner_calls);
+            let factory_calls = Arc::clone(&factory_calls);
+            move |_request| {
+                planner_calls.fetch_add(1, Ordering::Relaxed);
+                let factory_calls = Arc::clone(&factory_calls);
+                (
+                    permissions,
+                    ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                        factory_calls.fetch_add(1, Ordering::Relaxed);
+                        Box::pin(
+                            async move { ToolExecutionResult::completed_text(response).unwrap() },
+                        )
+                    })),
+                )
+            }
+        });
+        (set, planner_calls, factory_calls)
+    }
+
+    #[tokio::test]
+    async fn tool_sandbox_plan_admits_and_executes_the_factory_exactly_once() {
+        let (set, planner_calls, factory_calls) = sandbox_plan_set(
+            ToolExecutionMode::Parallel,
+            ToolSandboxContract::available([C::FilesystemRead, C::FilesystemWrite]),
+            ToolPermissionSet::new([C::FilesystemRead, C::FilesystemWrite]),
+            "sandboxed echo",
+        );
+        let request = sandbox_request(0x0c, "call_sandbox_ok", "echo");
+        // The admitted Execute plan survives planning and runs through the existing typed
+        // start proof/run helper; planner and factory each fire exactly once.
+        let outcome = run_planned_execution(Arc::clone(&set), request.clone()).await;
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: ToolResultDisposition::Succeeded,
+                ref content,
+            } if item_id == request.item_id()
+                && tool_call_id == *request.call().tool_call_id()
+                && content.parts()[0].as_text() == "sandboxed echo"
+        ));
+        assert_eq!(planner_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(factory_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn tool_sandbox_plan_gap_denies_without_invoking_the_factory_or_touching_the_gate() {
+        let (set, planner_calls, factory_calls) = sandbox_plan_set(
+            ToolExecutionMode::Parallel,
+            ToolSandboxContract::available([C::FilesystemRead]),
+            ToolPermissionSet::new([C::FilesystemRead, C::FilesystemWrite]),
+            "must not run",
+        );
+        let request = sandbox_request(0x0e, "call_sandbox_gap_plan", "echo");
+        // A gate bound to the same exact request exists before planning, exactly like the
+        // Session Execution slot's Prepared gate.
+        let gate = ToolStartGate::new(request.clone());
+        let Some(ToolExecutionPlan::PreExecution(result)) = set.plan(&request) else {
+            panic!("a capability gap truthfully denies the Execute plan into PreExecution");
+        };
+        assert_eq!(
+            result,
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Denied,
+                content: ToolResultContent::from_text_parts(vec![
+                    TOOL_CAPABILITY_GAP_TEXT.to_owned()
+                ])
+                .unwrap(),
+            }
+        );
+        // The denied frozen result settles through the existing pre-execution binding.
+        assert!(matches!(
+            ToolSet::bind_preexecution_result(&request, result),
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: ToolResultDisposition::Denied,
+                ref content,
+            } if item_id == request.item_id()
+                && tool_call_id == *request.call().tool_call_id()
+                && content.parts()[0].as_text() == TOOL_CAPABILITY_GAP_TEXT
+        ));
+        assert_eq!(planner_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(factory_calls.load(Ordering::Relaxed), 0);
+        // The untouched gate still accepts its single reservation and start.
+        assert!(gate.reserve(&request).unwrap().start().is_ok());
+    }
+
+    #[test]
+    fn tool_sandbox_plan_unavailable_denies_without_invoking_the_factory_or_touching_the_gate() {
+        let (set, planner_calls, factory_calls) = sandbox_plan_set(
+            ToolExecutionMode::Serial,
+            ToolSandboxContract::unavailable(),
+            ToolPermissionSet::new(ALL),
+            "must not run",
+        );
+        let request = sandbox_request(0x0f, "call_sandbox_unavailable_plan", "echo");
+        let gate = ToolStartGate::new(request.clone());
+        let Some(ToolExecutionPlan::PreExecution(result)) = set.plan(&request) else {
+            panic!("an unavailable sandbox truthfully denies the Execute plan");
+        };
+        assert_eq!(
+            result,
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Denied,
+                content: ToolResultContent::from_text_parts(vec![
+                    TOOL_SANDBOX_UNAVAILABLE_TEXT.to_owned()
+                ])
+                .unwrap(),
+            }
+        );
+        assert!(matches!(
+            ToolSet::bind_preexecution_result(&request, result),
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: ToolResultDisposition::Denied,
+                ref content,
+            } if item_id == request.item_id()
+                && tool_call_id == *request.call().tool_call_id()
+                && content.parts()[0].as_text() == TOOL_SANDBOX_UNAVAILABLE_TEXT
+        ));
+        assert_eq!(planner_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(factory_calls.load(Ordering::Relaxed), 0);
+        assert!(gate.reserve(&request).unwrap().start().is_ok());
+    }
+
+    #[test]
+    fn tool_sandbox_plan_keeps_explicit_preexecution_plans_frozen_even_when_unavailable() {
+        let frozen = ToolExecutionResult::PreExecution {
+            disposition: ToolResultDisposition::Failed,
+            content: ToolResultContent::from_text_parts(vec!["schema preflight failed".to_owned()])
+                .unwrap(),
+        };
+        let set = ToolSet::with_sandbox_contract(
+            vec![echo_definition(ToolExecutionMode::Serial)],
+            ToolSandboxContract::unavailable(),
+            {
+                let frozen = frozen.clone();
+                move |_request| {
+                    (
+                        ToolPermissionSet::new(ALL),
+                        ToolExecutionPlan::PreExecution(frozen.clone()),
+                    )
+                }
+            },
+        );
+        let request = sandbox_request(0x10, "call_frozen_plan", "echo");
+        // Only Execute plans are admitted: the explicit frozen plan keeps its original
+        // disposition and content even with an unavailable sandbox.
+        let Some(ToolExecutionPlan::PreExecution(result)) = set.plan(&request) else {
+            panic!("an explicit PreExecution plan is returned unchanged");
+        };
+        assert_eq!(result, frozen);
     }
 }
