@@ -1,13 +1,13 @@
 # MiniCore V2 设计评审（第四轮）
 
-状态：Open；全部普通P0/P1已关闭，仅V4-C0-1继续门禁production Tool/Sandbox adapter
+状态：Closed；全部普通P0/P1与conditional V4-C0-1均已关闭
 日期：2026-07-31
 范围：全部current、非归档V2文档，包括`README.md`、`CONTEXT.md`、`docs/architecture.md`、module设计、ADR 0100–0134、migration、research和前三轮review/handoff
 方式：主审逐份通读并交叉核对canonical owner；subagent结论仅作查漏线索，本文finding均由主审在current文档中独立复现
 
-关闭进度：V4-P0-1至P0-5、V4-P1-1至P1-4全部Closed；V4-C0-1 Open。ADR 0130–0134与0138是本review关闭过程中新增的Accepted决议。
+关闭进度：V4-P0-1至P0-5、V4-P1-1至P1-4及V4-C0-1全部Closed。ADR 0130–0134、0138与0140是本review关闭过程中新增的Accepted决议。
 
-> 进度说明（2026-08-11）：本文后续里程碑/暂停措辞是第四轮评审当时的dated snapshot；当前实施状态以[Development Plan](../development-plan.md)为准。V4-P1-3已由M12/ADR 0138关闭，当前仍具约束力的open gate只有conditional V4-C0-1。
+> 进度说明（2026-08-11）：本文后续里程碑/暂停措辞是第四轮评审当时的dated snapshot；当前实施状态以[Development Plan](../development-plan.md)为准。V4-P1-3已由M12/ADR 0138/0139关闭，V4-C0-1已由M13/ADR 0140关闭。
 
 ## 总体结论
 
@@ -25,7 +25,7 @@ Rig = standalone provider evidence harness；production使用protocol-specific p
 
 本轮没有发现需要恢复同步AgentLoop、SessionWriter durable commit barrier、Turn lifecycle JSONL、PromptContent resolver或字符offset provenance的理由。
 
-本review创建时识别出的五个P0与四个P1现已全部关闭；Sandbox enforcement继续作为首个production Tool/Sandbox adapter前的条件性P0。
+本review创建时识别出的五个P0、四个P1与一个conditional P0现已全部关闭。Production Provider与Tool/Sandbox adapters可以进入M14，但仍必须消费各自Accepted ADR和contract suite。
 
 严重度定义：
 
@@ -46,7 +46,7 @@ Rig = standalone provider evidence harness；production使用protocol-specific p
 | V4-P1-2 | P1 | Closed | 通用wire/storage envelope与限制未冻结 | serde fixture与format v1前 |
 | V4-P1-3 | P1 | Closed | Provider首版scope、Rig现实映射和旧permit/retry措辞未统一 | production ProviderAdapter前 |
 | V4-P1-4 | P1 | Closed | Workspace Test Matrix要求与ADR 0116相反的跨Session文件锁 | Workspace/Tool tests前 |
-| V4-C0-1 | 条件性P0 | Open | Sandbox不可强制capability时的pre-execution fail-closed门禁 | production Tool/Sandbox adapter前 |
+| V4-C0-1 | 条件性P0 | Closed | Sandbox不可强制capability时的pre-execution fail-closed门禁 | production Tool/Sandbox adapter前 |
 
 ## V4-P0-1 · `ModelCallRequest`有两套不兼容定义
 
@@ -100,7 +100,9 @@ Turn Execution Context只说明它如何调用private constructor并链接ModelG
 
 ## V4-P0-2 · Tool contract未统一
 
-状态：Closed（2026-07-31）。Tools现为ToolCall/Request/Outcome唯一owner，Session Execution拥有唯一ToolOperationSlot与SessionFileMutationQueue，Turn/Item只保留投影和complete exchange；所有pre-execution exact outcome统一生成truthful ToolResult。
+状态：Closed（2026-07-31）。Tools现为ToolCall/Request/Outcome唯一owner，Session Execution拥有唯一ToolOperationSlot；Session-local file mutation queue的owner/injection合同由ADR 0116冻结，Turn/Item只保留投影和complete exchange；所有pre-execution exact outcome统一生成truthful ToolResult。
+
+> 2026-08-11实施说明：本finding关闭的是canonical type/owner与可构造seam冲突，不代表`SessionFileMutationQueue`已经实现。`ToolOperationSlot`和truthful Tool exchange已经落地；file queue继续按ADR 0116/0140等待真实file Tool与authorized canonical target consumer。
 
 ### 关闭前场景
 
@@ -146,8 +148,8 @@ Turn Execution Context只说明它如何调用private constructor并链接ModelG
 - ToolCall、ToolExecutionOutcome和ToolOperationSlot各只有一个canonical owner；
 - unknown/schema-invalid/approval-deny/cancel-before-start均生成matching truthful ToolResult；
 - complete exchange fixture无需上层synthetic conversion；
-- Session-local same-file FIFO通过真实ToolSet调用路径运行；
-- ToolSet capture发生在task spawn前时，control/queue handle来源仍可构造。
+- Session-local same-file FIFO的owner、canonical key与cross-Session no-coordination规则只有一份合同；真实ToolSet调用路径在首个file-mutation adapter前按ADR 0116验证；
+- ToolSet capture发生在task spawn前时，control handle来源可构造；future mutation queue必须沿同一capture seam注入。
 
 ## V4-P0-3 · Prompt/Skill composition的async seam无法闭合
 
@@ -518,13 +520,15 @@ ADR 0116和Tools canonical规则明确：每个loaded Session拥有独立mutatio
 - cross-Session fixture明确验证无协调；
 - 文档不再暗示MiniCore提供跨Runtime/process文件隔离。
 
-## V4-C0-1 · Sandbox enforcement条件性P0继续有效
+## V4-C0-1 · Sandbox enforcement条件性P0
 
-这是第一轮O1、第二轮R7的同一问题，未被ADR 0126–0134关闭。
+状态：Closed（2026-08-11；ADR 0140）。这是第一轮O1、第二轮R7的同一问题。
 
-production Tool/Sandbox adapter必须在ToolStartGate前声明可强制的capability classes。最终PermissionSet要求与adapter enforceable capabilities的差集非空时，必须生成PreExecution Denied ToolResult并拒绝side effect。approval不能把不可强制限制转换为裸执行许可，Sandbox失败也不能静默fallback到无Sandbox执行。
+Tools现拥有closed `FilesystemRead | FilesystemWrite | Network | Process` class set、final `ToolPermissionSet`、`Available(enforceable) | Unavailable` Sandbox contract、exact capability gap和fixed non-secret `PreExecution + Denied` mapping。Direct Execute在ToolStartGate前admit；Approval的`AllowOnce`重新admit原ceiling，`AllowWith(candidate)`先证明不提升再admitcandidate。Gap、Unavailable或elevation都不调用factory、不poll executor且不fallback裸执行。
 
-该门禁不阻塞ScriptedProviderAdapter、纯内存Tool fixture或无真实OS/network/process副作用的测试实现；首个production adapter开始前必须升级为P0并接受ADR/canonical Tools更新。
+Adapter-independent round tests证明：非空、已admit permission plan在SecurityRevoked先赢时记录matching PreExecution Cancelled且factory为0；Sandbox unavailable记录PreExecution Denied并完成完整exchange；Running admitted plan观察operation-local cancellation、等待cooperative cleanup并truthfully记录`Executed + Cancelled`。Production adapters仍需在M14证明自己的effective enforcement与有界cleanup。
+
+ADR 0116的Session-local file mutation queue与本finding分离：首个production file-mutation adapter必须基于真实authorized canonical target实现alias FIFO；没有真实consumer前不创建测试专用queue。
 
 ## 未升级为Finding的事项
 
@@ -545,11 +549,11 @@ production Tool/Sandbox adapter必须在ToolStartGate前声明可强制的capabi
 
 已完成：V4-P0-1 → P0-2/P1-4 → P0-3 → P0-4 → P0-5 → P1-1 → P1-2 → P1-3；Rust crate、typed scalar/value/path carriers与production provider baseline gate已经建立。
 
-后续以[MiniCore V2开发计划](../development-plan.md)为实施入口：M0–M12已经完成。下一步先以M13关闭V4-C0-1，再进入M14 production Provider与Tool/Sandbox adapters；M12只解除provider gate，不替代production adapter contract suite。
+后续以[MiniCore V2开发计划](../development-plan.md)为实施入口：M0–M13已经完成。当前进入M14 production Provider与Tool/Sandbox adapters；M12/M13只解除对应gate，不替代production adapter contract suites。
 
 ## 第四轮关闭定义
 
-本文全部普通P0/P1已经满足以下关闭定义；conditional V4-C0-1继续独立开放：
+本文全部普通P0/P1与conditional V4-C0-1已经满足以下关闭定义：
 
 - canonical owner文档已修订，非owner只保留摘要与链接；
 - architecture INV索引仅在不变量语义变化时更新；
