@@ -24,7 +24,7 @@ mod support;
 use futures_util::StreamExt;
 use rig::client::CompletionClient;
 use rig::completion::message::AssistantContent;
-use rig::completion::{CompletionModel, ToolDefinition, Usage};
+use rig::completion::{CompletionError, CompletionModel, ToolDefinition, Usage};
 use rig::providers::anthropic::Client;
 use rig::providers::anthropic::client::AnthropicExt;
 use rig::providers::anthropic::completion::{CLAUDE_SONNET_4_6, GenericCompletionModel};
@@ -498,4 +498,76 @@ async fn m12_anthropic_streaming_early_eof_synthesizes_final_response() {
     // the provider terminated the message — the connection simply ended. A
     // future MiniCore adapter must independently track terminal evidence
     // (message_delta stop_reason + message_stop) and fail closed on its absence.
+}
+
+/// HTTP 500 retry reality: reqwest `send_streaming` surfaces a non-200 as
+/// `InvalidStatusCodeWithMessage`. `GenericEventSource` arms its default retry
+/// state after that error, but the Anthropic provider wrapper yields the first
+/// error and immediately breaks, dropping the event source before it can poll
+/// the retry delay. The second scripted 500 is the canary: any reconnect would
+/// consume it, and the captured server log proves it never happened.
+#[tokio::test(flavor = "current_thread")]
+async fn m12_anthropic_streaming_http_500_is_not_retried() {
+    let server = support::LoopbackServer::spawn_sse(&[(500, "boom"), (500, "boom")]);
+    let model = loopback_model(server.base_url());
+    let mut stream = model
+        .stream(weather_request(&model))
+        .await
+        .expect("streaming request must start against the loopback server");
+
+    // First poll: the invalid-status error with upstream status and body
+    // preserved. The provider wrapper will break before GenericEventSource can
+    // poll its armed retry delay.
+    let first = stream
+        .next()
+        .await
+        .expect("the 500 must surface as a stream error item");
+    match first {
+        Err(CompletionError::HttpError(rig::http_client::Error::InvalidStatusCodeWithMessage(
+            status,
+            body,
+        ))) => {
+            assert_eq!(
+                status.as_u16(),
+                500,
+                "the error must preserve the upstream status"
+            );
+            assert_eq!(body, "boom", "the error must preserve the upstream body");
+        }
+        other => panic!("first item must be the invalid-status error, got {other:?}"),
+    }
+
+    // The provider read loop already broke on that error; Rig 0.40.0 then
+    // yields the same always-synthesized zero-usage Final as the early-EOF
+    // path, so the stream is already dead — no reconnect, no retry delay, no
+    // second request.
+    match stream
+        .next()
+        .await
+        .expect("the synthesized final must follow")
+    {
+        Ok(StreamedAssistantContent::Final(response)) => {
+            assert_eq!(
+                response.usage.output_tokens, 0,
+                "the synthesized final after an error carries zero usage"
+            );
+        }
+        other => panic!("after the 500 error only the synthesized final may follow, got {other:?}"),
+    }
+
+    // Provider wrapper terminates: the next poll is stream end.
+    assert!(
+        stream.next().await.is_none(),
+        "after the 500 error the provider wrapper terminates the stream"
+    );
+
+    // Settle the server thread before asserting.
+    let captured = server.join();
+    assert_eq!(
+        captured.len(),
+        1,
+        "a 500 must never be retried: exactly one request, the second scripted 500 untouched"
+    );
+    assert_eq!(captured[0].method(), "POST");
+    assert_eq!(captured[0].path(), "/v1/messages");
 }
