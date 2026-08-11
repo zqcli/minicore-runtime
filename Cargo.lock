@@ -883,6 +883,7 @@ name = "minicore-runtime"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bytes",
  "file-id",
  "fs4",
  "futures-util",
