@@ -1,7 +1,9 @@
 # ADR 0126：Turn执行使用async loop，Session记录采用inline best-effort append
 
-状态：Partially Superseded by ADRs 0127, 0130, 0132, 0136 and 0137
+状态：Partially Superseded by ADRs 0127, 0130, 0132, 0136, 0137 and 0139
 日期：2026-07-30
+
+> 2026-08-11：[ADR 0139](0139-rig-is-evidence-only-under-rust-1-85.md)取代Rig production adapter条款；first-party async Turn loop和ModelGateway single-attempt边界不变。
 
 > 2026-08-03 refinement: ADR 0136 replaces the current durable-root/writable-proof and publication details, and ADR 0137 owns the current Recorder job/barrier/settlement and runtime shutdown rules. The current Recorder uses a short synchronous handle-transfer lock plus shared settlement, not the historical async mutex below. The historical decision body is unchanged; current implementation must read those ADRs and their canonical modules.
 >

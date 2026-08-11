@@ -20,7 +20,7 @@ SessionExecutor control actor
 
 LiveSessionState = current-process truth
 SessionRecorder = inline best-effort conversation recording
-Rig = ModelGateway private ProviderAdapter
+Rig = standalone provider evidence harness；production使用protocol-specific private ProviderAdapter
 ```
 
 本轮没有发现需要恢复同步AgentLoop、SessionWriter durable commit barrier、Turn lifecycle JSONL、PromptContent resolver或字符offset provenance的理由。
@@ -437,7 +437,7 @@ Conversation JSONL首行strict Header，后续entry required SessionId/TurnId并
 
 ## V4-P1-3 · Provider首版scope、Rig映射和旧措辞未统一
 
-状态：Closed（2026-08-11；ADR 0138）。首版baseline只保留OpenAI Responses与Anthropic Messages；Rig 0.40.0真实loopback、stream terminal、metadata与delivery/error evidence已冻结，旧permit/retry冲突已清除。
+状态：Closed（2026-08-11；ADR 0138/0139）。首版baseline只保留OpenAI Responses与Anthropic Messages；Rig 0.40.0真实loopback、stream terminal、metadata与delivery/error evidence已冻结，真实Rust 1.85冷编译拒绝Rig进入production dependency graph，旧permit/retry冲突已清除。
 
 ### 关闭前首版scope
 
@@ -471,12 +471,12 @@ ModelGateway current文档仍有被ADR 0125/0126取代的现行措辞：
 ### 已采纳决议
 
 1. `ProviderProtocol`首个production baseline只有`OpenAiResponses | AnthropicMessages`；未经同等级contract gate验证的OpenAI Chat Completions、Gemini等variant不接受为首版config，也不显示为available。M12关闭不代表production adapter已经存在。
-2. Rig保持exact 0.40.0 private implementation dependency。M12只以dev-dependency和`tests/m12_*`验证公开API；Rig Agent/Conversation/message/retry/provider type不能进入`src/`domain、Prompt、Conversation或Runtime public DTO。
+2. Rig exact 0.40.0只保留在standalone `provider-gate/` stable evidence package；root dependency/lockfile与`src/`不含Rig。M14使用OpenAI Responses与Anthropic Messages两个direct private adapters，Rig Agent/Conversation/message/retry/provider type不能进入domain、Prompt、Conversation或Runtime public DTO。
 3. 一次completion/stream invocation最多一个HTTP request。Rig synthetic `Final`不能替代protocol terminal；OpenAI要求`response.completed`，Anthropic要求non-empty `message_delta.stop_reason`。公开`HttpClientExt` wrapper可以在原样转发bytes时增量保存terminal与allowlisted headers。
 4. error/delivery只按typed status/type/code、transport stage、semantic-output-started、terminal evidence与bounded retry hint分类，不匹配human message。只有`NotSent | RejectedBeforeExecution`可保留delivery-safe transient reason；unknown/accepted/partial outcome分别fail closed为`RequestOutcomeUnknown | StreamInterrupted`。
 5. Gateway没有local model/route/principal permit wait。queued Steer不改变in-flight revision或retry basis；只在safe point成功apply后使旧basis失效。
 
-权威决议见[ADR 0138](../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)，closed mapping见[M12 fixture](../fixtures/provider-gate-m12/README.md)。
+协议合同见[ADR 0138](../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)，Rust 1.85 implementation choice见[ADR 0139](../adr/0139-rig-is-evidence-only-under-rust-1-85.md)，closed mapping见[M12 fixture](../fixtures/provider-gate-m12/README.md)。
 
 ### 关闭验证
 
@@ -486,7 +486,7 @@ ModelGateway current文档仍有被ADR 0125/0126取代的现行措辞：
 - [x] terminal evidence seam区分completed、early EOF、transport error和drop，provider error优先否决success；
 - [x] metadata seam只保留OpenAI `x-request-id/retry-after/openai-processing-ms`与Anthropic `request-id/retry-after`，canary header不可表示；
 - [x] 400/401 typed envelopes和malformed 200 real loopback fail closed；26-case fixture覆盖context/rate/auth/transport/malformed/EOF mapping；
-- [x] `rg`确认Rig只存在于dev dependency/tests，`src/`与public DTO无Rig type；
+- [x] 真实Rust 1.85冷编译拒绝Rig 0.36.0–0.40.0；`rg`确认Rig只存在于standalone `provider-gate/`，root dependency/lockfile、`src/`与public DTO无Rig type；
 - [x] current modules无Gateway-local concurrency wait/per-principal permit，queued Steer focused test通过。
 
 ## V4-P1-4 · Workspace Test Matrix与跨Session规则相反

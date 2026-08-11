@@ -1,13 +1,14 @@
 # Production Provider Gate M12 Fixtures
 
-本目录保存production `RigProviderAdapter`之前的provider-neutral delivery/error contract。它不是public Wire或Conversation format，也不包含credential、raw request/response body或human error message。
+本目录保存production OpenAI Responses/Anthropic Messages direct adapters之前的provider-neutral delivery/error contract。它不是public Wire或Conversation format，也不包含credential、raw request/response body或human error message。
 
 ## Authority
 
 - canonical behavior：[Model Gateway](../../modules/model-gateway.md)；
-- decision：[ADR 0138](../../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)；
+- protocol decision：[ADR 0138](../../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)；
+- Rust 1.85 implementation decision：[ADR 0139](../../adr/0139-rig-is-evidence-only-under-rust-1-85.md)；
 - fixture consumer：`tests/m12_provider_error_matrix.rs`；
-- real Rig HTTP evidence：`tests/m12_rig_*.rs`。
+- real Rig HTTP evidence：`provider-gate/tests/m12_rig_*.rs`。
 
 M14 production adapters必须消费同一fixture或生成等价的table-driven mapping tests，不能复制后再独立漂移。
 

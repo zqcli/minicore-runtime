@@ -772,4 +772,4 @@ ADR 0124已经删除scope、frontier与coverage chain。MVP允许旧Input/Steer�
 - [x] 冻结live Replace与cold replay marker规则。
 - [x] ADR 0134/Format V1冻结StoredCompaction wire casing、limits与golden vector contract。
 - [x] 实现ScriptedProviderAdapter Compaction vertical slice。
-- [ ] 实现Rig provider CompactionSummary mapping。
+- [ ] 实现OpenAI Responses与Anthropic Messages provider-native CompactionSummary mapping。

@@ -23,6 +23,6 @@ Run gates:
 
 ## M12 Provider Gate
 
-`tests/m12_rig_*.rs` drives exact `rig-core = 0.40.0` against test-owned `127.0.0.1:0` HTTP servers. These targets cover OpenAI Responses and Anthropic Messages unary/stream contracts, terminal-vs-EOF evidence, cancellation, single-request behavior, typed error envelopes and response metadata allowlists. `tests/m12_provider_error_matrix.rs` consumes `docs/fixtures/provider-gate-m12/error-mapping-v1.json` and freezes delivery-safe retry/normalization rules.
+`provider-gate/tests/m12_rig_*.rs`在standalone stable-only package中驱动exact `rig-core = 0.40.0`和test-owned `127.0.0.1:0` HTTP servers。这些targets覆盖OpenAI Responses与Anthropic Messages unary/stream contracts、terminal-vs-EOF evidence、cancellation、single-request behavior、typed error envelopes与response metadata allowlists。`tests/m12_provider_error_matrix.rs`留在主crate，消费`docs/fixtures/provider-gate-m12/error-mapping-v1.json`并在Rust 1.85下冻结delivery-safe retry/normalization rules。
 
-M12 tests must remain offline and deterministic: no external DNS/network, real credential, ambient provider config, sleep, timeout-based absence proof, blind yield polling or unjoined server thread. Rig remains a dev-dependency and may not appear in production `src/` or public DTOs.
+M12 tests必须保持offline和deterministic：不得使用external DNS/network、真实credential、ambient provider config、sleep、timeout-based absence proof、blind yield polling或unjoined server thread。Rig只存在于声明Rust 1.88并拥有独立lockfile的`provider-gate/` evidence package；root dependency/lockfile、production `src/`和public DTO不得出现Rig。`./scripts/check.sh`运行主crate与evidence package；`./scripts/check-msrv.sh`用真实Rust 1.85运行主crate全部targets。

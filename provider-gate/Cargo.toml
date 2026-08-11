@@ -1,0 +1,22 @@
+[package]
+name = "minicore-provider-gate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Stable-only evidence harness for the M12 Rig provider gate"
+
+# Standalone evidence package, not a member of the main crate workspace.
+# Its declared Rust 1.88 floor reflects language features used by rig-core
+# 0.40.0; Rig is rejected from the Rust 1.85 production baseline.
+
+[dependencies]
+bytes = "1.10.1"
+futures-util = "0.3.33"
+rig = { package = "rig-core", version = "=0.40.0", default-features = false, features = ["reqwest", "rustls", "test-utils"] }
+serde_json = "1.0.140"
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt"] }
+
+[lints.rust]
+unsafe_code = "forbid"
