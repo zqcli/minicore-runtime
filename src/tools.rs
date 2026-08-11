@@ -380,6 +380,17 @@ impl ToolExecutionStart {
     }
 }
 
+#[cfg(test)]
+impl ToolExecutionPlan {
+    /// Test-visible constructor for the empty default permission set.
+    pub(crate) fn execute(start: ToolExecutionStart) -> Self {
+        Self::Execute {
+            permissions: ToolPermissionSet::new([]),
+            start,
+        }
+    }
+}
+
 /// The move-only, redacted answer binding for one exact UserQuestion plan.
 ///
 /// The planner attaches the FnOnce that turns the typed host answer into a ToolResult; only
@@ -463,16 +474,24 @@ impl fmt::Debug for UserQuestionAnswerBinding {
     reason = "concrete executors/plans are cfg(test) until the M8 executor lands; production ToolSets are empty"
 )]
 pub(crate) enum ToolExecutionPlan {
-    Execute(ToolExecutionStart),
+    Execute {
+        /// The plan's final class-level permission set (the admission input).
+        permissions: ToolPermissionSet,
+        start: ToolExecutionStart,
+    },
     /// One Tool approval: the host is presented the exact typed approval request before any
     /// start-gate involvement; the allowed-path start factory is invoked only after the host
-    /// allows and the exact request's start reservation wins at resume, while a denied or
-    /// owner-cancelled approval settles the exact denied (or cancelled) PreExecution result
-    /// without ever reserving the gate.
+    /// allows, the plan permissions revalidate against the captured sandbox, and the exact
+    /// request's start reservation wins at resume, while a denied or owner-cancelled
+    /// approval settles the exact denied (or cancelled) PreExecution result without ever
+    /// reserving the gate.
     Approval {
+        /// The plan's final permission ceiling, revalidated against the captured sandbox at
+        /// settlement; an `AllowWith` candidate may only narrow it.
+        permissions: ToolPermissionSet,
         request: ToolApprovalRequest,
-        /// The allowed-path start factory: invoked only after the host allows and the exact
-        /// request's start reservation wins at resume.
+        /// The allowed-path start factory: invoked only after the host allows, the final
+        /// permission set revalidates, and the exact request's start reservation wins.
         allowed: ToolExecutionStart,
         denied: ToolExecutionResult,
     },
@@ -773,6 +792,16 @@ impl ToolPermissionSet {
         self.0.is_empty()
     }
 
+    /// Whether every class of `self` is carried by `other`: the ceiling revalidation.
+    const fn is_subset_of(&self, other: &Self) -> bool {
+        self.0.is_subset_of(&other.0)
+    }
+
+    /// `self` minus the classes carried by `other`: the exact missing set of an elevation.
+    const fn difference(self, other: Self) -> Self {
+        Self(self.0.difference(other.0))
+    }
+
     /// The restricted-option candidate: may equal or narrow the ceiling, never widen it.
     pub(crate) fn restricted_candidate(
         &self,
@@ -925,11 +954,10 @@ fn abandoned_runtime_failure(request: &ToolExecutionRequest) -> ToolExecutionOut
     }
 }
 
-/// The owner-internal per-request planner: one request produces its final permission set
-/// (the admission input) and its pre-start plan; Session Execution only sees the plan.
-/// The M14 production adapter fills this seam with the production per-request planner.
-type ToolPlanner =
-    dyn Fn(ToolExecutionRequest) -> (ToolPermissionSet, ToolExecutionPlan) + Send + Sync;
+/// The owner-internal per-request planner: one request produces its pre-start plan carrying
+/// the plan's final permission set on the Execute/Approval shapes; Session Execution only
+/// sees the plan.  The M14 production adapter fills this seam with the production planner.
+type ToolPlanner = dyn Fn(ToolExecutionRequest) -> ToolExecutionPlan + Send + Sync;
 
 /// The immutable Tool set captured for one Turn.
 #[derive(Clone)]
@@ -985,12 +1013,10 @@ impl ToolSet {
                 let executor = Arc::clone(&executor);
                 // The ignore-cancellation test wrapper: the start factory never surfaces the
                 // observer to the scripted executor.
-                (
-                    ToolPermissionSet::new([]),
-                    ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
-                        executor(request)
-                    })),
-                )
+                ToolExecutionPlan::Execute {
+                    permissions: ToolPermissionSet::new([]),
+                    start: ToolExecutionStart::new(move |_observer| executor(request)),
+                }
             }),
         )
     }
@@ -1015,12 +1041,10 @@ impl ToolSet {
             ToolSandboxContract::available([]),
             Arc::new(move |request| {
                 let executor = Arc::clone(&executor);
-                (
-                    ToolPermissionSet::new([]),
-                    ToolExecutionPlan::Execute(ToolExecutionStart::new(move |observer| {
-                        executor(request, observer)
-                    })),
-                )
+                ToolExecutionPlan::Execute {
+                    permissions: ToolPermissionSet::new([]),
+                    start: ToolExecutionStart::new(move |observer| executor(request, observer)),
+                }
             }),
         )
     }
@@ -1037,20 +1061,17 @@ impl ToolSet {
         Self::with_sandbox_plans(
             definitions,
             ToolSandboxContract::available([]),
-            Arc::new(move |request| (ToolPermissionSet::new([]), planner(request))),
+            Arc::new(planner),
         )
     }
 
-    /// Test-only constructor for the M13.2 admission tests: injects the captured sandbox
-    /// contract and a per-request planner producing the final permission set plus the plan.
+    /// Test-only constructor for the M13 admission tests: injects the captured sandbox
+    /// contract and a per-request planner producing the plan (carrying its final set).
     #[cfg(test)]
     pub(crate) fn with_sandbox_contract(
         definitions: Vec<ToolDefinition>,
         sandbox: ToolSandboxContract,
-        planner: impl Fn(ToolExecutionRequest) -> (ToolPermissionSet, ToolExecutionPlan)
-        + Send
-        + Sync
-        + 'static,
+        planner: impl Fn(ToolExecutionRequest) -> ToolExecutionPlan + Send + Sync + 'static,
     ) -> Arc<Self> {
         Self::with_sandbox_plans(definitions, sandbox, Arc::new(planner))
     }
@@ -1097,14 +1118,15 @@ impl ToolSet {
         {
             return None;
         }
-        let (permissions, plan) = planner(request.clone());
-        match plan {
-            // Only Execute plans are admitted; the bound proof is consumed here, and the
-            // M13 approval wiring will carry the proof forward.
-            ToolExecutionPlan::Execute(start) => match self.inner.sandbox.admit(permissions) {
-                Ok(_) => Some(ToolExecutionPlan::Execute(start)),
-                Err(error) => Some(ToolExecutionPlan::PreExecution(error.denied_result())),
-            },
+        match planner(request.clone()) {
+            // Only Execute plans are admitted here; the bound proof is consumed and the
+            // admitted plan keeps its final permission set for the started path.
+            ToolExecutionPlan::Execute { permissions, start } => {
+                match self.inner.sandbox.admit(permissions) {
+                    Ok(_) => Some(ToolExecutionPlan::Execute { permissions, start }),
+                    Err(error) => Some(ToolExecutionPlan::PreExecution(error.denied_result())),
+                }
+            }
             plan => Some(plan),
         }
     }
@@ -1191,25 +1213,40 @@ impl ToolSet {
         }))
     }
 
-    /// The minimal approval settlement from the exact request's private decision.
-    ///
-    /// `AllowOnce` resumes through the exact request's start gate.  `Deny` settles the exact
-    /// denied shape through the same pre-execution binding as any other unstarted result,
-    /// fail-closed: only a valid `PreExecution { disposition: Denied }` is preserved, an
-    /// explicit `Abandoned` passes its reason through, and any other `PreExecution`
-    /// disposition or any `Completed` shape (a malformed deny plan) becomes `Abandoned
-    /// OutcomeUnknown` — a never-started operation can never be disguised as an executed
-    /// ToolResult or as a different pre-execution outcome.  Owner cancellation is never an
-    /// approval decision: the caller settles it through `bind_approval_cancellation` under
-    /// the same pre-execution binding.
+    /// The approval settlement from the exact request's private decision.  `Deny` settles
+    /// the exact denied shape fail-closed through the same pre-execution binding as any
+    /// other unstarted result.  `AllowOnce` re-admits the plan's final permission set, and
+    /// `AllowWith(candidate)` first revalidates in release code that the candidate is within
+    /// that ceiling and then re-admits it; every revalidation failure settles the fixed
+    /// generic `PreExecution { Denied }` without ever reserving the gate.
     pub(crate) fn approval_settlement(
+        &self,
         decision: &ToolApprovalDecision,
+        permissions: ToolPermissionSet,
         denied: &ToolExecutionResult,
     ) -> ApprovalSettlement {
         match decision {
-            ToolApprovalDecision::AllowOnce => ApprovalSettlement::Resume,
             ToolApprovalDecision::Deny => {
                 ApprovalSettlement::PreExecution(Self::denied_settlement_result(denied))
+            }
+            ToolApprovalDecision::AllowOnce => match self.inner.sandbox.admit(permissions) {
+                Ok(_) => ApprovalSettlement::Resume,
+                Err(error) => ApprovalSettlement::PreExecution(error.denied_result()),
+            },
+            ToolApprovalDecision::AllowWith(candidate) => {
+                // The candidate may only narrow the plan ceiling: elevation fails closed even when the sandbox could enforce it.
+                if !candidate.is_subset_of(&permissions) {
+                    return ApprovalSettlement::PreExecution(
+                        ToolSandboxAdmissionError::CapabilityGap {
+                            missing: candidate.difference(permissions),
+                        }
+                        .denied_result(),
+                    );
+                }
+                match self.inner.sandbox.admit(*candidate) {
+                    Ok(_) => ApprovalSettlement::Resume,
+                    Err(error) => ApprovalSettlement::PreExecution(error.denied_result()),
+                }
             }
         }
     }
@@ -1810,6 +1847,13 @@ pub(crate) enum ToolApprovalDecision {
         reason = "constructed by future Tool approval execution in M8"
     )]
     AllowOnce,
+    /// The private restricted-option decision: resume only after the candidate revalidates
+    /// as a subset of the plan ceiling and re-admits against the captured sandbox.
+    #[allow(
+        dead_code,
+        reason = "constructed by M13.3 approval tests (Restricted options) until the M14 production planner"
+    )]
+    AllowWith(ToolPermissionSet),
     #[allow(
         dead_code,
         reason = "the M4 exact-resolution owner retains denial before the M8 host constructor"
@@ -1829,11 +1873,15 @@ impl ToolApprovalOption {
         view: ToolApprovalOptionView,
         decision: ToolApprovalDecision,
     ) -> Result<Self, ToolValueError> {
+        // One exact pairing per kind: AsRequested ↔ AllowOnce, Restricted ↔ AllowWith.
         let compatible = matches!(
-            (view.kind(), &decision),
+            (&decision, view.kind()),
             (
-                ToolApprovalOptionKindView::AsRequested,
-                ToolApprovalDecision::AllowOnce
+                ToolApprovalDecision::AllowOnce,
+                ToolApprovalOptionKindView::AsRequested
+            ) | (
+                ToolApprovalDecision::AllowWith(_),
+                ToolApprovalOptionKindView::Restricted
             )
         );
         if !compatible {
@@ -1919,7 +1967,7 @@ impl ToolApprovalRequest {
         match (decision, resolution.as_ref()) {
             (ToolApprovalDecision::Deny, ToolApprovalResolutionRef::Denied) => Ok(()),
             (
-                ToolApprovalDecision::AllowOnce,
+                ToolApprovalDecision::AllowOnce | ToolApprovalDecision::AllowWith(_),
                 ToolApprovalResolutionRef::Allowed { option_index, kind },
             ) => {
                 let option = self
@@ -1968,6 +2016,37 @@ pub(crate) fn live_approval_request_fixture_for(tool_name: &str) -> ToolApproval
 #[cfg(test)]
 pub(crate) fn live_approval_request_fixture() -> ToolApprovalRequest {
     live_approval_request_fixture_for("write_file")
+}
+
+/// Test-only fixture for one legitimate live Restricted approval request bound to the exact
+/// tool name the session tests execute; its single option resolves to the given `AllowWith`
+/// candidate, never the wider plan ceiling.
+#[cfg(test)]
+pub(crate) fn live_restricted_approval_request_fixture_for(
+    tool_name: &str,
+    candidate: ToolPermissionSet,
+) -> ToolApprovalRequest {
+    let requirements = ToolRequirementSummaryView::new(None, None, None).unwrap();
+    let option = ToolApprovalOptionView::new(
+        0,
+        ToolApprovalOptionKindView::Restricted,
+        "Restricted",
+        requirements.clone(),
+    )
+    .unwrap();
+    let view = ToolApprovalRequestView::new(
+        tool_name.parse().unwrap(),
+        "path: src/lib.rs",
+        "write requested",
+        requirements,
+        vec![option.clone()],
+    )
+    .unwrap();
+    ToolApprovalRequest::new(
+        view,
+        vec![ToolApprovalOption::new(option, ToolApprovalDecision::AllowWith(candidate)).unwrap()],
+    )
+    .unwrap()
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -2503,7 +2582,7 @@ mod tests {
         set: Arc<ToolSet>,
         request: ToolExecutionRequest,
     ) -> ToolExecutionOutcome {
-        let ToolExecutionPlan::Execute(start) = set
+        let ToolExecutionPlan::Execute { start, .. } = set
             .plan(&request)
             .expect("a known tool produces an execution plan")
         else {
@@ -2978,15 +3057,26 @@ mod tests {
             content: ToolResultContent::from_text_parts(vec!["approval denied".to_owned()])
                 .unwrap(),
         };
+        // A host AllowOnce with the empty default permission set revalidates against the
+        // empty default sandbox and resumes through the exact request's start gate.
+        let set = ToolSet::empty();
         assert!(matches!(
-            ToolSet::approval_settlement(&ToolApprovalDecision::AllowOnce, &denied_result),
+            set.approval_settlement(
+                &ToolApprovalDecision::AllowOnce,
+                ToolPermissionSet::new([]),
+                &denied_result,
+            ),
             ApprovalSettlement::Resume
         ));
         // A host Deny accepts only a valid PreExecution Denied (preserved exactly) or an
         // explicit Abandoned (reason preserved); every other shape fails closed to Abandoned
         // OutcomeUnknown through the same pre-execution binder.
         assert!(matches!(
-            ToolSet::approval_settlement(&ToolApprovalDecision::Deny, &denied_result),
+            set.approval_settlement(
+                &ToolApprovalDecision::Deny,
+                ToolPermissionSet::new([]),
+                &denied_result,
+            ),
             ApprovalSettlement::PreExecution(result)
                 if matches!(&result, ToolExecutionResult::PreExecution {
                     disposition: ToolResultDisposition::Denied,
@@ -2994,8 +3084,9 @@ mod tests {
                 } if content.parts()[0].as_text() == "approval denied")
         ));
         assert!(matches!(
-            ToolSet::approval_settlement(
+            set.approval_settlement(
                 &ToolApprovalDecision::Deny,
+                ToolPermissionSet::new([]),
                 &ToolExecutionResult::Abandoned {
                     reason: ToolAbandonReason::RuntimeFailure,
                 },
@@ -3029,7 +3120,11 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                ToolSet::approval_settlement(&ToolApprovalDecision::Deny, &malformed),
+                set.approval_settlement(
+                    &ToolApprovalDecision::Deny,
+                    ToolPermissionSet::new([]),
+                    &malformed,
+                ),
                 ApprovalSettlement::PreExecution(result)
                     if matches!(result, ToolExecutionResult::Abandoned {
                         reason: ToolAbandonReason::OutcomeUnknown,
@@ -3358,7 +3453,7 @@ mod tests {
         );
         assert!(matches!(
             set.plan(&request),
-            Some(ToolExecutionPlan::Execute(_))
+            Some(ToolExecutionPlan::Execute { .. })
         ));
         let gate = ToolStartGate::new(request.clone());
         assert!(gate.cancel_before_start());
@@ -4095,15 +4190,15 @@ mod tests {
             move |_request| {
                 planner_calls.fetch_add(1, Ordering::Relaxed);
                 let factory_calls = Arc::clone(&factory_calls);
-                (
+                ToolExecutionPlan::Execute {
                     permissions,
-                    ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                    start: ToolExecutionStart::new(move |_observer| {
                         factory_calls.fetch_add(1, Ordering::Relaxed);
                         Box::pin(
                             async move { ToolExecutionResult::completed_text(response).unwrap() },
                         )
-                    })),
-                )
+                    }),
+                }
             }
         });
         (set, planner_calls, factory_calls)
@@ -4233,12 +4328,7 @@ mod tests {
             ToolSandboxContract::unavailable(),
             {
                 let frozen = frozen.clone();
-                move |_request| {
-                    (
-                        ToolPermissionSet::new(ALL),
-                        ToolExecutionPlan::PreExecution(frozen.clone()),
-                    )
-                }
+                move |_request| ToolExecutionPlan::PreExecution(frozen.clone())
             },
         );
         let request = sandbox_request(0x10, "call_frozen_plan", "echo");
@@ -4248,5 +4338,228 @@ mod tests {
             panic!("an explicit PreExecution plan is returned unchanged");
         };
         assert_eq!(result, frozen);
+    }
+
+    /// The approval-settlement rig: only the captured sandbox contract matters, the planner
+    /// is never consulted by the settlement.
+    fn sandbox_settlement_set(sandbox: ToolSandboxContract) -> Arc<ToolSet> {
+        ToolSet::with_sandbox_contract(vec![], sandbox, |_| {
+            unreachable!("approval settlement never consults the planner")
+        })
+    }
+
+    fn denied_fixture(text: &'static str) -> ToolExecutionResult {
+        ToolExecutionResult::PreExecution {
+            disposition: ToolResultDisposition::Denied,
+            content: ToolResultContent::from_text_parts(vec![text.to_owned()]).unwrap(),
+        }
+    }
+
+    /// Asserts the settlement fails closed to the fixed generic PreExecution Denied
+    /// carrying `text` (the sandbox capability-gap or unavailable reason).
+    fn assert_settlement_denied(
+        set: &ToolSet,
+        decision: ToolApprovalDecision,
+        permissions: ToolPermissionSet,
+        text: &str,
+    ) {
+        assert!(matches!(
+            set.approval_settlement(&decision, permissions, &denied_fixture("approval denied")),
+            ApprovalSettlement::PreExecution(result)
+                if matches!(&result, ToolExecutionResult::PreExecution {
+                    disposition: ToolResultDisposition::Denied,
+                    content,
+                } if content.parts()[0].as_text() == text)
+        ));
+    }
+
+    /// Asserts the settlement resumes through the exact start gate.
+    fn assert_settlement_resumes(
+        set: &ToolSet,
+        decision: ToolApprovalDecision,
+        permissions: ToolPermissionSet,
+    ) {
+        assert!(matches!(
+            set.approval_settlement(&decision, permissions, &denied_fixture("approval denied")),
+            ApprovalSettlement::Resume
+        ));
+    }
+
+    #[test]
+    fn tool_sandbox_approval_restricted_option_revalidates_the_restricted_final_set() {
+        let ceiling = ToolPermissionSet::new([C::FilesystemRead, C::FilesystemWrite, C::Network]);
+        let restricted = ToolPermissionSet::new([C::FilesystemRead, C::FilesystemWrite]);
+        // The Restricted option resolves to the exact AllowWith candidate: kind and private
+        // decision match the option index.
+        let request = live_restricted_approval_request_fixture_for("echo", restricted);
+        let (decision, resolution) = request
+            .resolve(ToolApprovalDecisionInput::Allow { option_index: 0 })
+            .unwrap();
+        assert!(matches!(
+            decision,
+            ToolApprovalDecision::AllowWith(candidate) if candidate == restricted
+        ));
+        assert!(matches!(
+            resolution.as_ref(),
+            ToolApprovalResolutionRef::Allowed {
+                option_index: 0,
+                kind: ToolApprovalOptionKindView::Restricted,
+            }
+        ));
+        // The sandbox enforces only the restricted subset: the AllowWith revalidation admits
+        // the candidate and resumes, while the wider as-requested ceiling fails — the
+        // restricted final set, not the ceiling, is the admission input.
+        let set = sandbox_settlement_set(ToolSandboxContract::available([
+            C::FilesystemRead,
+            C::FilesystemWrite,
+        ]));
+        assert_settlement_resumes(&set, ToolApprovalDecision::AllowWith(restricted), ceiling);
+        assert_settlement_denied(
+            &set,
+            ToolApprovalDecision::AllowOnce,
+            ceiling,
+            TOOL_CAPABILITY_GAP_TEXT,
+        );
+    }
+
+    #[test]
+    fn tool_sandbox_approval_restricted_candidate_cannot_elevate_beyond_the_plan_ceiling() {
+        // The candidate adds Network beyond the plan ceiling; even a fully enforcing sandbox
+        // fails closed: an approval can never elevate a capability class the plan itself did
+        // not carry.
+        assert_settlement_denied(
+            &sandbox_settlement_set(ToolSandboxContract::available(ALL)),
+            ToolApprovalDecision::AllowWith(ToolPermissionSet::new([
+                C::FilesystemRead,
+                C::Network,
+            ])),
+            ToolPermissionSet::new([C::FilesystemRead, C::FilesystemWrite]),
+            TOOL_CAPABILITY_GAP_TEXT,
+        );
+    }
+
+    #[test]
+    fn tool_sandbox_approval_allow_once_revalidates_the_captured_sandbox_before_resume() {
+        let ceiling = ToolPermissionSet::new([C::FilesystemRead, C::FilesystemWrite]);
+        // A capability gap and an unavailable sandbox fail closed with the fixed denied
+        // texts; a fully enforcing sandbox resumes through the exact start gate.
+        assert_settlement_denied(
+            &sandbox_settlement_set(ToolSandboxContract::available([C::FilesystemRead])),
+            ToolApprovalDecision::AllowOnce,
+            ceiling,
+            TOOL_CAPABILITY_GAP_TEXT,
+        );
+        assert_settlement_denied(
+            &sandbox_settlement_set(ToolSandboxContract::unavailable()),
+            ToolApprovalDecision::AllowOnce,
+            ceiling,
+            TOOL_SANDBOX_UNAVAILABLE_TEXT,
+        );
+        assert_settlement_resumes(
+            &sandbox_settlement_set(ToolSandboxContract::available([
+                C::FilesystemRead,
+                C::FilesystemWrite,
+            ])),
+            ToolApprovalDecision::AllowOnce,
+            ceiling,
+        );
+    }
+
+    #[test]
+    fn tool_sandbox_approval_option_pairing_and_exact_resolution_reject_cross_pairs() {
+        let requirements = ToolRequirementSummaryView::new(None, None, None).unwrap();
+        let candidate = ToolPermissionSet::new([C::FilesystemRead]);
+        let as_requested = ToolApprovalOptionView::new(
+            0,
+            ToolApprovalOptionKindView::AsRequested,
+            "Allow once",
+            requirements.clone(),
+        )
+        .unwrap();
+        let restricted = ToolApprovalOptionView::new(
+            1,
+            ToolApprovalOptionKindView::Restricted,
+            "Restricted",
+            requirements.clone(),
+        )
+        .unwrap();
+        // The exact pairing: AsRequested maps only to AllowOnce, Restricted only to
+        // AllowWith; one two-option request carries both, and every cross-pair is rejected.
+        let request = ToolApprovalRequest::new(
+            ToolApprovalRequestView::new(
+                "echo".parse().unwrap(),
+                "path: src/lib.rs",
+                "write requested",
+                requirements,
+                vec![as_requested.clone(), restricted.clone()],
+            )
+            .unwrap(),
+            vec![
+                ToolApprovalOption::new(as_requested.clone(), ToolApprovalDecision::AllowOnce)
+                    .unwrap(),
+                ToolApprovalOption::new(
+                    restricted.clone(),
+                    ToolApprovalDecision::AllowWith(candidate),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        for (view, decision) in [
+            (
+                as_requested.clone(),
+                ToolApprovalDecision::AllowWith(candidate),
+            ),
+            (restricted.clone(), ToolApprovalDecision::AllowOnce),
+        ] {
+            assert!(matches!(
+                ToolApprovalOption::new(view, decision),
+                Err(ToolValueError::InvalidApproval)
+            ));
+        }
+        // The exact resolution validation admits only the paired kind/index/decision; any
+        // cross-pair of the two options is invalid.
+        for (decision, index, kind, valid) in [
+            (
+                ToolApprovalDecision::AllowOnce,
+                0u32,
+                ToolApprovalOptionKindView::AsRequested,
+                true,
+            ),
+            (
+                ToolApprovalDecision::AllowWith(candidate),
+                1,
+                ToolApprovalOptionKindView::Restricted,
+                true,
+            ),
+            (
+                ToolApprovalDecision::AllowWith(candidate),
+                0,
+                ToolApprovalOptionKindView::AsRequested,
+                false,
+            ),
+            (
+                ToolApprovalDecision::AllowOnce,
+                1,
+                ToolApprovalOptionKindView::Restricted,
+                false,
+            ),
+            (
+                ToolApprovalDecision::AllowWith(candidate),
+                1,
+                ToolApprovalOptionKindView::AsRequested,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                request
+                    .validate_exact_resolution(
+                        &decision,
+                        &ToolApprovalResolution::reconstruct_allowed(index, kind),
+                    )
+                    .is_ok(),
+                valid
+            );
+        }
     }
 }

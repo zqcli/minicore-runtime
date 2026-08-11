@@ -8232,7 +8232,7 @@ impl ToolOperationSlot {
             unreachable!("drive_until_terminal consumes a Prepared slot");
         };
         match plan {
-            ToolExecutionPlan::Execute(start) => {
+            ToolExecutionPlan::Execute { start, .. } => {
                 Self::Prepared {
                     request,
                     emergency_control,
@@ -8314,6 +8314,7 @@ impl ToolOperationSlot {
                 }
             }
             ToolExecutionPlan::Approval {
+                permissions,
                 request: approval,
                 allowed,
                 denied,
@@ -8346,23 +8347,27 @@ impl ToolOperationSlot {
                     )
                     .await
                 {
-                    Ok(decision) => match ToolSet::approval_settlement(&decision, &denied) {
-                        ApprovalSettlement::Resume => {
-                            #[cfg(test)]
-                            hooks.before_tool_resume().await;
-                            Self::Prepared {
-                                request,
-                                emergency_control,
-                                observation,
-                                gate,
+                    Ok(decision) => {
+                        // The settlement revalidates the plan's final permission set against
+                        // the captured sandbox before any start-gate reservation.
+                        match tool_set.approval_settlement(&decision, permissions, &denied) {
+                            ApprovalSettlement::Resume => {
+                                #[cfg(test)]
+                                hooks.before_tool_resume().await;
+                                Self::Prepared {
+                                    request,
+                                    emergency_control,
+                                    observation,
+                                    gate,
+                                }
+                                .reserve_then_run(allowed, tool_set)
+                                .await
                             }
-                            .reserve_then_run(allowed, tool_set)
-                            .await
+                            ApprovalSettlement::PreExecution(result) => Self::into_terminal(
+                                ToolSet::bind_preexecution_result(&request, result),
+                            ),
                         }
-                        ApprovalSettlement::PreExecution(result) => {
-                            Self::into_terminal(ToolSet::bind_preexecution_result(&request, result))
-                        }
-                    },
+                    }
                     Err(ToolExecutionControlError::Cancelled) => {
                         Self::into_terminal(ToolSet::bind_approval_cancellation(&request, denied))
                     }
@@ -12810,6 +12815,7 @@ mod tests {
                 let allowed = allowed.clone();
                 let denied = denied.clone();
                 ToolExecutionPlan::Approval {
+                    permissions: crate::tools::ToolPermissionSet::new([]),
                     request: approval,
                     allowed: ToolExecutionStart::new(move |_observer| {
                         Box::pin(async move { allowed })
@@ -12848,7 +12854,7 @@ mod tests {
                     }
                 } else {
                     let sibling_factory = Arc::clone(&sibling_factory);
-                    ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                    ToolExecutionPlan::execute(ToolExecutionStart::new(move |_observer| {
                         sibling_factory()
                     }))
                 }
@@ -15464,7 +15470,7 @@ mod tests {
                     } else {
                         let factory_events = Arc::clone(&factory_events);
                         let call_id = call_id.clone();
-                        ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                        ToolExecutionPlan::execute(ToolExecutionStart::new(move |_observer| {
                             factory_events
                                 .lock()
                                 .unwrap()
@@ -15751,7 +15757,7 @@ mod tests {
                         }
                     } else {
                         let factory_invoked = Arc::clone(&factory_invoked);
-                        ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                        ToolExecutionPlan::execute(ToolExecutionStart::new(move |_observer| {
                             factory_invoked.store(true, Ordering::Release);
                             Box::pin(async move {
                                 ToolExecutionResult::completed_text("must not run").unwrap()
@@ -16215,7 +16221,7 @@ mod tests {
                         }
                         "call_sibling" => {
                             let factory_invoked = Arc::clone(&factory_invoked);
-                            ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                            ToolExecutionPlan::execute(ToolExecutionStart::new(move |_observer| {
                                 factory_invoked.store(true, Ordering::Release);
                                 Box::pin(async move {
                                     ToolExecutionResult::completed_text("must not run").unwrap()
@@ -16335,7 +16341,7 @@ mod tests {
                         }),
                     }
                 } else {
-                    ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                    ToolExecutionPlan::execute(ToolExecutionStart::new(move |_observer| {
                         Box::pin(async move {
                             ToolExecutionResult::completed_text(format!("ran {call_id}")).unwrap()
                         })
@@ -17053,6 +17059,7 @@ mod tests {
                     let denied = denied.clone();
                     let allowed_constructed = Arc::clone(&allowed_constructed);
                     ToolExecutionPlan::Approval {
+                        permissions: crate::tools::ToolPermissionSet::new([]),
                         request: approval,
                         // The start factory marks construction: the sticky unload signal must
                         // fail the start-gate reservation before it is ever invoked.
@@ -17371,7 +17378,7 @@ mod tests {
                         }
                     } else {
                         let sibling_factory_constructed = Arc::clone(&sibling_factory_constructed);
-                        ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                        ToolExecutionPlan::execute(ToolExecutionStart::new(move |_observer| {
                             sibling_factory_constructed.store(true, Ordering::Release);
                             Box::pin(async move {
                                 ToolExecutionResult::completed_text("sibling ran").unwrap()
@@ -17608,6 +17615,7 @@ mod tests {
                     let allowed_constructed = Arc::clone(&allowed_constructed);
                     ToolExecutionPlan::Approval {
                         // The mismatched fixture: write_file approval for an echo request.
+                        permissions: crate::tools::ToolPermissionSet::new([]),
                         request: crate::tools::live_approval_request_fixture(),
                         allowed: ToolExecutionStart::new(move |_observer| {
                             allowed_constructed.store(true, Ordering::Release);
@@ -18253,7 +18261,7 @@ mod tests {
                     "call_panic" => panic!("scripted planner panic"),
                     "call_exec" => {
                         let factory_invoked = Arc::clone(&factory_invoked);
-                        ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                        ToolExecutionPlan::execute(ToolExecutionStart::new(move |_observer| {
                             factory_invoked.store(true, Ordering::Release);
                             Box::pin(async move {
                                 ToolExecutionResult::completed_text("must not run").unwrap()
@@ -18341,7 +18349,7 @@ mod tests {
                 if request.call().tool_call_id().as_str() == "call_ghost" {
                     panic!("the unknown tool is never handed to the planner");
                 }
-                ToolExecutionPlan::Execute(ToolExecutionStart::new(|_observer| {
+                ToolExecutionPlan::execute(ToolExecutionStart::new(|_observer| {
                     Box::pin(async { ToolExecutionResult::completed_text("must not run").unwrap() })
                 }))
             },
@@ -18433,7 +18441,7 @@ mod tests {
                 if request.call().tool_call_id().as_str() == "call_preflight" {
                     ToolExecutionPlan::PreExecution(denied.clone())
                 } else {
-                    ToolExecutionPlan::Execute(ToolExecutionStart::new(|_observer| {
+                    ToolExecutionPlan::execute(ToolExecutionStart::new(|_observer| {
                         Box::pin(async { ToolExecutionResult::completed_text("tool ran").unwrap() })
                     }))
                 }
@@ -18536,7 +18544,7 @@ mod tests {
                 if request.call().tool_call_id().as_str() == "call_panic" {
                     panic!("scripted planner panic");
                 }
-                ToolExecutionPlan::Execute(ToolExecutionStart::new(|_observer| {
+                ToolExecutionPlan::execute(ToolExecutionStart::new(|_observer| {
                     Box::pin(async { ToolExecutionResult::completed_text("tool ran").unwrap() })
                 }))
             },
@@ -18628,11 +18636,11 @@ mod tests {
             ],
             move |request| {
                 if request.call().tool_call_id().as_str() == "call_factory_panic" {
-                    ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                    ToolExecutionPlan::execute(ToolExecutionStart::new(move |_observer| {
                         panic!("scripted start factory panic")
                     }))
                 } else {
-                    ToolExecutionPlan::Execute(ToolExecutionStart::new(|_observer| {
+                    ToolExecutionPlan::execute(ToolExecutionStart::new(|_observer| {
                         Box::pin(async { ToolExecutionResult::completed_text("tool ran").unwrap() })
                     }))
                 }
@@ -18720,11 +18728,11 @@ mod tests {
             ],
             |request| {
                 if request.call().tool_call_id().as_str() == "call_exec_panic" {
-                    ToolExecutionPlan::Execute(ToolExecutionStart::new(|_observer| {
+                    ToolExecutionPlan::execute(ToolExecutionStart::new(|_observer| {
                         Box::pin(async { panic!("scripted executor panic") })
                     }))
                 } else {
-                    ToolExecutionPlan::Execute(ToolExecutionStart::new(|_observer| {
+                    ToolExecutionPlan::execute(ToolExecutionStart::new(|_observer| {
                         Box::pin(async { ToolExecutionResult::completed_text("tool ran").unwrap() })
                     }))
                 }
@@ -18923,7 +18931,7 @@ mod tests {
             ],
             |request| {
                 let call_id = request.call().tool_call_id().clone();
-                ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                ToolExecutionPlan::execute(ToolExecutionStart::new(move |_observer| {
                     Box::pin(async move {
                         ToolExecutionResult::completed_text(call_id.as_str()).unwrap()
                     })
@@ -19206,7 +19214,7 @@ mod tests {
                 move |request| {
                     if request.call().tool_call_id().as_str() == "call_first" {
                         let first_started = Arc::clone(&first_started);
-                        ToolExecutionPlan::Execute(ToolExecutionStart::new(move |observer| {
+                        ToolExecutionPlan::execute(ToolExecutionStart::new(move |observer| {
                             Box::pin(async move {
                                 first_started.notify_one();
                                 observer.cancelled().await;
@@ -19225,7 +19233,7 @@ mod tests {
                         // in the factory closure body, never inside the future poll: a
                         // signal that wins first-wins before the reservation must mean this
                         // factory was never invoked at all.
-                        ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                        ToolExecutionPlan::execute(ToolExecutionStart::new(move |_observer| {
                             later_factory.store(true, Ordering::Release);
                             Box::pin(async move {
                                 ToolExecutionResult::completed_text("must not run").unwrap()
@@ -19472,6 +19480,7 @@ mod tests {
                     let denied = denied.clone();
                     let allowed_polled = Arc::clone(&allowed_polled);
                     ToolExecutionPlan::Approval {
+                        permissions: crate::tools::ToolPermissionSet::new([]),
                         request: approval,
                         // The start factory marks construction: the resume revalidation must
                         // fail before it is ever invoked.
@@ -19560,6 +19569,166 @@ mod tests {
         assert!(!recording.contains("tool ran"));
         assert!(!recording.contains("must not run"));
         close_loaded(loaded).await;
+    }
+
+    /// One scripted Approval plan for the exact echo tool name under the given captured
+    /// sandbox contract and plan permission set; the allowed start factory counts its
+    /// constructions (the only entrance to the executor future).
+    fn scripted_sandbox_approval_tool_set(
+        sandbox: crate::tools::ToolSandboxContract,
+        permissions: crate::tools::ToolPermissionSet,
+        approval: crate::tools::ToolApprovalRequest,
+        allowed_constructed: Arc<AtomicUsize>,
+    ) -> Arc<ToolSet> {
+        let allowed = ToolExecutionResult::completed_text("tool ran").unwrap();
+        ToolSet::with_sandbox_contract(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            sandbox,
+            move |_| {
+                let allowed = allowed.clone();
+                let allowed_constructed = Arc::clone(&allowed_constructed);
+                ToolExecutionPlan::Approval {
+                    permissions,
+                    request: approval.clone(),
+                    allowed: ToolExecutionStart::new(move |_observer| {
+                        allowed_constructed.fetch_add(1, Ordering::Release);
+                        Box::pin(async move { allowed })
+                    }),
+                    denied: ToolExecutionResult::PreExecution {
+                        disposition: crate::tools::ToolResultDisposition::Denied,
+                        content: crate::tools::ToolResultContent::from_text_parts(vec![
+                            "approval denied".to_owned(),
+                        ])
+                        .unwrap(),
+                    },
+                }
+            },
+        )
+    }
+
+    /// One scripted sandbox-approval turn to terminal: returns factory count and recording.
+    async fn run_sandbox_approval_scenario(
+        store: &TempStore,
+        tool_set: Arc<ToolSet>,
+        allowed_constructed: Arc<AtomicUsize>,
+    ) -> (usize, String) {
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_approval_sandbox",
+            "echo",
+            "{\"value\":1}",
+            "approval tool round complete",
+        );
+        let loaded = scripted_text_fixture_with_tools(store, &model, tool_set).await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        loaded
+            .executor
+            .test_hooks()
+            .wait_pending_interaction_publication()
+            .await;
+        let pending = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(pending.pending_interactions().len(), 1);
+        loaded
+            .executor
+            .resolve_interaction(
+                turn_id,
+                *pending.pending_interactions()[0].item_id(),
+                *pending.pending_interactions()[0].request_id(),
+                "irk_88888888888888888888888888888890".parse().unwrap(),
+                InteractionResolutionInput::ToolApproval(
+                    crate::tools::ToolApprovalDecisionInput::Allow { option_index: 0 },
+                ),
+                "2026-08-08T10:09:00.000Z".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 2);
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert!(recording.contains("interaction_requested"));
+        assert!(recording.contains("interaction_resolved"));
+        close_loaded(loaded).await;
+        (allowed_constructed.load(Ordering::Acquire), recording)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_sandbox_allow_once_with_capability_gap_settles_denied_without_start() {
+        // The host allows as-requested, but the sandbox enforces only a subset of the
+        // plan's final set: the settlement fails closed to PreExecution Denied before any
+        // reservation.  Terminal + zero factory count + recording prove no start path ran.
+        let store = TempStore::new();
+        let allowed_constructed = Arc::new(AtomicUsize::new(0));
+        let tool_set = scripted_sandbox_approval_tool_set(
+            crate::tools::ToolSandboxContract::available([
+                crate::tools::ToolCapabilityClass::FilesystemRead,
+            ]),
+            crate::tools::ToolPermissionSet::new([
+                crate::tools::ToolCapabilityClass::FilesystemRead,
+                crate::tools::ToolCapabilityClass::FilesystemWrite,
+            ]),
+            crate::tools::live_approval_request_fixture_for("echo"),
+            allowed_constructed.clone(),
+        );
+        let (constructed, recording) =
+            run_sandbox_approval_scenario(&store, tool_set, allowed_constructed).await;
+        assert_eq!(constructed, 0);
+        assert!(recording.contains("pre_execution"));
+        assert!(recording.contains("tool capabilities cannot be enforced"));
+        assert!(!recording.contains("tool ran"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_sandbox_restricted_subset_allow_with_starts_exactly_once() {
+        // The host picks the Restricted option: the AllowWith candidate narrows the plan
+        // ceiling to exactly what the sandbox enforces (the as-requested ceiling would
+        // fail admission), the revalidation resumes, and the allowed factory starts once.
+        let store = TempStore::new();
+        let allowed_constructed = Arc::new(AtomicUsize::new(0));
+        let tool_set = scripted_sandbox_approval_tool_set(
+            crate::tools::ToolSandboxContract::available([
+                crate::tools::ToolCapabilityClass::FilesystemRead,
+                crate::tools::ToolCapabilityClass::FilesystemWrite,
+            ]),
+            crate::tools::ToolPermissionSet::new([
+                crate::tools::ToolCapabilityClass::FilesystemRead,
+                crate::tools::ToolCapabilityClass::FilesystemWrite,
+                crate::tools::ToolCapabilityClass::Network,
+            ]),
+            crate::tools::live_restricted_approval_request_fixture_for(
+                "echo",
+                crate::tools::ToolPermissionSet::new([
+                    crate::tools::ToolCapabilityClass::FilesystemRead,
+                    crate::tools::ToolCapabilityClass::FilesystemWrite,
+                ]),
+            ),
+            allowed_constructed.clone(),
+        );
+        let (constructed, recording) =
+            run_sandbox_approval_scenario(&store, tool_set, allowed_constructed).await;
+        assert_eq!(constructed, 1);
+        assert!(recording.contains("tool ran"));
     }
 
     #[tokio::test(flavor = "current_thread")]
