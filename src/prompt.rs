@@ -1081,12 +1081,18 @@ pub(crate) struct AssembledModelContext {
 }
 
 impl AssembledModelContext {
-    #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "read by the adjacent M14 OpenAI Responses adapter encoder"
+    )]
     pub(crate) fn system(&self) -> &[PromptSection] {
         &self.system
     }
 
-    #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "read by the adjacent M14 OpenAI Responses adapter encoder"
+    )]
     pub(crate) fn messages(&self) -> &[ModelMessage] {
         &self.messages
     }

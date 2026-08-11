@@ -22,6 +22,8 @@ MiniCore不能通过提升MSRV、`RUSTC_BOOTSTRAP`、跳过主crate all-targets�
 
    两者直接拥有各自HTTP request、SSE parsing、terminal evidence、typed envelope、metadata allowlist和single-attempt cancellation mapping，并复用一个private、必须经Rust 1.85冷编译验证的transport client。具体transport dependency只在M14 contract slice中选择和固定，不能预先把SDK类型写入provider-neutral seam。
 
+   M14首个OpenAI slice现已固定exact `reqwest = 0.13.4`，关闭default features，仅启用`json + rustls + stream`；client显式使用`retry::never()`、`redirect::Policy::none()`和`no_proxy()`。真实Rust 1.85隔离冷编译已覆盖主crate全部targets/features，local loopback suite通过真实`ProviderAdapter` seam验证完整`/responses` POST、bounded SSE、terminal/delivery/error、Structured mapping和cancellation。该实现仍使用explicit full endpoint与explicit bearer credential constructor；dynamic credential source、catalog安装和live opt-in smoke不由本slice伪造。
+
 3. ADR 0138冻结的provider合同继续有效：首版protocol scope、ordered content/tool identity、OpenAI `response.completed`、Anthropic non-empty `message_delta.stop_reason`、metadata allowlist、automatic retry为0、26-case delivery/error mapping与queued Steer规则均不改变。变化仅是production implementation choice；Rig synthetic `Final`等观察结果保留为反例和conformance输入。
 
 4. exact `rig-core = 0.40.0` tests移动到standalone `provider-gate/` package。该package不是主crateworkspace member，主动声明`rust-version = 1.88`，拥有独立lockfile，只在current stable门禁运行。Ubuntu stable通过`scripts/check.sh`运行它，macOS与Windows native jobs也运行它；所有测试继续离线、无credential/ambient config并使用test-owned loopback server。
@@ -37,13 +39,14 @@ MiniCore不能通过提升MSRV、`RUSTC_BOOTSTRAP`、跳过主crate all-targets�
 - `provider-gate/tests/m12_rig_*.rs`：exact Rig 0.40.0在current stable上的OpenAI Responses/Anthropic Messages unary、stream、terminal、metadata和error behavior；
 - `tests/m12_provider_error_matrix.rs`：主crate Rust 1.85下执行的26-case provider-neutral delivery/error合同；
 - `provider-gate/Cargo.toml`与独立`Cargo.lock`：Rig evidence dependency和更高language floor显式隔离；
-- root `Cargo.toml`与`Cargo.lock`：production package不含Rig；
+- root `Cargo.toml`与`Cargo.lock`：production package不含Rig；M14 OpenAI transport固定为经真实Rust 1.85验证的exact `reqwest = 0.13.4`最小feature set；
+- `src/model_gateway/openai_responses.rs`：direct private adapter及默认离线loopback contract suite，覆盖single POST、request/terminal mapping、bounded fragmented SSE、metadata redaction、delivery/error与cancellation；
 - `scripts/check-msrv.sh`：真实compiler identity和隔离target门禁；
 - `.github/workflows/ci.yml`：stable Ubuntu/macOS/Windows持续执行evidence harness，Rust 1.85执行主crate全部targets。
 
 ## 后果
 
-M14会比包装单一SDK多拥有少量provider wire代码，但接口更深且事实所有权更清晰：terminal、delivery、metadata和cancellation不再先被generic SDK擦除后再旁路重建。两个adapter可以共享transport、bounded SSE framing和redaction primitives，但不能共享会模糊协议terminal或typed envelope差异的generic response model。
+M14比包装单一SDK多拥有少量provider wire代码，但接口更深且事实所有权更清晰：OpenAI slice已证明terminal、delivery、metadata和cancellation可以由真正观察wire的owner直接分类，不必先由generic SDK擦除后再旁路重建。Anthropic adapter可以复用已验证的transport construction与bounded framing原则，但仍必须拥有独立Messages request/SSE terminal与typed envelope parser，不能共享会模糊协议差异的generic response model。
 
 Rig升级或重新评估只能作为独立候选：新版本必须先通过真实Rust 1.85冷编译和同等级contract suite，才可由新ADR考虑进入production baseline。当前不为未来可能兼容的Rig预留production abstraction、feature flag或conditional dependency。
 

@@ -2,7 +2,7 @@
 
 日期：2026-08-08
 
-状态：当前权威架构（M6.2 scripted foundation、M8.1最小ToolCall、M10 CompactionSummary purpose/budget request validation与ActiveTurnTask orchestration，以及crate-private Structured output foundation已实现；M12 protocol reality gate已关闭并因Rust 1.85拒绝Rig production dependency；完整ToolSpec schema、credential/connection implementation、provider-native Structured schema mapping/sanitization与direct production adapters待实现）
+状态：当前权威架构（M6.2 scripted foundation、M8.1最小ToolCall、M10 CompactionSummary purpose/budget request validation与ActiveTurnTask orchestration，以及crate-private Structured output foundation已实现；M12 protocol reality gate已关闭并因Rust 1.85拒绝Rig production dependency；M14 `OpenAiResponsesProviderAdapter`、OpenAI provider-native Structured mapping与默认离线loopback contract suite已实现；dynamic credential/catalog installation、cache/continuation、Anthropic Messages与production Tool/Sandbox adapters仍待实现）
 
 ## 目的
 
@@ -27,7 +27,7 @@
 - provider-native compaction artifact的持久化格式；
 - 完整pricing、billing ledger或成本审计。
 
-当前M6.2 foundation与M8.1最小ToolCall路径已运行：Runtime仍默认拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行。M10新增`CompactionSummary` purpose，并要求assembly budget proof、`NoToolCalls`、empty ToolSpec和explicit max output exact匹配，仍复用同一个single-attempt Gateway。crate-private Structured foundation已实现：`OutputContract::Structured` contract由绑定exact `TurnModelSnapshot`的constructor创建（capability与`max_schema_bytes` cap校验、schema v1 subset验证），optional name按[stable symbolic key](wire-schema.md#stable-symbolic-keys)共同floor限制为1..64 bytes，`ModelCallRequest` constructor按proof复验exact model/OutputContract绑定，Gateway对terminal执行exact JSON object parse与本地schema validation（`Refused` bypass；`UnexpectedToolCall`/`IncompleteResponse`/`InvalidStructuredOutput` precedence），并由ScriptedProviderAdapter端到端conformance覆盖；无JSON repair、type coercion或Markdown code-fence extraction。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。仍pending：任何public requester/Wire/SessionDefinition structured字段、Runtime/ActiveTurnTask structured激活（ordinary AgentRun路径仍`output_contract=None`，toolful Turn在普通ToolRound后的第二次Structured call未激活，Compaction仍固定`NoToolCalls`）、provider-native schema mapping/sanitization、完整ToolSpec schema、auth/credential/connection/cache、async Compaction retry/orchestration以及direct production adapters。M12 production provider gate已经用exact Rig 0.40.0 standalone loopback evidence、terminal/metadata proof和26-case delivery/error fixture关闭；真实Rust 1.85冷编译同时拒绝Rig进入production baseline，M14改为OpenAI Responses与Anthropic Messages两个direct adapters。该gate不代表production adapter或available catalog已实现。
+当前M6.2 foundation与M8.1最小ToolCall路径已运行：Runtime仍默认拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行。M10新增`CompactionSummary` purpose，并要求assembly budget proof、`NoToolCalls`、empty ToolSpec和explicit max output exact匹配，仍复用同一个single-attempt Gateway。crate-private Structured foundation已实现：`OutputContract::Structured` contract由绑定exact `TurnModelSnapshot`的constructor创建（capability与`max_schema_bytes` cap校验、schema v1 subset验证），optional name按[stable symbolic key](wire-schema.md#stable-symbolic-keys)共同floor限制为1..64 bytes，`ModelCallRequest` constructor按proof复验exact model/OutputContract绑定，Gateway对terminal执行exact JSON object parse与本地schema validation（`Refused` bypass；`UnexpectedToolCall`/`IncompleteResponse`/`InvalidStructuredOutput` precedence），并由ScriptedProviderAdapter端到端conformance覆盖；无JSON repair、type coercion或Markdown code-fence extraction。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。M14首个production slice现已实现`OpenAiResponsesProviderAdapter`：exact `reqwest = 0.13.4`关闭default features并只启用`json + rustls + stream`，client显式关闭retry、redirect和ambient proxy；adapter从exact model definition编码instructions/messages/Tools/NoToolCalls/Structured/reasoning/service tier，增量bounded解析SSE，仅以`response.completed`为success terminal，并规范化ordered content、usage、request ID、typed envelope、delivery和cancellation。29个默认离线测试通过真实`ModelGateway.generate_model_turn → ProviderAdapter`与`127.0.0.1:0` HTTP路径验证，真实Rust 1.85亦通过all-target check与focused tests。仍pending：任何public requester/Wire/SessionDefinition structured字段、Runtime/ActiveTurnTask structured激活（ordinary AgentRun路径仍`output_contract=None`，toolful Turn在普通ToolRound后的第二次Structured call未激活，Compaction仍固定`NoToolCalls`）、完整ToolSpec schema、dynamic credential source与catalog/model source安装、connection/cache/continuation policy、live opt-in smoke、Anthropic Messages direct adapter以及production Tool/Sandbox adapters；所以当前Runtime仍不发布OpenAI available model。
 
 相关权威文档：
 
@@ -898,7 +898,7 @@ ModelCallRequest
 - finish reason从protocol terminal与provider-specific response字段提取；仍不可得则使用`Unknown`；optional request ID/metadata不可得时保持None；
 - provider error envelope与transport error必须在adapter内转换成ProviderAttemptError。
 
-两个adapter可以共享private connection client、bounded SSE framing、header validation和redaction primitives；不能共享会抹平OpenAI/Anthropic terminal、typed envelope或delivery差异的generic response model。transport dependency必须在M14由真实Rust 1.85冷编译和adapter contract tests固定。
+两个adapter可以共享private connection client、bounded SSE framing、header validation和redaction primitives；不能共享会抹平OpenAI/Anthropic terminal、typed envelope或delivery差异的generic response model。M14 OpenAI slice已把transport固定为exact `reqwest = 0.13.4`的`json + rustls + stream`最小features，并由真实Rust 1.85冷编译、29个local loopback/focused tests验证；Anthropic可复用transport construction原则，但不能复用OpenAI parser。
 
 M12 standalone Rig evidence已经验证：
 
@@ -1452,7 +1452,7 @@ pub struct CustomProviderDefinition {
 
 规则：
 
-- 首个production baseline只支持`OpenAiResponses | AnthropicMessages`，且M14 adapter通过前都不能显示为available；
+- 首个production baseline只支持`OpenAiResponses | AnthropicMessages`；protocol adapter、dynamic credential resolution、catalog/model source installation与release smoke全部通过前，对应model不能显示为available；当前OpenAI仅完成direct adapter/local contract slice，Anthropic adapter仍pending；
 - OpenAI Chat Completions、Gemini或其他protocol不接受为首版config；新增variant必须先有同等级loopback、delivery/error fixture与Accepted decision；
 - 不根据endpoint或model name猜protocol；
 - endpoint必须HTTPS，localhost/development exception需要显式runtime policy；
@@ -1883,7 +1883,7 @@ M12 gate evidence：
 - [x] response metadata allowlist和canary rejection；
 - [x] delivery/error fixture与queued Steer retry rule。
 
-MVP首版只选择HTTP Responses/Messages streaming，不启用WebSocket或transport fallback。M14 production adapter仍必须消费同一contract suite，并补credential/client factory、owner-tracked cancellation cleanup、provider-native Structured mapping及production private error conversion。
+MVP首版只选择HTTP Responses/Messages streaming，不启用WebSocket或transport fallback。M14 OpenAI adapter已消费同一contract suite并实现owner-scoped cancellation、provider-native Structured mapping及private error conversion；仍需dynamic credential/catalog installation与live opt-in smoke。Anthropic production adapter仍必须独立消费Messages contract suite，不能复用OpenAI terminal/parser。
 
 ## Source Plan
 
@@ -1972,6 +1972,7 @@ src/model_gateway/provider/scripted.rs
 - [x] 执行Rig 0.40.0 ModelGateway reality gate，在production adapter冻结前完成OpenAI Responses/Anthropic Messages loopback、stream、terminal、metadata和delivery/error证据（ADR 0138）。
 - [x] 实现ModelGateway model resolution、immutable request/proof与single-attempt scripted core。
 - [x] 实现crate-private Structured foundation：`OutputContract::Structured` exact-model contract constructor（capability/`max_schema_bytes` cap、name 1..64、schema v1 subset）、`ModelCallRequest` exact-model/OutputContract proof复验、terminal exact JSON object parse与本地schema validation、`Refused` bypass及`UnexpectedToolCall`/`IncompleteResponse`/`InvalidStructuredOutput` precedence，ScriptedProviderAdapter端到端conformance。
-- [ ] 实现credential/connection/cache policy、provider-native Structured schema mapping/sanitization和OpenAI Responses/Anthropic Messages direct production adapters，并激活public structured requester/Wire/SessionDefinition字段与Runtime/ActiveTurnTask structured调用。
-- [x] 完成OpenAI Responses与Anthropic Messages M12 mock-server contract tests；production adapter suite仍属于M14。
+- [x] 实现OpenAI Responses direct private adapter、provider-native Structured strict mapping、bounded SSE terminal/delivery/error/cancellation与默认离线production loopback suite；transport由真实Rust 1.85验证。
+- [ ] 实现dynamic credential/catalog installation、connection/cache/continuation policy、Anthropic Messages direct adapter与live opt-in smoke，并激活public structured requester/Wire/SessionDefinition字段与Runtime/ActiveTurnTask structured调用。
+- [x] 完成OpenAI Responses与Anthropic Messages M12 mock-server contract tests；M14 OpenAI production adapter suite已完成，Anthropic production suite仍pending。
 - [x] 在阶段9冻结公开model catalog/query协议。
