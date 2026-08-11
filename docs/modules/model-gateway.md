@@ -1252,7 +1252,8 @@ same `Arc<ModelCallRequest>` is reused; no reassembly
 logical retry：
 
 - 不阻塞SessionExecutor control actor；
-- Steer、Cancel、成功Compaction Replace或conversation change使其失效；
+- queued Steer只排队且不改变`ConversationRevision`，因此不使in-flight result或retry backoff失效；Steer只在safe point被消费并成功apply后递增revision，使旧request basis失效；
+- Cancel、成功Compaction Replace或其他conversation mutation通过control/revision basis使retry失效；
 - 计入StoredAssistantMessage.logical_retry_count；
 - 不创建ModelAttempt entity；
 - 不改变ModelCallPurpose；
@@ -1272,7 +1273,6 @@ logical retry：
 ModelGateway在以下位置检查CancellationToken：
 
 - resolution validation后；
-- concurrency wait期间；
 - auth resolution和request前refresh前后；
 - provider request开始前；
 - stream read期间，直到provider terminal event被adapter接受。
@@ -1288,7 +1288,7 @@ Gateway success/cancel的线性化点是adapter接受完整provider terminal eve
 
 ```text
 cancel token fires
-→ 取消concurrency wait或当前single attempt
+→ 取消当前single attempt
 → 调用Rig stream.cancel或transport abort
 → 停止发布新progress
 → 返回ModelCallErrorReason::Cancelled
@@ -1386,7 +1386,7 @@ ResolvedAuth
 ProviderClientFactory
 ```
 
-AuthBindingRef固定credential source/account binding，不包含secret。ResolvedAuth另外产生opaque AuthPrincipalIdentity，用于per-principal concurrency、connection/cache隔离和continuation compatibility；该identity不进入TurnModelSnapshot、diagnostics或storage。若同一AuthBindingRef在active Turn期间解析为不同principal，Gateway必须清除旧connection/continuation candidate，不能跨principal复用provider state。
+AuthBindingRef固定credential source/account binding，不包含secret。ResolvedAuth另外产生opaque AuthPrincipalIdentity，只用于connection/cache隔离和continuation compatibility，不形成Gateway-local permit或admission policy；该identity不进入TurnModelSnapshot、diagnostics或storage。若同一AuthBindingRef在active Turn期间解析为不同principal，Gateway必须清除旧connection/continuation candidate，不能跨principal复用provider state。
 
 secret只允许存在于：
 
@@ -1796,7 +1796,7 @@ opaque encrypted reasoning
 - RequestOutcomeUnknown和StreamInterrupted默认不logical retry；
 - 仅`NotSent`/`RejectedBeforeExecution`的Timeout/TransportUnavailable/ProviderUnavailable允许logical retry；AcceptedNoOutput和unsafe/unknown outcome必须归一化为RequestOutcomeUnknown或StreamInterrupted；
 - Retry-After <= 60s时实际delay取purpose backoff与hint较大值，超过60s不调度；
-- Steer/Cancel使logical retry失效。
+- queued Steer不使in-flight result或retry backoff失效；Steer只在safe point消费并成功apply后通过revision变化使旧request失效；Cancel通过control arbitration使retry失效。
 
 ### Cancellation
 
@@ -1805,7 +1805,7 @@ opaque encrypted reasoning
 - cancel during stream；
 - provider terminal先于cancel时Gateway完成result；SessionExecutor仍可因version/cancel拒绝；
 - Rig AbortHandle桥接；
-- logical retry与Steer场景不存在可回传的旧detached Model future；execution_version用于拒绝basis已经变化的result并检测实现错误。
+- logical retry与queued Steer场景不存在可回传的旧detached Model future；exact `control_generation`、`ConversationRevision`与same `Arc<ModelCallRequest>`用于拒绝basis已经变化的result。
 
 ### Usage And Finish
 
