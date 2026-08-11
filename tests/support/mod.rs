@@ -307,6 +307,8 @@ fn serve_one(
 
     let reason = match scripted.status {
         200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         529 => "Overloaded",
