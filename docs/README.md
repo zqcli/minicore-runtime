@@ -33,7 +33,7 @@ M0–M6 foundations、M7 ordinary AgentRun与M8最小Tool/Interaction/Cancel及c
 
 - M11 Session Fork/catalog/query/event、Agent/Session mutation、definition CAS、Agent upgrade、ReloadWorkspace、readiness与shared-resource recovery及grace Unload、host security Workspace invalidation、RuntimeDependencyUnavailable readiness与probe recovery及full recovery scenario/fixture closure均已实现并通过统一质量门禁；
 - M12/V4-P1-3已由ADR 0138/0139、OpenAI Responses/Anthropic Messages真实Rig standalone loopback evidence、terminal/metadata seam、26-case delivery/error fixture与真实Rust 1.85冷编译关闭；Rig被拒绝进入production baseline，M14实现两个direct provider adapters；
-- M13/V4-C0-1已由ADR 0140、class-level admission、approval revalidation及SecurityRevoked/Sandbox-unavailable/Running round conformance关闭；M14实现production adapters，首个file-mutation adapter另须满足ADR 0116。
+- M13/V4-C0-1已由ADR 0140、class-level admission、approval revalidation及SecurityRevoked/Sandbox-unavailable/Running round conformance关闭；closure SHA `0951b12`的GitHub Actions run `31518732896`四平台全部success。M14实现production adapters，首个file-mutation adapter另须满足ADR 0116。
 
 ## 目录角色
 

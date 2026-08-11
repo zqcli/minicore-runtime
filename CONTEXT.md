@@ -29,7 +29,7 @@ M12 checkpoint series：
 - queued Steer在retry backoff只排队、不改变revision；safe point成功apply后才使旧basis失效；Gateway继续无local route/model/principal permits；
 - ADR 0138/0139 Accepted：协议合同继续有效，M14不实现`RigProviderAdapter`，改为`OpenAiResponsesProviderAdapter`与`AnthropicMessagesProviderAdapter`直接拥有各自HTTP/SSE、terminal、metadata与typed error mapping；ADR 0140 Accepted：Tool Sandbox class-level admission、approval revalidation与pre-start fail-closed合同关闭V4-C0-1；第四轮全部finding Closed。
 
-当前本地门禁已通过：`./scripts/check.sh`运行主crate764个library tests（3 ignored）、159个integration tests（1 ignored）及standalone provider-gate 25个tests；`./scripts/check-msrv.sh`显式锁定真实Rust 1.85 compiler并在隔离target运行主crate全部targets，结果为764个library tests（3 ignored）与159个integration tests（1 ignored）。Clippy、format、current/archive docs、Wire V1 144 active/0 pending与Durable Store fixtures通过。M13 closure commit的remote四平台acceptance仍待记录；最近已确认的M12 GitHub Actions run `31503035476`四个job全部success。
+当前本地门禁已通过：`./scripts/check.sh`运行主crate764个library tests（3 ignored）、159个integration tests（1 ignored）及standalone provider-gate 25个tests；`./scripts/check-msrv.sh`显式锁定真实Rust 1.85 compiler并在隔离target运行主crate全部targets，结果为764个library tests（3 ignored）与159个integration tests（1 ignored）。Clippy、format、current/archive docs、Wire V1 144 active/0 pending与Durable Store fixtures通过。M13 closure SHA `0951b12a9584c5f26f4757bf84cefb21e824d1dd`的GitHub Actions run `31518732896`已在Ubuntu stable、Rust 1.85、macOS与Windows四个job全部success。
 
 未实现边界不要误判为回归：M12没有实现production provider adapter、credential/client factory、connection/cache/continuation或provider-native Structured schema mapping；这些属于M14。production ask-user builtin的ToolName、input schema和answer→model-visible ToolResult text/render格式仍未冻结；production ToolService/executor/adapters、完整schema/hooks/policy/Sandbox/permission enforcement、Session-local mutation queue/mutation permit、public Tool DTO、具体Prompt/Skill source与Skill composition仍pending。没有真实producer前，不要伪造`DurableStateCorrupt`/`DurableStateTooLarge` loaded readiness；没有production file Tool/canonical target consumer前，不要先造mutation queue；Prompt/Skill authoring grammar与Runtime consumer未冻结前，不要实现filesystem adapter。
 
@@ -325,7 +325,7 @@ PromptIntent::Skill / PromptIntent::Composite / PromptBodyIntent::Template
 ## 当前开放问题
 
 - 第四轮评审：全部普通V4-P0/P1与conditional V4-C0-1已关闭；V4-P1-3由M12/ADR 0138/0139关闭，V4-C0-1由M13/ADR 0140关闭；
-- M0–M13已完成并通过本地stable/MSRV统一门禁；M13 closure commit的remote四平台acceptance仍待记录；
+- M0–M13已完成并通过本地stable/MSRV统一门禁；M13 closure SHA `0951b12`的GitHub Actions run `31518732896`四平台全部success；
 - M12冻结OpenAI Responses/Anthropic Messages production baseline、terminal/metadata与delivery/error contract，并明确拒绝Rig进入Rust 1.85 production baseline；M14仍需实现两个direct private provider adapters、credential/client factory、connection/cache/continuation、provider-native Structured mapping及production contract suite；
 - M14：实现两个direct provider adapters与production Tool/Sandbox adapters；Structured public activation、具体Prompt/Skill source、production ask-user builtin、Session-local mutation permit attachment、resource-level Tool policy/Sandbox与public Tool DTO继续pending。
 
