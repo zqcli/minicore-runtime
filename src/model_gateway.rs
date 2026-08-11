@@ -18,6 +18,8 @@ use crate::wire::lexical::{
 };
 use crate::wire::{BoundedJsonObject, BoundedJsonSchema, Money, ProtocolLimits};
 
+mod openai_responses;
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ModelIdentityError {
     #[error("model identity must be 1..=128 bytes")]
@@ -2869,7 +2871,7 @@ mod tests {
         }
     }
 
-    fn text_definition(
+    pub(super) fn text_definition(
         version: u64,
         default_max_output_tokens: u32,
         adapter: Arc<dyn ProviderAdapter>,
@@ -2902,7 +2904,7 @@ mod tests {
         .unwrap()
     }
 
-    fn resolve_request(max_output_tokens: Option<u32>) -> ResolveTurnModelRequest {
+    pub(super) fn resolve_request(max_output_tokens: Option<u32>) -> ResolveTurnModelRequest {
         ResolveTurnModelRequest::new(
             ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
             ReasoningPreference::Auto,
@@ -2953,7 +2955,7 @@ mod tests {
             .unwrap()
     }
 
-    fn scripted_tool_set() -> Arc<ToolSet> {
+    pub(super) fn scripted_tool_set() -> Arc<ToolSet> {
         ToolSet::with_executor(
             vec![
                 ToolDefinition::new(
@@ -3023,11 +3025,11 @@ mod tests {
         }
     }
 
-    async fn request_for_model(model: Arc<TurnModelSnapshot>) -> Arc<ModelCallRequest> {
+    pub(super) async fn request_for_model(model: Arc<TurnModelSnapshot>) -> Arc<ModelCallRequest> {
         request_for_model_with_tools(model, ToolSet::empty()).await
     }
 
-    async fn request_for_model_with_tools(
+    pub(super) async fn request_for_model_with_tools(
         model: Arc<TurnModelSnapshot>,
         tools: Arc<ToolSet>,
     ) -> Arc<ModelCallRequest> {
@@ -3945,7 +3947,7 @@ mod tests {
         assert_eq!(usage.reported_cost(), Some(&cost));
     }
 
-    fn structured_schema(json: &str) -> BoundedJsonSchema {
+    pub(super) fn structured_schema(json: &str) -> BoundedJsonSchema {
         json.parse().unwrap()
     }
 
@@ -3953,7 +3955,7 @@ mod tests {
         json.parse().unwrap()
     }
 
-    fn structured_definition(
+    pub(super) fn structured_definition(
         version: u64,
         default_max_output_tokens: u32,
         max_schema_bytes: NonZeroU32,
@@ -3999,19 +4001,28 @@ mod tests {
         .unwrap()
     }
 
-    async fn structured_request(
+    pub(super) async fn structured_request(
         model: &Arc<TurnModelSnapshot>,
         contract: &StructuredOutputContract,
+    ) -> Arc<ModelCallRequest> {
+        request_with_output_contract(model, Some(&OutputContract::Structured(contract.clone())))
+            .await
+    }
+
+    /// Assembles a real AgentRun request with the given output contract (Structured or
+    /// NoToolCalls) and an empty tool set, through the exact prompt assembly path.
+    pub(super) async fn request_with_output_contract(
+        model: &Arc<TurnModelSnapshot>,
+        output_contract: Option<&OutputContract>,
     ) -> Arc<ModelCallRequest> {
         let prompt_set = prompt_set_for_model(Arc::clone(model)).await;
         let (live, revision) = live_user_context(&prompt_set);
         let views = live.capture_conversation_views().unwrap();
-        let output_contract = OutputContract::Structured(contract.clone());
         let input = Arc::new(
             prompt_set
                 .assemble(PromptAssemblyInput::agent_run(
                     views.conversation(),
-                    Some(&output_contract),
+                    output_contract,
                 ))
                 .unwrap(),
         );
