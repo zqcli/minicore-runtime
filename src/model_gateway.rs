@@ -1696,16 +1696,29 @@ impl ScriptedModelFixture {
         arguments: &str,
         final_text: &str,
     ) -> Self {
+        Self::with_tool_round_calls(&[(tool_call_id, tool_name, arguments)], final_text)
+    }
+
+    /// One Tool round with multiple Tool calls in the first response (call_index follows the
+    /// slice order), then one final text response.
+    pub(crate) fn with_tool_round_calls(calls: &[(&str, &str, &str)], final_text: &str) -> Self {
         let scripts = vec![
             ScriptedProviderScript::success(
                 Vec::new(),
                 ProviderAttemptResult {
                     response_id: None,
-                    content: Arc::from([ProviderAttemptContent::ToolCall {
-                        tool_call_id: tool_call_id.parse().unwrap(),
-                        name: tool_name.parse().unwrap(),
-                        arguments: arguments.parse().unwrap(),
-                    }]),
+                    content: Arc::from(
+                        calls
+                            .iter()
+                            .map(|(tool_call_id, name, arguments)| {
+                                ProviderAttemptContent::ToolCall {
+                                    tool_call_id: tool_call_id.parse().unwrap(),
+                                    name: name.parse().unwrap(),
+                                    arguments: arguments.parse().unwrap(),
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
                     finish_reason: ModelFinishReason::ToolCalls,
                     usage: None,
                     metadata: ProviderResponseMetadata::new(None, None, None),

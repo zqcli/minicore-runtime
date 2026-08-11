@@ -12,7 +12,7 @@
 //! executor retains its permit (and excludes lifecycle/load changes) for as long as the loaded
 //! executor is live; this constructor does not acquire that permit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -65,23 +65,25 @@ use crate::runtime_interface::{
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, RuntimeTaskError, SystemClock, TrackedTask};
 use crate::session_ingress::{
-    EmergencyControlHandle, EmergencyControlObservation, EmergencyControlSignal,
-    EmergencyControlSignalOutcome, EmergencyControlTarget, FollowUpQueue, FollowUpQueueError,
-    QueuedSteer, SteerQueue, SteerQueueError,
-};
-use crate::tools::{
-    InteractionSettlement, ToolAbandonReason, ToolCall, ToolCancellationHandle, ToolExecutionMode,
-    ToolExecutionOutcome, ToolExecutionPlan, ToolExecutionRequest, ToolExecutionRun,
-    ToolExecutionStart, ToolSet, ToolStartError, ToolStartGate, ToolStartedExecution,
+    EmergencyControlHandle, EmergencyControlMigrationError, EmergencyControlObservation,
+    EmergencyControlSignal, EmergencyControlSignalOutcome, EmergencyControlTarget, FollowUpQueue,
+    FollowUpQueueError, InteractionPresentationPermit, InteractionResolutionPermit, QueuedSteer,
+    SteerQueue, SteerQueueError, UserQuestionBindingPermit,
 };
 #[cfg(test)]
-use crate::tools::{ToolExecutionResult, ToolOutcomeSource};
+use crate::tools::UserQuestionAnswerBinding;
+use crate::tools::{
+    ApprovalSettlement, ToolAbandonReason, ToolApprovalDecision, ToolApprovalRequest, ToolCall,
+    ToolCancellationHandle, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionPlan,
+    ToolExecutionRequest, ToolExecutionResult, ToolExecutionRun, ToolExecutionStart, ToolSet,
+    ToolStartError, ToolStartGate, ToolStartedExecution, UserQuestionAnswer, UserQuestionRequest,
+};
 use crate::turn_execution_context::{
     TurnContextCapture, TurnContextCaptureError, TurnExecutionContext,
 };
 use crate::turn_item_interaction::{
     AssistantDisposition, InteractionCancelReason, InteractionRequest, InteractionRequestView,
-    InteractionResolutionInput, ResolvedInteraction, UserMessageSource,
+    InteractionResolution, InteractionResolutionInput, ResolvedInteraction, UserMessageSource,
 };
 use crate::wire::{
     CommandId, CurrencyCode, IdGenerationError, InteractionResolutionKey, ItemId, Money,
@@ -2021,8 +2023,29 @@ impl SessionExecutor {
 
     /// Requests the actor to reject future requests.  An admitted publication may abandon
     /// cancellable candidate capture, but work that has reached durable publication still drains.
+    ///
+    /// The synchronous close signal handoff happens here, in this fixed order: the admission
+    /// gate is closed first, then the current exact emergency basis — an active Submit
+    /// admission or an active Turn — is signaled `PrepareForUnload` first-wins under the
+    /// emergency owner mutex (`signal_current`, no callback/await/nested lock), and only then
+    /// is the closing token cancelled.  Every owner that observes the basis — an
+    /// already-reserved interaction presentation or answer binding, a not-yet-reserved start
+    /// gate, an active worker — therefore settles the truthful unload reason (or keeps an
+    /// earlier Cancel/SecurityRevoked first-wins signal and reason) before the closing token
+    /// ever wakes the actor or workers, so no active Submit/Turn exact basis can advance to
+    /// the next Model after a close request.  The signal is sticky: `close_and_drain` later
+    /// re-attempts the exact Turn signal and on this path normally records
+    /// `AlreadySignaled { signal: PrepareForUnload }`; an earlier Cancel/SecurityRevoked
+    /// remains exact.
     pub(crate) fn request_closing(&self) {
         self.turn_admission_gate.close();
+        // The synchronous unload handoff: any active Submit/Turn exact basis carries the
+        // sticky PrepareForUnload before closing wakes the actor/workers.  `None` means no
+        // basis is bound (an already-Idle executor); the outcome is deliberately not read
+        // here — the drain re-attempts and records the exact outcome for close tests.
+        let _ = self
+            .emergency
+            .signal_current(EmergencyControlSignal::PrepareForUnload);
         self.closing.cancel();
     }
 
@@ -2834,7 +2857,7 @@ impl SessionExecutor {
             &generation,
             source_revision,
             &self.emergency,
-            emergency,
+            &emergency,
         ))
     }
 
@@ -3073,6 +3096,10 @@ struct ActiveTurn {
 struct ActiveInteraction {
     turn_id: TurnId,
     item_id: ItemId,
+    // The exact `ToolExecutionRequest` capture the pending interaction was presented for:
+    // the resolution reservation binds this exact capture so a host resolution can never
+    // be authorized against a foreign request.
+    request: crate::tools::ToolExecutionRequest,
     resolution_sender: oneshot::Sender<ResolvedInteraction>,
 }
 
@@ -3149,6 +3176,15 @@ impl ExpectedPublication {
 enum ActorFatality {
     Integrity,
     Internal,
+}
+
+/// The failure of one permit-consuming active-pending host-resolution apply: either the
+/// permit no longer authorizes the exact apply (the actor must fail closed with
+/// `ActorFatality::Integrity`), or the reducer rejected the resolution with an existing
+/// `HostInteractionResolutionError` that the caller settles with the existing error mapping.
+enum HostResolutionApplyFailure {
+    Integrity,
+    Reducer(HostInteractionResolutionError),
 }
 
 /// One select iteration of the actor main loop.  The branches borrow disjoint fields, so the
@@ -3276,30 +3312,61 @@ impl SessionExecutorActor {
         }
         let pending_interactions = self
             .pending_interactions
-            .keys()
-            .copied()
+            .iter()
+            .map(|(request_id, interaction)| (*request_id, interaction.turn_id))
             .collect::<Vec<_>>();
         let mut requests_drained = false;
         let mut emergency_requests_drained = false;
         let mut normal_exit = true;
-        if !pending_interactions.is_empty() {
-            if let Some(active_turn) = self.active_turn.as_ref() {
-                active_turn.cancellation.cancel();
-                if self
-                    .signal_emergency_cancel(active_turn.emergency.target())
-                    .is_err()
-                {
+        // Close is a Session unload: whenever a Turn is still active, publish the exact
+        // unload signal first-wins on its emergency basis *before* the Turn token is
+        // cancelled, and only then cancel the token, so every owner that observes the basis
+        // — an already-reserved but not-yet-registered UserQuestion included — settles the
+        // truthful PrepareForUnload reason instead of continuing to the next Model, and the
+        // Turn token is never cancelled before the signal exists (the signal is never
+        // generic-first).  `request_closing` already performed the synchronous handoff
+        // (`signal_current(PrepareForUnload)`) before cancelling the closing token, so on
+        // that path this attempt normally records `AlreadySignaled { signal:
+        // PrepareForUnload }`; the drain remains the authoritative actor cleanup and
+        // re-attempts the exact Turn signal so a close that never passed through
+        // `request_closing` (fatal/worker exits) still signals the basis.  An earlier
+        // Cancel/SecurityRevoked keeps its first-wins signal and reason (AlreadySignaled
+        // never overwrites it); both Accepted and AlreadySignaled leave the emergency basis
+        // cancelled, so no worker can start a new side effect.  A stale target is an
+        // integrity failure: the drain then reports an abnormal exit.
+        if let Some(active_turn) = self.active_turn.as_ref() {
+            // The exact first-wins outcome is captured: the drain records it (Accepted /
+            // AlreadySignaled / Stale) and notifies the close-drain signal probe immediately
+            // after the attempt settles, so an integrated close test can prove the drain's
+            // signal did not overwrite a previously won Cancel without polling.
+            let outcome = self.emergency.signal(
+                active_turn.emergency.target(),
+                EmergencyControlSignal::PrepareForUnload,
+            );
+            match outcome {
+                EmergencyControlSignalOutcome::Accepted { .. }
+                | EmergencyControlSignalOutcome::AlreadySignaled { .. } => {}
+                EmergencyControlSignalOutcome::StaleTarget => {
                     normal_exit = false;
                 }
             }
+            #[cfg(test)]
+            self.hooks.record_close_drain_signal(outcome);
+            active_turn.cancellation.cancel();
         }
-        for request_id in pending_interactions {
+        for (request_id, turn_id) in pending_interactions {
+            // Pending Interactions queued before close settle with the exact observed
+            // emergency reason: PrepareForUnload (or no signal at all) closes as
+            // SessionUnloaded, and an earlier first-wins Cancel/SecurityRevoked keeps its
+            // exact TurnCancelled/SecurityRevoked reason.
+            let reason = signal_to_interaction_cancel_reason(
+                self.emergency
+                    .observe(EmergencyControlTarget::Turn(turn_id))
+                    .and_then(|observation| observation.signal()),
+            )
+            .unwrap_or(InteractionCancelReason::SessionUnloaded);
             if self
-                .cancel_pending_interaction(
-                    request_id,
-                    SystemClock.now(),
-                    InteractionCancelReason::SessionUnloaded,
-                )
+                .cancel_pending_interaction(request_id, SystemClock.now(), reason)
                 .await
                 .is_err()
             {
@@ -4138,15 +4205,18 @@ impl SessionExecutorActor {
         let context = match completion.result {
             Ok(context) => context,
             Err(error) => {
-                // Observe the current emergency signal before retiring the admission
-                // observation: a PrepareForUnload that won the deadline reclassifies the
-                // generic admission cancellation (a user Cancel still stays SubmitCancelled).
-                // Every other failure stays truthful.
+                // Atomically retire the admission observation and capture its first-wins
+                // signal under the single emergency owner mutex: a PrepareForUnload that won
+                // the deadline reclassifies the generic admission cancellation (a user Cancel
+                // still stays SubmitCancelled).  Every other failure stays truthful.  The
+                // capture and the retirement are one transition — a concurrent synchronous
+                // close handoff (`request_closing`'s `signal_current`) can never land between
+                // an observe and a retire and lose the sticky unload signal — and a stale
+                // observation is an integrity failure.
                 let emergency_signal = self
                     .emergency
-                    .observe(active.emergency.target())
-                    .and_then(|observation| observation.signal());
-                self.emergency.retire(active.emergency);
+                    .retire_and_capture_signal(&active.emergency)
+                    .ok_or(ActorFatality::Integrity)?;
                 if error == SessionSubmitError::RuntimeDependencyUnavailable {
                     // The single production source of this dedicated failure is a transient
                     // DurableState StorageUnavailable while reading the pinned historical Agent
@@ -4260,18 +4330,31 @@ impl SessionExecutorActor {
         let Some(resources) = self.turn_resources.as_ref().cloned() else {
             return Err(ActorFatality::Integrity);
         };
-        let prior_signal = self
+        // The deterministic Submit→Turn emergency migration gap: an integrated regression
+        // parks the actor here, calls `request_closing` synchronously, and proves the sticky
+        // PrepareForUnload that lands on the Submit basis is preserved by the atomic
+        // migration onto the Turn basis.  The migration validates the exact Submit basis,
+        // checked-increments the epoch, captures the old signal, and installs the new Turn
+        // basis with the exact preserved signal under one owner mutex — no observe/retire/
+        // bind/re-signal split can erase or duplicate a signal between the operations, and
+        // the new Turn cancellation token is already cancelled when a signal is preserved.
+        #[cfg(test)]
+        self.hooks.before_emergency_submit_to_turn_migration().await;
+        let (emergency, prior_signal) = self
             .emergency
-            .observe(active.emergency.target())
-            .and_then(|observation| observation.signal());
-        self.emergency.retire(active.emergency);
-        let emergency = self
-            .emergency
-            .bind(EmergencyControlTarget::Turn(active.turn_id))
-            .map_err(|_| ActorFatality::Internal)?;
+            .migrate_target(
+                &active.emergency,
+                EmergencyControlTarget::Turn(active.turn_id),
+            )
+            .map_err(|error| match error {
+                EmergencyControlMigrationError::StaleObservation => ActorFatality::Integrity,
+                EmergencyControlMigrationError::EpochExhausted => ActorFatality::Internal,
+            })?;
         let cancellation = active.cancellation.clone();
-        if let Some(signal) = prior_signal {
-            self.signal_emergency(EmergencyControlTarget::Turn(active.turn_id), signal)?;
+        if prior_signal.is_some() {
+            // The preserved signal already won on the migrated Turn basis (its token is
+            // already cancelled): the worker-side admission cancellation settles the same
+            // reason instead of re-signaling through a second transition.
             cancellation.cancel();
         } else if cancellation.is_cancelled() {
             self.signal_emergency_cancel(EmergencyControlTarget::Turn(active.turn_id))?;
@@ -4293,7 +4376,7 @@ impl SessionExecutorActor {
             command_id: active.command_id,
             turn_id: active.turn_id,
             control_generation: Arc::clone(&control_generation),
-            emergency,
+            emergency: emergency.clone(),
             cancellation: cancellation.clone(),
             cancel_accepted: active.cancel_accepted,
             task: None,
@@ -4371,21 +4454,44 @@ impl SessionExecutorActor {
         &mut self,
         completion: InteractionRequestedCompletion,
     ) -> Result<(), ActorFatality> {
-        if self.closing.is_cancelled() {
-            return Ok(());
-        }
         let Some(active_turn) = self.active_turn.as_ref() else {
             return Err(ActorFatality::Internal);
         };
         if active_turn.turn_id != completion.turn_id {
             return Err(ActorFatality::Internal);
         }
+        // The completion's won presentation permit must be the exact current Turn basis and
+        // the exact request capture: its target is the exact Turn, its owner Arc is the
+        // actor's own emergency control owner, its reserved target + epoch are still the
+        // bound emergency basis (a completion carried on a retired/rebound/foreign basis is
+        // stale), and the carried request is the exact capture the permit was reserved for.
+        // This is the release-code authorization (never `debug_assert`-only).  The signal
+        // state is deliberately not consulted: a signal that lands after the reservation
+        // already lost first-wins at presentation time, and the pending interaction is
+        // applied and then settled with the exact observed cancellation.
+        if completion.presentation_permit.target()
+            != EmergencyControlTarget::Turn(completion.turn_id)
+            || !completion
+                .presentation_permit
+                .validates(&self.emergency, &completion.tool_request)
+        {
+            return Err(ActorFatality::Internal);
+        }
+        // The exact permit validation passed: the won presentation stage is never erased,
+        // even when the actor is closing or a signal already won.  The pending interaction
+        // is always applied + recorded + inserted + published, and only then settled with
+        // the exact observed first-wins signal when the actor is closing or the active
+        // cancellation/signal already won (closing with no signal falls back to a plain
+        // RuntimeClosing; a non-closing active cancellation falls back to TurnCancelled).
         let Some(conversation) = self.conversation.as_ref() else {
             return Err(ActorFatality::Integrity);
         };
+        let item_id = completion.tool_request.item_id();
+        let tool_call_id = completion.tool_request.call().tool_call_id().clone();
         let candidate = InteractionRequestCandidate::new(
             completion.request_id,
-            completion.item_id,
+            item_id,
+            tool_call_id,
             completion.request,
         );
         let fact = lock(&conversation.live_state)
@@ -4396,30 +4502,28 @@ impl SessionExecutorActor {
             completion.request_id,
             ActiveInteraction {
                 turn_id: completion.turn_id,
-                item_id: completion.item_id,
+                item_id,
+                request: completion.tool_request,
                 resolution_sender: completion.resolution_sender,
             },
         );
         self.publish_pending_interactions()?;
-        if self
-            .active_turn
-            .as_ref()
-            .is_some_and(|active_turn| active_turn.cancellation.is_cancelled())
+        if self.closing.is_cancelled()
+            || self
+                .active_turn
+                .as_ref()
+                .is_some_and(|active_turn| active_turn.cancellation.is_cancelled())
         {
-            let reason = self
-                .emergency
-                .observe(EmergencyControlTarget::Turn(completion.turn_id))
-                .and_then(|observation| observation.signal())
-                .map(|signal| match signal {
-                    EmergencyControlSignal::Cancel => InteractionCancelReason::TurnCancelled,
-                    EmergencyControlSignal::SecurityRevoked => {
-                        InteractionCancelReason::SecurityRevoked
-                    }
-                    EmergencyControlSignal::PrepareForUnload => {
-                        InteractionCancelReason::SessionUnloaded
-                    }
-                })
-                .unwrap_or(InteractionCancelReason::TurnCancelled);
+            let reason = signal_to_interaction_cancel_reason(
+                self.emergency
+                    .observe(EmergencyControlTarget::Turn(completion.turn_id))
+                    .and_then(|observation| observation.signal()),
+            )
+            .unwrap_or(if self.closing.is_cancelled() {
+                InteractionCancelReason::RuntimeClosing
+            } else {
+                InteractionCancelReason::TurnCancelled
+            });
             self.cancel_pending_interaction(completion.request_id, completion.timestamp, reason)
                 .await?;
         }
@@ -4433,17 +4537,112 @@ impl SessionExecutorActor {
         let Some(resolution) = request.resolution.take() else {
             return Err(ActorFatality::Integrity);
         };
-        let Some(conversation) = self.conversation.as_ref() else {
+        let Some(conversation) = self.conversation.as_ref().cloned() else {
             return Err(ActorFatality::Integrity);
         };
-        let apply = lock(&conversation.live_state).apply_host_interaction_resolution(
-            request.request_id,
-            request.expected_turn_id,
-            request.item_id,
-            request.resolution_key.clone(),
-            resolution,
-            request.timestamp,
-        );
+        // The host-resolution first-wins reservation runs only when the pending interaction
+        // is identified in the actor's own pending map by its exact Turn + Item and the
+        // active Turn basis matches.  A retry with no identified active pending entry
+        // (idempotent retries, already-settled owners) keeps the existing reducer path
+        // untouched below.
+        let identified_active_request = self
+            .pending_interactions
+            .get(&request.request_id)
+            .filter(|active| {
+                active.turn_id == request.expected_turn_id && active.item_id == request.item_id
+            })
+            .map(|active| active.request.clone());
+        let active_turn_observation = self
+            .active_turn
+            .as_ref()
+            .filter(|active_turn| active_turn.turn_id == request.expected_turn_id)
+            .map(|active_turn| active_turn.emergency.clone());
+        let apply = if let (Some(active_request), Some(turn_observation)) =
+            (identified_active_request, active_turn_observation)
+        {
+            // The named test barrier parks the actor after it dequeued/identified the active
+            // interaction but before the reservation, so a test can prove the synchronous
+            // close handoff (`request_closing`'s sticky `signal_current`) still wins before
+            // the resolution permit is ever reserved.
+            #[cfg(test)]
+            self.hooks.before_interaction_resolution_reservation().await;
+            let Some(resolution_permit) = self
+                .emergency
+                .reserve_interaction_resolution(&turn_observation, &active_request)
+            else {
+                // Signal-first (especially the synchronous `request_closing` close handoff):
+                // the host resolution is never applied — no Allow/UserAnswer/Denied durable
+                // fact is ever recorded.  The pending interaction is owner-cancelled with
+                // the exact first-wins signal reason first (apply + record + notify the
+                // waiter), and the host request settles `Closing` when the actor is closing
+                // else the truthful `AlreadyResolved` conflict (the owner cancellation
+                // already resolved the interaction).
+                let reason = signal_to_interaction_cancel_reason(
+                    self.emergency
+                        .observe(turn_observation.target())
+                        .and_then(|observation| observation.signal()),
+                )
+                .unwrap_or(if self.closing.is_cancelled() {
+                    InteractionCancelReason::RuntimeClosing
+                } else {
+                    InteractionCancelReason::TurnCancelled
+                });
+                self.cancel_pending_interaction(request.request_id, request.timestamp, reason)
+                    .await?;
+                request.settle(Err(if self.closing.is_cancelled() {
+                    SessionInteractionError::Closing
+                } else {
+                    SessionInteractionError::AlreadyResolved
+                }));
+                return Ok(());
+            };
+            // Permit-first: the reservation is the release-code authorization (exact owner /
+            // current / unsignaled / request capture, all under the owner mutex).  The
+            // active-pending host-resolution apply runs only through the private helper
+            // below, which consumes the permit together with the exact active
+            // `ToolExecutionRequest`, validates the exact target/owner/current/request, and
+            // calls the reducer exactly once — the permit stays owned through the apply and
+            // is consumed by the helper's return, never dropped bare before the mutation.
+            match self.apply_active_host_interaction_resolution(
+                &conversation,
+                resolution_permit,
+                active_request,
+                request,
+                resolution,
+            ) {
+                Ok(outcome) => Ok(outcome),
+                Err(HostResolutionApplyFailure::Integrity) => {
+                    // The permit no longer validates: the host resolution is never applied —
+                    // no Allow/UserAnswer/Denied durable fact is ever recorded on a stale or
+                    // foreign basis.  Fail closed: the actor closes instead of continuing
+                    // (the request's Drop settles the host with Closing).
+                    return Err(ActorFatality::Integrity);
+                }
+                Err(HostResolutionApplyFailure::Reducer(error)) => Err(error),
+            }
+        } else {
+            // No identified active pending entry (idempotent retries, already-settled
+            // owners): the reducer may run without a permit, but it must never *apply*.  An
+            // `Applied` outcome here means the pending map and live state have drifted — the
+            // resolution would be recorded with no active-pending entry and no first-wins
+            // authorization — so fail closed instead of bypassing authorization; only
+            // `Idempotent` or the existing errors below are acceptable.
+            let apply = lock(&conversation.live_state).apply_host_interaction_resolution(
+                request.request_id,
+                request.expected_turn_id,
+                request.item_id,
+                request.resolution_key.clone(),
+                resolution,
+                request.timestamp,
+            );
+            if matches!(
+                &apply,
+                Ok(HostInteractionResolutionApplyOutcome::Applied { .. })
+            ) {
+                return Err(ActorFatality::Integrity);
+            }
+            apply
+        };
         let (fact, resolution_for_worker) = match apply {
             Ok(HostInteractionResolutionApplyOutcome::Applied { fact, resolution }) => {
                 (fact, resolution)
@@ -4477,6 +4676,15 @@ impl SessionExecutorActor {
                 return Ok(());
             }
         };
+        // The host resolution is applied to live state here; the named test barrier parks
+        // the actor in this record-await gap so a test can prove the synchronous close
+        // handoff (`request_closing`'s sticky `signal_current`) still wins before the
+        // resolution is recorded and sent to the worker: binding/start gates then observe
+        // the unload signal and no side effect ever starts after close.
+        #[cfg(test)]
+        self.hooks
+            .after_interaction_resolution_apply_before_record()
+            .await;
         let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
         let active = self
             .pending_interactions
@@ -4489,6 +4697,51 @@ impl SessionExecutorActor {
         let _ = active.resolution_sender.send(resolution_for_worker);
         request.settle(Ok(()));
         Ok(())
+    }
+
+    /// The only active-pending host-resolution apply: consumes one `InteractionResolutionPermit`
+    /// together with the exact active `ToolExecutionRequest` and performs the reducer apply
+    /// exactly once.  The final proof consumption happens here in normal release code (never
+    /// `debug_assert`-only): the permit's target must be the exact Turn of this host
+    /// resolution, and the permit must still validate — the exact control owner Arc (a
+    /// foreign handle bound to the same target + epoch fails), the exact reserved target +
+    /// epoch still the bound emergency basis (a permit carried on a retired/rebound basis is
+    /// stale), and the pending interaction's request the exact capture the permit was
+    /// reserved for.  The signal state is deliberately not consulted: a signal that lands
+    /// after the reservation already lost first-wins at reservation time, and the host
+    /// resolution is applied and then settled with the exact observed cancellation by the
+    /// next stage's start/binding gate.  The permit remains owned through the apply call and
+    /// is consumed when this helper returns — the mutation never runs after a bare drop of
+    /// the authorization.
+    fn apply_active_host_interaction_resolution(
+        &self,
+        conversation: &LoadedSessionConversation,
+        resolution_permit: InteractionResolutionPermit,
+        active_request: ToolExecutionRequest,
+        request: &ResolveInteractionRequest,
+        resolution: InteractionResolutionInput,
+    ) -> Result<HostInteractionResolutionApplyOutcome, HostResolutionApplyFailure> {
+        if resolution_permit.target() != EmergencyControlTarget::Turn(request.expected_turn_id)
+            || !resolution_permit.validates(&self.emergency, &active_request)
+        {
+            // The permit no longer validates: the host resolution is never applied — no
+            // Allow/UserAnswer/Denied durable fact is ever recorded on a stale or foreign
+            // basis.
+            return Err(HostResolutionApplyFailure::Integrity);
+        }
+        // The exact permit validation passed: the host resolution is applied + recorded +
+        // sent exactly as before, even if the signal lands right after the reservation (the
+        // next stage's start/binding gate handles the signal).
+        lock(&conversation.live_state)
+            .apply_host_interaction_resolution(
+                request.request_id,
+                request.expected_turn_id,
+                request.item_id,
+                request.resolution_key.clone(),
+                resolution,
+                request.timestamp,
+            )
+            .map_err(HostResolutionApplyFailure::Reducer)
     }
 
     async fn cancel_request(&mut self, request: &mut CancelRequest) -> Result<(), ActorFatality> {
@@ -5492,6 +5745,12 @@ impl SessionExecutorActor {
                 steer_command_ids,
             );
         self.publish_current(Arc::new(current));
+        // The current pending-interaction projection was published synchronously; the
+        // test-only probe wakes after it, so one snapshot read observes this exact
+        // publication (a request presentation and a resolution/cancellation removal both
+        // land here, each counted once).
+        #[cfg(test)]
+        self.hooks.pending_interaction_published.notify();
         Ok(())
     }
 
@@ -5513,7 +5772,7 @@ impl SessionExecutorActor {
             return Err(ActorFatality::Integrity);
         };
         conversation.clear_control_generation(active.turn_id, &active.control_generation);
-        self.emergency.retire(active.emergency);
+        self.emergency.retire(&active.emergency);
         let pending_before = self.pending_interactions.len();
         self.pending_interactions
             .retain(|_, interaction| interaction.turn_id != active.turn_id);
@@ -7246,6 +7505,10 @@ fn valid_durable_agent_upgrade_shape(
         && returned.created_at() == owner_timestamp
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "each InteractionRequested completion is one owner-owned presentation message on the unbounded completion lane (with its won presentation permit), never cloned or pooled"
+)]
 enum ExecutorCompletion {
     Publication(PublicationCompletion),
     Admission(AdmissionCompletion),
@@ -7259,12 +7522,225 @@ enum ExecutorCompletion {
 
 struct InteractionRequestedCompletion {
     turn_id: TurnId,
+    // The won presentation permit the worker reserved first-wins against the emergency
+    // signal: the actor validates the exact owner/Turn basis and the exact request capture
+    // through it before applying the pending interaction, and never applies a completion
+    // carried on a stale or foreign basis.
+    presentation_permit: InteractionPresentationPermit,
     timestamp: Timestamp,
-    item_id: ItemId,
-    tool_call_id: crate::tools::ToolCallId,
+    // The exact `ToolExecutionRequest` the presentation was reserved for: the actor derives
+    // the ItemId and ToolCallId from this exact capture (no loose fields) and validates the
+    // permit against it before apply.
+    tool_request: ToolExecutionRequest,
     request_id: RequestId,
     request: InteractionRequest,
     resolution_sender: oneshot::Sender<ResolvedInteraction>,
+}
+
+/// The closed result of one concrete Tool control call.
+///
+/// The error carries no payload and its Debug is the closed variant names only: a caller can
+/// settle truthfully (cancelled-before-start vs owner-unavailable vs invariant) but can never
+/// leak or reconstruct any interaction detail through it.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+enum ToolExecutionControlError {
+    #[error("the exact emergency basis is already signaled or stale")]
+    Cancelled,
+    #[error("the interaction owner is unavailable")]
+    OwnerUnavailable,
+    #[error("the interaction resolution family does not match the request")]
+    Invalid,
+}
+
+/// The Session-private concrete Tool control for one active Turn's Tool operations.
+///
+/// One control is shared (Clone) by every planned operation of one round: it carries the
+/// exact Turn identity and the completion sender the actor's pending-interaction owner reads.
+/// The control deliberately owns no emergency basis: each operation slot reserves against its
+/// own exact `EmergencyControlHandle` + `EmergencyControlObservation`, which the control
+/// methods receive explicitly, so a mixed/foreign slot can never borrow the round's first
+/// slot basis.  The control is the only way a planned operation presents an interaction: the
+/// slot's exact basis is reserved first (a signaled/stale basis settles `Cancelled` without
+/// ever generating a RequestId or publishing a pending interaction), the RequestId is then
+/// generated, and the actor's resolution arrives over the existing `InteractionRequested`
+/// completion lane — the actor still applies + records before notifying back, and the
+/// resolution is delivered before the worker resumes.
+#[derive(Clone)]
+struct ToolExecutionControl {
+    turn_id: TurnId,
+    interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+}
+
+impl ToolExecutionControl {
+    fn new(
+        turn_id: TurnId,
+        interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    ) -> Self {
+        Self {
+            turn_id,
+            interaction_completion_sender,
+        }
+    }
+
+    /// Presents one Tool approval and awaits the host/owner resolution.
+    ///
+    /// The exact slot basis is reserved before anything is published: an already signaled or
+    /// stale basis (or a foreign observation) settles `Cancelled` without generating a
+    /// RequestId or any pending interaction.  The RequestId is generated here by the owner,
+    /// the existing `InteractionRequested` completion lane carries the request (together
+    /// with the exact `ToolExecutionRequest` capture and the won presentation permit) to the
+    /// actor (which validates and applies + records before notifying back), and the
+    /// resolution is matched to the exact approval family: `AllowOnce`/`Deny` resume or
+    /// deny, an owner/host cancellation settles `Cancelled`, and any impossible family
+    /// settles `Invalid`.
+    async fn request_approval(
+        &self,
+        request: &ToolExecutionRequest,
+        approval: ToolApprovalRequest,
+        emergency_control: &EmergencyControlHandle,
+        observation: &EmergencyControlObservation,
+        #[cfg(test)] hooks: &Arc<SessionExecutorTestHooksInner>,
+    ) -> Result<ToolApprovalDecision, ToolExecutionControlError> {
+        let resolution = self
+            .request_interaction(
+                request,
+                InteractionRequest::tool_approval(approval),
+                emergency_control,
+                observation,
+                #[cfg(test)]
+                hooks,
+            )
+            .await?;
+        match resolution.live() {
+            InteractionResolution::ToolApproval(decision) => Ok(decision.clone()),
+            InteractionResolution::Cancelled(_) => Err(ToolExecutionControlError::Cancelled),
+            InteractionResolution::UserAnswer(_) => Err(ToolExecutionControlError::Invalid),
+        }
+    }
+
+    /// Presents one UserQuestion and awaits the host answer or the owner resolution.
+    ///
+    /// Same first-wins basis reservation as `request_approval`; the resolution is matched to
+    /// the exact question family: an answer returns the private wrapper that binds the typed
+    /// answer to the exact slot's `UserQuestionBindingPermit` (reserved first-wins against
+    /// the signal on the same owner mutex, before any Tools binding may run), an owner/host
+    /// cancellation settles `Cancelled` without ever reserving a binding, and an impossible
+    /// family settles `Invalid`.
+    async fn request_user_question(
+        &self,
+        request: &ToolExecutionRequest,
+        question: UserQuestionRequest,
+        emergency_control: &EmergencyControlHandle,
+        observation: &EmergencyControlObservation,
+        #[cfg(test)] hooks: &Arc<SessionExecutorTestHooksInner>,
+    ) -> Result<UserQuestionAnswerBound, ToolExecutionControlError> {
+        let resolution = self
+            .request_interaction(
+                request,
+                InteractionRequest::user_question(question),
+                emergency_control,
+                observation,
+                #[cfg(test)]
+                hooks,
+            )
+            .await?;
+        match resolution.live() {
+            InteractionResolution::UserAnswer(answer) => {
+                // The actor already applied + recorded + sent the resolution; the worker is
+                // about to reserve the answer binding.  The named test barrier parks here so
+                // a test can prove the signal-first cancellation still wins before the
+                // binding permit is ever reserved.
+                #[cfg(test)]
+                hooks.before_user_question_binding().await;
+                // First-wins between the signal and the Tools binding, on the exact slot
+                // basis: a signal that already won reports Cancelled and the binding is
+                // never authorized, while a won permit authorizes the binding even if the
+                // signal lands right after.
+                let Some(binding_permit) =
+                    emergency_control.reserve_user_question_binding(observation, request)
+                else {
+                    return Err(ToolExecutionControlError::Cancelled);
+                };
+                Ok(UserQuestionAnswerBound {
+                    answer: answer.clone(),
+                    binding_permit,
+                })
+            }
+            InteractionResolution::Cancelled(_) => Err(ToolExecutionControlError::Cancelled),
+            InteractionResolution::ToolApproval(_) => Err(ToolExecutionControlError::Invalid),
+        }
+    }
+
+    /// The shared interaction presentation: the exact slot basis is reserved first-wins
+    /// against the signal on the owner mutex (a signaled/stale basis — or a foreign
+    /// observation — settles `Cancelled` before any RequestId is generated or anything is
+    /// published), then the owner-generated RequestId + `SystemClock.now` + oneshot are
+    /// created and the existing `InteractionRequested` completion lane carries the
+    /// interaction — together with the exact `ToolExecutionRequest` capture and the won
+    /// presentation permit — to the actor, which validates the exact owner/Turn basis and
+    /// the exact request capture before it applies the pending interaction.  The actor's
+    /// resolution is awaited here and the resolution is delivered before the worker resumes.
+    async fn request_interaction(
+        &self,
+        request: &ToolExecutionRequest,
+        interaction: InteractionRequest,
+        emergency_control: &EmergencyControlHandle,
+        observation: &EmergencyControlObservation,
+        #[cfg(test)] hooks: &Arc<SessionExecutorTestHooksInner>,
+    ) -> Result<ResolvedInteraction, ToolExecutionControlError> {
+        let Some(permit) = emergency_control.reserve_interaction_presentation(observation, request)
+        else {
+            return Err(ToolExecutionControlError::Cancelled);
+        };
+        // The presentation permit won first-wins against the signal: the request is now
+        // guaranteed to reach the actor even if the signal lands right after, and the actor
+        // settles it with the exact observed cancellation.  The named test barrier parks
+        // here so a test can prove the permit-first completion still publishes (apply +
+        // record + exact cancellation resolution) after the signal.
+        #[cfg(test)]
+        hooks.after_interaction_presentation_reserved().await;
+        let request_id =
+            RequestId::generate().map_err(|_| ToolExecutionControlError::OwnerUnavailable)?;
+        let (resolution_sender, resolution_receiver) = oneshot::channel();
+        let completion = InteractionRequestedCompletion {
+            turn_id: self.turn_id,
+            presentation_permit: permit,
+            timestamp: SystemClock.now(),
+            tool_request: request.clone(),
+            request_id,
+            request: interaction,
+            resolution_sender,
+        };
+        if self
+            .interaction_completion_sender
+            .send(ExecutorCompletion::InteractionRequested(completion))
+            .is_err()
+        {
+            return Err(ToolExecutionControlError::OwnerUnavailable);
+        }
+        resolution_receiver
+            .await
+            .map_err(|_| ToolExecutionControlError::OwnerUnavailable)
+    }
+}
+
+/// The private wrapper one answered UserQuestion returns: the typed host answer bound to the
+/// exact slot's won `UserQuestionBindingPermit`.
+///
+/// The operation slot consumes the wrapper (and only then invokes the Tools binding): the
+/// permit is the first-wins authorization that the signal did not win between the answer
+/// delivery and the binding, so a signal-first cancellation can never be misjudged as an
+/// authorized binding.
+struct UserQuestionAnswerBound {
+    answer: UserQuestionAnswer,
+    binding_permit: UserQuestionBindingPermit,
+}
+
+impl UserQuestionAnswerBound {
+    /// Consumes the wrapper into its typed answer and the won binding permit.
+    fn into_parts(self) -> (UserQuestionAnswer, UserQuestionBindingPermit) {
+        (self.answer, self.binding_permit)
+    }
 }
 
 struct SteerSafePointCompletion {
@@ -7488,7 +7964,7 @@ async fn run_admission(
     Ok(context)
 }
 
-/// The four lifecycle variants of one exact Tool operation slot.
+/// The single complete lifecycle of one exact Tool operation slot.
 ///
 /// The slot is constructed `Prepared` (bound to its exact request, the round's emergency
 /// handle + observation, and its own `ToolStartGate`), moves to `Running` only after the
@@ -7513,13 +7989,18 @@ enum ToolOperationSlot {
     },
     Running {
         request: ToolExecutionRequest,
+        // The slot's own exact emergency basis, moved in from Prepared at the started
+        // transition: the Running select watches this basis (never the round's first slot
+        // basis), so a mixed/foreign slot observes exactly its own signal.
         emergency_control: EmergencyControlHandle,
         observation: EmergencyControlObservation,
         cancellation: ToolCancellationHandle,
-        // The still-owned started run future: the Running select polls it, and the Settling
-        // signal path keeps awaiting the same future to the executor's cooperative
-        // cleanup/result.
-        run: ToolExecutionRun,
+        // The still-owned started run future wrapped with its exact request: the Running
+        // select polls the wrapper, and the Settling signal path keeps awaiting the same
+        // wrapper to the executor's cooperative cleanup/result.  An executor panic is
+        // caught inside the wrapper's poll boundary and maps to this exact request's
+        // identity-bound Abandoned outcome while the slot parts remain owned.
+        run: OwnedToolExecutionRun,
     },
     Settling {
         request: ToolExecutionRequest,
@@ -7529,14 +8010,42 @@ enum ToolOperationSlot {
     },
 }
 
+/// The session-local wrapper that owns one started executor run future together with the
+/// exact request it binds.
+///
+/// The wrapper is the single executor-panic boundary on the started path: it polls the run
+/// future with `catch_unwind` (polling only the future, never any slot state), so a
+/// panicking executor can never unwind or drop a Prepared/Running slot, and it yields the
+/// still-owned exact request so the caller maps the panic to that exact request's
+/// identity-bound Abandoned RuntimeFailure.  The started future stays owned by the wrapper
+/// the whole time, so it is never dropped because of a signal.
+struct OwnedToolExecutionRun {
+    request: ToolExecutionRequest,
+    run: ToolExecutionRun,
+}
+
+impl OwnedToolExecutionRun {
+    /// Polls the still-owned run future to its identity-bound outcome.  A panicking executor
+    /// is caught here and reported through the exact request the caller maps to Abandoned
+    /// RuntimeFailure; the panic is observed only at this poll boundary and no slot state
+    /// exists in the unwind path.
+    async fn await_bound(&mut self) -> Result<ToolExecutionOutcome, ToolExecutionRequest> {
+        match AssertUnwindSafe(&mut self.run).catch_unwind().await {
+            Ok(outcome) => Ok(outcome),
+            Err(_) => Err(self.request.clone()),
+        }
+    }
+}
+
 /// The crate-private owner of one exact Tool operation's whole lifecycle.
 ///
 /// Each exact request gets exactly one slot; the slot owns its own `ToolStartGate` (the sole
 /// operation owner — there is no second round-level gate), the emergency basis it reserves
-/// against, and the request it settles.  The consuming `drive` hides the plan, interaction
+/// against, and the request it settles.  The consuming `drive_planned` hides the interaction
 /// presentation, reservation, started proof, running cancellation, settlement, and terminal
-/// transition, and catches any planner/factory/executor panic closed to the exact
-/// identity-bound Abandoned RuntimeFailure.
+/// transition, and every caller-supplied panic (answer binding, start factory, executor run)
+/// is caught at its own exact boundary closed to the same slot's identity-bound Abandoned
+/// RuntimeFailure.
 impl ToolOperationSlot {
     /// Binds one exact request's slot to the round's emergency basis.  Constructed right
     /// after the assistant ToolCall apply and before the recorder await, so the gate binds
@@ -7581,10 +8090,89 @@ impl ToolOperationSlot {
     /// Binds one exact identity-bound outcome into the slot's Terminal variant.  Every
     /// settled path — unknown tool, frozen PreExecution, interaction deny/owner-cancellation,
     /// sender/receiver failure, invalid start binding, signal-first cancellation, foreign
-    /// proof — ends here; no path may return an outcome that did not first pass through a
-    /// Terminal slot.
+    /// proof, panic — ends here; no path may return an outcome that did not first pass
+    /// through a Terminal slot.
     fn into_terminal(outcome: ToolExecutionOutcome) -> Self {
         Self::Terminal { outcome }
+    }
+
+    /// Consumes a Prepared slot with one fixed identity-bound outcome under the exact
+    /// unstarted settlement first-wins: a signal/stale basis (or a foreign observation)
+    /// that already won settles the matching cancelled-before-start outcome instead, and a
+    /// won permit settles the given exact outcome.  The permit is then validated in normal
+    /// release code (exact owner Arc + current basis + exact request capture); a failing
+    /// validation is an invariant that fails closed to the identity-bound Abandoned
+    /// RuntimeFailure outcome and never proceeds.  The gate is dropped un-reserved and the
+    /// same slot moves into Terminal; no plan binding, start factory, or side effect ever
+    /// runs.
+    fn settle_unstarted_outcome(self, outcome: ToolExecutionOutcome) -> Self {
+        let Self::Prepared {
+            request,
+            emergency_control,
+            observation,
+            gate: _,
+        } = self
+        else {
+            unreachable!("settle_unstarted_outcome consumes a Prepared slot");
+        };
+        let Some(permit) =
+            emergency_control.reserve_unstarted_tool_settlement(&observation, &request)
+        else {
+            return Self::into_terminal(ToolSet::cancelled_before_start_outcome(&request));
+        };
+        if !permit.validates(&emergency_control, &request) {
+            return Self::into_terminal(abandoned_runtime_failure(&request));
+        }
+        Self::into_terminal(outcome)
+    }
+
+    /// Consumes a Prepared slot with one frozen pre-execution result under the same exact
+    /// unstarted settlement first-wins, then binds it with the pre-execution binding (a
+    /// malformed `Completed` shape fails closed to Abandoned OutcomeUnknown).
+    fn settle_unstarted_result(self, result: ToolExecutionResult) -> Self {
+        let Self::Prepared {
+            request,
+            emergency_control,
+            observation,
+            gate: _,
+        } = self
+        else {
+            unreachable!("settle_unstarted_result consumes a Prepared slot");
+        };
+        let Some(permit) =
+            emergency_control.reserve_unstarted_tool_settlement(&observation, &request)
+        else {
+            return Self::into_terminal(ToolSet::cancelled_before_start_outcome(&request));
+        };
+        if !permit.validates(&emergency_control, &request) {
+            return Self::into_terminal(abandoned_runtime_failure(&request));
+        }
+        Self::into_terminal(ToolSet::bind_preexecution_result(&request, result))
+    }
+
+    /// Consumes a Prepared slot with the truthful failed-before-start PreExecution Failed
+    /// outcome under the same exact unstarted settlement first-wins: an unstarted plan that
+    /// was not meant to run at all (an abandoned-exchange sibling) records the generic
+    /// "tool did not start" result, never an Abandoned merely because it was not started.
+    fn fail_before_start(self) -> Self {
+        let Self::Prepared {
+            request,
+            emergency_control,
+            observation,
+            gate: _,
+        } = self
+        else {
+            unreachable!("fail_before_start consumes a Prepared slot");
+        };
+        let Some(permit) =
+            emergency_control.reserve_unstarted_tool_settlement(&observation, &request)
+        else {
+            return Self::into_terminal(ToolSet::cancelled_before_start_outcome(&request));
+        };
+        if !permit.validates(&emergency_control, &request) {
+            return Self::into_terminal(abandoned_runtime_failure(&request));
+        }
+        Self::into_terminal(ToolSet::failed_before_start_outcome(&request))
     }
 
     /// The single extraction: consumes the Terminal slot and yields its bound identity-bound
@@ -7596,50 +8184,42 @@ impl ToolOperationSlot {
         outcome
     }
 
-    /// Consumes the slot through the whole operation lifecycle.
+    /// Consumes the Prepared slot with its round-owned plan through the whole lifecycle.
     ///
-    /// Everything that can panic for this request (planner, start factory, executor) is
-    /// polled inside this one catch_unwind, so a panic resolves exactly this request closed
-    /// to identity-bound Abandoned RuntimeFailure and never unwinds the round: Serial
-    /// requests after this one still settle, and Parallel drives stay parent-owned (no
+    /// Every caller-supplied step that can panic for this request is caught at its own exact
+    /// boundary with the slot's parts still owned — the answer binding at the binding call,
+    /// the start factory inside the Tools run constructor, the executor future inside the
+    /// slot's own run wrapper — so a panic resolves exactly this request closed to
+    /// identity-bound Abandoned RuntimeFailure on the same slot and never unwinds the round:
+    /// Serial requests after this one still settle, and Parallel drives stay parent-owned (no
     /// detached tasks).
-    async fn drive(
+    async fn drive_planned(
         self,
+        plan: ToolExecutionPlan,
+        control: &ToolExecutionControl,
         tool_set: Arc<ToolSet>,
-        turn_id: TurnId,
-        interaction_completion_sender: &mpsc::UnboundedSender<ExecutorCompletion>,
         #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
     ) -> ToolExecutionOutcome {
-        // The exact request is cloned before the slot moves into the caught drive, so a
-        // panic anywhere in the planner/factory/executor still maps to this exact request's
-        // identity-bound Abandoned outcome.
-        let catch_request = self.request().clone();
-        let terminal = AssertUnwindSafe(async move {
-            self.drive_until_terminal(
-                tool_set,
-                turn_id,
-                interaction_completion_sender,
-                #[cfg(test)]
-                hooks,
-            )
-            .await
-        })
-        .catch_unwind()
-        .await;
-        match terminal {
-            Ok(terminal) => terminal.into_outcome(),
-            // A panic also ends in a Terminal slot (identity-bound Abandoned) and is only
-            // then extracted, exactly like every ordinary path.
-            Err(_) => Self::into_terminal(abandoned_runtime_failure(&catch_request)).into_outcome(),
-        }
+        let Self::Prepared { .. } = self else {
+            unreachable!("drive_planned consumes a Prepared slot");
+        };
+        self.drive_until_terminal(
+            plan,
+            control,
+            tool_set,
+            #[cfg(test)]
+            hooks,
+        )
+        .await
+        .into_outcome()
     }
 
-    /// Drives a Prepared slot to its Terminal variant.
+    /// Drives a Prepared slot with its round-owned plan to its Terminal variant.
     async fn drive_until_terminal(
         self,
+        plan: ToolExecutionPlan,
+        control: &ToolExecutionControl,
         tool_set: Arc<ToolSet>,
-        turn_id: TurnId,
-        interaction_completion_sender: &mpsc::UnboundedSender<ExecutorCompletion>,
         #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
     ) -> Self {
         let Self::Prepared {
@@ -7650,9 +8230,6 @@ impl ToolOperationSlot {
         } = self
         else {
             unreachable!("drive_until_terminal consumes a Prepared slot");
-        };
-        let Some(plan) = tool_set.plan(&request) else {
-            return Self::into_terminal(ToolSet::unavailable_outcome(&request));
         };
         match plan {
             ToolExecutionPlan::Execute(start) => {
@@ -7667,55 +8244,132 @@ impl ToolOperationSlot {
             }
             ToolExecutionPlan::PreExecution(result) => {
                 // A frozen known-tool preflight result never reserves the gate and never
-                // invokes the start factory: settle it under the pre-execution binding, which
-                // also fails a malformed Completed shape closed to Abandoned OutcomeUnknown.
-                Self::into_terminal(ToolSet::bind_preexecution_result(&request, result))
+                // invokes the start factory.  The exact unstarted settlement is reserved
+                // first-wins against the signal on this same Prepared slot: a signal that
+                // already won (during the assistant record/planning) settles the matching
+                // cancelled-before-start outcome, and a won permit settles the exact frozen
+                // result under the pre-execution binding (which also fails a malformed
+                // Completed shape closed to Abandoned OutcomeUnknown).
+                Self::Prepared {
+                    request,
+                    emergency_control,
+                    observation,
+                    gate,
+                }
+                .settle_unstarted_result(result)
             }
-            ToolExecutionPlan::Interaction {
-                request_id,
-                request: interaction_request,
+            // A UserQuestion never reserves a gate and never constructs any start factory:
+            // the control presents the question on the slot's own exact basis and the
+            // move-only binding turns the typed host answer into the truthful answered
+            // ToolResult.  The binding permit is reserved first-wins against the signal on
+            // the same basis after the answer arrives (a signal-first cancellation skips the
+            // binding and settles the matching cancelled-before-start outcome); an
+            // unavailable owner or an impossible family is an invariant that fails closed to
+            // Abandoned RuntimeFailure.
+            ToolExecutionPlan::UserQuestion {
+                request: question,
+                answer: binding,
+            } => {
+                match control
+                    .request_user_question(
+                        &request,
+                        question,
+                        &emergency_control,
+                        &observation,
+                        #[cfg(test)]
+                        &hooks,
+                    )
+                    .await
+                {
+                    Ok(bound) => {
+                        // The binding permit won first-wins: consume the private wrapper and
+                        // only then invoke the Tools binding.  The release-code validation
+                        // proves the authorization was reserved on this exact slot's own
+                        // owner/basis and exact request capture; a failing validation is an
+                        // invariant that fails closed to the identity-bound Abandoned
+                        // RuntimeFailure outcome and never invokes the binding.
+                        let (host_answer, binding_permit) = bound.into_parts();
+                        if !binding_permit.validates(&emergency_control, &request) {
+                            return Self::into_terminal(abandoned_runtime_failure(&request));
+                        }
+                        // The binding is the one caller-supplied synchronous step on the
+                        // question path: a panicking binding fails closed to this exact
+                        // request's identity-bound Abandoned outcome while the Prepared
+                        // request/basis remain owned, and the same slot still consumes
+                        // itself into Terminal (no unrelated Terminal is manufactured).
+                        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            binding.bind(&request, host_answer)
+                        })) {
+                            Ok(outcome) => Self::into_terminal(outcome),
+                            Err(_) => Self::into_terminal(abandoned_runtime_failure(&request)),
+                        }
+                    }
+                    Err(ToolExecutionControlError::Cancelled) => {
+                        Self::into_terminal(ToolSet::cancelled_before_start_outcome(&request))
+                    }
+                    Err(
+                        ToolExecutionControlError::OwnerUnavailable
+                        | ToolExecutionControlError::Invalid,
+                    ) => Self::into_terminal(abandoned_runtime_failure(&request)),
+                }
+            }
+            ToolExecutionPlan::Approval {
+                request: approval,
                 allowed,
                 denied,
             } => {
-                // The interaction is presented before any gate involvement; the gate is only
-                // reserved at approval resume, and deny/owner-cancellation never reserve it.
+                // The interaction is presented on the slot's own exact basis before any gate
+                // involvement; the gate is only reserved at approval resume, and
+                // deny/owner-cancellation never reserve it.  The exact-binding invariant is
+                // validated first, in normal release code: the approval's tool name must be
+                // the exact request's call name.  A mismatched approval is never presented
+                // (no InteractionRequested is ever generated or recorded, and no gate or
+                // start factory is involved): the same slot fails closed to the
+                // identity-bound Abandoned OutcomeUnknown outcome.
                 let item_id = request.item_id();
                 let tool_call_id = request.call().tool_call_id().clone();
-                let (resolution_sender, resolution_receiver) = oneshot::channel();
-                let completion = InteractionRequestedCompletion {
-                    turn_id,
-                    timestamp: SystemClock.now(),
-                    item_id,
-                    tool_call_id: tool_call_id.clone(),
-                    request_id,
-                    request: interaction_request,
-                    resolution_sender,
-                };
-                if interaction_completion_sender
-                    .send(ExecutorCompletion::InteractionRequested(completion))
-                    .is_err()
-                {
-                    return Self::into_terminal(abandoned_runtime_failure(&request));
+                if !approval.matches_request(&request) {
+                    return Self::into_terminal(ToolExecutionOutcome::Abandoned {
+                        item_id,
+                        tool_call_id,
+                        reason: crate::tools::ToolAbandonReason::OutcomeUnknown,
+                    });
                 }
-                let Ok(resolution) = resolution_receiver.await else {
-                    return Self::into_terminal(abandoned_runtime_failure(&request));
-                };
-                match ToolSet::interaction_settlement(&resolution, &denied) {
-                    InteractionSettlement::PreExecution(result) => {
-                        Self::into_terminal(ToolSet::bind_preexecution_result(&request, result))
-                    }
-                    InteractionSettlement::Resume => {
+                match control
+                    .request_approval(
+                        &request,
+                        approval,
+                        &emergency_control,
+                        &observation,
                         #[cfg(test)]
-                        hooks.before_tool_resume().await;
-                        Self::Prepared {
-                            request,
-                            emergency_control,
-                            observation,
-                            gate,
+                        &hooks,
+                    )
+                    .await
+                {
+                    Ok(decision) => match ToolSet::approval_settlement(&decision, &denied) {
+                        ApprovalSettlement::Resume => {
+                            #[cfg(test)]
+                            hooks.before_tool_resume().await;
+                            Self::Prepared {
+                                request,
+                                emergency_control,
+                                observation,
+                                gate,
+                            }
+                            .reserve_then_run(allowed, tool_set)
+                            .await
                         }
-                        .reserve_then_run(allowed, tool_set)
-                        .await
+                        ApprovalSettlement::PreExecution(result) => {
+                            Self::into_terminal(ToolSet::bind_preexecution_result(&request, result))
+                        }
+                    },
+                    Err(ToolExecutionControlError::Cancelled) => {
+                        Self::into_terminal(ToolSet::bind_approval_cancellation(&request, denied))
                     }
+                    Err(
+                        ToolExecutionControlError::OwnerUnavailable
+                        | ToolExecutionControlError::Invalid,
+                    ) => Self::into_terminal(abandoned_runtime_failure(&request)),
                 }
             }
         }
@@ -7723,7 +8377,7 @@ impl ToolOperationSlot {
 
     /// Reserves the exact request's single start entry through the emergency owner mutex
     /// (first-wins with `signal` on one mutex), starts the permit outside that mutex, and
-    /// moves the slot into Running with its own cancellation pair.
+    /// moves the slot into Running with its own cancellation pair and its own basis.
     async fn reserve_then_run(self, start: ToolExecutionStart, tool_set: Arc<ToolSet>) -> Self {
         let proof = match self.reserve_start() {
             Ok(proof) => proof,
@@ -7757,12 +8411,7 @@ impl ToolOperationSlot {
         else {
             unreachable!("reservation runs only on a Prepared slot");
         };
-        match emergency_control.reserve_tool_start(
-            observation.target(),
-            observation.epoch(),
-            gate,
-            request,
-        ) {
+        match emergency_control.reserve_tool_start(observation, gate, request) {
             Some(Ok(permit)) => permit.start().map_err(|_| ToolStartError::InvalidBinding),
             Some(Err(error)) => Err(error),
             None => Err(ToolStartError::CancelledBeforeStart),
@@ -7771,12 +8420,15 @@ impl ToolOperationSlot {
 
     /// Constructs the Running slot only after the typed started proof exists.
     ///
-    /// The operation's own cancel pair is created here, and the start factory is invoked
-    /// only by `run_started_execution` after it revalidates the exact proof capture: a
-    /// foreign proof fails closed to the identity-bound Abandoned RuntimeFailure without
-    /// constructing the factory or any future, and that failure is already a Terminal
-    /// outcome.  The run future stays owned by the Running slot, so a started future can
-    /// never be dropped because of a signal.
+    /// The slot's own emergency basis moves in from Prepared, and the operation's own
+    /// cancel pair is created here.  The start factory is invoked only by
+    /// `run_started_execution` after it revalidates the exact proof capture, and a factory
+    /// panic fails closed there to the identity-bound Abandoned outcome while the consumed
+    /// Prepared parts/request remain owned: a foreign proof fails closed the same way
+    /// without constructing the factory or any future, and that failure is already a
+    /// Terminal outcome.  The run future stays owned by the Running slot (inside its
+    /// session-local wrapper), so a started future can never be dropped because of a
+    /// signal.
     async fn into_running(
         self,
         proof: ToolStartedExecution,
@@ -7787,7 +8439,7 @@ impl ToolOperationSlot {
             request,
             emergency_control,
             observation,
-            gate: _,
+            ..
         } = self
         else {
             unreachable!("into_running consumes a Prepared slot");
@@ -7795,29 +8447,37 @@ impl ToolOperationSlot {
         let (cancellation, observer) = ToolCancellationHandle::new();
         let run = match tool_set.run_started_execution(&request, proof, start, observer) {
             Ok(run) => run,
-            // The factory exact-capture revalidation failed: the slot goes straight to
-            // Terminal with the identity-bound Abandoned outcome.
+            // The factory exact-capture revalidation failed (or the start factory
+            // panicked): the slot goes straight to Terminal with the identity-bound
+            // Abandoned outcome.
             Err(outcome) => return Self::into_terminal(outcome),
         };
+        let run_request = request.clone();
         Self::Running {
             request,
             emergency_control,
             observation,
             cancellation,
-            run,
+            run: OwnedToolExecutionRun {
+                request: run_request,
+                run,
+            },
         }
         .await_started_run()
         .await
     }
 
-    /// The Running select between the exact emergency cancellation basis (`cancelled(target,
-    /// epoch)`) and the still-owned run future.
+    /// The Running select between the slot's own exact emergency cancellation basis
+    /// (`cancelled(target, epoch)` on the basis this slot moved in from Prepared) and the
+    /// still-owned run wrapper.
     ///
     /// When the signal (or a stale basis) wins, the slot first cancels its own cancellation
     /// pair, then enters Settling *before* the executor result and keeps awaiting the same
-    /// run future to the executor's cooperative cleanup/result: a started future is never
+    /// run wrapper to the executor's cooperative cleanup/result: a started future is never
     /// dropped because of a signal.  A natural completion binds its result and only then
-    /// passes through a brief Settling state.  Either way Settling then moves to Terminal.
+    /// passes through a brief Settling state.  Either way Settling then moves to Terminal;
+    /// an executor panic is caught inside the wrapper and maps to this exact request's
+    /// identity-bound Abandoned outcome.
     async fn await_started_run(self) -> Self {
         let Self::Running {
             request,
@@ -7832,21 +8492,21 @@ impl ToolOperationSlot {
         let mut run = run;
         let outcome = tokio::select! {
             biased;
-            _ = emergency_control.cancelled(
-                observation.target(),
-                observation.epoch(),
-            ) => {
+            _ = emergency_control.cancelled(&observation) => {
                 cancellation.cancel();
                 None
             }
-            outcome = &mut run => Some(outcome),
+            outcome = run.await_bound() => Some(outcome),
         };
         match outcome {
-            // Natural completion: the run produced its identity-bound outcome; the slot
-            // still passes through a brief Settling state before Terminal.
-            Some(outcome) => Self::Settling { request }.settle(outcome),
+            // Natural completion: the run wrapper produced its identity-bound outcome; the
+            // slot still passes through a brief Settling state before Terminal.
+            Some(Ok(outcome)) => Self::Settling { request }.settle(outcome),
+            // The executor panicked: the wrapper reported the still-owned exact request,
+            // and the same slot maps it to the identity-bound Abandoned outcome.
+            Some(Err(request)) => Self::into_terminal(abandoned_runtime_failure(&request)),
             // The signal (or a stale basis) won: the operation's own pair is already
-            // cancelled, and the Settling slot keeps awaiting the same run future to the
+            // cancelled, and the Settling slot keeps awaiting the same run wrapper to the
             // executor's cooperative cleanup/result before the outcome is bound.
             None => Self::Settling { request }.await_settled_run(run).await,
         }
@@ -7861,14 +8521,18 @@ impl ToolOperationSlot {
         Self::into_terminal(outcome)
     }
 
-    /// Signal-path settlement: the run future is still alive, so the Settling slot keeps
-    /// awaiting the same future to the executor's cooperative cleanup/result and only then
-    /// binds the outcome and moves to Terminal.
-    async fn await_settled_run(self, run: ToolExecutionRun) -> Self {
+    /// Signal-path settlement: the run wrapper is still alive, so the Settling slot keeps
+    /// awaiting the same wrapper to the executor's cooperative cleanup/result (an executor
+    /// panic maps through the wrapper's still-owned exact request) and only then binds the
+    /// outcome and moves to Terminal.
+    async fn await_settled_run(self, mut run: OwnedToolExecutionRun) -> Self {
         let Self::Settling { request: _ } = self else {
             unreachable!("await_settled_run consumes a Settling slot");
         };
-        Self::into_terminal(run.await)
+        match run.await_bound().await {
+            Ok(outcome) => Self::into_terminal(outcome),
+            Err(request) => Self::into_terminal(abandoned_runtime_failure(&request)),
+        }
     }
 }
 
@@ -7880,55 +8544,331 @@ fn abandoned_runtime_failure(request: &ToolExecutionRequest) -> ToolExecutionOut
     }
 }
 
+/// One planned Tool operation: the exact Prepared slot bound to its non-lifecycle action,
+/// plus the request's call position.
+///
+/// This wrapper is deliberately not a lifecycle enum and owns no lifecycle state: every
+/// lifecycle transition stays on the [`ToolOperationSlot`] it wraps — `Running` really
+/// owns the cancellation pair and the still-owned run wrapper, and `Settling`/`Terminal`
+/// are real slot variants.  The action is only what the round owner planned exactly once
+/// for the slot.
+struct PlannedToolOperation {
+    slot: ToolOperationSlot,
+    action: PlannedToolAction,
+    call_index: u32,
+}
+
+/// The non-lifecycle action one planned operation carries.
+///
+/// This is deliberately not operation state: every lifecycle transition stays on the
+/// [`ToolOperationSlot`] it accompanies.  `Plan` carries the move-only plan the round owner
+/// created exactly once; `Frozen` carries the fixed identity-bound outcome of a slot that
+/// could not be planned (an unknown tool or a planner panic) while the *same* Prepared slot
+/// remains owned and unstarted, so the exact unstarted settlement first-wins at consumption
+/// can still decide between the matching cancelled-before-start outcome and the frozen
+/// outcome.  A planner panic consumes no slot.
+enum PlannedToolAction {
+    Plan(ToolExecutionPlan),
+    Frozen(ToolExecutionOutcome),
+}
+
+impl PlannedToolOperation {
+    /// Consumes the wrapped operation through its whole lifecycle and yields its outcome
+    /// with the request's call position.
+    ///
+    /// A `Plan` is consumed by the slot's own lifecycle drive (`drive_planned`), which
+    /// isolates every binding/factory/executor panic at its own exact boundary closed to
+    /// identity-bound Abandoned RuntimeFailure; a `Frozen` outcome is settled through the
+    /// same exact unstarted settlement first-wins on the still-Prepared slot (a signal that
+    /// already won settles the matching cancelled-before-start outcome instead).
+    async fn drive(
+        self,
+        control: &ToolExecutionControl,
+        tool_set: Arc<ToolSet>,
+        #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
+    ) -> (u32, ToolExecutionOutcome) {
+        let call_index = self.call_index;
+        let outcome = match self.action {
+            PlannedToolAction::Plan(plan) => {
+                self.slot
+                    .drive_planned(
+                        plan,
+                        control,
+                        tool_set,
+                        #[cfg(test)]
+                        hooks,
+                    )
+                    .await
+            }
+            PlannedToolAction::Frozen(outcome) => {
+                self.slot.settle_unstarted_outcome(outcome).into_outcome()
+            }
+        };
+        (call_index, outcome)
+    }
+
+    /// Settles one not-yet-driven planned operation without executing its binding, start
+    /// factory, or any side effect.
+    ///
+    /// This is the abandoned-exchange settlement: every remaining operation consumes its
+    /// same still-Prepared slot through the exact unstarted settlement first-wins.  A
+    /// `Frozen` outcome and a frozen `PreExecution` result keep their exact outcomes; every
+    /// other unstarted plan settles the truthful PreExecution Failed "tool did not start"
+    /// (never Abandoned merely because it was not started).  A signal that already won
+    /// settles the matching cancelled-before-start outcome instead.  No slot or plan is
+    /// ever dropped silently: every outcome passes through a `Terminal` slot first.
+    fn settle_without_start(self) -> (u32, ToolExecutionOutcome) {
+        let call_index = self.call_index;
+        let outcome = match self.action {
+            PlannedToolAction::Frozen(outcome) => {
+                self.slot.settle_unstarted_outcome(outcome).into_outcome()
+            }
+            PlannedToolAction::Plan(ToolExecutionPlan::PreExecution(result)) => {
+                self.slot.settle_unstarted_result(result).into_outcome()
+            }
+            PlannedToolAction::Plan(_) => self.slot.fail_before_start().into_outcome(),
+        };
+        (call_index, outcome)
+    }
+}
+
+/// Plans one Prepared slot exactly once without consuming it: an unknown tool freezes the
+/// identity-bound unavailable outcome and a planner panic freezes the identity-bound
+/// Abandoned RuntimeFailure, both still on the same Prepared slot (a planner panic consumes
+/// no slot), so the exact unstarted settlement first-wins at consumption can still settle
+/// the matching cancelled-before-start outcome when a signal already won.  A normal plan
+/// keeps the Prepared slot together with its move-only plan.  The plan's start factory is
+/// never invoked here.
+fn plan_one_slot(slot: ToolOperationSlot, tool_set: &ToolSet) -> PlannedToolOperation {
+    let request = slot.request().clone();
+    let call_index = request.call().call_index();
+    match std::panic::catch_unwind(AssertUnwindSafe(|| tool_set.plan(&request))) {
+        Ok(Some(plan)) => PlannedToolOperation {
+            slot,
+            action: PlannedToolAction::Plan(plan),
+            call_index,
+        },
+        Ok(None) => PlannedToolOperation {
+            slot,
+            action: PlannedToolAction::Frozen(ToolSet::unavailable_outcome(&request)),
+            call_index,
+        },
+        Err(_) => PlannedToolOperation {
+            slot,
+            action: PlannedToolAction::Frozen(abandoned_runtime_failure(&request)),
+            call_index,
+        },
+    }
+}
+
+/// The round owner: plans every Prepared slot exactly once and drives UserQuestion
+/// operations strictly before any ordinary sibling.
+///
+/// Questions are hoisted ahead of every ordinary operation and driven one at a time in
+/// call_index order, so at most one question is ever pending and no ordinary operation is
+/// driven, reserved, or factory-invoked while a question waits for the host.  The caller
+/// applies each question outcome to live state + inline recorder attempt immediately after
+/// `next_question` returns, before the next question is presented or any ordinary sibling
+/// starts.  The round itself never writes live state: `next_question` only yields the
+/// outcome, and the caller owns the apply boundary.
+struct PlannedToolRound {
+    tool_set: Arc<ToolSet>,
+    control: ToolExecutionControl,
+    // Whether any operation in this round carries a Serial definition: computed at plan
+    // time from the Prepared slots (a planner panic or an unknown tool only freezes an
+    // outcome on the same Prepared slot, so it must not change the round's serial
+    // semantics).
+    is_serial: bool,
+    questions: VecDeque<PlannedToolOperation>,
+    remaining: Vec<PlannedToolOperation>,
+    #[cfg(test)]
+    hooks: Arc<SessionExecutorTestHooksInner>,
+}
+
+impl PlannedToolRound {
+    /// Plans every slot exactly once in call_index order and hoists UserQuestion operations
+    /// ahead of the ordinary ones, sharing one concrete `ToolExecutionControl` (which owns no
+    /// emergency basis: every slot reserves against its own exact basis).
+    fn plan(
+        tool_set: Arc<ToolSet>,
+        mut slots: Vec<ToolOperationSlot>,
+        turn_id: TurnId,
+        interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+        #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
+    ) -> Self {
+        slots.sort_by_key(|slot| slot.request().call().call_index());
+        // Whether any operation in this round carries a Serial definition: computed from the
+        // Prepared slots before planning (a planner panic or an unknown tool freezes an
+        // outcome on the same Prepared slot and must not change the round's serial
+        // semantics).
+        let is_serial = slots.iter().any(|slot| {
+            let request = slot.request();
+            tool_set
+                .definitions()
+                .iter()
+                .find(|definition| definition.name() == request.call().name())
+                .is_some_and(|definition| definition.mode() == ToolExecutionMode::Serial)
+        });
+        let control = ToolExecutionControl::new(turn_id, interaction_completion_sender);
+        let mut questions = VecDeque::new();
+        let mut remaining = Vec::new();
+        for slot in slots {
+            let operation = plan_one_slot(slot, &tool_set);
+            if matches!(
+                &operation.action,
+                PlannedToolAction::Plan(ToolExecutionPlan::UserQuestion { .. })
+            ) {
+                questions.push_back(operation);
+            } else {
+                remaining.push(operation);
+            }
+        }
+        Self {
+            tool_set,
+            control,
+            is_serial,
+            questions,
+            remaining,
+            #[cfg(test)]
+            hooks,
+        }
+    }
+
+    /// Drives the next hoisted UserQuestion to its Terminal outcome, or `None` when every
+    /// question settled.  The caller must apply the returned outcome (live + inline
+    /// recorder attempt) before calling this again or starting the ordinary siblings.
+    async fn next_question(&mut self) -> Option<(u32, ToolExecutionOutcome)> {
+        let operation = self.questions.pop_front()?;
+        Some(
+            operation
+                .drive(
+                    &self.control,
+                    Arc::clone(&self.tool_set),
+                    #[cfg(test)]
+                    Arc::clone(&self.hooks),
+                )
+                .await,
+        )
+    }
+
+    /// Executes the remaining (non-question) operations and returns their outcomes with
+    /// their call_index, in call_index order.
+    ///
+    /// Any Serial definition makes the whole remaining phase serial, otherwise all remaining
+    /// operations run through one parent-owned `join_all` (no detached tasks).  Approvals
+    /// are part of this ordinary phase (they are never hoisted).  Each operation's consuming
+    /// `drive` isolates its binding/factory/executor panics closed to Abandoned
+    /// RuntimeFailure, so a panicked Serial operation never stops the later ones.
+    async fn execute_remaining(self) -> Vec<(u32, ToolExecutionOutcome)> {
+        let PlannedToolRound {
+            tool_set,
+            control,
+            is_serial,
+            questions: _,
+            remaining,
+            #[cfg(test)]
+            hooks,
+        } = self;
+        if is_serial {
+            let mut results = Vec::with_capacity(remaining.len());
+            for operation in remaining {
+                results.push(
+                    operation
+                        .drive(
+                            &control,
+                            Arc::clone(&tool_set),
+                            #[cfg(test)]
+                            Arc::clone(&hooks),
+                        )
+                        .await,
+                );
+            }
+            return results;
+        }
+        join_all(remaining.into_iter().map(|operation| {
+            operation.drive(
+                &control,
+                Arc::clone(&tool_set),
+                #[cfg(test)]
+                Arc::clone(&hooks),
+            )
+        }))
+        .await
+    }
+
+    /// Settles every not-yet-driven question and ordinary operation without executing any
+    /// binding, start factory, or side effect, and returns the matching outcomes in stable
+    /// call_index order.
+    ///
+    /// This is the abandoned-exchange settlement: the caller already applied + recorded the
+    /// abandoned question outcome, and every remaining operation consumes its same
+    /// still-Prepared slot through the exact unstarted settlement first-wins.  A frozen
+    /// unknown/planner outcome and a frozen PreExecution result keep their exact outcomes;
+    /// every other unstarted plan settles the truthful PreExecution Failed "tool did not
+    /// start" (never Abandoned merely because it was not started), and a signal that already
+    /// won settles the matching cancelled-before-start outcome instead.  No slot or plan is
+    /// ever dropped silently.
+    fn settle_remaining_without_start(self) -> Vec<(u32, ToolExecutionOutcome)> {
+        let PlannedToolRound {
+            questions,
+            remaining,
+            ..
+        } = self;
+        let mut outcomes = Vec::with_capacity(questions.len() + remaining.len());
+        outcomes.extend(
+            questions
+                .into_iter()
+                .map(PlannedToolOperation::settle_without_start),
+        );
+        outcomes.extend(
+            remaining
+                .into_iter()
+                .map(PlannedToolOperation::settle_without_start),
+        );
+        outcomes.sort_by_key(|(call_index, _)| *call_index);
+        outcomes
+    }
+}
+
 /// Executes one gated Tool round over the already-constructed per-request operation slots.
 ///
-/// The round only sorts the slots by call_index and then either drives Serial requests one
-/// at a time or all Parallel requests through one parent-owned `join_all` (no detached
-/// tasks), returning results in call_index order.  Each slot's consuming `drive` owns the
-/// whole lifecycle (plan, interaction, reservation, running cancel, settle, terminal) and
-/// isolates that request's planner/factory/executor panics closed to Abandoned
-/// RuntimeFailure, so a panicked Serial request never stops the later requests.
+/// The round plans each slot exactly once (planner panics isolated per-slot), hoists and
+/// drives every UserQuestion before any ordinary operation, and then drives the remaining
+/// operations either serially (any Serial definition) or through one parent-owned `join_all`
+/// (no detached tasks), returning every result merged in call_index order.  The caller that
+/// must apply question outcomes between questions (the ActiveTurnTask) uses the
+/// `PlannedToolRound` deep interface instead; this entry collects everything first.
 async fn execute_gated_tool_round(
     tool_set: Arc<ToolSet>,
-    mut slots: Vec<ToolOperationSlot>,
+    slots: Vec<ToolOperationSlot>,
     turn_id: TurnId,
     interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
 ) -> Vec<ToolExecutionOutcome> {
-    slots.sort_by_key(|slot| slot.request().call().call_index());
-    let is_serial = slots.iter().any(|slot| {
-        tool_set
-            .definitions()
-            .iter()
-            .find(|definition| definition.name() == slot.request().call().name())
-            .is_some_and(|definition| definition.mode() == ToolExecutionMode::Serial)
-    });
-    if is_serial {
-        let mut results = Vec::with_capacity(slots.len());
-        for slot in slots {
-            results.push(
-                slot.drive(
-                    Arc::clone(&tool_set),
-                    turn_id,
-                    &interaction_completion_sender,
-                    #[cfg(test)]
-                    Arc::clone(&hooks),
-                )
-                .await,
-            );
+    let mut round = PlannedToolRound::plan(
+        tool_set,
+        slots,
+        turn_id,
+        interaction_completion_sender,
+        #[cfg(test)]
+        hooks,
+    );
+    let mut results = Vec::new();
+    while let Some((call_index, outcome)) = round.next_question().await {
+        // An abandoned question settles the whole exchange: every not-yet-driven question
+        // and ordinary operation is settled without executing any binding/factory/side
+        // effect, and no ordinary start continues.
+        if matches!(&outcome, ToolExecutionOutcome::Abandoned { .. }) {
+            results.push((call_index, outcome));
+            results.extend(round.settle_remaining_without_start());
+            results.sort_by_key(|(call_index, _)| *call_index);
+            return results.into_iter().map(|(_, outcome)| outcome).collect();
         }
-        return results;
+        results.push((call_index, outcome));
     }
-    join_all(slots.into_iter().map(|slot| {
-        slot.drive(
-            Arc::clone(&tool_set),
-            turn_id,
-            &interaction_completion_sender,
-            #[cfg(test)]
-            Arc::clone(&hooks),
-        )
-    }))
-    .await
+    results.extend(round.execute_remaining().await);
+    results.sort_by_key(|(call_index, _)| *call_index);
+    results.into_iter().map(|(_, outcome)| outcome).collect()
 }
 
 #[allow(
@@ -7960,9 +8900,9 @@ async fn run_active_turn(
         turn_id,
         control_generation,
         emergency_control.clone(),
-        emergency_observation,
+        emergency_observation.clone(),
         cancellation.clone(),
-        executor_closing,
+        executor_closing.clone(),
         closing,
         interaction_completion_sender,
         steer_completion_sender,
@@ -8000,18 +8940,34 @@ async fn run_active_turn(
                 }
             };
             if settled.is_err() {
-                SessionTurnTerminal::Failed(SessionTurnFailure::Internal)
-            } else if cancellation.is_cancelled() {
-                let Some(signal) = emergency_control
+                return SessionTurnTerminal::Failed(SessionTurnFailure::Internal);
+            }
+            // The executor-closing token wakes this worker on the same close() that wakes
+            // the actor, so the worker can return Err before the actor's close_and_drain has
+            // signaled the basis.  close_and_drain always signals any active Turn basis
+            // (before cancelling its token), so awaiting the exact basis cancellation —
+            // which returns immediately when the basis is stale/retired, e.g. on an actor
+            // fatal path — and then re-observing maps the truthful first-wins signal to
+            // Interrupted instead of misclassifying the close as a failure.  With a stale
+            // basis or no signal the exact failure is retained; no reason is ever
+            // fabricated.
+            if executor_closing.is_cancelled()
+                && emergency_control
                     .observe(emergency_observation.target())
                     .and_then(|observation| observation.signal())
-                else {
-                    return SessionTurnTerminal::Failed(failure);
-                };
-                SessionTurnTerminal::Interrupted(session_turn_interruption(signal))
-            } else {
-                SessionTurnTerminal::Failed(failure)
+                    .is_none()
+            {
+                emergency_control.cancelled(&emergency_observation).await;
             }
+            if cancellation.is_cancelled() || executor_closing.is_cancelled() {
+                if let Some(signal) = emergency_control
+                    .observe(emergency_observation.target())
+                    .and_then(|observation| observation.signal())
+                {
+                    return SessionTurnTerminal::Interrupted(session_turn_interruption(signal));
+                }
+            }
+            SessionTurnTerminal::Failed(failure)
         }
     }
 }
@@ -8043,7 +8999,7 @@ async fn run_active_turn_inner(
         turn_id,
         control_generation: Arc::clone(&control_generation),
         emergency_control: emergency_control.clone(),
-        emergency_observation,
+        emergency_observation: emergency_observation.clone(),
         cancellation: cancellation.clone(),
         executor_closing: executor_closing.clone(),
         closing: closing.clone(),
@@ -8053,7 +9009,7 @@ async fn run_active_turn_inner(
     };
     loop {
         if cancellation.is_cancelled()
-            || !emergency_control_is_unsignaled_current(&emergency_control, emergency_observation)
+            || !emergency_control_is_unsignaled_current(&emergency_control, &emergency_observation)
         {
             return Err(SessionTurnFailure::Model);
         }
@@ -8110,7 +9066,7 @@ async fn run_active_turn_inner(
             turn_id,
             Arc::clone(&control_generation),
             emergency_control.clone(),
-            emergency_observation,
+            &emergency_observation,
             cancellation.clone(),
             executor_closing.clone(),
             closing.clone(),
@@ -8217,7 +9173,7 @@ async fn run_active_turn_inner(
                 Arc::clone(&conversation),
                 turn_id,
                 &emergency_control,
-                emergency_observation,
+                &emergency_observation,
                 cancellation.clone(),
                 &steer_completion_sender,
                 true,
@@ -8230,7 +9186,8 @@ async fn run_active_turn_inner(
             SteerArbitration::none()
         };
         if let Some(queued) = steer.queued {
-            if !emergency_control_is_unsignaled_current(&emergency_control, emergency_observation) {
+            if !emergency_control_is_unsignaled_current(&emergency_control, &emergency_observation)
+            {
                 return Err(SessionTurnFailure::Model);
             }
             let intermediate = StoredAssistantMessage::reconstruct(
@@ -8259,7 +9216,7 @@ async fn run_active_turn_inner(
                 queued,
                 assistant_fact.revision(),
                 &emergency_control,
-                emergency_observation,
+                &emergency_observation,
                 cancellation.clone(),
                 #[cfg(test)]
                 Arc::clone(&hooks),
@@ -8268,7 +9225,7 @@ async fn run_active_turn_inner(
             {
                 if !emergency_control_is_unsignaled_current(
                     &emergency_control,
-                    emergency_observation,
+                    &emergency_observation,
                 ) {
                     return Err(SessionTurnFailure::Model);
                 }
@@ -8282,7 +9239,7 @@ async fn run_active_turn_inner(
             }
             continue;
         }
-        if !emergency_control_is_unsignaled_current(&emergency_control, emergency_observation) {
+        if !emergency_control_is_unsignaled_current(&emergency_control, &emergency_observation) {
             return Err(SessionTurnFailure::Model);
         }
         let fact = {
@@ -8311,23 +9268,73 @@ async fn run_active_turn_inner(
         let slots = requests
             .into_iter()
             .map(|request| {
-                ToolOperationSlot::new(request, &emergency_control, emergency_observation)
+                ToolOperationSlot::new(request, &emergency_control, emergency_observation.clone())
             })
             .collect::<Vec<_>>();
         let _ = conversation.recorder.record(entry).await;
         #[cfg(test)]
         hooks.before_tool_round_start().await;
-        let tool_results = execute_gated_tool_round(
+        let mut round = PlannedToolRound::plan(
             Arc::clone(context.tool_set()),
             slots,
             turn_id,
             interaction_completion_sender.clone(),
             #[cfg(test)]
             Arc::clone(&hooks),
-        )
-        .await;
+        );
+        // UserQuestion operations are hoisted and driven one at a time in call_index order:
+        // each question outcome is applied to live state + inline recorder attempt
+        // immediately, before the next question is presented or any ordinary sibling starts.
+        // A canceled basis settles every later question and the remaining start gates through
+        // the control/gate prechecks, so all matching outcomes still get applied and recorded
+        // before the Turn interrupts.  An abandoned question settles the exchange and starts
+        // no remaining side effect, exactly like the ordinary abandoned terminal semantics.
+        while let Some((_call_index, outcome)) = round.next_question().await {
+            let (item_id, tool_call_id, stored) = stored_tool_outcome(outcome)?;
+            if matches!(&stored, StoredToolOutcome::Abandoned { .. }) {
+                // The abandoned question outcome is applied + recorded first, then every
+                // not-yet-driven question and ordinary operation settles without executing
+                // any binding/factory/side effect (every `Some(plan)` Prepared slot moves
+                // explicitly to Terminal(Abandoned RuntimeFailure) and plan-None/Terminal
+                // slots keep their exact outcome).  The matching outcomes are applied +
+                // inline-recorded in stable call_index order before the exchange is
+                // abandoned, so no Prepared slot or plan is ever dropped silently.
+                let fact = lock(&conversation.live_state)
+                    .apply_tool_message(
+                        StoredToolMessage::reconstruct(item_id, tool_call_id, stored),
+                        turn_id,
+                        SystemClock.now(),
+                    )
+                    .map_err(|_| SessionTurnFailure::Internal)?;
+                let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
+                for (_call_index, outcome) in round.settle_remaining_without_start() {
+                    let (item_id, tool_call_id, stored) = stored_tool_outcome(outcome)?;
+                    let fact = lock(&conversation.live_state)
+                        .apply_tool_message(
+                            StoredToolMessage::reconstruct(item_id, tool_call_id, stored),
+                            turn_id,
+                            SystemClock.now(),
+                        )
+                        .map_err(|_| SessionTurnFailure::Internal)?;
+                    let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
+                }
+                lock(&conversation.live_state)
+                    .abandon_current_tool_exchange(turn_id)
+                    .map_err(|_| SessionTurnFailure::Internal)?;
+                return Err(SessionTurnFailure::Model);
+            }
+            let fact = lock(&conversation.live_state)
+                .apply_tool_message(
+                    StoredToolMessage::reconstruct(item_id, tool_call_id, stored),
+                    turn_id,
+                    SystemClock.now(),
+                )
+                .map_err(|_| SessionTurnFailure::Internal)?;
+            let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
+        }
+        let tool_results = round.execute_remaining().await;
         let mut abandoned = false;
-        for outcome in tool_results {
+        for (_call_index, outcome) in tool_results {
             let (item_id, tool_call_id, stored) = stored_tool_outcome(outcome)?;
             abandoned |= matches!(&stored, StoredToolOutcome::Abandoned { .. });
             let fact = lock(&conversation.live_state)
@@ -8352,7 +9359,7 @@ async fn run_active_turn_inner(
             Arc::clone(&conversation),
             turn_id,
             &emergency_control,
-            emergency_observation,
+            &emergency_observation,
             cancellation.clone(),
             &steer_completion_sender,
             false,
@@ -8369,7 +9376,7 @@ async fn run_active_turn_inner(
                 queued,
                 steer.basis_revision,
                 &emergency_control,
-                emergency_observation,
+                &emergency_observation,
                 cancellation.clone(),
                 #[cfg(test)]
                 Arc::clone(&hooks),
@@ -8378,7 +9385,7 @@ async fn run_active_turn_inner(
             {
                 if !emergency_control_is_unsignaled_current(
                     &emergency_control,
-                    emergency_observation,
+                    &emergency_observation,
                 ) {
                     return Err(SessionTurnFailure::Model);
                 }
@@ -8576,10 +9583,9 @@ impl ActiveTurnCompaction {
                 _ = self.executor_closing.cancelled() => return Err(error),
                 _ = self.closing.cancelled() => return Err(error),
                 _ = self.cancellation.cancelled() => return Err(error),
-                _ = self.emergency_control.cancelled(
-                    self.emergency_observation.target(),
-                    self.emergency_observation.epoch(),
-                ) => return Err(error),
+                _ = self.emergency_control.cancelled(&self.emergency_observation) => {
+                    return Err(error);
+                }
                 _ = tokio::time::sleep(delay) => {}
             }
         }
@@ -8595,7 +9601,7 @@ impl ActiveTurnCompaction {
                 &self.control_generation,
                 operation.request.source_revision(),
                 &self.emergency_control,
-                self.emergency_observation,
+                &self.emergency_observation,
             )
     }
 
@@ -8604,7 +9610,7 @@ impl ActiveTurnCompaction {
             Arc::clone(&self.conversation),
             self.turn_id,
             &self.emergency_control,
-            self.emergency_observation,
+            &self.emergency_observation,
             self.cancellation.clone(),
             &self.completion_sender,
             false,
@@ -8621,7 +9627,7 @@ impl ActiveTurnCompaction {
                 queued,
                 steer.basis_revision,
                 &self.emergency_control,
-                self.emergency_observation,
+                &self.emergency_observation,
                 self.cancellation.clone(),
                 #[cfg(test)]
                 Arc::clone(&self.hooks),
@@ -8630,7 +9636,7 @@ impl ActiveTurnCompaction {
             {
                 if !emergency_control_is_unsignaled_current(
                     &self.emergency_control,
-                    self.emergency_observation,
+                    &self.emergency_observation,
                 ) {
                     return Err(SessionTurnFailure::Model);
                 }
@@ -8671,7 +9677,7 @@ async fn call_agent_run_with_logical_retry(
     turn_id: TurnId,
     control_generation: Arc<ControlGeneration>,
     emergency_control: EmergencyControlHandle,
-    emergency_observation: EmergencyControlObservation,
+    emergency_observation: &EmergencyControlObservation,
     cancellation: CancellationToken,
     executor_closing: CancellationToken,
     closing: CancellationToken,
@@ -8742,10 +9748,7 @@ async fn call_agent_run_with_logical_retry(
             _ = cancellation.cancelled() => {
                 return Err(error);
             }
-            _ = emergency_control.cancelled(
-                emergency_observation.target(),
-                emergency_observation.epoch(),
-            ) => {
+            _ = emergency_control.cancelled(emergency_observation) => {
                 return Err(error);
             }
             _ = tokio::time::sleep(delay) => {}
@@ -8759,7 +9762,7 @@ fn retry_basis_is_current(
     control_generation: &Arc<ControlGeneration>,
     source_revision: crate::live_conversation::ConversationRevision,
     emergency_control: &EmergencyControlHandle,
-    emergency_observation: EmergencyControlObservation,
+    emergency_observation: &EmergencyControlObservation,
 ) -> bool {
     if !emergency_control_is_unsignaled_current(emergency_control, emergency_observation) {
         return false;
@@ -8779,13 +9782,9 @@ fn retry_basis_is_current(
 
 fn emergency_control_is_unsignaled_current(
     emergency_control: &EmergencyControlHandle,
-    emergency_observation: EmergencyControlObservation,
+    emergency_observation: &EmergencyControlObservation,
 ) -> bool {
-    emergency_control
-        .observe(emergency_observation.target())
-        .is_some_and(|current| {
-            current.epoch() == emergency_observation.epoch() && current.signal().is_none()
-        })
+    emergency_control.is_unsignaled_current(emergency_observation)
 }
 
 const fn session_turn_interruption(signal: EmergencyControlSignal) -> SessionTurnInterruption {
@@ -8793,6 +9792,25 @@ const fn session_turn_interruption(signal: EmergencyControlSignal) -> SessionTur
         EmergencyControlSignal::Cancel => SessionTurnInterruption::UserCancelled,
         EmergencyControlSignal::SecurityRevoked => SessionTurnInterruption::SecurityRevoked,
         EmergencyControlSignal::PrepareForUnload => SessionTurnInterruption::PrepareForUnload,
+    }
+}
+
+/// Maps the exact first-wins emergency signal to the truthful Interaction cancel reason.
+/// `None` (no signal observed on the exact target) is left to the caller's fallback, because
+/// the closing paths differ: a closing actor with no signal replies a plain RuntimeClosing,
+/// while a close drain without a signal still closes pending Interactions as SessionUnloaded.
+const fn signal_to_interaction_cancel_reason(
+    signal: Option<EmergencyControlSignal>,
+) -> Option<InteractionCancelReason> {
+    match signal {
+        Some(EmergencyControlSignal::Cancel) => Some(InteractionCancelReason::TurnCancelled),
+        Some(EmergencyControlSignal::SecurityRevoked) => {
+            Some(InteractionCancelReason::SecurityRevoked)
+        }
+        Some(EmergencyControlSignal::PrepareForUnload) => {
+            Some(InteractionCancelReason::SessionUnloaded)
+        }
+        None => None,
     }
 }
 
@@ -8842,7 +9860,7 @@ async fn arbitrate_one_steer(
     conversation: Arc<LoadedSessionConversation>,
     turn_id: TurnId,
     emergency_control: &EmergencyControlHandle,
-    emergency_observation: EmergencyControlObservation,
+    emergency_observation: &EmergencyControlObservation,
     cancellation: CancellationToken,
     steer_completion_sender: &mpsc::UnboundedSender<ExecutorCompletion>,
     close_if_empty: bool,
@@ -8873,10 +9891,9 @@ async fn arbitrate_one_steer(
     let Some(queued) = (tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(SessionTurnFailure::Model),
-        _ = emergency_control.cancelled(
-            emergency_observation.target(),
-            emergency_observation.epoch(),
-        ) => return Err(SessionTurnFailure::Model),
+        _ = emergency_control.cancelled(emergency_observation) => {
+            return Err(SessionTurnFailure::Model);
+        }
         result = waiter => result.map_err(|_| SessionTurnFailure::Internal)?,
     }) else {
         return Ok(SteerArbitration {
@@ -8907,7 +9924,7 @@ async fn resolve_one_steer(
     queued: QueuedSteer,
     basis_revision: crate::live_conversation::ConversationRevision,
     emergency_control: &EmergencyControlHandle,
-    emergency_observation: EmergencyControlObservation,
+    emergency_observation: &EmergencyControlObservation,
     cancellation: CancellationToken,
     #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
 ) -> Result<Option<StoredUserMessage>, SessionTurnFailure> {
@@ -8921,10 +9938,9 @@ async fn resolve_one_steer(
     let message = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(SessionTurnFailure::Model),
-        _ = emergency_control.cancelled(
-            emergency_observation.target(),
-            emergency_observation.epoch(),
-        ) => return Err(SessionTurnFailure::Model),
+        _ = emergency_control.cancelled(emergency_observation) => {
+            return Err(SessionTurnFailure::Model);
+        }
         result = context.resolve_user_message(intent) => result.map_err(map_turn_prompt_error)?,
     };
     #[cfg(test)]
@@ -10638,6 +11654,90 @@ impl SessionExecutorTestHooks {
         self.inner.before_tool_round_start.release();
     }
 
+    pub(crate) fn arm_after_interaction_presentation_reserved(&self) {
+        self.inner.after_interaction_presentation_reserved.arm();
+    }
+
+    pub(crate) async fn wait_after_interaction_presentation_reserved(&self) {
+        self.inner
+            .after_interaction_presentation_reserved
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_after_interaction_presentation_reserved(&self) {
+        self.inner.after_interaction_presentation_reserved.release();
+    }
+
+    pub(crate) fn arm_after_interaction_resolution_apply_before_record(&self) {
+        self.inner
+            .after_interaction_resolution_apply_before_record
+            .arm();
+    }
+
+    pub(crate) async fn wait_after_interaction_resolution_apply_before_record(&self) {
+        self.inner
+            .after_interaction_resolution_apply_before_record
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_after_interaction_resolution_apply_before_record(&self) {
+        self.inner
+            .after_interaction_resolution_apply_before_record
+            .release();
+    }
+
+    pub(crate) fn arm_before_interaction_resolution_reservation(&self) {
+        self.inner.before_interaction_resolution_reservation.arm();
+    }
+
+    pub(crate) async fn wait_before_interaction_resolution_reservation(&self) {
+        self.inner
+            .before_interaction_resolution_reservation
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_before_interaction_resolution_reservation(&self) {
+        self.inner
+            .before_interaction_resolution_reservation
+            .release();
+    }
+
+    /// Awaits the drain's first-wins `PrepareForUnload` signal attempt on the active Turn to
+    /// be fully processed: the drain records the exact outcome and then notifies this
+    /// countable settlement exactly once (close-and-drain runs once per actor lifetime), so
+    /// an integrated close test can release the worker only after the drain's signal attempt
+    /// settled, without polling or sleeping.  Each wait consumes exactly one notification.
+    pub(crate) async fn await_close_drain_signal_processed(&self) {
+        self.inner.close_drain_signal_processed.wait().await;
+    }
+
+    /// The exact outcome of the drain's first-wins `PrepareForUnload` signal attempt on the
+    /// active Turn (Accepted / AlreadySignaled / Stale): recorded before the processed probe
+    /// notifies, so it is always readable once `await_close_drain_signal_processed` returns.
+    pub(crate) fn close_drain_signal_outcome(&self) -> Option<EmergencyControlSignalOutcome> {
+        *lock(&self.inner.close_drain_signal_outcome)
+    }
+
+    pub(crate) fn arm_before_emergency_submit_to_turn_migration(&self) {
+        self.inner.before_emergency_submit_to_turn_migration.arm();
+    }
+
+    pub(crate) async fn wait_before_emergency_submit_to_turn_migration(&self) {
+        self.inner
+            .before_emergency_submit_to_turn_migration
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_before_emergency_submit_to_turn_migration(&self) {
+        self.inner
+            .before_emergency_submit_to_turn_migration
+            .release();
+    }
+
     pub(crate) fn arm_before_tool_resume(&self) {
         self.inner.before_tool_resume.arm();
     }
@@ -10753,6 +11853,31 @@ impl SessionExecutorTestHooks {
         self.inner.settled.wait().await;
     }
 
+    /// Awaits the next successful pending-interaction publication (the actor publishes the
+    /// current snapshot synchronously before notifying, so after this returns one snapshot
+    /// read observes that exact projection).  Every publication of the pending-interaction
+    /// set — an interaction request presentation and a resolution/cancellation removal —
+    /// is counted, and each wait consumes exactly one; a fresh fixture starts at count
+    /// zero, so tests consume publications in the exact actor order.
+    pub(crate) async fn wait_pending_interaction_publication(&self) {
+        self.inner.pending_interaction_published.wait().await;
+    }
+
+    pub(crate) fn arm_before_user_question_binding(&self) {
+        self.inner.before_user_question_binding.arm();
+    }
+
+    pub(crate) async fn wait_before_user_question_binding(&self) {
+        self.inner
+            .before_user_question_binding
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_before_user_question_binding(&self) {
+        self.inner.before_user_question_binding.release();
+    }
+
     pub(crate) fn fail_next_snapshot_install_after_commit(&self) {
         self.inner
             .fail_next_install_after_commit
@@ -10769,12 +11894,20 @@ struct SessionExecutorTestHooksInner {
     before_compaction_apply: Arc<NamedAsyncBarrier>,
     before_steer_safe_point: Arc<NamedAsyncBarrier>,
     before_tool_round_start: Arc<NamedAsyncBarrier>,
+    after_interaction_presentation_reserved: Arc<NamedAsyncBarrier>,
+    after_interaction_resolution_apply_before_record: Arc<NamedAsyncBarrier>,
+    before_interaction_resolution_reservation: Arc<NamedAsyncBarrier>,
+    before_emergency_submit_to_turn_migration: Arc<NamedAsyncBarrier>,
     before_tool_resume: Arc<NamedAsyncBarrier>,
+    before_user_question_binding: Arc<NamedAsyncBarrier>,
     after_steer_resolution: Arc<NamedAsyncBarrier>,
     after_steer_arbitration: Arc<NamedAsyncBarrier>,
     after_snapshot_finish: Arc<NamedAsyncBarrier>,
     after_commit_before_install: Arc<NamedAsyncBarrier>,
     settled: Arc<SettlementNotification>,
+    pending_interaction_published: Arc<SettlementNotification>,
+    close_drain_signal_processed: Arc<SettlementNotification>,
+    close_drain_signal_outcome: Arc<Mutex<Option<EmergencyControlSignalOutcome>>>,
     fail_next_install_after_commit: std::sync::atomic::AtomicBool,
     runtime_dependency_probe_settlements: std::sync::atomic::AtomicUsize,
     runtime_dependency_probe_settled: tokio::sync::Notify,
@@ -10797,12 +11930,20 @@ impl SessionExecutorTestHooksInner {
             before_compaction_apply: Arc::new(NamedAsyncBarrier::new()),
             before_steer_safe_point: Arc::new(NamedAsyncBarrier::new()),
             before_tool_round_start: Arc::new(NamedAsyncBarrier::new()),
+            after_interaction_presentation_reserved: Arc::new(NamedAsyncBarrier::new()),
+            after_interaction_resolution_apply_before_record: Arc::new(NamedAsyncBarrier::new()),
+            before_interaction_resolution_reservation: Arc::new(NamedAsyncBarrier::new()),
+            before_emergency_submit_to_turn_migration: Arc::new(NamedAsyncBarrier::new()),
             before_tool_resume: Arc::new(NamedAsyncBarrier::new()),
+            before_user_question_binding: Arc::new(NamedAsyncBarrier::new()),
             after_steer_resolution: Arc::new(NamedAsyncBarrier::new()),
             after_steer_arbitration: Arc::new(NamedAsyncBarrier::new()),
             after_snapshot_finish: Arc::new(NamedAsyncBarrier::new()),
             after_commit_before_install: Arc::new(NamedAsyncBarrier::new()),
             settled: Arc::new(SettlementNotification::new()),
+            pending_interaction_published: Arc::new(SettlementNotification::new()),
+            close_drain_signal_processed: Arc::new(SettlementNotification::new()),
+            close_drain_signal_outcome: Arc::new(Mutex::new(None)),
             fail_next_install_after_commit: std::sync::atomic::AtomicBool::new(false),
             runtime_dependency_probe_settlements: std::sync::atomic::AtomicUsize::new(0),
             runtime_dependency_probe_settled: tokio::sync::Notify::new(),
@@ -10841,8 +11982,61 @@ impl SessionExecutorTestHooksInner {
         self.before_tool_round_start.wait_if_armed().await;
     }
 
+    async fn after_interaction_presentation_reserved(&self) {
+        self.after_interaction_presentation_reserved
+            .wait_if_armed()
+            .await;
+    }
+
+    /// Parks the actor right after a host interaction resolution was applied to live state
+    /// and before the resolution is recorded / sent to the worker: a test can prove the
+    /// synchronous close handoff (`request_closing`'s sticky `signal_current`) still wins
+    /// during this record-await gap, so the binding/start gates observe the unload signal
+    /// and no side effect ever starts after close.
+    async fn after_interaction_resolution_apply_before_record(&self) {
+        self.after_interaction_resolution_apply_before_record
+            .wait_if_armed()
+            .await;
+    }
+
+    /// Parks the actor after it dequeued/identified the active pending interaction but
+    /// before the host-resolution first-wins permit is reserved: a test can prove the
+    /// synchronous close handoff (`request_closing`'s sticky `signal_current`) still wins
+    /// before the reservation, so the host resolution is never applied (no
+    /// Allow/UserAnswer/Denied durable fact) and the pending interaction is owner-cancelled
+    /// with the exact unload reason instead.
+    async fn before_interaction_resolution_reservation(&self) {
+        self.before_interaction_resolution_reservation
+            .wait_if_armed()
+            .await;
+    }
+
+    /// Records the drain's exact first-wins `PrepareForUnload` signal outcome on the active
+    /// Turn and notifies the countable `close_drain_signal_processed` probe.  Called for
+    /// every outcome (Accepted, AlreadySignaled, Stale) after the signal attempt fully
+    /// settles.
+    fn record_close_drain_signal(&self, outcome: EmergencyControlSignalOutcome) {
+        *lock(&self.close_drain_signal_outcome) = Some(outcome);
+        self.close_drain_signal_processed.notify();
+    }
+
+    /// Parks the actor right before the atomic Submit→Turn emergency migration in the
+    /// admission success handler: a test can prove the synchronous close handoff
+    /// (`request_closing`'s sticky `signal_current`) that lands on the Submit basis is
+    /// preserved by the migration onto the new Turn basis at the new epoch — never erased
+    /// or duplicated by a split observe/retire/bind/re-signal sequence.
+    async fn before_emergency_submit_to_turn_migration(&self) {
+        self.before_emergency_submit_to_turn_migration
+            .wait_if_armed()
+            .await;
+    }
+
     async fn before_tool_resume(&self) {
         self.before_tool_resume.wait_if_armed().await;
+    }
+
+    async fn before_user_question_binding(&self) {
+        self.before_user_question_binding.wait_if_armed().await;
     }
 
     async fn after_steer_resolution(&self) {
@@ -11018,6 +12212,10 @@ impl SettlementNotification {
         }
     }
 
+    fn count(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn notify(&self) {
         self.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.changed.notify_waiters();
@@ -11067,7 +12265,8 @@ mod tests {
     use crate::model_gateway::{ModelSelection, ReasoningPreference, ScriptedModelFixture};
     use crate::prompt::{PromptBodyIntent, TextIntent};
     use crate::runtime_task::RuntimeTaskContext;
-    use crate::wire::{CanonicalFileUri, FileUriFamily, RequestId, SessionId};
+    use crate::tools::{ToolExecutionFuture, ToolOutcomeSource};
+    use crate::wire::{CanonicalFileUri, FileUriFamily, SessionId};
     use crate::workspace::{
         RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput, WorkspacePathTarget,
         WorkspaceRootInput, WorkspaceRootKey, WorkspaceSourcePolicy, lower_workspace,
@@ -11590,11 +12789,12 @@ mod tests {
     }
 
     fn scripted_approval_tool_set(
-        request_id: RequestId,
-        interaction_request: InteractionRequest,
         allowed: ToolExecutionResult,
         denied: ToolExecutionResult,
     ) -> Arc<ToolSet> {
+        // The round's exact ToolCall is an echo call: the approval must carry the exact
+        // same tool name, or the slot's exact-binding invariant would fail closed.
+        let approval = crate::tools::live_approval_request_fixture_for("echo");
         ToolSet::with_interaction_planner(
             vec![
                 crate::tools::ToolDefinition::new(
@@ -11606,12 +12806,11 @@ mod tests {
                 .unwrap(),
             ],
             move |_| {
-                let interaction_request = interaction_request.clone();
+                let approval = approval.clone();
                 let allowed = allowed.clone();
                 let denied = denied.clone();
-                ToolExecutionPlan::Interaction {
-                    request_id,
-                    request: interaction_request,
+                ToolExecutionPlan::Approval {
+                    request: approval,
                     allowed: ToolExecutionStart::new(move |_observer| {
                         Box::pin(async move { allowed })
                     }),
@@ -11621,13 +12820,46 @@ mod tests {
         )
     }
 
+    /// One UserQuestion operation (`call_question`) plus one ordinary sibling: the question
+    /// binds through the scripted closure (fresh move-only binding per plan) and the sibling
+    /// runs through the scripted start factory, both on one Serial definition.
+    fn scripted_question_round_tool_set(
+        question_binding: Arc<dyn Fn(UserQuestionAnswer) -> ToolExecutionResult + Send + Sync>,
+        sibling_factory: Arc<dyn Fn() -> ToolExecutionFuture + Send + Sync>,
+    ) -> Arc<ToolSet> {
+        ToolSet::with_interaction_planner(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            move |request| {
+                if request.call().tool_call_id().as_str() == "call_question" {
+                    let question_binding = Arc::clone(&question_binding);
+                    ToolExecutionPlan::UserQuestion {
+                        request: user_question_request_fixture(),
+                        answer: UserQuestionAnswerBinding::new(move |answer| {
+                            question_binding(answer)
+                        }),
+                    }
+                } else {
+                    let sibling_factory = Arc::clone(&sibling_factory);
+                    ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                        sibling_factory()
+                    }))
+                }
+            },
+        )
+    }
+
     async fn scripted_pending_tool_interaction_fixture(
         store: &TempStore,
         model: &ScriptedModelFixture,
-        request_id: RequestId,
     ) -> LoadedFixture {
-        let interaction_request =
-            InteractionRequest::tool_approval(crate::tools::live_approval_request_fixture());
         let allowed = ToolExecutionResult::completed_text("tool ran").unwrap();
         let denied = ToolExecutionResult::PreExecution {
             disposition: crate::tools::ToolResultDisposition::Denied,
@@ -11636,8 +12868,31 @@ mod tests {
             ])
             .unwrap(),
         };
-        let tool_set = scripted_approval_tool_set(request_id, interaction_request, allowed, denied);
+        let tool_set = scripted_approval_tool_set(allowed, denied);
         scripted_text_fixture_with_tools(store, model, tool_set).await
+    }
+
+    fn user_question_request_fixture() -> UserQuestionRequest {
+        UserQuestionRequest::reconstruct(
+            None,
+            vec![
+                crate::tools::UserQuestionField::reconstruct(
+                    0,
+                    "Continue?",
+                    true,
+                    crate::tools::UserQuestionInput::Text { multiline: false },
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn user_question_answer_fixture(text: &str) -> UserQuestionAnswer {
+        UserQuestionAnswer::new(vec![
+            crate::tools::UserQuestionFieldAnswer::text(0, text).unwrap(),
+        ])
+        .unwrap()
     }
 
     fn changed_workspace(path: &Path) -> Workspace {
@@ -12896,9 +14151,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn executor_close_after_turn_admission_still_runs_first_model_attempt() {
+    async fn executor_close_after_turn_admission_cancels_the_first_model_attempt() {
         let store = TempStore::new();
-        let model = ScriptedModelFixture::new(vec!["admitted attempt"]);
+        let model = ScriptedModelFixture::new(vec!["must not run"]);
         let loaded = scripted_text_fixture(&store, &model).await;
         let hooks = loaded.executor.test_hooks();
         hooks.arm_before_agent_run_attempt();
@@ -12917,15 +14172,34 @@ mod tests {
 
         hooks.wait_before_agent_run_attempt().await;
         assert_eq!(model.request_count(), 0);
-        let mut close = Box::pin(loaded.executor.close());
-        assert!(poll_once_pending(close.as_mut()).await);
-        assert_eq!(model.request_count(), 0);
+        let executor = loaded.executor.clone();
+        let close = tokio::spawn(async move { executor.close().await });
+        // `request_closing` performed the synchronous close handoff before cancelling the
+        // closing token: the active Turn basis already carries the sticky PrepareForUnload,
+        // so the drain's re-attempt on the active Turn records the exact AlreadySignaled
+        // outcome (the signal was never generic-first and the Turn token is cancelled only
+        // after the signal) before the worker is released: no scheduling guess is needed.
+        hooks.await_close_drain_signal_processed().await;
+        assert!(matches!(
+            hooks.close_drain_signal_outcome(),
+            Some(EmergencyControlSignalOutcome::AlreadySignaled {
+                signal: EmergencyControlSignal::PrepareForUnload,
+                ..
+            })
+        ));
         hooks.release_before_agent_run_attempt();
         assert!(close.await.is_ok());
-        assert_eq!(model.request_count(), 1);
+        // Close is a Session unload: the drain signals PrepareForUnload first-wins on the
+        // Turn basis and only then cancels the Turn token, so the not-yet-started attempt
+        // is cancelled before any Model call and the Turn interrupts with the exact unload
+        // terminal.
+        assert_eq!(model.request_count(), 0);
         assert_eq!(
             loaded.executor.published_snapshot().last_terminal(),
-            Some((turn_id, SessionTurnTerminal::Completed))
+            Some((
+                turn_id,
+                SessionTurnTerminal::Interrupted(SessionTurnInterruption::PrepareForUnload)
+            ))
         );
         loaded.state.close().await;
         let _ = loaded.context;
@@ -13584,9 +14858,6 @@ mod tests {
             "{\"value\":1}",
             "denied tool round complete",
         );
-        let request_id: RequestId = "req_33333333333333333333333333333333".parse().unwrap();
-        let interaction_request =
-            InteractionRequest::tool_approval(crate::tools::live_approval_request_fixture());
         let allowed = ToolExecutionResult::completed_text("tool ran").unwrap();
         let denied = ToolExecutionResult::PreExecution {
             disposition: crate::tools::ToolResultDisposition::Denied,
@@ -13595,7 +14866,7 @@ mod tests {
             ])
             .unwrap(),
         };
-        let tool_set = scripted_approval_tool_set(request_id, interaction_request, allowed, denied);
+        let tool_set = scripted_approval_tool_set(allowed, denied);
         let session_id: SessionId = SESSION_ID.parse().unwrap();
         let definition = state.session_current_definition(session_id).unwrap();
         let workspace = resolver
@@ -13655,7 +14926,9 @@ mod tests {
         .await
         .expect("the Interaction request is projected");
         assert_eq!(pending.current_turn(), Some(turn_id));
-        assert_eq!(pending.pending_interactions()[0].request_id(), &request_id);
+        // The owner generates the RequestId at presentation time; the test takes it from the
+        // projected pending interaction.
+        let request_id = *pending.pending_interactions()[0].request_id();
         assert_eq!(pending.public_pending_interactions().len(), 1);
         assert_eq!(pending.active_items().len(), 2);
 
@@ -13784,9 +15057,6 @@ mod tests {
             "{\"value\":1}",
             "must not run",
         );
-        let request_id: RequestId = "req_44444444444444444444444444444444".parse().unwrap();
-        let interaction_request =
-            InteractionRequest::tool_approval(crate::tools::live_approval_request_fixture());
         let allowed = ToolExecutionResult::completed_text("tool ran").unwrap();
         let denied = ToolExecutionResult::PreExecution {
             disposition: crate::tools::ToolResultDisposition::Denied,
@@ -13795,7 +15065,7 @@ mod tests {
             ])
             .unwrap(),
         };
-        let tool_set = scripted_approval_tool_set(request_id, interaction_request, allowed, denied);
+        let tool_set = scripted_approval_tool_set(allowed, denied);
         let session_id: SessionId = SESSION_ID.parse().unwrap();
         let definition = state.session_current_definition(session_id).unwrap();
         let workspace = resolver
@@ -13855,7 +15125,6 @@ mod tests {
         .await
         .expect("the Interaction request is projected");
         assert_eq!(pending.current_turn(), Some(turn_id));
-        assert_eq!(pending.pending_interactions()[0].request_id(), &request_id);
 
         let timestamp: Timestamp = "2026-08-08T10:01:00.000Z".parse().unwrap();
         let mismatched_turn = TurnId::generate().unwrap();
@@ -13911,8 +15180,7 @@ mod tests {
             "{\"value\":1}",
             "must not run",
         );
-        let request_id: RequestId = "req_55555555555555555555555555555555".parse().unwrap();
-        let loaded = scripted_pending_tool_interaction_fixture(&store, &model, request_id).await;
+        let loaded = scripted_pending_tool_interaction_fixture(&store, &model).await;
         let turn_id = loaded
             .executor
             .submit(
@@ -13937,7 +15205,6 @@ mod tests {
         .await
         .expect("the Interaction request is projected");
         assert_eq!(pending.current_turn(), Some(turn_id));
-        assert_eq!(pending.pending_interactions()[0].request_id(), &request_id);
 
         assert_eq!(
             loaded
@@ -13980,8 +15247,7 @@ mod tests {
             "{\"value\":1}",
             "must not run",
         );
-        let request_id: RequestId = "req_66666666666666666666666666666666".parse().unwrap();
-        let loaded = scripted_pending_tool_interaction_fixture(&store, &model, request_id).await;
+        let loaded = scripted_pending_tool_interaction_fixture(&store, &model).await;
         let turn_id = loaded
             .executor
             .submit(
@@ -14006,7 +15272,6 @@ mod tests {
         .await
         .expect("the Interaction request is projected");
         assert_eq!(pending.current_turn(), Some(turn_id));
-        assert_eq!(pending.pending_interactions()[0].request_id(), &request_id);
 
         loaded.executor.close().await.unwrap();
         assert_eq!(model.request_count(), 1);
@@ -14020,6 +15285,2377 @@ mod tests {
         assert!(!recording.contains("must not run"));
         loaded.state.close().await;
         let _ = loaded.context;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripted_user_question_is_answer_bound_and_recorded_before_the_next_model_call() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_question",
+            "echo",
+            "{\"value\":1}",
+            "question round complete",
+        );
+        let question_request = user_question_request_fixture();
+        let bound_answers = Arc::new(Mutex::new(Vec::<String>::new()));
+        let tool_set = ToolSet::with_interaction_planner(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            {
+                let bound_answers = Arc::clone(&bound_answers);
+                move |_| {
+                    let bound_answers = Arc::clone(&bound_answers);
+                    ToolExecutionPlan::UserQuestion {
+                        request: question_request.clone(),
+                        answer: UserQuestionAnswerBinding::new(move |answer| {
+                            // The binding reads the typed host answer and produces the
+                            // truthful answered PreExecution Succeeded result.
+                            let text = match answer.answers()[0].value() {
+                                crate::tools::UserQuestionAnswerValue::Text(text) => {
+                                    text.as_ref().to_owned()
+                                }
+                                crate::tools::UserQuestionAnswerValue::Choice { .. } => {
+                                    panic!("wrong answer family")
+                                }
+                            };
+                            bound_answers.lock().unwrap().push(text.clone());
+                            ToolExecutionResult::PreExecution {
+                                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                                content: crate::tools::ToolResultContent::from_text_parts(vec![
+                                    format!("question answered: {text}"),
+                                ])
+                                .unwrap(),
+                            }
+                        }),
+                    }
+                }
+            },
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let hooks = loaded.executor.test_hooks();
+        // The question presentation publishes the pending interaction synchronously before
+        // the probe notifies: exactly one snapshot read observes that projection.
+        hooks.wait_pending_interaction_publication().await;
+        let pending = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(pending.current_turn(), Some(turn_id));
+        assert_eq!(
+            pending.current_turn_view().unwrap().phase(),
+            Some(TurnExecutionPhaseView::WaitingForUserInput)
+        );
+        assert_eq!(pending.public_pending_interactions().len(), 1);
+        assert_eq!(model.request_count(), 1);
+        // The question owns no executor: while it is pending nothing was executed and no
+        // ordinary sibling exists to start.
+        let request_id = *pending.pending_interactions()[0].request_id();
+        loaded
+            .executor
+            .resolve_interaction(
+                turn_id,
+                *pending.pending_interactions()[0].item_id(),
+                request_id,
+                "irk_99999999999999999999999999999999".parse().unwrap(),
+                InteractionResolutionInput::UserAnswer(user_question_answer_fixture("yes")),
+                "2026-08-08T10:10:00.000Z".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        // The same Turn runs its final Model response after the answered question settled.
+        let terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    terminal: SessionTurnTerminal::Completed,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(terminal.turn_id(), Some(turn_id));
+        assert_eq!(model.request_count(), 2);
+        assert_eq!(*bound_answers.lock().unwrap(), ["yes"]);
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert!(recording.contains("interaction_requested"));
+        assert!(recording.contains("interaction_resolved"));
+        assert!(recording.contains("pre_execution"));
+        assert!(recording.contains("question answered: yes"));
+        assert!(recording.contains("succeeded"));
+        assert!(!recording.contains("executed"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_question_round_is_exclusive_until_the_answer_is_applied() {
+        let store = TempStore::new();
+        // Batch: ordinary call_index 0, question call_index 1, ordinary call_index 2, all
+        // Parallel definitions.
+        let model = ScriptedModelFixture::with_tool_round_calls(
+            &[
+                ("call_echo_0", "echo", "{\"value\":0}"),
+                ("call_ask", "echo", "{\"value\":1}"),
+                ("call_echo_2", "echo", "{\"value\":2}"),
+            ],
+            "exclusive round complete",
+        );
+        let question_request = user_question_request_fixture();
+        let factory_events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (answer_bound_sender, mut answer_bound_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<String>();
+        let tool_set = ToolSet::with_interaction_planner(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            {
+                let factory_events = Arc::clone(&factory_events);
+                move |request| {
+                    let call_id = request.call().tool_call_id().clone();
+                    if call_id.as_str() == "call_ask" {
+                        let answer_bound_sender = answer_bound_sender.clone();
+                        ToolExecutionPlan::UserQuestion {
+                            request: question_request.clone(),
+                            answer: UserQuestionAnswerBinding::new(move |answer| {
+                                let text = match answer.answers()[0].value() {
+                                    crate::tools::UserQuestionAnswerValue::Text(text) => {
+                                        text.as_ref().to_owned()
+                                    }
+                                    crate::tools::UserQuestionAnswerValue::Choice { .. } => {
+                                        panic!("wrong answer family")
+                                    }
+                                };
+                                // The binding event is strictly ordered before the apply,
+                                // which is strictly ordered before any ordinary sibling
+                                // factory is invoked (same task, no other interleaving).
+                                let _ = answer_bound_sender.send(text.clone());
+                                ToolExecutionResult::PreExecution {
+                                    disposition: crate::tools::ToolResultDisposition::Succeeded,
+                                    content: crate::tools::ToolResultContent::from_text_parts(
+                                        vec![format!("question answered: {text}")],
+                                    )
+                                    .unwrap(),
+                                }
+                            }),
+                        }
+                    } else {
+                        let factory_events = Arc::clone(&factory_events);
+                        let call_id = call_id.clone();
+                        ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                            factory_events
+                                .lock()
+                                .unwrap()
+                                .push(format!("factory {call_id}"));
+                            Box::pin(async move {
+                                ToolExecutionResult::completed_text(format!("ran {call_id}"))
+                                    .unwrap()
+                            })
+                        }))
+                    }
+                }
+            },
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run the mixed round").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let hooks = loaded.executor.test_hooks();
+        hooks.wait_pending_interaction_publication().await;
+        let pending = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(pending.current_turn(), Some(turn_id));
+        assert_eq!(
+            pending.current_turn_view().unwrap().phase(),
+            Some(TurnExecutionPhaseView::WaitingForUserInput)
+        );
+        // While the question is pending, neither ordinary sibling is driven, reserved, or
+        // factory-invoked: their start factories were never called.
+        assert!(factory_events.lock().unwrap().is_empty());
+        assert_eq!(model.request_count(), 1);
+        loaded
+            .executor
+            .resolve_interaction(
+                turn_id,
+                *pending.pending_interactions()[0].item_id(),
+                *pending.pending_interactions()[0].request_id(),
+                "irk_99999999999999999999999999999998".parse().unwrap(),
+                InteractionResolutionInput::UserAnswer(user_question_answer_fixture("yes")),
+                "2026-08-08T10:11:00.000Z".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        // The answer binding consumed the typed answer before the apply, which happens
+        // before any ordinary sibling starts: the answer event arrives strictly before any
+        // factory event (both run on the single ActiveTurnTask, in that order).
+        let bound = answer_bound_receiver
+            .recv()
+            .await
+            .expect("the answer binding consumed the typed answer");
+        assert_eq!(bound, "yes");
+        let terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    terminal: SessionTurnTerminal::Completed,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(terminal.turn_id(), Some(turn_id));
+        assert_eq!(model.request_count(), 2);
+        let mut factories = factory_events.lock().unwrap().clone();
+        factories.sort();
+        assert_eq!(factories, ["factory call_echo_0", "factory call_echo_2"]);
+        // The exchange applies the hoisted question outcome first (immediately after its
+        // resolution, before any ordinary sibling started), then the remaining ordinary
+        // results in call_index order: the recorded tool messages are the question, then
+        // call_echo_0, then call_echo_2.
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        let question_record = recording.find("question answered: yes").unwrap();
+        let ordinary_0 = recording.find("ran call_echo_0").unwrap();
+        let ordinary_2 = recording.find("ran call_echo_2").unwrap();
+        assert!(question_record < ordinary_0 && ordinary_0 < ordinary_2);
+        assert!(recording.contains("interaction_requested"));
+        assert!(recording.contains("interaction_resolved"));
+        assert!(recording.contains("pre_execution"));
+        assert!(recording.contains("succeeded"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_user_questions_are_presented_sequentially_after_each_answer_is_applied() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_tool_round_calls(
+            &[
+                ("call_first_question", "echo", "{\"value\":1}"),
+                ("call_second_question", "echo", "{\"value\":2}"),
+            ],
+            "both questions complete",
+        );
+        let question_request = user_question_request_fixture();
+        let question_calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let tool_set = ToolSet::with_interaction_planner(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            {
+                let question_calls = Arc::clone(&question_calls);
+                move |request| {
+                    let call_id = request.call().tool_call_id().clone();
+                    let question_calls = Arc::clone(&question_calls);
+                    let label = if call_id.as_str() == "call_first_question" {
+                        "first"
+                    } else {
+                        "second"
+                    };
+                    ToolExecutionPlan::UserQuestion {
+                        request: question_request.clone(),
+                        answer: UserQuestionAnswerBinding::new(move |answer| {
+                            let text = match answer.answers()[0].value() {
+                                crate::tools::UserQuestionAnswerValue::Text(text) => {
+                                    text.as_ref().to_owned()
+                                }
+                                crate::tools::UserQuestionAnswerValue::Choice { .. } => {
+                                    panic!("wrong answer family")
+                                }
+                            };
+                            question_calls
+                                .lock()
+                                .unwrap()
+                                .push(format!("{label} {text}"));
+                            ToolExecutionResult::PreExecution {
+                                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                                content: crate::tools::ToolResultContent::from_text_parts(vec![
+                                    format!("{label} answer recorded: {text}"),
+                                ])
+                                .unwrap(),
+                            }
+                        }),
+                    }
+                }
+            },
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run both questions").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let hooks = loaded.executor.test_hooks();
+        hooks.wait_pending_interaction_publication().await;
+        let first_pending = loaded.executor.snapshot().await.unwrap();
+        let first_request_id = *first_pending.pending_interactions()[0].request_id();
+        // At most one question is ever pending: the second question is not yet presented.
+        assert_eq!(first_pending.pending_interactions().len(), 1);
+        assert_eq!(first_pending.current_turn(), Some(turn_id));
+        assert_eq!(
+            first_pending.current_turn_view().unwrap().phase(),
+            Some(TurnExecutionPhaseView::WaitingForUserInput)
+        );
+        assert_eq!(model.request_count(), 1);
+        loaded
+            .executor
+            .resolve_interaction(
+                turn_id,
+                *first_pending.pending_interactions()[0].item_id(),
+                first_request_id,
+                "irk_99999999999999999999999999999997".parse().unwrap(),
+                InteractionResolutionInput::UserAnswer(user_question_answer_fixture("one")),
+                "2026-08-08T10:12:00.000Z".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        // The resolution removal publishes first (explicitly consumed here), and the second
+        // question is presented only after the first resolution was applied + its result
+        // recorded: the mid-test recording already carries the first resolution + first
+        // answered ToolResult and not yet the second answer, and the pending interaction is
+        // a different owner-generated RequestId.
+        hooks.wait_pending_interaction_publication().await;
+        hooks.wait_pending_interaction_publication().await;
+        let second_pending = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(second_pending.pending_interactions().len(), 1);
+        assert_ne!(
+            second_pending.pending_interactions()[0].request_id(),
+            &first_request_id
+        );
+        let mid_recording =
+            fs::read_to_string(store.session_path().join("conversation.jsonl")).unwrap();
+        let first_resolution = mid_recording.find("interaction_resolved").unwrap();
+        let first_record = mid_recording.find("first answer recorded: one").unwrap();
+        assert!(first_resolution < first_record);
+        assert!(!mid_recording.contains("second answer recorded"));
+        loaded
+            .executor
+            .resolve_interaction(
+                turn_id,
+                *second_pending.pending_interactions()[0].item_id(),
+                *second_pending.pending_interactions()[0].request_id(),
+                "irk_99999999999999999999999999999996".parse().unwrap(),
+                InteractionResolutionInput::UserAnswer(user_question_answer_fixture("two")),
+                "2026-08-08T10:12:00.001Z".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        let terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    terminal: SessionTurnTerminal::Completed,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(terminal.turn_id(), Some(turn_id));
+        assert_eq!(model.request_count(), 2);
+        assert_eq!(*question_calls.lock().unwrap(), ["first one", "second two"]);
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert!(
+            recording.find("first answer recorded: one").unwrap()
+                < recording.find("second answer recorded: two").unwrap()
+        );
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_pending_user_question_skips_binding_and_settles_cancelled_before_start() {
+        let store = TempStore::new();
+        // Batch: question call_index 0 and one ordinary sibling call_index 1.
+        let model = ScriptedModelFixture::with_tool_round_calls(
+            &[
+                ("call_question", "echo", "{\"value\":1}"),
+                ("call_rest", "echo", "{\"value\":2}"),
+            ],
+            "must not run",
+        );
+        let question_request = user_question_request_fixture();
+        let binding_invoked = Arc::new(AtomicBool::new(false));
+        let factory_invoked = Arc::new(AtomicBool::new(false));
+        let tool_set = ToolSet::with_interaction_planner(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            {
+                let binding_invoked = Arc::clone(&binding_invoked);
+                let factory_invoked = Arc::clone(&factory_invoked);
+                move |request| {
+                    if request.call().tool_call_id().as_str() == "call_question" {
+                        let binding_invoked = Arc::clone(&binding_invoked);
+                        ToolExecutionPlan::UserQuestion {
+                            request: question_request.clone(),
+                            answer: UserQuestionAnswerBinding::new(move |_| {
+                                binding_invoked.store(true, Ordering::Release);
+                                ToolExecutionResult::PreExecution {
+                                    disposition: crate::tools::ToolResultDisposition::Succeeded,
+                                    content: crate::tools::ToolResultContent::from_text_parts(
+                                        vec!["must not be bound".to_owned()],
+                                    )
+                                    .unwrap(),
+                                }
+                            }),
+                        }
+                    } else {
+                        let factory_invoked = Arc::clone(&factory_invoked);
+                        ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                            factory_invoked.store(true, Ordering::Release);
+                            Box::pin(async move {
+                                ToolExecutionResult::completed_text("must not run").unwrap()
+                            })
+                        }))
+                    }
+                }
+            },
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run question then rest").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let hooks = loaded.executor.test_hooks();
+        hooks.wait_pending_interaction_publication().await;
+        let pending = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(pending.current_turn(), Some(turn_id));
+        assert_eq!(
+            pending.current_turn_view().unwrap().phase(),
+            Some(TurnExecutionPhaseView::WaitingForUserInput)
+        );
+        assert_eq!(pending.pending_interactions().len(), 1);
+        assert!(matches!(
+            pending.pending_interactions()[0].request(),
+            InteractionRequestView::UserQuestion(_)
+        ));
+        assert!(
+            loaded
+                .executor
+                .cancel(
+                    SessionCancelTarget::Turn(turn_id),
+                    "2026-08-08T10:13:00.000Z".parse().unwrap(),
+                )
+                .await
+                .is_ok()
+        );
+        let terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    terminal: SessionTurnTerminal::Interrupted(
+                        SessionTurnInterruption::UserCancelled,
+                    ),
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(terminal.turn_id(), Some(turn_id));
+        // The cancel never invoked the answer binding and never constructed the ordinary
+        // sibling's start factory; no next Model ran.
+        assert!(!binding_invoked.load(Ordering::Acquire));
+        assert!(!factory_invoked.load(Ordering::Acquire));
+        assert_eq!(model.request_count(), 1);
+        // The cancelled question was removed and no further interaction was ever presented:
+        // the terminal snapshot projects no pending interaction, and the recording carries
+        // exactly one interaction_requested entry (a second question would have published
+        // its own entry).
+        assert!(
+            loaded
+                .executor
+                .snapshot()
+                .await
+                .unwrap()
+                .pending_interactions()
+                .is_empty()
+        );
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert_eq!(recording.matches("interaction_requested").count(), 1);
+        assert!(recording.contains("interaction_requested"));
+        assert!(recording.contains("interaction_resolved"));
+        assert!(recording.contains("turn_cancelled"));
+        assert!(recording.contains("pre_execution"));
+        assert!(recording.contains("cancelled"));
+        // The question and its ordinary sibling both settle the matching
+        // cancelled-before-start PreExecution Cancelled ToolResult.
+        assert_eq!(recording.matches("tool did not start").count(), 2);
+        assert!(!recording.contains("must not run"));
+        assert!(!recording.contains("must not be bound"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_question_binding_permit_loses_first_wins_to_a_signal_at_the_binding_boundary() {
+        let store = TempStore::new();
+        // Batch: question call_index 0 and one ordinary sibling call_index 1.
+        let model = ScriptedModelFixture::with_tool_round_calls(
+            &[
+                ("call_question", "echo", "{\"value\":1}"),
+                ("call_sibling", "echo", "{\"value\":2}"),
+            ],
+            "must not run",
+        );
+        let binding_invoked = Arc::new(AtomicBool::new(false));
+        let factory_invoked = Arc::new(AtomicBool::new(false));
+        let tool_set = scripted_question_round_tool_set(
+            Arc::new({
+                let binding_invoked = Arc::clone(&binding_invoked);
+                move |_| {
+                    binding_invoked.store(true, Ordering::Release);
+                    ToolExecutionResult::PreExecution {
+                        disposition: crate::tools::ToolResultDisposition::Succeeded,
+                        content: crate::tools::ToolResultContent::from_text_parts(vec![
+                            "must not be bound".to_owned(),
+                        ])
+                        .unwrap(),
+                    }
+                }
+            }),
+            Arc::new({
+                let factory_invoked = Arc::clone(&factory_invoked);
+                move || {
+                    factory_invoked.store(true, Ordering::Release);
+                    Box::pin(
+                        async move { ToolExecutionResult::completed_text("must not run").unwrap() },
+                    )
+                }
+            }),
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run question then rest").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let hooks = loaded.executor.test_hooks();
+        hooks.wait_pending_interaction_publication().await;
+        let pending = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(pending.pending_interactions().len(), 1);
+        // The actor applies + records + sends the answer; the worker receives it and parks
+        // at the named barrier before it reserves the UserQuestion binding permit.
+        hooks.arm_before_user_question_binding();
+        loaded
+            .executor
+            .resolve_interaction(
+                turn_id,
+                *pending.pending_interactions()[0].item_id(),
+                *pending.pending_interactions()[0].request_id(),
+                "irk_99999999999999999999999999999994".parse().unwrap(),
+                InteractionResolutionInput::UserAnswer(user_question_answer_fixture("yes")),
+                "2026-08-08T10:14:00.000Z".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        hooks.wait_before_user_question_binding().await;
+        // The signal wins at the binding boundary: the binding permit is never reserved, so
+        // the Tools binding is never invoked and the ordinary sibling never starts.
+        assert!(
+            loaded
+                .executor
+                .cancel(
+                    SessionCancelTarget::Turn(turn_id),
+                    "2026-08-08T10:14:00.001Z".parse().unwrap(),
+                )
+                .await
+                .is_ok()
+        );
+        hooks.release_before_user_question_binding();
+        let terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    terminal: SessionTurnTerminal::Interrupted(
+                        SessionTurnInterruption::UserCancelled,
+                    ),
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(terminal.turn_id(), Some(turn_id));
+        assert!(!binding_invoked.load(Ordering::Acquire));
+        assert!(!factory_invoked.load(Ordering::Acquire));
+        assert_eq!(model.request_count(), 1);
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        // Both the question and its ordinary sibling settle the matching
+        // cancelled-before-start PreExecution Cancelled ToolResult (the turn interruption
+        // itself was already asserted through the TurnTerminal event).
+        assert_eq!(recording.matches("tool did not start").count(), 2);
+        assert!(recording.contains("pre_execution"));
+        assert!(recording.contains("cancelled"));
+        assert!(!recording.contains("must not run"));
+        assert!(!recording.contains("must not be bound"));
+        assert!(!recording.contains("question answered"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_revoke_pending_user_question_skips_binding_and_settles_both_matching_cancelled_results()
+     {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_tool_round_calls(
+            &[
+                ("call_question", "echo", "{\"value\":1}"),
+                ("call_sibling", "echo", "{\"value\":2}"),
+            ],
+            "must not run",
+        );
+        let binding_invoked = Arc::new(AtomicBool::new(false));
+        let factory_invoked = Arc::new(AtomicBool::new(false));
+        let tool_set = scripted_question_round_tool_set(
+            Arc::new({
+                let binding_invoked = Arc::clone(&binding_invoked);
+                move |_| {
+                    binding_invoked.store(true, Ordering::Release);
+                    ToolExecutionResult::PreExecution {
+                        disposition: crate::tools::ToolResultDisposition::Succeeded,
+                        content: crate::tools::ToolResultContent::from_text_parts(vec![
+                            "must not be bound".to_owned(),
+                        ])
+                        .unwrap(),
+                    }
+                }
+            }),
+            Arc::new({
+                let factory_invoked = Arc::clone(&factory_invoked);
+                move || {
+                    factory_invoked.store(true, Ordering::Release);
+                    Box::pin(
+                        async move { ToolExecutionResult::completed_text("must not run").unwrap() },
+                    )
+                }
+            }),
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run question then rest").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let hooks = loaded.executor.test_hooks();
+        hooks.wait_pending_interaction_publication().await;
+        let pending = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(pending.pending_interactions().len(), 1);
+        assert_eq!(
+            loaded
+                .executor
+                .security_revoke(SessionCancelTarget::Turn(turn_id))
+                .await,
+            Ok(())
+        );
+        // The pending question is cancelled with the exact SecurityRevoked reason; the
+        // binding and the ordinary sibling's factory are never invoked and no next Model
+        // runs.
+        let terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    terminal: SessionTurnTerminal::Interrupted(
+                        SessionTurnInterruption::SecurityRevoked,
+                    ),
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(terminal.turn_id(), Some(turn_id));
+        assert!(!binding_invoked.load(Ordering::Acquire));
+        assert!(!factory_invoked.load(Ordering::Acquire));
+        assert_eq!(model.request_count(), 1);
+        assert!(
+            loaded
+                .executor
+                .snapshot()
+                .await
+                .unwrap()
+                .pending_interactions()
+                .is_empty()
+        );
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert_eq!(recording.matches("interaction_requested").count(), 1);
+        assert!(recording.contains("interaction_resolved"));
+        assert!(recording.contains("security_revoked"));
+        // Both the question and its ordinary sibling settle the matching
+        // cancelled-before-start PreExecution Cancelled ToolResult.
+        assert_eq!(recording.matches("tool did not start").count(), 2);
+        assert!(recording.contains("pre_execution"));
+        assert!(recording.contains("cancelled"));
+        assert!(!recording.contains("must not run"));
+        assert!(!recording.contains("must not be bound"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_pending_user_question_settles_unloaded_without_binding_or_followup_model_call() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_tool_round_calls(
+            &[
+                ("call_question", "echo", "{\"value\":1}"),
+                ("call_sibling", "echo", "{\"value\":2}"),
+            ],
+            "must not run",
+        );
+        let binding_invoked = Arc::new(AtomicBool::new(false));
+        let factory_invoked = Arc::new(AtomicBool::new(false));
+        let tool_set = scripted_question_round_tool_set(
+            Arc::new({
+                let binding_invoked = Arc::clone(&binding_invoked);
+                move |_| {
+                    binding_invoked.store(true, Ordering::Release);
+                    ToolExecutionResult::PreExecution {
+                        disposition: crate::tools::ToolResultDisposition::Succeeded,
+                        content: crate::tools::ToolResultContent::from_text_parts(vec![
+                            "must not be bound".to_owned(),
+                        ])
+                        .unwrap(),
+                    }
+                }
+            }),
+            Arc::new({
+                let factory_invoked = Arc::clone(&factory_invoked);
+                move || {
+                    factory_invoked.store(true, Ordering::Release);
+                    Box::pin(
+                        async move { ToolExecutionResult::completed_text("must not run").unwrap() },
+                    )
+                }
+            }),
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run question then rest").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let hooks = loaded.executor.test_hooks();
+        hooks.wait_pending_interaction_publication().await;
+        let pending = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(pending.pending_interactions().len(), 1);
+        assert!(matches!(
+            pending.pending_interactions()[0].request(),
+            InteractionRequestView::UserQuestion(_)
+        ));
+        // The graceful-Unload close cancels the pending question with the exact
+        // SessionUnloaded reason: the binding and the ordinary sibling's factory are never
+        // invoked and no next Model runs.  The exact close signal (PrepareForUnload) makes
+        // the drained Turn interrupt with the deterministic PrepareForUnload terminal.
+        loaded.executor.close().await.unwrap();
+        let terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    terminal: SessionTurnTerminal::Interrupted(
+                        SessionTurnInterruption::PrepareForUnload,
+                    ),
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(terminal.turn_id(), Some(turn_id));
+        assert!(!binding_invoked.load(Ordering::Acquire));
+        assert!(!factory_invoked.load(Ordering::Acquire));
+        assert_eq!(model.request_count(), 1);
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert_eq!(recording.matches("interaction_requested").count(), 1);
+        assert!(recording.contains("interaction_resolved"));
+        assert!(recording.contains("session_unloaded"));
+        assert_eq!(recording.matches("tool did not start").count(), 2);
+        assert!(recording.contains("pre_execution"));
+        assert!(recording.contains("cancelled"));
+        assert!(!recording.contains("must not run"));
+        assert!(!recording.contains("must not be bound"));
+        loaded.state.close().await;
+        let _ = loaded.context;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_question_flavors_settle_every_remaining_operation_without_start() {
+        for flavor in ["abandoned", "malformed", "panicking"] {
+            let store = TempStore::new();
+            // Batch: question call_index 0, one ordinary Execute sibling call_index 1, and
+            // one frozen PreExecution sibling call_index 2.
+            let model = ScriptedModelFixture::with_tool_round_calls(
+                &[
+                    ("call_question", "echo", "{\"value\":1}"),
+                    ("call_sibling", "echo", "{\"value\":2}"),
+                    ("call_frozen", "echo", "{\"value\":3}"),
+                ],
+                "must not run",
+            );
+            let binding_invoked = Arc::new(AtomicBool::new(false));
+            let factory_invoked = Arc::new(AtomicBool::new(false));
+            let tool_set = ToolSet::with_interaction_planner(
+                vec![
+                    crate::tools::ToolDefinition::new(
+                        "echo".parse().unwrap(),
+                        "Echo a bounded JSON value",
+                        "{}".parse().unwrap(),
+                        crate::tools::ToolExecutionMode::Serial,
+                    )
+                    .unwrap(),
+                ],
+                {
+                    let binding_invoked = Arc::clone(&binding_invoked);
+                    let factory_invoked = Arc::clone(&factory_invoked);
+                    move |request| match request.call().tool_call_id().as_str() {
+                        "call_question" => {
+                            let binding_invoked = Arc::clone(&binding_invoked);
+                            ToolExecutionPlan::UserQuestion {
+                                request: user_question_request_fixture(),
+                                answer: UserQuestionAnswerBinding::new(move |_| {
+                                    binding_invoked.store(true, Ordering::Release);
+                                    match flavor {
+                                        // The binding truthfully reports an abandoned result.
+                                        "abandoned" => ToolExecutionResult::Abandoned {
+                                            reason: crate::tools::ToolAbandonReason::RuntimeFailure,
+                                        },
+                                        // A Completed shape after a question is an invariant:
+                                        // the binding fails closed to Abandoned OutcomeUnknown.
+                                        "malformed" => ToolExecutionResult::completed_text(
+                                            "must not be recorded as executed",
+                                        )
+                                        .unwrap(),
+                                        // A panicking binding is caught at the binding call
+                                        // with the slot's Prepared parts still owned and fails
+                                        // closed to identity-bound Abandoned RuntimeFailure.
+                                        "panicking" => panic!("scripted answer binding panic"),
+                                        _ => unreachable!("one of the three scripted flavors"),
+                                    }
+                                }),
+                            }
+                        }
+                        "call_sibling" => {
+                            let factory_invoked = Arc::clone(&factory_invoked);
+                            ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                                factory_invoked.store(true, Ordering::Release);
+                                Box::pin(async move {
+                                    ToolExecutionResult::completed_text("must not run").unwrap()
+                                })
+                            }))
+                        }
+                        // A frozen known-tool preflight result: recognizable content that
+                        // must be preserved through the abandoned-exchange settlement.
+                        "call_frozen" => {
+                            ToolExecutionPlan::PreExecution(ToolExecutionResult::PreExecution {
+                                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                                content: crate::tools::ToolResultContent::from_text_parts(vec![
+                                    "frozen preflight preserved".to_owned(),
+                                ])
+                                .unwrap(),
+                            })
+                        }
+                        _ => unreachable!("only the three scripted calls are planned"),
+                    }
+                },
+            );
+            let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+            let mut subscription = loaded.executor.subscribe().await.unwrap();
+            let turn_id = loaded
+                .executor
+                .submit(
+                    CommandId::generate().unwrap(),
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("run question then rest").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let hooks = loaded.executor.test_hooks();
+            hooks.wait_pending_interaction_publication().await;
+            let pending = loaded.executor.snapshot().await.unwrap();
+            assert_eq!(pending.pending_interactions().len(), 1);
+            loaded
+                .executor
+                .resolve_interaction(
+                    turn_id,
+                    *pending.pending_interactions()[0].item_id(),
+                    *pending.pending_interactions()[0].request_id(),
+                    "irk_99999999999999999999999999999993".parse().unwrap(),
+                    InteractionResolutionInput::UserAnswer(user_question_answer_fixture("yes")),
+                    "2026-08-08T10:15:00.000Z".parse().unwrap(),
+                )
+                .await
+                .unwrap();
+            let terminal = wait_for_event(&mut subscription, |event| {
+                matches!(
+                    event,
+                    SessionExecutorEvent::TurnTerminal {
+                        terminal: SessionTurnTerminal::Failed(SessionTurnFailure::Model),
+                        ..
+                    }
+                )
+            })
+            .await;
+            assert_eq!(terminal.turn_id(), Some(turn_id));
+            // The binding consumed the answer exactly once (it either reported Abandoned or
+            // failed closed), the ordinary sibling's start factory was never invoked, and no
+            // next Model ran: the exchange abandoned after the first terminal outcome.
+            assert!(binding_invoked.load(Ordering::Acquire));
+            assert!(!factory_invoked.load(Ordering::Acquire));
+            assert_eq!(model.request_count(), 1);
+            let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+                .expect("the scripted conversation recording is readable");
+            // Only the question is Abandoned; the ordinary unstarted sibling settles the
+            // truthful PreExecution Failed "tool did not start" (never Abandoned merely
+            // because it was not started), and the frozen PreExecution sibling keeps its
+            // exact recognizable content through the first-wins settlement — no factory and
+            // no next Model ever run.
+            assert_eq!(recording.matches("abandoned").count(), 1);
+            assert_eq!(recording.matches("tool did not start").count(), 1);
+            assert!(recording.contains("frozen preflight preserved"));
+            assert!(!recording.contains("must not run"));
+            assert!(!recording.contains("must not be recorded as executed"));
+            assert!(!recording.contains("final text"));
+            close_loaded(loaded).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn planned_round_hoists_questions_ahead_of_ordinary_ops_and_merges_results_in_call_order()
+    {
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        let question_request = user_question_request_fixture();
+        let tool_set = ToolSet::with_interaction_planner(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            move |request| {
+                let call_id = request.call().tool_call_id().clone();
+                if call_id.as_str() == "call_question" {
+                    ToolExecutionPlan::UserQuestion {
+                        request: question_request.clone(),
+                        answer: UserQuestionAnswerBinding::new(move |_| {
+                            ToolExecutionResult::PreExecution {
+                                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                                content: crate::tools::ToolResultContent::from_text_parts(vec![
+                                    format!("question {call_id}"),
+                                ])
+                                .unwrap(),
+                            }
+                        }),
+                    }
+                } else {
+                    ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                        Box::pin(async move {
+                            ToolExecutionResult::completed_text(format!("ran {call_id}")).unwrap()
+                        })
+                    }))
+                }
+            },
+        );
+        // Input order is deliberately shuffled (ordinary 2, question 1, ordinary 0); the
+        // round plans in call_index order and hoists the question.
+        let requests = [
+            ToolExecutionRequest::new(
+                "itm_0000000000000000000000000000000c".parse().unwrap(),
+                ToolCall::new(
+                    "call_echo_2".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    2,
+                ),
+            ),
+            ToolExecutionRequest::new(
+                "itm_0000000000000000000000000000000b".parse().unwrap(),
+                ToolCall::new(
+                    "call_question".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    1,
+                ),
+            ),
+            ToolExecutionRequest::new(
+                "itm_0000000000000000000000000000000a".parse().unwrap(),
+                ToolCall::new(
+                    "call_echo_0".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    0,
+                ),
+            ),
+        ];
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
+            .collect::<Vec<_>>();
+        // A test-side interaction owner answers the presented question through the same
+        // InteractionRequested completion lane, exactly like the actor would.
+        let (interaction_completion_sender, mut interaction_receiver) = mpsc::unbounded_channel();
+        let answer = user_question_answer_fixture("direct");
+        let resolver = tokio::spawn(async move {
+            while let Some(completion) = interaction_receiver.recv().await {
+                let ExecutorCompletion::InteractionRequested(completion) = completion else {
+                    continue;
+                };
+                let resolution = match completion.request {
+                    InteractionRequest::UserQuestion(request) => {
+                        InteractionRequest::user_question(request)
+                            .resolve_host(InteractionResolutionInput::UserAnswer(answer.clone()))
+                            .unwrap()
+                    }
+                    _ => panic!("only a UserQuestion is presented"),
+                };
+                let _ = completion.resolution_sender.send(resolution);
+            }
+        });
+        let results = execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        )
+        .await;
+        resolver.await.unwrap();
+        let contents = results
+            .iter()
+            .map(|outcome| match outcome {
+                ToolExecutionOutcome::Completed {
+                    source: ToolOutcomeSource::PreExecution,
+                    content,
+                    ..
+                } => content.parts()[0].as_text().to_owned(),
+                ToolExecutionOutcome::Completed {
+                    source: ToolOutcomeSource::Executed,
+                    content,
+                    ..
+                } => content.parts()[0].as_text().to_owned(),
+                other => panic!("unexpected outcome: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        // The merged results come back in call_index order (ordinary 0, question 1,
+        // ordinary 2), even though the question was hoisted and driven first.
+        assert_eq!(
+            contents,
+            [
+                "ran call_echo_0",
+                "question call_question",
+                "ran call_echo_2"
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_execution_control_never_publishes_an_interaction_after_a_signal() {
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        let (interaction_completion_sender, mut interaction_receiver) = mpsc::unbounded_channel();
+        let control = ToolExecutionControl::new(
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+        );
+        let hooks = Arc::new(SessionExecutorTestHooksInner::new());
+        // The signal wins first: the presentation permit is never granted, so the precheck
+        // settles Cancelled before any RequestId is generated and no InteractionRequested
+        // completion is ever published — a later question can never be presented as pending
+        // after a signal.
+        assert_eq!(
+            emergency.signal(target, EmergencyControlSignal::Cancel),
+            EmergencyControlSignalOutcome::Accepted { epoch: 1 }
+        );
+        let item_id: ItemId = "itm_00000000000000000000000000000001".parse().unwrap();
+        let tool_call_id: crate::tools::ToolCallId = "call_question".parse().unwrap();
+        let request = ToolExecutionRequest::new(
+            item_id,
+            ToolCall::new(
+                tool_call_id.clone(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        assert!(matches!(
+            control
+                .request_user_question(
+                    &request,
+                    user_question_request_fixture(),
+                    &emergency,
+                    &observation,
+                    &hooks,
+                )
+                .await,
+            Err(ToolExecutionControlError::Cancelled)
+        ));
+        assert!(matches!(
+            control
+                .request_approval(
+                    &request,
+                    crate::tools::live_approval_request_fixture(),
+                    &emergency,
+                    &observation,
+                    &hooks,
+                )
+                .await,
+            Err(ToolExecutionControlError::Cancelled)
+        ));
+        assert!(interaction_receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closing_actor_truthfully_settles_the_queued_question_and_interrupts_for_unload() {
+        let store = TempStore::new();
+        let model =
+            ScriptedModelFixture::with_tool_round("call_question", "echo", "{}", "final text");
+        let binding_invoked = Arc::new(AtomicBool::new(false));
+        let tool_set = scripted_question_round_tool_set(
+            Arc::new({
+                let binding_invoked = Arc::clone(&binding_invoked);
+                move |_| {
+                    binding_invoked.store(true, Ordering::Release);
+                    ToolExecutionResult::PreExecution {
+                        disposition: crate::tools::ToolResultDisposition::Succeeded,
+                        content: crate::tools::ToolResultContent::from_text_parts(vec![
+                            "must not be bound".to_owned(),
+                        ])
+                        .unwrap(),
+                    }
+                }
+            }),
+            Arc::new(|| {
+                Box::pin(async move { ToolExecutionResult::completed_text("no sibling").unwrap() })
+            }),
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let hooks = loaded.executor.test_hooks();
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        // The barrier is armed before the submit, so the worker cannot pass the park point
+        // before close starts: it parks before the round plan and no completion exists yet
+        // when close begins, so the drain can settle nothing and waits for the worker.
+        hooks.arm_before_tool_round_start();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        hooks.wait_before_tool_round_start().await;
+        let executor = loaded.executor.clone();
+        let close = tokio::spawn(async move { executor.close().await });
+        // The drain publishes Finishing: the actor is now inside close_and_drain, which has
+        // already signaled PrepareForUnload first-wins on the Turn basis and cancelled the
+        // Turn token.
+        let finishing = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::ExecutionChanged { snapshot, .. }
+                    if snapshot.execution_state() == SessionExecutionState::Finishing
+            )
+        })
+        .await;
+        assert_eq!(finishing.turn_id(), None);
+        hooks.release_before_tool_round_start();
+        // The close signal won before the worker could reserve the question's presentation:
+        // the presentation is refused, the question settles the matching
+        // cancelled-before-start PreExecution Cancelled result, and the cancelled Turn
+        // interrupts with the exact PrepareForUnload terminal — no next Model ever runs.
+        let terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    terminal: SessionTurnTerminal::Interrupted(
+                        SessionTurnInterruption::PrepareForUnload,
+                    ),
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(terminal.turn_id(), Some(turn_id));
+        close.await.unwrap().expect("close drains the active turn");
+        assert!(!binding_invoked.load(Ordering::Acquire));
+        assert_eq!(model.request_count(), 1);
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        // The question was never presented (the unload signal won before the presentation
+        // reservation), so no pending interaction was ever recorded; the worker settled the
+        // matching cancelled-before-start PreExecution Cancelled result, never an abandoned
+        // runtime failure, and the interrupted Turn never ran the scripted follow-up Model.
+        assert!(!recording.contains("interaction_requested"));
+        assert!(recording.contains("tool did not start"));
+        assert!(recording.contains("pre_execution"));
+        assert!(recording.contains("cancelled"));
+        assert!(!recording.contains("abandoned"));
+        assert!(!recording.contains("must not be bound"));
+        assert!(!recording.contains("final text"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_after_a_won_turn_cancel_keeps_the_first_wins_signal_and_terminal_reason() {
+        let store = TempStore::new();
+        let model =
+            ScriptedModelFixture::with_tool_round("call_question", "echo", "{}", "final text");
+        let binding_invoked = Arc::new(AtomicBool::new(false));
+        let tool_set = scripted_question_round_tool_set(
+            Arc::new({
+                let binding_invoked = Arc::clone(&binding_invoked);
+                move |_| {
+                    binding_invoked.store(true, Ordering::Release);
+                    ToolExecutionResult::PreExecution {
+                        disposition: crate::tools::ToolResultDisposition::Succeeded,
+                        content: crate::tools::ToolResultContent::from_text_parts(vec![
+                            "must not be bound".to_owned(),
+                        ])
+                        .unwrap(),
+                    }
+                }
+            }),
+            Arc::new(|| {
+                Box::pin(async move { ToolExecutionResult::completed_text("no sibling").unwrap() })
+            }),
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let hooks = loaded.executor.test_hooks();
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        hooks.arm_before_tool_round_start();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        hooks.wait_before_tool_round_start().await;
+        // The host Cancel wins first-wins on the Turn basis before close ever starts.
+        assert!(
+            loaded
+                .executor
+                .cancel(
+                    SessionCancelTarget::Turn(turn_id),
+                    "2026-08-08T10:16:00.000Z".parse().unwrap(),
+                )
+                .await
+                .is_ok()
+        );
+        let executor = loaded.executor.clone();
+        let close = tokio::spawn(async move { executor.close().await });
+        // The drain's first-wins PrepareForUnload attempt on the active Turn is fully
+        // processed before the worker is released: the probe proves the drain ran while the
+        // worker was still parked (before any presentation reservation) and records the
+        // exact AlreadySignaled outcome — the original Cancel keeps its signal and reason,
+        // the drained Turn still interrupts with the exact first-wins UserCancelled
+        // terminal, and no unload reason is ever recorded.
+        hooks.await_close_drain_signal_processed().await;
+        assert!(matches!(
+            hooks.close_drain_signal_outcome(),
+            Some(EmergencyControlSignalOutcome::AlreadySignaled {
+                signal: EmergencyControlSignal::Cancel,
+                ..
+            })
+        ));
+        hooks.release_before_tool_round_start();
+        let terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    terminal: SessionTurnTerminal::Interrupted(
+                        SessionTurnInterruption::UserCancelled,
+                    ),
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(terminal.turn_id(), Some(turn_id));
+        assert!(close.await.unwrap().is_ok());
+        assert!(!binding_invoked.load(Ordering::Acquire));
+        assert_eq!(model.request_count(), 1);
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert!(!recording.contains("interaction_requested"));
+        assert!(recording.contains("tool did not start"));
+        assert!(recording.contains("pre_execution"));
+        assert!(recording.contains("cancelled"));
+        assert!(!recording.contains("abandoned"));
+        assert!(!recording.contains("session_unloaded"));
+        assert!(!recording.contains("final text"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn presentation_permit_first_completion_still_publishes_and_settles_turn_cancelled() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_tool_round_calls(
+            &[
+                ("call_question", "echo", "{\"value\":1}"),
+                ("call_sibling", "echo", "{\"value\":2}"),
+            ],
+            "final text",
+        );
+        let binding_invoked = Arc::new(AtomicBool::new(false));
+        let factory_invoked = Arc::new(AtomicBool::new(false));
+        let tool_set = scripted_question_round_tool_set(
+            Arc::new({
+                let binding_invoked = Arc::clone(&binding_invoked);
+                move |_| {
+                    binding_invoked.store(true, Ordering::Release);
+                    ToolExecutionResult::PreExecution {
+                        disposition: crate::tools::ToolResultDisposition::Succeeded,
+                        content: crate::tools::ToolResultContent::from_text_parts(vec![
+                            "must not be bound".to_owned(),
+                        ])
+                        .unwrap(),
+                    }
+                }
+            }),
+            Arc::new({
+                let factory_invoked = Arc::clone(&factory_invoked);
+                move || {
+                    factory_invoked.store(true, Ordering::Release);
+                    Box::pin(
+                        async move { ToolExecutionResult::completed_text("must not run").unwrap() },
+                    )
+                }
+            }),
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let hooks = loaded.executor.test_hooks();
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        // The barrier is armed before the submit, so the worker cannot pass the
+        // presentation point before the host Cancel lands: the worker reserves the
+        // presentation permit first-wins (no signal yet) and then parks — no completion is
+        // sent yet, so the actor's pending map is still empty when the host cancels.
+        hooks.arm_after_interaction_presentation_reserved();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        hooks.wait_after_interaction_presentation_reserved().await;
+        // The worker holds the won presentation permit but has not published any completion
+        // yet: the pending map is still empty when the exact Turn Cancel is accepted.
+        assert!(
+            loaded
+                .executor
+                .snapshot()
+                .await
+                .unwrap()
+                .pending_interactions()
+                .is_empty()
+        );
+        assert!(
+            loaded
+                .executor
+                .cancel(
+                    SessionCancelTarget::Turn(turn_id),
+                    "2026-08-08T10:16:00.000Z".parse().unwrap(),
+                )
+                .await
+                .is_ok()
+        );
+        // The permit-first presentation still publishes: the worker resumes, the
+        // owner-generated RequestId completion reaches the actor, which applies + records
+        // the interaction request and then settles it with the exact TurnCancelled reason
+        // (the host Cancel won first-wins on the Turn basis).  The question settles the
+        // matching cancelled-before-start PreExecution Cancelled and the cancelled Turn
+        // interrupts with the exact UserCancelled terminal — the binding and the ordinary
+        // sibling's factory never run and no next Model ever runs.
+        hooks.release_after_interaction_presentation_reserved();
+        let terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    terminal: SessionTurnTerminal::Interrupted(
+                        SessionTurnInterruption::UserCancelled,
+                    ),
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(terminal.turn_id(), Some(turn_id));
+        assert!(!binding_invoked.load(Ordering::Acquire));
+        assert!(!factory_invoked.load(Ordering::Acquire));
+        assert_eq!(model.request_count(), 1);
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert_eq!(recording.matches("interaction_requested").count(), 1);
+        assert_eq!(recording.matches("interaction_resolved").count(), 1);
+        assert!(recording.contains("turn_cancelled"));
+        assert_eq!(recording.matches("tool did not start").count(), 2);
+        assert_eq!(recording.matches("\"pre_execution\"").count(), 2);
+        assert!(recording.contains("cancelled"));
+        assert!(!recording.contains("succeeded"));
+        assert!(!recording.contains("must not be bound"));
+        assert!(!recording.contains("must not run"));
+        assert!(!recording.contains("final text"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn presentation_permit_first_survives_close_and_records_the_unloaded_resolution() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_tool_round_calls(
+            &[
+                ("call_question", "echo", "{\"value\":1}"),
+                ("call_sibling", "echo", "{\"value\":2}"),
+            ],
+            "final text",
+        );
+        let binding_invoked = Arc::new(AtomicBool::new(false));
+        let factory_invoked = Arc::new(AtomicBool::new(false));
+        let tool_set = scripted_question_round_tool_set(
+            Arc::new({
+                let binding_invoked = Arc::clone(&binding_invoked);
+                move |_| {
+                    binding_invoked.store(true, Ordering::Release);
+                    ToolExecutionResult::PreExecution {
+                        disposition: crate::tools::ToolResultDisposition::Succeeded,
+                        content: crate::tools::ToolResultContent::from_text_parts(vec![
+                            "must not be bound".to_owned(),
+                        ])
+                        .unwrap(),
+                    }
+                }
+            }),
+            Arc::new({
+                let factory_invoked = Arc::clone(&factory_invoked);
+                move || {
+                    factory_invoked.store(true, Ordering::Release);
+                    Box::pin(
+                        async move { ToolExecutionResult::completed_text("must not run").unwrap() },
+                    )
+                }
+            }),
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let hooks = loaded.executor.test_hooks();
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        // The worker reserves the presentation permit first-wins (no signal yet) and parks
+        // before any completion is sent, so the actor's pending map is still empty when
+        // close begins.
+        hooks.arm_after_interaction_presentation_reserved();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        hooks.wait_after_interaction_presentation_reserved().await;
+        // Close starts while the worker holds the won presentation permit: `request_closing`
+        // already signaled the active Turn basis PrepareForUnload synchronously, so the
+        // drain's re-attempt records the exact AlreadySignaled { signal: PrepareForUnload }
+        // outcome and cancels the Turn token only after the signal — the close-drain signal
+        // probe confirms it before the worker is released.
+        let executor = loaded.executor.clone();
+        let close = tokio::spawn(async move { executor.close().await });
+        hooks.await_close_drain_signal_processed().await;
+        assert!(matches!(
+            hooks.close_drain_signal_outcome(),
+            Some(EmergencyControlSignalOutcome::AlreadySignaled {
+                signal: EmergencyControlSignal::PrepareForUnload,
+                ..
+            })
+        ));
+        // The permit-first presentation still publishes: the worker resumes, the
+        // owner-generated RequestId completion reaches the drain's actor, which applies +
+        // records + inserts + publishes the pending interaction and then settles it with
+        // the exact observed PrepareForUnload => SessionUnloaded resolution.  The won
+        // presentation stage is never erased: the request and its resolution are both
+        // recorded exactly once, the question settles the matching cancelled-before-start
+        // outcome (its binding is never authorized), the sibling's factory never runs, and
+        // no next Model ever runs.
+        hooks.release_after_interaction_presentation_reserved();
+        let terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    terminal: SessionTurnTerminal::Interrupted(
+                        SessionTurnInterruption::PrepareForUnload,
+                    ),
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(terminal.turn_id(), Some(turn_id));
+        assert!(close.await.unwrap().is_ok());
+        assert!(!binding_invoked.load(Ordering::Acquire));
+        assert!(!factory_invoked.load(Ordering::Acquire));
+        assert_eq!(model.request_count(), 1);
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert_eq!(recording.matches("interaction_requested").count(), 1);
+        assert_eq!(recording.matches("interaction_resolved").count(), 1);
+        assert!(recording.contains("session_unloaded"));
+        assert_eq!(recording.matches("tool did not start").count(), 2);
+        assert_eq!(recording.matches("\"pre_execution\"").count(), 2);
+        assert!(recording.contains("cancelled"));
+        assert!(!recording.contains("succeeded"));
+        assert!(!recording.contains("must not be bound"));
+        assert!(!recording.contains("must not run"));
+        assert!(!recording.contains("final text"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closing_during_submit_to_turn_migration_preserves_sticky_unload_on_the_turn_basis() {
+        // The deterministic Submit→Turn migration gap regression: the admission worker
+        // already succeeded and the actor is parked immediately before the atomic emergency
+        // migration, so the Submit admission is still the current emergency target.
+        // `request_closing`'s synchronous close handoff (`signal_current`) signals the
+        // Submit basis PrepareForUnload first-wins; the migration must then preserve that
+        // exact signal on the new Turn basis at the checked-incremented epoch — never
+        // erased or duplicated by a split observe/retire/bind/re-signal sequence — the Turn
+        // must interrupt with the exact unload terminal without ever calling the Model, and
+        // the close must drain cleanly.  No yield/timeout/poll guess anywhere in the
+        // ordering: the barrier parks the actor, the synchronous handoff signals, the
+        // counted drain probe records the exact preserved-signal outcome on the migrated
+        // basis, and the subscription event carries the terminal.
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["must not run"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let emergency = loaded.executor.emergency_control_for_test();
+        hooks.arm_before_emergency_submit_to_turn_migration();
+        let command_id = CommandId::generate().unwrap();
+        let submit_executor = loaded.executor.clone();
+        let submit = tokio::spawn(async move {
+            submit_executor
+                .submit(
+                    command_id,
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("close before migration").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        // The admission worker succeeded and the actor is parked before the migration: the
+        // emergency basis is still the exact Submit admission, unsignaled.
+        hooks.wait_before_emergency_submit_to_turn_migration().await;
+        let submit_observation = emergency
+            .observe(EmergencyControlTarget::Submit(command_id))
+            .expect("the Submit admission owns the emergency target before the migration");
+        assert_eq!(submit_observation.signal(), None);
+        // The synchronous close handoff runs now: the current Submit basis carries the
+        // sticky PrepareForUnload first-wins before the migration is released.
+        loaded.executor.request_closing();
+        assert_eq!(
+            emergency
+                .observe(EmergencyControlTarget::Submit(command_id))
+                .and_then(|observation| observation.signal()),
+            Some(EmergencyControlSignal::PrepareForUnload)
+        );
+        hooks.release_before_emergency_submit_to_turn_migration();
+        // The atomic migration preserves the exact unload signal onto the new Turn basis at
+        // the checked-incremented epoch, and the submit resolves TurnStarted.
+        let turn_id = submit.await.unwrap().unwrap();
+        // The current Turn basis at drain time carries the preserved PrepareForUnload at the
+        // new epoch: the drain's re-attempt records the exact
+        // AlreadySignaled { epoch: submit epoch + 1, signal: PrepareForUnload } before the
+        // terminal retires the basis, so the preserved signal provably reached the Turn
+        // basis — a direct post-terminal observe would race the retirement, so the counted
+        // drain probe is the deterministic observation point.
+        hooks.await_close_drain_signal_processed().await;
+        assert_eq!(
+            hooks.close_drain_signal_outcome(),
+            Some(EmergencyControlSignalOutcome::AlreadySignaled {
+                epoch: submit_observation.epoch() + 1,
+                signal: EmergencyControlSignal::PrepareForUnload,
+            })
+        );
+        // The preserved signal drives the exact unload terminal.
+        let terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    terminal: SessionTurnTerminal::Interrupted(
+                        SessionTurnInterruption::PrepareForUnload,
+                    ),
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(terminal.turn_id(), Some(turn_id));
+        // The Model never ran, and the close drains cleanly with the preserved signal
+        // already won (no generic-first state, no fatal exit).
+        assert_eq!(model.request_count(), 0);
+        assert!(loaded.executor.close().await.is_ok());
+        loaded.state.close().await;
+        let _ = loaded.context;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_during_host_allow_apply_keeps_sticky_unload_before_the_allowed_future() {
+        // The deterministic record-await gap regression: the host Allow resolution is
+        // applied to live state, but `request_closing` runs before the resolution is
+        // recorded and sent to the worker.  The synchronous close handoff (`signal_current`)
+        // must make the sticky PrepareForUnload observable on the exact Turn basis before
+        // the closing token wakes anyone, so the worker's approval start gate sees the
+        // signal, the allowed future is never constructed, the slot settles the matching
+        // cancelled-before-start PreExecution Cancelled, and the Turn interrupts with the
+        // exact unload terminal — no yield/timeout/poll guess anywhere in the ordering.
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_resume",
+            "echo",
+            "{\"value\":1}",
+            "must not run",
+        );
+        let approval = crate::tools::live_approval_request_fixture_for("echo");
+        let allowed = ToolExecutionResult::completed_text("tool ran").unwrap();
+        let denied = ToolExecutionResult::PreExecution {
+            disposition: crate::tools::ToolResultDisposition::Denied,
+            content: crate::tools::ToolResultContent::from_text_parts(vec![format!(
+                "approval denied"
+            )])
+            .unwrap(),
+        };
+        let allowed_constructed = Arc::new(AtomicBool::new(false));
+        let tool_set = ToolSet::with_interaction_planner(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            {
+                let approval = approval.clone();
+                let allowed = allowed.clone();
+                let denied = denied.clone();
+                let allowed_constructed = Arc::clone(&allowed_constructed);
+                move |_| {
+                    let approval = approval.clone();
+                    let allowed = allowed.clone();
+                    let denied = denied.clone();
+                    let allowed_constructed = Arc::clone(&allowed_constructed);
+                    ToolExecutionPlan::Approval {
+                        request: approval,
+                        // The start factory marks construction: the sticky unload signal must
+                        // fail the start-gate reservation before it is ever invoked.
+                        allowed: ToolExecutionStart::new(move |_observer| {
+                            allowed_constructed.store(true, Ordering::Release);
+                            Box::pin(async move { allowed })
+                        }),
+                        denied,
+                    }
+                }
+            },
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let hooks = loaded.executor.test_hooks();
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The pending-interaction projection is published synchronously before the test
+        // probe wakes: one counted wait then one snapshot read observes the exact Approval
+        // publication — no timeout/yield/poll guess.
+        hooks.wait_pending_interaction_publication().await;
+        let pending = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(pending.pending_interactions().len(), 1);
+        assert_eq!(pending.current_turn(), Some(turn_id));
+        assert_eq!(model.request_count(), 1);
+        let request_id = *pending.pending_interactions()[0].request_id();
+        // Arm the barrier before the host resolve: the actor applies the Allow resolution
+        // to live state and then parks in the record-await gap.
+        hooks.arm_after_interaction_resolution_apply_before_record();
+        let resolve_executor = loaded.executor.clone();
+        let resolve = tokio::spawn(async move {
+            resolve_executor
+                .resolve_interaction(
+                    turn_id,
+                    *pending.pending_interactions()[0].item_id(),
+                    request_id,
+                    "irk_88888888888888888888888888888888".parse().unwrap(),
+                    InteractionResolutionInput::ToolApproval(
+                        crate::tools::ToolApprovalDecisionInput::Allow { option_index: 0 },
+                    ),
+                    "2026-08-08T10:17:00.000Z".parse().unwrap(),
+                )
+                .await
+        });
+        // The actor is parked after the host resolution apply and before the recorder
+        // await / worker send: the synchronous close handoff runs now and must make the
+        // sticky unload signal observable on the exact Turn basis.
+        hooks
+            .wait_after_interaction_resolution_apply_before_record()
+            .await;
+        loaded.executor.request_closing();
+        assert_eq!(
+            loaded
+                .executor
+                .emergency_control_for_test()
+                .observe(EmergencyControlTarget::Turn(turn_id))
+                .and_then(|observation| observation.signal()),
+            Some(EmergencyControlSignal::PrepareForUnload)
+        );
+        // Release: the host resolution settles along the existing owner path (record +
+        // publish + worker send), then the actor drains.  The drain's re-attempt records
+        // the exact AlreadySignaled { signal: PrepareForUnload } — the synchronous handoff
+        // won first, so nothing generic-first ever exists.
+        hooks.release_after_interaction_resolution_apply_before_record();
+        resolve.await.unwrap().unwrap();
+        let terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    terminal: SessionTurnTerminal::Interrupted(
+                        SessionTurnInterruption::PrepareForUnload,
+                    ),
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(terminal.turn_id(), Some(turn_id));
+        hooks.await_close_drain_signal_processed().await;
+        assert!(matches!(
+            hooks.close_drain_signal_outcome(),
+            Some(EmergencyControlSignalOutcome::AlreadySignaled {
+                signal: EmergencyControlSignal::PrepareForUnload,
+                ..
+            })
+        ));
+        // The allowed future was never constructed, no next Model ever ran, and the
+        // resolution was recorded before the unload terminal.
+        assert!(!allowed_constructed.load(Ordering::Acquire));
+        assert_eq!(model.request_count(), 1);
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert_eq!(recording.matches("interaction_requested").count(), 1);
+        assert_eq!(recording.matches("interaction_resolved").count(), 1);
+        assert_eq!(recording.matches("tool did not start").count(), 1);
+        assert_eq!(recording.matches("\"pre_execution\"").count(), 1);
+        assert!(recording.contains("cancelled"));
+        assert!(!recording.contains("succeeded"));
+        assert!(!recording.contains("tool ran"));
+        assert!(!recording.contains("must not run"));
+        assert!(!recording.contains("final text"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_during_host_resolution_reservation_owner_cancels_without_any_host_fact() {
+        // The host-resolution first-wins regression: a pending UserQuestion is presented
+        // and the actor is parked immediately after it dequeued/identified the active
+        // pending interaction but BEFORE the resolution permit is reserved.
+        // `request_closing`'s synchronous close handoff (`signal_current`) signals the Turn
+        // basis PrepareForUnload first-wins; when the actor resumes, the reservation must
+        // fail (signal-first) and the pending interaction must be owner-cancelled with the
+        // exact unload reason (apply + record + notify the waiter) — the host resolution is
+        // never applied, so no Allow/UserAnswer/Denied durable fact ever exists.  The
+        // question binding is never authorized, the sibling's factory never runs, every
+        // matching slot settles cancelled-before-start, the Turn interrupts with the exact
+        // unload terminal, and the host resolve settles the truthful Closing error.  No
+        // yield/timeout/poll guess anywhere in the ordering: the barrier parks the actor,
+        // the synchronous handoff signals, the release resumes, and the counted publication
+        // probe + subscription event carry the settlements.
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_tool_round_calls(
+            &[
+                ("call_question", "echo", "{\"value\":1}"),
+                ("call_sibling", "echo", "{\"value\":2}"),
+            ],
+            "final text",
+        );
+        let binding_invoked = Arc::new(AtomicBool::new(false));
+        let factory_invoked = Arc::new(AtomicBool::new(false));
+        let tool_set = scripted_question_round_tool_set(
+            Arc::new({
+                let binding_invoked = Arc::clone(&binding_invoked);
+                move |_| {
+                    binding_invoked.store(true, Ordering::Release);
+                    ToolExecutionResult::PreExecution {
+                        disposition: crate::tools::ToolResultDisposition::Succeeded,
+                        content: crate::tools::ToolResultContent::from_text_parts(vec![
+                            "must not be bound".to_owned(),
+                        ])
+                        .unwrap(),
+                    }
+                }
+            }),
+            Arc::new({
+                let factory_invoked = Arc::clone(&factory_invoked);
+                move || {
+                    factory_invoked.store(true, Ordering::Release);
+                    Box::pin(
+                        async move { ToolExecutionResult::completed_text("must not run").unwrap() },
+                    )
+                }
+            }),
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let hooks = loaded.executor.test_hooks();
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The pending-interaction projection is published synchronously before the test
+        // probe wakes: one counted wait then one snapshot read observes the exact
+        // UserQuestion publication — no timeout/yield/poll guess.
+        hooks.wait_pending_interaction_publication().await;
+        let pending = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(pending.pending_interactions().len(), 1);
+        assert_eq!(pending.current_turn(), Some(turn_id));
+        assert_eq!(model.request_count(), 1);
+        let request_id = *pending.pending_interactions()[0].request_id();
+        // Arm the barrier before the host resolve: the actor dequeues and identifies the
+        // active pending interaction and then parks immediately before the resolution
+        // permit is reserved.
+        hooks.arm_before_interaction_resolution_reservation();
+        let resolve_executor = loaded.executor.clone();
+        let resolve = tokio::spawn(async move {
+            resolve_executor
+                .resolve_interaction(
+                    turn_id,
+                    *pending.pending_interactions()[0].item_id(),
+                    request_id,
+                    "irk_88888888888888888888888888888888".parse().unwrap(),
+                    InteractionResolutionInput::UserAnswer(user_question_answer_fixture(
+                        "host answer",
+                    )),
+                    "2026-08-08T10:17:00.000Z".parse().unwrap(),
+                )
+                .await
+        });
+        // The actor is parked after identifying the active interaction and before the
+        // reservation: the synchronous close handoff runs now and must make the sticky
+        // unload signal observable on the exact Turn basis.
+        hooks.wait_before_interaction_resolution_reservation().await;
+        loaded.executor.request_closing();
+        assert_eq!(
+            loaded
+                .executor
+                .emergency_control_for_test()
+                .observe(EmergencyControlTarget::Turn(turn_id))
+                .and_then(|observation| observation.signal()),
+            Some(EmergencyControlSignal::PrepareForUnload)
+        );
+        // Release: the reservation loses first-wins, the actor owner-cancels the pending
+        // interaction with the exact unload reason (apply + record + notify the waiter),
+        // and the host request settles the truthful Closing error — no host fact is ever
+        // applied.
+        hooks.release_before_interaction_resolution_reservation();
+        assert_eq!(
+            resolve.await.unwrap(),
+            Err(SessionInteractionError::Closing)
+        );
+        let terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    terminal: SessionTurnTerminal::Interrupted(
+                        SessionTurnInterruption::PrepareForUnload,
+                    ),
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(terminal.turn_id(), Some(turn_id));
+        // The question binding was never authorized and the sibling's factory never ran.
+        assert!(!binding_invoked.load(Ordering::Acquire));
+        assert!(!factory_invoked.load(Ordering::Acquire));
+        assert_eq!(model.request_count(), 1);
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert_eq!(recording.matches("interaction_requested").count(), 1);
+        // The owner cancellation is the only resolution: no Allow/UserAnswer/Denied host
+        // fact was ever applied or recorded.
+        assert_eq!(recording.matches("interaction_resolved").count(), 1);
+        assert!(recording.contains("session_unloaded"));
+        assert_eq!(recording.matches("tool did not start").count(), 2);
+        assert_eq!(recording.matches("\"pre_execution\"").count(), 2);
+        assert!(recording.contains("cancelled"));
+        assert!(!recording.contains("succeeded"));
+        assert!(!recording.contains("must not be bound"));
+        assert!(!recording.contains("must not run"));
+        assert!(!recording.contains("final text"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreign_slot_observation_is_rejected_for_interaction_presentation() {
+        // The round owner handle A and a foreign handle B are both bound to the exact same
+        // Turn target (identical target + epoch, different opaque owner Arc): this is not a
+        // valid production round configuration (production round slots all carry the same
+        // owner's observation), and a slot whose observation belongs to the foreign handle
+        // must be rejected at every first-wins seam — it can never borrow the owner's
+        // basis, present an interaction, or reserve a start.  The owner's own slot on the
+        // same round stays unaffected.
+        let owner_control = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let owner_observation = owner_control.bind(target).unwrap();
+        let foreign_control = EmergencyControlHandle::new();
+        let foreign_observation = foreign_control.bind(target).unwrap();
+        assert_eq!(owner_observation.epoch(), foreign_observation.epoch());
+        let question_request = user_question_request_fixture();
+        let sibling_factory_constructed = Arc::new(AtomicBool::new(false));
+        let tool_set = ToolSet::with_interaction_planner(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            {
+                let sibling_factory_constructed = Arc::clone(&sibling_factory_constructed);
+                move |request| {
+                    let call_id = request.call().tool_call_id().clone();
+                    if call_id.as_str() == "call_question" {
+                        ToolExecutionPlan::UserQuestion {
+                            request: question_request.clone(),
+                            answer: UserQuestionAnswerBinding::new(move |answer| {
+                                let text = match answer.answers()[0].value() {
+                                    crate::tools::UserQuestionAnswerValue::Text(text) => {
+                                        text.as_ref().to_owned()
+                                    }
+                                    crate::tools::UserQuestionAnswerValue::Choice { .. } => {
+                                        panic!("wrong answer family")
+                                    }
+                                };
+                                ToolExecutionResult::PreExecution {
+                                    disposition: crate::tools::ToolResultDisposition::Succeeded,
+                                    content: crate::tools::ToolResultContent::from_text_parts(
+                                        vec![format!("question answered: {text}")],
+                                    )
+                                    .unwrap(),
+                                }
+                            }),
+                        }
+                    } else {
+                        let sibling_factory_constructed = Arc::clone(&sibling_factory_constructed);
+                        ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                            sibling_factory_constructed.store(true, Ordering::Release);
+                            Box::pin(async move {
+                                ToolExecutionResult::completed_text("sibling ran").unwrap()
+                            })
+                        }))
+                    }
+                }
+            },
+        );
+        // Input order is question (call_index 1) first, sibling (call_index 0) second; the
+        // round sorts by call_index, so the sibling is the first slot.
+        let requests = [
+            ToolExecutionRequest::new(
+                "itm_0000000000000000000000000000000d".parse().unwrap(),
+                ToolCall::new(
+                    "call_question".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    1,
+                ),
+            ),
+            ToolExecutionRequest::new(
+                "itm_0000000000000000000000000000000e".parse().unwrap(),
+                ToolCall::new(
+                    "call_sibling".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    0,
+                ),
+            ),
+        ];
+        // The question slot carries the FOREIGN observation under the owner control: the
+        // exact-owner check rejects its presentation before any RequestId is generated.  The
+        // sibling carries the owner's own observation and runs normally.
+        let slots = vec![
+            ToolOperationSlot::new(requests[0].clone(), &owner_control, foreign_observation),
+            ToolOperationSlot::new(requests[1].clone(), &owner_control, owner_observation),
+        ];
+        let (interaction_completion_sender, mut interaction_receiver) = mpsc::unbounded_channel();
+        let results = execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        )
+        .await;
+        // The foreign observation never presented: no InteractionRequested completion was
+        // ever published, so no pending interaction can exist for the foreign slot.
+        assert!(interaction_receiver.try_recv().is_err());
+        // The question slot settled the truthful stale cancelled-before-start outcome on
+        // the foreign basis instead of borrowing the owner's unsignaled basis to present.
+        assert!(matches!(
+            &results[1],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: crate::tools::ToolResultDisposition::Cancelled,
+                ..
+            } if item_id == &requests[0].item_id()
+                && tool_call_id == requests[0].call().tool_call_id()
+        ));
+        // The owner's own slot on the same round is unaffected: it ran and completed.
+        assert!(sibling_factory_constructed.load(Ordering::Acquire));
+        assert!(matches!(
+            &results[0],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                content,
+            } if item_id == &requests[1].item_id()
+                && tool_call_id == requests[1].call().tool_call_id()
+                && content.parts()[0].as_text() == "sibling ran"
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreign_slot_observation_is_rejected_for_start_reservation() {
+        // The round owner handle A and a foreign handle B are both bound to the exact same
+        // Turn target (identical target + epoch, different opaque owner Arc).  The second
+        // slot carries the foreign observation under the owner control: its start
+        // reservation is rejected by the exact-owner check in normal release code (never a
+        // debug_assert), so it settles the truthful stale cancelled-before-start outcome
+        // and its start factory is never constructed — while the owner's own slot on the
+        // same round runs to its natural completion.
+        let owner_control = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let owner_observation = owner_control.bind(target).unwrap();
+        let foreign_control = EmergencyControlHandle::new();
+        let foreign_observation = foreign_control.bind(target).unwrap();
+        assert_eq!(owner_observation.epoch(), foreign_observation.epoch());
+        let started = [
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        ];
+        let started_by_executor = started.clone();
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let release_first_by_executor = release_first.clone();
+        let tool_set = ToolSet::with_cancellable_executor(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            move |request, _observer| {
+                let index = request.call().call_index();
+                let started = started_by_executor.clone();
+                let release_first = release_first_by_executor.clone();
+                Box::pin(async move {
+                    started[index as usize].notify_one();
+                    if index == 0 {
+                        // The owner's own slot completes naturally once the test releases it.
+                        release_first.notified().await;
+                        ToolExecutionResult::completed_text("first ran").unwrap()
+                    } else {
+                        panic!("the foreign slot's factory must never be constructed")
+                    }
+                })
+            },
+        );
+        let requests = [
+            ToolExecutionRequest::new(
+                "itm_0000000000000000000000000000000f".parse().unwrap(),
+                ToolCall::new(
+                    "call_first".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    0,
+                ),
+            ),
+            ToolExecutionRequest::new(
+                "itm_00000000000000000000000000000010".parse().unwrap(),
+                ToolCall::new(
+                    "call_second".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    1,
+                ),
+            ),
+        ];
+        let slots = vec![
+            ToolOperationSlot::new(requests[0].clone(), &owner_control, owner_observation),
+            ToolOperationSlot::new(requests[1].clone(), &owner_control, foreign_observation),
+        ];
+        let (interaction_completion_sender, _) = mpsc::unbounded_channel();
+        let release = tokio::spawn(async move {
+            // The owner's own slot started; release it to its natural completion.  The
+            // foreign slot never started (its reservation was rejected before any
+            // factory), so nothing ever signals the foreign handle.
+            started[0].notified().await;
+            release_first.notify_one();
+        });
+        let results = execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        )
+        .await;
+        release.await.unwrap();
+        // The owner's own slot completed naturally as an Executed Succeeded result.
+        assert!(matches!(
+            &results[0],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                content,
+            } if item_id == &requests[0].item_id()
+                && tool_call_id == requests[0].call().tool_call_id()
+                && content.parts()[0].as_text() == "first ran"
+        ));
+        // The foreign slot's start reservation was rejected by the exact-owner check: it
+        // settled the truthful stale cancelled-before-start outcome and its factory was
+        // never constructed.
+        assert!(matches!(
+            &results[1],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: crate::tools::ToolResultDisposition::Cancelled,
+                ..
+            } if item_id == &requests[1].item_id()
+                && tool_call_id == requests[1].call().tool_call_id()
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_with_a_foreign_tool_name_fails_closed_without_any_interaction_request() {
+        // The approval exact-binding invariant: an approval whose view tool name does not
+        // match the exact request's call name (an echo ToolCall presented a write_file
+        // approval) is validated in normal release code before any presentation.  The same
+        // slot fails closed to the identity-bound Abandoned OutcomeUnknown outcome — no
+        // InteractionRequested is ever generated or recorded, and no gate is reserved or
+        // start factory constructed.
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        let request = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000011".parse().unwrap(),
+            ToolCall::new(
+                "call_echo".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        let allowed_constructed = Arc::new(AtomicBool::new(false));
+        let tool_set = ToolSet::with_interaction_planner(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            {
+                let allowed_constructed = Arc::clone(&allowed_constructed);
+                move |_| {
+                    let allowed_constructed = Arc::clone(&allowed_constructed);
+                    ToolExecutionPlan::Approval {
+                        // The mismatched fixture: write_file approval for an echo request.
+                        request: crate::tools::live_approval_request_fixture(),
+                        allowed: ToolExecutionStart::new(move |_observer| {
+                            allowed_constructed.store(true, Ordering::Release);
+                            Box::pin(async move {
+                                ToolExecutionResult::completed_text("must not run").unwrap()
+                            })
+                        }),
+                        denied: ToolExecutionResult::PreExecution {
+                            disposition: crate::tools::ToolResultDisposition::Denied,
+                            content: crate::tools::ToolResultContent::from_text_parts(vec![
+                                "approval denied".to_owned(),
+                            ])
+                            .unwrap(),
+                        },
+                    }
+                }
+            },
+        );
+        let slots = vec![ToolOperationSlot::new(
+            request.clone(),
+            &emergency,
+            observation,
+        )];
+        let (interaction_completion_sender, mut interaction_receiver) = mpsc::unbounded_channel();
+        let results = execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        )
+        .await;
+        // No interaction was ever requested: the mismatched approval never reached any
+        // presentation, RequestId generation, or pending interaction.
+        assert!(interaction_receiver.try_recv().is_err());
+        // The exact-binding invariant failed closed on the same slot: identity-bound
+        // Abandoned OutcomeUnknown.
+        assert!(matches!(
+            &results[0],
+            ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: crate::tools::ToolAbandonReason::OutcomeUnknown,
+            } if item_id == &request.item_id()
+                && tool_call_id == request.call().tool_call_id()
+        ));
+        // The allowed-path start factory was never constructed.
+        assert!(!allowed_constructed.load(Ordering::Acquire));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -14400,7 +18036,7 @@ mod tests {
         let observation = emergency
             .observe(EmergencyControlTarget::Turn(turn_id))
             .expect("the active Turn owns the emergency target");
-        assert!(emergency.retire(observation));
+        assert!(emergency.retire(&observation));
         tokio::time::advance(std::time::Duration::from_secs(2)).await;
         assert_eq!(
             wait_for_terminal(&loaded.executor, turn_id).await,
@@ -14461,7 +18097,7 @@ mod tests {
         let observation = emergency.bind(target).unwrap();
         assert!(emergency_control_is_unsignaled_current(
             &emergency,
-            observation
+            &observation
         ));
         assert!(matches!(
             emergency.signal(target, EmergencyControlSignal::SecurityRevoked),
@@ -14469,12 +18105,12 @@ mod tests {
         ));
         assert!(!emergency_control_is_unsignaled_current(
             &emergency,
-            observation
+            &observation
         ));
-        assert!(emergency.retire(observation));
+        assert!(emergency.retire(&observation));
         assert!(!emergency_control_is_unsignaled_current(
             &emergency,
-            observation
+            &observation
         ));
     }
 
@@ -14575,6 +18211,199 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn signal_before_tool_round_start_wins_over_frozen_preexecution_panic_and_execute() {
+        let store = TempStore::new();
+        // Mixed round: a known tool with a frozen PreExecution result, a known tool whose
+        // planner panics (frozen Abandoned outcome), and a known tool with an Execute plan
+        // whose start factory must never run.  (A genuinely unknown tool cannot pass the
+        // Model gateway's exact tool-name validation in an integrated round, so the frozen
+        // unknown/unavailable outcome is covered by the direct pre-signaled round test
+        // below; the mechanism it proves is the same first-wins settlement.)
+        let model = ScriptedModelFixture::with_tool_round_calls(
+            &[
+                ("call_preflight", "echo", "{\"value\":1}"),
+                ("call_panic", "echo", "{\"value\":2}"),
+                ("call_exec", "echo", "{\"value\":3}"),
+            ],
+            "must not run",
+        );
+        let factory_invoked = Arc::new(AtomicBool::new(false));
+        let tool_set = ToolSet::with_interaction_planner(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            {
+                let factory_invoked = Arc::clone(&factory_invoked);
+                move |request| match request.call().tool_call_id().as_str() {
+                    "call_preflight" => {
+                        ToolExecutionPlan::PreExecution(ToolExecutionResult::PreExecution {
+                            disposition: crate::tools::ToolResultDisposition::Succeeded,
+                            content: crate::tools::ToolResultContent::from_text_parts(vec![
+                                "custom preflight must not survive the signal".to_owned(),
+                            ])
+                            .unwrap(),
+                        })
+                    }
+                    "call_panic" => panic!("scripted planner panic"),
+                    "call_exec" => {
+                        let factory_invoked = Arc::clone(&factory_invoked);
+                        ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                            factory_invoked.store(true, Ordering::Release);
+                            Box::pin(async move {
+                                ToolExecutionResult::completed_text("must not run").unwrap()
+                            })
+                        }))
+                    }
+                    _ => unreachable!("only the three scripted calls are planned"),
+                }
+            },
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_before_tool_round_start();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run mixed round").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The Turn worker built the prepared operation slots and is parked before the
+        // round: the signal now wins first-wins before any planning or driving, over every
+        // frozen PreExecution/planner-panic outcome and every Execute reservation.
+        hooks.wait_before_tool_round_start().await;
+        assert!(
+            loaded
+                .executor
+                .cancel(
+                    SessionCancelTarget::Turn(turn_id),
+                    "2026-08-08T10:06:00.000Z".parse().unwrap(),
+                )
+                .await
+                .is_ok()
+        );
+        hooks.release_before_tool_round_start();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Interrupted(SessionTurnInterruption::UserCancelled)
+        );
+        assert_eq!(model.request_count(), 1);
+        // The signal already won before planning/driving: every unstarted result — the
+        // frozen PreExecution, the planner-panic frozen Abandoned, and the Execute
+        // reservation — settles the matching PreExecution Cancelled "tool did not start".
+        // No custom/abandoned outcome survives, no factory ever ran, and no next Model
+        // ran.
+        assert!(!factory_invoked.load(Ordering::Acquire));
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert_eq!(recording.matches("tool did not start").count(), 3);
+        assert_eq!(recording.matches("\"pre_execution\"").count(), 3);
+        assert!(recording.contains("cancelled"));
+        assert!(!recording.contains("tool is unavailable"));
+        assert!(!recording.contains("custom preflight must not survive the signal"));
+        assert!(!recording.contains("abandoned"));
+        assert!(!recording.contains("must not run"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn signal_first_settles_frozen_unknown_unavailable_to_cancelled_before_start() {
+        // Direct pre-signaled round: the unknown tool freezes the identity-bound
+        // unavailable outcome on its same Prepared slot, and the already-won signal settles
+        // it to the matching PreExecution Cancelled "tool did not start" through the exact
+        // unstarted settlement first-wins — never the unavailable outcome.
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        let tool_set = ToolSet::with_interaction_planner(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            move |request| {
+                if request.call().tool_call_id().as_str() == "call_ghost" {
+                    panic!("the unknown tool is never handed to the planner");
+                }
+                ToolExecutionPlan::Execute(ToolExecutionStart::new(|_observer| {
+                    Box::pin(async { ToolExecutionResult::completed_text("must not run").unwrap() })
+                }))
+            },
+        );
+        let requests = [
+            ToolExecutionRequest::new(
+                "itm_00000000000000000000000000000001".parse().unwrap(),
+                ToolCall::new(
+                    "call_ghost".parse().unwrap(),
+                    "ghost".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    0,
+                ),
+            ),
+            ToolExecutionRequest::new(
+                "itm_00000000000000000000000000000002".parse().unwrap(),
+                ToolCall::new(
+                    "call_echo".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    1,
+                ),
+            ),
+        ];
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
+            .collect::<Vec<_>>();
+        // The signal wins first-wins before any planning or driving.
+        assert_eq!(
+            emergency.signal(target, EmergencyControlSignal::Cancel),
+            EmergencyControlSignalOutcome::Accepted { epoch: 1 }
+        );
+        let (interaction_completion_sender, _) = mpsc::unbounded_channel();
+        let results = execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        )
+        .await;
+        // Both the frozen unknown/unavailable outcome and the Execute reservation settle
+        // the matching PreExecution Cancelled "tool did not start"; no unavailable outcome
+        // and no abandoned outcome ever survives.
+        for (request, result) in requests.iter().zip(&results) {
+            assert!(matches!(
+                result,
+                ToolExecutionOutcome::Completed {
+                    item_id,
+                    tool_call_id,
+                    source: ToolOutcomeSource::PreExecution,
+                    disposition: crate::tools::ToolResultDisposition::Cancelled,
+                    content,
+                } if item_id == &request.item_id()
+                    && tool_call_id == request.call().tool_call_id()
+                    && content.parts()[0].as_text() == "tool did not start"
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn pre_execution_plan_settles_without_reserving_the_gate_and_later_serial_requests_still_settle()
      {
         let emergency = EmergencyControlHandle::new();
@@ -14632,7 +18461,7 @@ mod tests {
         ];
         let slots = requests
             .iter()
-            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation))
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
             .collect::<Vec<_>>();
         // The gate clones share each slot gate's state, so the post-round assertions observe
         // whether the slot's own gate was reserved.
@@ -14734,7 +18563,7 @@ mod tests {
         ];
         let slots = requests
             .iter()
-            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation))
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
             .collect::<Vec<_>>();
         let panic_gate = slots[0].gate().clone();
         let ok_gate = slots[1].gate().clone();
@@ -14775,6 +18604,301 @@ mod tests {
         assert!(matches!(
             ok_gate.reserve(&requests[1]),
             Err(ToolStartError::InvalidBinding)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_factory_panic_fails_closed_that_exact_request_and_later_serial_requests_still_settle()
+     {
+        let emergency = EmergencyControlHandle::new();
+        let observation = emergency
+            .bind(EmergencyControlTarget::Turn(
+                "trn_77777777777777777777777777777777".parse().unwrap(),
+            ))
+            .unwrap();
+        let tool_set = ToolSet::with_interaction_planner(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            move |request| {
+                if request.call().tool_call_id().as_str() == "call_factory_panic" {
+                    ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                        panic!("scripted start factory panic")
+                    }))
+                } else {
+                    ToolExecutionPlan::Execute(ToolExecutionStart::new(|_observer| {
+                        Box::pin(async { ToolExecutionResult::completed_text("tool ran").unwrap() })
+                    }))
+                }
+            },
+        );
+        let requests = [
+            ToolExecutionRequest::new(
+                "itm_00000000000000000000000000000003".parse().unwrap(),
+                ToolCall::new(
+                    "call_factory_panic".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    0,
+                ),
+            ),
+            ToolExecutionRequest::new(
+                "itm_00000000000000000000000000000004".parse().unwrap(),
+                ToolCall::new(
+                    "call_ok".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    1,
+                ),
+            ),
+        ];
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
+            .collect::<Vec<_>>();
+        let (interaction_completion_sender, _) = mpsc::unbounded_channel();
+        let results = execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        )
+        .await;
+        // The panicking start factory is caught inside the Tools run constructor with the
+        // consumed Prepared parts/request still owned: the same slot fails closed to
+        // identity-bound Abandoned RuntimeFailure and the later Serial request still
+        // settles.
+        assert!(matches!(
+            &results[0],
+            ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: crate::tools::ToolAbandonReason::RuntimeFailure,
+            } if item_id == &requests[0].item_id()
+                && tool_call_id == requests[0].call().tool_call_id()
+        ));
+        assert!(matches!(
+            &results[1],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                ..
+            } if item_id == &requests[1].item_id()
+                && tool_call_id == requests[1].call().tool_call_id()
+        ));
+        // The factory panicked before any executor future existed; the panicked slot still
+        // consumed itself into Terminal through the same slot, and the sibling's gate was
+        // consumed exactly once by its own start.
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn executor_run_panic_maps_through_the_same_slot_to_abandoned_runtime_failure() {
+        let emergency = EmergencyControlHandle::new();
+        let observation = emergency
+            .bind(EmergencyControlTarget::Turn(
+                "trn_77777777777777777777777777777777".parse().unwrap(),
+            ))
+            .unwrap();
+        let tool_set = ToolSet::with_interaction_planner(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            |request| {
+                if request.call().tool_call_id().as_str() == "call_exec_panic" {
+                    ToolExecutionPlan::Execute(ToolExecutionStart::new(|_observer| {
+                        Box::pin(async { panic!("scripted executor panic") })
+                    }))
+                } else {
+                    ToolExecutionPlan::Execute(ToolExecutionStart::new(|_observer| {
+                        Box::pin(async { ToolExecutionResult::completed_text("tool ran").unwrap() })
+                    }))
+                }
+            },
+        );
+        let requests = [
+            ToolExecutionRequest::new(
+                "itm_00000000000000000000000000000005".parse().unwrap(),
+                ToolCall::new(
+                    "call_exec_panic".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    0,
+                ),
+            ),
+            ToolExecutionRequest::new(
+                "itm_00000000000000000000000000000006".parse().unwrap(),
+                ToolCall::new(
+                    "call_ok".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    1,
+                ),
+            ),
+        ];
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
+            .collect::<Vec<_>>();
+        let (interaction_completion_sender, _) = mpsc::unbounded_channel();
+        let results = execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        )
+        .await;
+        // The panicking executor run is caught inside the slot's own run wrapper using its
+        // still-owned exact request: the same Running slot maps to identity-bound Abandoned
+        // RuntimeFailure, and the parallel sibling still settles.
+        assert!(matches!(
+            &results[0],
+            ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: crate::tools::ToolAbandonReason::RuntimeFailure,
+            } if item_id == &requests[0].item_id()
+                && tool_call_id == requests[0].call().tool_call_id()
+        ));
+        assert!(matches!(
+            &results[1],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                ..
+            } if item_id == &requests[1].item_id()
+                && tool_call_id == requests[1].call().tool_call_id()
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn signal_path_executor_panic_maps_through_the_settling_slot_to_abandoned_runtime_failure()
+     {
+        let emergency = EmergencyControlHandle::new();
+        let observation = emergency
+            .bind(EmergencyControlTarget::Turn(
+                "trn_77777777777777777777777777777777".parse().unwrap(),
+            ))
+            .unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_by_executor = Arc::clone(&started);
+        let signal_delivered = Arc::new(tokio::sync::Notify::new());
+        let signal_delivered_by_executor = Arc::clone(&signal_delivered);
+        let tool_set = ToolSet::with_cancellable_executor(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            move |request, observer| {
+                if request.call().tool_call_id().as_str() == "call_exec_panic" {
+                    let started = Arc::clone(&started_by_executor);
+                    let signal_delivered = Arc::clone(&signal_delivered_by_executor);
+                    Box::pin(async move {
+                        started.notify_one();
+                        observer.cancelled().await;
+                        signal_delivered.notify_one();
+                        panic!("scripted executor panic during signal cleanup")
+                    })
+                } else {
+                    Box::pin(
+                        async move { ToolExecutionResult::completed_text("tool ran").unwrap() },
+                    )
+                }
+            },
+        );
+        let requests = [
+            ToolExecutionRequest::new(
+                "itm_00000000000000000000000000000007".parse().unwrap(),
+                ToolCall::new(
+                    "call_exec_panic".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    0,
+                ),
+            ),
+            ToolExecutionRequest::new(
+                "itm_00000000000000000000000000000008".parse().unwrap(),
+                ToolCall::new(
+                    "call_ok".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    1,
+                ),
+            ),
+        ];
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
+            .collect::<Vec<_>>();
+        let (interaction_completion_sender, _) = mpsc::unbounded_channel();
+        let round = tokio::spawn(async move {
+            execute_gated_tool_round(
+                tool_set,
+                slots,
+                "trn_77777777777777777777777777777777".parse().unwrap(),
+                interaction_completion_sender,
+                Arc::new(SessionExecutorTestHooksInner::new()),
+            )
+            .await
+        });
+        // The panicking executor started and is awaiting its own cancellation: the signal
+        // wins first-wins and the slot's Settling path keeps awaiting the same run wrapper.
+        started.notified().await;
+        assert_eq!(
+            emergency.signal(
+                EmergencyControlTarget::Turn(
+                    "trn_77777777777777777777777777777777".parse().unwrap()
+                ),
+                EmergencyControlSignal::Cancel,
+            ),
+            EmergencyControlSignalOutcome::Accepted { epoch: 1 }
+        );
+        signal_delivered.notified().await;
+        let results = round.await.unwrap();
+        // The executor panic during signal cleanup is caught by the Settling slot's run
+        // wrapper with the still-owned exact request: identity-bound Abandoned
+        // RuntimeFailure, never a fabricated outcome, and the sibling still settles.
+        assert!(matches!(
+            &results[0],
+            ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: crate::tools::ToolAbandonReason::RuntimeFailure,
+            } if item_id == &requests[0].item_id()
+                && tool_call_id == requests[0].call().tool_call_id()
+        ));
+        assert!(matches!(
+            &results[1],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                ..
+            } if item_id == &requests[1].item_id()
+                && tool_call_id == requests[1].call().tool_call_id()
         ));
     }
 
@@ -14838,7 +18962,7 @@ mod tests {
         ];
         let slots = requests
             .iter()
-            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation))
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
             .collect::<Vec<_>>();
         let gates = slots
             .iter()
@@ -15133,7 +19257,7 @@ mod tests {
         ];
         let slots = requests
             .iter()
-            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation))
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
             .collect::<Vec<_>>();
         let (interaction_completion_sender, _) = mpsc::unbounded_channel();
         let signal_handle = emergency.clone();
@@ -15254,7 +19378,7 @@ mod tests {
             .collect::<Vec<_>>();
         let slots = requests
             .iter()
-            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation))
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
             .collect::<Vec<_>>();
         let (interaction_completion_sender, _) = mpsc::unbounded_channel();
         let signal_handle = emergency.clone();
@@ -15317,9 +19441,7 @@ mod tests {
             "{\"value\":1}",
             "must not run",
         );
-        let request_id: RequestId = "req_88888888888888888888888888888888".parse().unwrap();
-        let interaction_request =
-            InteractionRequest::tool_approval(crate::tools::live_approval_request_fixture());
+        let approval = crate::tools::live_approval_request_fixture_for("echo");
         let allowed = ToolExecutionResult::completed_text("tool ran").unwrap();
         let denied = ToolExecutionResult::PreExecution {
             disposition: crate::tools::ToolResultDisposition::Denied,
@@ -15340,18 +19462,17 @@ mod tests {
                 .unwrap(),
             ],
             {
-                let interaction_request = interaction_request.clone();
+                let approval = approval.clone();
                 let allowed = allowed.clone();
                 let denied = denied.clone();
                 let allowed_polled = Arc::clone(&allowed_polled);
                 move |_| {
-                    let interaction_request = interaction_request.clone();
+                    let approval = approval.clone();
                     let allowed = allowed.clone();
                     let denied = denied.clone();
                     let allowed_polled = Arc::clone(&allowed_polled);
-                    ToolExecutionPlan::Interaction {
-                        request_id,
-                        request: interaction_request,
+                    ToolExecutionPlan::Approval {
+                        request: approval,
                         // The start factory marks construction: the resume revalidation must
                         // fail before it is ever invoked.
                         allowed: ToolExecutionStart::new(move |_observer| {
@@ -15388,6 +19509,9 @@ mod tests {
         })
         .await
         .expect("the Interaction request is projected");
+        // The owner generated the RequestId at presentation time; the test takes it from the
+        // projected pending interaction.
+        let request_id = *pending.pending_interactions()[0].request_id();
         // The host allows first; the worker receives the resolution and parks at the resume
         // revalidation barrier, where the signal now wins first-wins.
         hooks.arm_before_tool_resume();

@@ -150,12 +150,14 @@ impl fmt::Debug for InteractionRequest {
 }
 
 impl InteractionRequest {
-    #[cfg(test)]
+    /// The Session concrete Tool control constructs the exact owner request for one Tool
+    /// approval presentation.
     pub(crate) fn tool_approval(request: ToolApprovalRequest) -> Self {
         Self::ToolApproval(request)
     }
 
-    #[cfg(test)]
+    /// The Session concrete Tool control constructs the exact owner request for one
+    /// UserQuestion presentation.
     pub(crate) fn user_question(request: UserQuestionRequest) -> Self {
         Self::UserQuestion(request)
     }

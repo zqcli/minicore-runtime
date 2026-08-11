@@ -1,5 +1,6 @@
 use std::fmt;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -8,9 +9,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::turn_item_interaction::{
-    InteractionRequest, InteractionResolution, ResolvedInteraction,
-};
 use crate::wire::lexical::{
     LexicalError, canonical_json_string_len, normalize_newlines, validate_opaque_ascii,
     validate_safe_text, validate_stable_symbolic_key,
@@ -382,27 +380,109 @@ impl ToolExecutionStart {
     }
 }
 
+/// The move-only, redacted answer binding for one exact UserQuestion plan.
+///
+/// The planner attaches the FnOnce that turns the typed host answer into a ToolResult; only
+/// the owner path (`bind`) may invoke it, and the binding is deliberately not Clone: an
+/// answer is consumed exactly once by exactly the one question operation that presented it.
+pub(crate) struct UserQuestionAnswerBinding {
+    bind: Box<dyn FnOnce(UserQuestionAnswer) -> ToolExecutionResult + Send>,
+}
+
+impl UserQuestionAnswerBinding {
+    /// Test-visible constructor for scripted planners; the M8 executor adapter supplies the
+    /// production constructor.
+    #[cfg(test)]
+    pub(crate) fn new(
+        bind: impl FnOnce(UserQuestionAnswer) -> ToolExecutionResult + Send + 'static,
+    ) -> Self {
+        Self {
+            bind: Box::new(bind),
+        }
+    }
+
+    /// The owner-only answer bind: consumes the binding, invokes the producer with the typed
+    /// host answer, and binds the resulting ToolResult truthfully for the exact request.
+    ///
+    /// Only a `PreExecution { disposition: Succeeded, .. }` shape is a truthful answered
+    /// question result (the question is answered before any execution, and a succeeded
+    /// pre-execution is the only disposition that can honestly represent the host answer); an
+    /// explicit `Abandoned` passes its reason through unchanged.  Every malformed answered
+    /// shape (`Completed`, or a `PreExecution` that is Failed/Denied/Cancelled) is an
+    /// invariant that fails closed to identity-bound Abandoned OutcomeUnknown.
+    pub(crate) fn bind(
+        self,
+        request: &ToolExecutionRequest,
+        answer: UserQuestionAnswer,
+    ) -> ToolExecutionOutcome {
+        let item_id = request.item_id();
+        let tool_call_id = request.call().tool_call_id().clone();
+        match (self.bind)(answer) {
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Succeeded,
+                content,
+            } => ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: ToolResultDisposition::Succeeded,
+                content,
+            },
+            ToolExecutionResult::Abandoned { reason } => ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason,
+            },
+            ToolExecutionResult::Completed { .. } | ToolExecutionResult::PreExecution { .. } => {
+                ToolExecutionOutcome::Abandoned {
+                    item_id,
+                    tool_call_id,
+                    reason: ToolAbandonReason::OutcomeUnknown,
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Debug for UserQuestionAnswerBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("UserQuestionAnswerBinding { .. }")
+    }
+}
+
 /// The synchronous pre-start plan one Tool executor produces for one exact request.
 ///
 /// The plan is produced before any start-gate reservation and its start factory is never
 /// invoked by the plan producer: an `Execute` plan holds its factory uninvoked, an
-/// `Interaction` plan is presented to the host before the start gate is ever involved, and a
-/// `PreExecution` plan carries a frozen preflight result that never reaches the start gate.
-/// The start gate decides whether the factory may construct a future; this slice covers
-/// exactly that start seam, not a fuller operation slot.
+/// `Approval`/`UserQuestion` plan is presented to the host before the start gate is ever
+/// involved, and a `PreExecution` plan carries a frozen preflight result that never reaches
+/// the start gate.  The start gate decides whether the factory may construct a future; this
+/// slice covers exactly that start seam, not a fuller operation slot.
 #[allow(
     dead_code,
     reason = "concrete executors/plans are cfg(test) until the M8 executor lands; production ToolSets are empty"
 )]
 pub(crate) enum ToolExecutionPlan {
     Execute(ToolExecutionStart),
-    Interaction {
-        request_id: crate::wire::RequestId,
-        request: InteractionRequest,
+    /// One Tool approval: the host is presented the exact typed approval request before any
+    /// start-gate involvement; the allowed-path start factory is invoked only after the host
+    /// allows and the exact request's start reservation wins at resume, while a denied or
+    /// owner-cancelled approval settles the exact denied (or cancelled) PreExecution result
+    /// without ever reserving the gate.
+    Approval {
+        request: ToolApprovalRequest,
         /// The allowed-path start factory: invoked only after the host allows and the exact
         /// request's start reservation wins at resume.
         allowed: ToolExecutionStart,
         denied: ToolExecutionResult,
+    },
+    /// One UserQuestion: the host is presented the exact typed question and the answer is
+    /// consumed by the move-only answer binding.  A question never reserves a start gate and
+    /// never constructs any start factory: the binding produces the truthful answered
+    /// ToolResult (or an explicit Abandoned reason) directly.
+    UserQuestion {
+        request: UserQuestionRequest,
+        answer: UserQuestionAnswerBinding,
     },
     /// A frozen known-tool preflight result (schema, policy, hook, or sandbox preflight): the
     /// request settles as PreExecution without any start-gate reservation and the executor is
@@ -747,9 +827,9 @@ impl ToolSet {
     }
 
     /// Test-only planner constructor for scripted pre-start plans.  The planner returns the
-    /// exact plan synchronously: an `Interaction` plan is produced before any start-gate
-    /// reservation, so the host interaction is presented first and the gate is only involved
-    /// at approval resume.
+    /// exact plan synchronously: an `Approval`/`UserQuestion` plan is produced before any
+    /// start-gate reservation, so the host interaction is presented first and the gate is
+    /// only involved at approval resume.
     #[cfg(test)]
     pub(crate) fn with_interaction_planner(
         definitions: Vec<ToolDefinition>,
@@ -806,9 +886,9 @@ impl ToolSet {
     }
 
     /// The identity-bound cancelled-before-start outcome for one exact request.  Generated by
-    /// the Tools owner when the start reservation loses to a signal (or a stale basis): the
-    /// executor is never polled, so the round still records a matching PreExecution Cancelled
-    /// ToolResult instead of abandoning the whole exchange.
+    /// the Tools owner when the start reservation (or the exact unstarted settlement) loses to
+    /// a signal (or a stale basis): the executor is never polled, so the round still records a
+    /// matching PreExecution Cancelled ToolResult instead of abandoning the whole exchange.
     pub(crate) fn cancelled_before_start_outcome(
         request: &ToolExecutionRequest,
     ) -> ToolExecutionOutcome {
@@ -817,7 +897,24 @@ impl ToolSet {
             tool_call_id: request.call().tool_call_id().clone(),
             source: ToolOutcomeSource::PreExecution,
             disposition: ToolResultDisposition::Cancelled,
-            content: ToolResultContent::cancelled_before_start(),
+            content: ToolResultContent::did_not_start(),
+        }
+    }
+
+    /// The identity-bound failed-before-start outcome for one exact request: an unstarted
+    /// plan that was not meant to run at all (an abandoned exchange sibling) settles a
+    /// truthful PreExecution Failed with the same generic bounded content as the cancelled
+    /// path.  The executor is never polled, so no domain content exists; the request never
+    /// reserves a gate.
+    pub(crate) fn failed_before_start_outcome(
+        request: &ToolExecutionRequest,
+    ) -> ToolExecutionOutcome {
+        ToolExecutionOutcome::Completed {
+            item_id: request.item_id(),
+            tool_call_id: request.call().tool_call_id().clone(),
+            source: ToolOutcomeSource::PreExecution,
+            disposition: ToolResultDisposition::Failed,
+            content: ToolResultContent::did_not_start(),
         }
     }
 
@@ -843,33 +940,66 @@ impl ToolSet {
         if !request.is_exact_capture(proof.request()) {
             return Err(abandoned_runtime_failure(request));
         }
-        let future = start.start(observer);
+        // The start factory is the one caller-supplied synchronous step on the started path
+        // (the executor future itself is caught by the caller's run wrapper): a panicking
+        // factory must fail closed to the exact request's identity-bound Abandoned outcome
+        // while the consumed Prepared parts/request remain owned by the caller, so the slot
+        // still consumes itself into Terminal here and no unrelated Terminal is manufactured.
+        let future = match std::panic::catch_unwind(AssertUnwindSafe(|| start.start(observer))) {
+            Ok(future) => future,
+            Err(_) => return Err(abandoned_runtime_failure(request)),
+        };
         let request = request.clone();
         Ok(Box::pin(async move {
             Self::bind_started_result(&request, future.await)
         }))
     }
 
-    /// The pre-start settlement decision for one resolved Interaction.
+    /// The minimal approval settlement from the exact request's private decision.
     ///
-    /// `Resume` means the host allowed: the caller must revalidate the exact request's start
-    /// gate and only then execute the allowed future.  Deny and owner cancellation never
-    /// reserve the gate; they settle the exact denied (or cancelled) PreExecution result
-    /// directly.
-    pub(crate) fn interaction_settlement(
-        resolution: &ResolvedInteraction,
+    /// `AllowOnce` resumes through the exact request's start gate.  `Deny` settles the exact
+    /// denied shape through the same pre-execution binding as any other unstarted result,
+    /// fail-closed: only a valid `PreExecution { disposition: Denied }` is preserved, an
+    /// explicit `Abandoned` passes its reason through, and any other `PreExecution`
+    /// disposition or any `Completed` shape (a malformed deny plan) becomes `Abandoned
+    /// OutcomeUnknown` — a never-started operation can never be disguised as an executed
+    /// ToolResult or as a different pre-execution outcome.  Owner cancellation is never an
+    /// approval decision: the caller settles it through `bind_approval_cancellation` under
+    /// the same pre-execution binding.
+    pub(crate) fn approval_settlement(
+        decision: &ToolApprovalDecision,
         denied: &ToolExecutionResult,
-    ) -> InteractionSettlement {
-        match resolution.live() {
-            InteractionResolution::ToolApproval(ToolApprovalDecision::Deny) => {
-                InteractionSettlement::PreExecution(denied.clone())
+    ) -> ApprovalSettlement {
+        match decision {
+            ToolApprovalDecision::AllowOnce => ApprovalSettlement::Resume,
+            ToolApprovalDecision::Deny => {
+                ApprovalSettlement::PreExecution(Self::denied_settlement_result(denied))
             }
-            InteractionResolution::Cancelled(_) => {
-                InteractionSettlement::PreExecution(Self::cancelled_result(denied.clone()))
+        }
+    }
+
+    /// The private fail-closed Deny-shape projection: only a valid `PreExecution { disposition:
+    /// Denied }` (preserved exactly) or an explicit `Abandoned` (reason preserved) is
+    /// accepted; any other `PreExecution` disposition or any `Completed` shape projects
+    /// `Abandoned OutcomeUnknown` so the generic pre-execution binder can never emit a
+    /// fabricated outcome from a malformed deny plan.
+    fn denied_settlement_result(denied: &ToolExecutionResult) -> ToolExecutionResult {
+        match denied {
+            result @ ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Denied,
+                ..
             }
-            InteractionResolution::ToolApproval(_) | InteractionResolution::UserAnswer(_) => {
-                InteractionSettlement::Resume
-            }
+            | result @ ToolExecutionResult::Abandoned { .. } => result.clone(),
+            ToolExecutionResult::Completed { .. }
+            | ToolExecutionResult::PreExecution {
+                disposition:
+                    ToolResultDisposition::Succeeded
+                    | ToolResultDisposition::Failed
+                    | ToolResultDisposition::Cancelled,
+                ..
+            } => ToolExecutionResult::Abandoned {
+                reason: ToolAbandonReason::OutcomeUnknown,
+            },
         }
     }
 
@@ -952,16 +1082,48 @@ impl ToolSet {
         }
     }
 
+    /// The approval cancellation binding: one exact owner/host-cancelled approval settles its
+    /// identity-bound cancelled pre-execution outcome directly, without exposing the raw
+    /// cancellation rewrite to Session Execution.  Only a valid `PreExecution { disposition:
+    /// Denied }` plan is rewritten to Cancelled (content preserved) under the same
+    /// pre-execution binding; an explicit `Abandoned` passes its reason through, and any
+    /// other `PreExecution` disposition or any malformed `Completed` shape fails closed to
+    /// Abandoned OutcomeUnknown — a cancellation is never fabricated from a malformed plan.
+    pub(crate) fn bind_approval_cancellation(
+        request: &ToolExecutionRequest,
+        denied: ToolExecutionResult,
+    ) -> ToolExecutionOutcome {
+        Self::bind_preexecution_result(request, Self::cancelled_result(denied))
+    }
+
+    /// The private approval cancellation rewrite: one exact denied preflight result with its
+    /// disposition rewritten to Cancelled (content preserved).  Only a valid `PreExecution`
+    /// Denied shape is rewritten; an explicit `Abandoned` passes its reason through
+    /// unchanged, and every other shape — a `PreExecution` with any other disposition or a
+    /// malformed `Completed` — projects `Abandoned OutcomeUnknown` so the same pre-execution
+    /// binding fails it closed and a cancelled approval can never be disguised as an
+    /// executed ToolResult or as a different pre-execution outcome.  Only the owner's
+    /// `bind_approval_cancellation` uses it; Session Execution never receives the raw result.
     fn cancelled_result(result: ToolExecutionResult) -> ToolExecutionResult {
         match result {
-            ToolExecutionResult::Completed { content, .. }
-            | ToolExecutionResult::PreExecution { content, .. } => {
-                ToolExecutionResult::PreExecution {
-                    disposition: ToolResultDisposition::Cancelled,
-                    content,
-                }
-            }
-            ToolExecutionResult::Abandoned { reason } => ToolExecutionResult::Abandoned { reason },
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Denied,
+                content,
+            } => ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Cancelled,
+                content,
+            },
+            other @ ToolExecutionResult::Abandoned { .. } => other,
+            ToolExecutionResult::Completed { .. }
+            | ToolExecutionResult::PreExecution {
+                disposition:
+                    ToolResultDisposition::Succeeded
+                    | ToolResultDisposition::Failed
+                    | ToolResultDisposition::Cancelled,
+                ..
+            } => ToolExecutionResult::Abandoned {
+                reason: ToolAbandonReason::OutcomeUnknown,
+            },
         }
     }
 
@@ -976,13 +1138,12 @@ impl ToolSet {
     }
 }
 
-/// The pre-start settlement decision for one resolved Interaction.
-pub(crate) enum InteractionSettlement {
+/// The pre-start settlement decision for one resolved Tool approval.
+pub(crate) enum ApprovalSettlement {
     /// The host allowed: resume through the exact request's start gate and only then execute
     /// the allowed future.
     Resume,
-    /// The host denied or owner-cancelled: settle as pre-execution without any start-gate
-    /// reservation.
+    /// The host denied: settle as pre-execution without any start-gate reservation.
     PreExecution(ToolExecutionResult),
 }
 
@@ -1068,9 +1229,10 @@ impl ToolResultContent {
         }
     }
 
-    /// The bounded generic content for one exact tool that was cancelled before its start
-    /// gate reservation: the executor was never polled, so no domain content exists.
-    fn cancelled_before_start() -> Self {
+    /// The bounded generic content for one exact tool that never started: the executor was
+    /// never polled, so no domain content exists.  Shared by the cancelled-before-start and
+    /// failed-before-start outcomes.
+    fn did_not_start() -> Self {
         Self {
             parts: Arc::from([ToolResultContentPart::Text(ToolResultText(Arc::from(
                 "tool did not start",
@@ -1498,6 +1660,15 @@ impl ToolApprovalRequest {
         }
     }
 
+    /// Validates the exact-binding invariant that one approval belongs to one exact Tool
+    /// request, in normal release code (never `debug_assert`-only): the approval view's tool
+    /// name must be the exact request's call name.  A mismatched approval is never
+    /// presented; the consuming slot fails closed to the identity-bound Abandoned
+    /// OutcomeUnknown outcome without any interaction request, gate, or start factory.
+    pub(crate) fn matches_request(&self, request: &ToolExecutionRequest) -> bool {
+        self.view().tool_name() == request.call().name()
+    }
+
     /// Validates that both halves of an approval settlement came from this exact request.
     ///
     /// The safe resolution alone is deliberately insufficient for an allow: the private
@@ -1530,8 +1701,11 @@ impl ToolApprovalRequest {
     }
 }
 
+/// Test-only fixture for one legitimate live approval request bound to the exact tool name
+/// the session tests execute (the echo calls in round tests), so the approval's tool name
+/// matches the exact `ToolExecutionRequest` call name.
 #[cfg(test)]
-pub(crate) fn live_approval_request_fixture() -> ToolApprovalRequest {
+pub(crate) fn live_approval_request_fixture_for(tool_name: &str) -> ToolApprovalRequest {
     let requirements = ToolRequirementSummaryView::new(None, None, None).unwrap();
     let option = ToolApprovalOptionView::new(
         0,
@@ -1541,7 +1715,7 @@ pub(crate) fn live_approval_request_fixture() -> ToolApprovalRequest {
     )
     .unwrap();
     let view = ToolApprovalRequestView::new(
-        "write_file".parse().unwrap(),
+        tool_name.parse().unwrap(),
         "path: src/lib.rs",
         "write requested",
         requirements,
@@ -1553,6 +1727,11 @@ pub(crate) fn live_approval_request_fixture() -> ToolApprovalRequest {
         vec![ToolApprovalOption::new(option, ToolApprovalDecision::AllowOnce).unwrap()],
     )
     .unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn live_approval_request_fixture() -> ToolApprovalRequest {
+    live_approval_request_fixture_for("write_file")
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -2083,7 +2262,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
-    use crate::turn_item_interaction::{InteractionCancelReason, InteractionResolutionInput};
 
     async fn run_planned_execution(
         set: Arc<ToolSet>,
@@ -2548,47 +2726,289 @@ mod tests {
     }
 
     #[test]
-    fn interaction_settlement_denies_and_cancels_without_resume_and_allows_resume() {
-        let interaction = InteractionRequest::tool_approval(live_approval_request_fixture());
+    fn approval_settlement_allows_resume_denies_preexecution_and_cancellation_rewrites_the_denied_result()
+     {
+        let request = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000001".parse().unwrap(),
+            ToolCall::new(
+                "call_1".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
         let denied_result = ToolExecutionResult::PreExecution {
             disposition: ToolResultDisposition::Denied,
             content: ToolResultContent::from_text_parts(vec!["approval denied".to_owned()])
                 .unwrap(),
         };
-        let denied = interaction
-            .resolve_host(InteractionResolutionInput::ToolApproval(
-                ToolApprovalDecisionInput::Deny,
-            ))
-            .unwrap();
-        let cancelled =
-            ResolvedInteraction::cancelled_by_owner(InteractionCancelReason::TurnCancelled)
-                .unwrap();
-        let allowed = interaction
-            .resolve_host(InteractionResolutionInput::ToolApproval(
-                ToolApprovalDecisionInput::Allow { option_index: 0 },
-            ))
-            .unwrap();
-
         assert!(matches!(
-            ToolSet::interaction_settlement(&denied, &denied_result),
-            InteractionSettlement::PreExecution(result)
-                if matches!(result, ToolExecutionResult::PreExecution {
+            ToolSet::approval_settlement(&ToolApprovalDecision::AllowOnce, &denied_result),
+            ApprovalSettlement::Resume
+        ));
+        // A host Deny accepts only a valid PreExecution Denied (preserved exactly) or an
+        // explicit Abandoned (reason preserved); every other shape fails closed to Abandoned
+        // OutcomeUnknown through the same pre-execution binder.
+        assert!(matches!(
+            ToolSet::approval_settlement(&ToolApprovalDecision::Deny, &denied_result),
+            ApprovalSettlement::PreExecution(result)
+                if matches!(&result, ToolExecutionResult::PreExecution {
                     disposition: ToolResultDisposition::Denied,
-                    ..
-                })
+                    content,
+                } if content.parts()[0].as_text() == "approval denied")
         ));
         assert!(matches!(
-            ToolSet::interaction_settlement(&cancelled, &denied_result),
-            InteractionSettlement::PreExecution(result)
-                if matches!(result, ToolExecutionResult::PreExecution {
-                    disposition: ToolResultDisposition::Cancelled,
-                    ..
+            ToolSet::approval_settlement(
+                &ToolApprovalDecision::Deny,
+                &ToolExecutionResult::Abandoned {
+                    reason: ToolAbandonReason::RuntimeFailure,
+                },
+            ),
+            ApprovalSettlement::PreExecution(result)
+                if matches!(result, ToolExecutionResult::Abandoned {
+                    reason: ToolAbandonReason::RuntimeFailure,
                 })
         ));
+        for malformed in [
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Succeeded,
+                content: ToolResultContent::from_text_parts(vec!["must not settle".to_owned()])
+                    .unwrap(),
+            },
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Failed,
+                content: ToolResultContent::from_text_parts(vec!["must not settle".to_owned()])
+                    .unwrap(),
+            },
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Cancelled,
+                content: ToolResultContent::from_text_parts(vec!["must not settle".to_owned()])
+                    .unwrap(),
+            },
+            ToolExecutionResult::completed_text("must not settle").unwrap(),
+            ToolExecutionResult::Completed {
+                disposition: ToolResultDisposition::Denied,
+                content: ToolResultContent::from_text_parts(vec!["must not settle".to_owned()])
+                    .unwrap(),
+            },
+        ] {
+            assert!(matches!(
+                ToolSet::approval_settlement(&ToolApprovalDecision::Deny, &malformed),
+                ApprovalSettlement::PreExecution(result)
+                    if matches!(result, ToolExecutionResult::Abandoned {
+                        reason: ToolAbandonReason::OutcomeUnknown,
+                    })
+            ));
+            // The generic pre-execution binder never fabricates a different outcome from the
+            // fail-closed projection.
+            assert!(matches!(
+                ToolSet::bind_preexecution_result(
+                    &request,
+                    ToolSet::denied_settlement_result(&malformed)
+                ),
+                ToolExecutionOutcome::Abandoned {
+                    reason: ToolAbandonReason::OutcomeUnknown,
+                    ..
+                }
+            ));
+        }
+        // The cancellation helper preserves the denied content and rewrites the disposition
+        // to Cancelled, so an owner/host-cancelled approval settles a matching cancelled
+        // pre-execution under the same pre-execution binding.
         assert!(matches!(
-            ToolSet::interaction_settlement(&allowed, &denied_result),
-            InteractionSettlement::Resume
+            ToolSet::cancelled_result(denied_result),
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Cancelled,
+                content,
+            } if content.parts()[0].as_text() == "approval denied"
         ));
+        // An explicit Abandoned passes its reason through unchanged.
+        assert!(matches!(
+            ToolSet::cancelled_result(ToolExecutionResult::Abandoned {
+                reason: ToolAbandonReason::RuntimeFailure,
+            }),
+            ToolExecutionResult::Abandoned {
+                reason: ToolAbandonReason::RuntimeFailure,
+            }
+        ));
+        // Every other shape is never rewritten: a PreExecution with any disposition other
+        // than Denied, or a malformed Completed shape (including Denied), projects Abandoned
+        // OutcomeUnknown so the same pre-execution binding fails it closed (a cancelled
+        // approval can never be disguised as an executed ToolResult or as a different
+        // pre-execution outcome), and no cancellation is fabricated from a malformed plan.
+        for malformed in [
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Succeeded,
+                content: ToolResultContent::from_text_parts(vec!["must not rewrite".to_owned()])
+                    .unwrap(),
+            },
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Failed,
+                content: ToolResultContent::from_text_parts(vec!["must not rewrite".to_owned()])
+                    .unwrap(),
+            },
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Cancelled,
+                content: ToolResultContent::from_text_parts(vec!["must not rewrite".to_owned()])
+                    .unwrap(),
+            },
+            ToolExecutionResult::completed_text("must not rewrite").unwrap(),
+            ToolExecutionResult::Completed {
+                disposition: ToolResultDisposition::Denied,
+                content: ToolResultContent::from_text_parts(vec!["must not rewrite".to_owned()])
+                    .unwrap(),
+            },
+        ] {
+            assert!(matches!(
+                ToolSet::cancelled_result(malformed.clone()),
+                ToolExecutionResult::Abandoned {
+                    reason: ToolAbandonReason::OutcomeUnknown,
+                }
+            ));
+            assert!(matches!(
+                ToolSet::bind_approval_cancellation(&request, malformed),
+                ToolExecutionOutcome::Abandoned {
+                    reason: ToolAbandonReason::OutcomeUnknown,
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            ToolSet::bind_approval_cancellation(
+                &request,
+                ToolExecutionResult::Abandoned {
+                    reason: ToolAbandonReason::RuntimeFailure,
+                },
+            ),
+            ToolExecutionOutcome::Abandoned {
+                reason: ToolAbandonReason::RuntimeFailure,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn user_question_answer_binding_is_redacted_and_binds_only_truthful_answered_shapes() {
+        let request = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000001".parse().unwrap(),
+            ToolCall::new(
+                "call_1".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        let answer =
+            UserQuestionAnswer::new(vec![UserQuestionFieldAnswer::text(0, "yes").unwrap()])
+                .unwrap();
+
+        // The binding is move-only and its Debug is fully redacted: neither the answer nor
+        // any produced content is reachable through it.
+        let binding = UserQuestionAnswerBinding::new(|_| ToolExecutionResult::PreExecution {
+            disposition: ToolResultDisposition::Succeeded,
+            content: ToolResultContent::from_text_parts(vec!["SECRET-ANSWER".to_owned()]).unwrap(),
+        });
+        assert_eq!(format!("{binding:?}"), "UserQuestionAnswerBinding { .. }");
+        assert!(matches!(
+            binding.bind(&request, answer.clone()),
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: ToolResultDisposition::Succeeded,
+                content,
+            } if item_id == request.item_id()
+                && tool_call_id == *request.call().tool_call_id()
+                && content.parts()[0].as_text() == "SECRET-ANSWER"
+        ));
+
+        // The producer reads the typed answer through the FnOnce: the binding is the exact
+        // owner path that turns the typed host answer into the answered ToolResult.
+        let binding = UserQuestionAnswerBinding::new(|answer| {
+            let text = match answer.answers()[0].value() {
+                UserQuestionAnswerValue::Text(text) => text.as_ref().to_owned(),
+                UserQuestionAnswerValue::Choice { .. } => panic!("wrong answer family"),
+            };
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Succeeded,
+                content: ToolResultContent::from_text_parts(vec![format!("answered: {text}")])
+                    .unwrap(),
+            }
+        });
+        assert!(matches!(
+            binding.bind(&request, answer.clone()),
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: ToolResultDisposition::Succeeded,
+                content,
+            } if item_id == request.item_id()
+                && tool_call_id == *request.call().tool_call_id()
+                && content.parts()[0].as_text() == "answered: yes"
+        ));
+
+        // An explicit Abandoned passes its reason through unchanged.
+        let binding = UserQuestionAnswerBinding::new(|_| ToolExecutionResult::Abandoned {
+            reason: ToolAbandonReason::RuntimeFailure,
+        });
+        assert!(matches!(
+            binding.bind(&request, answer.clone()),
+            ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: ToolAbandonReason::RuntimeFailure,
+            } if item_id == request.item_id()
+                && tool_call_id == *request.call().tool_call_id()
+        ));
+    }
+
+    #[test]
+    fn user_question_answer_binding_fails_closed_on_malformed_answered_shapes() {
+        let request = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000001".parse().unwrap(),
+            ToolCall::new(
+                "call_1".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        let answer =
+            UserQuestionAnswer::new(vec![UserQuestionFieldAnswer::text(0, "yes").unwrap()])
+                .unwrap();
+        // A Completed shape after a question is an invariant: the executor never ran, so an
+        // answered question can never be disguised as an executed ToolResult.
+        for malformed in [
+            ToolExecutionResult::completed_text("ran").unwrap(),
+            ToolExecutionResult::Completed {
+                disposition: ToolResultDisposition::Denied,
+                content: ToolResultContent::from_text_parts(vec!["denied".to_owned()]).unwrap(),
+            },
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Failed,
+                content: ToolResultContent::from_text_parts(vec!["failed".to_owned()]).unwrap(),
+            },
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Denied,
+                content: ToolResultContent::from_text_parts(vec!["denied".to_owned()]).unwrap(),
+            },
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Cancelled,
+                content: ToolResultContent::from_text_parts(vec!["cancelled".to_owned()]).unwrap(),
+            },
+        ] {
+            let binding = UserQuestionAnswerBinding::new(move |_| malformed.clone());
+            assert!(matches!(
+                binding.bind(&request, answer.clone()),
+                ToolExecutionOutcome::Abandoned {
+                    item_id,
+                    tool_call_id,
+                    reason: ToolAbandonReason::OutcomeUnknown,
+                } if item_id == request.item_id()
+                    && tool_call_id == *request.call().tool_call_id()
+            ));
+        }
     }
 
     #[test]

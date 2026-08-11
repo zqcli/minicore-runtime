@@ -1,6 +1,6 @@
 # Turn、Item 与 Interaction 架构设计
 
-状态：当前权威架构（ADR 0134后；当前implemented scope为crate-private Scripted vertical slice——Tool/Interaction/Cancel与crate-private `ToolOperationSlot`完整生命周期（first-wins start gate、Running best-effort cancellation与truthful settle）已实现，生产实现未启动）
+状态：当前权威架构（ADR 0134后；当前implemented scope为crate-private Scripted vertical slice——Tool/Interaction/Cancel与crate-private `ToolOperationSlot`完整生命周期（first-wins start gate、Running best-effort cancellation与truthful settle）及crate-private scripted approval/UserQuestion控制seam（typed `ToolExecutionPlan::{Approval, UserQuestion}`、move-only `UserQuestionAnswerBinding`、hoisted exclusive question调度与signal-first settlement）已实现，生产实现未启动）
 日期：2026-07-31
 
 ## 目的
@@ -212,7 +212,7 @@ start reservation前Cancel/SecurityRevoked获胜时Tool不执行。Running后获
 
 INV-401 start first-wins已落地：每个exact `ToolExecutionRequest` capture（ItemId + same `Arc<ToolCall>`）绑定slot自己的`ToolStartGate` lock-free slot（`ToolOperationSlot::Prepared`，不存在第二层round-level gate），reservation在EmergencyControl owner mutex内对exact unsignaled target/epoch执行、与`signal`在同一mutex线性化，move-only `ToolStartPermit`→`ToolStartedExecution` proof后`run_started_execution`复验exact capture并调用factory构造future；signal/stale先赢→不调用factory、matching PreExecution Cancelled ToolResult，reservation/start先赢→signal只触发operation cancellation observer、slot经Settling继续await same run后truthful settle（started run不因signal drop），exact Executed/Abandoned。Running best-effort cancellation已由`ToolOperationSlot` Running（`ToolCancellationHandle`）+ Settling实现；production ToolService/executor/adapter teardown与mutation permit attachment to Settling仍pending。
 
-SessionRecorder不参与Tool start，不记录`ToolExecutionStarted`。process crash可能丢失side-effect事实，restart不自动重跑Tool。
+SessionRecorder不参与Tool start，不记录`ToolExecutionStarted`。process crash可能丢失side-effect事实，restart不自动重跑Tool。UserQuestion/ask-user绝不预留ToolStartGate或mutation ticket（hoisted exclusive question调度，见[UserQuestion](#userquestion)）；Cancel/SecurityRevoked/Unload signal-first跳过binding并settle全部unstarted calls为matching PreExecution Cancelled。
 
 ## Complete Tool Exchange
 
@@ -362,6 +362,8 @@ construct typed request
 
 notify/resume等待当前inline append attempt返回；recording failure转为Degraded后仍继续Interaction。successful write不表示flush或fsync。
 
+request candidate（`InteractionRequestCandidate`）绑定exact ItemId + 已started ToolCallId + request body（mismatch在reducer apply与EntryId allocation前以typed error拒绝）；presentation经`InteractionPresentationPermit`在Emergency owner mutex内与signal first-wins（signal-first不生成RequestId、不publish pending interaction）；append-before-notify与resolution-before-resume顺序不变。
+
 first live terminal resolution wins：
 
 - Presentation Adapter为每一次逻辑Resolve生成不可预测random 128-bit `InteractionResolutionKey`，retry exact same canonical resolution时复用；
@@ -392,7 +394,7 @@ Tool policy = Ask
 └─ Cancelled before start → PreExecution Cancelled ToolResult
 ```
 
-approval只对当前call有效。MVP不持久化Session/Turn grant。
+approval只对当前call有效。MVP不持久化Session/Turn grant。Approval request tool name必须与exact request call name一致（`matches_request`，mismatch fail closed为identity-bound Abandoned、绝不present/record）；host resolution经`InteractionResolutionPermit`在Emergency owner mutex内与signal/close first-wins后才apply（signal-first不apply并settle pending interaction为对应cancellation）。
 
 ## UserQuestion
 
@@ -403,14 +405,17 @@ Ask-user Tool使用Interaction：
 ```text
 assistant asks ask-user ToolCall
 → live ToolInvocation Started
+→ 按typed plan shape（`ToolExecutionPlan::UserQuestion`）识别并hoisted到全部ordinary sibling之前
 → InteractionRequested(UserQuestion)
 → await answer
-→ answer converted to truthful ToolResult
+→ answer经move-only `UserQuestionAnswerBinding`绑定为truthful PreExecution Succeeded ToolResult
 → complete exchange
 → next Model
 ```
 
 UserAnswer不是UserMessage，不创建新Turn，也不进入Steer queue。MVP UserQuestion只允许[Tools定义的non-secret Text/SingleChoice fields](tools.md#approval-and-question-types)。question/answer完整值可以进入live state、JSONL、Interaction event/history和PreExecution ToolResult，并可能发送给模型；不得用于credential/password/token收集。任何future secret input必须建立独立secure host port与non-recorded one-time reference，不能只给当前request增加`secret: true`。
+
+当前crate-private scripted实现状态：question由typed plan shape识别、hoisted到全部ordinary sibling之前按call_index串行驱动、至多一个pending；每个question outcome（answer或owner cancellation）先apply live+inline record attempt再继续；等待期间phase为`WaitingForUserInput`；question不预留ToolStartGate或mutation ticket、不构造start factory；valid answer经move-only/redacted `UserQuestionAnswerBinding::bind`产生identity-bound `PreExecution + Succeeded`（malformed/panic fail closed为identity-bound Abandoned OutcomeUnknown）；Cancel/SecurityRevoked/Unload signal-first跳过binding并settle全部unstarted calls为matching PreExecution Cancelled；presentation/resolution/binding permit-first各阶段settle truthfully；abandoned question对remaining无副作用（known preflight保留、其余unstarted为PreExecution Failed）。production ask-user builtin ToolName、schema与answer→model-visible ToolResult的text/render格式仍未冻结/实现。
 
 ## Cancel与Terminal Cleanup
 
