@@ -65,11 +65,12 @@ impl CanonicalFileUri {
         &self.wire
     }
 
-    #[allow(
-        dead_code,
-        reason = "Workspace durable store encoding will use this crate-private wire seam"
-    )]
-    pub(crate) fn from_decoded_parts(
+    /// Constructs the canonical RFC 8089 wire value from already decoded,
+    /// family-tagged path parts. Hosts should use this typed constructor instead
+    /// of interpolating native paths into URI strings: it validates the selected
+    /// family and authority, applies canonical percent encoding, and then
+    /// re-parses the exact wire form through the same public grammar.
+    pub fn from_decoded_parts(
         family: FileUriFamily,
         authority: Option<&str>,
         decoded_path: &str,

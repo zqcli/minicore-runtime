@@ -20,7 +20,15 @@ use crate::wire::{BoundedJsonObject, BoundedJsonSchema, Money, ProtocolLimits};
 
 mod anthropic_messages;
 mod openai_responses;
+mod provider_installation;
 mod provider_transport;
+
+pub(crate) use provider_installation::ProviderSourceBuildError;
+pub use provider_installation::{
+    CredentialSource, CredentialSourceFuture, ModelProviderConfig, ModelProviderConfigError,
+    ModelProviderDescriptor, ModelProviderDescriptorError, ModelReasoningSupport,
+    ProviderCredential, ProviderCredentialError, ProviderEndpointPolicy,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ModelIdentityError {
@@ -75,6 +83,42 @@ macro_rules! stable_model_identity {
 
 stable_model_identity!(ProviderId, false);
 stable_model_identity!(ModelId, true);
+
+/// The private validated provider wire model name. It is deliberately separate from
+/// the stable `ModelId`: the durable identity never changes, while the provider API
+/// model name may need to differ (and stays invisible to hosts and to durable
+/// provenance). It is not a stable identity: it is validated as non-empty printable
+/// opaque ASCII within 256 bytes (no control characters, spaces, quotes, or
+/// backslashes) so provider names such as OpenAI fine-tune names containing `:`
+/// parse. Debug always redacts the value.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ApiModelName(Box<str>);
+
+impl ApiModelName {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for ApiModelName {
+    type Err = ProviderOpaqueValueError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        validate_opaque_ascii(value, 256).map_err(|error| match error {
+            LexicalError::Empty | LexicalError::TooLong => ProviderOpaqueValueError::InvalidLength,
+            LexicalError::InvalidGrammar | LexicalError::UnsafeText => {
+                ProviderOpaqueValueError::InvalidGrammar
+            }
+        })?;
+        Ok(Self(value.into()))
+    }
+}
+
+impl fmt::Debug for ApiModelName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ApiModelName(<redacted>)")
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ModelDefinitionVersion(NonZeroU64);
@@ -490,12 +534,14 @@ pub(crate) trait ProviderAdapter: Send + Sync {
 pub(crate) struct ModelDefinition {
     selection: ModelSelection,
     version: ModelDefinitionVersion,
+    api_model_name: ApiModelName,
     identity: Arc<TurnModelIdentity>,
     capabilities: ModelCapabilities,
     limits: EffectiveModelLimits,
     token_estimate_rate: TokenEstimateRate,
     generation: ModelGenerationDefaults,
     adapter: Arc<dyn ProviderAdapter>,
+    credential_source: Arc<dyn CredentialSource>,
 }
 
 #[cfg_attr(
@@ -513,11 +559,13 @@ impl ModelDefinition {
     pub(crate) fn new(
         selection: ModelSelection,
         version: ModelDefinitionVersion,
+        api_model_name: ApiModelName,
         capabilities: ModelCapabilities,
         limits: EffectiveModelLimits,
         token_estimate_rate: TokenEstimateRate,
         generation: ModelGenerationDefaults,
         adapter: Arc<dyn ProviderAdapter>,
+        credential_source: Arc<dyn CredentialSource>,
     ) -> Result<Self, ModelResolutionError> {
         if !capabilities.text_input
             || limits
@@ -532,12 +580,14 @@ impl ModelDefinition {
         Ok(Self {
             selection,
             version,
+            api_model_name,
             identity: Arc::new(TurnModelIdentity),
             capabilities,
             limits,
             token_estimate_rate,
             generation,
             adapter,
+            credential_source,
         })
     }
 
@@ -569,12 +619,14 @@ fn reasoning_summary_is_supported(
 
 #[allow(
     dead_code,
-    reason = "the only current variant is produced by concrete ModelSourceAdapter implementations"
+    reason = "the current variants are produced by concrete ModelSourceAdapter implementations"
 )]
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum ModelSourceError {
     #[error("model definition source is unavailable")]
     Unavailable,
+    #[error("model definition source produced an invalid definition")]
+    InvalidDefinition,
 }
 
 pub(crate) type ModelSourceFuture<'a> =
@@ -726,6 +778,7 @@ pub(crate) struct TurnModelSnapshot {
     owner: Arc<ModelGatewayOwner>,
     turn_ref: TurnModelRef,
     definition: ModelDefinitionRef,
+    api_model_name: ApiModelName,
     capabilities: ModelCapabilities,
     limits: EffectiveModelLimits,
     token_estimate_rate: TokenEstimateRate,
@@ -740,6 +793,13 @@ impl TurnModelSnapshot {
 
     pub(crate) const fn definition(&self) -> &ModelDefinitionRef {
         &self.definition
+    }
+
+    /// The private provider wire model name of the exact definition. Exposed only
+    /// crate-privately so the child provider adapters can encode the wire `model`
+    /// field; durable provenance always uses the stable `ModelSelection` ids.
+    pub(crate) const fn api_model_name(&self) -> &ApiModelName {
+        &self.api_model_name
     }
 
     pub(crate) const fn generation(&self) -> EffectiveGenerationPolicy {
@@ -812,6 +872,7 @@ impl TurnModelSnapshot {
         let definition = ModelDefinition::new(
             ModelSelection::new("fixture".parse().unwrap(), "fixture".parse().unwrap()),
             ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
+            "fixture".parse().unwrap(),
             capabilities,
             limits,
             TokenEstimateRate::new(bytes_per_token, 1).unwrap(),
@@ -821,12 +882,14 @@ impl TurnModelSnapshot {
                 ModelServiceClass::Standard,
             ),
             Arc::new(ScriptedProviderAdapter::new(Vec::new())),
+            fixed_credential_source("fixture-credential"),
         )
         .unwrap();
         Arc::new(Self {
             owner: Arc::clone(&owner),
             turn_ref: TurnModelRef { owner, identity },
             definition: definition.reference(),
+            api_model_name: definition.api_model_name.clone(),
             capabilities: definition.capabilities,
             limits,
             token_estimate_rate: definition.token_estimate_rate,
@@ -885,8 +948,13 @@ impl ModelGateway {
     async fn build_candidate(&self) -> Result<Arc<ModelCatalogView>, ModelResolutionError> {
         let mut definitions = BTreeMap::new();
         for source in &*self.sources {
-            for definition in source.discover().await.map_err(|_| {
-                ModelResolutionError::new(ModelResolutionErrorKind::SourceUnavailable)
+            for definition in source.discover().await.map_err(|error| match error {
+                ModelSourceError::Unavailable => {
+                    ModelResolutionError::new(ModelResolutionErrorKind::SourceUnavailable)
+                }
+                ModelSourceError::InvalidDefinition => {
+                    ModelResolutionError::new(ModelResolutionErrorKind::InvalidDefinition)
+                }
             })? {
                 let selection = definition.selection.clone();
                 if definitions
@@ -955,6 +1023,7 @@ impl ModelGateway {
                 identity: Arc::clone(&definition.identity),
             },
             definition: definition.reference(),
+            api_model_name: definition.api_model_name.clone(),
             capabilities: definition.capabilities,
             limits: definition.limits,
             token_estimate_rate: definition.token_estimate_rate,
@@ -980,9 +1049,28 @@ impl ModelGateway {
             return Err(ModelCallError::new(ModelCallErrorReason::Cancelled));
         }
 
+        // The dynamic credential source resolves on every attempt, cancellation-aware,
+        // strictly before any provider adapter executes. Cancellation during or after
+        // resolution but before execute is Cancelled/NotSent; a resolved `None` is a
+        // missing credential typed AuthMissing/NotSent with the adapter never invoked.
+        let credential = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(ModelCallError::new(ModelCallErrorReason::Cancelled));
+            }
+            credential = request.model.execution.credential_source.resolve() => credential,
+        };
+        if cancel.is_cancelled() {
+            return Err(ModelCallError::new(ModelCallErrorReason::Cancelled));
+        }
+        let Some(credential) = credential else {
+            return Err(ModelCallError::new(ModelCallErrorReason::AuthMissing));
+        };
+
         let attempt = ProviderAttemptRequest {
             effective_max_output_tokens: request.effective_max_output_tokens(),
             call: Arc::clone(&request),
+            credential,
         };
         let result = request
             .model
@@ -1625,6 +1713,7 @@ impl fmt::Debug for ModelCallRequest {
 pub(crate) struct ProviderAttemptRequest {
     call: Arc<ModelCallRequest>,
     effective_max_output_tokens: NonZeroU32,
+    credential: ProviderCredential,
 }
 
 #[cfg_attr(
@@ -1634,6 +1723,12 @@ pub(crate) struct ProviderAttemptRequest {
 impl ProviderAttemptRequest {
     const fn call(&self) -> &Arc<ModelCallRequest> {
         &self.call
+    }
+
+    /// The gateway-resolved per-attempt credential; the direct adapters inject it
+    /// into the bearer/x-api-key headers. Never printed by Debug.
+    const fn credential(&self) -> &ProviderCredential {
+        &self.credential
     }
 }
 
@@ -1646,6 +1741,7 @@ impl fmt::Debug for ProviderAttemptRequest {
                 "effective_max_output_tokens",
                 &self.effective_max_output_tokens,
             )
+            .field("credential", &"<redacted>")
             .finish()
     }
 }
@@ -1657,6 +1753,28 @@ impl fmt::Debug for ModelGateway {
             .field("source_count", &self.sources.len())
             .finish()
     }
+}
+
+/// A `#[cfg(test)]` credential source that resolves one fixed credential forever.
+/// Used by every scripted/fixture definition so attempts through the gateway always
+/// resolve `Some`; contract suites that assert exact auth headers build explicit
+/// sources via `fixed_credential_source`.
+#[cfg(test)]
+pub(crate) fn fixed_credential_source(credential: &str) -> Arc<dyn CredentialSource> {
+    struct FixedCredentialSource(ProviderCredential);
+
+    impl CredentialSource for FixedCredentialSource {
+        fn resolve(&self) -> CredentialSourceFuture<'_> {
+            let credential = self.0.clone();
+            Box::pin(async move { Some(credential) })
+        }
+    }
+
+    Arc::new(FixedCredentialSource(
+        credential
+            .parse()
+            .expect("test credential must be valid opaque ASCII"),
+    ))
 }
 
 #[cfg(test)]
@@ -1805,6 +1923,7 @@ impl ScriptedModelFixture {
         let definition = ModelDefinition::new(
             ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
             ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
+            "gpt-5".parse().unwrap(),
             ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
             EffectiveModelLimits::new(
                 NonZeroU32::new(context_window_tokens),
@@ -1817,6 +1936,7 @@ impl ScriptedModelFixture {
                 ModelServiceClass::Standard,
             ),
             provider,
+            fixed_credential_source("scripted-credential"),
         )
         .unwrap();
         let gateway = Arc::new(ModelGateway::new(Vec::new()));
@@ -2831,6 +2951,7 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
     use std::sync::Mutex;
 
+    use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -2878,18 +2999,26 @@ mod tests {
         default_max_output_tokens: u32,
         adapter: Arc<dyn ProviderAdapter>,
     ) -> ModelDefinition {
-        text_definition_with_context_limit(version, default_max_output_tokens, 128_000, adapter)
+        text_definition_with_credential(
+            version,
+            default_max_output_tokens,
+            128_000,
+            adapter,
+            "test-credential",
+        )
     }
 
-    fn text_definition_with_context_limit(
+    pub(super) fn text_definition_with_credential(
         version: u64,
         default_max_output_tokens: u32,
         context_window_tokens: u32,
         adapter: Arc<dyn ProviderAdapter>,
+        credential: &str,
     ) -> ModelDefinition {
         ModelDefinition::new(
             ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
             ModelDefinitionVersion::new(NonZeroU64::new(version).unwrap()),
+            "gpt-5".parse().unwrap(),
             ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
             EffectiveModelLimits::new(
                 NonZeroU32::new(context_window_tokens),
@@ -2902,8 +3031,24 @@ mod tests {
                 ModelServiceClass::Standard,
             ),
             adapter,
+            fixed_credential_source(credential),
         )
         .unwrap()
+    }
+
+    fn text_definition_with_context_limit(
+        version: u64,
+        default_max_output_tokens: u32,
+        context_window_tokens: u32,
+        adapter: Arc<dyn ProviderAdapter>,
+    ) -> ModelDefinition {
+        text_definition_with_credential(
+            version,
+            default_max_output_tokens,
+            context_window_tokens,
+            adapter,
+            "test-credential",
+        )
     }
 
     pub(super) fn resolve_request(max_output_tokens: Option<u32>) -> ResolveTurnModelRequest {
@@ -3113,6 +3258,264 @@ mod tests {
         }
         assert_eq!(old_scripted.requests().len(), 1);
         assert_eq!(new_scripted.requests().len(), 1);
+    }
+
+    /// A provider adapter that records the exact credential it received per attempt.
+    struct RecordingCredentialAdapter {
+        observed: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ProviderAdapter for RecordingCredentialAdapter {
+        fn execute(
+            &self,
+            request: ProviderAttemptRequest,
+            _progress: ModelProgressPublisher,
+            _cancel: CancellationToken,
+        ) -> ProviderAttemptFuture<'_> {
+            self.observed
+                .lock()
+                .unwrap()
+                .push(request.credential().for_header().to_owned());
+            Box::pin(async move {
+                Ok(ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::Text(Arc::from("ok"))]),
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                })
+            })
+        }
+    }
+
+    /// A model source that counts how many times the catalog rebuilt it.
+    struct CountingModelSource {
+        definition: ModelDefinition,
+        discover_count: Mutex<usize>,
+    }
+
+    impl ModelSourceAdapter for CountingModelSource {
+        fn discover(&self) -> ModelSourceFuture<'_> {
+            *self.discover_count.lock().unwrap() += 1;
+            let definition = self.definition.clone();
+            Box::pin(async move { Ok(vec![definition]) })
+        }
+    }
+
+    /// A mutable credential source that pops the next credential per resolution.
+    struct MutableCredentialSource {
+        credentials: Mutex<Vec<ProviderCredential>>,
+    }
+
+    impl CredentialSource for MutableCredentialSource {
+        fn resolve(&self) -> CredentialSourceFuture<'_> {
+            let credential = self
+                .credentials
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("test credential queue must not underflow");
+            Box::pin(async move { Some(credential) })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_credential_is_auth_missing_not_sent_without_adapter_execution() {
+        struct MissingCredentialSource;
+
+        impl CredentialSource for MissingCredentialSource {
+            fn resolve(&self) -> CredentialSourceFuture<'_> {
+                Box::pin(async { None })
+            }
+        }
+
+        let adapter = Arc::new(ScriptedProviderAdapter::new(vec![
+            ScriptedProviderScript::success(Vec::new(), text_attempt_result("must not execute")),
+        ]));
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let definition = ModelDefinition::new(
+            ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+            ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
+            "gpt-5".parse().unwrap(),
+            ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
+            EffectiveModelLimits::new(NonZeroU32::new(128_000), NonZeroU32::new(8_192)),
+            TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1).unwrap(),
+            ModelGenerationDefaults::new(
+                NonZeroU32::new(4_096).unwrap(),
+                ModelReasoningSummary::ProviderDefault,
+                ModelServiceClass::Standard,
+            ),
+            provider,
+            Arc::new(MissingCredentialSource),
+        )
+        .unwrap();
+        let source = Arc::new(MutableModelSource::new(vec![definition]));
+        let source_adapter: Arc<dyn ModelSourceAdapter> = source;
+        let gateway = ModelGateway::new(vec![source_adapter]);
+        let model = gateway
+            .resolve_for_turn(gateway.initialize().await.unwrap(), resolve_request(None))
+            .unwrap();
+
+        let error = gateway
+            .generate_model_turn(
+                request_for_model(model).await,
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.reason(), ModelCallErrorReason::AuthMissing);
+        assert_eq!(error.delivery(), ProviderRequestDeliveryState::NotSent);
+        assert!(
+            adapter.requests().is_empty(),
+            "a missing credential must never reach the provider adapter"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retained_snapshot_resolves_the_credential_source_on_each_attempt() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let adapter = Arc::new(RecordingCredentialAdapter {
+            observed: Arc::clone(&observed),
+        });
+        let provider: Arc<dyn ProviderAdapter> = adapter;
+        let credential_source = Arc::new(MutableCredentialSource {
+            // Vec::pop yields the last element first, so the queue is reversed.
+            credentials: Mutex::new(vec![
+                "cred-two".parse().unwrap(),
+                "cred-one".parse().unwrap(),
+            ]),
+        });
+        let definition = ModelDefinition::new(
+            ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+            ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
+            "gpt-5".parse().unwrap(),
+            ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
+            EffectiveModelLimits::new(NonZeroU32::new(128_000), NonZeroU32::new(8_192)),
+            TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1).unwrap(),
+            ModelGenerationDefaults::new(
+                NonZeroU32::new(4_096).unwrap(),
+                ModelReasoningSummary::ProviderDefault,
+                ModelServiceClass::Standard,
+            ),
+            provider,
+            credential_source,
+        )
+        .unwrap();
+        let source = Arc::new(CountingModelSource {
+            definition,
+            discover_count: Mutex::new(0),
+        });
+        let counting_source = Arc::clone(&source);
+        let source_adapter: Arc<dyn ModelSourceAdapter> = source;
+        let gateway = ModelGateway::new(vec![source_adapter]);
+        let snapshot = gateway
+            .resolve_for_turn(gateway.initialize().await.unwrap(), resolve_request(None))
+            .unwrap();
+        let request = request_for_model(Arc::clone(&snapshot)).await;
+
+        for _ in 0..2 {
+            gateway
+                .generate_model_turn(
+                    Arc::clone(&request),
+                    ModelProgressPublisher::discard(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            ["cred-one", "cred-two"],
+            "the same retained snapshot must resolve the dynamic source on each attempt"
+        );
+        assert_eq!(
+            *counting_source.discover_count.lock().unwrap(),
+            1,
+            "resolving credentials must never rebuild the catalog"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_during_credential_resolution_never_executes_the_adapter() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
+        struct GatedCredentialSource {
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        impl CredentialSource for GatedCredentialSource {
+            fn resolve(&self) -> CredentialSourceFuture<'_> {
+                let started = Arc::clone(&self.started);
+                let release = Arc::clone(&self.release);
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    None
+                })
+            }
+        }
+
+        let adapter = Arc::new(ScriptedProviderAdapter::new(vec![
+            ScriptedProviderScript::success(Vec::new(), text_attempt_result("must not execute")),
+        ]));
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let definition = ModelDefinition::new(
+            ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+            ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
+            "gpt-5".parse().unwrap(),
+            ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
+            EffectiveModelLimits::new(NonZeroU32::new(128_000), NonZeroU32::new(8_192)),
+            TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1).unwrap(),
+            ModelGenerationDefaults::new(
+                NonZeroU32::new(4_096).unwrap(),
+                ModelReasoningSummary::ProviderDefault,
+                ModelServiceClass::Standard,
+            ),
+            provider,
+            Arc::new(GatedCredentialSource {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }),
+        )
+        .unwrap();
+        let source = Arc::new(MutableModelSource::new(vec![definition]));
+        let source_adapter: Arc<dyn ModelSourceAdapter> = source;
+        let gateway = Arc::new(ModelGateway::new(vec![source_adapter]));
+        let model = gateway
+            .resolve_for_turn(gateway.initialize().await.unwrap(), resolve_request(None))
+            .unwrap();
+        let request = request_for_model(model).await;
+
+        let cancel = CancellationToken::new();
+        let gateway_task = Arc::clone(&gateway);
+        let request_task = Arc::clone(&request);
+        let cancel_task = cancel.clone();
+        let generation = tokio::spawn(async move {
+            gateway_task
+                .generate_model_turn(request_task, ModelProgressPublisher::discard(), cancel_task)
+                .await
+        });
+
+        // Deterministic ordering: the source signals that resolution is parked, then
+        // the test cancels exactly inside that window; no sleep or timeout is used.
+        started.notified().await;
+        cancel.cancel();
+
+        let error = generation
+            .await
+            .expect("generation task must settle")
+            .expect_err("cancellation must fail the attempt");
+        assert_eq!(error.reason(), ModelCallErrorReason::Cancelled);
+        assert_eq!(error.delivery(), ProviderRequestDeliveryState::NotSent);
+        assert!(
+            adapter.requests().is_empty(),
+            "cancellation during credential resolution must never execute the adapter"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3963,9 +4366,26 @@ mod tests {
         max_schema_bytes: NonZeroU32,
         adapter: Arc<dyn ProviderAdapter>,
     ) -> ModelDefinition {
+        structured_definition_with_credential(
+            version,
+            default_max_output_tokens,
+            max_schema_bytes,
+            adapter,
+            "test-credential",
+        )
+    }
+
+    pub(super) fn structured_definition_with_credential(
+        version: u64,
+        default_max_output_tokens: u32,
+        max_schema_bytes: NonZeroU32,
+        adapter: Arc<dyn ProviderAdapter>,
+        credential: &str,
+    ) -> ModelDefinition {
         ModelDefinition::new(
             ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
             ModelDefinitionVersion::new(NonZeroU64::new(version).unwrap()),
+            "gpt-5".parse().unwrap(),
             ModelCapabilities::text_only(ReasoningCapabilities::all(), true)
                 .with_structured_json_schema(),
             EffectiveModelLimits::new(NonZeroU32::new(128_000), NonZeroU32::new(8_192))
@@ -3977,6 +4397,7 @@ mod tests {
                 ModelServiceClass::Standard,
             ),
             adapter,
+            fixed_credential_source(credential),
         )
         .unwrap()
     }
@@ -3988,8 +4409,9 @@ mod tests {
         adapter: Arc<dyn ProviderAdapter>,
     ) -> ModelDefinition {
         ModelDefinition::new(
-            selection,
+            selection.clone(),
             ModelDefinitionVersion::new(NonZeroU64::new(version).unwrap()),
+            selection.model_id().as_str().parse().unwrap(),
             ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
             EffectiveModelLimits::new(NonZeroU32::new(128_000), NonZeroU32::new(8_192)),
             TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1).unwrap(),
@@ -3999,6 +4421,7 @@ mod tests {
                 ModelServiceClass::Standard,
             ),
             adapter,
+            fixed_credential_source("test-credential"),
         )
         .unwrap()
     }

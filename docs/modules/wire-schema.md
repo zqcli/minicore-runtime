@@ -291,7 +291,7 @@ Wire：
 
 ### Workspace Paths
 
-Absolute Workspace input path编码platform-independent canonical RFC 8089 `file:` URI。Wire decoder先生成fields private的shared typed carrier `CanonicalFileUri { family, authority: Option<String>, decoded_utf8_path }`，并把它交给Workspace-owned `WorkspaceRootInput`形成host-neutral typed command。只有command进入Runtime completion owner后，Workspace才按host family checked-convert为durable `WorkspaceRootSpec { path: PathBuf }`；在macOS接收Windows/UNC carrier仍必须完成typed decode且不得改变wire bytes或借用host path parser猜语义。unsupported host family在Workspace command application阶段返回`InvalidArgument + DoNotRetry`，不是`TypedJsonError`或outer `RuntimeDispatchError`。
+Absolute Workspace input path编码platform-independent canonical RFC 8089 `file:` URI。Wire decoder先生成fields private的shared typed carrier `CanonicalFileUri { family, authority: Option<String>, decoded_utf8_path }`，并把它交给Workspace-owned `WorkspaceRootInput`形成host-neutral typed command。trusted host从already-decoded POSIX/drive/UNC parts构造typed command时应调用public `CanonicalFileUri::from_decoded_parts(...)`，由Wire owner执行family/authority validation与canonical percent encoding，不能直接插值native path拼URI。只有command进入Runtime completion owner后，Workspace才按host family checked-convert为durable `WorkspaceRootSpec { path: PathBuf }`；在macOS接收Windows/UNC carrier仍必须完成typed decode且不得改变wire bytes或借用host path parser猜语义。unsupported host family在Workspace command application阶段返回`InvalidArgument + DoNotRetry`，不是`TypedJsonError`或outer `RuntimeDispatchError`。
 
 Canonical examples：
 
