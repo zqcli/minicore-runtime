@@ -20,3 +20,9 @@ Run gates:
 ```
 
 `check-msrv.sh` requires rustup and the `1.85.0` toolchain (`rustup toolchain install 1.85.0 --profile minimal`). Heavy tests must clean temporary artifacts on success and failure and must not require network, credentials or ambient home configuration.
+
+## M12 Provider Gate
+
+`tests/m12_rig_*.rs` drives exact `rig-core = 0.40.0` against test-owned `127.0.0.1:0` HTTP servers. These targets cover OpenAI Responses and Anthropic Messages unary/stream contracts, terminal-vs-EOF evidence, cancellation, single-request behavior, typed error envelopes and response metadata allowlists. `tests/m12_provider_error_matrix.rs` consumes `docs/fixtures/provider-gate-m12/error-mapping-v1.json` and freezes delivery-safe retry/normalization rules.
+
+M12 tests must remain offline and deterministic: no external DNS/network, real credential, ambient provider config, sleep, timeout-based absence proof, blind yield polling or unjoined server thread. Rig remains a dev-dependency and may not appear in production `src/` or public DTOs.

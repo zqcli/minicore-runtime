@@ -27,7 +27,7 @@
 - provider-native compaction artifact的持久化格式；
 - 完整pricing、billing ledger或成本审计。
 
-当前M6.2 foundation与M8.1最小ToolCall路径已运行：Runtime仍默认拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行。M10新增`CompactionSummary` purpose，并要求assembly budget proof、`NoToolCalls`、empty ToolSpec和explicit max output exact匹配，仍复用同一个single-attempt Gateway。crate-private Structured foundation已实现：`OutputContract::Structured` contract由绑定exact `TurnModelSnapshot`的constructor创建（capability与`max_schema_bytes` cap校验、schema v1 subset验证），optional name按[stable symbolic key](wire-schema.md#stable-symbolic-keys)共同floor限制为1..64 bytes，`ModelCallRequest` constructor按proof复验exact model/OutputContract绑定，Gateway对terminal执行exact JSON object parse与本地schema validation（`Refused` bypass；`UnexpectedToolCall`/`IncompleteResponse`/`InvalidStructuredOutput` precedence），并由ScriptedProviderAdapter端到端conformance覆盖；无JSON repair、type coercion或Markdown code-fence extraction。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。仍pending：任何public requester/Wire/SessionDefinition structured字段、Runtime/ActiveTurnTask structured激活（ordinary AgentRun路径仍`output_contract=None`，toolful Turn在普通ToolRound后的第二次Structured call未激活，Compaction仍固定`NoToolCalls`）、provider-native schema mapping/sanitization、完整ToolSpec schema、auth/credential/connection/cache、async Compaction retry/orchestration以及Rig production adapters。
+当前M6.2 foundation与M8.1最小ToolCall路径已运行：Runtime仍默认拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行。M10新增`CompactionSummary` purpose，并要求assembly budget proof、`NoToolCalls`、empty ToolSpec和explicit max output exact匹配，仍复用同一个single-attempt Gateway。crate-private Structured foundation已实现：`OutputContract::Structured` contract由绑定exact `TurnModelSnapshot`的constructor创建（capability与`max_schema_bytes` cap校验、schema v1 subset验证），optional name按[stable symbolic key](wire-schema.md#stable-symbolic-keys)共同floor限制为1..64 bytes，`ModelCallRequest` constructor按proof复验exact model/OutputContract绑定，Gateway对terminal执行exact JSON object parse与本地schema validation（`Refused` bypass；`UnexpectedToolCall`/`IncompleteResponse`/`InvalidStructuredOutput` precedence），并由ScriptedProviderAdapter端到端conformance覆盖；无JSON repair、type coercion或Markdown code-fence extraction。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。仍pending：任何public requester/Wire/SessionDefinition structured字段、Runtime/ActiveTurnTask structured激活（ordinary AgentRun路径仍`output_contract=None`，toolful Turn在普通ToolRound后的第二次Structured call未激活，Compaction仍固定`NoToolCalls`）、provider-native schema mapping/sanitization、完整ToolSpec schema、auth/credential/connection/cache、async Compaction retry/orchestration以及Rig production adapters。M12 production provider gate已经通过exact Rig 0.40.0离线loopback tests、terminal/metadata public seam proof和26-case delivery/error fixture关闭；该gate只冻结OpenAI Responses与Anthropic Messages baseline，不代表production adapter或available catalog已实现。
 
 相关权威文档：
 
@@ -41,6 +41,7 @@
 - [ADR 0119：模型调用使用Session逻辑重试](../adr/0119-model-calls-use-session-logical-retries.md)
 - [ADR 0120：失败由事实拥有模块分类，恢复由执行拥有者决定](../adr/0120-failures-stay-with-owning-modules.md)
 - [ADR 0125：ModelGateway不设置本地模型调用Permit](../adr/0125-model-gateway-has-no-local-call-permits.md)
+- [ADR 0138：Production Provider baseline只采用已验证的Rig协议合同](../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)
 
 ## 决策摘要
 
@@ -898,17 +899,21 @@ RigProviderAdapter是provider attempt adapter，不是ModelGateway implementatio
 
 如果Rig generic和provider-specific API都无法保留MiniCore要求的semantic content、tool identity或usage，spike必须阻止该provider adapter并提出targeted follow-up ADR；不能把Rig raw types泄漏给caller。直接重写provider HTTP client不属于当前accepted baseline。
 
-Rig spike必须验证：
+M12 Rig spike已经验证：
 
-- OpenAI Responses和Anthropic Messages的role映射；
-- reasoning text/summary/encrypted/signature round-trip；
-- tool call index/name/arguments和content order；
-- stream EOF、cancel和usage terminal行为；
-- custom base URL；
-- typed cache-control；
-- finish reason提取；
-- provider request/response ID提取；
-- context overflow与rate-limit分类。
+- OpenAI Responses instructions与Anthropic Messages system、ordered messages、Tool schema及ToolCall identity/order；
+- OpenAI reasoning summary/encrypted artifact与Anthropic thinking/signature round-trip；
+- Anthropic typed cache-control及OpenAI structured output request mapping；
+- unary/stream usage、provider response identity、Anthropic stop reason与OpenAI terminal status；
+- custom base URL只访问test-owned `127.0.0.1:0`；
+- stream cancel、fragmented SSE、transport error、drop与early EOF；
+- OpenAI `response.completed`和Anthropic non-empty `message_delta.stop_reason`作为protocol terminal evidence；Rig synthetic zero-usage `Final`不作为terminal；
+- public `HttpClientExt` wrapper可以在原样转发bytes时提取terminal和allowlisted headers，不改变Rig output；
+- OpenAI body response ID/header `x-request-id`与Anthropic body ID/header `request-id`独立提取；
+- 400/401/429/500/529 typed envelope、malformed 200和single-request行为；
+- 26-case provider-neutral delivery/error matrix中的context overflow、rate limit、auth、transport、malformed response和early EOF分类。
+
+OpenAI generic completion没有统一finish reason；M14 private adapter使用Responses terminal/status/incomplete details。Anthropic使用typed `stop_reason`。仍不可得时使用`Unknown`，不根据文本推断。
 
 ## Streaming And Progress
 
@@ -1430,9 +1435,7 @@ custom provider必须显式声明：
 ```rust
 pub enum ProviderProtocol {
     OpenAiResponses,
-    OpenAiChatCompletions,
     AnthropicMessages,
-    Gemini,
 }
 ```
 
@@ -1448,7 +1451,9 @@ pub struct CustomProviderDefinition {
 
 规则：
 
-- 不根据endpoint猜protocol；
+- 首个production baseline只支持`OpenAiResponses | AnthropicMessages`，且M14 adapter通过前都不能显示为available；
+- OpenAI Chat Completions、Gemini或其他protocol不接受为首版config；新增variant必须先有同等级loopback、delivery/error fixture与Accepted decision；
+- 不根据endpoint或model name猜protocol；
 - endpoint必须HTTPS，localhost/development exception需要显式runtime policy；
 - config load拒绝URL userinfo、query和fragment；path必须canonicalize且不得携带secret-like token；
 - endpoint identity只使用canonical origin和validated base path，safe catalog view默认不显示完整custom path；
@@ -1865,15 +1870,19 @@ opaque encrypted reasoning
 
 ### Real Adapter Integration
 
-- Rig OpenAI Responses mock server；
-- Rig Anthropic Messages mock server；
-- SSE fragmented frames；
-- WebSocket upgrade failure；
-- malformed provider payload；
-- rate-limit/status/body mapping；
-- custom base URL；
-- tool/reasoning/usage round-trip；
-- cancellation and connection close。
+M12 gate evidence：
+
+- [x] Rig OpenAI Responses loopback server；
+- [x] Rig Anthropic Messages loopback server；
+- [x] SSE fragmented frames、protocol terminal、early EOF与stream error；
+- [x] malformed provider payload、400/401/429/500/529 status/body与single-request；
+- [x] custom base URL；
+- [x] tool/reasoning/usage/identity/cache-control round-trip；
+- [x] cancellation、stream drop与connection close；
+- [x] response metadata allowlist和canary rejection；
+- [x] delivery/error fixture与queued Steer retry rule。
+
+MVP首版只选择HTTP Responses/Messages streaming，不启用WebSocket或transport fallback。M14 production adapter仍必须消费同一contract suite，并补credential/client factory、owner-tracked cancellation cleanup、provider-native Structured mapping及production private error conversion。
 
 ## Source Plan
 
@@ -1956,10 +1965,10 @@ src/model_gateway/provider/scripted.rs
 - [x] 定义multi-session直接并发和provider rate-limit governance（ADR 0125）。
 - [x] 定义persistence、recovery、performance和test matrix。
 - [x] 实现M6.2 ScriptedProviderAdapter text-only AgentRun vertical slice，包括exact request identity、ordered progress、terminal/error validation、cancellation与reload-retained adapter。
-- [ ] 随M8/M10扩展ScriptedProviderAdapter覆盖允许ToolCall与CompactionSummary vertical slices。
-- [ ] 尽早执行Rig 0.40.0 ModelGateway integration spike，在production adapter冻结前完成。
+- [x] 随M8/M10扩展ScriptedProviderAdapter覆盖允许ToolCall与CompactionSummary vertical slices。
+- [x] 执行Rig 0.40.0 ModelGateway reality gate，在production adapter冻结前完成OpenAI Responses/Anthropic Messages loopback、stream、terminal、metadata和delivery/error证据（ADR 0138）。
 - [x] 实现ModelGateway model resolution、immutable request/proof与single-attempt scripted core。
 - [x] 实现crate-private Structured foundation：`OutputContract::Structured` exact-model contract constructor（capability/`max_schema_bytes` cap、name 1..64、schema v1 subset）、`ModelCallRequest` exact-model/OutputContract proof复验、terminal exact JSON object parse与本地schema validation、`Refused` bypass及`UnexpectedToolCall`/`IncompleteResponse`/`InvalidStructuredOutput` precedence，ScriptedProviderAdapter端到端conformance。
 - [ ] 实现credential/connection/cache policy、provider-native Structured schema mapping/sanitization和Rig production provider adapters，并激活public structured requester/Wire/SessionDefinition字段与Runtime/ActiveTurnTask structured调用。
-- [ ] 完成OpenAI Responses与Anthropic Messages mock-server tests。
+- [x] 完成OpenAI Responses与Anthropic Messages M12 mock-server contract tests；production adapter suite仍属于M14。
 - [x] 在阶段9冻结公开model catalog/query协议。
