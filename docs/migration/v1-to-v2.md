@@ -208,7 +208,7 @@ Prompt Q1/Q4已分别由ADR 0128/0129关闭。待完成：Tool/Sandbox O1/R7。
 
 ### 阶段6–8：Async模型调用协同交付束
 
-状态：M6–M10 scripted async spine与M12 Rig reality gate已完成；production Rig adapter仍属于M14。
+状态：M6–M10 scripted async spine与M12 provider reality gate已完成；Rig已因Rust 1.85被拒绝进入production baseline，两个direct provider adapters仍属于M14。
 
 共享spine：
 
@@ -242,7 +242,7 @@ V4-P1-2 wire/storage format门禁已经关闭；全部普通P0/P1（含V4-P1-3�
 
 ## Rig 0.40.0 Spike
 
-静态源码审计与真实M12 loopback spike均已完成：Rig适合作为private ProviderAdapter，不适合作为MiniCore domain/interface来源。Accepted baseline见[ADR 0138](../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)，delivery/error contract见[M12 fixture](../fixtures/provider-gate-m12/README.md)。
+静态源码审计与真实M12 loopback spike均已完成：Rig适合作为protocol evidence，不适合作为MiniCore Rust 1.85 production dependency或domain/interface来源。协议合同见[ADR 0138](../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)，implementation转向见[ADR 0139](../adr/0139-rig-is-evidence-only-under-rust-1-85.md)，delivery/error contract见[M12 fixture](../fixtures/provider-gate-m12/README.md)。
 
 已验证：
 
@@ -254,7 +254,7 @@ V4-P1-2 wire/storage format门禁已经关闭；全部普通P0/P1（含V4-P1-3�
 - automatic retry为0的single-request evidence；
 - base URL override和两协议real mock HTTP server；
 - Rig synthetic zero-usage `Final`不能替代protocol terminal；
-- Rig类型只存在于dev dependency/tests，不进入production/public DTO。
+- Rig只存在于standalone stable-only `provider-gate/` package，不进入root dependency/lockfile、production或public DTO；
 
 ## 开放问题
 
@@ -264,7 +264,7 @@ Recorder问题见[`docs/review/async-loop-best-effort-recording-open-questions.m
 
 - 第四轮全部普通V4-P0/P1已关闭；V4-P1-3由M12/ADR 0138关闭；
 - 首个Rust crate已经消费ADR 0134/Format V1/Wire V1 fixtures并实现semantic conformance runner；
-- production Rig provider adapters仍属于M14，必须消费M12 contract suite；
+- production OpenAI Responses/Anthropic Messages direct adapters仍属于M14，必须消费M12 contract suite；
 - production Tool/Sandbox adapter前关闭O1/R7/V4-C0-1。
 
 ## 文档治理

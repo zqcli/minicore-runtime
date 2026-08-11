@@ -1,7 +1,9 @@
 # ADR 0105: SessionExecutor 拥有 loaded Session
 
-状态：Partially Superseded by ADRs 0126 and 0127
+状态：Partially Superseded by ADRs 0126, 0127 and 0139
 日期：2026-07-24
+
+> 2026-08-11：[ADR 0139](0139-rig-is-evidence-only-under-rust-1-85.md)取代本文保留的Rig production adapter假设；first-party Session/Turn owner原则不变。
 
 > 2026-07-31：control actor、single ActiveTurnTask和live terminal handoff保留；ADR 0127删除restart conservative terminalization，Load从recorded conversation建立Idle view。
 

@@ -2343,7 +2343,7 @@ CLI / TUI / Tauri backend
 → AssembledModelContext
 → ModelCallRequest
 → ModelGateway.generate_model_turn()
-→ ModelGateway private ProviderAdapter（production可使用RigProviderAdapter，仅处理provider attempt）
+→ ModelGateway private ProviderAdapter（production使用OpenAI Responses或Anthropic Messages protocol-specific adapter，仅处理provider attempt）
 → OpenAI Responses / Anthropic Messages / other provider
 → ModelCallResult
 → ActiveTurnTask validates SessionId + TurnId + control_generation + ConversationRevision

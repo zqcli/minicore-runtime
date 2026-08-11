@@ -27,11 +27,6 @@ futures-util = "0.3.33"
 
 [dev-dependencies]
 tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "test-util"] }
-# M12: dev-only direct dep so the test-only HttpClientExt wrapper can name `bytes::Bytes`
-# in trait signatures; resolves to the already-locked bytes version, adding no new crate.
-bytes = "1.10.1"
-# M12: dev-only probe of real rig-core 0.40.0 (default-features off; reqwest/rustls/test-utils only).
-rig = { package = "rig-core", version = "=0.40.0", default-features = false, features = ["reqwest", "rustls", "test-utils"] }
 
 
 [[test]]

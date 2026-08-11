@@ -1,7 +1,9 @@
 # ADR 0138：Production Provider baseline只采用已验证的Rig协议合同
 
-状态：Accepted
+状态：Partially Superseded by ADR 0139
 日期：2026-08-11
+
+Refinement note：本ADR冻结的OpenAI Responses/Anthropic Messages协议、terminal、metadata、single-attempt与delivery/error合同继续有效；`rig-core`作为主crate dev/production dependency及M14 `RigProviderAdapter`的决定已被ADR 0139取代。Rig 0.40.0现只存在于standalone stable-only evidence harness，M14改为两个direct provider adapters。
 
 ## 背景
 
@@ -59,12 +61,12 @@ M12使用exact `rig-core = 0.40.0`、真实`127.0.0.1:0` HTTP/1.1 loopback serve
 
 ## 可执行证据
 
-- `tests/m12_rig_openai_responses.rs`：OpenAI instructions/messages/tools/reasoning/structured schema、identity/order/status/usage、base URL和500 single-request；
-- `tests/m12_rig_anthropic_messages.rs`：Anthropic system/messages/tools/thinking/signature/cache-control、identity/stop reason/usage、base URL和500 single-request；
-- `tests/m12_rig_openai_streaming.rs`与`tests/m12_rig_anthropic_streaming.rs`：完整stream、usage、cancel、early EOF和500 single-request；
-- `tests/m12_rig_terminal_evidence.rs`：fragmented SSE、terminal/EOF/error/drop可区分的公开`HttpClientExt` seam；
-- `tests/m12_rig_response_metadata.rs`：成功/error路径的header allowlist、body ID/header ID独立性与canary rejection；
-- `tests/m12_rig_error_envelopes.rs`：两协议400/401 typed envelope、malformed 200 fail-closed和single-request；
+- `provider-gate/tests/m12_rig_openai_responses.rs`：OpenAI instructions/messages/tools/reasoning/structured schema、identity/order/status/usage、base URL和500 single-request；
+- `provider-gate/tests/m12_rig_anthropic_messages.rs`：Anthropic system/messages/tools/thinking/signature/cache-control、identity/stop reason/usage、base URL和500 single-request；
+- `provider-gate/tests/m12_rig_openai_streaming.rs`与`provider-gate/tests/m12_rig_anthropic_streaming.rs`：完整stream、usage、cancel、early EOF和500 single-request；
+- `provider-gate/tests/m12_rig_terminal_evidence.rs`：fragmented SSE、terminal/EOF/error/drop可区分的公开`HttpClientExt` seam；
+- `provider-gate/tests/m12_rig_response_metadata.rs`：成功/error路径的header allowlist、body ID/header ID独立性与canary rejection；
+- `provider-gate/tests/m12_rig_error_envelopes.rs`：两协议400/401 typed envelope、malformed 200 fail-closed和single-request；
 - `tests/m12_provider_error_matrix.rs`：26-case closed taxonomy、delivery normalization、retry/Compaction不变量与no-message-classification；
 - `session_execution::tests::steer_queued_during_agent_run_retry_backoff_is_consumed_after_success`：queued Steer规则。
 

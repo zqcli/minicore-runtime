@@ -1,7 +1,9 @@
 # ADR 0106: ModelGateway 是单一深异步 operation
 
-状态：Accepted
+状态：Partially Superseded by ADR 0139
 日期：2026-07-24
+
+> 2026-08-11：[ADR 0139](0139-rig-is-evidence-only-under-rust-1-85.md)取代首个production `RigProviderAdapter`条款。ModelGateway deep operation、private `ProviderAdapter`、single-attempt与provider-neutral ownership继续有效；M14使用两个protocol-specific direct adapters。
 
 > 2026-07-31：`ModelCallRequest`由ModelGateway唯一拥有；Turn Execution Context、Prompt、Session Execution和Compaction只调用其private constructor或消费immutable request，不复制第二份字段定义。OutputContract只存在于`AssembledModelContext`及其assembly proof。
 

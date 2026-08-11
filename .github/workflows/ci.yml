@@ -53,3 +53,4 @@ jobs:
       - name: Select stable Rust toolchain
         run: rustup override set stable
       - run: cargo test --all-targets --locked
+      - run: cargo test --manifest-path provider-gate/Cargo.toml --all-targets --locked

@@ -8,7 +8,6 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | --- | --- |
 | [0101](0101-workspace-ownership.md) | Workspace属于Session definition |
 | [0102](0102-prompt-tool-skill-are-distinct-subsystems.md) | Prompt、Tool、Skill保持独立module |
-| [0106](0106-model-gateway-is-single-deep-operation.md) | ModelGateway拥有provider-neutral单次operation |
 | [0125](0125-model-gateway-has-no-local-call-permits.md) | ModelGateway不设置本地调用permit |
 | [0127](0127-session-recording-omits-turn-lifecycle.md) | Conversation recording不保存Turn lifecycle |
 | [0128](0128-prompt-content-is-materialized-before-publication.md) | Prompt content在publication前materialize |
@@ -19,7 +18,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0135](0135-workspace-public-input-is-host-neutral.md) | Workspace public input在command application前保持host-neutral |
 | [0136](0136-durablestate-operation-owned-generations.md) | DurableState使用operation-owned immutable generations、permanent reservations与root lease；read with ADR 0137 |
 | [0137](0137-tokio-owner-tracked-async-foundation.md) | Tokio owner-tracked async foundation与deterministic persistent seams；refines ADR 0117 and supports ADR 0136 |
-| [0138](0138-production-provider-baseline-uses-verified-rig-contracts.md) | Production Provider baseline只采用已验证的OpenAI Responses与Anthropic Messages Rig合同 |
+| [0139](0139-rig-is-evidence-only-under-rust-1-85.md) | Rust 1.85 production baseline拒绝Rig依赖，采用direct provider adapters |
 
 ## Current With Later Refinements
 
@@ -29,7 +28,8 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | --- | --- |
 | [0100](0100-domain-model-and-ownership.md) | ADR 0126 |
 | [0103](0103-turn-item-interaction-model.md) | ADR 0124、0126、0127 |
-| [0105](0105-session-executor-owns-loaded-session.md) | ADR 0126、0127 |
+| [0105](0105-session-executor-owns-loaded-session.md) | ADR 0126、0127、0139 |
+| [0106](0106-model-gateway-is-single-deep-operation.md) | ADR 0139 |
 | [0108](0108-runtime-public-protocol.md) | ADR 0126、0127、0133 |
 | [0109](0109-review-b-determinism-and-serialized-operations.md) | ADR 0124、0126 |
 | [0110](0110-prompt-and-skill-use-shared-reloadable-views.md) | ADR 0127、0129 |
@@ -39,14 +39,15 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0116](0116-file-mutations-use-session-local-queues.md) | ADR 0126 |
 | [0117](0117-async-synchronization-uses-single-owner-and-typed-permits.md) | ADR 0124、0125、0126、0127、0136、0137 |
 | [0118](0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md) | ADR 0124、0126、0127、0133 |
-| [0119](0119-model-calls-use-session-logical-retries.md) | ADR 0126 |
+| [0119](0119-model-calls-use-session-logical-retries.md) | ADR 0126、0139 |
 | [0120](0120-failures-stay-with-owning-modules.md) | ADR 0126 |
 | [0121](0121-workspace-updates-require-idle.md) | ADR 0124、0126、0127 |
 | [0123](0123-identity-uses-refs-and-explicit-reload.md) | ADR 0124、0126、0127、0129、0132 |
 | [0124](0124-session-replay-is-tolerant-and-links-are-minimal.md) | ADR 0126、0127、0131、0132、0134、0136、0137 |
-| [0126](0126-turn-execution-is-async-and-session-recording-is-best-effort.md) | ADR 0127、0130、0132、0136、0137 |
+| [0126](0126-turn-execution-is-async-and-session-recording-is-best-effort.md) | ADR 0127、0130、0132、0136、0137、0139 |
 | [0133](0133-runtime-public-payload-is-snapshot-recoverable.md) | ADR 0135、0136、0137 |
 | [0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md) | ADR 0135 |
+| [0138](0138-production-provider-baseline-uses-verified-rig-contracts.md) | ADR 0139 |
 
 ## Historical / Superseded
 

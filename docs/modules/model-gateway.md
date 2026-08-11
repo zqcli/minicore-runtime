@@ -2,7 +2,7 @@
 
 日期：2026-08-08
 
-状态：当前权威架构（M6.2 scripted foundation、M8.1最小ToolCall、M10 CompactionSummary purpose/budget request validation与ActiveTurnTask orchestration，以及crate-private Structured output foundation已实现；完整ToolSpec schema、credential/connection implementation、provider-native Structured schema mapping/sanitization、Rig reality gate与production adapters待实现）
+状态：当前权威架构（M6.2 scripted foundation、M8.1最小ToolCall、M10 CompactionSummary purpose/budget request validation与ActiveTurnTask orchestration，以及crate-private Structured output foundation已实现；M12 protocol reality gate已关闭并因Rust 1.85拒绝Rig production dependency；完整ToolSpec schema、credential/connection implementation、provider-native Structured schema mapping/sanitization与direct production adapters待实现）
 
 ## 目的
 
@@ -16,7 +16,7 @@
 - 单次provider attempt与Session logical retry如何区分；
 - cancellation、authentication、secret redaction、跨Session并发调用和provider rate limit反馈如何治理；
 - provider prompt cache、connection reuse和continuation如何保持完整logical input等价性；
-- Rig 0.40.0可以为provider协议映射与单次attempt调用复用哪些能力，以及这些能力如何被限制在private `ProviderAdapter`内。
+- M12 Rig 0.40.0 evidence揭示了哪些provider协议事实与SDK损失点，以及为何production `ProviderAdapter`直接拥有HTTP/SSE mapping。
 
 本文不定义：
 
@@ -27,7 +27,7 @@
 - provider-native compaction artifact的持久化格式；
 - 完整pricing、billing ledger或成本审计。
 
-当前M6.2 foundation与M8.1最小ToolCall路径已运行：Runtime仍默认拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行。M10新增`CompactionSummary` purpose，并要求assembly budget proof、`NoToolCalls`、empty ToolSpec和explicit max output exact匹配，仍复用同一个single-attempt Gateway。crate-private Structured foundation已实现：`OutputContract::Structured` contract由绑定exact `TurnModelSnapshot`的constructor创建（capability与`max_schema_bytes` cap校验、schema v1 subset验证），optional name按[stable symbolic key](wire-schema.md#stable-symbolic-keys)共同floor限制为1..64 bytes，`ModelCallRequest` constructor按proof复验exact model/OutputContract绑定，Gateway对terminal执行exact JSON object parse与本地schema validation（`Refused` bypass；`UnexpectedToolCall`/`IncompleteResponse`/`InvalidStructuredOutput` precedence），并由ScriptedProviderAdapter端到端conformance覆盖；无JSON repair、type coercion或Markdown code-fence extraction。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。仍pending：任何public requester/Wire/SessionDefinition structured字段、Runtime/ActiveTurnTask structured激活（ordinary AgentRun路径仍`output_contract=None`，toolful Turn在普通ToolRound后的第二次Structured call未激活，Compaction仍固定`NoToolCalls`）、provider-native schema mapping/sanitization、完整ToolSpec schema、auth/credential/connection/cache、async Compaction retry/orchestration以及Rig production adapters。M12 production provider gate已经通过exact Rig 0.40.0离线loopback tests、terminal/metadata public seam proof和26-case delivery/error fixture关闭；该gate只冻结OpenAI Responses与Anthropic Messages baseline，不代表production adapter或available catalog已实现。
+当前M6.2 foundation与M8.1最小ToolCall路径已运行：Runtime仍默认拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行。M10新增`CompactionSummary` purpose，并要求assembly budget proof、`NoToolCalls`、empty ToolSpec和explicit max output exact匹配，仍复用同一个single-attempt Gateway。crate-private Structured foundation已实现：`OutputContract::Structured` contract由绑定exact `TurnModelSnapshot`的constructor创建（capability与`max_schema_bytes` cap校验、schema v1 subset验证），optional name按[stable symbolic key](wire-schema.md#stable-symbolic-keys)共同floor限制为1..64 bytes，`ModelCallRequest` constructor按proof复验exact model/OutputContract绑定，Gateway对terminal执行exact JSON object parse与本地schema validation（`Refused` bypass；`UnexpectedToolCall`/`IncompleteResponse`/`InvalidStructuredOutput` precedence），并由ScriptedProviderAdapter端到端conformance覆盖；无JSON repair、type coercion或Markdown code-fence extraction。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。仍pending：任何public requester/Wire/SessionDefinition structured字段、Runtime/ActiveTurnTask structured激活（ordinary AgentRun路径仍`output_contract=None`，toolful Turn在普通ToolRound后的第二次Structured call未激活，Compaction仍固定`NoToolCalls`）、provider-native schema mapping/sanitization、完整ToolSpec schema、auth/credential/connection/cache、async Compaction retry/orchestration以及direct production adapters。M12 production provider gate已经用exact Rig 0.40.0 standalone loopback evidence、terminal/metadata proof和26-case delivery/error fixture关闭；真实Rust 1.85冷编译同时拒绝Rig进入production baseline，M14改为OpenAI Responses与Anthropic Messages两个direct adapters。该gate不代表production adapter或available catalog已实现。
 
 相关权威文档：
 
@@ -42,6 +42,7 @@
 - [ADR 0120：失败由事实拥有模块分类，恢复由执行拥有者决定](../adr/0120-failures-stay-with-owning-modules.md)
 - [ADR 0125：ModelGateway不设置本地模型调用Permit](../adr/0125-model-gateway-has-no-local-call-permits.md)
 - [ADR 0138：Production Provider baseline只采用已验证的Rig协议合同](../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)
+- [ADR 0139：Rust 1.85下Rig只作为独立证据harness](../adr/0139-rig-is-evidence-only-under-rust-1-85.md)
 
 ## 决策摘要
 
@@ -56,7 +57,7 @@
 - ModelGateway只编码完整provider-neutral context，不重新决定conversation visibility；
 - `TurnModelSnapshot`固定exact model definition、capabilities、effective limits和generation policy；
 - active Turn内不允许静默替换provider/model identity；
-- MVP中每次`generate_model_turn`只执行一个provider attempt，Rig和底层provider SDK automatic retry固定为0；
+- MVP中每次`generate_model_turn`只执行一个provider attempt，adapter与private HTTP client automatic retry固定为0；
 - ModelGateway不执行transparent retry、401 refresh-and-resend或WebSocket → HTTP transport fallback；
 - ActiveTurnTask只对同一个immutable request执行最多3次AgentRun logical retry；CompactionSummary最多1次；
 - cross-model fallback不是ModelGateway transparent behavior；
@@ -66,8 +67,8 @@
 - authentication secret、raw headers、raw request/response body和provider SDK类型不越过ModelGateway seam；
 - prompt cache、connection reuse、`previous_response_id`和incremental request只是wire optimization；
 - 所有optimization必须能退回完整`AssembledModelContext`请求；
-- ProviderAdapter是private internal seam，首批实现为RigProviderAdapter和ScriptedProviderAdapter；
-- RigProviderAdapter只负责具体provider的request/stream/response/error映射与单次attempt执行；model resolution、request validation、auth policy与credential resolution、progress lifecycle、cache/continuation policy和terminal result归一化均由ModelGateway拥有；
+- ProviderAdapter是private internal seam，首批实现为`ScriptedProviderAdapter`、`OpenAiResponsesProviderAdapter`与`AnthropicMessagesProviderAdapter`；
+- 两个production adapter各自负责其provider request/SSE/response/error映射与单次attempt执行；model resolution、request validation、auth policy与credential resolution、progress lifecycle、cache/continuation policy和terminal result归一化均由ModelGateway拥有；
 - 不增加`ModelStep`、`ModelAttempt`领域entity、provider session public object或第二conversation state。
 
 ## 同类项目研究
@@ -213,8 +214,9 @@ Rig 0.40.0的integration gaps：
 - stream cancellation使用Rig `AbortHandle`，需要桥接MiniCore CancellationToken；
 - prompt cache、reasoning和structured output仍需provider-specific typed mapping；
 - generic interface不能完整表达所有provider response metadata。
+- crate source使用Rust 1.85不支持的let-chain与trait-upcasting语法；0.36.0–0.40.0均不能作为直接MSRV降级。
 
-结论：Rig适合作为private provider adapter实现，不适合作为MiniCore ModelGateway interface或domain type来源。
+结论：Rig evidence适合验证provider合同和SDK损失点，不适合作为MiniCore Rust 1.85 production dependency，也不适合作为ModelGateway interface或domain type来源。M14由两个private direct adapters拥有协议wire mapping。
 
 ## 对比结论
 
@@ -826,22 +828,23 @@ pub(crate) trait ProviderAdapter: Send + Sync {
 
 ProviderAdapter可以：
 
-- 把private `ProviderAttemptRequest`编码成具体provider/Rig typed request；
+- 把private `ProviderAttemptRequest`编码成具体provider wire request；
 - 使用已经解析的model、endpoint和credential执行一次provider request；
 - 桥接provider stream与attempt cancellation；
-- 把provider content、finish reason、usage、metadata和SDK error映射为`ProviderAttemptResult`或`ProviderAttemptError`。
+- 把provider content、finish reason、usage、metadata和typed protocol/transport error映射为`ProviderAttemptResult`或`ProviderAttemptError`。
 
 ProviderAdapter不能：
 
 - 选择或替换provider/model，解析catalog current value或改变Turn-pinned model identity；
 - 重新组装Prompt、判断conversation visibility或执行Tool；
 - 决定logical retry、执行transport fallback、cache/continuation policy或terminal Turn结果；
-- 发布ModelGateway attempt lifecycle、构造最终`ModelCallResult`或把Rig raw type泄漏给caller。
+- 发布ModelGateway attempt lifecycle、构造最终`ModelCallResult`或把provider/transport raw type泄漏给caller。
 
 首个production实现：
 
 ```text
-RigProviderAdapter
+OpenAiResponsesProviderAdapter
+AnthropicMessagesProviderAdapter
 ```
 
 首个测试实现使用：
@@ -866,40 +869,38 @@ ProviderAttemptRequest可以包含：
 
 这些类型都必须private、non-serializable并使用redacted Debug。
 
-只有private adapter可以使用Rig provider types和`CompletionRequest.additional_params`。调用方不能提交arbitrary JSON。
+只有private adapter可以使用provider wire DTO、HTTP/SSE transport types和typed provider options。调用方不能提交arbitrary JSON。
 
-## Rig Adapter Mapping
+## Direct Provider Adapter Mapping
 
 ```text
 ModelCallRequest
 → ModelGateway validate / resolve / plan attempt
 → private ProviderAttemptRequest
-→ RigProviderAdapter encode并执行一个provider attempt
+→ protocol-specific adapter encode并执行一个provider attempt
 → ProviderAttemptResult或ProviderAttemptError
 → ModelGateway terminal归一化
 → FinalizedAssistantResponse或ModelCallError
 ```
 
-RigProviderAdapter不被限制为generic `CompletionModel::stream`。当generic类型擦除finish reason、request ID或reasoning artifact时，adapter可以使用Rig公开的provider-specific request/response types；这些类型仍不能越过private adapter。
-
-RigProviderAdapter是provider attempt adapter，不是ModelGateway implementation的替代品。它不拥有provider选择、logical retry、cache/continuation判定或最终错误分类。Rig和provider SDK的内建retry必须显式配置为0；spike无法证明这一点时不得冻结production adapter。
+`OpenAiResponsesProviderAdapter`与`AnthropicMessagesProviderAdapter`直接拥有各自request body、SSE event、typed error envelope和terminal parser，避免generic SDK先擦除finish、delivery或metadata事实后再用旁路重建。两个adapter仍不能越过private seam，也不是ModelGateway implementation的替代品；它们不拥有provider选择、logical retry、cache/continuation判定或最终错误分类。private HTTP client的内建retry必须显式为0。
 
 映射要求：
 
-- ordered System sections映射到Rig preamble或provider-specific system/instructions字段；
+- ordered System sections映射到provider-specific system/instructions字段；
 - messages保持source order；
 - reasoning/text/tool call保持final content order；
-- ToolSpec映射到Rig ToolDefinition；
-- OutputContract映射到ToolChoice/output_schema/provider typed options；
-- Rig `additional_params`只由adapter内部typed builder生成；
-- Rig Usage规范化到MiniCore ModelUsage；
-- Rig AbortHandle桥接MiniCore CancellationToken；
-- generic finish reason缺失时读取受支持provider-specific terminal response；仍不可得则使用`Unknown`；optional request ID/metadata不可得时保持None；
-- Rig CompletionError只在adapter内存在，必须转换成ProviderAttemptError。
+- ToolSpec映射到provider tool schema；
+- OutputContract映射到provider tool choice/output schema typed options；
+- provider-specific optional fields只由adapter内部typed builder生成；
+- provider usage规范化到MiniCore ModelUsage；
+- transport abort桥接MiniCore CancellationToken；
+- finish reason从protocol terminal与provider-specific response字段提取；仍不可得则使用`Unknown`；optional request ID/metadata不可得时保持None；
+- provider error envelope与transport error必须在adapter内转换成ProviderAttemptError。
 
-如果Rig generic和provider-specific API都无法保留MiniCore要求的semantic content、tool identity或usage，spike必须阻止该provider adapter并提出targeted follow-up ADR；不能把Rig raw types泄漏给caller。直接重写provider HTTP client不属于当前accepted baseline。
+两个adapter可以共享private connection client、bounded SSE framing、header validation和redaction primitives；不能共享会抹平OpenAI/Anthropic terminal、typed envelope或delivery差异的generic response model。transport dependency必须在M14由真实Rust 1.85冷编译和adapter contract tests固定。
 
-M12 Rig spike已经验证：
+M12 standalone Rig evidence已经验证：
 
 - OpenAI Responses instructions与Anthropic Messages system、ordered messages、Tool schema及ToolCall identity/order；
 - OpenAI reasoning summary/encrypted artifact与Anthropic thinking/signature round-trip；
@@ -913,7 +914,7 @@ M12 Rig spike已经验证：
 - 400/401/429/500/529 typed envelope、malformed 200和single-request行为；
 - 26-case provider-neutral delivery/error matrix中的context overflow、rate limit、auth、transport、malformed response和early EOF分类。
 
-OpenAI generic completion没有统一finish reason；M14 private adapter使用Responses terminal/status/incomplete details。Anthropic使用typed `stop_reason`。仍不可得时使用`Unknown`，不根据文本推断。
+同一gate也证明Rig 0.40.0无法由真实Rust 1.85编译，因此这些结果是协议参考和SDK反例，不是production implementation dependency。OpenAI adapter使用Responses terminal/status/incomplete details；Anthropic adapter使用typed `stop_reason`。仍不可得时使用`Unknown`，不根据文本推断。
 
 ## Streaming And Progress
 
@@ -1099,7 +1100,7 @@ pub enum ModelFinishReason {
 
 - provider native finish code映射到closed taxonomy；
 - 原始code可以作为allowlisted redacted metadata保留；
-- generic Rig response没有finish reason时使用provider-specific adapter提取；
+- generic provider projection没有finish reason时由protocol-specific adapter从terminal response提取；
 - 仍不可得时使用Unknown，不根据文本内容伪造；
 - ToolCall content是通过Response Validation后ActiveTurnTask进入Tool path的主要事实；finish reason在Gateway中用于一致性校验和diagnostics；
 - Length和ContentFiltered返回`IncompleteResponse`，不进入live conversation；
@@ -1166,7 +1167,7 @@ validate request
 → normalize one terminal result or typed error
 ```
 
-Rig和底层provider SDK automatic retry必须配置为0。ModelGateway不执行DNS/connect/TLS retry、429/5xx retry、401 refresh-and-resend、stream restart或WebSocket → HTTP fallback。失败后本次Gateway operation立即terminal，由ActiveTurnTask根据typed error决定是否logical retry。
+adapter与private HTTP client automatic retry必须配置为0。ModelGateway不执行DNS/connect/TLS retry、429/5xx retry、401 refresh-and-resend、stream restart或WebSocket → HTTP fallback。失败后本次Gateway operation立即terminal，由ActiveTurnTask根据typed error决定是否logical retry。
 
 每个ProviderAttemptError必须携带private delivery state：
 
@@ -1294,7 +1295,7 @@ Gateway success/cancel的线性化点是adapter接受完整provider terminal eve
 ```text
 cancel token fires
 → 取消当前single attempt
-→ 调用Rig stream.cancel或transport abort
+→ 调用transport abort
 → 停止发布新progress
 → 返回ModelCallErrorReason::Cancelled
 ```
@@ -1721,7 +1722,7 @@ opaque encrypted reasoning
 ### Interface And Ownership
 
 - 只有`resolve_for_turn`和`generate_model_turn`进入Session execution；
-- ActiveTurnTask/SessionExecutor不import Rig provider类型；
+- ActiveTurnTask/SessionExecutor不import provider-native或transport类型；
 - ModelGateway不能读取Conversation Storage或Prompt definitions；
 - ProviderAdapter不能append Session entry；
 - shared Gateway并发处理多个Session；
@@ -1786,7 +1787,7 @@ opaque encrypted reasoning
 ### Retry
 
 - admitted request每次generate_model_turn只调用一次ProviderAdapter.execute；preflight validation或active route/principal cooldown可以在provider调用前以typed error terminal，因此总调用数为0或1；
-- Rig和provider SDK automatic retry固定为0；
+- adapter与private HTTP client automatic retry固定为0；
 - connect failure、429、5xx和timeout都以typed error terminal返回Gateway caller；
 - delivery state准确区分NotSent、RejectedBeforeExecution、AcceptedNoOutput、OutputStarted和Unknown；
 - request delivery outcome unknown返回RequestOutcomeUnknown；
@@ -1809,7 +1810,7 @@ opaque encrypted reasoning
 - cancel before request start；
 - cancel during stream；
 - provider terminal先于cancel时Gateway完成result；SessionExecutor仍可因version/cancel拒绝；
-- Rig AbortHandle桥接；
+- transport abort桥接；
 - logical retry与queued Steer场景不存在可回传的旧detached Model future；exact `control_generation`、`ConversationRevision`与same `Arc<ModelCallRequest>`用于拒绝basis已经变化的result。
 
 ### Usage And Finish
@@ -1832,7 +1833,7 @@ opaque encrypted reasoning
 - non-empty Refused作为successful response，不经过Structured schema validation；
 - empty Refused → InvalidProviderResponse；
 - 上述四个response error均不logical retry且不生成Completed Item；
-- generic Rig缺finish reason时provider-specific extraction；
+- generic provider projection缺finish reason时protocol-specific extraction；
 - response ID长度和字符validation。
 
 ### Auth And Redaction
@@ -1900,7 +1901,9 @@ src/model_gateway/cache.rs
 src/model_gateway/continuation.rs
 src/model_gateway/redaction.rs
 src/model_gateway/provider.rs
-src/model_gateway/provider/rig.rs
+src/model_gateway/provider/openai_responses.rs
+src/model_gateway/provider/anthropic_messages.rs
+src/model_gateway/provider/transport.rs
 src/model_gateway/provider/scripted.rs
 ```
 
@@ -1908,7 +1911,7 @@ src/model_gateway/provider/scripted.rs
 
 ## Rejected Designs
 
-### ActiveTurnTask直接调用Rig provider
+### ActiveTurnTask直接调用provider或SDK
 
 否决原因：provider type、auth、base URL、retry、usage和error会扩散到Turn execution。
 
@@ -1969,6 +1972,6 @@ src/model_gateway/provider/scripted.rs
 - [x] 执行Rig 0.40.0 ModelGateway reality gate，在production adapter冻结前完成OpenAI Responses/Anthropic Messages loopback、stream、terminal、metadata和delivery/error证据（ADR 0138）。
 - [x] 实现ModelGateway model resolution、immutable request/proof与single-attempt scripted core。
 - [x] 实现crate-private Structured foundation：`OutputContract::Structured` exact-model contract constructor（capability/`max_schema_bytes` cap、name 1..64、schema v1 subset）、`ModelCallRequest` exact-model/OutputContract proof复验、terminal exact JSON object parse与本地schema validation、`Refused` bypass及`UnexpectedToolCall`/`IncompleteResponse`/`InvalidStructuredOutput` precedence，ScriptedProviderAdapter端到端conformance。
-- [ ] 实现credential/connection/cache policy、provider-native Structured schema mapping/sanitization和Rig production provider adapters，并激活public structured requester/Wire/SessionDefinition字段与Runtime/ActiveTurnTask structured调用。
+- [ ] 实现credential/connection/cache policy、provider-native Structured schema mapping/sanitization和OpenAI Responses/Anthropic Messages direct production adapters，并激活public structured requester/Wire/SessionDefinition字段与Runtime/ActiveTurnTask structured调用。
 - [x] 完成OpenAI Responses与Anthropic Messages M12 mock-server contract tests；production adapter suite仍属于M14。
 - [x] 在阶段9冻结公开model catalog/query协议。

@@ -7,6 +7,9 @@ cd "$root"
 cargo fmt --all -- --check
 cargo test --all-targets --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo fmt --manifest-path provider-gate/Cargo.toml -- --check
+cargo test --manifest-path provider-gate/Cargo.toml --all-targets --locked
+cargo clippy --manifest-path provider-gate/Cargo.toml --all-targets --locked -- -D warnings
 python3 scripts/check_docs.py
 python3 docs/fixtures/wire-v1/verify.py
 python3 docs/fixtures/durable-store-v1/verify.py
