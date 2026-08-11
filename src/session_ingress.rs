@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::prompt::PromptIntent;
+use crate::tools::{ToolExecutionRequest, ToolStartError, ToolStartGate, ToolStartPermit};
 use crate::wire::{CommandId, TurnId};
 
 pub(crate) const FOLLOW_UP_QUEUE_CAPACITY: usize = 8;
@@ -207,6 +208,41 @@ impl EmergencyControlHandle {
             .lock()
             .expect("emergency control state is not poisoned");
         state.target == Some(target) && state.epoch == epoch
+    }
+
+    /// Reserves one exact Tool start gate only while the exact `target` + `epoch` is current
+    /// and unsignaled, holding the same owner mutex that `signal` and `bind` lock.
+    ///
+    /// This is the linearization point for first-wins start reservations: a caller that must
+    /// not start a Tool side effect when Cancel/SecurityRevoked has already won performs its
+    /// exact `ToolStartGate::reserve` here, so `signal` and the reservation serialize on one
+    /// mutex instead of observe-then-lock racing.  The gate reservation itself is now only an
+    /// exact-capture check plus one lock-free atomic CAS: the gate owns no nested mutex, so
+    /// holding the emergency owner mutex here locks no sibling guard (no lock ordering), can
+    /// never poison the gate (the gate has no lock to poison), and runs no caller callback or
+    /// arbitrary work — `signal` and `bind` can never be stalled by this reservation.
+    /// `None` means the exact basis is not current or is already signaled (first-wins went to
+    /// the signal, or the basis is stale); `Some` is the gate reservation result.  Outside a
+    /// Round the caller consumes the returned permit with `start` to obtain the typed
+    /// `ToolStartedExecution` proof; the start transition runs outside this mutex, so a
+    /// reservation that won here always produces its proof even when the signal lands right
+    /// after the reservation (the signal closes only the emergency basis, never the
+    /// already-Reserved gate).
+    pub(crate) fn reserve_tool_start(
+        &self,
+        target: EmergencyControlTarget,
+        epoch: u64,
+        gate: &ToolStartGate,
+        request: &ToolExecutionRequest,
+    ) -> Option<Result<ToolStartPermit, ToolStartError>> {
+        let state = self
+            .state
+            .lock()
+            .expect("emergency control state is not poisoned");
+        if state.target != Some(target) || state.epoch != epoch || state.signal.is_some() {
+            return None;
+        }
+        Some(gate.reserve(request))
     }
 
     pub(crate) async fn cancelled(&self, target: EmergencyControlTarget, epoch: u64) {
@@ -483,6 +519,7 @@ impl FollowUpQueue {
 #[cfg(test)]
 mod tests {
     use crate::prompt::{PromptBodyIntent, PromptIntent, TextIntent};
+    use crate::tools::{ToolCall, ToolExecutionRequest, ToolStartError, ToolStartGate};
     use crate::wire::{CommandId, TurnId};
 
     use super::{
@@ -505,6 +542,18 @@ mod tests {
 
     fn turn_id(value: u8) -> TurnId {
         format!("trn_{value:032x}").parse().unwrap()
+    }
+
+    fn tool_request(value: u8, call_id: &str, call_index: u32) -> ToolExecutionRequest {
+        ToolExecutionRequest::new(
+            format!("itm_{value:032x}").parse().unwrap(),
+            ToolCall::new(
+                call_id.parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                call_index,
+            ),
+        )
     }
 
     #[test]
@@ -698,6 +747,140 @@ mod tests {
         assert_eq!(
             format!("{observation:?}"),
             "EmergencyControlObservation { .. }"
+        );
+    }
+
+    #[test]
+    fn emergency_control_reserves_tool_start_only_on_exact_unsignaled_current() {
+        let control = EmergencyControlHandle::new();
+        let target = EmergencyControlTarget::Turn(turn_id(61));
+        let observation = control.bind(target).unwrap();
+        let request = tool_request(1, "call_exact", 0);
+        let gate = ToolStartGate::new(request.clone());
+
+        // The exact current unsignaled basis reserves, and the permit starts the gate.
+        let permit = control
+            .reserve_tool_start(target, observation.epoch(), &gate, &request)
+            .expect("the exact unsignaled current basis reserves");
+        assert!(
+            permit
+                .expect("the reservation itself is not refused")
+                .start()
+                .is_ok()
+        );
+        // The exact entry is now started: a later reservation is a duplicate invariant.
+        assert!(matches!(
+            gate.reserve(&request),
+            Err(ToolStartError::InvalidBinding)
+        ));
+
+        // A stale epoch never reserves: the reservation does not run on an old basis.
+        assert!(
+            control
+                .reserve_tool_start(target, observation.epoch() + 1, &gate, &request)
+                .is_none()
+        );
+        // A different target never reserves.
+        assert!(
+            control
+                .reserve_tool_start(
+                    EmergencyControlTarget::Turn(turn_id(62)),
+                    observation.epoch(),
+                    &gate,
+                    &request,
+                )
+                .is_none()
+        );
+
+        // After the signal wins, the reservation never runs: the signal is first-wins.
+        assert_eq!(
+            control.signal(target, EmergencyControlSignal::Cancel),
+            EmergencyControlSignalOutcome::Accepted {
+                epoch: observation.epoch()
+            }
+        );
+        assert!(
+            control
+                .reserve_tool_start(target, observation.epoch(), &gate, &request)
+                .is_none()
+        );
+        // The signal that won stays observable.
+        assert_eq!(
+            control.observe(target).unwrap().signal(),
+            Some(EmergencyControlSignal::Cancel)
+        );
+
+        // Retiring the observation also closes the reservation basis.
+        assert!(control.retire(observation));
+        assert!(
+            control
+                .reserve_tool_start(target, observation.epoch(), &gate, &request)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn emergency_control_typed_reservation_linearizes_with_signal_on_one_mutex() {
+        let control = EmergencyControlHandle::new();
+        let target = EmergencyControlTarget::Turn(turn_id(63));
+        let observation = control.bind(target).unwrap();
+        let request = tool_request(2, "call_first_wins", 0);
+        let gate = ToolStartGate::new(request.clone());
+
+        // A reservation that linearized before the signal starts truthfully afterwards: the
+        // permit holds the gate in Reserved and start succeeds even after the signal lands.
+        let permit = control
+            .reserve_tool_start(target, observation.epoch(), &gate, &request)
+            .expect("the reservation linearized before the signal")
+            .expect("the reservation itself is not refused");
+        assert_eq!(
+            control.signal(target, EmergencyControlSignal::SecurityRevoked),
+            EmergencyControlSignalOutcome::Accepted {
+                epoch: observation.epoch()
+            }
+        );
+        assert!(permit.start().is_ok());
+        // The started gate stays closed: the signal did not resurrect a second reservation.
+        assert!(matches!(
+            gate.reserve(&request),
+            Err(ToolStartError::InvalidBinding)
+        ));
+    }
+
+    #[test]
+    fn emergency_control_typed_reservation_passes_gate_failures_through_under_the_mutex() {
+        let control = EmergencyControlHandle::new();
+        let target = EmergencyControlTarget::Turn(turn_id(64));
+        let observation = control.bind(target).unwrap();
+        let request = tool_request(3, "call_closed", 0);
+        let gate = ToolStartGate::new(request.clone());
+
+        // A foreign request fails the exact-binding invariant inside the reservation: the
+        // gate error is the result while the emergency mutex still guards the basis.
+        let foreign = tool_request(4, "call_foreign", 0);
+        assert!(matches!(
+            control.reserve_tool_start(target, observation.epoch(), &gate, &foreign),
+            Some(Err(ToolStartError::InvalidBinding))
+        ));
+
+        // A gate explicitly closed before start reports CancelledBeforeStart.
+        assert!(gate.cancel_before_start());
+        assert!(matches!(
+            control.reserve_tool_start(target, observation.epoch(), &gate, &request),
+            Some(Err(ToolStartError::CancelledBeforeStart))
+        ));
+
+        // The signal still wins over any later reservation, gate errors included.
+        assert_eq!(
+            control.signal(target, EmergencyControlSignal::Cancel),
+            EmergencyControlSignalOutcome::Accepted {
+                epoch: observation.epoch()
+            }
+        );
+        assert!(
+            control
+                .reserve_tool_start(target, observation.epoch(), &gate, &request)
+                .is_none()
         );
     }
 

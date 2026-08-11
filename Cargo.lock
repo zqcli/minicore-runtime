@@ -149,6 +149,7 @@ dependencies = [
  "base64",
  "file-id",
  "fs4",
+ "futures-util",
  "getrandom",
  "regex-syntax",
  "same-file",
