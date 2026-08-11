@@ -18135,7 +18135,7 @@ mod tests {
             );
             let tool_polled = Arc::new(AtomicBool::new(false));
             let tool_polled_by_executor = Arc::clone(&tool_polled);
-            let tool_set = ToolSet::with_executor(
+            let tool_set = ToolSet::with_sandbox_contract(
                 vec![
                     crate::tools::ToolDefinition::new(
                         "echo".parse().unwrap(),
@@ -18145,13 +18145,24 @@ mod tests {
                     )
                     .unwrap(),
                 ],
+                crate::tools::ToolSandboxContract::available([
+                    crate::tools::ToolCapabilityClass::Network,
+                ]),
                 move |_| {
-                    // The executor closure is the start factory's body: it runs only when
-                    // the factory is invoked after a winning reservation.
-                    tool_polled_by_executor.store(true, Ordering::Release);
-                    Box::pin(
-                        async move { ToolExecutionResult::completed_text("tool ran").unwrap() },
-                    )
+                    let tool_polled = Arc::clone(&tool_polled_by_executor);
+                    // The start factory's synchronous body is the factory-invoked probe: it
+                    // runs only when the factory is invoked after a winning reservation.
+                    crate::tools::ToolExecutionPlan::Execute {
+                        permissions: crate::tools::ToolPermissionSet::new([
+                            crate::tools::ToolCapabilityClass::Network,
+                        ]),
+                        start: crate::tools::ToolExecutionStart::new(move |_observer| {
+                            tool_polled.store(true, Ordering::Release);
+                            Box::pin(async move {
+                                ToolExecutionResult::completed_text("tool ran").unwrap()
+                            })
+                        }),
+                    }
                 },
             );
             let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
@@ -19100,7 +19111,7 @@ mod tests {
         let tool_started_by_executor = Arc::clone(&tool_started);
         let cancel_observed_by_executor = Arc::clone(&cancel_observed);
         let release_tool_by_executor = Arc::clone(&release_tool);
-        let tool_set = ToolSet::with_cancellable_executor(
+        let tool_set = ToolSet::with_sandbox_contract(
             vec![
                 crate::tools::ToolDefinition::new(
                     "echo".parse().unwrap(),
@@ -19110,25 +19121,36 @@ mod tests {
                 )
                 .unwrap(),
             ],
-            move |_request, observer| {
+            crate::tools::ToolSandboxContract::available([
+                crate::tools::ToolCapabilityClass::FilesystemRead,
+            ]),
+            move |_request| {
                 let tool_started = Arc::clone(&tool_started_by_executor);
                 let cancel_observed = Arc::clone(&cancel_observed_by_executor);
                 let release_tool = Arc::clone(&release_tool_by_executor);
-                Box::pin(async move {
-                    tool_started.notify_one();
-                    // Cooperative executor: observes the operation's own cancellation and
-                    // runs its bounded cleanup before returning.
-                    observer.cancelled().await;
-                    cancel_observed.notify_one();
-                    release_tool.notified().await;
-                    ToolExecutionResult::Completed {
-                        disposition: crate::tools::ToolResultDisposition::Cancelled,
-                        content: crate::tools::ToolResultContent::from_text_parts(vec![
-                            "cooperative cleanup".to_owned(),
-                        ])
-                        .unwrap(),
-                    }
-                })
+                // The admitted Execute plan's start factory receives the cancellation
+                // observer: the cooperative executor observes the operation's own
+                // cancellation and runs its bounded cleanup before returning.
+                crate::tools::ToolExecutionPlan::Execute {
+                    permissions: crate::tools::ToolPermissionSet::new([
+                        crate::tools::ToolCapabilityClass::FilesystemRead,
+                    ]),
+                    start: crate::tools::ToolExecutionStart::new(move |observer| {
+                        Box::pin(async move {
+                            tool_started.notify_one();
+                            observer.cancelled().await;
+                            cancel_observed.notify_one();
+                            release_tool.notified().await;
+                            ToolExecutionResult::Completed {
+                                disposition: crate::tools::ToolResultDisposition::Cancelled,
+                                content: crate::tools::ToolResultContent::from_text_parts(vec![
+                                    "cooperative cleanup".to_owned(),
+                                ])
+                                .unwrap(),
+                            }
+                        })
+                    }),
+                }
             },
         );
         let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
@@ -19729,6 +19751,79 @@ mod tests {
             run_sandbox_approval_scenario(&store, tool_set, allowed_constructed).await;
         assert_eq!(constructed, 1);
         assert!(recording.contains("tool ran"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandbox_unavailable_denies_execute_plan_without_invoking_factory() {
+        // An unavailable Sandbox denies the Execute plan's non-empty permission set before
+        // any start-gate reservation: the round settles the exact PreExecution Denied
+        // result ("tool sandbox is unavailable"), the start factory is never invoked, and
+        // the Turn completes normally with the follow-up Model response.
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_sandbox_unavailable",
+            "echo",
+            "{\"value\":1}",
+            "sandbox round complete",
+        );
+        let factory_invoked = Arc::new(AtomicBool::new(false));
+        let factory_invoked_by_planner = Arc::clone(&factory_invoked);
+        let tool_set = ToolSet::with_sandbox_contract(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            crate::tools::ToolSandboxContract::unavailable(),
+            move |_| {
+                let factory_invoked = Arc::clone(&factory_invoked_by_planner);
+                // The planner still requests a non-empty capability class: only the
+                // admission decides the denial, never the factory.
+                crate::tools::ToolExecutionPlan::Execute {
+                    permissions: crate::tools::ToolPermissionSet::new([
+                        crate::tools::ToolCapabilityClass::Network,
+                    ]),
+                    start: crate::tools::ToolExecutionStart::new(move |_observer| {
+                        factory_invoked.store(true, Ordering::Release);
+                        Box::pin(
+                            async move { ToolExecutionResult::completed_text("tool ran").unwrap() },
+                        )
+                    }),
+                }
+            },
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 2);
+        // The denied PreExecution never reached the start gate: no factory, no executor.
+        assert!(!factory_invoked.load(Ordering::Acquire));
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert!(recording.contains("call_sandbox_unavailable"));
+        assert!(recording.contains("\"source\":\"pre_execution\""));
+        assert!(recording.contains("\"disposition\":\"denied\""));
+        assert!(recording.contains("tool sandbox is unavailable"));
+        assert!(!recording.contains("tool ran"));
+        close_loaded(loaded).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
