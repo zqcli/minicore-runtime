@@ -18,7 +18,9 @@ use crate::wire::lexical::{
 };
 use crate::wire::{BoundedJsonObject, BoundedJsonSchema, Money, ProtocolLimits};
 
+mod anthropic_messages;
 mod openai_responses;
+mod provider_transport;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ModelIdentityError {
