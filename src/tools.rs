@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 use crate::turn_item_interaction::{
     InteractionRequest, InteractionResolution, ResolvedInteraction,
@@ -286,24 +287,121 @@ impl ToolExecutionResult {
 pub(crate) type ToolExecutionFuture =
     Pin<Box<dyn Future<Output = ToolExecutionResult> + Send + 'static>>;
 
+/// The bound run future for one started execution: it resolves to the identity-bound
+/// `ToolExecutionOutcome` (the executor's `ToolExecutionResult` is bound inside).
+pub(crate) type ToolExecutionRun =
+    Pin<Box<dyn Future<Output = ToolExecutionOutcome> + Send + 'static>>;
+
+/// The trigger side of one started Tool operation's cancellation pair.
+///
+/// The Session Execution slot creates the pair only after the typed started proof exists and
+/// hands the observer to the start factory; the executor can only observe `cancelled` and
+/// performs its own bounded cleanup before returning.  `cancel` is idempotent.
+#[derive(Clone)]
+pub(crate) struct ToolCancellationHandle {
+    token: CancellationToken,
+}
+
+/// The observation side of one started Tool operation's cancellation pair: the executor can
+/// only observe cancellation, never trigger it.
+#[derive(Clone)]
+pub(crate) struct ToolCancellationObserver {
+    #[allow(
+        dead_code,
+        reason = "read only by the cooperative-cancellation seam; production ToolSets are empty and only the cancellation tests exercise it"
+    )]
+    token: CancellationToken,
+}
+
+impl ToolCancellationHandle {
+    pub(crate) fn new() -> (Self, ToolCancellationObserver) {
+        let token = CancellationToken::new();
+        (
+            Self {
+                token: token.clone(),
+            },
+            ToolCancellationObserver { token },
+        )
+    }
+
+    /// Idempotent: the token stays cancelled after the first call.
+    pub(crate) fn cancel(&self) {
+        self.token.cancel();
+    }
+}
+
+impl ToolCancellationObserver {
+    /// Awaits the operation's cancellation: returns when the owning slot cancelled the pair.
+    /// This is the executor's cooperative-cancellation seam: a running executor awaits it and
+    /// performs its own bounded cleanup before returning.
+    #[allow(
+        dead_code,
+        reason = "awaited by concrete executors; production ToolSets are empty and only the cooperative-cancellation tests exercise it"
+    )]
+    pub(crate) async fn cancelled(&self) {
+        self.token.cancelled().await;
+    }
+}
+
+impl fmt::Debug for ToolCancellationHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ToolCancellationHandle { .. }")
+    }
+}
+
+impl fmt::Debug for ToolCancellationObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ToolCancellationObserver { .. }")
+    }
+}
+
+/// The move-only start factory for one exact Tool execution.
+///
+/// The factory is the only way an executor future comes into existence: it receives the
+/// cancellation observer and returns the run future.  `ToolSet::run_started_execution`
+/// invokes it only after the typed started proof's exact capture revalidates, so a foreign
+/// proof never constructs the factory or any future.
+pub(crate) struct ToolExecutionStart {
+    factory: Box<dyn FnOnce(ToolCancellationObserver) -> ToolExecutionFuture + Send>,
+}
+
+impl ToolExecutionStart {
+    /// Test-visible constructor for scripted planners; the M8 executor adapter supplies the
+    /// production constructor.
+    #[cfg(test)]
+    pub(crate) fn new(
+        factory: impl FnOnce(ToolCancellationObserver) -> ToolExecutionFuture + Send + 'static,
+    ) -> Self {
+        Self {
+            factory: Box::new(factory),
+        }
+    }
+
+    fn start(self, observer: ToolCancellationObserver) -> ToolExecutionFuture {
+        (self.factory)(observer)
+    }
+}
+
 /// The synchronous pre-start plan one Tool executor produces for one exact request.
 ///
-/// The plan is produced before any start-gate reservation and is never polled by the plan
-/// producer: an `Execute` plan holds its executor future unpolled, an `Interaction` plan is
-/// presented to the host before the start gate is ever involved, and a `PreExecution` plan
-/// carries a frozen preflight result that never reaches the start gate.  The start gate
-/// decides whether an unpolled future may begin; this slice covers exactly that start seam,
-/// not a fuller operation slot.
+/// The plan is produced before any start-gate reservation and its start factory is never
+/// invoked by the plan producer: an `Execute` plan holds its factory uninvoked, an
+/// `Interaction` plan is presented to the host before the start gate is ever involved, and a
+/// `PreExecution` plan carries a frozen preflight result that never reaches the start gate.
+/// The start gate decides whether the factory may construct a future; this slice covers
+/// exactly that start seam, not a fuller operation slot.
 #[allow(
     dead_code,
     reason = "concrete executors/plans are cfg(test) until the M8 executor lands; production ToolSets are empty"
 )]
 pub(crate) enum ToolExecutionPlan {
-    Execute(ToolExecutionFuture),
+    Execute(ToolExecutionStart),
     Interaction {
         request_id: crate::wire::RequestId,
         request: InteractionRequest,
-        allowed: ToolExecutionFuture,
+        /// The allowed-path start factory: invoked only after the host allows and the exact
+        /// request's start reservation wins at resume.
+        allowed: ToolExecutionStart,
         denied: ToolExecutionResult,
     },
     /// A frozen known-tool preflight result (schema, policy, hook, or sandbox preflight): the
@@ -607,9 +705,44 @@ impl ToolSet {
         definitions: Vec<ToolDefinition>,
         executor: impl Fn(ToolExecutionRequest) -> ToolExecutionFuture + Send + Sync + 'static,
     ) -> Arc<Self> {
+        let executor: Arc<dyn Fn(ToolExecutionRequest) -> ToolExecutionFuture + Send + Sync> =
+            Arc::new(executor);
         Self::with_plans(
             definitions,
-            Arc::new(move |request| ToolExecutionPlan::Execute(executor(request))),
+            Arc::new(move |request| {
+                let executor = Arc::clone(&executor);
+                // The ignore-cancellation test wrapper: the start factory never surfaces the
+                // observer to the scripted executor.
+                ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                    executor(request)
+                }))
+            }),
+        )
+    }
+
+    /// Test-only cancellable-executor constructor: the scripted executor receives the
+    /// cancellation observer so cooperative-cancellation tests can await it and clean up.
+    #[cfg(test)]
+    pub(crate) fn with_cancellable_executor(
+        definitions: Vec<ToolDefinition>,
+        executor: impl Fn(ToolExecutionRequest, ToolCancellationObserver) -> ToolExecutionFuture
+        + Send
+        + Sync
+        + 'static,
+    ) -> Arc<Self> {
+        let executor: Arc<
+            dyn Fn(ToolExecutionRequest, ToolCancellationObserver) -> ToolExecutionFuture
+                + Send
+                + Sync,
+        > = Arc::new(executor);
+        Self::with_plans(
+            definitions,
+            Arc::new(move |request| {
+                let executor = Arc::clone(&executor);
+                ToolExecutionPlan::Execute(ToolExecutionStart::new(move |observer| {
+                    executor(request, observer)
+                }))
+            }),
         )
     }
 
@@ -688,26 +821,33 @@ impl ToolSet {
         }
     }
 
-    /// Runs one already-started execution to its identity-bound outcome.
+    /// Constructs the run for one already-started execution, or fails closed before it.
     ///
     /// The typed proof is the only entrance to the started path: it is constructed only by a
     /// successful Reserved→Started transition and binds the exact started request capture.
-    /// A foreign proof (one whose exact capture is not `request`) is an invariant that fails
-    /// closed to identity-bound Abandoned RuntimeFailure with the future dropped unpolled.
+    /// The exact-capture revalidation runs first: a foreign proof (one whose exact capture is
+    /// not `request`) fails closed to identity-bound Abandoned RuntimeFailure and the start
+    /// factory is never invoked, so no executor future exists and nothing is polled.
     ///
-    /// The future is awaited directly: every production caller settles inside its
-    /// per-request outer settle task, whose join converts a panicking executor to the exact
-    /// Abandoned RuntimeFailure, so the started path spawns no detached task of its own.
-    pub(crate) async fn run_started_execution(
+    /// On success the factory is invoked with the cancellation observer and the returned run
+    /// future is bound to the exact request.  The caller drives the run future: the Session
+    /// Execution slot isolates planner/factory/executor panics through its consuming drive,
+    /// so the started path spawns no detached task of its own.
+    pub(crate) fn run_started_execution(
         &self,
         request: &ToolExecutionRequest,
         proof: ToolStartedExecution,
-        future: ToolExecutionFuture,
-    ) -> ToolExecutionOutcome {
+        start: ToolExecutionStart,
+        observer: ToolCancellationObserver,
+    ) -> Result<ToolExecutionRun, ToolExecutionOutcome> {
         if !request.is_exact_capture(proof.request()) {
-            return abandoned_runtime_failure(request);
+            return Err(abandoned_runtime_failure(request));
         }
-        Self::bind_started_result(request, future.await)
+        let future = start.start(observer);
+        let request = request.clone();
+        Ok(Box::pin(async move {
+            Self::bind_started_result(&request, future.await)
+        }))
     }
 
     /// The pre-start settlement decision for one resolved Interaction.
@@ -1949,7 +2089,7 @@ mod tests {
         set: Arc<ToolSet>,
         request: ToolExecutionRequest,
     ) -> ToolExecutionOutcome {
-        let ToolExecutionPlan::Execute(future) = set
+        let ToolExecutionPlan::Execute(start) = set
             .plan(&request)
             .expect("a known tool produces an execution plan")
         else {
@@ -1960,14 +2100,14 @@ mod tests {
             .expect("the exact request reserves its gate")
             .start()
             .expect("the reserved gate starts");
-        // The production started path settles inside a per-request outer settle task whose
-        // join isolates a panicking executor; direct tests reproduce that isolation with one
-        // spawn of their own.
-        let outcome = tokio::spawn({
-            let request = request.clone();
-            async move { set.run_started_execution(&request, proof, future).await }
-        })
-        .await;
+        let (_handle, observer) = ToolCancellationHandle::new();
+        let run = set
+            .run_started_execution(&request, proof, start, observer)
+            .expect("the exact proof revalidates and the factory constructs the run");
+        // The production started path settles inside the Session Execution slot's consuming
+        // drive, whose catch_unwind isolates a panicking executor; direct tests reproduce
+        // that isolation with one spawn of their own.
+        let outcome = tokio::spawn(run).await;
         match outcome {
             Ok(outcome) => outcome,
             Err(_) => abandoned_runtime_failure(&request),
@@ -1975,8 +2115,8 @@ mod tests {
     }
 
     /// Runs one scripted result through the exact proof path: fresh gate, exact reservation,
-    /// typed started proof, then the started binding, isolated by one spawn like the
-    /// per-request outer settle task.
+    /// typed started proof, then the started binding, isolated by one spawn like the Session
+    /// Execution slot's consuming drive.
     async fn run_started_with(
         set: Arc<ToolSet>,
         request: ToolExecutionRequest,
@@ -1987,14 +2127,16 @@ mod tests {
             .expect("the exact request reserves its gate")
             .start()
             .expect("the reserved gate starts");
-        let outcome = tokio::spawn({
-            let request = request.clone();
-            async move {
-                set.run_started_execution(&request, proof, Box::pin(async move { result }))
-                    .await
-            }
-        })
-        .await;
+        let (_handle, observer) = ToolCancellationHandle::new();
+        let run = set
+            .run_started_execution(
+                &request,
+                proof,
+                ToolExecutionStart::new(move |_observer| Box::pin(async move { result })),
+                observer,
+            )
+            .expect("the exact proof revalidates and the factory constructs the run");
+        let outcome = tokio::spawn(run).await;
         match outcome {
             Ok(outcome) => outcome,
             Err(_) => abandoned_runtime_failure(&request),
@@ -2235,9 +2377,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreign_started_proof_never_polls_the_future_and_fails_closed_identity_bound() {
-        let polled = Arc::new(AtomicBool::new(false));
-        let polled_by_future = Arc::clone(&polled);
+    async fn foreign_started_proof_never_invokes_the_start_factory_and_fails_closed_identity_bound()
+    {
+        let constructed = Arc::new(AtomicBool::new(false));
+        let constructed_by_factory = Arc::clone(&constructed);
         let set = ToolSet::empty();
         let request = ToolExecutionRequest::new(
             "itm_00000000000000000000000000000001".parse().unwrap(),
@@ -2265,19 +2408,21 @@ mod tests {
             .expect("the exact request reserves its gate")
             .start()
             .expect("the reserved gate starts");
-        let outcome = set
-            .run_started_execution(
-                &foreign,
-                proof,
-                Box::pin(async move {
-                    polled_by_future.store(true, Ordering::Release);
-                    ToolExecutionResult::completed_text("must not run").unwrap()
-                }),
-            )
-            .await;
-        // The foreign proof fails closed to the identity-bound Abandoned RuntimeFailure and
-        // the future was never polled: no foreign proof can drive a future to an executed
-        // outcome.
+        let (_handle, observer) = ToolCancellationHandle::new();
+        // The foreign proof fails closed before the factory is invoked: the factory never
+        // runs, so no executor future exists and nothing is polled.
+        let outcome = match set.run_started_execution(
+            &foreign,
+            proof,
+            ToolExecutionStart::new(move |_observer| {
+                constructed_by_factory.store(true, Ordering::Release);
+                Box::pin(async { ToolExecutionResult::completed_text("must not run").unwrap() })
+            }),
+            observer,
+        ) {
+            Ok(_) => panic!("a foreign proof must fail closed before the factory is invoked"),
+            Err(outcome) => outcome,
+        };
         assert!(matches!(
             outcome,
             ToolExecutionOutcome::Abandoned {
@@ -2287,7 +2432,7 @@ mod tests {
             } if item_id == foreign.item_id()
                 && tool_call_id == *foreign.call().tool_call_id()
         ));
-        assert!(!polled.load(Ordering::Acquire));
+        assert!(!constructed.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2524,9 +2669,9 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_before_start_gate_never_polls_the_executor_and_generates_matching_outcome() {
-        let polled = Arc::new(AtomicBool::new(false));
-        let polled_by_executor = Arc::clone(&polled);
+    fn cancelled_before_start_gate_never_invokes_the_factory_and_generates_matching_outcome() {
+        let constructed = Arc::new(AtomicBool::new(false));
+        let constructed_by_executor = Arc::clone(&constructed);
         let set = ToolSet::with_executor(
             vec![
                 ToolDefinition::new(
@@ -2538,11 +2683,12 @@ mod tests {
                 .unwrap(),
             ],
             move |_| {
-                let polled = Arc::clone(&polled_by_executor);
-                Box::pin(async move {
-                    polled.store(true, Ordering::Release);
-                    ToolExecutionResult::completed_text("must not run").unwrap()
-                })
+                // The executor closure is the ignore-cancellation wrapper's factory body: it
+                // runs only when the start factory is invoked.
+                constructed_by_executor.store(true, Ordering::Release);
+                Box::pin(
+                    async move { ToolExecutionResult::completed_text("must not run").unwrap() },
+                )
             },
         );
         let request = ToolExecutionRequest::new(
@@ -2578,8 +2724,9 @@ mod tests {
                 && tool_call_id == *request.call().tool_call_id()
                 && content.parts()[0].as_text() == "tool did not start"
         ));
-        // The plan was created synchronously but its executor future was never polled.
-        assert!(!polled.load(Ordering::Acquire));
+        // The plan was created synchronously but its start factory was never invoked: the
+        // executor closure never ran and no executor future exists.
+        assert!(!constructed.load(Ordering::Acquire));
     }
 
     #[test]

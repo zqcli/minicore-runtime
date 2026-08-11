@@ -70,8 +70,9 @@ use crate::session_ingress::{
     QueuedSteer, SteerQueue, SteerQueueError,
 };
 use crate::tools::{
-    InteractionSettlement, ToolAbandonReason, ToolCall, ToolExecutionMode, ToolExecutionOutcome,
-    ToolExecutionPlan, ToolExecutionRequest, ToolSet, ToolStartGate, ToolStartedExecution,
+    InteractionSettlement, ToolAbandonReason, ToolCall, ToolCancellationHandle, ToolExecutionMode,
+    ToolExecutionOutcome, ToolExecutionPlan, ToolExecutionRequest, ToolExecutionRun,
+    ToolExecutionStart, ToolSet, ToolStartError, ToolStartGate, ToolStartedExecution,
 };
 #[cfg(test)]
 use crate::tools::{ToolExecutionResult, ToolOutcomeSource};
@@ -7487,89 +7488,387 @@ async fn run_admission(
     Ok(context)
 }
 
-/// One Turn/round-local concrete Tool start gate.
+/// The four lifecycle variants of one exact Tool operation slot.
 ///
-/// The concrete gate binds the exact `EmergencyControlHandle` + `EmergencyControlObservation`
-/// and one exact `ToolExecutionRequest` capture per entry.  Reservation is atomic with the
-/// emergency signal: the tools owner's `ToolStartGate` slot transition runs while the
-/// emergency owner mutex is held, so a first-wins signal either closes the reservation
-/// (`Signaled`, the executor is never polled) or the reservation commits before the signal
-/// can land (the executor may only truthfully settle afterwards).
-#[derive(Clone)]
-struct RoundToolStartGate {
-    inner: Arc<RoundToolStartGateInner>,
+/// The slot is constructed `Prepared` (bound to its exact request, the round's emergency
+/// handle + observation, and its own `ToolStartGate`), moves to `Running` only after the
+/// typed started proof exists (owning the operation's own cancellation pair and the
+/// still-owned run future), enters `Settling` once the run future is no longer being
+/// selected against, and ends `Terminal` once the identity-bound outcome is bound.  There
+/// is no separate state label: the variant is the slot, and every lifecycle fact is carried
+/// by the variant that owns it.
+///
+/// Settling is the current waiting point: the signal branch enters Settling *before* the
+/// executor result (its own pair is cancelled first, and the Settling slot keeps awaiting
+/// the same run future to the executor's cooperative cleanup/result — a started future is
+/// never dropped because of a signal), while a natural completion binds its result and only
+/// then passes through a brief Settling state.  The future mutation permit step still comes
+/// later and is not part of this slot.
+enum ToolOperationSlot {
+    Prepared {
+        request: ToolExecutionRequest,
+        emergency_control: EmergencyControlHandle,
+        observation: EmergencyControlObservation,
+        gate: ToolStartGate,
+    },
+    Running {
+        request: ToolExecutionRequest,
+        emergency_control: EmergencyControlHandle,
+        observation: EmergencyControlObservation,
+        cancellation: ToolCancellationHandle,
+        // The still-owned started run future: the Running select polls it, and the Settling
+        // signal path keeps awaiting the same future to the executor's cooperative
+        // cleanup/result.
+        run: ToolExecutionRun,
+    },
+    Settling {
+        request: ToolExecutionRequest,
+    },
+    Terminal {
+        outcome: ToolExecutionOutcome,
+    },
 }
 
-struct RoundToolStartGateInner {
-    emergency_control: EmergencyControlHandle,
-    observation: EmergencyControlObservation,
-    entries: Vec<RoundToolStartGateEntry>,
-}
-
-struct RoundToolStartGateEntry {
-    request: ToolExecutionRequest,
-    gate: ToolStartGate,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RoundToolStartError {
-    /// The signal (or a stale basis) won before the reservation: never start, settle the
-    /// matching PreExecution Cancelled ToolResult.
-    Signaled,
-    /// A foreign/duplicate request violated the exact-binding invariant: fail closed to
-    /// Abandoned RuntimeFailure.
-    InvalidBinding,
-}
-
-impl RoundToolStartGate {
+/// The crate-private owner of one exact Tool operation's whole lifecycle.
+///
+/// Each exact request gets exactly one slot; the slot owns its own `ToolStartGate` (the sole
+/// operation owner — there is no second round-level gate), the emergency basis it reserves
+/// against, and the request it settles.  The consuming `drive` hides the plan, interaction
+/// presentation, reservation, started proof, running cancellation, settlement, and terminal
+/// transition, and catches any planner/factory/executor panic closed to the exact
+/// identity-bound Abandoned RuntimeFailure.
+impl ToolOperationSlot {
+    /// Binds one exact request's slot to the round's emergency basis.  Constructed right
+    /// after the assistant ToolCall apply and before the recorder await, so the gate binds
+    /// the exact request capture for the whole round.
     fn new(
+        request: ToolExecutionRequest,
         emergency_control: &EmergencyControlHandle,
         observation: EmergencyControlObservation,
-        requests: &[ToolExecutionRequest],
     ) -> Self {
-        Self {
-            inner: Arc::new(RoundToolStartGateInner {
-                emergency_control: emergency_control.clone(),
-                observation,
-                entries: requests
-                    .iter()
-                    .map(|request| RoundToolStartGateEntry {
-                        request: request.clone(),
-                        gate: ToolStartGate::new(request.clone()),
-                    })
-                    .collect(),
-            }),
+        Self::Prepared {
+            gate: ToolStartGate::new(request.clone()),
+            request,
+            emergency_control: emergency_control.clone(),
+            observation,
         }
     }
 
-    /// Reserves and starts the exact request's single entry.  The gate reservation (the
-    /// Prepared→Reserved slot transition) runs under the emergency owner mutex, linearizing
-    /// with `signal` on one mutex; the returned permit then produces the typed started proof
-    /// outside that mutex, so a reservation that already won can always truthfully settle (a
-    /// later signal closes only the emergency basis, never the already-Reserved gate).
-    fn reserve_start(
-        &self,
-        request: &ToolExecutionRequest,
-    ) -> Result<ToolStartedExecution, RoundToolStartError> {
-        let entry = self
-            .inner
-            .entries
-            .iter()
-            .find(|entry| entry.request.is_exact_capture(request))
-            .ok_or(RoundToolStartError::InvalidBinding)?;
-        let reserved = self.inner.emergency_control.reserve_tool_start(
-            self.inner.observation.target(),
-            self.inner.observation.epoch(),
-            &entry.gate,
-            request,
-        );
-        match reserved {
-            Some(Ok(permit)) => permit
-                .start()
-                .map_err(|_| RoundToolStartError::InvalidBinding),
-            Some(Err(_)) => Err(RoundToolStartError::InvalidBinding),
-            None => Err(RoundToolStartError::Signaled),
+    /// The exact request of any non-terminal slot: the identity-bound fail-closed outcomes
+    /// (panic mapping, cancellation-before-start, invalid binding) are built from it before
+    /// the slot reaches Terminal.
+    fn request(&self) -> &ToolExecutionRequest {
+        match self {
+            Self::Prepared { request, .. }
+            | Self::Running { request, .. }
+            | Self::Settling { request } => request,
+            Self::Terminal { .. } => {
+                unreachable!("a Terminal slot carries no request")
+            }
         }
+    }
+
+    /// Test-only accessor: lets a direct round test assert that a PreExecution or panicked
+    /// request never reserved its own gate (the clone shares the slot gate's state).
+    #[cfg(test)]
+    fn gate(&self) -> &ToolStartGate {
+        let Self::Prepared { gate, .. } = self else {
+            panic!("the gate exists only on a Prepared slot");
+        };
+        gate
+    }
+
+    /// Binds one exact identity-bound outcome into the slot's Terminal variant.  Every
+    /// settled path — unknown tool, frozen PreExecution, interaction deny/owner-cancellation,
+    /// sender/receiver failure, invalid start binding, signal-first cancellation, foreign
+    /// proof — ends here; no path may return an outcome that did not first pass through a
+    /// Terminal slot.
+    fn into_terminal(outcome: ToolExecutionOutcome) -> Self {
+        Self::Terminal { outcome }
+    }
+
+    /// The single extraction: consumes the Terminal slot and yields its bound identity-bound
+    /// outcome.  No outcome is ever returned that did not first pass through a Terminal slot.
+    fn into_outcome(self) -> ToolExecutionOutcome {
+        let Self::Terminal { outcome } = self else {
+            unreachable!("into_outcome consumes a Terminal slot");
+        };
+        outcome
+    }
+
+    /// Consumes the slot through the whole operation lifecycle.
+    ///
+    /// Everything that can panic for this request (planner, start factory, executor) is
+    /// polled inside this one catch_unwind, so a panic resolves exactly this request closed
+    /// to identity-bound Abandoned RuntimeFailure and never unwinds the round: Serial
+    /// requests after this one still settle, and Parallel drives stay parent-owned (no
+    /// detached tasks).
+    async fn drive(
+        self,
+        tool_set: Arc<ToolSet>,
+        turn_id: TurnId,
+        interaction_completion_sender: &mpsc::UnboundedSender<ExecutorCompletion>,
+        #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
+    ) -> ToolExecutionOutcome {
+        // The exact request is cloned before the slot moves into the caught drive, so a
+        // panic anywhere in the planner/factory/executor still maps to this exact request's
+        // identity-bound Abandoned outcome.
+        let catch_request = self.request().clone();
+        let terminal = AssertUnwindSafe(async move {
+            self.drive_until_terminal(
+                tool_set,
+                turn_id,
+                interaction_completion_sender,
+                #[cfg(test)]
+                hooks,
+            )
+            .await
+        })
+        .catch_unwind()
+        .await;
+        match terminal {
+            Ok(terminal) => terminal.into_outcome(),
+            // A panic also ends in a Terminal slot (identity-bound Abandoned) and is only
+            // then extracted, exactly like every ordinary path.
+            Err(_) => Self::into_terminal(abandoned_runtime_failure(&catch_request)).into_outcome(),
+        }
+    }
+
+    /// Drives a Prepared slot to its Terminal variant.
+    async fn drive_until_terminal(
+        self,
+        tool_set: Arc<ToolSet>,
+        turn_id: TurnId,
+        interaction_completion_sender: &mpsc::UnboundedSender<ExecutorCompletion>,
+        #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
+    ) -> Self {
+        let Self::Prepared {
+            request,
+            emergency_control,
+            observation,
+            gate,
+        } = self
+        else {
+            unreachable!("drive_until_terminal consumes a Prepared slot");
+        };
+        let Some(plan) = tool_set.plan(&request) else {
+            return Self::into_terminal(ToolSet::unavailable_outcome(&request));
+        };
+        match plan {
+            ToolExecutionPlan::Execute(start) => {
+                Self::Prepared {
+                    request,
+                    emergency_control,
+                    observation,
+                    gate,
+                }
+                .reserve_then_run(start, tool_set)
+                .await
+            }
+            ToolExecutionPlan::PreExecution(result) => {
+                // A frozen known-tool preflight result never reserves the gate and never
+                // invokes the start factory: settle it under the pre-execution binding, which
+                // also fails a malformed Completed shape closed to Abandoned OutcomeUnknown.
+                Self::into_terminal(ToolSet::bind_preexecution_result(&request, result))
+            }
+            ToolExecutionPlan::Interaction {
+                request_id,
+                request: interaction_request,
+                allowed,
+                denied,
+            } => {
+                // The interaction is presented before any gate involvement; the gate is only
+                // reserved at approval resume, and deny/owner-cancellation never reserve it.
+                let item_id = request.item_id();
+                let tool_call_id = request.call().tool_call_id().clone();
+                let (resolution_sender, resolution_receiver) = oneshot::channel();
+                let completion = InteractionRequestedCompletion {
+                    turn_id,
+                    timestamp: SystemClock.now(),
+                    item_id,
+                    tool_call_id: tool_call_id.clone(),
+                    request_id,
+                    request: interaction_request,
+                    resolution_sender,
+                };
+                if interaction_completion_sender
+                    .send(ExecutorCompletion::InteractionRequested(completion))
+                    .is_err()
+                {
+                    return Self::into_terminal(abandoned_runtime_failure(&request));
+                }
+                let Ok(resolution) = resolution_receiver.await else {
+                    return Self::into_terminal(abandoned_runtime_failure(&request));
+                };
+                match ToolSet::interaction_settlement(&resolution, &denied) {
+                    InteractionSettlement::PreExecution(result) => {
+                        Self::into_terminal(ToolSet::bind_preexecution_result(&request, result))
+                    }
+                    InteractionSettlement::Resume => {
+                        #[cfg(test)]
+                        hooks.before_tool_resume().await;
+                        Self::Prepared {
+                            request,
+                            emergency_control,
+                            observation,
+                            gate,
+                        }
+                        .reserve_then_run(allowed, tool_set)
+                        .await
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reserves the exact request's single start entry through the emergency owner mutex
+    /// (first-wins with `signal` on one mutex), starts the permit outside that mutex, and
+    /// moves the slot into Running with its own cancellation pair.
+    async fn reserve_then_run(self, start: ToolExecutionStart, tool_set: Arc<ToolSet>) -> Self {
+        let proof = match self.reserve_start() {
+            Ok(proof) => proof,
+            Err(ToolStartError::CancelledBeforeStart) => {
+                // The signal (or a stale basis) won before the reservation: never start, and
+                // settle the matching PreExecution Cancelled ToolResult.
+                return Self::into_terminal(ToolSet::cancelled_before_start_outcome(
+                    self.request(),
+                ));
+            }
+            Err(ToolStartError::InvalidBinding) => {
+                return Self::into_terminal(abandoned_runtime_failure(self.request()));
+            }
+        };
+        self.into_running(proof, start, tool_set).await
+    }
+
+    /// The first-wins reservation: `reserve_tool_start` runs the gate's Prepared→Reserved
+    /// slot transition while the emergency owner mutex is held, so a signal that already won
+    /// (or a stale basis) reports `CancelledBeforeStart` and the start factory is never
+    /// consulted; a foreign/duplicate capture reports `InvalidBinding`.  The returned
+    /// permit's Reserved→Started transition runs outside the mutex, so a reservation that
+    /// already won always produces its proof.
+    fn reserve_start(&self) -> Result<ToolStartedExecution, ToolStartError> {
+        let Self::Prepared {
+            request,
+            emergency_control,
+            observation,
+            gate,
+        } = self
+        else {
+            unreachable!("reservation runs only on a Prepared slot");
+        };
+        match emergency_control.reserve_tool_start(
+            observation.target(),
+            observation.epoch(),
+            gate,
+            request,
+        ) {
+            Some(Ok(permit)) => permit.start().map_err(|_| ToolStartError::InvalidBinding),
+            Some(Err(error)) => Err(error),
+            None => Err(ToolStartError::CancelledBeforeStart),
+        }
+    }
+
+    /// Constructs the Running slot only after the typed started proof exists.
+    ///
+    /// The operation's own cancel pair is created here, and the start factory is invoked
+    /// only by `run_started_execution` after it revalidates the exact proof capture: a
+    /// foreign proof fails closed to the identity-bound Abandoned RuntimeFailure without
+    /// constructing the factory or any future, and that failure is already a Terminal
+    /// outcome.  The run future stays owned by the Running slot, so a started future can
+    /// never be dropped because of a signal.
+    async fn into_running(
+        self,
+        proof: ToolStartedExecution,
+        start: ToolExecutionStart,
+        tool_set: Arc<ToolSet>,
+    ) -> Self {
+        let Self::Prepared {
+            request,
+            emergency_control,
+            observation,
+            gate: _,
+        } = self
+        else {
+            unreachable!("into_running consumes a Prepared slot");
+        };
+        let (cancellation, observer) = ToolCancellationHandle::new();
+        let run = match tool_set.run_started_execution(&request, proof, start, observer) {
+            Ok(run) => run,
+            // The factory exact-capture revalidation failed: the slot goes straight to
+            // Terminal with the identity-bound Abandoned outcome.
+            Err(outcome) => return Self::into_terminal(outcome),
+        };
+        Self::Running {
+            request,
+            emergency_control,
+            observation,
+            cancellation,
+            run,
+        }
+        .await_started_run()
+        .await
+    }
+
+    /// The Running select between the exact emergency cancellation basis (`cancelled(target,
+    /// epoch)`) and the still-owned run future.
+    ///
+    /// When the signal (or a stale basis) wins, the slot first cancels its own cancellation
+    /// pair, then enters Settling *before* the executor result and keeps awaiting the same
+    /// run future to the executor's cooperative cleanup/result: a started future is never
+    /// dropped because of a signal.  A natural completion binds its result and only then
+    /// passes through a brief Settling state.  Either way Settling then moves to Terminal.
+    async fn await_started_run(self) -> Self {
+        let Self::Running {
+            request,
+            emergency_control,
+            observation,
+            cancellation,
+            run,
+        } = self
+        else {
+            unreachable!("await_started_run consumes a Running slot");
+        };
+        let mut run = run;
+        let outcome = tokio::select! {
+            biased;
+            _ = emergency_control.cancelled(
+                observation.target(),
+                observation.epoch(),
+            ) => {
+                cancellation.cancel();
+                None
+            }
+            outcome = &mut run => Some(outcome),
+        };
+        match outcome {
+            // Natural completion: the run produced its identity-bound outcome; the slot
+            // still passes through a brief Settling state before Terminal.
+            Some(outcome) => Self::Settling { request }.settle(outcome),
+            // The signal (or a stale basis) won: the operation's own pair is already
+            // cancelled, and the Settling slot keeps awaiting the same run future to the
+            // executor's cooperative cleanup/result before the outcome is bound.
+            None => Self::Settling { request }.await_settled_run(run).await,
+        }
+    }
+
+    /// Natural-completion settlement: the outcome is already bound, so the brief Settling
+    /// state only moves the slot to Terminal.
+    fn settle(self, outcome: ToolExecutionOutcome) -> Self {
+        let Self::Settling { request: _ } = self else {
+            unreachable!("settle consumes a Settling slot");
+        };
+        Self::into_terminal(outcome)
+    }
+
+    /// Signal-path settlement: the run future is still alive, so the Settling slot keeps
+    /// awaiting the same future to the executor's cooperative cleanup/result and only then
+    /// binds the outcome and moves to Terminal.
+    async fn await_settled_run(self, run: ToolExecutionRun) -> Self {
+        let Self::Settling { request: _ } = self else {
+            unreachable!("await_settled_run consumes a Settling slot");
+        };
+        Self::into_terminal(run.await)
     }
 }
 
@@ -7581,160 +7880,55 @@ fn abandoned_runtime_failure(request: &ToolExecutionRequest) -> ToolExecutionOut
     }
 }
 
-/// Settles one exact request's pre-start plan through its round-local start gate.
+/// Executes one gated Tool round over the already-constructed per-request operation slots.
 ///
-/// An `Execute` plan only runs once the gate reservation wins and the typed started proof is
-/// produced; the plan future is never polled before the proof exists.  When the signal wins
-/// the plan future is dropped unpolled and the identity-bound PreExecution Cancelled outcome
-/// is generated.  An `Interaction` plan is presented before any gate involvement; the gate is
-/// only reserved at approval resume, and deny/owner-cancellation never reserve it.
-async fn settle_one_plan(
-    tool_set: &ToolSet,
-    gate: &RoundToolStartGate,
-    request: ToolExecutionRequest,
-    turn_id: TurnId,
-    interaction_completion_sender: &mpsc::UnboundedSender<ExecutorCompletion>,
-    #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
-) -> ToolExecutionOutcome {
-    let Some(plan) = tool_set.plan(&request) else {
-        return ToolSet::unavailable_outcome(&request);
-    };
-    match plan {
-        ToolExecutionPlan::Execute(future) => match gate.reserve_start(&request) {
-            Ok(proof) => {
-                tool_set
-                    .run_started_execution(&request, proof, future)
-                    .await
-            }
-            Err(RoundToolStartError::Signaled) => ToolSet::cancelled_before_start_outcome(&request),
-            Err(RoundToolStartError::InvalidBinding) => abandoned_runtime_failure(&request),
-        },
-        ToolExecutionPlan::PreExecution(result) => {
-            // A frozen known-tool preflight result never reserves the gate and never polls
-            // the executor: settle it under the pre-execution binding, which also fails a
-            // malformed Completed shape closed to Abandoned OutcomeUnknown.
-            ToolSet::bind_preexecution_result(&request, result)
-        }
-        ToolExecutionPlan::Interaction {
-            request_id,
-            request: interaction_request,
-            allowed,
-            denied,
-        } => {
-            let item_id = request.item_id();
-            let tool_call_id = request.call().tool_call_id().clone();
-            let (resolution_sender, resolution_receiver) = oneshot::channel();
-            let completion = InteractionRequestedCompletion {
-                turn_id,
-                timestamp: SystemClock.now(),
-                item_id,
-                tool_call_id: tool_call_id.clone(),
-                request_id,
-                request: interaction_request,
-                resolution_sender,
-            };
-            if interaction_completion_sender
-                .send(ExecutorCompletion::InteractionRequested(completion))
-                .is_err()
-            {
-                return abandoned_runtime_failure(&request);
-            }
-            let Ok(resolution) = resolution_receiver.await else {
-                return abandoned_runtime_failure(&request);
-            };
-            match ToolSet::interaction_settlement(&resolution, &denied) {
-                InteractionSettlement::PreExecution(result) => {
-                    ToolSet::bind_preexecution_result(&request, result)
-                }
-                InteractionSettlement::Resume => {
-                    #[cfg(test)]
-                    hooks.before_tool_resume().await;
-                    match gate.reserve_start(&request) {
-                        Ok(proof) => {
-                            tool_set
-                                .run_started_execution(&request, proof, allowed)
-                                .await
-                        }
-                        Err(RoundToolStartError::Signaled) => {
-                            ToolSet::cancelled_before_start_outcome(&request)
-                        }
-                        Err(RoundToolStartError::InvalidBinding) => {
-                            abandoned_runtime_failure(&request)
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Executes one gated Tool round: synchronous pre-start plans, then per-request first-wins
-/// gate reservation, preserving the old round ordering (call_index order, Serial mode runs
-/// one request at a time, Parallel mode starts all requests before awaiting any).  Every
-/// request's whole settlement (planner + reservation + execution) runs inside its own
-/// panic-isolated future, so a synchronous planner panic or a panicking executor fails
-/// exactly that request closed to Abandoned RuntimeFailure while later Serial requests
-/// still settle.
+/// The round only sorts the slots by call_index and then either drives Serial requests one
+/// at a time or all Parallel requests through one parent-owned `join_all` (no detached
+/// tasks), returning results in call_index order.  Each slot's consuming `drive` owns the
+/// whole lifecycle (plan, interaction, reservation, running cancel, settle, terminal) and
+/// isolates that request's planner/factory/executor panics closed to Abandoned
+/// RuntimeFailure, so a panicked Serial request never stops the later requests.
 async fn execute_gated_tool_round(
     tool_set: Arc<ToolSet>,
-    gate: RoundToolStartGate,
-    requests: Vec<ToolExecutionRequest>,
+    mut slots: Vec<ToolOperationSlot>,
     turn_id: TurnId,
     interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
 ) -> Vec<ToolExecutionOutcome> {
-    let mut requests = requests;
-    requests.sort_by_key(|request| request.call().call_index());
-    let is_serial = requests.iter().any(|request| {
+    slots.sort_by_key(|slot| slot.request().call().call_index());
+    let is_serial = slots.iter().any(|slot| {
         tool_set
             .definitions()
             .iter()
-            .find(|definition| definition.name() == request.call().name())
+            .find(|definition| definition.name() == slot.request().call().name())
             .is_some_and(|definition| definition.mode() == ToolExecutionMode::Serial)
     });
-    // Per-request panic isolation: each settlement future is polled through catch_unwind, so
-    // a panic anywhere in that request's planner or executor resolves the exact request
-    // closed to Abandoned RuntimeFailure without unwinding the round or detaching any task.
-    let settle = |request: ToolExecutionRequest| {
-        let tool_set = Arc::clone(&tool_set);
-        let gate = gate.clone();
-        let interaction_completion_sender = interaction_completion_sender.clone();
-        #[cfg(test)]
-        let hooks = Arc::clone(&hooks);
-        let catch_request = request.clone();
-        async move {
-            let outcome = AssertUnwindSafe(async move {
-                settle_one_plan(
-                    &tool_set,
-                    &gate,
-                    request,
+    if is_serial {
+        let mut results = Vec::with_capacity(slots.len());
+        for slot in slots {
+            results.push(
+                slot.drive(
+                    Arc::clone(&tool_set),
                     turn_id,
                     &interaction_completion_sender,
                     #[cfg(test)]
-                    hooks,
+                    Arc::clone(&hooks),
                 )
-                .await
-            })
-            .catch_unwind()
-            .await;
-            match outcome {
-                Ok(result) => result,
-                Err(_) => abandoned_runtime_failure(&catch_request),
-            }
-        }
-    };
-    if is_serial {
-        let mut results = Vec::with_capacity(requests.len());
-        for request in requests {
-            // A panicked caught future settles that exact request closed and the loop
-            // continues with the later Serial requests.
-            results.push(settle(request).await);
+                .await,
+            );
         }
         return results;
     }
-    // Parallel mode polls every caught settlement concurrently, still returning results in
-    // call_index order.
-    join_all(requests.into_iter().map(settle)).await
+    join_all(slots.into_iter().map(|slot| {
+        slot.drive(
+            Arc::clone(&tool_set),
+            turn_id,
+            &interaction_completion_sender,
+            #[cfg(test)]
+            Arc::clone(&hooks),
+        )
+    }))
+    .await
 }
 
 #[allow(
@@ -8107,22 +8301,25 @@ async fn run_active_turn_inner(
         if !is_tool_round {
             return Ok(entry);
         }
-        // Build the exact requests and their round-local start gate right after the assistant
-        // ToolCall apply and before the recorder await, so the gate binds the exact
-        // request captures and the whole round uses that one gate.
+        // Build the exact requests and bind each one's operation slot (own start gate +
+        // emergency basis) right after the assistant ToolCall apply and before the recorder
+        // await, so every gate binds the exact request capture for the whole round.
         let requests = calls
             .into_iter()
             .map(|(item_id, call)| ToolExecutionRequest::new(item_id, call))
             .collect::<Vec<_>>();
-        let start_gate =
-            RoundToolStartGate::new(&emergency_control, emergency_observation, &requests);
+        let slots = requests
+            .into_iter()
+            .map(|request| {
+                ToolOperationSlot::new(request, &emergency_control, emergency_observation)
+            })
+            .collect::<Vec<_>>();
         let _ = conversation.recorder.record(entry).await;
         #[cfg(test)]
         hooks.before_tool_round_start().await;
         let tool_results = execute_gated_tool_round(
             Arc::clone(context.tool_set()),
-            start_gate,
-            requests,
+            slots,
             turn_id,
             interaction_completion_sender.clone(),
             #[cfg(test)]
@@ -11415,7 +11612,9 @@ mod tests {
                 ToolExecutionPlan::Interaction {
                     request_id,
                     request: interaction_request,
-                    allowed: Box::pin(async move { allowed }),
+                    allowed: ToolExecutionStart::new(move |_observer| {
+                        Box::pin(async move { allowed })
+                    }),
                     denied,
                 }
             },
@@ -14303,11 +14502,12 @@ mod tests {
                     .unwrap(),
                 ],
                 move |_| {
-                    let tool_polled = Arc::clone(&tool_polled_by_executor);
-                    Box::pin(async move {
-                        tool_polled.store(true, Ordering::Release);
-                        ToolExecutionResult::completed_text("tool ran").unwrap()
-                    })
+                    // The executor closure is the start factory's body: it runs only when
+                    // the factory is invoked after a winning reservation.
+                    tool_polled_by_executor.store(true, Ordering::Release);
+                    Box::pin(
+                        async move { ToolExecutionResult::completed_text("tool ran").unwrap() },
+                    )
                 },
             );
             let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
@@ -14325,7 +14525,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            // The Turn worker built the exact requests + start gate and is parked before the
+            // The Turn worker built the prepared operation slots and is parked before the
             // round: the signal now wins first-wins against every reservation.
             hooks.wait_before_tool_round_start().await;
             if security_revoked {
@@ -14359,7 +14559,8 @@ mod tests {
                 SessionTurnTerminal::Interrupted(expected)
             );
             assert_eq!(model.request_count(), 1);
-            // The executor future was planned synchronously but never polled.
+            // The plan was created synchronously but its start factory was never invoked:
+            // the executor closure never ran and no executor future exists.
             assert!(!tool_polled.load(Ordering::Acquire));
             let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
                 .expect("the scripted conversation recording is readable");
@@ -14403,13 +14604,13 @@ mod tests {
                 if request.call().tool_call_id().as_str() == "call_preflight" {
                     ToolExecutionPlan::PreExecution(denied.clone())
                 } else {
-                    ToolExecutionPlan::Execute(Box::pin(async {
-                        ToolExecutionResult::completed_text("tool ran").unwrap()
+                    ToolExecutionPlan::Execute(ToolExecutionStart::new(|_observer| {
+                        Box::pin(async { ToolExecutionResult::completed_text("tool ran").unwrap() })
                     }))
                 }
             },
         );
-        let requests = vec![
+        let requests = [
             ToolExecutionRequest::new(
                 "itm_00000000000000000000000000000001".parse().unwrap(),
                 ToolCall::new(
@@ -14429,12 +14630,18 @@ mod tests {
                 ),
             ),
         ];
-        let gate = RoundToolStartGate::new(&emergency, observation, &requests);
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation))
+            .collect::<Vec<_>>();
+        // The gate clones share each slot gate's state, so the post-round assertions observe
+        // whether the slot's own gate was reserved.
+        let preflight_gate = slots[0].gate().clone();
+        let executed_gate = slots[1].gate().clone();
         let (interaction_completion_sender, _) = mpsc::unbounded_channel();
         let results = execute_gated_tool_round(
             tool_set,
-            gate.clone(),
-            requests.clone(),
+            slots,
             "trn_77777777777777777777777777777777".parse().unwrap(),
             interaction_completion_sender,
             Arc::new(SessionExecutorTestHooksInner::new()),
@@ -14462,12 +14669,18 @@ mod tests {
             } if item_id == &requests[1].item_id()
                 && tool_call_id == requests[1].call().tool_call_id()
         ));
-        // The frozen preflight never reserved its gate entry (still reservable and startable),
-        // while the executed request's entry was consumed by the round.
-        assert!(gate.reserve_start(&requests[0]).is_ok());
+        // The frozen preflight never reserved its own gate (still reservable and startable),
+        // while the executed request's gate was consumed by the round.
+        assert!(
+            preflight_gate
+                .reserve(&requests[0])
+                .unwrap()
+                .start()
+                .is_ok()
+        );
         assert!(matches!(
-            gate.reserve_start(&requests[1]),
-            Err(RoundToolStartError::InvalidBinding)
+            executed_gate.reserve(&requests[1]),
+            Err(ToolStartError::InvalidBinding)
         ));
     }
 
@@ -14494,12 +14707,12 @@ mod tests {
                 if request.call().tool_call_id().as_str() == "call_panic" {
                     panic!("scripted planner panic");
                 }
-                ToolExecutionPlan::Execute(Box::pin(async {
-                    ToolExecutionResult::completed_text("tool ran").unwrap()
+                ToolExecutionPlan::Execute(ToolExecutionStart::new(|_observer| {
+                    Box::pin(async { ToolExecutionResult::completed_text("tool ran").unwrap() })
                 }))
             },
         );
-        let requests = vec![
+        let requests = [
             ToolExecutionRequest::new(
                 "itm_00000000000000000000000000000003".parse().unwrap(),
                 ToolCall::new(
@@ -14519,18 +14732,22 @@ mod tests {
                 ),
             ),
         ];
-        let gate = RoundToolStartGate::new(&emergency, observation, &requests);
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation))
+            .collect::<Vec<_>>();
+        let panic_gate = slots[0].gate().clone();
+        let ok_gate = slots[1].gate().clone();
         let (interaction_completion_sender, _) = mpsc::unbounded_channel();
         let results = execute_gated_tool_round(
             tool_set,
-            gate.clone(),
-            requests.clone(),
+            slots,
             "trn_77777777777777777777777777777777".parse().unwrap(),
             interaction_completion_sender,
             Arc::new(SessionExecutorTestHooksInner::new()),
         )
         .await;
-        // The panicking planner took down only its own spawned settlement: the exact request
+        // The panicking planner was caught by that slot's consuming drive: the exact request
         // fails closed to Abandoned RuntimeFailure and the later Serial request still settles.
         assert!(matches!(
             &results[0],
@@ -14552,12 +14769,12 @@ mod tests {
             } if item_id == &requests[1].item_id()
                 && tool_call_id == requests[1].call().tool_call_id()
         ));
-        // The panicked request never reached a reservation: its gate entry is still
+        // The panicked request never reached a reservation: its own gate is still
         // reservable and startable.
-        assert!(gate.reserve_start(&requests[0]).is_ok());
+        assert!(panic_gate.reserve(&requests[0]).unwrap().start().is_ok());
         assert!(matches!(
-            gate.reserve_start(&requests[1]),
-            Err(RoundToolStartError::InvalidBinding)
+            ok_gate.reserve(&requests[1]),
+            Err(ToolStartError::InvalidBinding)
         ));
     }
 
@@ -14582,13 +14799,15 @@ mod tests {
             ],
             |request| {
                 let call_id = request.call().tool_call_id().clone();
-                ToolExecutionPlan::Execute(Box::pin(async move {
-                    ToolExecutionResult::completed_text(call_id.as_str()).unwrap()
+                ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                    Box::pin(async move {
+                        ToolExecutionResult::completed_text(call_id.as_str()).unwrap()
+                    })
                 }))
             },
         );
         // Input order is C, A, B; call_index order is A(0), B(1), C(2).
-        let requests = vec![
+        let requests = [
             ToolExecutionRequest::new(
                 "itm_0000000000000000000000000000000c".parse().unwrap(),
                 ToolCall::new(
@@ -14617,12 +14836,18 @@ mod tests {
                 ),
             ),
         ];
-        let gate = RoundToolStartGate::new(&emergency, observation, &requests);
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation))
+            .collect::<Vec<_>>();
+        let gates = slots
+            .iter()
+            .map(|slot| slot.gate().clone())
+            .collect::<Vec<_>>();
         let (interaction_completion_sender, _) = mpsc::unbounded_channel();
         let results = execute_gated_tool_round(
             tool_set,
-            gate.clone(),
-            requests.clone(),
+            slots,
             "trn_77777777777777777777777777777777".parse().unwrap(),
             interaction_completion_sender,
             Arc::new(SessionExecutorTestHooksInner::new()),
@@ -14642,11 +14867,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(contents, ["call_a", "call_b", "call_c"]);
-        // Every gate entry was reserved and started by the round exactly once.
-        for request in &requests {
+        // Every slot's own gate was reserved and started by the round exactly once.
+        for (request, gate) in requests.iter().zip(gates) {
             assert!(matches!(
-                gate.reserve_start(request),
-                Err(RoundToolStartError::InvalidBinding)
+                gate.reserve(request),
+                Err(ToolStartError::InvalidBinding)
             ));
         }
     }
@@ -14728,6 +14953,361 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cooperative_cancel_during_running_tool_observes_cancel_and_settles_executed_cancelled()
+    {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_cooperative",
+            "echo",
+            "{\"value\":1}",
+            "must not run",
+        );
+        let tool_started = Arc::new(tokio::sync::Notify::new());
+        let cancel_observed = Arc::new(tokio::sync::Notify::new());
+        let release_tool = Arc::new(tokio::sync::Notify::new());
+        let tool_started_by_executor = Arc::clone(&tool_started);
+        let cancel_observed_by_executor = Arc::clone(&cancel_observed);
+        let release_tool_by_executor = Arc::clone(&release_tool);
+        let tool_set = ToolSet::with_cancellable_executor(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            move |_request, observer| {
+                let tool_started = Arc::clone(&tool_started_by_executor);
+                let cancel_observed = Arc::clone(&cancel_observed_by_executor);
+                let release_tool = Arc::clone(&release_tool_by_executor);
+                Box::pin(async move {
+                    tool_started.notify_one();
+                    // Cooperative executor: observes the operation's own cancellation and
+                    // runs its bounded cleanup before returning.
+                    observer.cancelled().await;
+                    cancel_observed.notify_one();
+                    release_tool.notified().await;
+                    ToolExecutionResult::Completed {
+                        disposition: crate::tools::ToolResultDisposition::Cancelled,
+                        content: crate::tools::ToolResultContent::from_text_parts(vec![
+                            "cooperative cleanup".to_owned(),
+                        ])
+                        .unwrap(),
+                    }
+                })
+            },
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The tool is Running with its own cancellation pair and the executor awaits the
+        // observer.
+        tool_started.notified().await;
+        assert!(
+            loaded
+                .executor
+                .cancel(
+                    SessionCancelTarget::Turn(turn_id),
+                    "2026-08-08T10:09:00.000Z".parse().unwrap(),
+                )
+                .await
+                .is_ok()
+        );
+        // The executor observed the cancellation and is still cleaning up (parked on the
+        // release barrier): the Turn must not be terminal before the cleanup finishes.
+        cancel_observed.notified().await;
+        assert!(
+            loaded
+                .executor
+                .snapshot()
+                .await
+                .unwrap()
+                .last_terminal()
+                .is_none()
+        );
+        release_tool.notify_one();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Interrupted(SessionTurnInterruption::UserCancelled)
+        );
+        assert_eq!(model.request_count(), 1);
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        // The cooperative result is a truthful executed Cancelled ToolResult: the started
+        // operation ran to its own cleanup and was never disguised as pre-execution, and no
+        // next Model runs.
+        assert!(recording.contains("call_cooperative"));
+        assert!(recording.contains("\"source\":\"executed\""));
+        assert!(recording.contains("\"disposition\":\"cancelled\""));
+        assert!(recording.contains("cooperative cleanup"));
+        assert!(!recording.contains("must not run"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serial_round_running_first_receives_cancel_and_later_factory_is_never_invoked() {
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let later_factory_constructed = Arc::new(AtomicBool::new(false));
+        let first_started_by_executor = Arc::clone(&first_started);
+        let later_factory_by_executor = Arc::clone(&later_factory_constructed);
+        let tool_set = ToolSet::with_interaction_planner(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            {
+                let first_started = Arc::clone(&first_started_by_executor);
+                let later_factory = Arc::clone(&later_factory_by_executor);
+                move |request| {
+                    if request.call().tool_call_id().as_str() == "call_first" {
+                        let first_started = Arc::clone(&first_started);
+                        ToolExecutionPlan::Execute(ToolExecutionStart::new(move |observer| {
+                            Box::pin(async move {
+                                first_started.notify_one();
+                                observer.cancelled().await;
+                                ToolExecutionResult::Completed {
+                                    disposition: crate::tools::ToolResultDisposition::Cancelled,
+                                    content: crate::tools::ToolResultContent::from_text_parts(
+                                        vec!["first cleaned up".to_owned()],
+                                    )
+                                    .unwrap(),
+                                }
+                            })
+                        }))
+                    } else {
+                        let later_factory = Arc::clone(&later_factory);
+                        // The later request's start factory marks construction synchronously
+                        // in the factory closure body, never inside the future poll: a
+                        // signal that wins first-wins before the reservation must mean this
+                        // factory was never invoked at all.
+                        ToolExecutionPlan::Execute(ToolExecutionStart::new(move |_observer| {
+                            later_factory.store(true, Ordering::Release);
+                            Box::pin(async move {
+                                ToolExecutionResult::completed_text("must not run").unwrap()
+                            })
+                        }))
+                    }
+                }
+            },
+        );
+        let requests = [
+            ToolExecutionRequest::new(
+                "itm_00000000000000000000000000000001".parse().unwrap(),
+                ToolCall::new(
+                    "call_first".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    0,
+                ),
+            ),
+            ToolExecutionRequest::new(
+                "itm_00000000000000000000000000000002".parse().unwrap(),
+                ToolCall::new(
+                    "call_later".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    1,
+                ),
+            ),
+        ];
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation))
+            .collect::<Vec<_>>();
+        let (interaction_completion_sender, _) = mpsc::unbounded_channel();
+        let signal_handle = emergency.clone();
+        let signal = tokio::spawn(async move {
+            first_started.notified().await;
+            signal_handle.signal(target, EmergencyControlSignal::Cancel);
+        });
+        let results = execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        )
+        .await;
+        signal.await.unwrap();
+        // The running first request observed the cancellation and truthfully settled its own
+        // Executed Cancelled result.
+        assert!(matches!(
+            &results[0],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: crate::tools::ToolResultDisposition::Cancelled,
+                ..
+            } if item_id == &requests[0].item_id()
+                && tool_call_id == requests[0].call().tool_call_id()
+        ));
+        // The later Serial request never constructed its start factory: the signal won
+        // first-wins before its reservation, so it settles the matching PreExecution
+        // Cancelled outcome.
+        assert!(!later_factory_constructed.load(Ordering::Acquire));
+        assert!(matches!(
+            &results[1],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: crate::tools::ToolResultDisposition::Cancelled,
+                ..
+            } if item_id == &requests[1].item_id()
+                && tool_call_id == requests[1].call().tool_call_id()
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parallel_cancel_notifies_every_running_observer_and_keeps_call_index_result_order() {
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        let (started_sender, mut started_receiver) = tokio::sync::mpsc::unbounded_channel::<u32>();
+        let cancelled_observers = Arc::new(Mutex::new(Vec::new()));
+        let teardown_completions = Arc::new(Mutex::new(Vec::new()));
+        let cancelled_observers_by_executor = Arc::clone(&cancelled_observers);
+        let teardown_completions_by_executor = Arc::clone(&teardown_completions);
+        let done = [
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        ];
+        let tool_set = ToolSet::with_cancellable_executor(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            move |request, observer| {
+                let index = request.call().call_index();
+                let started_sender = started_sender.clone();
+                let cancelled_observers = Arc::clone(&cancelled_observers_by_executor);
+                let teardown_completions = Arc::clone(&teardown_completions_by_executor);
+                let done = done.clone();
+                Box::pin(async move {
+                    let _ = started_sender.send(index);
+                    observer.cancelled().await;
+                    cancelled_observers.lock().unwrap().push(index);
+                    // Teardown completes in inverse call_index order: the highest index
+                    // finishes first and each lower index waits for the one above it, so
+                    // every started future is still awaited to its own cleanup.
+                    if index < 2 {
+                        done[index as usize + 1].notified().await;
+                    }
+                    teardown_completions.lock().unwrap().push(index);
+                    done[index as usize].notify_one();
+                    ToolExecutionResult::Completed {
+                        disposition: crate::tools::ToolResultDisposition::Cancelled,
+                        content: crate::tools::ToolResultContent::from_text_parts(vec![format!(
+                            "cleaned up {index}"
+                        )])
+                        .unwrap(),
+                    }
+                })
+            },
+        );
+        let requests = (0..3)
+            .map(|index| {
+                let index = index as u32;
+                ToolExecutionRequest::new(
+                    format!("itm_0000000000000000000000000000000{}", index + 1)
+                        .parse()
+                        .unwrap(),
+                    ToolCall::new(
+                        format!("call_{}", (b'a' + index as u8) as char)
+                            .parse()
+                            .unwrap(),
+                        "echo".parse().unwrap(),
+                        "{}".parse().unwrap(),
+                        index,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation))
+            .collect::<Vec<_>>();
+        let (interaction_completion_sender, _) = mpsc::unbounded_channel();
+        let signal_handle = emergency.clone();
+        let signal = tokio::spawn(async move {
+            // Signal only once every operation is Running and awaiting its observer: collect
+            // the three started IDs one by one, then signal.
+            let mut started = Vec::new();
+            while started.len() < 3 {
+                started.push(
+                    started_receiver
+                        .recv()
+                        .await
+                        .expect("every Running operation reports its start"),
+                );
+            }
+            started.sort_unstable();
+            assert_eq!(started, [0, 1, 2]);
+            signal_handle.signal(target, EmergencyControlSignal::SecurityRevoked);
+        });
+        let results = execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        )
+        .await;
+        signal.await.unwrap();
+        // Every Running operation observed the cancellation through its own observer.
+        let mut observed = cancelled_observers.lock().unwrap().clone();
+        observed.sort();
+        assert_eq!(observed, [0, 1, 2]);
+        // Teardown completed in inverse call_index order while every started future was
+        // awaited to its own cleanup.
+        assert_eq!(*teardown_completions.lock().unwrap(), [2, 1, 0]);
+        // Results still settle in call_index order, each carrying its own identity.
+        for (index, outcome) in results.iter().enumerate() {
+            assert!(matches!(
+                outcome,
+                ToolExecutionOutcome::Completed {
+                    item_id,
+                    tool_call_id,
+                    source: ToolOutcomeSource::Executed,
+                    disposition: crate::tools::ToolResultDisposition::Cancelled,
+                    content,
+                } if *item_id == requests[index].item_id()
+                    && tool_call_id == requests[index].call().tool_call_id()
+                    && content.parts()[0].as_text() == format!("cleaned up {index}")
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn approval_allow_before_emergency_revalidates_the_start_gate_and_never_runs_the_allowed_future()
      {
         let store = TempStore::new();
@@ -14772,9 +15352,11 @@ mod tests {
                     ToolExecutionPlan::Interaction {
                         request_id,
                         request: interaction_request,
-                        allowed: Box::pin(async move {
+                        // The start factory marks construction: the resume revalidation must
+                        // fail before it is ever invoked.
+                        allowed: ToolExecutionStart::new(move |_observer| {
                             allowed_polled.store(true, Ordering::Release);
-                            allowed
+                            Box::pin(async move { allowed })
                         }),
                         denied,
                     }
