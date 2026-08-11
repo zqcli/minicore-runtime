@@ -27,7 +27,9 @@ use futures_util::StreamExt;
 use rig::OneOrMany;
 use rig::client::CompletionClient;
 use rig::completion::message::{Reasoning, ReasoningContent};
-use rig::completion::{AssistantContent, CompletionModel, CompletionRequest, Message, Usage};
+use rig::completion::{
+    AssistantContent, CompletionError, CompletionModel, CompletionRequest, Message, Usage,
+};
 use rig::providers::openai::responses_api::ResponsesUsage;
 use rig::providers::openai::{Client, GPT_4O_MINI};
 use rig::streaming::StreamedAssistantContent;
@@ -560,4 +562,71 @@ async fn early_eof_without_completed_yields_synthetic_zero_usage_final_never_err
         "partial text must survive early EOF, got {:?}",
         choice[0]
     );
+}
+
+/// HTTP 500 reality: `GenericEventSource` ships an unconditional
+/// exponential-backoff retry policy (`DEFAULT_RETRY`: 300ms start, infinite
+/// retries, error-agnostic), but automatic retry is *effectively zero* on the
+/// OpenAI Responses path: the reqwest client surfaces the 500 as
+/// `InvalidStatusCodeWithMessage` (status **and** body preserved), and the
+/// provider wrapper breaks out of the event-source loop on the first error,
+/// dropping the event source mid-retry-cycle — the scheduled reconnect never
+/// fires. Consumer-visible: one error item, then `None`, exactly one POST.
+#[tokio::test]
+async fn http_500_breaks_stream_with_effectively_zero_retries_despite_retry_policy() {
+    // Two scripted 500s: the second is a tripwire that proves the retry
+    // cycle never re-issues the POST.
+    let error_body =
+        "{\"error\":{\"message\":\"boom\",\"type\":\"server_error\",\"code\":\"server_error\"}}";
+    let server = support::LoopbackServer::spawn_sse(&[(500, error_body), (500, error_body)]);
+    let model = openai_client(server.base_url()).completion_model(GPT_4O_MINI);
+    let mut stream = model
+        .stream(simple_request())
+        .await
+        .expect("stream must start");
+
+    // First poll: the provider error is the first item, carrying both the
+    // 500 status and the exact error body.
+    let err = stream
+        .next()
+        .await
+        .expect("first item must be the provider error")
+        .expect_err("HTTP 500 must surface as a stream error");
+    assert!(
+        matches!(
+            &err,
+            CompletionError::HttpError(
+                rig::http_client::Error::InvalidStatusCodeWithMessage(code, _)
+            ) if code.as_u16() == 500
+        ),
+        "the 500 must surface as an HTTP status error, got {err:?}"
+    );
+    assert_eq!(
+        err.provider_response_status().map(|status| status.as_u16()),
+        Some(500),
+        "the 500 status must stay recoverable"
+    );
+    assert_eq!(
+        err.provider_response_body(),
+        Some(error_body),
+        "the 500 body must be preserved verbatim"
+    );
+
+    // Second poll: the provider wrapper breaks on the first error and drops
+    // the event source before its retry delay elapses — the stream ends.
+    assert!(
+        stream.next().await.is_none(),
+        "the error must terminate the stream: no retry item, no synthesized final"
+    );
+
+    // Exactly one POST /responses: the scripted second 500 is never consumed.
+    let requests = server.join();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the event source retry cycle must never re-issue the POST"
+    );
+    assert_eq!(requests[0].method(), "POST");
+    assert_eq!(requests[0].path(), "/responses");
+    assert_eq!(requests[0].json_body()["stream"], true);
 }
