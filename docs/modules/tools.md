@@ -1,6 +1,6 @@
 # Tool 子系统架构设计
 
-状态：当前权威架构；M8.1最小Scripted Tool round-trip与crate-private `ToolOperationSlot`完整生命周期已实现（Prepared→Running→Settling→Terminal：per-request slot-owned `ToolStartGate` first-wins start gate、typed started proof、Running cancellation pair、signal先赢→PreExecution Cancelled且不调用factory、start先赢→Settling继续await same run后truthful settle、PreExecution/Executed/Abandoned truthful settlement），crate-private scripted approval/UserQuestion控制正确性seam亦已实现（typed `ToolExecutionPlan::{Approval, UserQuestion}`拆分、Session-private concrete `ToolExecutionControl`、Tools-owned move-only `UserQuestionAnswerBinding`、hoisted exclusive question调度与signal-first settlement）；M13.1已实现class-level `ToolPermissionSet × ToolSandboxContract`差集、unavailable fail-closed与restricted candidate不得扩大，M13.2已把direct `Execute` plan在任何ToolStartGate reservation/factory poll前接入该admission，M13.3已让Execute/Approval plan各自携带唯一final permission事实并在host allow后复验`AllowOnce | AllowWith` ceiling与Sandbox，M13.4已用非空、已admit permission plan完成SecurityRevoked-before-start、Sandbox unavailable与Running cooperative truthful settlement的Session round conformance。完整ToolService/source/schema/hooks/policy、resource-level grants、production ask-user builtin ToolName/schema与answer→model-visible ToolResult text/render格式、production executor/adapter（返回前须提供有界、可确认cleanup）与Session-local mutation queue/mutation permit attachment to Settling仍待实现
+状态：当前权威架构；M8.1最小Scripted Tool round-trip与crate-private `ToolOperationSlot`完整生命周期已实现（Prepared→Running→Settling→Terminal：per-request slot-owned `ToolStartGate` first-wins start gate、typed started proof、Running cancellation pair、signal先赢→PreExecution Cancelled且不调用factory、start先赢→Settling继续await same run后truthful settle、PreExecution/Executed/Abandoned truthful settlement），crate-private scripted approval/UserQuestion控制正确性seam亦已实现（typed `ToolExecutionPlan::{Approval, UserQuestion}`拆分、Session-private concrete `ToolExecutionControl`、Tools-owned move-only `UserQuestionAnswerBinding`、hoisted exclusive question调度与signal-first settlement）；M13/V4-C0-1已由ADR 0140关闭：class-level `ToolPermissionSet × ToolSandboxContract`差集、unavailable fail-closed、restricted candidate不得扩大、direct Execute admission、approval resume revalidation及非空permission plan的SecurityRevoked/Sandbox-unavailable/Running Session round conformance均已实现。完整ToolService/source/schema/hooks/policy、resource-level grants、production ask-user builtin ToolName/schema与answer→model-visible ToolResult text/render格式、production executor/adapter（返回前须提供有界、可确认cleanup）与Session-local mutation queue/mutation permit attachment to Settling仍待实现
 日期：2026-07-31
 
 ## 目的
@@ -49,7 +49,7 @@ ToolSet只服务一个Turn。shared resource reload不改变active ToolSet；fut
 - 多文件/open-world/Serial Tool使batch按call order串行；
 - 跨Session共享Workspace不协调；
 - MVP不启用通用bash；
-- production Sandbox adapter开始前必须关闭O1 capability enforcement门禁。
+- production Sandbox adapter必须遵守ADR 0140 capability enforcement合同并证明effective enforcement。
 
 ## 对象关系
 
@@ -470,7 +470,7 @@ approval invariants：
 - resolution后再次执行Workspace/policy/Sandbox enforceability与ToolStartGate revalidation，approval从不替代enforcement；
 - exact private option map只存在于Pending Interaction/live waiter，不进入普通Snapshot、event或diagnostic；recorded history只保存safe option view与selected decision kind。
 
-Implementation staging：M1.5的safe view/replay carrier可以表示`Restricted`；M13.3已实现`Restricted → AllowWith(ToolPermissionSet)` private exact option map、recorded safe kind/index validation与Session resume前class-level ceiling/Sandbox revalidation，因此adapter-independent conformance可以执行Restricted。production Tool source仍必须从真实policy/workspace facts构造resource-level candidate，host仍只能选择exact option index；不得从safe view或任意public input发明PermissionSet。production Tool/Sandbox adapter继续受V4-C0-1门禁约束。
+Implementation staging：M1.5的safe view/replay carrier可以表示`Restricted`；M13.3已实现`Restricted → AllowWith(ToolPermissionSet)` private exact option map、recorded safe kind/index validation与Session resume前class-level ceiling/Sandbox revalidation，因此adapter-independent conformance可以执行Restricted。production Tool source仍必须从真实policy/workspace facts构造resource-level candidate，host仍只能选择exact option index；不得从safe view或任意public input发明PermissionSet。production Tool/Sandbox adapter必须遵守ADR 0140并用自己的contract suite证明effective enforcement。
 
 UserQuestion首版是显式non-secret、recordable、model-visible的结构化表单：
 
@@ -518,7 +518,7 @@ MVP没有`secret`、password、credential、file upload或arbitrary JSON answer 
 
 当前crate-private scripted实现状态：typed `ToolExecutionPlan::UserQuestion`与Tools-owned move-only/redacted `UserQuestionAnswerBinding`已实现（binding只接受truthful `PreExecution + Succeeded`作为answer、显式Abandoned直通、其余malformed形状fail closed为identity-bound Abandoned OutcomeUnknown）；question由typed plan shape识别、hoisted到全部ordinary sibling之前按call_index串行驱动、至多一个pending，不预留ToolStartGate或mutation ticket；每个question outcome先apply live+inline record attempt再继续；Cancel/SecurityRevoked/Unload signal-first跳过binding并settle全部unstarted calls为matching PreExecution Cancelled。production ask-user builtin ToolName、公开schema与answer→model-visible ToolResult的text/render格式仍未冻结/实现；上述字段类型是crate-private scripted carrier，不代表production Tool DTO已冻结。
 
-approval不替代Sandbox。无法强制required capability时production executor必须在side effect前拒绝；该能力声明和差集算法由O1在production Tool/Sandbox adapter开始前冻结。
+approval不替代Sandbox。无法强制required capability时production executor必须在side effect前拒绝；该能力声明、差集算法与pre-start fail-closed顺序已由ADR 0140冻结。
 
 ### Tool Execution Control
 
@@ -531,8 +531,12 @@ approval与UserQuestion控制现由Session-private concrete `ToolExecutionContro
 
 ```rust
 pub(crate) enum ToolExecutionPlan {
-    Execute(ToolExecutionStart),
+    Execute {
+        permissions: ToolPermissionSet,
+        start: ToolExecutionStart,
+    },
     Approval {
+        permissions: ToolPermissionSet,
         request: ToolApprovalRequest,
         allowed: ToolExecutionStart,
         denied: ToolExecutionResult,
@@ -828,11 +832,11 @@ Tool grant store
 - Cancel期间mutation permit等待I/O settle；
 - reload不改变active ToolSet；
 - restart不恢复permit/task；
-- Sandbox unenforceable capability gate（production adapter前）。
+- Sandbox unenforceable capability gate（ADR 0140已关闭；production adapter继续证明effective enforcement）。
 
 ## 开放问题
 
-1. O1：class-level capability schema、pre-execution差集、direct Execute admission与approval resume revalidation已实现；仍需production policy/workspace/resource-level permission producer和adapter conformance；
+1. production policy/workspace/resource-level permission producer与每个adapter的effective-enforcement conformance；
 2. production builtin Tool最小集合；
 3. `max_tool_result_bytes`和future blob handling；
 4. provider-specific ToolResult error lowering。
@@ -852,5 +856,5 @@ ToolStartPermit使用actor message、owner-local CAS或等价private实现属于
 - [x] complete Tool exchange自动projection；
 - [x] ToolStartGate first-wins start gate与typed started proof，及完整`ToolOperationSlot`生命周期（Prepared→Running→Settling→Terminal、Running cancellation pair与truthful settle；M8.3 foundation已从round-local narrow slice升级为slot）；
 - [x] UserQuestion producer与exclusive scheduler正确性（typed `ToolExecutionPlan::UserQuestion`、move-only `UserQuestionAnswerBinding`（仅truthful PreExecution+Succeeded为answer）、hoisted exclusive question调度（call_index串行、至多一个pending、不涉及ToolStartGate/mutation ticket）、signal-first settlement与abandoned question无副作用）；
-- [ ] O1 production Sandbox gate（M13.1 algebra、M13.2 direct Execute admission、M13.3 Restricted/AllowOnce approval resume revalidation已实现；SecurityRevoked/Sandbox-unavailable/Running round conformance与production permission producer pending）；
+- [x] O1/R7/V4-C0-1 production Sandbox gate（ADR 0140；class-level algebra、direct Execute admission、Restricted/AllowOnce resume revalidation及SecurityRevoked/Sandbox-unavailable/Running round conformance）；
 - [ ] production implementation/tests（含production ask-user builtin ToolName/schema与answer→model-visible ToolResult text/render格式、完整schema/hooks/policy/Sandbox enforcement、production ToolService/executor/adapters与Session-local file mutation queue）。

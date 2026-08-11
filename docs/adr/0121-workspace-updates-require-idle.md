@@ -3,6 +3,8 @@
 状态：Partially Superseded by ADRs 0124, 0126 and 0127
 日期：2026-07-27
 
+> 2026-08-11：O1 Sandbox enforcement已由[ADR 0140](0140-tool-sandbox-admission-fails-closed-before-start.md)关闭；本ADR的SecurityRevoked、无动态handle revocation与truthful in-flight settlement规则继续有效。
+
 > 2026-07-31：Idle-only update、SecurityRevoked、truthful Tool settlement和terminal后重新resolve继续有效；ADR 0127删除TurnInterrupted recording与restart interruption reason reconstruction。
 
 > 2026-07-30：Workspace Idle-only update、SecurityRevoked和Tool settlement保留；TurnInterrupted先apply live并best-effort record，recording failure不影响Workspace readiness。
@@ -40,7 +42,7 @@ pi、Codex和Claude Code等同类产品通常在Session、Tool或sandbox启动�
 - Workspace update UX从热更新变为Turn间更新；长Turn中修改配置需要先Cancel。
 - 删除Workspace lease/control/commit authorization相关字段、同步排序和测试；ADR 0111/0117中的Workspace revoke特殊分支由本ADR修订。
 - `TurnInterruptionKind::SecurityRevoked`与sticky EmergencyControl保留，但它表示authority/host安全事件，不表示Workspace definition patch。
-- O10和O11关闭；O1 Sandbox enforcement继续开放。O12先由[ADR 0122](0122-workspace-fingerprints-are-runtime-local.md)收窄Workspace fingerprint恢复策略，后由[ADR 0123](0123-identity-uses-refs-and-explicit-reload.md)删除Workspace fingerprint族并取代ADR 0122。
+- O10和O11关闭；O1 Sandbox enforcement在本ADR作出时继续开放，后由[ADR 0140](0140-tool-sandbox-admission-fails-closed-before-start.md)关闭。O12先由[ADR 0122](0122-workspace-fingerprints-are-runtime-local.md)收窄Workspace fingerprint恢复策略，后由[ADR 0123](0123-identity-uses-refs-and-explicit-reload.md)删除Workspace fingerprint族并取代ADR 0122。
 - handle-relative open仍可作为O1/TOCTOU防护的platform adapter实现问题，但不再用于承诺active-Turn动态revocation。
 
 ## 被否决方案

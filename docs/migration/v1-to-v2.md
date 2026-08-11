@@ -1,6 +1,6 @@
 # MiniCore V1 → V2 版本迁移记录
 
-状态：V2目标架构已推进至ADR 0138；全部普通V4-P0/P1已关闭，production Provider/Tool adapters仍未实现
+状态：V2目标架构已推进至ADR 0140；全部普通V4-P0/P1与conditional V4-C0-1已关闭，production Provider/Tool adapters仍未实现
 日期：2026-08-11
 
 ## 目的
@@ -107,7 +107,7 @@ ADR 0134关闭wire/storage format门禁：Wire Schema冻结JSON casing/tag、typ
 - 同Session最多一个ActiveTurnTask；
 - 不恢复旧Future、Tool side effect或Interaction waiter；
 - recording不能驱动副作用重放；
-- 先用ScriptedProviderAdapter证明真实module spine，再接Rig provider adapter。
+- 先用ScriptedProviderAdapter证明真实module spine，再接protocol-specific direct provider adapters。
 
 ## 阶段状态
 
@@ -193,7 +193,7 @@ ADR 0134关闭wire/storage format门禁：Wire Schema冻结JSON casing/tag、typ
 - ToolStartGate独立于Session recording；
 - Workspace update Idle-only，SecurityRevoked保持。
 
-Prompt Q1/Q4已分别由ADR 0128/0129关闭。待完成：Tool/Sandbox O1/R7。
+Prompt Q1/Q4已分别由ADR 0128/0129关闭。Tool/Sandbox O1/R7已由M13/ADR 0140关闭；production实现仍属于M14。
 
 ### 阶段5：Agent/Session lifecycle
 
@@ -225,7 +225,7 @@ SessionExecutor admits Turn
 
 实现顺序：
 
-V4-P1-2 wire/storage format门禁已经关闭；全部普通P0/P1（含V4-P1-3）已关闭。Rust typed carriers与scripted async spine已经进入`dev`。后续阶段、依赖、测试分层与production gate以[MiniCore V2开发计划](../development-plan.md)为准；V4-C0-1继续在production Tool/Sandbox adapter开始前关闭，production Provider/Tool adapters属于M14。
+V4-P1-2 wire/storage format门禁已经关闭；全部普通P0/P1（含V4-P1-3）与conditional V4-C0-1均已关闭。Rust typed carriers与scripted async spine已经进入`dev`。后续阶段、依赖与测试分层以[MiniCore V2开发计划](../development-plan.md)为准；production Provider/Tool adapters属于M14并分别遵守ADR 0138/0139与ADR 0140。
 
 共同完成门槛：
 
@@ -262,10 +262,10 @@ Recorder问题见[`docs/review/async-loop-best-effort-recording-open-questions.m
 
 其他门禁：
 
-- 第四轮全部普通V4-P0/P1已关闭；V4-P1-3由M12/ADR 0138关闭；
+- 第四轮全部普通V4-P0/P1与conditional V4-C0-1已关闭；V4-P1-3由M12/ADR 0138/0139关闭，V4-C0-1由M13/ADR 0140关闭；
 - 首个Rust crate已经消费ADR 0134/Format V1/Wire V1 fixtures并实现semantic conformance runner；
 - production OpenAI Responses/Anthropic Messages direct adapters仍属于M14，必须消费M12 contract suite；
-- production Tool/Sandbox adapter前关闭O1/R7/V4-C0-1。
+- production Tool/Sandbox adapters必须消费ADR 0140 contract suite；首个file-mutation adapter另须实现ADR 0116的Session-local queue。
 
 ## 文档治理
 
@@ -292,5 +292,5 @@ V2生产迁移完成需要：
 - recorder failure/replay fixtures通过；
 - Rig provider contract tests通过；
 - wire schema冻结；
-- O1/R7在production Sandbox前关闭；
+- O1/R7已由ADR 0140关闭，production Sandbox adapters继续证明effective enforcement；
 - README、Architecture、CONTEXT、modules、ADR和handoff无current旧术语冲突。

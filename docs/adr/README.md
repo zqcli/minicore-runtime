@@ -19,6 +19,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0136](0136-durablestate-operation-owned-generations.md) | DurableState使用operation-owned immutable generations、permanent reservations与root lease；read with ADR 0137 |
 | [0137](0137-tokio-owner-tracked-async-foundation.md) | Tokio owner-tracked async foundation与deterministic persistent seams；refines ADR 0117 and supports ADR 0136 |
 | [0139](0139-rig-is-evidence-only-under-rust-1-85.md) | Rust 1.85 production baseline拒绝Rig依赖，采用direct provider adapters |
+| [0140](0140-tool-sandbox-admission-fails-closed-before-start.md) | Tool Sandbox capability admission在start前fail closed |
 
 ## Current With Later Refinements
 
@@ -41,7 +42,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0118](0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md) | ADR 0124、0126、0127、0133 |
 | [0119](0119-model-calls-use-session-logical-retries.md) | ADR 0126、0139 |
 | [0120](0120-failures-stay-with-owning-modules.md) | ADR 0126 |
-| [0121](0121-workspace-updates-require-idle.md) | ADR 0124、0126、0127 |
+| [0121](0121-workspace-updates-require-idle.md) | ADR 0124、0126、0127、0140 |
 | [0123](0123-identity-uses-refs-and-explicit-reload.md) | ADR 0124、0126、0127、0129、0132 |
 | [0124](0124-session-replay-is-tolerant-and-links-are-minimal.md) | ADR 0126、0127、0131、0132、0134、0136、0137 |
 | [0126](0126-turn-execution-is-async-and-session-recording-is-best-effort.md) | ADR 0127、0130、0132、0136、0137、0139 |
