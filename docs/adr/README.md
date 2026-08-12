@@ -18,10 +18,10 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0136](0136-durablestate-operation-owned-generations.md) | DurableState使用operation-owned immutable generations、permanent reservations与root lease；read with ADR 0137 |
 | [0137](0137-tokio-owner-tracked-async-foundation.md) | Tokio owner-tracked async foundation与deterministic persistent seams；refines ADR 0117 and supports ADR 0136 |
 | [0140](0140-tool-sandbox-admission-fails-closed-before-start.md) | Tool Sandbox capability admission在start前fail closed；ADR 0143/0144提供production `FilesystemRead` consumers |
-| [0141](0141-provider-calls-are-stateless-full-request.md) | Provider调用是无状态full-request wire policy：一次invocation零或一次`ProviderAdapter::execute`、独立地零或一次POST（若发送则携带完整full request）、无optimization fallback/continuation；显式cache annotation与continuation保持omission |
 | [0142](0142-production-ask-user-is-a-closed-opt-in-builtin.md) | Production `ask_user`是closed、default-off、Runtime-owned builtin：`MiniCoreRuntimeConfig::with_ask_user_tool()` idempotent opt-in、zero permission、仅UserQuestion或frozen PreExecution failure plans、deterministic compact JSON answer；ADR 0143/0144增加独立可组合的Workspace read selections |
 | [0143](0143-production-read-file-uses-workspace-capabilities.md) | Production `read_file`是closed、default-off、Workspace-bound builtin：`MiniCoreRuntimeConfig::with_read_file_tool()` idempotent opt-in、ReadOnly Workspace authority ceiling（requested ReadWrite收紧为ReadOnly、Prompt/Skill source保持false）、per-admission WorkspaceSnapshot-bound materialization、cwd-relative `WorkspaceRelativePath` only、`FilesystemRead` exact sandbox、fixed result texts与65,536-byte单Text part bound、per-Session permanent revocation integrated with host invalidation |
 | [0144](0144-production-list-directory-uses-bounded-capability-enumeration.md) | Production `list_directory`是closed、default-off、Workspace-bound direct enumeration builtin：与`read_file`共享ReadOnly authority/revocation，empty path表示cwd，capability-relative directory open，不递归/不跟随entry symlink，256-entry/8,192-name-byte/65,536-JSON bounds与deterministic compact JSON |
+| [0145](0145-live-provider-evidence-refines-direct-adapter-wire-truth.md) | 真实OpenAI Responses/Anthropic Messages public Runtime release evidence细化direct adapter wire truth：固定产品User-Agent、unsigned Anthropic thinking truthful normalization/replay omission、message_start stop fields absent-or-null；live smoke仍默认ignored |
 
 ## Current With Later Refinements
 
@@ -32,7 +32,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0100](0100-domain-model-and-ownership.md) | ADR 0126 |
 | [0103](0103-turn-item-interaction-model.md) | ADR 0124、0126、0127 |
 | [0105](0105-session-executor-owns-loaded-session.md) | ADR 0126、0127、0139 |
-| [0106](0106-model-gateway-is-single-deep-operation.md) | ADR 0139、0141 |
+| [0106](0106-model-gateway-is-single-deep-operation.md) | ADR 0139、0141、0145 |
 | [0108](0108-runtime-public-protocol.md) | ADR 0126、0127、0133 |
 | [0109](0109-review-b-determinism-and-serialized-operations.md) | ADR 0124、0126 |
 | [0110](0110-prompt-and-skill-use-shared-reloadable-views.md) | ADR 0127、0129 |
@@ -51,8 +51,9 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0126](0126-turn-execution-is-async-and-session-recording-is-best-effort.md) | ADR 0127、0130、0132、0136、0137、0139 |
 | [0133](0133-runtime-public-payload-is-snapshot-recoverable.md) | ADR 0135、0136、0137 |
 | [0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md) | ADR 0135 |
-| [0138](0138-production-provider-baseline-uses-verified-rig-contracts.md) | ADR 0139、0141 |
-| [0139](0139-rig-is-evidence-only-under-rust-1-85.md) | ADR 0141 |
+| [0138](0138-production-provider-baseline-uses-verified-rig-contracts.md) | ADR 0139、0141、0145 |
+| [0139](0139-rig-is-evidence-only-under-rust-1-85.md) | ADR 0141、0145 |
+| [0141](0141-provider-calls-are-stateless-full-request.md) | ADR 0145 |
 
 ## Historical / Superseded
 

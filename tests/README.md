@@ -64,3 +64,5 @@ cargo test --locked --test m14_live_provider_smoke   # 报告 2 ignored、0 执�
 ```
 
 两个tests共享一个120s的explicit live wait bound（纯operational bound，不是absence proof），成功路径总是调用`runtime.shutdown()`；temp durable root/workspace目录通过`Drop`清理。test使用public types only：`MiniCoreRuntimeConfig::with_model_provider` + protocol-specific `ModelProviderConfig`构造函数，descriptor为provider `openai-live`/`anthropic-live` + model `smoke`（stable selection刻意与API model名不同）、version 1、conservative Provider-default reasoning/Standard service/no structured output、default max output 64、bytes-per-token 4。env-backed `CredentialSource`定义在integration test内部：`resolve()`只返回async future，`std::env::var`与`ProviderCredential`解析都在future内完成；缺失/非法credential解析为`None`（typed `AuthMissing`/`NotSent`）且不打印。
+
+2026-08-12已在显式release环境连续执行两个exact ignored tests，OpenAI Responses与Anthropic Messages完整public Runtime paths均通过。credential来自仓库外0600临时环境文件，执行后unset并删除；仓库不记录credential、private endpoint或response content。该次nonsecret evidence与暴露的User-Agent/Anthropic wire refinements见[ADR 0145](../docs/adr/0145-live-provider-evidence-refines-direct-adapter-wire-truth.md)。默认gate行为不变：tests继续ignored、离线且无ambient credential依赖。
