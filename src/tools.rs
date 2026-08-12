@@ -9,14 +9,20 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::runtime_task::RuntimeTaskContext;
 use crate::wire::lexical::{
     LexicalError, canonical_json_string_len, normalize_newlines, validate_opaque_ascii,
     validate_safe_text, validate_stable_symbolic_key,
 };
 use crate::wire::{BoundedJsonObject, BoundedJsonSchema, ItemId, ProtocolLimits};
+use crate::workspace::WorkspaceToolContext;
 
 /// The M14 production `ask_user` builtin: one closed, default-off, Runtime-owned Tool.
 mod ask_user;
+
+/// The production `read_file` builtin: one closed, default-off, Runtime-owned Tool that
+/// reads one UTF-8 text file relative to the Workspace cwd.
+mod read_file;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolNameError {
@@ -307,10 +313,6 @@ pub(crate) struct ToolCancellationHandle {
 /// only observe cancellation, never trigger it.
 #[derive(Clone)]
 pub(crate) struct ToolCancellationObserver {
-    #[allow(
-        dead_code,
-        reason = "read only by cancellable executors; the production ask_user builtin never starts an executor"
-    )]
     token: CancellationToken,
 }
 
@@ -334,11 +336,8 @@ impl ToolCancellationHandle {
 impl ToolCancellationObserver {
     /// Awaits the operation's cancellation: returns when the owning slot cancelled the pair.
     /// This is the executor's cooperative-cancellation seam: a running executor awaits it and
-    /// performs its own bounded cleanup before returning.
-    #[allow(
-        dead_code,
-        reason = "awaited by concrete cancellable executors; the production ask_user builtin never starts an executor"
-    )]
+    /// performs its own bounded cleanup before returning.  The production read_file builtin
+    /// awaits it before scheduling its blocking read and keeps its tracked job while it runs.
     pub(crate) async fn cancelled(&self) {
         self.token.cancelled().await;
     }
@@ -367,9 +366,10 @@ pub(crate) struct ToolExecutionStart {
 }
 
 impl ToolExecutionStart {
-    /// Test-visible constructor for scripted planners; the M8 executor adapter supplies the
-    /// production constructor.
-    #[cfg(test)]
+    /// The production constructor binding one exact request to its move-only start factory:
+    /// the read_file builtin planner uses it, and scripted planners use it in tests.  Only
+    /// the owner's `run_started_execution` may invoke the factory, and only after the typed
+    /// started proof's exact capture revalidates.
     pub(crate) fn new(
         factory: impl FnOnce(ToolCancellationObserver) -> ToolExecutionFuture + Send + 'static,
     ) -> Self {
@@ -1018,6 +1018,19 @@ impl ToolSet {
     /// existing residency capture; the default Runtime ToolSet stays empty.
     pub(crate) fn ask_user_builtin() -> Arc<Self> {
         ask_user::build_tool_set()
+    }
+
+    /// The production opt-in read_file builtin ToolSet: exactly one immutable `read_file`
+    /// Tool with its closed schema, its `FilesystemRead` planner, and the available
+    /// `FilesystemRead` sandbox contract, pinned to the exact captured Workspace tool
+    /// context and the exact Runtime task context.  `open` selects exactly one ToolSet and
+    /// passes it through the existing residency capture; the default Runtime ToolSet stays
+    /// empty.
+    pub(crate) fn read_file_builtin(
+        workspace: WorkspaceToolContext,
+        task_context: RuntimeTaskContext,
+    ) -> Arc<Self> {
+        read_file::build_tool_set(workspace, task_context)
     }
 
     #[cfg(test)]
