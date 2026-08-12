@@ -90,6 +90,7 @@ pub struct MiniCoreRuntimeConfig {
     model_providers: Vec<ModelProviderConfig>,
     ask_user_tool: bool,
     read_file_tool: bool,
+    list_directory_tool: bool,
 }
 
 impl MiniCoreRuntimeConfig {
@@ -101,6 +102,7 @@ impl MiniCoreRuntimeConfig {
             model_providers: Vec::new(),
             ask_user_tool: false,
             read_file_tool: false,
+            list_directory_tool: false,
         }
     }
 
@@ -142,15 +144,31 @@ impl MiniCoreRuntimeConfig {
     /// read-only Workspace resolution authority.
     ///
     /// The default Runtime ToolSet stays empty; this opt-in is idempotent and independent of
-    /// `with_ask_user_tool`.  `open` freezes it into the single production Tool config and
-    /// selects the read-only Workspace resolver, so every declared root is resolved with an
-    /// authority ceiling of exactly `ReadOnly` filesystem access — never `ReadWrite` — and
-    /// Prompt/Skill source ceilings stay false: the opt-in is both the Tool installation and
-    /// the read-only authority ceiling.  The read_file ToolSet is materialized per admission
-    /// against the exact captured Workspace snapshot, so no single static ToolSet is selected
-    /// here.
+    /// `with_ask_user_tool` and `with_list_directory_tool`.  `open` freezes it into the single
+    /// production Tool config and selects the read-only Workspace resolver — the same shared
+    /// workspace read authority the `list_directory` opt-in uses — so every declared root is
+    /// resolved with an authority ceiling of exactly `ReadOnly` filesystem access — never
+    /// `ReadWrite` — and Prompt/Skill source ceilings stay false: the workspace read opt-ins
+    /// are both the Tool installation and the read-only authority ceiling.  The read_file
+    /// ToolSet is materialized per admission against the exact captured Workspace snapshot, so
+    /// no single static ToolSet is selected here.
     pub fn with_read_file_tool(mut self) -> Self {
         self.read_file_tool = true;
+        self
+    }
+
+    /// Opts the Runtime into the closed production `list_directory` builtin ToolSet and the
+    /// same read-only Workspace resolution authority as `with_read_file_tool`.
+    ///
+    /// The default Runtime ToolSet stays empty; this opt-in is idempotent and independent of
+    /// `with_ask_user_tool` and `with_read_file_tool`.  `open` freezes it into the single
+    /// production Tool config and selects the read-only Workspace resolver shared with
+    /// `read_file`, so every declared root is resolved with an authority ceiling of exactly
+    /// `ReadOnly` filesystem access — never `ReadWrite` — and Prompt/Skill source ceilings
+    /// stay false.  The list_directory ToolSet is materialized per admission against the exact
+    /// captured Workspace snapshot, so no single static ToolSet is selected here.
+    pub fn with_list_directory_tool(mut self) -> Self {
+        self.list_directory_tool = true;
         self
     }
 }
@@ -324,26 +342,31 @@ impl MiniCoreRuntime {
                 }
             };
 
-        // The read_file opt-in selects the read-only Workspace resolver and its revocation
-        // control: every declared root resolves with an authority ceiling of exactly
-        // `ReadOnly` filesystem access (never `ReadWrite`), Prompt/Skill source ceilings stay
-        // false, and the Runtime owner keeps the control so the host Workspace authority
-        // invalidation seam can revoke read access per Session.  The default resolver keeps
-        // the existing restricted authority unchanged and has no control.
-        let (resolver, read_access_control) = if config.read_file_tool {
+        // The workspace read opt-ins (read_file, list_directory) select the read-only
+        // Workspace resolver and its single revocation control: every declared root resolves
+        // with an authority ceiling of exactly `ReadOnly` filesystem access (never
+        // `ReadWrite`), Prompt/Skill source ceilings stay false, and the Runtime owner keeps
+        // the control so the host Workspace authority invalidation seam can revoke read access
+        // per Session.  The default resolver keeps the existing restricted authority unchanged
+        // and has no control.
+        let (resolver, read_access_control) = if config.read_file_tool || config.list_directory_tool
+        {
             let (resolver, control) = WorkspaceResolver::new_with_read_access(task_context.clone());
             (Arc::new(resolver), Some(control))
         } else {
             (Arc::new(WorkspaceResolver::new(task_context.clone())), None)
         };
-        // The production Tool config is frozen exactly once at `open`: the two closed host
-        // opt-ins (ask_user, read_file) are captured in one immutable config and passed
-        // through the residency start.  Nothing is materialized here — each admission
-        // materializes its ToolSet against the exact captured Workspace snapshot, so no
-        // single static ToolSet is selected when read_file is enabled and the default
-        // Runtime ToolSet stays empty.
-        let tool_config =
-            crate::tools::ProductionToolConfig::new(config.ask_user_tool, config.read_file_tool);
+        // The production Tool config is frozen exactly once at `open`: the three closed host
+        // opt-ins (ask_user, read_file, list_directory) are captured in one immutable config
+        // and passed through the residency start.  Nothing is materialized here — each
+        // admission materializes its ToolSet against the exact captured Workspace snapshot, so
+        // no single static ToolSet is selected when a workspace read builtin is enabled and
+        // the default Runtime ToolSet stays empty.
+        let tool_config = crate::tools::ProductionToolConfig::new(
+            config.ask_user_tool,
+            config.read_file_tool,
+            config.list_directory_tool,
+        );
         let session_residency = match SessionResidencyRegistry::start_with_turn_resources_and_production_tools_and_compaction_and_unload_grace(
             task_context.clone(),
             durable_state.clone(),
@@ -415,16 +438,17 @@ impl MiniCoreRuntime {
     }
 
     /// Host-only security Workspace authority invalidation (not a wire command).  Except for
-    /// the Runtime-owned read_file authority, the host has already published the current hard
-    /// restriction fact; the Runtime routes out-of-band to the loaded Session executor —
-    /// without the runtime publication semaphore and without waiting on any ordinary work
-    /// lane — samples one `SystemClock` timestamp, signals the active admission/Turn
-    /// first-wins with `SecurityRevoked` (or enters Preparing directly when Idle), and
-    /// re-resolves the installed Workspace with the exact current definition.  For a Runtime
-    /// opened with the read_file opt-in, this method itself first publishes the permanent
-    /// read revocation for the Session through the owner-held control, so the read authority
-    /// is already restricted when the recovery re-resolves — the restriction stays current
-    /// even if the residency reports SessionNotLoaded/Closing/internal.  The await resolves
+    /// the Runtime-owned workspace read authority (read_file/list_directory), the host has
+    /// already published the current hard restriction fact; the Runtime routes out-of-band to
+    /// the loaded Session executor — without the runtime publication semaphore and without
+    /// waiting on any ordinary work lane — samples one `SystemClock` timestamp, signals the
+    /// active admission/Turn first-wins with `SecurityRevoked` (or enters Preparing directly
+    /// when Idle), and re-resolves the installed Workspace with the exact current definition.
+    /// For a Runtime opened with a workspace read opt-in (read_file or list_directory), this
+    /// method itself first publishes the permanent read revocation for the Session through the
+    /// owner-held control, so the read authority is already restricted when the recovery
+    /// re-resolves — the restriction stays current even if the residency reports
+    /// SessionNotLoaded/Closing/internal.  The await resolves
     /// only after the recovery final state is installed (Ready or the new Workspace/Prompt
     /// Unavailable cause).  The durable definition/revision/metadata/conversation are never
     /// changed.  No `CommandId` is generated.
@@ -832,12 +856,13 @@ struct RuntimeInner {
     // This is a multi-reader gate, so Submits across different Sessions never serialize against
     // each other.
     shared_resource_gate: Arc<RwLock<()>>,
-    // The Runtime-owned read_file Workspace read-authority revocation control, installed only
-    // by the read_file opt-in at `open`.  The default/no-read Runtime stores None and keeps
-    // its existing invalidation behavior; the read_file Runtime revokes through this exact
-    // control before every host Workspace authority invalidation so the restriction is
-    // published before the recovery re-resolves.  It is a separate owner clone of the same
-    // process-local set the resolver authority checks, so no authority state is duplicated.
+    // The Runtime-owned workspace read-authority revocation control, installed only by the
+    // workspace read opt-ins (read_file, list_directory) at `open`.  The default/no-read
+    // Runtime stores None and keeps its existing invalidation behavior; either read opt-in
+    // Runtime revokes through this exact control before every host Workspace authority
+    // invalidation so the restriction is published before the recovery re-resolves.  It is a
+    // separate owner clone of the same process-local set the resolver authority checks, so no
+    // authority state is duplicated.
     read_access_control: Option<WorkspaceReadAccessControl>,
     retained_until_shutdown: Mutex<Option<Arc<RuntimeInner>>>,
     session_residency: Mutex<Option<Arc<SessionResidencyRegistry>>>,
@@ -1990,13 +2015,13 @@ impl RuntimeInner {
     /// The host-only security invalidation route: no runtime publication semaphore, no ordinary
     /// work-lane wait.  A missing loaded executor is `SessionNotLoaded`; a registry/runtime
     /// closing is `RuntimeClosing`; an impossible actor failure is `Internal`.  For the
-    /// Runtime-owned read_file authority, the permanent per-Session read revocation is
-    /// published here first (after the Open lifecycle and residency existence checks, before
-    /// the timestamp sample and the residency invalidation), so the hard restriction is
-    /// current before the recovery re-resolves and stays published even when the residency
-    /// returns SessionNotLoaded/Closing/internal.  The default/no-read Runtime has no control
-    /// and keeps its existing behavior.  The single `SystemClock` timestamp is sampled here
-    /// and carried through the executor recovery events.
+    /// Runtime-owned workspace read authority (read_file/list_directory), the permanent
+    /// per-Session read revocation is published here first (after the Open lifecycle and
+    /// residency existence checks, before the timestamp sample and the residency invalidation),
+    /// so the hard restriction is current before the recovery re-resolves and stays published
+    /// even when the residency returns SessionNotLoaded/Closing/internal.  The default/no-read
+    /// Runtime has no control and keeps its existing behavior.  The single `SystemClock`
+    /// timestamp is sampled here and carried through the executor recovery events.
     async fn invalidate_session_workspace_authority(
         &self,
         session_id: SessionId,
@@ -2007,8 +2032,8 @@ impl RuntimeInner {
         let Some(residency) = self.residency() else {
             return Err(SessionWorkspaceInvalidationError::RuntimeClosing);
         };
-        // The Runtime-owned read_file authority publishes its permanent read revocation for
-        // this Session before the host restriction is routed: the revoke is the hard
+        // The Runtime-owned workspace read authority publishes its permanent read revocation
+        // for this Session before the host restriction is routed: the revoke is the hard
         // restriction for that authority, stays current even if the residency below returns
         // SessionNotLoaded/Closing/internal, and is observed by the recovery's re-resolve.
         if let Some(control) = self.read_access_control.as_ref() {
@@ -7105,17 +7130,79 @@ mod tests {
         assert_eq!(format!("{fresh:?}"), "MiniCoreRuntimeConfig { .. }");
     }
 
+    #[test]
+    fn runtime_config_list_directory_tool_is_default_off_and_the_opt_in_is_idempotent_and_independent()
+     {
+        let default = MiniCoreRuntimeConfig::new(PathBuf::from("/unused"));
+        assert!(
+            !default.list_directory_tool,
+            "the default Runtime ToolSet stays empty"
+        );
+        let opted = default.with_list_directory_tool();
+        assert!(opted.list_directory_tool);
+        // The opt-in is idempotent: opting in twice keeps the exact same flag.
+        let twice = opted.with_list_directory_tool();
+        assert!(twice.list_directory_tool);
+        // The list_directory opt-in is independent of ask_user and read_file in both
+        // directions.
+        let list_only =
+            MiniCoreRuntimeConfig::new(PathBuf::from("/unused")).with_list_directory_tool();
+        assert!(
+            !list_only.ask_user_tool,
+            "the list_directory opt-in never enables ask_user"
+        );
+        assert!(
+            !list_only.read_file_tool,
+            "the list_directory opt-in never enables read_file"
+        );
+        let ask_only = MiniCoreRuntimeConfig::new(PathBuf::from("/unused")).with_ask_user_tool();
+        assert!(
+            !ask_only.list_directory_tool,
+            "the ask_user opt-in never enables list_directory"
+        );
+        let read_only = MiniCoreRuntimeConfig::new(PathBuf::from("/unused")).with_read_file_tool();
+        assert!(
+            !read_only.list_directory_tool,
+            "the read_file opt-in never enables list_directory"
+        );
+        // Each pair combines independently, and the triple combines exactly once per flag.
+        let ask_list = ask_only.with_list_directory_tool();
+        assert!(ask_list.ask_user_tool && ask_list.list_directory_tool && !ask_list.read_file_tool);
+        let read_list = read_only.with_list_directory_tool();
+        assert!(
+            read_list.read_file_tool && read_list.list_directory_tool && !read_list.ask_user_tool
+        );
+        let all_three = read_list.with_ask_user_tool();
+        assert!(
+            all_three.ask_user_tool && all_three.read_file_tool && all_three.list_directory_tool
+        );
+        // A fresh default config is unaffected, and the redacted Debug shape is unchanged
+        // by the new field.
+        let fresh = MiniCoreRuntimeConfig::new(PathBuf::from("/unused"));
+        assert!(!fresh.list_directory_tool);
+        assert_eq!(format!("{fresh:?}"), "MiniCoreRuntimeConfig { .. }");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_open_tool_opt_ins_disclose_exactly_the_opted_builtins() {
         // The frozen production Tool config discloses exactly the opted builtins once: the
-        // default stays empty, each single opt-in discloses its one builtin, and the
-        // combined opt-in discloses exactly ask_user then read_file (never twice, never
-        // any unopted builtin).
-        for (ask_user, read_file, expected_names) in [
-            (false, false, Vec::<&str>::new()),
-            (true, false, vec!["ask_user"]),
-            (false, true, vec!["read_file"]),
-            (true, true, vec!["ask_user", "read_file"]),
+        // default stays empty, each single opt-in discloses its one builtin, and every
+        // combined opt-in discloses exactly the fixed order ask_user then read_file then
+        // list_directory (never twice, never any unopted builtin, never reordered).
+        for (ask_user, read_file, list_directory, expected_names) in [
+            (false, false, false, Vec::<&str>::new()),
+            (true, false, false, vec!["ask_user"]),
+            (false, true, false, vec!["read_file"]),
+            (false, false, true, vec!["list_directory"]),
+            (true, true, false, vec!["ask_user", "read_file"]),
+            (true, false, true, vec!["ask_user", "list_directory"]),
+            (false, true, true, vec!["read_file", "list_directory"]),
+            (
+                true,
+                true,
+                true,
+                vec!["ask_user", "read_file", "list_directory"],
+            ),
         ] {
             let root = TempRoot::new();
             let workspace = TempWorkspace::new();
@@ -7126,6 +7213,9 @@ mod tests {
             }
             if read_file {
                 config = config.with_read_file_tool().with_read_file_tool();
+            }
+            if list_directory {
+                config = config.with_list_directory_tool().with_list_directory_tool();
             }
             let runtime =
                 MiniCoreRuntime::open_with_model_fixture(config, Handle::current(), &model)
@@ -7187,11 +7277,12 @@ mod tests {
             let requests = model.requests();
             assert_eq!(requests.len(), 1);
             let tools = requests[0].input().tools();
-            let mut disclosed = tools
+            // The exact fixed disclosure order, never sorted: ask_user, read_file,
+            // list_directory in that sequence.
+            let disclosed = tools
                 .iter()
                 .map(|tool| tool.name().as_str())
                 .collect::<Vec<_>>();
-            disclosed.sort_unstable();
             assert_eq!(disclosed, expected_names);
             if read_file {
                 let schema: crate::wire::BoundedJsonSchema = r#"{"type":"object","properties":{"path":{"type":"string","maxLength":4096}},"required":["path"],"additionalProperties":false}"#
@@ -7202,6 +7293,16 @@ mod tests {
                     .find(|tool| tool.name().as_str() == "read_file")
                     .expect("the read_file opt-in discloses its builtin exactly once");
                 assert_eq!(read_file_tool.input_schema(), &schema);
+            }
+            if list_directory {
+                let schema: crate::wire::BoundedJsonSchema = r#"{"type":"object","properties":{"path":{"type":"string","maxLength":4096}},"required":["path"],"additionalProperties":false}"#
+                    .parse()
+                    .expect("the frozen list_directory schema is valid");
+                let list_directory_tool = tools
+                    .iter()
+                    .find(|tool| tool.name().as_str() == "list_directory")
+                    .expect("the list_directory opt-in discloses its builtin exactly once");
+                assert_eq!(list_directory_tool.input_schema(), &schema);
             }
             runtime.shutdown().await;
         }
@@ -7326,6 +7427,379 @@ mod tests {
                         && content.parts()[0].as_text() == "hello from the workspace\n"
                 ))
         );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_directory_tool_opt_in_lists_the_workspace_cwd_and_continues_the_turn_end_to_end()
+    {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        // Deterministic entries under the Workspace cwd (`src`): one file, one nested
+        // directory, one file.  The production list_directory builtin must list them through
+        // the read-only authority ceiling over a Workspace whose requested access is
+        // ReadWrite, tightened to ReadOnly at resolution, and sort them by UTF-8 name bytes
+        // as a.txt, nested, z.txt.
+        fs::write(workspace.path().join("src").join("a.txt"), "a\n")
+            .expect("the first Workspace cwd file is written");
+        fs::create_dir(workspace.path().join("src").join("nested"))
+            .expect("the nested Workspace cwd directory is created");
+        fs::write(workspace.path().join("src").join("z.txt"), "z\n")
+            .expect("the last Workspace cwd file is written");
+        // The scripted model emits one list_directory ToolCall for the cwd itself (empty
+        // path), then one final text response for the same Turn after the listing settles.
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_list",
+            "list_directory",
+            r#"{"path":""}"#,
+            "final public answer",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_list_directory_tool(),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the list_directory opt-in Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+        let submit_command_id = CommandId::generate().unwrap();
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                submit_command_id,
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("list it").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+
+        // The one Tool round runs the production list_directory builtin against the exact
+        // captured Workspace snapshot and the same Turn runs its final response.
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => {
+                        panic!("unexpected frame before list_directory Turn completion: {other:?}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the list_directory Turn completes");
+        assert_eq!(terminal.command_id(), Some(submit_command_id));
+        assert!(matches!(
+            terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == turn_id
+        ));
+        assert!(
+            terminal
+                .msg()
+                .session_snapshot()
+                .and_then(|snapshot| snapshot.usage())
+                .is_some_and(|usage| usage.model_calls() == 2)
+        );
+        assert_eq!(model.request_count(), 2);
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        // The first request discloses the exact frozen list_directory schema.
+        assert_eq!(requests[0].input().tools().len(), 1);
+        assert_eq!(
+            requests[0].input().tools()[0].name().as_str(),
+            "list_directory"
+        );
+        let schema: crate::wire::BoundedJsonSchema = r#"{"type":"object","properties":{"path":{"type":"string","maxLength":4096}},"required":["path"],"additionalProperties":false}"#
+            .parse()
+            .expect("the frozen list_directory schema is valid");
+        assert_eq!(requests[0].input().tools()[0].input_schema(), &schema);
+        // The second request carries the exact immutable ToolResult content of the listing:
+        // one text part with the compact sorted JSON of the three deterministic entries.
+        assert!(
+            requests[1]
+                .input()
+                .messages()
+                .iter()
+                .any(|message| matches!(
+                    message.as_ref(),
+                    ModelMessageRef::Tool {
+                        tool_call_id,
+                        content,
+                    } if tool_call_id.as_str() == "call_list"
+                        && content.parts().len() == 1
+                        && content.parts()[0].as_text()
+                            == r#"{"entries":[{"name":"a.txt","type":"file"},{"name":"nested","type":"directory"},{"name":"z.txt","type":"file"}]}"#
+                ))
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_directory_authority_invalidation_revokes_read_access_and_restores_no_grant() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        fs::write(workspace.path().join("src").join("a.txt"), "a\n")
+            .expect("the Workspace cwd file is written");
+        // The scripted model emits one list_directory ToolCall per Turn round, then one
+        // final text response for that same Turn, across two rounds: the first Turn proves
+        // the read grant, the post-revocation recovery is inspected through the installed
+        // snapshot, and the second Turn is the real future admission — every admission
+        // materializes the list_directory ToolSet against exactly the current snapshot.  The
+        // two rounds use distinct tool_call_ids so their ToolResults are distinguishable.
+        let model = ScriptedModelFixture::with_two_tool_rounds(
+            (
+                "call_list",
+                "list_directory",
+                r#"{"path":""}"#,
+                "final public answer",
+            ),
+            (
+                "call_list_again",
+                "list_directory",
+                r#"{"path":""}"#,
+                "second final answer",
+            ),
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_list_directory_tool(),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the list_directory opt-in Runtime opens");
+        // The list_directory-only Runtime holds the same owner-side read authority control
+        // as the read_file opt-in: revocation must work identically for either workspace
+        // read builtin.
+        assert!(
+            runtime.inner.read_access_control.is_some(),
+            "the list_directory opt-in installs the shared workspace read authority control"
+        );
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+
+        // One list_directory Turn succeeds end-to-end: the read authority grant is genuinely
+        // present before the host revocation.
+        let submit_command_id = CommandId::generate().unwrap();
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                submit_command_id,
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("list it").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => {
+                        panic!("unexpected frame before list_directory Turn completion: {other:?}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the list_directory Turn completes");
+        assert!(matches!(
+            terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == turn_id
+        ));
+        assert_eq!(model.request_count(), 2);
+        let requests = model.requests();
+        assert!(requests[1].input().messages().iter().any(|message| {
+            matches!(
+                message.as_ref(),
+                ModelMessageRef::Tool {
+                    tool_call_id,
+                    content,
+                } if tool_call_id.as_str() == "call_list"
+                    && content.parts().len() == 1
+                    && content.parts()[0].as_text()
+                        == r#"{"entries":[{"name":"a.txt","type":"file"}]}"#
+            )
+        }));
+
+        // The host Workspace authority invalidation seam revokes the read authority for this
+        // Session through the owner-held control and recovers the loaded Idle Session.
+        runtime
+            .invalidate_session_workspace_authority(session_id)
+            .await
+            .expect("the host-only invalidation seam recovers the list_directory Session");
+
+        // The recovery re-resolves with the revoked authority: the recovered installed
+        // WorkspaceSnapshot carries no read grant — the exact snapshot every future admission
+        // materializes the list_directory ToolSet against — and no further model call was
+        // made by the recovery.
+        let residency = runtime
+            .inner
+            .residency()
+            .expect("the open Runtime retains its residency");
+        let executor = residency
+            .executor_for_test(session_id)
+            .expect("the recovered Session stays loaded");
+        let recovered_snapshot = executor.published_snapshot();
+        assert_eq!(recovered_snapshot.readiness(), SessionReadinessView::Ready);
+        let workspace_snapshot = recovered_snapshot
+            .workspace_optional()
+            .expect("a Ready recovery installs its WorkspaceSnapshot");
+        assert_eq!(workspace_snapshot.session_id(), session_id);
+        assert_eq!(
+            workspace_snapshot
+                .tool_context()
+                .access()
+                .authorize_read_directory(&"".parse().unwrap())
+                .unwrap_err(),
+            WorkspaceAccessError::NotAuthorized
+        );
+        assert_eq!(model.request_count(), 2);
+
+        // The real future admission: a second public Submit starts against the recovered
+        // no-grant Workspace snapshot (readiness Ready), the same Turn path discloses the
+        // list_directory ToolSet against that snapshot, and the model's second list_directory
+        // ToolCall to the cwd settles PreExecution + Denied with the exact frozen text before
+        // any start factory exists — the same Turn then receives its scripted final text and
+        // completes.
+        let second_command_id = CommandId::generate().unwrap();
+        let second_submit = runtime
+            .dispatch(CommandRequest::new(
+                second_command_id,
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("list it again").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("the second public Submit dispatches");
+        let second_turn_id = started_turn(&second_submit);
+        let second_terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => {
+                        panic!(
+                            "unexpected frame before the post-revocation list_directory Turn completion: {other:?}"
+                        )
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the post-revocation list_directory Turn completes");
+        assert_eq!(second_terminal.command_id(), Some(second_command_id));
+        assert!(matches!(
+            second_terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == second_turn_id
+        ));
+        assert_eq!(model.request_count(), 4);
+
+        // The exact model request sequence across both admissions, four requests total:
+        // request 0 is the first Turn's first request disclosing list_directory; request 1
+        // carries the first success ToolResult with the exact listing; request 2 is the
+        // second Turn's first request and still discloses list_directory against the
+        // recovered no-grant snapshot; request 3 carries the second ToolResult with the exact
+        // denial text, never any entry.
+        let requests = model.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].input().tools().len(), 1);
+        assert_eq!(
+            requests[0].input().tools()[0].name().as_str(),
+            "list_directory"
+        );
+        assert_eq!(requests[2].input().tools().len(), 1);
+        assert_eq!(
+            requests[2].input().tools()[0].name().as_str(),
+            "list_directory"
+        );
+        assert!(requests[3].input().messages().iter().any(|message| {
+            matches!(
+                message.as_ref(),
+                ModelMessageRef::Tool {
+                    tool_call_id,
+                    content,
+                } if tool_call_id.as_str() == "call_list_again"
+                    && content.parts().len() == 1
+                    && content.parts()[0].as_text() == "workspace directory access is denied"
+            )
+        }));
+        // The denied second listing never leaks any entry into its own ToolResult: the
+        // call_list_again result is exactly the one denial part (the first Turn's success
+        // ToolResult legitimately stays in the conversation history, but no second listing
+        // result ever carries an entry name).
+        assert!(!requests[3].input().messages().iter().any(|message| {
+            matches!(
+                message.as_ref(),
+                ModelMessageRef::Tool {
+                    tool_call_id,
+                    content,
+                } if tool_call_id.as_str() == "call_list_again"
+                    && content.parts().iter().any(|part| part.as_text().contains("a.txt"))
+            )
+        }));
         runtime.shutdown().await;
     }
 
