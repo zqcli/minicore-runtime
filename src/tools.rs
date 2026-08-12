@@ -15,6 +15,9 @@ use crate::wire::lexical::{
 };
 use crate::wire::{BoundedJsonObject, BoundedJsonSchema, ItemId, ProtocolLimits};
 
+/// The M14 production `ask_user` builtin: one closed, default-off, Runtime-owned Tool.
+mod ask_user;
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolNameError {
     #[error("tool name must be 1..=64 bytes")]
@@ -255,7 +258,7 @@ impl ToolExecutionRequest {
 
 #[allow(
     dead_code,
-    reason = "executor results are produced by cfg(test) scripted executors until the M8 executor lands"
+    reason = "executor results are produced by scripted executors or future OS-backed production adapters; the production ask_user builtin never executes"
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ToolExecutionResult {
@@ -306,7 +309,7 @@ pub(crate) struct ToolCancellationHandle {
 pub(crate) struct ToolCancellationObserver {
     #[allow(
         dead_code,
-        reason = "read only by the cooperative-cancellation seam; production ToolSets are empty and only the cancellation tests exercise it"
+        reason = "read only by cancellable executors; the production ask_user builtin never starts an executor"
     )]
     token: CancellationToken,
 }
@@ -334,7 +337,7 @@ impl ToolCancellationObserver {
     /// performs its own bounded cleanup before returning.
     #[allow(
         dead_code,
-        reason = "awaited by concrete executors; production ToolSets are empty and only the cooperative-cancellation tests exercise it"
+        reason = "awaited by concrete cancellable executors; the production ask_user builtin never starts an executor"
     )]
     pub(crate) async fn cancelled(&self) {
         self.token.cancelled().await;
@@ -397,6 +400,7 @@ impl ToolExecutionPlan {
 /// the owner path (`bind`) may invoke it, and the binding is deliberately not Clone: an
 /// answer is consumed exactly once by exactly the one question operation that presented it.
 pub(crate) struct UserQuestionAnswerBinding {
+    request: ToolExecutionRequest,
     bind: Box<dyn FnOnce(UserQuestionAnswer) -> ToolExecutionResult + Send>,
 }
 
@@ -405,9 +409,11 @@ impl UserQuestionAnswerBinding {
     /// production constructor.
     #[cfg(test)]
     pub(crate) fn new(
+        request: ToolExecutionRequest,
         bind: impl FnOnce(UserQuestionAnswer) -> ToolExecutionResult + Send + 'static,
     ) -> Self {
         Self {
+            request,
             bind: Box::new(bind),
         }
     }
@@ -428,6 +434,13 @@ impl UserQuestionAnswerBinding {
     ) -> ToolExecutionOutcome {
         let item_id = request.item_id();
         let tool_call_id = request.call().tool_call_id().clone();
+        if !self.request.is_exact_capture(request) {
+            return ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: ToolAbandonReason::RuntimeFailure,
+            };
+        }
         match (self.bind)(answer) {
             ToolExecutionResult::PreExecution {
                 disposition: ToolResultDisposition::Succeeded,
@@ -471,7 +484,7 @@ impl fmt::Debug for UserQuestionAnswerBinding {
 /// slice covers exactly that start seam, not a fuller operation slot.
 #[allow(
     dead_code,
-    reason = "concrete executors/plans are cfg(test) until the M8 executor lands; production ToolSets are empty"
+    reason = "most executor plan variants remain exercised by scripted tests; the production ask_user builtin uses UserQuestion and PreExecution only"
 )]
 pub(crate) enum ToolExecutionPlan {
     Execute {
@@ -997,6 +1010,14 @@ impl ToolSet {
                 sandbox: ToolSandboxContract::available([]),
             }),
         })
+    }
+
+    /// The production opt-in builtin ToolSet: exactly one immutable `ask_user` Tool with its
+    /// closed schema, its planner, and the available empty sandbox contract.  `open` selects
+    /// exactly one ToolSet (the empty default or this builtin) and passes it through the
+    /// existing residency capture; the default Runtime ToolSet stays empty.
+    pub(crate) fn ask_user_builtin() -> Arc<Self> {
+        ask_user::build_tool_set()
     }
 
     #[cfg(test)]
@@ -3235,9 +3256,12 @@ mod tests {
 
         // The binding is move-only and its Debug is fully redacted: neither the answer nor
         // any produced content is reachable through it.
-        let binding = UserQuestionAnswerBinding::new(|_| ToolExecutionResult::PreExecution {
-            disposition: ToolResultDisposition::Succeeded,
-            content: ToolResultContent::from_text_parts(vec!["SECRET-ANSWER".to_owned()]).unwrap(),
+        let binding = UserQuestionAnswerBinding::new(request.clone(), |_| {
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Succeeded,
+                content: ToolResultContent::from_text_parts(vec!["SECRET-ANSWER".to_owned()])
+                    .unwrap(),
+            }
         });
         assert_eq!(format!("{binding:?}"), "UserQuestionAnswerBinding { .. }");
         assert!(matches!(
@@ -3255,7 +3279,7 @@ mod tests {
 
         // The producer reads the typed answer through the FnOnce: the binding is the exact
         // owner path that turns the typed host answer into the answered ToolResult.
-        let binding = UserQuestionAnswerBinding::new(|answer| {
+        let binding = UserQuestionAnswerBinding::new(request.clone(), |answer| {
             let text = match answer.answers()[0].value() {
                 UserQuestionAnswerValue::Text(text) => text.as_ref().to_owned(),
                 UserQuestionAnswerValue::Choice { .. } => panic!("wrong answer family"),
@@ -3280,9 +3304,10 @@ mod tests {
         ));
 
         // An explicit Abandoned passes its reason through unchanged.
-        let binding = UserQuestionAnswerBinding::new(|_| ToolExecutionResult::Abandoned {
-            reason: ToolAbandonReason::RuntimeFailure,
-        });
+        let binding =
+            UserQuestionAnswerBinding::new(request.clone(), |_| ToolExecutionResult::Abandoned {
+                reason: ToolAbandonReason::RuntimeFailure,
+            });
         assert!(matches!(
             binding.bind(&request, answer.clone()),
             ToolExecutionOutcome::Abandoned {
@@ -3329,7 +3354,8 @@ mod tests {
                 content: ToolResultContent::from_text_parts(vec!["cancelled".to_owned()]).unwrap(),
             },
         ] {
-            let binding = UserQuestionAnswerBinding::new(move |_| malformed.clone());
+            let binding =
+                UserQuestionAnswerBinding::new(request.clone(), move |_| malformed.clone());
             assert!(matches!(
                 binding.bind(&request, answer.clone()),
                 ToolExecutionOutcome::Abandoned {
@@ -3340,6 +3366,54 @@ mod tests {
                     && tool_call_id == *request.call().tool_call_id()
             ));
         }
+    }
+
+    #[test]
+    fn user_question_answer_binding_rejects_a_foreign_exact_request_capture_before_invoking() {
+        let request = ToolExecutionRequest::new(
+            "itm_00000000000000000000000000000001".parse().unwrap(),
+            ToolCall::new(
+                "call_1".parse().unwrap(),
+                "echo".parse().unwrap(),
+                "{}".parse().unwrap(),
+                0,
+            ),
+        );
+        let foreign = ToolExecutionRequest::new(
+            request.item_id(),
+            ToolCall::new(
+                request.call().tool_call_id().clone(),
+                request.call().name().clone(),
+                request.call().arguments().clone(),
+                request.call().call_index(),
+            ),
+        );
+        assert!(!request.is_exact_capture(&foreign));
+        let invoked = Arc::new(AtomicBool::new(false));
+        let binding = UserQuestionAnswerBinding::new(request, {
+            let invoked = Arc::clone(&invoked);
+            move |_| {
+                invoked.store(true, Ordering::Release);
+                ToolExecutionResult::PreExecution {
+                    disposition: ToolResultDisposition::Succeeded,
+                    content: ToolResultContent::from_text_parts(vec!["must not bind".to_owned()])
+                        .unwrap(),
+                }
+            }
+        });
+        let answer =
+            UserQuestionAnswer::new(vec![UserQuestionFieldAnswer::text(0, "yes").unwrap()])
+                .unwrap();
+        assert!(matches!(
+            binding.bind(&foreign, answer),
+            ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: ToolAbandonReason::RuntimeFailure,
+            } if item_id == foreign.item_id()
+                && tool_call_id == *foreign.call().tool_call_id()
+        ));
+        assert!(!invoked.load(Ordering::Acquire));
     }
 
     #[test]
