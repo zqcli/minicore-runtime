@@ -31,6 +31,16 @@
 //!   of the block (provider block indexes are tracked strictly in order, but an
 //!   empty preceding hidden block must never create index drift); hidden
 //!   thinking is never published;
+//! - `thinking` normalization is signature-truthful: the start requires a
+//!   string `thinking` field and an optional string `signature` field (absent
+//!   means unsigned; a present empty string is the official start placeholder;
+//!   null/non-string is malformed), and a `signature_delta` may establish a
+//!   signature on an unsigned start. Official signed thinking normalizes to
+//!   replayable reasoning (exact text + exact signature) and replays verbatim
+//!   on future Anthropic calls; unsigned thinking is preserved truthfully as
+//!   text-only reasoning and omitted from future Anthropic replay (never
+//!   fabricated into a signed block) — the adapter claims provider support for
+//!   signed thinking only;
 //! - cancellation before the request is `Cancelled/NotSent`; cancellation
 //!   during send or read aborts by dropping the reqwest future/stream and
 //!   returns `Cancelled` with a conservative delivery; a synchronously accepted
@@ -519,9 +529,10 @@ fn thinking_and_effort(reasoning: ModelReasoningSummary) -> (Option<Value>, Opti
 
 /// Encodes the ordered transcript as Anthropic Messages. Assistant blocks keep
 /// their frozen domain order; only provider-incompatible reasoning is skipped
-/// (never fabricated into a Claude block), and an assistant message whose blocks
-/// all become unrepresentable is dropped whole rather than emitted empty. Fails
-/// `NotSent InvalidRequest` when no representable message remains.
+/// (never fabricated into a Claude block — including unsigned text-only
+/// thinking preserved from a compatible provider), and an assistant message
+/// whose blocks all become unrepresentable is dropped whole rather than emitted
+/// empty. Fails `NotSent InvalidRequest` when no representable message remains.
 fn encode_messages(messages: &[ModelMessage]) -> Result<Vec<Value>, ProviderAttemptError> {
     let mut encoded = Vec::new();
     for message in messages {
@@ -591,12 +602,15 @@ fn encode_messages(messages: &[ModelMessage]) -> Result<Vec<Value>, ProviderAtte
 }
 
 /// Protocol-truthful reasoning replay: a Claude thinking block requires the exact
-/// text with its original signature; a signature-only block (text None — the
+/// text with its original signature; unsigned text-only reasoning (visible
+/// thinking preserved from a compatible provider without a signature) is
+/// truthful but non-replayable on Anthropic and is omitted here — never
+/// fabricated into a signed block; a signature-only block (text None — the
 /// normalized form of a hidden/display-omitted adaptive thinking block) replays
 /// as an empty thinking block carrying the exact signature; a redacted block may
 /// replay only from an unambiguously Anthropic opaque artifact (encrypted content
-/// with no OpenAI provider item id, signature, text, or summary). Anything else is
-/// skipped.
+/// with no OpenAI provider item id, signature, text, or summary). Anything else
+/// is skipped.
 fn encode_reasoning_block(reasoning: &ReasoningContent) -> Option<Value> {
     if let (Some(text), Some(signature)) = (reasoning.text(), reasoning.signature()) {
         return Some(json!({
@@ -734,7 +748,9 @@ struct OpenBlock {
 enum OpenBlockKind {
     Thinking {
         thinking: String,
-        signature: String,
+        /// `None` when the start carried no `signature` field (an unsigned
+        /// block); a `signature_delta` establishes/extends the string.
+        signature: Option<String>,
     },
     RedactedThinking {
         data: String,
@@ -902,19 +918,21 @@ fn handle_content_block_start(value: &Value, state: &mut AnthropicStreamState) -
     let block_type = block.get("type").and_then(Value::as_str).ok_or(())?;
     let kind = match block_type {
         "thinking" => {
-            // The official streaming contract always carries both strings on the
-            // start block; empty is accepted (a hidden/adaptive-omitted block),
-            // missing is malformed.
+            // `thinking` is required and must be a string: empty is the official
+            // hidden/adaptive-omitted placeholder, missing is malformed.
+            // `signature` is optional: absent means an unsigned block (None); a
+            // present value must be a string — empty is accepted as the official
+            // start placeholder, null/non-string is malformed. A signature may
+            // also arrive later via `signature_delta`.
             let thinking = block
                 .get("thinking")
                 .and_then(Value::as_str)
                 .ok_or(())?
                 .to_owned();
-            let signature = block
-                .get("signature")
-                .and_then(Value::as_str)
-                .ok_or(())?
-                .to_owned();
+            let signature = match block.get("signature") {
+                None => None,
+                Some(value) => Some(value.as_str().ok_or(())?.to_owned()),
+            };
             OpenBlockKind::Thinking {
                 thinking,
                 signature,
@@ -1005,7 +1023,12 @@ fn handle_content_block_delta(
             if !signature_delta.is_empty() {
                 mark_semantic(delivery);
             }
-            signature.push_str(signature_delta);
+            // An unsigned start (absent `signature`) is established by the first
+            // `signature_delta` (empty or non-empty); later deltas keep appending
+            // so a legal late signature is never dropped.
+            signature
+                .get_or_insert_with(String::new)
+                .push_str(signature_delta);
         }
         ("text_delta", OpenBlockKind::Text { text }) => {
             let piece = delta.get("text").and_then(Value::as_str).ok_or(())?;
@@ -1062,22 +1085,24 @@ fn handle_content_block_stop(value: &Value, state: &mut AnthropicStreamState) ->
             thinking,
             signature,
         } => {
-            if thinking.is_empty() && signature.is_empty() {
+            // A present-but-empty signature (official start placeholder) is the
+            // same as no signature.
+            let signature = signature.filter(|signature| !signature.is_empty());
+            if thinking.is_empty() && signature.is_none() {
                 // Empty hidden thinking contributes no domain block.
                 return Ok(());
             }
-            // Visible thinking without its signature is malformed: Claude replay
-            // requires the exact signature for the exact text.
-            if !thinking.is_empty() && signature.is_empty() {
-                return Err(());
-            }
-            // Signature-only stays representable (adaptive display omission).
+            // Visible thinking without a signature is preserved truthfully as
+            // text-only reasoning: never fabricated into a signed replayable
+            // block, and future Anthropic replay omits it. Signature-only stays
+            // representable (adaptive display omission), and visible thinking
+            // with its exact signature stays replayable.
             ProviderAttemptContent::Reasoning(
                 ReasoningContent::new(
                     (!thinking.is_empty()).then_some(thinking),
                     None,
                     None,
-                    (!signature.is_empty()).then_some(signature),
+                    signature,
                     None,
                 )
                 .map_err(|_| ())?,
@@ -2205,6 +2230,127 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_thinking_is_preserved_text_only_and_omitted_from_anthropic_replay() {
+        // Receive: a thinking block whose start carries no `signature` field at
+        // all (the live-wire unsigned shape), with visible thinking deltas,
+        // normalizes to text-only ReasoningContent — signature None, truthful
+        // but not replayable on Anthropic.
+        let received = dispatch_events(&[
+            message_start("msg_unsigned", None, 5),
+            content_block_start(0, json!({"type": "thinking", "thinking": ""})),
+            thinking_delta(0, "visible unsigned thought"),
+            content_block_stop(0),
+            text_block_start(1),
+            text_delta(1, "visible"),
+            content_block_stop(1),
+            message_delta("end_turn", 3),
+        ])
+        .unwrap()
+        .unwrap();
+        let mut reasoning = None;
+        for content in received.content.iter() {
+            if let ProviderAttemptContent::Reasoning(block) = content {
+                reasoning = Some(block);
+            }
+        }
+        let reasoning =
+            reasoning.expect("visible unsigned thinking must normalize to a reasoning block");
+        assert_eq!(reasoning.text(), Some("visible unsigned thought"));
+        assert_eq!(
+            reasoning.signature(),
+            None,
+            "unsigned thinking must never gain a signature"
+        );
+        assert_eq!(
+            encode_reasoning_block(reasoning),
+            None,
+            "text-only reasoning must never be fabricated into a signed Claude block"
+        );
+
+        // Encode: future Anthropic replay omits the unsigned reasoning but keeps
+        // the same assistant's representable text; an assistant whose only block
+        // is unsigned reasoning is dropped whole (existing rule).
+        let assistant = ModelMessage::assistant(Arc::from([
+            ModelAssistantContent::reasoning(reasoning.clone()),
+            ModelAssistantContent::text(Arc::from("visible")).unwrap(),
+        ]))
+        .unwrap();
+        let user = ModelMessage::unstamped_user_text(Arc::from("continue")).unwrap();
+        let wire = Value::Array(encode_messages(&[user, assistant]).unwrap());
+        assert_eq!(
+            wire,
+            json!([
+                {"role": "user", "content": [{"type": "text", "text": "continue"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "visible"}]},
+            ])
+        );
+
+        let unsigned_only = ModelMessage::assistant(Arc::from([ModelAssistantContent::reasoning(
+            reasoning.clone(),
+        )]))
+        .unwrap();
+        assert_eq!(
+            encode_messages(&[unsigned_only]).unwrap_err().reason,
+            ModelCallErrorReason::InvalidRequest,
+            "an assistant message whose only block is unsigned reasoning is dropped whole"
+        );
+    }
+
+    #[test]
+    fn late_signature_delta_after_absent_start_signature_is_kept() {
+        // The start omits `signature` entirely; a later non-empty signature_delta
+        // establishes the signature on the open thinking block and must never be
+        // dropped: the block becomes replayable with the exact text + signature.
+        let result = dispatch_events(&[
+            message_start("msg_late_sig", None, 5),
+            content_block_start(0, json!({"type": "thinking", "thinking": ""})),
+            thinking_delta(0, "signed later"),
+            signature_delta(0, "sig_late"),
+            content_block_stop(0),
+            message_delta("end_turn", 3),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.content.len(), 1);
+        match &result.content[0] {
+            ProviderAttemptContent::Reasoning(reasoning) => {
+                assert_eq!(reasoning.text(), Some("signed later"));
+                assert_eq!(reasoning.signature(), Some("sig_late"));
+                assert_eq!(
+                    encode_reasoning_block(reasoning),
+                    Some(json!({
+                        "type": "thinking",
+                        "thinking": "signed later",
+                        "signature": "sig_late",
+                    }))
+                );
+            }
+            other => panic!("expected reasoning, got {other:?}"),
+        }
+
+        // An empty signature_delta after an absent start establishes the empty
+        // string without losing a later non-empty delta: the final signature is
+        // the concatenation, never dropped.
+        let result = dispatch_events(&[
+            message_start("msg_late_sig2", None, 5),
+            content_block_start(0, json!({"type": "thinking", "thinking": ""})),
+            signature_delta(0, ""),
+            signature_delta(0, "sig_after_empty"),
+            thinking_delta(0, "thought"),
+            content_block_stop(0),
+            message_delta("end_turn", 3),
+        ])
+        .unwrap()
+        .unwrap();
+        match &result.content[0] {
+            ProviderAttemptContent::Reasoning(reasoning) => {
+                assert_eq!(reasoning.signature(), Some("sig_after_empty"));
+            }
+            other => panic!("expected reasoning, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn encode_messages_tool_result_parts_are_ordered_text_blocks_not_joined() {
         let tool = ModelMessage::tool_result(
             "call_two_parts".parse().unwrap(),
@@ -2895,9 +3041,21 @@ mod tests {
                        "content_block": {"type": "thinking", "signature": "sig"}}),
             ),
             (
-                "thinking missing signature",
+                "thinking non-string signature",
                 json!({"type": "content_block_start", "index": 0,
-                       "content_block": {"type": "thinking", "thinking": ""}}),
+                       "content_block": {"type": "thinking", "thinking": "",
+                                          "signature": 42}}),
+            ),
+            (
+                "thinking null signature",
+                json!({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "thinking", "thinking": "",
+                                          "signature": null}}),
+            ),
+            (
+                "thinking non-string thinking",
+                json!({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "thinking", "thinking": 7}}),
             ),
             (
                 "text missing text",
@@ -2949,15 +3107,35 @@ mod tests {
             );
         }
 
-        // Non-empty thinking without a signature by block stop is malformed.
-        let error = dispatch_events(&[
+        // Visible thinking without a signature is preserved as text-only
+        // reasoning (truthful, non-replayable): the missing-signature start
+        // shape from a compatible provider succeeds and never gains a signature.
+        let result = dispatch_events(&[
             message_start("msg_cb", None, 5),
-            thinking_block_start(0),
+            content_block_start(0, json!({"type": "thinking", "thinking": ""})),
             thinking_delta(0, "visible thought"),
             content_block_stop(0),
+            text_block_start(1),
+            text_delta(1, "ok"),
+            content_block_stop(1),
+            message_delta("end_turn", 3),
         ])
-        .expect_err("non-empty thinking without a signature must fail closed");
-        assert_eq!(error.reason, ModelCallErrorReason::InvalidProviderResponse);
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.content.len(), 2);
+        match &result.content[0] {
+            ProviderAttemptContent::Reasoning(reasoning) => {
+                assert_eq!(reasoning.text(), Some("visible thought"));
+                assert_eq!(reasoning.signature(), None);
+                assert_eq!(
+                    encode_reasoning_block(reasoning),
+                    None,
+                    "unsigned visible thinking must never be fabricated into a \
+                     signed Claude block"
+                );
+            }
+            other => panic!("expected text-only reasoning, got {other:?}"),
+        }
 
         // Signature-only thinking stays representable (adaptive display omission).
         let result = dispatch_events(&[
@@ -4743,6 +4921,84 @@ mod tests {
         match &result.response().content()[0] {
             FinalizedAssistantContent::Text { text } => assert_eq!(&**text, "hello"),
             other => panic!("empty hidden block must not leak into content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loopback_live_wire_unsigned_thinking_sequence_succeeds() {
+        // Live-wire evidence: HTTPS /v1/messages, model `deepseek-v4-flash`
+        // returns the standard SSE sequence — message_start, a thinking block
+        // whose start is exactly {"type":"thinking","thinking":""} with no
+        // `signature` field, 17 non-empty thinking_deltas, zero signature_delta,
+        // a normal text block, and message_delta end_turn. The whole exchange
+        // must succeed: the unsigned thinking is preserved as text-only
+        // reasoning, the terminal/usage contract is unchanged, and no signature
+        // is ever synthesized.
+        let mut events = vec![message_start("msg_live", None, 25)];
+        events.push(content_block_start(
+            0,
+            json!({"type": "thinking", "thinking": ""}),
+        ));
+        for fragment in 1..=17 {
+            events.push(thinking_delta(0, &format!("thought fragment {fragment} ")));
+        }
+        events.push(content_block_stop(0));
+        events.push(text_block_start(1));
+        events.push(text_delta(1, "final answer"));
+        events.push(content_block_stop(1));
+        events.push(message_delta("end_turn", 30));
+
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: sse(&events),
+            gate: 0,
+        }]);
+        let adapter = Arc::new(
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
+        );
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let (gateway, model) = gateway_and_model(definition_with(
+            ModelReasoningSummary::ProviderDefault,
+            ModelServiceClass::Standard,
+            None,
+            provider,
+        ))
+        .await;
+
+        let result = gateway
+            .generate_model_turn(
+                request_for_model(model).await,
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let requests = server.join();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(result.response().finish_reason(), ModelFinishReason::Stop);
+        assert_eq!(result.response().content().len(), 2);
+        match &result.response().content()[0] {
+            FinalizedAssistantContent::Reasoning(reasoning) => {
+                let text = reasoning
+                    .text()
+                    .expect("visible unsigned thinking must carry its text");
+                assert!(text.starts_with("thought fragment 1 "));
+                assert!(text.contains("thought fragment 17 "));
+                assert_eq!(
+                    reasoning.signature(),
+                    None,
+                    "unsigned live-wire thinking must never gain a signature"
+                );
+            }
+            other => panic!("expected text-only reasoning, got {other:?}"),
+        }
+        match &result.response().content()[1] {
+            FinalizedAssistantContent::Text { text } => assert_eq!(&**text, "final answer"),
+            other => panic!("expected text, got {other:?}"),
         }
     }
 
