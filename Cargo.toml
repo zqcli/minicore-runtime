@@ -16,6 +16,9 @@ heavy-tests = []
 # phase ever uses ambient authority to capture a root `Dir`; Tool paths resolve strictly
 # capability-relative from a captured root and can never escape it.
 cap-std = { version = "=4.0.2", default-features = false }
+# The exact cap-primitives crate behind cap-std, pinned identically, for the typed
+# final-component no-follow option (`FollowSymlinks::No`) of the write target's create open.
+cap-primitives = { version = "=4.0.2", default-features = false }
 base64 = "0.22.1"
 getrandom = "0.3.3"
 regex-syntax = "=0.8.11"
