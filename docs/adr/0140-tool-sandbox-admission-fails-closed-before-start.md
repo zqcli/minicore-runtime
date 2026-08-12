@@ -3,6 +3,8 @@
 状态：Accepted
 日期：2026-08-11
 
+> 2026-08-12：首个production OS-backed `FilesystemRead` route已由[ADR 0143](0143-production-read-file-uses-workspace-capabilities.md)交付：`read_file`是closed、default-off、Workspace-bound builtin，经本ADR的admission门禁（exact `FilesystemRead` ceiling、available sandbox contract、frozen denial）进入Execute。本ADR的fail-closed admission、approval pairing与truthful settlement规则继续有效；其第8条列举的production ToolService、generic permission producer与public Tool DTO等仍pending。
+
 ## 背景
 
 第四轮评审的conditional V4-C0-1（第一轮O1、第二轮R7）要求：首个production OS/network/process Tool或Sandbox adapter出现前，MiniCore必须能判断adapter是否真正声明了所需capability class；无法强制时必须在任何side effect start前拒绝，approval和Sandbox故障都不能退化为裸执行。

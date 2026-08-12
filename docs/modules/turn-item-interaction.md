@@ -1,6 +1,6 @@
 # Turn、Item 与 Interaction 架构设计
 
-状态：当前权威架构（ADR 0142后；Tool/Interaction/Cancel与crate-private `ToolOperationSlot`完整生命周期、scripted approval/UserQuestion控制seam，以及closed/default-off production `ask_user` builtin均已实现；OS-backed production Tool/Sandbox adapters仍pending）
+状态：当前权威架构（ADR 0143后；Tool/Interaction/Cancel与crate-private `ToolOperationSlot`完整生命周期、scripted approval/UserQuestion控制seam、closed/default-off production `ask_user` builtin，以及首个narrow OS-backed production `read_file` builtin均已实现；其余write/network/process与其它file Tool/Sandbox adapters仍pending）
 日期：2026-07-31
 
 ## 目的
