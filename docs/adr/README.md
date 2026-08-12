@@ -22,6 +22,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0143](0143-production-read-file-uses-workspace-capabilities.md) | Production `read_file`是closed、default-off、Workspace-bound builtin：`MiniCoreRuntimeConfig::with_read_file_tool()` idempotent opt-in、ReadOnly Workspace authority ceiling（requested ReadWrite收紧为ReadOnly、Prompt/Skill source保持false）、per-admission WorkspaceSnapshot-bound materialization、cwd-relative `WorkspaceRelativePath` only、`FilesystemRead` exact sandbox、fixed result texts与65,536-byte单Text part bound、per-Session permanent revocation integrated with host invalidation |
 | [0144](0144-production-list-directory-uses-bounded-capability-enumeration.md) | Production `list_directory`是closed、default-off、Workspace-bound direct enumeration builtin：与`read_file`共享ReadOnly authority/revocation，empty path表示cwd，capability-relative directory open，不递归/不跟随entry symlink，256-entry/8,192-name-byte/65,536-JSON bounds与deterministic compact JSON |
 | [0145](0145-live-provider-evidence-refines-direct-adapter-wire-truth.md) | 真实OpenAI Responses/Anthropic Messages public Runtime release evidence细化direct adapter wire truth：固定产品User-Agent、unsigned Anthropic thinking truthful normalization/replay omission、message_start stop fields absent-or-null；live smoke仍默认ignored |
+| [0146](0146-production-write-file-binds-capability-targets-to-session-fifo.md) | Production `write_file`是closed、default-off、Workspace-bound mutation builtin：ReadWrite authority仍受requested access约束，existing/create target使用capability-opened physical identity，same-Session ticket按`call_index` FIFO，mutation permit由`ToolOperationSlot`持有through `Settling`，16,384-byte safe UTF-8 full replacement且不mkdir/append/atomic rename |
 
 ## Current With Later Refinements
 
@@ -39,12 +40,12 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0111](0111-session-ingress-separates-control-and-work-lanes.md) | ADR 0124、0126、0127 |
 | [0113](0113-user-question-uses-runtime-protocol-and-ui-presentation.md) | ADR 0124、0126、0127、0133、0142 |
 | [0114](0114-runtime-observation-uses-snapshot-first-streams.md) | ADR 0126、0127、0133 |
-| [0116](0116-file-mutations-use-session-local-queues.md) | ADR 0126 |
+| [0116](0116-file-mutations-use-session-local-queues.md) | ADR 0126、0146 |
 | [0117](0117-async-synchronization-uses-single-owner-and-typed-permits.md) | ADR 0124、0125、0126、0127、0136、0137 |
 | [0118](0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md) | ADR 0124、0126、0127、0133 |
 | [0119](0119-model-calls-use-session-logical-retries.md) | ADR 0126、0139、0141 |
 | [0120](0120-failures-stay-with-owning-modules.md) | ADR 0126 |
-| [0121](0121-workspace-updates-require-idle.md) | ADR 0124、0126、0127、0140、0143、0144 |
+| [0121](0121-workspace-updates-require-idle.md) | ADR 0124、0126、0127、0140、0143、0144、0146 |
 | [0123](0123-identity-uses-refs-and-explicit-reload.md) | ADR 0124、0126、0127、0129、0132、0141 |
 | [0124](0124-session-replay-is-tolerant-and-links-are-minimal.md) | ADR 0126、0127、0131、0132、0134、0136、0137 |
 | [0125](0125-model-gateway-has-no-local-call-permits.md) | ADR 0141 |
