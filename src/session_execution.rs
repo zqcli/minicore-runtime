@@ -73,11 +73,12 @@ use crate::session_ingress::{
 #[cfg(test)]
 use crate::tools::UserQuestionAnswerBinding;
 use crate::tools::{
-    ApprovalSettlement, ToolAbandonReason, ToolApprovalDecision, ToolApprovalRequest, ToolCall,
-    ToolCancellationHandle, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionPlan,
-    ToolExecutionRequest, ToolExecutionResult, ToolExecutionRun, ToolExecutionStart, ToolSet,
-    ToolStartError, ToolStartGate, ToolStartedExecution, TurnToolResources, UserQuestionAnswer,
-    UserQuestionRequest,
+    ApprovalSettlement, PreparedToolExecution, SessionFileMutationPermit, SessionFileMutationQueue,
+    SessionFileMutationTicket, ToolAbandonReason, ToolApprovalDecision, ToolApprovalRequest,
+    ToolCall, ToolCancellationHandle, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionPlan,
+    ToolExecutionPreparation, ToolExecutionRequest, ToolExecutionResult, ToolExecutionRun,
+    ToolExecutionStart, ToolSet, ToolStartError, ToolStartGate, ToolStartedExecution,
+    TurnToolResources, UserQuestionAnswer, UserQuestionRequest,
 };
 use crate::turn_execution_context::{
     TurnContextCapture, TurnContextCaptureError, TurnExecutionContext,
@@ -1993,6 +1994,7 @@ impl SessionExecutor {
             failure_state: Arc::clone(&failure_state),
             conversation: conversation.clone(),
             turn_resources,
+            file_mutation_queue: SessionFileMutationQueue::new(),
             active_admission: None,
             active_turn: None,
             pending_interactions: BTreeMap::new(),
@@ -3000,6 +3002,12 @@ struct SessionExecutorActor {
     failure_state: Arc<ActorFailureState>,
     conversation: Option<Arc<LoadedSessionConversation>>,
     turn_resources: Option<TurnResources>,
+    /// The single Session-local file mutation queue this loaded executor owns: created
+    /// exactly once at start, kept until the actor drops, and cloned into every
+    /// `AdmissionWork` so each admission's production ToolSet captures the same queue.
+    /// No Agent/Session/Turn public DTO, Turn context, Workspace, or Runtime-global owner
+    /// ever holds it.
+    file_mutation_queue: Arc<SessionFileMutationQueue>,
     active_admission: Option<ActiveAdmission>,
     active_turn: Option<ActiveTurn>,
     pending_interactions: BTreeMap<RequestId, ActiveInteraction>,
@@ -4179,6 +4187,10 @@ impl SessionExecutorActor {
         let prompt_service = Arc::clone(&self.prompt_service);
         let closing = self.closing.clone();
         let turn_admission_gate = Arc::clone(&self.turn_admission_gate);
+        // The exact Session-local mutation queue is cloned into every admission: one loaded
+        // executor owns one queue, and every Turn of that Session reserves against the same
+        // queue instance (never shared across Sessions).
+        let file_mutation_queue = Arc::clone(&self.file_mutation_queue);
         #[cfg(test)]
         let hooks = Arc::clone(&self.hooks);
         let guard = AdmissionCompletionGuard::new(completion_sender, turn_id);
@@ -4192,6 +4204,7 @@ impl SessionExecutorActor {
                 workspace,
                 prompt_service,
                 resources,
+                file_mutation_queue,
                 conversation,
                 turn_admission_gate,
                 cancellation,
@@ -7879,6 +7892,10 @@ struct AdmissionWork {
     workspace: Arc<WorkspaceSnapshot>,
     prompt_service: Arc<PromptService>,
     resources: TurnResources,
+    /// The exact Session-local mutation queue of the loaded executor: the same `Arc` every
+    /// admission of this Session carries, so a production ToolSet captures the same queue
+    /// per admission while Captured test ToolSets stay unchanged.
+    file_mutation_queue: Arc<SessionFileMutationQueue>,
     conversation: Arc<LoadedSessionConversation>,
     turn_admission_gate: Arc<TurnAdmissionGate>,
     turn_id: TurnId,
@@ -7900,6 +7917,7 @@ async fn run_admission(
         workspace,
         prompt_service,
         resources,
+        file_mutation_queue,
         conversation,
         turn_admission_gate,
         turn_id,
@@ -7931,11 +7949,15 @@ async fn run_admission(
     // snapshot is captured and before the Turn context capture: a captured test-injected
     // set is consumed unchanged, while the frozen production config installs its ToolSet
     // against this exact snapshot's tool context (no task-time filesystem discovery or raw
-    // spawn).  An active Turn keeps this captured set; a later Workspace reload or
-    // definition update only affects future admissions.
-    let tool_set = resources
-        .tools
-        .materialize(workspace.tool_context(), task_context.clone());
+    // spawn).  The exact Session-local mutation queue travels with the admission so a
+    // production ToolSet captures the same queue per admission.  An active Turn keeps this
+    // captured set; a later Workspace reload or definition update only affects future
+    // admissions.
+    let tool_set = resources.tools.materialize(
+        workspace.tool_context(),
+        task_context.clone(),
+        file_mutation_queue,
+    );
     let context = TurnExecutionContext::capture(TurnContextCapture {
         turn_id,
         session: definition,
@@ -8023,8 +8045,16 @@ async fn run_admission(
 /// executor result (its own pair is cancelled first, and the Settling slot keeps awaiting
 /// the same run future to the executor's cooperative cleanup/result — a started future is
 /// never dropped because of a signal), while a natural completion binds its result and only
-/// then passes through a brief Settling state.  The future mutation permit step still comes
-/// later and is not part of this slot.
+/// then passes through a brief Settling state.
+///
+/// A started file mutation additionally owns `Option<SessionFileMutationPermit>` on its
+/// `Running` and `Settling` variants: the permit is granted only after the prepared
+/// operation's queue ticket becomes its turn and is held across the whole started run and
+/// outcome-capture window.  Every already-started path — natural result, signal cleanup,
+/// executor panic, and the start-factory panic/foreign-proof invariant after the typed
+/// started proof — passes through Settling while holding the permit, and the permit is
+/// released only during Settling → Terminal, after the exact outcome is bound.  Ordinary
+/// operations carry `None` and preserve their exact transitions.
 enum ToolOperationSlot {
     Prepared {
         request: ToolExecutionRequest,
@@ -8046,9 +8076,17 @@ enum ToolOperationSlot {
         // caught inside the wrapper's poll boundary and maps to this exact request's
         // identity-bound Abandoned outcome while the slot parts remain owned.
         run: OwnedToolExecutionRun,
+        // The started mutation's Session queue permit, if any: owned by the slot from the
+        // grant through the whole outcome-capture window and released only at Settling →
+        // Terminal.  Ordinary operations carry `None`.
+        permit: Option<SessionFileMutationPermit>,
     },
     Settling {
         request: ToolExecutionRequest,
+        // The started mutation's Session queue permit, if any: moved in from Running and
+        // held through the signal-path cleanup/result await; released only as this variant
+        // is consumed into Terminal, after the exact outcome is bound.
+        permit: Option<SessionFileMutationPermit>,
     },
     Terminal {
         outcome: ToolExecutionOutcome,
@@ -8115,11 +8153,32 @@ impl ToolOperationSlot {
         match self {
             Self::Prepared { request, .. }
             | Self::Running { request, .. }
-            | Self::Settling { request } => request,
+            | Self::Settling { request, .. } => request,
             Self::Terminal { .. } => {
                 unreachable!("a Terminal slot carries no request")
             }
         }
+    }
+
+    /// The slot's own exact emergency handle, read only by the round owner's mutation
+    /// preparation phase while the slot is still Prepared.
+    fn emergency_control(&self) -> &EmergencyControlHandle {
+        let Self::Prepared {
+            emergency_control, ..
+        } = self
+        else {
+            panic!("the emergency handle exists only on a Prepared slot");
+        };
+        emergency_control
+    }
+
+    /// The slot's own exact emergency observation, read only by the round owner's mutation
+    /// preparation phase while the slot is still Prepared.
+    fn observation(&self) -> &EmergencyControlObservation {
+        let Self::Prepared { observation, .. } = self else {
+            panic!("the observation exists only on a Prepared slot");
+        };
+        observation
     }
 
     /// Test-only accessor: lets a direct round test assert that a PreExecution or panicked
@@ -8287,6 +8346,29 @@ impl ToolOperationSlot {
                 .reserve_then_run(start, tool_set)
                 .await
             }
+            // A prepared file mutation: the round owner already invoked the preparation
+            // factory, awaited its full settlement, and synchronously reserved this exact
+            // request's queue ticket in call_index order.  The slot waits for its ticket
+            // against the exact emergency basis, then reserves/starts the gate and carries
+            // the queue permit through Running/Settling, releasing it only at Settling →
+            // Terminal.
+            ToolExecutionPlan::PreparedFileMutation { ticket, start } => {
+                Self::Prepared {
+                    request,
+                    emergency_control,
+                    observation,
+                    gate,
+                }
+                .reserve_ticket_then_run(ticket, start, tool_set)
+                .await
+            }
+            // The round owner always transforms every FileMutation plan in its preparation
+            // phase (into a PreparedFileMutation, a truthful PreExecution result, or a
+            // frozen fail-closed outcome) before any operation is driven, so no drive can
+            // ever see an unprepared mutation plan.
+            ToolExecutionPlan::FileMutation { .. } => {
+                unreachable!("the round prepares every file-mutation plan before driving")
+            }
             ToolExecutionPlan::PreExecution(result) => {
                 // A frozen known-tool preflight result never reserves the gate and never
                 // invokes the start factory.  The exact unstarted settlement is reserved
@@ -8428,6 +8510,7 @@ impl ToolOperationSlot {
     /// Reserves the exact request's single start entry through the emergency owner mutex
     /// (first-wins with `signal` on one mutex), starts the permit outside that mutex, and
     /// moves the slot into Running with its own cancellation pair and its own basis.
+    /// Ordinary operations carry no queue permit.
     async fn reserve_then_run(self, start: ToolExecutionStart, tool_set: Arc<ToolSet>) -> Self {
         let proof = match self.reserve_start() {
             Ok(proof) => proof,
@@ -8442,7 +8525,79 @@ impl ToolOperationSlot {
                 return Self::into_terminal(abandoned_runtime_failure(self.request()));
             }
         };
-        self.into_running(proof, start, tool_set).await
+        self.into_running(proof, start, tool_set, None).await
+    }
+
+    /// The prepared file-mutation started path: waits for the reserved queue ticket against
+    /// the exact emergency basis, then reserves/starts the existing gate and moves the slot
+    /// into Running holding the queue permit.
+    ///
+    /// While the ticket waits, the exact emergency cancellation (or a stale/foreign basis,
+    /// which `cancelled` reports immediately) wins by dropping/removing the ticket — its
+    /// Drop leaves the queue and wakes the next same-key waiter — and the slot settles the
+    /// matching PreExecution Cancelled outcome without any start.  A foreign exact request
+    /// inside the queue fails closed there (the ticket is already removed and the next
+    /// waiter woken) and this exact slot fails closed to identity-bound Abandoned
+    /// RuntimeFailure.  Once the ticket becomes the permit, the gate is reserved/started
+    /// first-wins: a signal that wins between permit and start leaves the unused permit to
+    /// drop (releasing the active holder and waking the next same-key waiter) with no
+    /// executor ever started.
+    async fn reserve_ticket_then_run(
+        self,
+        ticket: SessionFileMutationTicket,
+        start: ToolExecutionStart,
+        tool_set: Arc<ToolSet>,
+    ) -> Self {
+        let Self::Prepared {
+            request,
+            emergency_control,
+            observation,
+            gate,
+        } = self
+        else {
+            unreachable!("reserve_ticket_then_run consumes a Prepared slot");
+        };
+        let permit = match tokio::select! {
+            biased;
+            _ = emergency_control.cancelled(&observation) => {
+                // The signal already won (or the basis is stale/foreign): the ticket is
+                // dropped here, removing it from the queue and waking the next same-key
+                // waiter; the slot settles the matching PreExecution Cancelled outcome.
+                return Self::into_terminal(ToolSet::cancelled_before_start_outcome(&request));
+            }
+            result = ticket.wait(request.clone()) => result,
+        } {
+            Ok(permit) => permit,
+            // The queue already failed the foreign exact request closed and removed its
+            // ticket; this exact slot fails closed to the identity-bound Abandoned outcome.
+            Err(_) => return Self::into_terminal(abandoned_runtime_failure(&request)),
+        };
+        // With the permit in hand, the gate reservation runs first-wins against the signal
+        // under the emergency owner mutex.  On any loss the unused permit drops here,
+        // releasing the active holder and waking the next same-key waiter; no executor
+        // ever starts.
+        let proof = match emergency_control.reserve_tool_start(&observation, &gate, &request) {
+            Some(Ok(start_permit)) => match start_permit.start() {
+                Ok(proof) => proof,
+                Err(_) => {
+                    return Self::into_terminal(abandoned_runtime_failure(&request));
+                }
+            },
+            Some(Err(ToolStartError::CancelledBeforeStart)) | None => {
+                return Self::into_terminal(ToolSet::cancelled_before_start_outcome(&request));
+            }
+            Some(Err(ToolStartError::InvalidBinding)) => {
+                return Self::into_terminal(abandoned_runtime_failure(&request));
+            }
+        };
+        Self::Prepared {
+            request,
+            emergency_control,
+            observation,
+            gate,
+        }
+        .into_running(proof, start, tool_set, Some(permit))
+        .await
     }
 
     /// The first-wins reservation: `reserve_tool_start` runs the gate's Prepared→Reserved
@@ -8475,15 +8630,18 @@ impl ToolOperationSlot {
     /// `run_started_execution` after it revalidates the exact proof capture, and a factory
     /// panic fails closed there to the identity-bound Abandoned outcome while the consumed
     /// Prepared parts/request remain owned: a foreign proof fails closed the same way
-    /// without constructing the factory or any future, and that failure is already a
-    /// Terminal outcome.  The run future stays owned by the Running slot (inside its
-    /// session-local wrapper), so a started future can never be dropped because of a
-    /// signal.
+    /// without constructing the factory or any future.  The queue permit (if any) moves
+    /// with the slot: even a factory panic or foreign-proof invariant after the typed
+    /// started proof passes through Settling while holding the permit, which is released
+    /// only at Settling → Terminal after the exact outcome is bound.  The run future stays
+    /// owned by the Running slot (inside its session-local wrapper), so a started future
+    /// can never be dropped because of a signal.
     async fn into_running(
         self,
         proof: ToolStartedExecution,
         start: ToolExecutionStart,
         tool_set: Arc<ToolSet>,
+        permit: Option<SessionFileMutationPermit>,
     ) -> Self {
         let Self::Prepared {
             request,
@@ -8498,9 +8656,14 @@ impl ToolOperationSlot {
         let run = match tool_set.run_started_execution(&request, proof, start, observer) {
             Ok(run) => run,
             // The factory exact-capture revalidation failed (or the start factory
-            // panicked): the slot goes straight to Terminal with the identity-bound
-            // Abandoned outcome.
-            Err(outcome) => return Self::into_terminal(outcome),
+            // panicked) after the typed started proof: the slot still passes through
+            // Settling while holding the queue permit (released only at Settling →
+            // Terminal), so a same-key sibling never acquires while this exact outcome is
+            // unsettled.  Ordinary operations carry `None` and keep their exact
+            // transitions.
+            Err(outcome) => {
+                return Self::Settling { request, permit }.settle(outcome);
+            }
         };
         let run_request = request.clone();
         Self::Running {
@@ -8512,6 +8675,7 @@ impl ToolOperationSlot {
                 request: run_request,
                 run,
             },
+            permit,
         }
         .await_started_run()
         .await
@@ -8527,7 +8691,9 @@ impl ToolOperationSlot {
     /// dropped because of a signal.  A natural completion binds its result and only then
     /// passes through a brief Settling state.  Either way Settling then moves to Terminal;
     /// an executor panic is caught inside the wrapper and maps to this exact request's
-    /// identity-bound Abandoned outcome.
+    /// identity-bound Abandoned outcome.  The queue permit (if any) moves from Running into
+    /// Settling on every started path and is released only at Settling → Terminal; an
+    /// ordinary operation carries `None` and preserves its exact transitions.
     async fn await_started_run(self) -> Self {
         let Self::Running {
             request,
@@ -8535,6 +8701,7 @@ impl ToolOperationSlot {
             observation,
             cancellation,
             run,
+            permit,
         } = self
         else {
             unreachable!("await_started_run consumes a Running slot");
@@ -8551,21 +8718,41 @@ impl ToolOperationSlot {
         match outcome {
             // Natural completion: the run wrapper produced its identity-bound outcome; the
             // slot still passes through a brief Settling state before Terminal.
-            Some(Ok(outcome)) => Self::Settling { request }.settle(outcome),
+            Some(Ok(outcome)) => Self::Settling { request, permit }.settle(outcome),
             // The executor panicked: the wrapper reported the still-owned exact request,
-            // and the same slot maps it to the identity-bound Abandoned outcome.
-            Some(Err(request)) => Self::into_terminal(abandoned_runtime_failure(&request)),
+            // and the same slot maps it to the identity-bound Abandoned outcome.  A started
+            // mutation still passes through Settling while holding its permit (released at
+            // Settling → Terminal); an ordinary operation keeps its existing direct
+            // Terminal transition.
+            Some(Err(request)) => {
+                if permit.is_some() {
+                    let outcome = abandoned_runtime_failure(&request);
+                    Self::Settling { request, permit }.settle(outcome)
+                } else {
+                    Self::into_terminal(abandoned_runtime_failure(&request))
+                }
+            }
             // The signal (or a stale basis) won: the operation's own pair is already
             // cancelled, and the Settling slot keeps awaiting the same run wrapper to the
             // executor's cooperative cleanup/result before the outcome is bound.
-            None => Self::Settling { request }.await_settled_run(run).await,
+            None => {
+                Self::Settling { request, permit }
+                    .await_settled_run(run)
+                    .await
+            }
         }
     }
 
     /// Natural-completion settlement: the outcome is already bound, so the brief Settling
-    /// state only moves the slot to Terminal.
+    /// state only moves the slot to Terminal.  The queue permit (if any) is released only
+    /// now, as the Settling variant is consumed into Terminal after the exact outcome is
+    /// bound.
     fn settle(self, outcome: ToolExecutionOutcome) -> Self {
-        let Self::Settling { request: _ } = self else {
+        let Self::Settling {
+            request: _,
+            permit: _,
+        } = self
+        else {
             unreachable!("settle consumes a Settling slot");
         };
         Self::into_terminal(outcome)
@@ -8574,15 +8761,26 @@ impl ToolOperationSlot {
     /// Signal-path settlement: the run wrapper is still alive, so the Settling slot keeps
     /// awaiting the same wrapper to the executor's cooperative cleanup/result (an executor
     /// panic maps through the wrapper's still-owned exact request) and only then binds the
-    /// outcome and moves to Terminal.
+    /// outcome and moves to Terminal.  The queue permit (if any) stays owned by the
+    /// Settling slot through the whole cleanup/result await — a same-key sibling cannot
+    /// acquire until this exact outcome settles — and is released only when the variant is
+    /// consumed into Terminal, after the outcome is bound.
     async fn await_settled_run(self, mut run: OwnedToolExecutionRun) -> Self {
-        let Self::Settling { request: _ } = self else {
+        // Await the run wrapper first: the permit must not be released while the exact
+        // outcome is still unsettled, so the Settling slot is destructured only after the
+        // outcome is bound.
+        let outcome = match run.await_bound().await {
+            Ok(outcome) => outcome,
+            Err(request) => abandoned_runtime_failure(&request),
+        };
+        let Self::Settling {
+            request: _,
+            permit: _,
+        } = self
+        else {
             unreachable!("await_settled_run consumes a Settling slot");
         };
-        match run.await_bound().await {
-            Ok(outcome) => Self::into_terminal(outcome),
-            Err(request) => Self::into_terminal(abandoned_runtime_failure(&request)),
-        }
+        Self::into_terminal(outcome)
     }
 }
 
@@ -8804,11 +9002,16 @@ impl PlannedToolRound {
     /// Executes the remaining (non-question) operations and returns their outcomes with
     /// their call_index, in call_index order.
     ///
-    /// Any Serial definition makes the whole remaining phase serial, otherwise all remaining
-    /// operations run through one parent-owned `join_all` (no detached tasks).  Approvals
-    /// are part of this ordinary phase (they are never hoisted).  Each operation's consuming
-    /// `drive` isolates its binding/factory/executor panics closed to Abandoned
-    /// RuntimeFailure, so a panicked Serial operation never stops the later ones.
+    /// The file-mutation preparation phase runs strictly after every UserQuestion settled
+    /// and before any ordinary operation is driven: remaining operations are iterated in
+    /// call_index order and each mutation plan settles its preparation and reserves its
+    /// exact Session queue ticket synchronously, so no future-poll ordering determines
+    /// ticket order.  Any Serial definition then makes the whole remaining phase serial,
+    /// otherwise all remaining operations run through one parent-owned `join_all` (no
+    /// detached tasks).  Approvals are part of this ordinary phase (they are never
+    /// hoisted).  Each operation's consuming `drive` isolates its
+    /// binding/factory/executor panics closed to Abandoned RuntimeFailure, so a panicked
+    /// Serial operation never stops the later ones.
     async fn execute_remaining(self) -> Vec<(u32, ToolExecutionOutcome)> {
         let PlannedToolRound {
             tool_set,
@@ -8819,6 +9022,7 @@ impl PlannedToolRound {
             #[cfg(test)]
             hooks,
         } = self;
+        let remaining = prepare_file_mutations(remaining).await;
         if is_serial {
             let mut results = Vec::with_capacity(remaining.len());
             for operation in remaining {
@@ -8877,6 +9081,120 @@ impl PlannedToolRound {
         );
         outcomes.sort_by_key(|(call_index, _)| *call_index);
         outcomes
+    }
+}
+
+/// The round owner's file-mutation preparation phase, run strictly after every UserQuestion
+/// settled and before any ordinary operation is driven.
+///
+/// Remaining operations are iterated in call_index order (the round planned them sorted,
+/// so this order never depends on the caller's input order or on future polling).  For each
+/// file-mutation plan the phase first checks the exact emergency basis: a basis that
+/// already won (or a stale/foreign observation) settles the matching cancelled-before-start
+/// outcome without ever invoking the preparation factory.  Otherwise the move-only
+/// preparation factory is invoked exactly once and its future is awaited to full
+/// settlement — never dropped because of a signal that arrives meanwhile — and only after
+/// that settlement the exact slot basis is re-checked at the post-settlement boundary: a
+/// ready result reserves its exact Session queue ticket synchronously (in call_index
+/// order) and keeps the ready start factory only while the basis is still unsignaled and
+/// current, while a signal that won during the await keeps the operation unstarted-
+/// cancelled with no ticket reservation and no start (the ready key/start are dropped and
+/// the matching cancelled-before-start outcome is frozen).  A truthful unstarted result
+/// stays under the existing unstarted first-wins; a panicking factory/future maps to the
+/// exact slot's identity-bound Abandoned RuntimeFailure.  Every other action passes
+/// through unchanged.
+async fn prepare_file_mutations(remaining: Vec<PlannedToolOperation>) -> Vec<PlannedToolOperation> {
+    let mut prepared = Vec::with_capacity(remaining.len());
+    for operation in remaining {
+        let PlannedToolOperation {
+            slot,
+            action,
+            call_index,
+        } = operation;
+        let action = match action {
+            PlannedToolAction::Plan(ToolExecutionPlan::FileMutation { prepare, queue, .. }) => {
+                let request = slot.request().clone();
+                // The exact emergency basis gate: only invoke the preparation while the
+                // slot's own basis is still current and unsignaled.  An already-won signal
+                // or a stale/foreign observation settles the matching cancelled-before-start
+                // outcome instead, with no preparation job ever constructed.
+                if !slot
+                    .emergency_control()
+                    .is_unsignaled_current(slot.observation())
+                {
+                    PlannedToolAction::Frozen(ToolSet::cancelled_before_start_outcome(&request))
+                } else {
+                    match await_mutation_preparation(prepare).await {
+                        Ok(PreparedToolExecution::Ready { key, start }) => {
+                            // The post-settlement recheck: the scheduled preparation was
+                            // awaited to settlement even when a signal arrived meanwhile,
+                            // and only now is the exact slot basis consulted again.  A
+                            // basis that is no longer unsignaled/current keeps this
+                            // operation unstarted-cancelled: the ready key/start are
+                            // dropped with no queue reservation ever made, and the
+                            // matching cancelled-before-start outcome is frozen for the
+                            // same exact unstarted settlement first-wins at consumption.
+                            if !slot
+                                .emergency_control()
+                                .is_unsignaled_current(slot.observation())
+                            {
+                                PlannedToolAction::Frozen(ToolSet::cancelled_before_start_outcome(
+                                    &request,
+                                ))
+                            } else {
+                                // The synchronous FIFO reservation happens here, in
+                                // call_index order, before any remaining operation is
+                                // driven: no future-poll ordering can determine ticket
+                                // order.
+                                let ticket = queue.reserve(key, &request);
+                                PlannedToolAction::Plan(ToolExecutionPlan::PreparedFileMutation {
+                                    ticket,
+                                    start,
+                                })
+                            }
+                        }
+                        Ok(PreparedToolExecution::Unstarted(result)) => {
+                            // A truthful unstarted preparation result stays under the
+                            // existing unstarted first-wins at consumption (a signal that
+                            // already won settles the matching cancelled-before-start
+                            // outcome instead); no ticket was ever reserved.
+                            PlannedToolAction::Plan(ToolExecutionPlan::PreExecution(result))
+                        }
+                        Err(()) => PlannedToolAction::Frozen(abandoned_runtime_failure(&request)),
+                    }
+                }
+            }
+            other => other,
+        };
+        prepared.push(PlannedToolOperation {
+            slot,
+            action,
+            call_index,
+        });
+    }
+    prepared
+}
+
+/// The owner-side preparation boundary for one exact file mutation: invokes the move-only
+/// preparation factory exactly once and awaits its future to full settlement.
+///
+/// The factory call and every future poll are isolated with `catch_unwind` (polling only
+/// the future, never any round state), so a panicking preparation resolves exactly this
+/// request closed to identity-bound Abandoned RuntimeFailure and never unwinds the round:
+/// later Serial operations still settle and Parallel drives stay parent-owned.  The future
+/// is awaited to completion even when the emergency basis is signaled meanwhile: a
+/// scheduled preparation is never dropped because of a signal, and the caller re-checks
+/// the exact slot basis at the post-settlement boundary before any ticket is reserved.
+async fn await_mutation_preparation(
+    prepare: ToolExecutionPreparation,
+) -> Result<PreparedToolExecution, ()> {
+    let future = match std::panic::catch_unwind(AssertUnwindSafe(|| prepare.prepare())) {
+        Ok(future) => future,
+        Err(_) => return Err(()),
+    };
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(settled) => Ok(settled),
+        Err(_) => Err(()),
     }
 }
 
@@ -12299,6 +12617,7 @@ impl SettlementNotification {
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
     use std::fs;
     use std::future::{Future, poll_fn};
     use std::num::{NonZeroU8, NonZeroU32};
@@ -12315,11 +12634,15 @@ mod tests {
     use crate::model_gateway::{ModelSelection, ReasoningPreference, ScriptedModelFixture};
     use crate::prompt::{PromptBodyIntent, TextIntent};
     use crate::runtime_task::RuntimeTaskContext;
-    use crate::tools::{ToolExecutionFuture, ToolOutcomeSource};
+    use crate::tools::{
+        PreparedToolExecution, SessionFileMutationQueue, ToolCapabilityClass, ToolExecutionFuture,
+        ToolExecutionPreparation, ToolOutcomeSource, ToolPermissionSet, ToolSandboxContract,
+    };
     use crate::wire::{CanonicalFileUri, FileUriFamily, SessionId};
     use crate::workspace::{
-        RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput, WorkspacePathTarget,
-        WorkspaceRootInput, WorkspaceRootKey, WorkspaceSourcePolicy, lower_workspace,
+        RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput,
+        WorkspaceFileMutationKey, WorkspacePathTarget, WorkspaceRootInput, WorkspaceRootKey,
+        WorkspaceSourcePolicy, lower_workspace,
     };
 
     const AGENT_ID: &str = "agt_11111111111111111111111111111111";
@@ -18575,6 +18898,1193 @@ mod tests {
             executed_gate.reserve(&requests[1]),
             Err(ToolStartError::InvalidBinding)
         ));
+    }
+
+    // ---------- Session-local file mutation queue round tests ----------
+
+    /// A countable Notify-based event probe for the mutation round tests: records ordered
+    /// events and wakes waiters on every change (no sleep/yield polling anywhere).
+    #[derive(Default)]
+    struct RoundProbe {
+        events: Mutex<Vec<String>>,
+        changed: tokio::sync::Notify,
+    }
+
+    impl RoundProbe {
+        fn record(&self, event: impl Into<String>) {
+            self.events.lock().unwrap().push(event.into());
+            self.changed.notify_waiters();
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+
+        async fn wait_until(&self, predicate: impl Fn(&[String]) -> bool) {
+            loop {
+                let notified = self.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if predicate(&self.events.lock().unwrap()) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn position(&self, event: &str) -> usize {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .position(|recorded| recorded == event)
+                .unwrap_or_else(|| panic!("the probe never recorded {event:?}"))
+        }
+    }
+
+    struct MutationRoundTemp(PathBuf);
+
+    impl MutationRoundTemp {
+        fn new(label: &str) -> Self {
+            loop {
+                let number = NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "minicore-session-executor-mutation-{label}-{}-{number}",
+                    std::process::id()
+                ));
+                if path.exists() {
+                    continue;
+                }
+                fs::create_dir(&path).expect("the mutation round root is created");
+                fs::write(path.join("target.txt"), b"body").expect("the target fixture is written");
+                fs::write(path.join("other.txt"), b"body").expect("the other fixture is written");
+                return Self(path);
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for MutationRoundTemp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// One real temp-dir ReadWrite workspace lowered through the write-access resolver,
+    /// exposing two distinct prepared mutation keys for the round tests.
+    struct MutationRoundFixture {
+        _temporary: MutationRoundTemp,
+        task_context: RuntimeTaskContext,
+        target: WorkspaceFileMutationKey,
+        other: WorkspaceFileMutationKey,
+    }
+
+    async fn mutation_round_fixture() -> MutationRoundFixture {
+        let temporary = MutationRoundTemp::new("round");
+        let task_context = RuntimeTaskContext::new(Handle::current())
+            .await
+            .expect("the test runtime provides tracked task admission");
+        let (resolver, _control) = WorkspaceResolver::new_with_write_access(task_context.clone());
+        let workspace = lower_workspace(
+            WorkspaceDefinitionInput::new(
+                WorkspaceRootInput::new(
+                    "repo".parse().unwrap(),
+                    workspace_uri(temporary.path()),
+                    RequestedFilesystemAccess::ReadWrite,
+                    WorkspaceSourcePolicy::new(false, false),
+                ),
+                Vec::new(),
+                WorkspaceCwdSpec::new("repo".parse().unwrap(), "".parse().unwrap()),
+            )
+            .unwrap(),
+            WorkspaceRevision::new(std::num::NonZeroU64::new(1).unwrap()),
+            WorkspacePathTarget::current(),
+        )
+        .unwrap();
+        let candidate = resolver
+            .resolve(SESSION_ID.parse().unwrap(), &workspace)
+            .await
+            .expect("the mutation round workspace resolves");
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .expect("the mutation round snapshot finishes");
+        let tool_context = snapshot.tool_context();
+        let access = tool_context.access();
+        let prepared = |name: &str| {
+            access
+                .authorize_write(&name.parse().unwrap())
+                .expect("the fixture target authorizes")
+                .prepare()
+                .expect("the fixture target prepares")
+        };
+        let target = prepared("target.txt").key();
+        let other = prepared("other.txt").key();
+        assert_ne!(
+            target, other,
+            "the two fixture files are distinct mutation keys"
+        );
+        MutationRoundFixture {
+            _temporary: temporary,
+            task_context,
+            target,
+            other,
+        }
+    }
+
+    fn mutation_round_request(suffix: u8, call: &str, call_index: u32) -> ToolExecutionRequest {
+        ToolExecutionRequest::new(
+            format!("itm_000000000000000000000000000000{suffix:02x}")
+                .parse()
+                .unwrap(),
+            ToolCall::new(
+                call.parse().unwrap(),
+                "write_file".parse().unwrap(),
+                "{}".parse().unwrap(),
+                call_index,
+            ),
+        )
+    }
+
+    /// One scripted Ready preparation: records `prepare:{tag}` on invocation and settles
+    /// the ready key + a start factory that records `start:{tag}` before awaiting the
+    /// per-call release Notify and recording `done:{tag}`.
+    fn ready_preparation(
+        probe: &Arc<RoundProbe>,
+        key: WorkspaceFileMutationKey,
+        release: Arc<tokio::sync::Notify>,
+        tag: &'static str,
+    ) -> ToolExecutionPreparation {
+        let probe = Arc::clone(probe);
+        let prepare_tag = format!("prepare:{tag}");
+        let start_tag = format!("start:{tag}");
+        let done_tag = format!("done:{tag}");
+        ToolExecutionPreparation::new(move || {
+            let probe = Arc::clone(&probe);
+            let release = Arc::clone(&release);
+            let key = key.clone();
+            let prepare_tag = prepare_tag.clone();
+            let start_tag = start_tag.clone();
+            let done_tag = done_tag.clone();
+            Box::pin(async move {
+                probe.record(prepare_tag);
+                PreparedToolExecution::Ready {
+                    key,
+                    start: ToolExecutionStart::new(move |_observer| {
+                        let probe = Arc::clone(&probe);
+                        let release = Arc::clone(&release);
+                        let start_tag = start_tag.clone();
+                        let done_tag = done_tag.clone();
+                        Box::pin(async move {
+                            probe.record(start_tag);
+                            release.notified().await;
+                            probe.record(done_tag);
+                            ToolExecutionResult::completed_text("done").unwrap()
+                        })
+                    }),
+                }
+            })
+        })
+    }
+
+    /// Builds one Parallel `write_file` ToolSet with the `FilesystemWrite` outer sandbox
+    /// contract whose planner routes every call to a scripted file-mutation plan with the
+    /// given per-call preparation.
+    fn mutation_round_tool_set(
+        queue: &Arc<SessionFileMutationQueue>,
+        prepare: impl Fn(ToolExecutionRequest) -> ToolExecutionPreparation + Send + Sync + 'static,
+    ) -> Arc<ToolSet> {
+        let queue_plan = Arc::clone(queue);
+        ToolSet::with_sandbox_contract(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "write_file".parse().unwrap(),
+                    "Write one file",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            ToolSandboxContract::available([ToolCapabilityClass::FilesystemWrite]),
+            move |request| {
+                ToolExecutionPlan::file_mutation(
+                    ToolPermissionSet::new([ToolCapabilityClass::FilesystemWrite]),
+                    prepare(request.clone()),
+                    Arc::clone(&queue_plan),
+                )
+            },
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_round_prepares_and_reserves_in_call_index_order_regardless_of_input_order() {
+        let fixture = mutation_round_fixture().await;
+        let queue = SessionFileMutationQueue::new();
+        let probe = Arc::new(RoundProbe::default());
+        let releases: HashMap<u32, Arc<tokio::sync::Notify>> = [
+            (1, Arc::new(tokio::sync::Notify::new())),
+            (3, Arc::new(tokio::sync::Notify::new())),
+        ]
+        .into_iter()
+        .collect();
+        let target_key = fixture.target.clone();
+        let probe_plan = Arc::clone(&probe);
+        let releases_plan = releases.clone();
+        let tool_set = mutation_round_tool_set(&queue, move |request| {
+            let call_index = request.call().call_index();
+            let tag = if call_index == 1 { "one" } else { "three" };
+            ready_preparation(
+                &probe_plan,
+                target_key.clone(),
+                Arc::clone(
+                    releases_plan
+                        .get(&call_index)
+                        .expect("the call has a release"),
+                ),
+                tag,
+            )
+        });
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        // Input order is deliberately shuffled (call_index 3 first, then 1): the round
+        // plans in call_index order, so preparation and reservation follow call_index.
+        let requests = [
+            mutation_round_request(0x81, "call_three", 3),
+            mutation_round_request(0x82, "call_one", 1),
+        ];
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
+            .collect::<Vec<_>>();
+        let (interaction_completion_sender, _) = mpsc::unbounded_channel();
+        let round = tokio::spawn(execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        ));
+        // Both preparations settle in call_index order regardless of the shuffled input.
+        probe
+            .wait_until(|events| {
+                events
+                    .iter()
+                    .filter(|event| event.starts_with("prepare:"))
+                    .count()
+                    == 2
+            })
+            .await;
+        let events = probe.events();
+        let prepares = events
+            .iter()
+            .filter(|event| event.starts_with("prepare:"))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prepares,
+            ["prepare:one", "prepare:three"],
+            "preparation follows call_index order, not input order"
+        );
+        // The call_index-1 ticket is reserved first and starts; the call_index-3 ticket
+        // (same key) waits behind it in reservation order.
+        probe
+            .wait_until(|events| events.iter().any(|event| event == "start:one"))
+            .await;
+        assert!(
+            !probe.events().iter().any(|event| event == "start:three"),
+            "the later reservation waits for its FIFO turn"
+        );
+        releases[&1].notify_one();
+        probe
+            .wait_until(|events| events.iter().any(|event| event == "start:three"))
+            .await;
+        assert!(
+            probe.position("done:one") < probe.position("start:three"),
+            "the permit is released only after the first run settles"
+        );
+        releases[&3].notify_one();
+        let results = round.await.expect("the round task settles");
+        assert_eq!(results.len(), 2);
+        // Results merge in call_index order (call_one first), regardless of input order.
+        let mut expected = requests.clone();
+        expected.sort_by_key(|request| request.call().call_index());
+        for (request, result) in expected.iter().zip(&results) {
+            assert!(matches!(
+                result,
+                ToolExecutionOutcome::Completed {
+                    item_id,
+                    tool_call_id,
+                    source: ToolOutcomeSource::Executed,
+                    disposition: crate::tools::ToolResultDisposition::Succeeded,
+                    ..
+                } if item_id == &request.item_id()
+                    && tool_call_id == request.call().tool_call_id()
+            ));
+        }
+        assert_eq!(queue.entry_count(), 0, "the round leaves the queue empty");
+        fixture.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_round_user_question_is_fully_handled_before_mutation_preparation_starts() {
+        let fixture = mutation_round_fixture().await;
+        let queue = SessionFileMutationQueue::new();
+        let probe = Arc::new(RoundProbe::default());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let target_key = fixture.target.clone();
+        let probe_plan = Arc::clone(&probe);
+        let release_plan = Arc::clone(&release);
+        let queue_plan = Arc::clone(&queue);
+        let tool_set = ToolSet::with_sandbox_contract(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "write_file".parse().unwrap(),
+                    "Write one file",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            ToolSandboxContract::available([ToolCapabilityClass::FilesystemWrite]),
+            move |request| {
+                if request.call().tool_call_id().as_str() == "call_question" {
+                    ToolExecutionPlan::UserQuestion {
+                        request: user_question_request_fixture(),
+                        answer: UserQuestionAnswerBinding::new(request.clone(), {
+                            let probe = Arc::clone(&probe_plan);
+                            move |_answer| {
+                                probe.record("question-bound");
+                                ToolExecutionResult::PreExecution {
+                                    disposition: crate::tools::ToolResultDisposition::Succeeded,
+                                    content: crate::tools::ToolResultContent::from_text_parts(
+                                        vec!["answered".to_owned()],
+                                    )
+                                    .unwrap(),
+                                }
+                            }
+                        }),
+                    }
+                } else {
+                    ToolExecutionPlan::file_mutation(
+                        ToolPermissionSet::new([ToolCapabilityClass::FilesystemWrite]),
+                        ready_preparation(
+                            &probe_plan,
+                            target_key.clone(),
+                            Arc::clone(&release_plan),
+                            "write",
+                        ),
+                        Arc::clone(&queue_plan),
+                    )
+                }
+            },
+        );
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        let (interaction_completion_sender, mut interaction_receiver): (
+            mpsc::UnboundedSender<ExecutorCompletion>,
+            mpsc::UnboundedReceiver<ExecutorCompletion>,
+        ) = mpsc::unbounded_channel();
+        // The host-side resolver records the presentation and holds the answer until the
+        // test verified that no preparation started while the question was pending.
+        let answer_release = Arc::new(tokio::sync::Notify::new());
+        let resolver = tokio::spawn({
+            let probe = Arc::clone(&probe);
+            let answer_release = Arc::clone(&answer_release);
+            async move {
+                let completion = interaction_receiver
+                    .recv()
+                    .await
+                    .expect("the question is presented");
+                let ExecutorCompletion::InteractionRequested(completion) = completion else {
+                    panic!("only a UserQuestion is presented");
+                };
+                probe.record("question-presented");
+                answer_release.notified().await;
+                let resolution = match completion.request {
+                    InteractionRequest::UserQuestion(request) => {
+                        InteractionRequest::user_question(request)
+                            .resolve_host(InteractionResolutionInput::UserAnswer(
+                                user_question_answer_fixture("direct"),
+                            ))
+                            .unwrap()
+                    }
+                    _ => panic!("only a UserQuestion is presented"),
+                };
+                let _ = completion.resolution_sender.send(resolution);
+            }
+        });
+        let requests = [
+            mutation_round_request(0x91, "call_question", 0),
+            mutation_round_request(0x92, "call_write", 1),
+        ];
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
+            .collect::<Vec<_>>();
+        let round = tokio::spawn(execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        ));
+        probe
+            .wait_until(|events| events.iter().any(|event| event == "question-presented"))
+            .await;
+        assert!(
+            !probe
+                .events()
+                .iter()
+                .any(|event| event.starts_with("prepare:")),
+            "no mutation preparation starts while the question waits for the host"
+        );
+        answer_release.notify_one();
+        probe
+            .wait_until(|events| events.iter().any(|event| event == "prepare:write"))
+            .await;
+        assert!(
+            probe.position("question-bound") < probe.position("prepare:write"),
+            "the question is fully answered before any mutation preparation"
+        );
+        release.notify_one();
+        let results = round.await.expect("the round task settles");
+        assert!(matches!(
+            &results[0],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                content,
+            } if item_id == &requests[0].item_id()
+                && tool_call_id == requests[0].call().tool_call_id()
+                && content.parts()[0].as_text() == "answered"
+        ));
+        assert!(matches!(
+            &results[1],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                ..
+            } if item_id == &requests[1].item_id()
+                && tool_call_id == requests[1].call().tool_call_id()
+        ));
+        resolver.await.expect("the resolver task settles");
+        assert_eq!(queue.entry_count(), 0, "the round leaves the queue empty");
+        fixture.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_round_same_key_siblings_run_fifo_while_different_key_sibling_runs_concurrently()
+     {
+        let fixture = mutation_round_fixture().await;
+        let queue = SessionFileMutationQueue::new();
+        let probe = Arc::new(RoundProbe::default());
+        let releases: HashMap<u32, Arc<tokio::sync::Notify>> = [
+            (0, Arc::new(tokio::sync::Notify::new())),
+            (1, Arc::new(tokio::sync::Notify::new())),
+            (2, Arc::new(tokio::sync::Notify::new())),
+        ]
+        .into_iter()
+        .collect();
+        let target_key = fixture.target.clone();
+        let other_key = fixture.other.clone();
+        let probe_plan = Arc::clone(&probe);
+        let releases_plan = releases.clone();
+        let tool_set = mutation_round_tool_set(&queue, move |request| {
+            let call_index = request.call().call_index();
+            let (key, tag) = match call_index {
+                0 => (target_key.clone(), "a"),
+                1 => (target_key.clone(), "b"),
+                _ => (other_key.clone(), "c"),
+            };
+            ready_preparation(
+                &probe_plan,
+                key,
+                Arc::clone(
+                    releases_plan
+                        .get(&call_index)
+                        .expect("the call has a release"),
+                ),
+                tag,
+            )
+        });
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        // a and b share the target key (FIFO); c is a different key (independent).
+        let requests = [
+            mutation_round_request(0xa1, "call_a", 0),
+            mutation_round_request(0xa2, "call_b", 1),
+            mutation_round_request(0xa3, "call_c", 2),
+        ];
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
+            .collect::<Vec<_>>();
+        let (interaction_completion_sender, _) = mpsc::unbounded_channel();
+        let round = tokio::spawn(execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        ));
+        // a (target) and c (other) start concurrently; b (same key as a) waits behind a.
+        probe
+            .wait_until(|events| {
+                events.iter().any(|event| event == "start:a")
+                    && events.iter().any(|event| event == "start:c")
+            })
+            .await;
+        assert!(
+            !probe.events().iter().any(|event| event == "start:b"),
+            "the same-key sibling waits for its FIFO turn while the other key runs"
+        );
+        releases[&0].notify_one();
+        probe
+            .wait_until(|events| events.iter().any(|event| event == "start:b"))
+            .await;
+        assert!(
+            probe.position("done:a") < probe.position("start:b"),
+            "the same-key permit is released only after a's run settles"
+        );
+        releases[&1].notify_one();
+        releases[&2].notify_one();
+        let results = round.await.expect("the round task settles");
+        assert_eq!(results.len(), 3);
+        for (request, result) in requests.iter().zip(&results) {
+            assert!(matches!(
+                result,
+                ToolExecutionOutcome::Completed {
+                    item_id,
+                    tool_call_id,
+                    source: ToolOutcomeSource::Executed,
+                    disposition: crate::tools::ToolResultDisposition::Succeeded,
+                    ..
+                } if item_id == &request.item_id()
+                    && tool_call_id == request.call().tool_call_id()
+            ));
+        }
+        assert_eq!(queue.entry_count(), 0, "the round leaves the queue empty");
+        fixture.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_round_signal_while_waiting_prevents_start_and_removes_the_ticket() {
+        let fixture = mutation_round_fixture().await;
+        let queue = SessionFileMutationQueue::new();
+        let probe = Arc::new(RoundProbe::default());
+        let releases: HashMap<u32, Arc<tokio::sync::Notify>> = [
+            (0, Arc::new(tokio::sync::Notify::new())),
+            (1, Arc::new(tokio::sync::Notify::new())),
+        ]
+        .into_iter()
+        .collect();
+        let target_key = fixture.target.clone();
+        let probe_plan = Arc::clone(&probe);
+        let releases_plan = releases.clone();
+        let tool_set = mutation_round_tool_set(&queue, move |request| {
+            let call_index = request.call().call_index();
+            ready_preparation(
+                &probe_plan,
+                target_key.clone(),
+                Arc::clone(
+                    releases_plan
+                        .get(&call_index)
+                        .expect("the call has a release"),
+                ),
+                if call_index == 0 { "a" } else { "b" },
+            )
+        });
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        let requests = [
+            mutation_round_request(0xb1, "call_a", 0),
+            mutation_round_request(0xb2, "call_b", 1),
+        ];
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
+            .collect::<Vec<_>>();
+        let (interaction_completion_sender, _) = mpsc::unbounded_channel();
+        let round = tokio::spawn(execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        ));
+        // a starts and holds its permit; b waits on its ticket.
+        probe
+            .wait_until(|events| events.iter().any(|event| event == "start:a"))
+            .await;
+        assert!(
+            !probe.events().iter().any(|event| event == "start:b"),
+            "b waits behind a's permit"
+        );
+        // The exact emergency cancellation wins while b waits: b's ticket is dropped and
+        // removed, b never starts, and a keeps running to its natural result.
+        assert_eq!(
+            emergency.signal(target, EmergencyControlSignal::Cancel),
+            EmergencyControlSignalOutcome::Accepted { epoch: 1 }
+        );
+        releases[&0].notify_one();
+        let results = round.await.expect("the round task settles");
+        assert!(matches!(
+            &results[0],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                ..
+            } if item_id == &requests[0].item_id()
+                && tool_call_id == requests[0].call().tool_call_id()
+        ));
+        assert!(matches!(
+            &results[1],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: crate::tools::ToolResultDisposition::Cancelled,
+                content,
+            } if item_id == &requests[1].item_id()
+                && tool_call_id == requests[1].call().tool_call_id()
+                && content.parts()[0].as_text() == "tool did not start"
+        ));
+        assert!(
+            !probe.events().iter().any(|event| event == "start:b"),
+            "the waiting mutation never started"
+        );
+        assert_eq!(queue.entry_count(), 0, "the dropped ticket left the queue");
+        fixture.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_round_signal_during_preparation_keeps_it_unstarted_cancelled_without_a_ticket()
+     {
+        let fixture = mutation_round_fixture().await;
+        let queue = SessionFileMutationQueue::new();
+        let probe = Arc::new(RoundProbe::default());
+        // The scheduled preparation parks on this release until the test has signaled the
+        // exact emergency basis, then settles Ready: the post-settlement recheck must drop
+        // the ready key/start without any queue reservation and freeze the matching
+        // cancelled-before-start outcome.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let target_key = fixture.target.clone();
+        let probe_plan = Arc::clone(&probe);
+        let release_plan = Arc::clone(&release);
+        let tool_set = mutation_round_tool_set(&queue, move |_request| {
+            let probe = Arc::clone(&probe_plan);
+            let release = Arc::clone(&release_plan);
+            let key = target_key.clone();
+            ToolExecutionPreparation::new(move || {
+                Box::pin(async move {
+                    probe.record("prepare:started");
+                    release.notified().await;
+                    probe.record("prepare:settled");
+                    PreparedToolExecution::Ready {
+                        key,
+                        start: ToolExecutionStart::new(move |_observer| {
+                            let probe = Arc::clone(&probe);
+                            Box::pin(async move {
+                                probe.record("start:ran");
+                                ToolExecutionResult::completed_text("done").unwrap()
+                            })
+                        }),
+                    }
+                })
+            })
+        });
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        let requests = [mutation_round_request(0xb5, "call_prepared", 0)];
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
+            .collect::<Vec<_>>();
+        let (interaction_completion_sender, _) = mpsc::unbounded_channel();
+        let round = tokio::spawn(execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        ));
+        // The scheduled preparation starts and parks; no ticket exists yet.
+        probe
+            .wait_until(|events| events.iter().any(|event| event == "prepare:started"))
+            .await;
+        assert_eq!(
+            queue.entry_count(),
+            0,
+            "no ticket exists while the scheduled preparation is still settling"
+        );
+        // The exact emergency cancellation wins while the scheduled preparation is parked.
+        assert_eq!(
+            emergency.signal(target, EmergencyControlSignal::Cancel),
+            EmergencyControlSignalOutcome::Accepted { epoch: 1 }
+        );
+        // The scheduled preparation is still awaited to full settlement.
+        release.notify_one();
+        probe
+            .wait_until(|events| events.iter().any(|event| event == "prepare:settled"))
+            .await;
+        // The post-settlement recheck keeps the operation unstarted-cancelled: the ready
+        // key/start were dropped without reserving any ticket, and the start factory never
+        // ran.
+        assert_eq!(
+            queue.entry_count(),
+            0,
+            "no ticket is reserved after the signal won during settlement"
+        );
+        assert!(
+            !probe.events().iter().any(|event| event == "start:ran"),
+            "the dropped ready start factory never runs"
+        );
+        let results = round.await.expect("the round task settles");
+        assert!(matches!(
+            &results[0],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: crate::tools::ToolResultDisposition::Cancelled,
+                content,
+            } if item_id == &requests[0].item_id()
+                && tool_call_id == requests[0].call().tool_call_id()
+                && content.parts()[0].as_text() == "tool did not start"
+        ));
+        assert_eq!(
+            probe.events(),
+            ["prepare:started", "prepare:settled"],
+            "only the awaited preparation ran; the start factory never did"
+        );
+        assert_eq!(queue.entry_count(), 0, "the round leaves the queue empty");
+        fixture.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_round_signal_after_start_keeps_permit_through_settling_until_the_same_run_settles()
+     {
+        let fixture = mutation_round_fixture().await;
+        let queue = SessionFileMutationQueue::new();
+        let probe = Arc::new(RoundProbe::default());
+        let releases: HashMap<u32, Arc<tokio::sync::Notify>> = [
+            (0, Arc::new(tokio::sync::Notify::new())),
+            (1, Arc::new(tokio::sync::Notify::new())),
+        ]
+        .into_iter()
+        .collect();
+        let target_key = fixture.target.clone();
+        let probe_a = Arc::clone(&probe);
+        let release_a = Arc::clone(releases.get(&0).expect("a has a release"));
+        let probe_plan = Arc::clone(&probe);
+        let releases_plan = releases.clone();
+        let tool_set = mutation_round_tool_set(&queue, move |request| {
+            let call_index = request.call().call_index();
+            if call_index == 0 {
+                // a's executor observes the cancellation pair and performs its own cleanup
+                // before returning: the signal path keeps awaiting this same run.
+                let probe = Arc::clone(&probe_a);
+                let release_a = Arc::clone(&release_a);
+                let key = target_key.clone();
+                ToolExecutionPreparation::new(move || {
+                    let probe = Arc::clone(&probe);
+                    let release_a = Arc::clone(&release_a);
+                    let key = key.clone();
+                    Box::pin(async move {
+                        probe.record("prepare:a");
+                        PreparedToolExecution::Ready {
+                            key,
+                            start: ToolExecutionStart::new(move |observer| {
+                                let probe = Arc::clone(&probe);
+                                let release_a = Arc::clone(&release_a);
+                                Box::pin(async move {
+                                    probe.record("start:a");
+                                    observer.cancelled().await;
+                                    probe.record("cleanup:a");
+                                    release_a.notified().await;
+                                    probe.record("done:a");
+                                    ToolExecutionResult::completed_text("done").unwrap()
+                                })
+                            }),
+                        }
+                    })
+                })
+            } else {
+                ready_preparation(
+                    &probe_plan,
+                    target_key.clone(),
+                    Arc::clone(releases_plan.get(&call_index).expect("b has a release")),
+                    "b",
+                )
+            }
+        });
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        let requests = [
+            mutation_round_request(0xc1, "call_a", 0),
+            mutation_round_request(0xc2, "call_b", 1),
+        ];
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
+            .collect::<Vec<_>>();
+        let (interaction_completion_sender, _) = mpsc::unbounded_channel();
+        let round = tokio::spawn(execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        ));
+        probe
+            .wait_until(|events| events.iter().any(|event| event == "start:a"))
+            .await;
+        // A fresh same-key reservation made while a runs must not acquire while a is in
+        // Settling: it parks behind a's still-held permit and can only acquire after a's
+        // exact outcome is bound and the permit is released at Settling → Terminal.
+        let probe_request = mutation_round_request(0xc3, "call_probe", 2);
+        let probe_ticket = queue.reserve(fixture.target.clone(), &probe_request);
+        let probe_plan_wait = Arc::clone(&probe);
+        let probe_task = tokio::spawn(async move {
+            let _permit = probe_ticket
+                .wait(probe_request.clone())
+                .await
+                .expect("the fresh same-key reservation eventually acquires");
+            probe_plan_wait.record("probe-acquired");
+        });
+        // The signal wins after a started: a enters Settling while its run is still
+        // cleaning up, holding its queue permit the whole time.
+        assert_eq!(
+            emergency.signal(target, EmergencyControlSignal::Cancel),
+            EmergencyControlSignalOutcome::Accepted { epoch: 1 }
+        );
+        probe
+            .wait_until(|events| events.iter().any(|event| event == "cleanup:a"))
+            .await;
+        // While a is in Settling, its permit is still held: the same-key sibling b never
+        // starts (its waiting ticket lost to the signal) and the fresh same-key
+        // reservation cannot acquire.
+        assert_eq!(
+            queue.entry_count(),
+            1,
+            "a's permit is still held during Settling"
+        );
+        assert!(
+            !probe.events().iter().any(|event| event == "start:b"),
+            "the same-key sibling never starts"
+        );
+        assert!(
+            !probe.events().iter().any(|event| event == "probe-acquired"),
+            "the fresh same-key reservation cannot acquire while a's outcome is unsettled"
+        );
+        releases[&0].notify_one();
+        // The permit is released only after the same run cleanup/result settles: the fresh
+        // same-key reservation acquires strictly after a's outcome was bound.
+        probe
+            .wait_until(|events| events.iter().any(|event| event == "probe-acquired"))
+            .await;
+        assert!(
+            probe.position("done:a") < probe.position("probe-acquired"),
+            "the permit is released only after the same run cleanup/result settles"
+        );
+        let results = round.await.expect("the round task settles");
+        assert!(matches!(
+            &results[0],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                ..
+            } if item_id == &requests[0].item_id()
+                && tool_call_id == requests[0].call().tool_call_id()
+        ));
+        assert!(matches!(
+            &results[1],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: crate::tools::ToolResultDisposition::Cancelled,
+                content,
+            } if item_id == &requests[1].item_id()
+                && tool_call_id == requests[1].call().tool_call_id()
+                && content.parts()[0].as_text() == "tool did not start"
+        ));
+        probe_task.await.expect("the probe waiter task settles");
+        assert_eq!(
+            queue.entry_count(),
+            0,
+            "the last permit removes the key entry"
+        );
+        fixture.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_round_preparation_panic_fails_closed_and_later_serial_operations_still_run() {
+        let fixture = mutation_round_fixture().await;
+        let queue = SessionFileMutationQueue::new();
+        let probe = Arc::new(RoundProbe::default());
+        let probe_plan = Arc::clone(&probe);
+        let queue_plan = Arc::clone(&queue);
+        let tool_set = ToolSet::with_sandbox_contract(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "write_file".parse().unwrap(),
+                    "Write one file",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            ToolSandboxContract::available([ToolCapabilityClass::FilesystemWrite]),
+            move |request| match request.call().tool_call_id().as_str() {
+                // A panicking preparation factory: the closure itself panics synchronously
+                // before returning any future, so the round owner's catch_unwind around the
+                // factory invocation maps it to this exact slot's identity-bound Abandoned
+                // RuntimeFailure.
+                "call_factory_panic" => ToolExecutionPlan::file_mutation(
+                    ToolPermissionSet::new([ToolCapabilityClass::FilesystemWrite]),
+                    ToolExecutionPreparation::new(|| {
+                        panic!("the preparation factory panics");
+                        #[allow(unreachable_code)]
+                        Box::pin(async move {
+                            unreachable!("the panicking factory never produces a future")
+                        })
+                    }),
+                    Arc::clone(&queue_plan),
+                ),
+                // A distinct panicking preparation future: the factory returns normally and
+                // the first poll panics, so the round owner's catch_unwind around the poll
+                // maps it to the same exact Abandoned RuntimeFailure.
+                "call_future_panic" => ToolExecutionPlan::file_mutation(
+                    ToolPermissionSet::new([ToolCapabilityClass::FilesystemWrite]),
+                    ToolExecutionPreparation::new(|| {
+                        Box::pin(async move {
+                            panic!("the preparation future panics");
+                            #[allow(unreachable_code)]
+                            PreparedToolExecution::Unstarted(ToolExecutionResult::PreExecution {
+                                disposition: crate::tools::ToolResultDisposition::Failed,
+                                content: crate::tools::ToolResultContent::from_text_parts(vec![
+                                    "file could not be written".to_owned(),
+                                ])
+                                .unwrap(),
+                            })
+                        })
+                    }),
+                    Arc::clone(&queue_plan),
+                ),
+                _ => {
+                    let probe = Arc::clone(&probe_plan);
+                    ToolExecutionPlan::execute(ToolExecutionStart::new(move |_observer| {
+                        let probe = Arc::clone(&probe);
+                        Box::pin(async move {
+                            probe.record("start:ok");
+                            ToolExecutionResult::completed_text("ran").unwrap()
+                        })
+                    }))
+                }
+            },
+        );
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        let requests = [
+            mutation_round_request(0xd1, "call_factory_panic", 0),
+            mutation_round_request(0xd2, "call_future_panic", 1),
+            mutation_round_request(0xd3, "call_ok", 2),
+        ];
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
+            .collect::<Vec<_>>();
+        let (interaction_completion_sender, _) = mpsc::unbounded_channel();
+        let results = execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        )
+        .await;
+        // Both panicking preparations settle the exact slot's Abandoned RuntimeFailure
+        // without any start, and the later Serial operation still runs.
+        for (request, result) in requests.iter().zip(&results[..2]) {
+            assert!(matches!(
+                result,
+                ToolExecutionOutcome::Abandoned {
+                    item_id,
+                    tool_call_id,
+                    reason: ToolAbandonReason::RuntimeFailure,
+                } if item_id == &request.item_id()
+                    && tool_call_id == request.call().tool_call_id()
+            ));
+        }
+        assert!(matches!(
+            &results[2],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                content,
+            } if item_id == &requests[2].item_id()
+                && tool_call_id == requests[2].call().tool_call_id()
+                && content.parts()[0].as_text() == "ran"
+        ));
+        assert_eq!(
+            probe.events(),
+            ["start:ok"],
+            "only the ordinary Serial operation ever started"
+        );
+        assert_eq!(queue.entry_count(), 0, "no ticket was ever reserved");
+        fixture.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_round_unstarted_preparation_result_stays_truthful_without_starting() {
+        let fixture = mutation_round_fixture().await;
+        let queue = SessionFileMutationQueue::new();
+        let probe = Arc::new(RoundProbe::default());
+        let probe_plan = Arc::clone(&probe);
+        let queue_plan = Arc::clone(&queue);
+        let tool_set = ToolSet::with_sandbox_contract(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "write_file".parse().unwrap(),
+                    "Write one file",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            ToolSandboxContract::available([ToolCapabilityClass::FilesystemWrite]),
+            move |request| match request.call().tool_call_id().as_str() {
+                // A truthful unstarted pre-execution result: settles Failed without any
+                // start or ticket.
+                "call_failed" => ToolExecutionPlan::file_mutation(
+                    ToolPermissionSet::new([ToolCapabilityClass::FilesystemWrite]),
+                    ToolExecutionPreparation::new(|| {
+                        Box::pin(async move {
+                            PreparedToolExecution::Unstarted(ToolExecutionResult::PreExecution {
+                                disposition: crate::tools::ToolResultDisposition::Failed,
+                                content: crate::tools::ToolResultContent::from_text_parts(vec![
+                                    "file could not be written".to_owned(),
+                                ])
+                                .unwrap(),
+                            })
+                        })
+                    }),
+                    Arc::clone(&queue_plan),
+                ),
+                // An explicit Abandoned unstarted result passes its reason through under
+                // the same unstarted settlement.
+                "call_abandoned" => ToolExecutionPlan::file_mutation(
+                    ToolPermissionSet::new([ToolCapabilityClass::FilesystemWrite]),
+                    ToolExecutionPreparation::new(|| {
+                        Box::pin(async move {
+                            PreparedToolExecution::Unstarted(ToolExecutionResult::Abandoned {
+                                reason: ToolAbandonReason::RuntimeFailure,
+                            })
+                        })
+                    }),
+                    Arc::clone(&queue_plan),
+                ),
+                _ => {
+                    let probe = Arc::clone(&probe_plan);
+                    ToolExecutionPlan::execute(ToolExecutionStart::new(move |_observer| {
+                        let probe = Arc::clone(&probe);
+                        Box::pin(async move {
+                            probe.record("start:ok");
+                            ToolExecutionResult::completed_text("ran").unwrap()
+                        })
+                    }))
+                }
+            },
+        );
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        let requests = [
+            mutation_round_request(0xe1, "call_failed", 0),
+            mutation_round_request(0xe2, "call_abandoned", 1),
+            mutation_round_request(0xe3, "call_ok", 2),
+        ];
+        let slots = requests
+            .iter()
+            .map(|request| ToolOperationSlot::new(request.clone(), &emergency, observation.clone()))
+            .collect::<Vec<_>>();
+        let (interaction_completion_sender, _) = mpsc::unbounded_channel();
+        let results = execute_gated_tool_round(
+            tool_set,
+            slots,
+            "trn_77777777777777777777777777777777".parse().unwrap(),
+            interaction_completion_sender,
+            Arc::new(SessionExecutorTestHooksInner::new()),
+        )
+        .await;
+        assert!(matches!(
+            &results[0],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: crate::tools::ToolResultDisposition::Failed,
+                content,
+            } if item_id == &requests[0].item_id()
+                && tool_call_id == requests[0].call().tool_call_id()
+                && content.parts()[0].as_text() == "file could not be written"
+        ));
+        assert!(matches!(
+            &results[1],
+            ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: ToolAbandonReason::RuntimeFailure,
+            } if item_id == &requests[1].item_id()
+                && tool_call_id == requests[1].call().tool_call_id()
+        ));
+        assert!(matches!(
+            &results[2],
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: crate::tools::ToolResultDisposition::Succeeded,
+                content,
+            } if item_id == &requests[2].item_id()
+                && tool_call_id == requests[2].call().tool_call_id()
+                && content.parts()[0].as_text() == "ran"
+        ));
+        assert_eq!(
+            probe.events(),
+            ["start:ok"],
+            "only the ordinary operation ever started"
+        );
+        assert_eq!(queue.entry_count(), 0, "no ticket was ever reserved");
+        fixture.task_context.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
