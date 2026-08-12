@@ -2627,10 +2627,10 @@ impl fmt::Debug for WorkspaceAccessRoot {
 
 /// The narrow filesystem ceiling a loaded WorkspaceSnapshot projects for Tools.
 /// It exposes only the captured canonical cwd, the effective access roots with
-/// their bound capabilities, and synchronous cwd-relative read authorization.
-/// Roots are non-overlapping and cwd lies within exactly one root, so this first
-/// slice authorizes only cwd-relative read paths; additional roots are not
-/// directly addressable through this schema.
+/// their bound capabilities, and synchronous cwd-relative read and
+/// directory-read authorization. Roots are non-overlapping and cwd lies within
+/// exactly one root, so this slice authorizes only cwd-relative read paths;
+/// additional roots are not directly addressable through this schema.
 #[derive(Clone)]
 pub(crate) struct WorkspaceAccessView {
     session_id: SessionId,
@@ -2663,6 +2663,51 @@ impl WorkspaceAccessView {
         if relative.is_root() {
             return Err(WorkspaceAccessError::InvalidPath);
         }
+        let (root, cwd_in_root) = self.containing_read_root()?;
+        let target = cwd_in_root.join(relative.as_str());
+        if !target
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(WorkspaceAccessError::InvalidPath);
+        }
+        Ok(AuthorizedWorkspaceReadPath {
+            root_dir: Arc::clone(&root.dir),
+            relative: target,
+        })
+    }
+
+    /// Authorizes one cwd-relative directory-read target with exactly the same
+    /// containing root, effective readable grant, cwd-relative prepend and fully
+    /// normal containment model as [`WorkspaceAccessView::authorize_read`]. Unlike
+    /// file reads the empty relative path is legal: it names the captured cwd
+    /// directory itself, including when the cwd is the root. The returned value
+    /// is the only one a Tool may use to open a directory.
+    pub(crate) fn authorize_read_directory(
+        &self,
+        relative: &WorkspaceRelativePath,
+    ) -> Result<AuthorizedWorkspaceReadDirectory, WorkspaceAccessError> {
+        let (root, cwd_in_root) = self.containing_read_root()?;
+        let target = cwd_in_root.join(relative.as_str());
+        if !target
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(WorkspaceAccessError::InvalidPath);
+        }
+        Ok(AuthorizedWorkspaceReadDirectory {
+            root_dir: Arc::clone(&root.dir),
+            relative: target,
+        })
+    }
+
+    /// The single shared basis for cwd-relative read and directory-read
+    /// authorization: the exact root holding the captured canonical cwd plus the
+    /// cwd's capability-relative position inside it, or the error that makes the
+    /// schema inapplicable.
+    fn containing_read_root(
+        &self,
+    ) -> Result<(&WorkspaceAccessRoot, PathBuf), WorkspaceAccessError> {
         let root = self
             .roots
             .iter()
@@ -2680,17 +2725,7 @@ impl WorkspaceAccessView {
             .as_path()
             .strip_prefix(root.canonical_path.as_path())
             .map_err(|_| WorkspaceAccessError::Unavailable)?;
-        let target = cwd_in_root.join(relative.as_str());
-        if !target
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-        {
-            return Err(WorkspaceAccessError::InvalidPath);
-        }
-        Ok(AuthorizedWorkspaceReadPath {
-            root_dir: Arc::clone(&root.dir),
-            relative: target,
-        })
+        Ok((root, cwd_in_root.to_path_buf()))
     }
 }
 
@@ -2785,6 +2820,46 @@ impl fmt::Debug for AuthorizedWorkspaceReadPath {
     }
 }
 
+/// The only authorized directory-read value a Tool can consume: the open
+/// capability bound to the authorized root plus a normalized
+/// capability-relative target. It never exposes ambient absolute paths; opening
+/// always resolves through the captured `Dir`, which cannot escape the root it
+/// was bound to.
+#[derive(Clone)]
+pub(crate) struct AuthorizedWorkspaceReadDirectory {
+    root_dir: Arc<CapabilityDir>,
+    relative: PathBuf,
+}
+
+impl AuthorizedWorkspaceReadDirectory {
+    /// The normalized capability-relative target; safe to expose because it
+    /// contains no ambient root text.
+    #[cfg(test)]
+    pub(crate) fn relative_path(&self) -> &Path {
+        &self.relative
+    }
+
+    /// Opens the target directory through the captured root capability. The
+    /// empty target names the captured cwd directory itself and clones the bound
+    /// capability handle; a non-empty target is opened capability-relative
+    /// through the root, so a symlink that would leave the root fails closed at
+    /// this open.
+    pub(crate) fn open(&self) -> Result<cap_std::fs::Dir, WorkspaceAccessError> {
+        if self.relative.as_os_str().is_empty() {
+            return self.root_dir.try_clone().map_err(map_access_io_error);
+        }
+        self.root_dir
+            .open_dir(&self.relative)
+            .map_err(map_access_io_error)
+    }
+}
+
+impl fmt::Debug for AuthorizedWorkspaceReadDirectory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthorizedWorkspaceReadDirectory { .. }")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -2800,15 +2875,16 @@ mod tests {
         AuthorizedWorkspaceReadPath, CanonicalWorkspacePath, CapturedWorkspacePromptSource,
         CapturedWorkspaceSkillSource, LocalWorkspacePathAdapter, OpenedWorkspaceRoot,
         RequestedFilesystemAccess, RestrictedWorkspaceAuthority, Workspace, WorkspaceAccessError,
-        WorkspaceAuthority, WorkspaceAuthorityDecision, WorkspaceAuthorityError,
-        WorkspaceAuthorityRequest, WorkspaceAuthorityRootDecision, WorkspaceAuthorityRootRequest,
-        WorkspaceConstructionError, WorkspaceCwdSpec, WorkspaceDefinitionInput,
-        WorkspaceFilesystemGrant, WorkspaceInputLoweringError, WorkspacePathAdapter,
-        WorkspacePathError, WorkspacePathTarget, WorkspaceResolveError, WorkspaceResolver,
-        WorkspaceRootIdentity, WorkspaceRootInput, WorkspaceRootRole, WorkspaceRootSpec,
-        WorkspaceRootTrust, WorkspaceSnapshotFinishError, WorkspaceSourceCaptureError,
-        WorkspaceSourcePolicy, WorkspaceTrustLevel, WorkspaceTrustRevision, checked_native_uri,
-        lower_workspace, test_capability_scratch, uri_from_spec,
+        WorkspaceAccessRoot, WorkspaceAccessView, WorkspaceAuthority, WorkspaceAuthorityDecision,
+        WorkspaceAuthorityError, WorkspaceAuthorityRequest, WorkspaceAuthorityRootDecision,
+        WorkspaceAuthorityRootRequest, WorkspaceConstructionError, WorkspaceCwdSpec,
+        WorkspaceDefinitionInput, WorkspaceFilesystemGrant, WorkspaceInputLoweringError,
+        WorkspacePathAdapter, WorkspacePathError, WorkspacePathTarget, WorkspaceResolveError,
+        WorkspaceResolver, WorkspaceRootIdentity, WorkspaceRootInput, WorkspaceRootRole,
+        WorkspaceRootSpec, WorkspaceRootTrust, WorkspaceSnapshotFinishError,
+        WorkspaceSourceCaptureError, WorkspaceSourcePolicy, WorkspaceTrustLevel,
+        WorkspaceTrustRevision, checked_native_uri, lower_workspace, test_capability_scratch,
+        uri_from_spec,
     };
     use crate::runtime_task::RuntimeTaskContext;
     use crate::wire::{CanonicalFileUri, SessionId, WorkspaceRelativePath, WorkspaceRevision};
@@ -4493,6 +4569,286 @@ mod tests {
         assert!(!error_text.contains("secret"));
         assert!(!error_text.contains("escape"));
         // The target file itself exists and is readable through ordinary std access.
+        assert_eq!(
+            std::fs::read(outside.join("secret.txt")).unwrap(),
+            b"outside secret"
+        );
+        task_context.shutdown().await;
+    }
+
+    fn listed_directory_names(dir: &cap_std::fs::Dir) -> Vec<String> {
+        let mut names = dir
+            .entries()
+            .expect("the directory lists its entries")
+            .map(|entry| {
+                entry
+                    .expect("a directory entry is readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_directory_authorization_opens_cwd_and_nested_directories() {
+        let temporary = TempDirectory::new("directory-read");
+        let root = temporary.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).expect("the nested directory is creatable");
+        std::fs::write(root.join("notes.txt"), b"top").unwrap();
+        std::fs::write(root.join("sub/data.txt"), b"data").unwrap();
+
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            LocalWorkspacePathAdapter,
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadOnly, false, false),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = snapshot.tool_context();
+        let access = tool_context.access();
+
+        // With the cwd at the root the empty target names the captured cwd
+        // directory and opens to list the real direct entries.
+        let cwd_dir = access
+            .authorize_read_directory(&WorkspaceRelativePath::default())
+            .unwrap();
+        assert_eq!(cwd_dir.relative_path(), Path::new(""));
+        assert_eq!(
+            listed_directory_names(&cwd_dir.open().unwrap()),
+            vec!["notes.txt".to_string(), "sub".to_string()]
+        );
+
+        // A relative nested directory also opens through the same root capability.
+        let nested = access
+            .authorize_read_directory(&"sub".parse().unwrap())
+            .unwrap();
+        assert_eq!(nested.relative_path(), Path::new("sub"));
+        assert_eq!(
+            listed_directory_names(&nested.open().unwrap()),
+            vec!["data.txt".to_string()]
+        );
+
+        // Debug is fixed redacted and leaks no path text.
+        assert_eq!(
+            format!("{cwd_dir:?}"),
+            "AuthorizedWorkspaceReadDirectory { .. }"
+        );
+        let debug = format!("{access:?} {cwd_dir:?} {nested:?}");
+        assert!(!debug.contains(temporary.path().to_str().unwrap()));
+        assert!(!debug.contains("notes.txt"));
+        assert!(!debug.contains("data.txt"));
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_directory_authorization_binds_empty_to_cwd_inside_the_root() {
+        let temporary = TempDirectory::new("directory-read-cwd");
+        let root = temporary.path().join("root");
+        std::fs::create_dir_all(root.join("nested").join("deep"))
+            .expect("the nested directory is creatable");
+        std::fs::write(root.join("top.txt"), b"top").unwrap();
+        std::fs::write(root.join("nested/inside.txt"), b"inside").unwrap();
+        std::fs::write(root.join("nested/deep/bottom.txt"), b"bottom").unwrap();
+
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", "nested"),
+        )
+        .unwrap();
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            LocalWorkspacePathAdapter,
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadOnly, false, false),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = snapshot.tool_context();
+        let access = tool_context.access();
+
+        // The empty target binds to the captured cwd, not the root: the listed
+        // entries are the cwd's own, and the capability-relative target carries
+        // the cwd's position in the root.
+        let cwd_dir = access
+            .authorize_read_directory(&WorkspaceRelativePath::default())
+            .unwrap();
+        assert_eq!(cwd_dir.relative_path(), Path::new("nested"));
+        assert_eq!(
+            listed_directory_names(&cwd_dir.open().unwrap()),
+            vec!["deep".to_string(), "inside.txt".to_string()]
+        );
+
+        // A nested relative target is prepended with the cwd's position.
+        let deep = access
+            .authorize_read_directory(&"deep".parse().unwrap())
+            .unwrap();
+        assert_eq!(deep.relative_path(), Path::new("nested/deep"));
+        assert_eq!(
+            listed_directory_names(&deep.open().unwrap()),
+            vec!["bottom.txt".to_string()]
+        );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_directory_authorization_denies_without_a_readable_grant() {
+        let temporary = TempDirectory::new("directory-deny");
+        let root = temporary.path().join("root");
+        std::fs::create_dir_all(&root).expect("the test root is creatable");
+
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            LocalWorkspacePathAdapter,
+            authority_with_ceiling(WorkspaceFilesystemGrant::None, false, false),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = snapshot.tool_context();
+        let access = tool_context.access();
+
+        // No readable grant denies even the empty (cwd) target.
+        assert_eq!(
+            access
+                .authorize_read_directory(&WorkspaceRelativePath::default())
+                .unwrap_err(),
+            WorkspaceAccessError::NotAuthorized
+        );
+        assert_eq!(
+            access
+                .authorize_read_directory(&"sub".parse().unwrap())
+                .unwrap_err(),
+            WorkspaceAccessError::NotAuthorized
+        );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_directory_authorization_error_semantics_are_frozen() {
+        let (_, dir) = test_capability_scratch();
+        let root = WorkspaceAccessRoot {
+            canonical_path: CanonicalWorkspacePath::new(PathBuf::from("/deterministic/project")),
+            dir,
+            filesystem: WorkspaceFilesystemGrant::ReadOnly,
+        };
+
+        // A cwd outside every captured root makes the read basis unavailable.
+        let outside = WorkspaceAccessView {
+            session_id: session_id(),
+            cwd: CanonicalWorkspacePath::new(PathBuf::from("/deterministic/elsewhere")),
+            roots: Arc::from(vec![root.clone()]),
+        };
+        assert_eq!(
+            outside
+                .authorize_read_directory(&WorkspaceRelativePath::default())
+                .unwrap_err(),
+            WorkspaceAccessError::Unavailable
+        );
+
+        // A cwd whose position inside its root is not fully normal is invalid.
+        let non_normal = WorkspaceAccessView {
+            session_id: session_id(),
+            cwd: CanonicalWorkspacePath::new(PathBuf::from("/deterministic/project/../outside")),
+            roots: Arc::from(vec![root]),
+        };
+        assert_eq!(
+            non_normal
+                .authorize_read_directory(&"sub".parse().unwrap())
+                .unwrap_err(),
+            WorkspaceAccessError::InvalidPath
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn capability_directory_read_rejects_symlink_escape_outside_the_root() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDirectory::new("tool-dir-escape");
+        let root = temporary.path().join("root");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(&root).expect("the test root is creatable");
+        std::fs::create_dir_all(&outside).expect("the outside directory is creatable");
+        std::fs::write(outside.join("secret.txt"), b"outside secret").unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            LocalWorkspacePathAdapter,
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadOnly, false, false),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = snapshot.tool_context();
+        let access = tool_context.access();
+
+        // The target text is fully normal, so authorization succeeds, but the
+        // capability open fails closed on the escaping symlink.
+        let authorized = access
+            .authorize_read_directory(&"escape".parse().unwrap())
+            .unwrap();
+        let error = authorized.open().unwrap_err();
+        assert_eq!(error, WorkspaceAccessError::OpenFailed);
+        let error_text = format!("{error:?} {error}");
+        assert!(!error_text.contains("secret"));
+        assert!(!error_text.contains("escape"));
+        // The target directory itself is still readable through ordinary std access.
         assert_eq!(
             std::fs::read(outside.join("secret.txt")).unwrap(),
             b"outside secret"
