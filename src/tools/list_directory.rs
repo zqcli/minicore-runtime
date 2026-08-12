@@ -40,7 +40,7 @@
 //! - `directory contains an unsupported entry name` for any entry name that is not valid
 //!   UTF-8;
 //! - `directory listing is too large` for more than 256 direct entries (the 257th item is
-//!   consumed only to detect the overflow) or preserved UTF-8 name bytes summing beyond
+//!   consumed only to detect the overflow) or retained UTF-8 name bytes summing beyond
 //!   8,192 (or the final JSON beyond 65,536 bytes / not safe Text, which fails closed the
 //!   same way).
 //!
@@ -108,7 +108,7 @@ const DIRECTORY_UNLISTABLE_TEXT: &str = "directory could not be listed";
 const DIRECTORY_UNSUPPORTED_NAME_TEXT: &str = "directory contains an unsupported entry name";
 
 /// The exact frozen Completed Failed text for any closed bound violation: more than 256
-/// direct entries, preserved UTF-8 name bytes summing beyond 8,192, or a final JSON beyond
+/// direct entries, retained UTF-8 name bytes summing beyond 8,192, or a final JSON beyond
 /// 65,536 bytes / not safe Text.
 const DIRECTORY_TOO_LARGE_TEXT: &str = "directory listing is too large";
 
@@ -119,7 +119,7 @@ const MAX_DIRECT_ENTRIES: usize = 256;
 /// the listing stops immediately.
 const MAX_ENTRIES_PLUS_ONE: usize = MAX_DIRECT_ENTRIES + 1;
 
-/// The closed preserved-name bound: the raw UTF-8 bytes of all preserved entry names sum to
+/// The closed retained-name bound: the raw UTF-8 bytes of all retained entry names sum to
 /// at most 8,192.
 const MAX_NAME_BYTES_TOTAL: usize = 8192;
 
@@ -315,7 +315,7 @@ enum ListDirectoryOutcome {
     Unlistable,
     /// Any entry name that is not valid UTF-8.
     UnsupportedName,
-    /// More than 256 direct entries, preserved name bytes beyond 8,192, or a final JSON
+    /// More than 256 direct entries, retained name bytes beyond 8,192, or a final JSON
     /// beyond the one-part content bound / not safe Text.
     TooLarge,
 }
@@ -326,8 +326,12 @@ enum ListDirectoryOutcome {
 /// Only direct entries are read — never recursively, never a file's content — and each
 /// entry is classified by its own `DirEntry::file_type` (lstat semantics, so entry
 /// symlinks are reported as `symlink`, never followed).  The 257th item is consumed only
-/// to detect the overflow, and the preserved UTF-8 name bytes are summed so the 8,192
-/// budget stops the listing immediately once exceeded, before any further iteration.
+/// to detect the overflow, and the retained UTF-8 name bytes are budgeted: each name is
+/// UTF-8-checked and measured as a borrow (`to_str`) against the cumulative 8,192 budget
+/// before any copy, so the listing stops immediately once the budget is exceeded, before
+/// any further iteration or any copy of an over-budget name.  The budget governs only
+/// those retained copies — the transient `OsString` cap-std/OS constructs for one
+/// `DirEntry::file_name` is not controlled here.
 fn list_direct_entries(target: AuthorizedWorkspaceReadDirectory) -> ListDirectoryOutcome {
     let dir = match target.open() {
         Ok(dir) => dir,
@@ -353,9 +357,13 @@ fn list_direct_entries(target: AuthorizedWorkspaceReadDirectory) -> ListDirector
             Ok(entry) => entry,
             Err(outcome) => return outcome,
         };
-        let name = match entry.file_name().into_string() {
-            Ok(name) => name,
-            Err(_) => return ListDirectoryOutcome::UnsupportedName,
+        // The entry name is checked and budgeted as a borrow before any copy: invalid
+        // UTF-8 settles UnsupportedName, an over-budget length settles TooLarge, and only
+        // an in-budget name is copied (`to_owned`) into the collected set below.
+        let file_name = entry.file_name();
+        let name = match file_name.to_str() {
+            Some(name) => name,
+            None => return ListDirectoryOutcome::UnsupportedName,
         };
         name_bytes_total = match name_bytes_total.checked_add(name.len()) {
             Some(total) if total <= MAX_NAME_BYTES_TOTAL => total,
@@ -374,9 +382,9 @@ fn list_direct_entries(target: AuthorizedWorkspaceReadDirectory) -> ListDirector
         } else {
             "other"
         };
-        collected.push((name, kind));
+        collected.push((name.to_owned(), kind));
     }
-    // Deterministic byte-ascending order over the preserved UTF-8 names; directory entry
+    // Deterministic byte-ascending order over the retained UTF-8 names; directory entry
     // names are unique, so the ordering is total.
     collected.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
     let listing = ListingJson {
