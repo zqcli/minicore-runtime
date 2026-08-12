@@ -2,7 +2,8 @@
 //!
 //! Only protocol-neutral pieces with a real second consumer live here: the
 //! locked-down reqwest client construction (no redirects, no retries, no
-//! ambient proxy), the response byte limit, protocol-neutral cancellation /
+//! ambient proxy, and an explicit fixed product `User-Agent` — see
+//! [`USER_AGENT`]), the response byte limit, protocol-neutral cancellation /
 //! invalid-request / invalid-provider-response / transport read / send-phase
 //! classification, the cancellation-aware bounded body drain and bounded JSON
 //! envelope read, numeric retry-after parsing, the event-stream content-type
@@ -26,17 +27,28 @@ use crate::model_gateway::{
     ModelCallErrorReason, ProviderAttemptError, ProviderRequestDeliveryState,
 };
 
+/// The fixed product `User-Agent` every shared-client POST carries. Compiled
+/// from the Cargo package name/version so it can never drift from the shipped
+/// artifact; stable, nonsecret, and provider-neutral (no browser disguise, no
+/// per-provider value). Gateway/WAF policy may rely on it: a compatible HTTPS
+/// gateway behind a Cloudflare-style rule rejects UA-less requests with HTTP
+/// 403 while this identifier passes, and it is identical for the OpenAI and
+/// Anthropic adapters.
+pub(super) const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
 /// Builds the locked-down production HTTP client shared by every direct adapter:
-/// redirects disabled, automatic retries disabled, ambient proxy disabled. An
-/// adapter attempt therefore never sends more than one POST, and any POST it
-/// sends carries the complete full request (pre-send cancellation,
-/// `AuthMissing`, validation and encoding/build failures can produce zero
-/// POSTs).
+/// redirects disabled, automatic retries disabled, ambient proxy disabled, and
+/// an explicit fixed product [`USER_AGENT`] installed on every request. An
+/// adapter attempt therefore never sends more than one POST, any POST it sends
+/// carries the complete full request (pre-send cancellation, `AuthMissing`,
+/// validation and encoding/build failures can produce zero POSTs), and every
+/// POST identifies itself with the exact same nonsecret product UA.
 pub(super) fn build_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .no_proxy()
+        .user_agent(USER_AGENT)
         .build()
 }
 

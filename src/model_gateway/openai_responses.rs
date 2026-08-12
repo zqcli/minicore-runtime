@@ -1439,6 +1439,15 @@ mod tests {
         );
         assert_eq!(request.header("content-type"), Some("application/json"));
         assert_eq!(request.header("accept"), Some("text/event-stream"));
+        assert_eq!(
+            request.header("user-agent"),
+            // The shared locked-down transport contract (provider_transport::USER_AGENT):
+            // the exact fixed product UA, identical for every direct adapter, never a
+            // browser disguise. Pinned literally so the wire value cannot drift from
+            // the compile-time package name/version concat without failing this test.
+            Some("minicore-runtime/0.1.0"),
+            "every adapter POST must carry the fixed product user-agent"
+        );
         let content_length: usize = request
             .header("content-length")
             .expect("content-length header must be present")
