@@ -1,12 +1,15 @@
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use thiserror::Error;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime_task::RuntimeTaskContext;
@@ -15,7 +18,7 @@ use crate::wire::lexical::{
     validate_safe_text, validate_stable_symbolic_key,
 };
 use crate::wire::{BoundedJsonObject, BoundedJsonSchema, ItemId, ProtocolLimits};
-use crate::workspace::WorkspaceToolContext;
+use crate::workspace::{WorkspaceFileMutationKey, WorkspaceToolContext};
 
 /// The M14 production `ask_user` builtin: one closed, default-off, Runtime-owned Tool.
 mod ask_user;
@@ -387,6 +390,383 @@ impl ToolExecutionStart {
     }
 }
 
+/// The move-only preparation factory of one exact file-mutation plan.
+///
+/// The synchronous Tool planner only constructs the factory: constructing it performs no
+/// I/O and no await.  The round owner invokes the factory exactly once and awaits its
+/// future to full settlement (the future is never dropped because of a signal); the future
+/// settles the [`PreparedToolExecution`]: a ready opaque mutation key plus the move-only
+/// start factory, or a truthful unstarted `ToolExecutionResult`.  The factory and its
+/// result stay deep and redacted: no Workspace handle or path ever leaves the producing
+/// builtin, and there is no generic resource-lock abstraction anywhere on this surface.
+#[allow(
+    dead_code,
+    reason = "the production write_file planner constructs this in its own slice; scripted test planners use the cfg(test) constructor"
+)]
+pub(crate) struct ToolExecutionPreparation {
+    factory: Box<dyn FnOnce() -> ToolExecutionPreparationFuture + Send>,
+}
+
+/// The Send preparation future one exact file-mutation factory produces.
+pub(crate) type ToolExecutionPreparationFuture =
+    Pin<Box<dyn Future<Output = PreparedToolExecution> + Send + 'static>>;
+
+impl ToolExecutionPreparation {
+    /// Test-visible constructor for scripted planners; the production write_file planner
+    /// supplies the production constructor in its own slice.
+    #[cfg(test)]
+    pub(crate) fn new(
+        factory: impl FnOnce() -> ToolExecutionPreparationFuture + Send + 'static,
+    ) -> Self {
+        Self {
+            factory: Box::new(factory),
+        }
+    }
+
+    /// The owner-only factory invocation: consumes the preparation and constructs its
+    /// future.  Only the round owner's mutation preparation phase calls this, and only
+    /// after the exact emergency basis was still unsignaled; the owner re-checks the same
+    /// exact basis at the post-settlement boundary before any queue ticket is reserved.
+    pub(crate) fn prepare(self) -> ToolExecutionPreparationFuture {
+        (self.factory)()
+    }
+}
+
+impl fmt::Debug for ToolExecutionPreparation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ToolExecutionPreparation { .. }")
+    }
+}
+
+/// The settled outcome of one file-mutation preparation.
+///
+/// `Ready` carries the opaque [`WorkspaceFileMutationKey`] the Session queue serializes on
+/// plus the move-only [`ToolExecutionStart`] factory; `Unstarted` carries a truthful
+/// unstarted result (a `PreExecution` shape or an explicit `Abandoned`) that settles under
+/// the existing unstarted first-wins without any start.  A malformed `Completed` shape
+/// fails closed under that same pre-execution binding.  A `Ready` that settles after the
+/// exact emergency basis was signaled meanwhile is dropped by the round owner without any
+/// queue reservation or start, keeping the operation unstarted-cancelled.
+#[allow(
+    dead_code,
+    reason = "settled by scripted test preparation futures; the production write_file preparation settles it in its own slice"
+)]
+pub(crate) enum PreparedToolExecution {
+    Ready {
+        key: WorkspaceFileMutationKey,
+        start: ToolExecutionStart,
+    },
+    Unstarted(ToolExecutionResult),
+}
+
+impl fmt::Debug for PreparedToolExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedToolExecution { .. }")
+    }
+}
+
+/// The Session-local FIFO queue that serializes file mutations of one exact physical
+/// target within one loaded Session.
+///
+/// One loaded `SessionExecutorActor` creates exactly one `Arc<SessionFileMutationQueue>` at
+/// start and keeps it until the actor drops; every Turn admission clones the same Arc into
+/// its `AdmissionWork`, and a production ToolSet captures the same queue per admission so
+/// its file-mutation plans can reserve tickets against it.  The queue carries no SessionId:
+/// Session locality comes only from the queue instance's ownership.
+///
+/// The key registry is a private `HashMap` with one entry per mutation key that still has a
+/// waiting ticket or an active permit.  Reservations are synchronous and happen in
+/// assistant `call_index` order, so no future-poll ordering can determine ticket order.
+/// Same-key tickets are FIFO; different keys are independent.  A dropped/cancelled waiting
+/// ticket is removed from its key's queue and wakes the next waiter; dropping a permit
+/// releases the active holder and wakes the next waiter; the key entry is removed after the
+/// last ticket/permit leaves.  All waiting uses per-ticket `Notify` wakes under the owner
+/// mutex — no sleep, no yield, no polling.
+#[derive(Clone)]
+pub(crate) struct SessionFileMutationQueue {
+    inner: Arc<SessionFileMutationQueueInner>,
+}
+
+struct SessionFileMutationQueueInner {
+    /// The key registry owner mutex: every reservation, grant, ticket drop, and permit
+    /// release serializes here (short critical sections, no await, no callback).
+    state: Mutex<SessionFileMutationQueueState>,
+}
+
+#[derive(Default)]
+struct SessionFileMutationQueueState {
+    entries: HashMap<WorkspaceFileMutationKey, FileMutationQueueEntry>,
+}
+
+#[derive(Default)]
+struct FileMutationQueueEntry {
+    /// Waiting tickets in reservation order for this exact key.
+    waiting: VecDeque<WaitingFileMutationTicket>,
+    /// The active permit holder, if any: exactly one per key while a mutation runs.
+    active: Option<ActiveFileMutationPermit>,
+}
+
+/// One waiting ticket slot inside a key's FIFO: the exact `ToolExecutionRequest` capture
+/// bound at reservation plus the per-ticket wake handle.
+struct WaitingFileMutationTicket {
+    request: ToolExecutionRequest,
+    wake: Arc<Notify>,
+}
+
+/// The active permit marker: exactly one per key, installed only by a grant and cleared
+/// only by the permit's drop.
+struct ActiveFileMutationPermit;
+
+impl SessionFileMutationQueue {
+    /// Creates one empty Session-local queue.  The loaded `SessionExecutorActor` calls this
+    /// exactly once at start and keeps the returned `Arc` until the actor drops.
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(SessionFileMutationQueueInner {
+                state: Mutex::new(SessionFileMutationQueueState::default()),
+            }),
+        })
+    }
+
+    /// Synchronously reserves one exact-request-bound waiting ticket for the given mutation
+    /// key, appending it to the key's FIFO (creating the key entry on first reservation).
+    /// The caller (the round owner) reserves in assistant `call_index` order before any
+    /// remaining operation is driven, so ticket order never depends on future polling.
+    pub(crate) fn reserve(
+        &self,
+        key: WorkspaceFileMutationKey,
+        request: &ToolExecutionRequest,
+    ) -> SessionFileMutationTicket {
+        let wake = Arc::new(Notify::new());
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("the session file mutation queue state is not poisoned");
+        state
+            .entries
+            .entry(key.clone())
+            .or_default()
+            .waiting
+            .push_back(WaitingFileMutationTicket {
+                request: request.clone(),
+                wake: Arc::clone(&wake),
+            });
+        SessionFileMutationTicket {
+            queue: Arc::clone(&self.inner),
+            key,
+            wake,
+        }
+    }
+
+    /// Test-only registry probe: the number of key entries that still hold a waiting ticket
+    /// or an active permit.
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .expect("the session file mutation queue state is not poisoned")
+            .entries
+            .len()
+    }
+}
+
+impl SessionFileMutationQueueInner {
+    /// One synchronous grant attempt under the owner mutex, shared by the fast path and the
+    /// notified re-checks of [`SessionFileMutationTicket::wait`].
+    ///
+    /// `None` means this ticket is not the head of its key's FIFO or the key has an active
+    /// permit holder, so the waiter keeps parking.  `Some(Ok(permit))` grants the turn: the
+    /// head ticket is removed and the active holder installed.  A foreign exact request
+    /// (the wait's expected capture is not the exact capture bound at reservation) fails
+    /// closed: the head ticket is removed and the next waiter woken, and the error is
+    /// returned without any permit.
+    fn try_grant(
+        self: &Arc<Self>,
+        key: &WorkspaceFileMutationKey,
+        wake: &Arc<Notify>,
+        expected: &ToolExecutionRequest,
+    ) -> Option<Result<SessionFileMutationPermit, SessionFileMutationError>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("the session file mutation queue state is not poisoned");
+        let entry = state.entries.get_mut(key)?;
+        if entry.active.is_some() {
+            return None;
+        }
+        let head = entry.waiting.front()?;
+        if !Arc::ptr_eq(&head.wake, wake) {
+            return None;
+        }
+        if !head.request.is_exact_capture(expected) {
+            // Foreign exact request: fail closed, remove this ticket, and wake the next.
+            entry.waiting.pop_front();
+            let next = entry.waiting.front().map(|ticket| ticket.wake.clone());
+            if entry.waiting.is_empty() {
+                state.entries.remove(key);
+            }
+            drop(state);
+            if let Some(next) = next {
+                next.notify_one();
+            }
+            return Some(Err(SessionFileMutationError::ForeignRequest));
+        }
+        let _head = entry
+            .waiting
+            .pop_front()
+            .expect("the head ticket was just verified");
+        entry.active = Some(ActiveFileMutationPermit);
+        drop(state);
+        Some(Ok(SessionFileMutationPermit {
+            queue: Arc::clone(self),
+            key: key.clone(),
+        }))
+    }
+}
+
+impl fmt::Debug for SessionFileMutationQueue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionFileMutationQueue { .. }")
+    }
+}
+
+/// The move-only waiting ticket one exact file mutation reserved against its Session queue.
+///
+/// The ticket binds the exact `ToolExecutionRequest` capture of the reservation and is
+/// deliberately not Clone: one reservation is consumed by exactly one wait.  Awaiting the
+/// ticket parks on its own `Notify` until it is the head of its key's FIFO with no active
+/// permit; dropping an unconsumed ticket removes it from the queue and wakes the next
+/// same-key waiter.
+pub(crate) struct SessionFileMutationTicket {
+    queue: Arc<SessionFileMutationQueueInner>,
+    key: WorkspaceFileMutationKey,
+    wake: Arc<Notify>,
+}
+
+impl SessionFileMutationTicket {
+    /// Awaits this ticket's turn and returns the move-only permit, or fails closed when the
+    /// expected request is not the exact capture bound at reservation (the queue already
+    /// removed the ticket and woke the next waiter).
+    pub(crate) async fn wait(
+        self,
+        expected: ToolExecutionRequest,
+    ) -> Result<SessionFileMutationPermit, SessionFileMutationError> {
+        // The synchronous fast path: a ticket that is already the head with no active
+        // holder grants immediately, without ever parking.
+        if let Some(result) = self.queue.try_grant(&self.key, &self.wake, &expected) {
+            return result;
+        }
+        // Park on the per-ticket wake handle: every grant, cancellation, and release that
+        // moves this ticket's turn notifies exactly this handle, and a notification that
+        // arrives before the waiter parks is retained by the Notify, so no wakeup is ever
+        // lost and no sleep/yield polling exists anywhere in the queue.
+        let mut notified = Box::pin(self.wake.notified());
+        loop {
+            notified.as_mut().await;
+            match self.queue.try_grant(&self.key, &self.wake, &expected) {
+                Some(result) => return result,
+                None => {
+                    // A stale wake (the ticket is not yet the head): re-park on a fresh
+                    // notified future, which retains any notification that arrived meanwhile.
+                    notified = Box::pin(self.wake.notified());
+                }
+            }
+        }
+    }
+}
+
+impl Drop for SessionFileMutationTicket {
+    fn drop(&mut self) {
+        // A dropped/cancelled waiting ticket leaves its key's FIFO and wakes the next
+        // same-key waiter; the key entry is removed when no ticket and no permit remain.
+        let mut state = self
+            .queue
+            .state
+            .lock()
+            .expect("the session file mutation queue state is not poisoned");
+        let Some(entry) = state.entries.get_mut(&self.key) else {
+            return;
+        };
+        let Some(position) = entry
+            .waiting
+            .iter()
+            .position(|ticket| Arc::ptr_eq(&ticket.wake, &self.wake))
+        else {
+            // The ticket was already granted or removed; nothing left to do.
+            return;
+        };
+        entry.waiting.remove(position);
+        let next = entry.waiting.front().map(|ticket| ticket.wake.clone());
+        if entry.waiting.is_empty() && entry.active.is_none() {
+            state.entries.remove(&self.key);
+        }
+        drop(state);
+        if let Some(next) = next {
+            next.notify_one();
+        }
+    }
+}
+
+impl fmt::Debug for SessionFileMutationTicket {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionFileMutationTicket { .. }")
+    }
+}
+
+/// The move-only permit that one exact file mutation holds from its queue turn until its
+/// whole outcome settles.
+///
+/// Only [`SessionFileMutationTicket::wait`] constructs it, at the exact moment the ticket
+/// becomes the head of its key's FIFO with no active holder.  Dropping the permit releases
+/// the active holder and wakes the next same-key waiter; the key entry is removed when no
+/// ticket and no permit remain.  The permit is deliberately not Clone: one queue turn is
+/// consumed by exactly one mutation, and the started operation's slot owns it through
+/// Running/Settling and releases it only at Settling → Terminal.
+pub(crate) struct SessionFileMutationPermit {
+    queue: Arc<SessionFileMutationQueueInner>,
+    key: WorkspaceFileMutationKey,
+}
+
+impl Drop for SessionFileMutationPermit {
+    fn drop(&mut self) {
+        // Releasing the active holder wakes the next same-key waiter; the key entry is
+        // removed when no ticket and no permit remain.
+        let mut state = self
+            .queue
+            .state
+            .lock()
+            .expect("the session file mutation queue state is not poisoned");
+        let Some(entry) = state.entries.get_mut(&self.key) else {
+            return;
+        };
+        entry.active = None;
+        let next = entry.waiting.front().map(|ticket| ticket.wake.clone());
+        if entry.waiting.is_empty() {
+            state.entries.remove(&self.key);
+        }
+        drop(state);
+        if let Some(next) = next {
+            next.notify_one();
+        }
+    }
+}
+
+impl fmt::Debug for SessionFileMutationPermit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionFileMutationPermit { .. }")
+    }
+}
+
+/// The closed failure of one waiting ticket's grant: a foreign exact request awaited a
+/// ticket bound to another request's capture.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionFileMutationError {
+    #[error("a file mutation ticket was awaited by a foreign exact request")]
+    ForeignRequest,
+}
+
 #[cfg(test)]
 impl ToolExecutionPlan {
     /// Test-visible constructor for the empty default permission set.
@@ -394,6 +774,22 @@ impl ToolExecutionPlan {
         Self::Execute {
             permissions: ToolPermissionSet::new([]),
             start,
+        }
+    }
+
+    /// Test-visible constructor for scripted file-mutation plans: the exact final
+    /// permission set, the move-only preparation factory, and the exact Session queue the
+    /// round reserves against.  The production write_file planner supplies its own
+    /// constructor in its own slice.
+    pub(crate) fn file_mutation(
+        permissions: ToolPermissionSet,
+        prepare: ToolExecutionPreparation,
+        queue: Arc<SessionFileMutationQueue>,
+    ) -> Self {
+        Self::FileMutation {
+            permissions,
+            prepare,
+            queue,
         }
     }
 }
@@ -519,6 +915,32 @@ pub(crate) enum ToolExecutionPlan {
     UserQuestion {
         request: UserQuestionRequest,
         answer: UserQuestionAnswerBinding,
+    },
+    /// One file mutation: the plan's final permission set is admitted exactly like
+    /// `Execute`, and the move-only preparation factory performs no I/O and no await at
+    /// plan time.  The round owner invokes the factory and awaits its future to full
+    /// settlement, then reserves the exact Session queue ticket synchronously in call_index
+    /// order; the started operation waits for its ticket before any start-gate reservation.
+    FileMutation {
+        /// The plan's final class-level permission set (the admission input).
+        permissions: ToolPermissionSet,
+        /// The move-only preparation factory: constructs the Send future that settles the
+        /// ready key + start factory or a truthful unstarted result.
+        prepare: ToolExecutionPreparation,
+        /// The exact Session-local mutation queue captured at admission: the round owner
+        /// reserves this plan's ticket against it, in call_index order.
+        queue: Arc<SessionFileMutationQueue>,
+    },
+    /// One prepared file mutation: the round owner already invoked the preparation factory,
+    /// awaited its full settlement, and synchronously reserved the exact Session queue
+    /// ticket.  The slot waits for its ticket against the exact emergency basis, then
+    /// reserves/starts the gate and carries the queue permit through Running/Settling,
+    /// releasing it only at Settling → Terminal.
+    PreparedFileMutation {
+        /// The move-only reserved queue ticket the slot awaits before any start.
+        ticket: SessionFileMutationTicket,
+        /// The ready start factory from the settled preparation.
+        start: ToolExecutionStart,
     },
     /// A frozen known-tool preflight result (schema, policy, hook, or sandbox preflight): the
     /// request settles as PreExecution without any start-gate reservation and the executor is
@@ -1187,6 +1609,22 @@ impl ToolSet {
                     Err(error) => Some(ToolExecutionPlan::PreExecution(error.denied_result())),
                 }
             }
+            // A file-mutation plan is admitted exactly like Execute: the same class-level
+            // sandbox admission runs on the plan's final permission set, and a denied
+            // admission freezes the same PreExecution Denied result without ever
+            // constructing or invoking any preparation job.
+            ToolExecutionPlan::FileMutation {
+                permissions,
+                prepare,
+                queue,
+            } => match self.inner.sandbox.admit(permissions) {
+                Ok(_) => Some(ToolExecutionPlan::FileMutation {
+                    permissions,
+                    prepare,
+                    queue,
+                }),
+                Err(error) => Some(ToolExecutionPlan::PreExecution(error.denied_result())),
+            },
             plan => Some(plan),
         }
     }
@@ -1521,11 +1959,14 @@ impl ProductionToolConfig {
     /// composed set containing exactly the enabled members in the frozen `ask_user` →
     /// `read_file` → `list_directory` order, bound to the exact Workspace tool context and
     /// Runtime task context, with one frozen three-route planner and the `FilesystemRead`
-    /// outer sandbox contract.
+    /// outer sandbox contract.  The exact Session-local mutation queue is captured into the
+    /// composed planner for the future write_file route; the three current builtins ignore
+    /// it.
     pub(crate) fn for_workspace(
         &self,
         workspace: WorkspaceToolContext,
         task_context: RuntimeTaskContext,
+        file_mutation_queue: Arc<SessionFileMutationQueue>,
     ) -> Arc<ToolSet> {
         if !self.read_file && !self.list_directory {
             return Arc::clone(&self.base);
@@ -1536,6 +1977,7 @@ impl ProductionToolConfig {
             self.list_directory,
             workspace,
             task_context,
+            file_mutation_queue,
         )
     }
 }
@@ -1557,15 +1999,21 @@ pub(crate) enum TurnToolResources {
 impl TurnToolResources {
     /// Materializes the exact ToolSet for one admission: a `Captured` set returns its Arc
     /// unchanged, while a `Production` config installs its set against the exact captured
-    /// Workspace tool context.  Consumes `self` so one admission materializes exactly once.
+    /// Workspace tool context.  The exact Session-local mutation queue is passed through so
+    /// a production ToolSet may capture the same queue per admission (the current three
+    /// builtins ignore it; the future write_file route binds its mutation plans to it).
+    /// Consumes `self` so one admission materializes exactly once.
     pub(crate) fn materialize(
         self,
         workspace: WorkspaceToolContext,
         task_context: RuntimeTaskContext,
+        file_mutation_queue: Arc<SessionFileMutationQueue>,
     ) -> Arc<ToolSet> {
         match self {
             TurnToolResources::Captured(tool_set) => tool_set,
-            TurnToolResources::Production(config) => config.for_workspace(workspace, task_context),
+            TurnToolResources::Production(config) => {
+                config.for_workspace(workspace, task_context, file_mutation_queue)
+            }
         }
     }
 }
@@ -1587,6 +2035,7 @@ fn composed_production_tool_set(
     list_directory: bool,
     workspace: WorkspaceToolContext,
     task_context: RuntimeTaskContext,
+    file_mutation_queue: Arc<SessionFileMutationQueue>,
 ) -> Arc<ToolSet> {
     let mut definitions: Vec<ToolDefinition> = Vec::new();
     if ask_user {
@@ -1605,18 +2054,28 @@ fn composed_production_tool_set(
     let planner: Arc<ToolPlanner> = Arc::new({
         let workspace = workspace.clone();
         let task_context = task_context.clone();
-        move |request| match request.call().name().as_str() {
-            ask_user::ASK_USER_NAME => ask_user::plan(request),
-            read_file::READ_FILE_NAME => read_file::plan(&workspace, &task_context, request),
-            list_directory::LIST_DIRECTORY_NAME => {
-                list_directory::plan(&workspace, &task_context, request)
+        // The exact Session-local mutation queue captured at this admission: the frozen
+        // write_file route (the next slice) binds its mutation plans to this queue; the
+        // three current builtins never touch it.
+        let file_mutation_queue = Arc::clone(&file_mutation_queue);
+        move |request| {
+            // Keep the per-admission queue capture owned by the composed planner so the
+            // future write_file route can embed it into its mutation plans; the current
+            // routes never touch it.
+            let _queue_capture = &file_mutation_queue;
+            match request.call().name().as_str() {
+                ask_user::ASK_USER_NAME => ask_user::plan(request),
+                read_file::READ_FILE_NAME => read_file::plan(&workspace, &task_context, request),
+                list_directory::LIST_DIRECTORY_NAME => {
+                    list_directory::plan(&workspace, &task_context, request)
+                }
+                // The normal ToolSet lookup invokes the planner only for a name present in this
+                // set's definitions, which are exactly the enabled frozen names above, so no
+                // other name can ever reach the composed planner.
+                _ => unreachable!(
+                    "the composed production ToolSet routes exactly the three frozen builtin names"
+                ),
             }
-            // The normal ToolSet lookup invokes the planner only for a name present in this
-            // set's definitions, which are exactly the enabled frozen names above, so no
-            // other name can ever reach the composed planner.
-            _ => unreachable!(
-                "the composed production ToolSet routes exactly the three frozen builtin names"
-            ),
         }
     });
     Arc::new(ToolSet {
@@ -5060,7 +5519,11 @@ mod tests {
                 selection.read_file,
                 selection.list_directory,
             );
-            let set = config.for_workspace(rig.workspace.clone(), rig.task_context.clone());
+            let set = config.for_workspace(
+                rig.workspace.clone(),
+                rig.task_context.clone(),
+                SessionFileMutationQueue::new(),
+            );
 
             // Exactly the enabled definitions and prompt specs in the one frozen order,
             // with no duplicates.
@@ -5099,7 +5562,11 @@ mod tests {
             // Arc reuse: no workspace-bound tool means every materialization returns the
             // same captured base Arc; any workspace-bound tool means a fresh Arc per
             // admission, bound to the exact Workspace/task contexts.
-            let again = config.for_workspace(rig.workspace.clone(), rig.task_context.clone());
+            let again = config.for_workspace(
+                rig.workspace.clone(),
+                rig.task_context.clone(),
+                SessionFileMutationQueue::new(),
+            );
             if has_workspace_tools {
                 assert!(!Arc::ptr_eq(&set, &again), "selection {selection:?}");
                 assert_eq!(
@@ -5123,7 +5590,11 @@ mod tests {
                 selection.read_file,
                 selection.list_directory,
             );
-            let set = config.for_workspace(rig.workspace.clone(), rig.task_context.clone());
+            let set = config.for_workspace(
+                rig.workspace.clone(),
+                rig.task_context.clone(),
+                SessionFileMutationQueue::new(),
+            );
             let enabled = |name: &'static str| selection.names.contains(&name);
 
             // ask_user route: exactly its typed UserQuestion when selected (invalid
@@ -5239,8 +5710,11 @@ mod tests {
     async fn turn_tool_resources_captured_materialize_returns_the_same_arc() {
         let rig = composition_workspace().await;
         let set = ToolSet::ask_user_builtin();
-        let materialized = TurnToolResources::Captured(Arc::clone(&set))
-            .materialize(rig.workspace.clone(), rig.task_context.clone());
+        let materialized = TurnToolResources::Captured(Arc::clone(&set)).materialize(
+            rig.workspace.clone(),
+            rig.task_context.clone(),
+            SessionFileMutationQueue::new(),
+        );
         // A captured carrier returns its exact Arc unchanged, untouched by the Workspace
         // or task context and by any later reload.
         assert!(Arc::ptr_eq(&set, &materialized));
@@ -5257,7 +5731,11 @@ mod tests {
     {
         let rig = composition_workspace().await;
         let set = TurnToolResources::Production(ProductionToolConfig::new(false, true, false))
-            .materialize(rig.workspace.clone(), rig.task_context.clone());
+            .materialize(
+                rig.workspace.clone(),
+                rig.task_context.clone(),
+                SessionFileMutationQueue::new(),
+            );
         // The production read_file selection materializes the exact workspace-bound set:
         // one read_file definition and prompt spec with the FilesystemRead outer contract.
         let definitions = set.definitions();
@@ -5276,7 +5754,11 @@ mod tests {
      {
         let rig = composition_workspace().await;
         let set = TurnToolResources::Production(ProductionToolConfig::new(false, false, true))
-            .materialize(rig.workspace.clone(), rig.task_context.clone());
+            .materialize(
+                rig.workspace.clone(),
+                rig.task_context.clone(),
+                SessionFileMutationQueue::new(),
+            );
         // The production list_directory selection materializes the exact workspace-bound
         // set: one list_directory definition and prompt spec with the FilesystemRead outer
         // contract, and its empty-cwd route plans Execute with exactly FilesystemRead.
@@ -5308,7 +5790,11 @@ mod tests {
     async fn turn_tool_resources_production_materialize_installs_the_composed_read_and_list_set() {
         let rig = composition_workspace().await;
         let set = TurnToolResources::Production(ProductionToolConfig::new(false, true, true))
-            .materialize(rig.workspace.clone(), rig.task_context.clone());
+            .materialize(
+                rig.workspace.clone(),
+                rig.task_context.clone(),
+                SessionFileMutationQueue::new(),
+            );
         // The production read_file + list_directory selection materializes one composed
         // workspace-bound set in the frozen order, both routes planning Execute with the
         // same FilesystemRead outer contract.
@@ -5347,5 +5833,384 @@ mod tests {
             );
         }
         rig.task_context.shutdown().await;
+    }
+
+    // ---------- SessionFileMutationQueue + file-mutation plan shape ----------
+
+    /// One real temp-dir ReadWrite workspace lowered through the write-access resolver,
+    /// exposing two distinct prepared mutation keys for the queue tests.
+    struct MutationQueueFixture {
+        _temporary: CompositionTempDir,
+        task_context: RuntimeTaskContext,
+        target: WorkspaceFileMutationKey,
+        other: WorkspaceFileMutationKey,
+    }
+
+    async fn mutation_queue_fixture() -> MutationQueueFixture {
+        let temporary = CompositionTempDir::new("mutation-queue");
+        write_fixture(temporary.path(), "target.txt", b"body");
+        write_fixture(temporary.path(), "other.txt", b"body");
+        let task_context = RuntimeTaskContext::new(tokio::runtime::Handle::current())
+            .await
+            .expect("the test runtime provides tracked task admission");
+        let (resolver, _control) = WorkspaceResolver::new_with_write_access(task_context.clone());
+        let workspace = lower_workspace(
+            WorkspaceDefinitionInput::new(
+                WorkspaceRootInput::new(
+                    "primary".parse().unwrap(),
+                    format!("file://{}", temporary.path().display())
+                        .parse()
+                        .unwrap(),
+                    RequestedFilesystemAccess::ReadWrite,
+                    WorkspaceSourcePolicy::new(false, false),
+                ),
+                Vec::new(),
+                WorkspaceCwdSpec::new("primary".parse().unwrap(), "".parse().unwrap()),
+            )
+            .unwrap(),
+            WorkspaceRevision::new(NonZeroU64::new(1).expect("the test revision is non-zero")),
+            WorkspacePathTarget::Posix,
+        )
+        .expect("the test workspace lowers");
+        let candidate = resolver
+            .resolve(composition_session_id(), &workspace)
+            .await
+            .expect("the test workspace resolves");
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .expect("the test snapshot finishes");
+        let tool_context = snapshot.tool_context();
+        let access = tool_context.access();
+        let prepared = |name: &str| {
+            access
+                .authorize_write(&name.parse().unwrap())
+                .expect("the fixture target authorizes")
+                .prepare()
+                .expect("the fixture target prepares")
+        };
+        let target = prepared("target.txt").key();
+        let other = prepared("other.txt").key();
+        assert_ne!(
+            target, other,
+            "the two fixture files are distinct mutation keys"
+        );
+        MutationQueueFixture {
+            _temporary: temporary,
+            task_context,
+            target,
+            other,
+        }
+    }
+
+    fn mutation_request(suffix: u8, call: &str, call_index: u32) -> ToolExecutionRequest {
+        ToolExecutionRequest::new(
+            format!("itm_000000000000000000000000000000{suffix:02x}")
+                .parse()
+                .unwrap(),
+            ToolCall::new(
+                call.parse().unwrap(),
+                "write_file".parse().unwrap(),
+                "{}".parse().unwrap(),
+                call_index,
+            ),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_queue_same_key_grants_fifo_by_reservation_order_and_cleans_entries() {
+        let fixture = mutation_queue_fixture().await;
+        let queue = SessionFileMutationQueue::new();
+        let r1 = mutation_request(0x11, "call_one", 0);
+        let r2 = mutation_request(0x12, "call_two", 1);
+        let r3 = mutation_request(0x13, "call_three", 2);
+        let t1 = queue.reserve(fixture.target.clone(), &r1);
+        let t2 = queue.reserve(fixture.target.clone(), &r2);
+        let t3 = queue.reserve(fixture.target.clone(), &r3);
+        assert_eq!(
+            queue.entry_count(),
+            1,
+            "one key entry holds the three tickets"
+        );
+        let p1 = t1
+            .wait(r1.clone())
+            .await
+            .expect("the first reservation grants immediately");
+        // The later siblings can only grant when their turn arrives: record the grant
+        // order through spawned waiters, then drop the permits in reservation order.  The
+        // grants are only reachable through the queue's Notify, so the recorded order is
+        // deterministic and never depends on future polling.
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let waiter = |ticket: SessionFileMutationTicket,
+                      request: ToolExecutionRequest,
+                      tag: &'static str| {
+            let order = Arc::clone(&order);
+            async move {
+                let permit = ticket
+                    .wait(request.clone())
+                    .await
+                    .expect("the ticket grants in FIFO order");
+                order.lock().unwrap().push(tag);
+                permit
+            }
+        };
+        let second = tokio::spawn(waiter(t2, r2.clone(), "two"));
+        let third = tokio::spawn(waiter(t3, r3.clone(), "three"));
+        // p1 still holds the key: neither sibling can have granted yet.
+        assert_eq!(*order.lock().unwrap(), Vec::<&str>::new());
+        drop(p1);
+        let p2 = second.await.expect("the second waiter task settles");
+        assert_eq!(*order.lock().unwrap(), ["two"]);
+        // The third ticket still waits behind the second permit.
+        drop(p2);
+        let p3 = third.await.expect("the third waiter task settles");
+        assert_eq!(*order.lock().unwrap(), ["two", "three"]);
+        assert_eq!(
+            queue.entry_count(),
+            1,
+            "the third permit still holds the entry"
+        );
+        drop(p3);
+        assert_eq!(
+            queue.entry_count(),
+            0,
+            "the last permit removes the key entry"
+        );
+        fixture.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_queue_different_keys_acquire_concurrently() {
+        let fixture = mutation_queue_fixture().await;
+        let queue = SessionFileMutationQueue::new();
+        let ra = mutation_request(0x21, "call_a", 0);
+        let rb = mutation_request(0x22, "call_b", 1);
+        let ta = queue.reserve(fixture.target.clone(), &ra);
+        let tb = queue.reserve(fixture.other.clone(), &rb);
+        let pa = ta.wait(ra.clone()).await.expect("the target ticket grants");
+        // The different-key ticket grants while the target key is still held: keys are
+        // independent, so both permits coexist.
+        let pb = tb
+            .wait(rb.clone())
+            .await
+            .expect("the other ticket grants without waiting");
+        assert_eq!(queue.entry_count(), 2);
+        drop(pa);
+        assert_eq!(
+            queue.entry_count(),
+            1,
+            "the other key entry stays until its permit drops"
+        );
+        drop(pb);
+        assert_eq!(
+            queue.entry_count(),
+            0,
+            "the last permit removes its key entry"
+        );
+        fixture.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_queue_waiting_ticket_cancellation_or_drop_wakes_the_next() {
+        let fixture = mutation_queue_fixture().await;
+        let queue = SessionFileMutationQueue::new();
+        let r1 = mutation_request(0x31, "call_one", 0);
+        let r2 = mutation_request(0x32, "call_two", 1);
+        let r3 = mutation_request(0x33, "call_three", 2);
+
+        // A dropped waiting ticket (never awaited) leaves the FIFO and lets the next
+        // reservation grant immediately.
+        let t1 = queue.reserve(fixture.target.clone(), &r1);
+        let t2 = queue.reserve(fixture.target.clone(), &r2);
+        drop(t1);
+        let p2 = t2
+            .wait(r2.clone())
+            .await
+            .expect("the next ticket grants after the drop");
+        drop(p2);
+        assert_eq!(queue.entry_count(), 0);
+
+        // A cancelled waiting ticket (the wait future is dropped while parked behind an
+        // active permit) is removed and wakes the next waiter.
+        let t1 = queue.reserve(fixture.target.clone(), &r1);
+        let t2 = queue.reserve(fixture.target.clone(), &r2);
+        let t3 = queue.reserve(fixture.target.clone(), &r3);
+        let p1 = t1
+            .wait(r1.clone())
+            .await
+            .expect("the first reservation grants");
+        let parked = tokio::spawn(t2.wait(r2.clone()));
+        // Cancel the parked waiter: aborting the task drops the wait future and therefore
+        // the waiting ticket, which removes it from the queue.
+        parked.abort();
+        let _ = parked.await;
+        assert_eq!(queue.entry_count(), 1, "only t3 remains queued behind p1");
+        // The cancellation removed t2, so releasing p1 wakes t3 directly.
+        drop(p1);
+        let p3 = t3
+            .wait(r3.clone())
+            .await
+            .expect("the next waiter grants after the cancellation");
+        drop(p3);
+        assert_eq!(queue.entry_count(), 0);
+        fixture.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_queue_foreign_exact_request_fails_closed_and_does_not_block_the_next() {
+        let fixture = mutation_queue_fixture().await;
+        let queue = SessionFileMutationQueue::new();
+        let r1 = mutation_request(0x41, "call_one", 0);
+        let r2 = mutation_request(0x42, "call_two", 1);
+        let r3 = mutation_request(0x43, "call_three", 2);
+        let t1 = queue.reserve(fixture.target.clone(), &r1);
+        let t2 = queue.reserve(fixture.target.clone(), &r2);
+        let t3 = queue.reserve(fixture.target.clone(), &r3);
+        let p1 = t1
+            .wait(r1.clone())
+            .await
+            .expect("the first reservation grants");
+        // The second ticket is awaited by a foreign exact request: the queue must fail it
+        // closed and remove its ticket instead of granting.
+        let foreign = tokio::spawn(t2.wait(r3.clone()));
+        drop(p1);
+        let result = foreign.await.expect("the foreign waiter task settles");
+        assert!(
+            matches!(result, Err(SessionFileMutationError::ForeignRequest)),
+            "the foreign exact request fails closed"
+        );
+        // The foreign ticket was removed and the next waiter woken: t3 grants immediately.
+        let p3 = t3
+            .wait(r3.clone())
+            .await
+            .expect("the next ticket grants after the foreign fail-closed");
+        assert_eq!(queue.entry_count(), 1);
+        drop(p3);
+        assert_eq!(queue.entry_count(), 0);
+        fixture.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_queue_separate_instances_never_coordinate() {
+        let fixture = mutation_queue_fixture().await;
+        let queue_a = SessionFileMutationQueue::new();
+        let queue_b = SessionFileMutationQueue::new();
+        let r1 = mutation_request(0x51, "call_one", 0);
+        let r2 = mutation_request(0x52, "call_two", 1);
+        let ta1 = queue_a.reserve(fixture.target.clone(), &r1);
+        let ta2 = queue_a.reserve(fixture.target.clone(), &r2);
+        let tb = queue_b.reserve(fixture.target.clone(), &r1);
+        let pa1 = ta1
+            .wait(r1.clone())
+            .await
+            .expect("queue A grants its head ticket");
+        // The other Session queue holds the same physical key but grants immediately: two
+        // queues never coordinate, even for the same file.
+        let pb = tb
+            .wait(r1.clone())
+            .await
+            .expect("queue B grants independently of queue A");
+        // Queue A's own second ticket still waits behind its first permit.
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let order_two = Arc::clone(&order);
+        let second = tokio::spawn(async move {
+            let permit = ta2
+                .wait(r2.clone())
+                .await
+                .expect("queue A's second ticket waits for its turn");
+            order_two.lock().unwrap().push("a2");
+            permit
+        });
+        assert_eq!(*order.lock().unwrap(), Vec::<&str>::new());
+        drop(pa1);
+        let pa2 = second.await.expect("the queue A waiter task settles");
+        assert_eq!(*order.lock().unwrap(), ["a2"]);
+        drop(pb);
+        drop(pa2);
+        assert_eq!(queue_a.entry_count(), 0);
+        assert_eq!(queue_b.entry_count(), 0);
+        fixture.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_queue_debug_stays_redacted() {
+        let fixture = mutation_queue_fixture().await;
+        let queue = SessionFileMutationQueue::new();
+        let request = mutation_request(0x61, "call_one", 0);
+        let ticket = queue.reserve(fixture.target.clone(), &request);
+        assert_eq!(format!("{queue:?}"), "SessionFileMutationQueue { .. }");
+        assert_eq!(format!("{ticket:?}"), "SessionFileMutationTicket { .. }");
+        let permit = ticket
+            .wait(request.clone())
+            .await
+            .expect("the ticket grants");
+        assert_eq!(format!("{permit:?}"), "SessionFileMutationPermit { .. }");
+        assert_eq!(
+            format!("{:?}", fixture.target),
+            "WorkspaceFileMutationKey { .. }"
+        );
+        drop(permit);
+        fixture.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_set_plan_admits_file_mutation_exactly_like_execute() {
+        let queue = SessionFileMutationQueue::new();
+        let denied_queue = Arc::clone(&queue);
+        let definition = ToolDefinition::new(
+            "write_file".parse().unwrap(),
+            "Write one file",
+            "{}".parse().unwrap(),
+            ToolExecutionMode::Parallel,
+        )
+        .unwrap();
+        let request = mutation_request(0x71, "call_write", 0);
+        // The mutation plan is admitted against the captured sandbox exactly like Execute:
+        // an admitted FilesystemWrite plan keeps its shape with the preparation factory
+        // uninvoked (no I/O, no await at plan time), and a denied admission freezes the
+        // same PreExecution Denied result.
+        let admitted = ToolSet::with_sandbox_contract(
+            vec![definition.clone()],
+            ToolSandboxContract::available([C::FilesystemWrite]),
+            move |_request| {
+                ToolExecutionPlan::file_mutation(
+                    ToolPermissionSet::new([C::FilesystemWrite]),
+                    ToolExecutionPreparation::new(|| {
+                        Box::pin(async move {
+                            unreachable!("the preparation factory must not run at plan time")
+                        })
+                    }),
+                    Arc::clone(&queue),
+                )
+            },
+        );
+        let planned = admitted.plan(&request).expect("the known write tool plans");
+        assert!(matches!(
+            planned,
+            ToolExecutionPlan::FileMutation { permissions, .. }
+                if permissions == ToolPermissionSet::new([C::FilesystemWrite])
+        ));
+        let denied = ToolSet::with_sandbox_contract(
+            vec![definition],
+            ToolSandboxContract::available([C::FilesystemRead]),
+            move |_request| {
+                ToolExecutionPlan::file_mutation(
+                    ToolPermissionSet::new([C::FilesystemWrite]),
+                    ToolExecutionPreparation::new(|| {
+                        Box::pin(async move {
+                            unreachable!("the preparation factory must not run at plan time")
+                        })
+                    }),
+                    Arc::clone(&denied_queue),
+                )
+            },
+        );
+        assert!(matches!(
+            denied.plan(&request),
+            Some(ToolExecutionPlan::PreExecution(result))
+                if matches!(result, ToolExecutionResult::PreExecution {
+                    disposition: ToolResultDisposition::Denied,
+                    ..
+                })
+        ));
     }
 }
