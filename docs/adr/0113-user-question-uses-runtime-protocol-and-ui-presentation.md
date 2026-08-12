@@ -1,9 +1,11 @@
 # ADR 0113: UserQuestion 使用 MiniCore 交互协议与 UI 展示 Adapter
 
-状态：Partially Superseded by ADRs 0124, 0126, 0127 and 0133
+状态：Partially Superseded by ADRs 0124, 0126, 0127, 0133 and 0142
 日期：2026-07-25
 
-> 2026-08-11 implementation refinement：crate-private scripted UserQuestion控制正确性seam已实现——typed `ToolExecutionPlan::UserQuestion` + Tools-owned move-only/redacted `UserQuestionAnswerBinding`（仅truthful `PreExecution + Succeeded`接受为answer，malformed/panic fail closed为identity-bound Abandoned）、Session-private concrete `ToolExecutionControl`复用既有Interaction actor/wire/storage owner（无public interface/trait冻结）、question按typed plan shape hoisted到全部ordinary sibling之前（call_index串行、至多一个pending、不预留ToolStartGate/mutation ticket、每个question outcome先apply+inline record再继续）、Cancel/SecurityRevoked/Unload signal-first跳过binding并settle全部unstarted calls为matching PreExecution Cancelled、valid answer产生identity-bound PreExecution Succeeded。本ADR的MiniCore-owned protocol与UI-presentation职责分离继续有效；public ask-user builtin ToolName、schema与answer→model-visible ToolResult text/render格式仍未冻结/实现，production ToolService/executor/adapters仍pending。
+> 2026-08-11 implementation refinement：crate-private scripted UserQuestion控制正确性seam已实现——typed `ToolExecutionPlan::UserQuestion` + Tools-owned move-only/redacted `UserQuestionAnswerBinding`（仅truthful `PreExecution + Succeeded`接受为answer，malformed/panic fail closed为identity-bound Abandoned）、Session-private concrete `ToolExecutionControl`复用既有Interaction actor/wire/storage owner（无public interface/trait冻结）、question按typed plan shape hoisted到全部ordinary sibling之前（call_index串行、至多一个pending、不预留ToolStartGate/mutation ticket、每个question outcome先apply+inline record再继续）、Cancel/SecurityRevoked/Unload signal-first跳过binding并settle全部unstarted calls为matching PreExecution Cancelled、valid answer产生identity-bound PreExecution Succeeded。本ADR的MiniCore-owned protocol与UI-presentation职责分离继续有效；当时尚未冻结的public ask-user builtin surface现由下述ADR 0142补充，production ToolService/executor/adapters仍pending。
+
+> 2026-08-12：[ADR 0142](0142-production-ask-user-is-a-closed-opt-in-builtin.md)冻结production ask-user builtin：ToolName恰为`ask_user`、closed input schema、`MiniCoreRuntimeConfig::with_ask_user_tool()` default-off idempotent opt-in与`ToolSet::ask_user_builtin()`生产构造，answer→model-visible ToolResult为恰一个deterministic compact JSON Text part（`{"answers":[{"questionIndex":3,"value":{"type":"text","data":"hello"}}]}`或choice `{"answers":[{"questionIndex":7,"value":{"type":"choice","data":{"optionIndex":11}}]}`，ascending answer order，optional未答可渲染`{"answers":[]}`）；builtin仅返回UserQuestion或frozen PreExecution failure plans，零capability permission，使用available empty sandbox contract，绝不创建ToolExecutionStart/executor future/cancellation pair/start-gate reservation/approval/OS资源。public ask-user builtin ToolName/schema与answer render格式现已冻结；production ToolService/executor/adapters仍pending。
 
 > [ADR 0133](0133-runtime-public-payload-is-snapshot-recoverable.md)冻结request-scoped approval options、non-secret Text/SingleChoice question payload、safe Runtime view和random request-scoped resolution key；host不能构造PermissionSet或通过Interaction收集credential。
 
@@ -44,7 +46,7 @@ request_user_question(
 
 ### 3. 首版 producer 是独占的 pre-execution ask-user route
 
-- ToolSet 提供一个内建 ask-user route；具体公开 ToolName 不在本 ADR 冻结。
+- ToolSet 提供一个内建 ask-user route；本ADR不冻结具体公开ToolName，后续ADR 0142将其冻结为`ask_user`。
 - route在owner-local Tool start reservation、file mutation ticket reservation和任何外部副作用之前调用`request_user_question`。
 - 等待期间不预留mutation ticket，也不持有TurnControl reservation或`ToolStartPermit`。
 - ask-user route返回`UserAnswer`后生成`PreExecution` truthful ToolResult并append `role=tool`；当同一assistant的全部matching results存在时，ConversationStorage自动形成complete exchange。

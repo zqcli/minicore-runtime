@@ -2415,7 +2415,9 @@ ModelCallResult contains built-in ask-user ToolCall
 → complete exchange后same Turn next PromptSet.assemble
 ```
 
-Pending期间`TurnStatus`和`SessionExecutionState`仍为Running，`TurnExecutionPhase = WaitingForUserInput`。ActiveTurnTask只等待oneshot，对应SessionExecutor control actor继续处理Resolve/Cancel/SecurityRevoked/Unload/Snapshot；其他Session不受影响。等待期间不预留file mutation ticket，也不持有ToolStartGate，elapsed time不会自动关闭Interaction。
+Production builtin（ADR 0142）：ToolName恰为`ask_user`，closed input schema与`MiniCoreRuntimeConfig::with_ask_user_tool()` default-off idempotent opt-in在[Tools](tools.md#production-ask-user-builtin)冻结；builtin绝不创建executor/start factory/approval，也不reserve/start per-slot gate，answer binding先经exact `validate_answer`验证再产生`PreExecution + Succeeded`、恰一个deterministic compact JSON Text part（`{"answers":[...]}`，ascending order，optional未答`{"answers":[]}`），render/invariant失败fail closed为Abandoned RuntimeFailure。host通过既有`InteractionCommand::Resolve`返回`UserAnswer`即可，无需新增Runtime capability。
+
+Pending期间`TurnStatus`和`SessionExecutionState`仍为Running，`TurnExecutionPhase = WaitingForUserInput`。ActiveTurnTask只等待oneshot，对应SessionExecutor control actor继续处理Resolve/Cancel/SecurityRevoked/Unload/Snapshot；其他Session不受影响。等待期间不预留file mutation ticket，也不持有ToolStartPermit或reserve/start per-slot ToolStartGate，elapsed time不会自动关闭Interaction。
 
 ## Transport 与 Adapter
 

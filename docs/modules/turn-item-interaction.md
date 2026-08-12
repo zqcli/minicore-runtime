@@ -1,6 +1,6 @@
 # Turn、Item 与 Interaction 架构设计
 
-状态：当前权威架构（ADR 0134后；当前implemented scope为crate-private Scripted vertical slice——Tool/Interaction/Cancel与crate-private `ToolOperationSlot`完整生命周期（first-wins start gate、Running best-effort cancellation与truthful settle）及crate-private scripted approval/UserQuestion控制seam（typed `ToolExecutionPlan::{Approval, UserQuestion}`、move-only `UserQuestionAnswerBinding`、hoisted exclusive question调度与signal-first settlement）已实现，生产实现未启动）
+状态：当前权威架构（ADR 0142后；Tool/Interaction/Cancel与crate-private `ToolOperationSlot`完整生命周期、scripted approval/UserQuestion控制seam，以及closed/default-off production `ask_user` builtin均已实现；OS-backed production Tool/Sandbox adapters仍pending）
 日期：2026-07-31
 
 ## 目的
@@ -415,7 +415,7 @@ assistant asks ask-user ToolCall
 
 UserAnswer不是UserMessage，不创建新Turn，也不进入Steer queue。MVP UserQuestion只允许[Tools定义的non-secret Text/SingleChoice fields](tools.md#approval-and-question-types)。question/answer完整值可以进入live state、JSONL、Interaction event/history和PreExecution ToolResult，并可能发送给模型；不得用于credential/password/token收集。任何future secret input必须建立独立secure host port与non-recorded one-time reference，不能只给当前request增加`secret: true`。
 
-当前crate-private scripted实现状态：question由typed plan shape识别、hoisted到全部ordinary sibling之前按call_index串行驱动、至多一个pending；每个question outcome（answer或owner cancellation）先apply live+inline record attempt再继续；等待期间phase为`WaitingForUserInput`；question不预留ToolStartGate或mutation ticket、不构造start factory；valid answer经move-only/redacted `UserQuestionAnswerBinding::bind`产生identity-bound `PreExecution + Succeeded`（malformed/panic fail closed为identity-bound Abandoned OutcomeUnknown）；Cancel/SecurityRevoked/Unload signal-first跳过binding并settle全部unstarted calls为matching PreExecution Cancelled；presentation/resolution/binding permit-first各阶段settle truthfully；abandoned question对remaining无副作用（known preflight保留、其余unstarted为PreExecution Failed）。production ask-user builtin ToolName、schema与answer→model-visible ToolResult的text/render格式仍未冻结/实现。
+当前crate-private scripted实现状态：question由typed plan shape识别、hoisted到全部ordinary sibling之前按call_index串行驱动、至多一个pending；每个question outcome（answer或owner cancellation）先apply live+inline record attempt再继续；等待期间phase为`WaitingForUserInput`；question不预留ToolStartGate或mutation ticket、不构造start factory；valid answer经move-only/redacted `UserQuestionAnswerBinding::bind`产生identity-bound `PreExecution + Succeeded`（malformed/panic fail closed为identity-bound Abandoned OutcomeUnknown）；Cancel/SecurityRevoked/Unload signal-first跳过binding并settle全部unstarted calls为matching PreExecution Cancelled；presentation/resolution/binding permit-first各阶段settle truthfully；abandoned question对remaining无副作用（known preflight保留、其余unstarted为PreExecution Failed）。M14 production `ask_user` builtin已由[ADR 0142](../adr/0142-production-ask-user-is-a-closed-opt-in-builtin.md)冻结并实现（ToolName恰为`ask_user`、closed input schema、default-off `with_ask_user_tool()` opt-in、zero permission、仅UserQuestion/frozen PreExecution plans、answer为恰一个deterministic compact JSON Text part，render/invariant失败fail closed为Abandoned RuntimeFailure）。
 
 ## Cancel与Terminal Cleanup
 

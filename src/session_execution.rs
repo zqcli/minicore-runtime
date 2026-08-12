@@ -12848,7 +12848,7 @@ mod tests {
                     let question_binding = Arc::clone(&question_binding);
                     ToolExecutionPlan::UserQuestion {
                         request: user_question_request_fixture(),
-                        answer: UserQuestionAnswerBinding::new(move |answer| {
+                        answer: UserQuestionAnswerBinding::new(request.clone(), move |answer| {
                             question_binding(answer)
                         }),
                     }
@@ -15316,11 +15316,11 @@ mod tests {
             ],
             {
                 let bound_answers = Arc::clone(&bound_answers);
-                move |_| {
+                move |request| {
                     let bound_answers = Arc::clone(&bound_answers);
                     ToolExecutionPlan::UserQuestion {
                         request: question_request.clone(),
-                        answer: UserQuestionAnswerBinding::new(move |answer| {
+                        answer: UserQuestionAnswerBinding::new(request, move |answer| {
                             // The binding reads the typed host answer and produces the
                             // truthful answered PreExecution Succeeded result.
                             let text = match answer.answers()[0].value() {
@@ -15445,7 +15445,7 @@ mod tests {
                         let answer_bound_sender = answer_bound_sender.clone();
                         ToolExecutionPlan::UserQuestion {
                             request: question_request.clone(),
-                            answer: UserQuestionAnswerBinding::new(move |answer| {
+                            answer: UserQuestionAnswerBinding::new(request, move |answer| {
                                 let text = match answer.answers()[0].value() {
                                     crate::tools::UserQuestionAnswerValue::Text(text) => {
                                         text.as_ref().to_owned()
@@ -15596,7 +15596,7 @@ mod tests {
                     };
                     ToolExecutionPlan::UserQuestion {
                         request: question_request.clone(),
-                        answer: UserQuestionAnswerBinding::new(move |answer| {
+                        answer: UserQuestionAnswerBinding::new(request, move |answer| {
                             let text = match answer.answers()[0].value() {
                                 crate::tools::UserQuestionAnswerValue::Text(text) => {
                                     text.as_ref().to_owned()
@@ -15744,7 +15744,7 @@ mod tests {
                         let binding_invoked = Arc::clone(&binding_invoked);
                         ToolExecutionPlan::UserQuestion {
                             request: question_request.clone(),
-                            answer: UserQuestionAnswerBinding::new(move |_| {
+                            answer: UserQuestionAnswerBinding::new(request, move |_| {
                                 binding_invoked.store(true, Ordering::Release);
                                 ToolExecutionResult::PreExecution {
                                     disposition: crate::tools::ToolResultDisposition::Succeeded,
@@ -16197,7 +16197,7 @@ mod tests {
                             let binding_invoked = Arc::clone(&binding_invoked);
                             ToolExecutionPlan::UserQuestion {
                                 request: user_question_request_fixture(),
-                                answer: UserQuestionAnswerBinding::new(move |_| {
+                                answer: UserQuestionAnswerBinding::new(request, move |_| {
                                     binding_invoked.store(true, Ordering::Release);
                                     match flavor {
                                         // The binding truthfully reports an abandoned result.
@@ -16330,7 +16330,7 @@ mod tests {
                 if call_id.as_str() == "call_question" {
                     ToolExecutionPlan::UserQuestion {
                         request: question_request.clone(),
-                        answer: UserQuestionAnswerBinding::new(move |_| {
+                        answer: UserQuestionAnswerBinding::new(request, move |_| {
                             ToolExecutionResult::PreExecution {
                                 disposition: crate::tools::ToolResultDisposition::Succeeded,
                                 content: crate::tools::ToolResultContent::from_text_parts(vec![
@@ -17358,7 +17358,7 @@ mod tests {
                     if call_id.as_str() == "call_question" {
                         ToolExecutionPlan::UserQuestion {
                             request: question_request.clone(),
-                            answer: UserQuestionAnswerBinding::new(move |answer| {
+                            answer: UserQuestionAnswerBinding::new(request, move |answer| {
                                 let text = match answer.answers()[0].value() {
                                     crate::tools::UserQuestionAnswerValue::Text(text) => {
                                         text.as_ref().to_owned()

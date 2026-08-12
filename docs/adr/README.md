@@ -19,6 +19,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0137](0137-tokio-owner-tracked-async-foundation.md) | Tokio owner-tracked async foundation与deterministic persistent seams；refines ADR 0117 and supports ADR 0136 |
 | [0140](0140-tool-sandbox-admission-fails-closed-before-start.md) | Tool Sandbox capability admission在start前fail closed |
 | [0141](0141-provider-calls-are-stateless-full-request.md) | Provider调用是无状态full-request wire policy：一次invocation零或一次`ProviderAdapter::execute`、独立地零或一次POST（若发送则携带完整full request）、无optimization fallback/continuation；显式cache annotation与continuation保持omission |
+| [0142](0142-production-ask-user-is-a-closed-opt-in-builtin.md) | Production `ask_user`是closed、default-off、Runtime-owned builtin：`MiniCoreRuntimeConfig::with_ask_user_tool()` idempotent opt-in、zero permission、仅UserQuestion或frozen PreExecution failure plans、deterministic compact JSON answer |
 
 ## Current With Later Refinements
 
@@ -34,7 +35,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0109](0109-review-b-determinism-and-serialized-operations.md) | ADR 0124、0126 |
 | [0110](0110-prompt-and-skill-use-shared-reloadable-views.md) | ADR 0127、0129 |
 | [0111](0111-session-ingress-separates-control-and-work-lanes.md) | ADR 0124、0126、0127 |
-| [0113](0113-user-question-uses-runtime-protocol-and-ui-presentation.md) | ADR 0124、0126、0127、0133 |
+| [0113](0113-user-question-uses-runtime-protocol-and-ui-presentation.md) | ADR 0124、0126、0127、0133、0142 |
 | [0114](0114-runtime-observation-uses-snapshot-first-streams.md) | ADR 0126、0127、0133 |
 | [0116](0116-file-mutations-use-session-local-queues.md) | ADR 0126 |
 | [0117](0117-async-synchronization-uses-single-owner-and-typed-permits.md) | ADR 0124、0125、0126、0127、0136、0137 |

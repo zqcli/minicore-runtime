@@ -88,6 +88,7 @@ pub struct MiniCoreRuntimeConfig {
     compaction: CompactionSettings,
     unload_grace: StdDuration,
     model_providers: Vec<ModelProviderConfig>,
+    ask_user_tool: bool,
 }
 
 impl MiniCoreRuntimeConfig {
@@ -97,6 +98,7 @@ impl MiniCoreRuntimeConfig {
             compaction: CompactionSettings::default(),
             unload_grace: DEFAULT_UNLOAD_GRACE,
             model_providers: Vec::new(),
+            ask_user_tool: false,
         }
     }
 
@@ -122,6 +124,16 @@ impl MiniCoreRuntimeConfig {
     /// `RuntimeInitializationError::InvalidConfiguration`.
     pub fn with_unload_grace(mut self, unload_grace: StdDuration) -> Self {
         self.unload_grace = unload_grace;
+        self
+    }
+
+    /// Opts the Runtime into the closed production `ask_user` builtin ToolSet.
+    ///
+    /// The default Runtime ToolSet stays empty; this opt-in is idempotent and `open` selects
+    /// exactly one immutable ToolSet (the empty default or this builtin) and passes it through
+    /// the existing residency capture.
+    pub fn with_ask_user_tool(mut self) -> Self {
+        self.ask_user_tool = true;
         self
     }
 }
@@ -296,6 +308,14 @@ impl MiniCoreRuntime {
             };
 
         let resolver = Arc::new(WorkspaceResolver::new(task_context.clone()));
+        // The production ToolSet is selected exactly once at `open`: the empty default stays
+        // the default, and the host opt-in installs the closed `ask_user` builtin through the
+        // existing residency ToolSet capture path.
+        let tool_set = if config.ask_user_tool {
+            crate::tools::ToolSet::ask_user_builtin()
+        } else {
+            crate::tools::ToolSet::empty()
+        };
         let session_residency = match SessionResidencyRegistry::start_with_turn_resources_and_tools_and_compaction_and_unload_grace(
             task_context.clone(),
             durable_state.clone(),
@@ -304,7 +324,7 @@ impl MiniCoreRuntime {
             Arc::clone(&prompt_resources),
             Arc::clone(&model_gateway),
             Arc::clone(&model_catalog),
-            crate::tools::ToolSet::empty(),
+            tool_set,
             compaction,
             unload_grace,
         ) {
@@ -4086,7 +4106,8 @@ mod tests {
         ScriptedModelFixture, TokenEstimateRate, fixed_credential_source,
     };
     use crate::prompt::{
-        AgentPromptSelection, PromptBodyIntent, PromptIntent, SessionPromptSelection, TextIntent,
+        AgentPromptSelection, ModelMessageRef, PromptBodyIntent, PromptIntent,
+        SessionPromptSelection, TextIntent,
     };
     use crate::runtime_interface::{
         AgentCommand, CommandCompletion, CommandErrorCode, CommandOutcome, CommandRequest,
@@ -4097,7 +4118,8 @@ mod tests {
         RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionExecutionView,
         SessionLifecycleView, SessionReadinessView, SessionRecordingState, SessionStateEventKind,
         SessionUnavailableView, SnapshotRequest, SnapshotResponse, StateEventMsg,
-        SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView, TurnTerminalView,
+        SubscriptionRequest, SubscriptionScope, TurnCommand, TurnExecutionPhaseView,
+        TurnFailureView, TurnTerminalView,
     };
     use crate::runtime_task::RuntimeTaskError;
     use crate::session_execution::SessionExecutionState;
@@ -4105,7 +4127,7 @@ mod tests {
         SessionResidencyInteractionError, SessionResidencyLifecycleError,
         SessionResidencyLoadError, SessionResidencyLoadOutcome, SessionResidencyUnloadOutcome,
     };
-    use crate::tools::ToolApprovalDecisionInput;
+    use crate::tools::{ToolApprovalDecisionInput, UserQuestionAnswer, UserQuestionFieldAnswer};
     use crate::turn_item_interaction::InteractionResolutionInput;
     use crate::wire::conversation_jsonl::ConversationLineCodec;
     use crate::wire::{
@@ -6894,6 +6916,301 @@ mod tests {
                 .definition_count(),
             0
         );
+        runtime.shutdown().await;
+    }
+
+    #[test]
+    fn runtime_config_ask_user_tool_is_default_off_and_the_opt_in_is_idempotent() {
+        let default = MiniCoreRuntimeConfig::new(PathBuf::from("/unused"));
+        assert!(
+            !default.ask_user_tool,
+            "the default Runtime ToolSet stays empty"
+        );
+        let opted = default.with_ask_user_tool();
+        assert!(opted.ask_user_tool);
+        // The opt-in is idempotent: opting in twice keeps the exact same flag.
+        let twice = opted.with_ask_user_tool();
+        assert!(twice.ask_user_tool);
+        // A fresh default config is unaffected, and the redacted Debug shape is unchanged
+        // by the new field.
+        let fresh = MiniCoreRuntimeConfig::new(PathBuf::from("/unused"));
+        assert!(!fresh.ask_user_tool);
+        assert_eq!(format!("{fresh:?}"), "MiniCoreRuntimeConfig { .. }");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_open_keeps_tools_default_off_and_double_opt_in_discloses_one_builtin() {
+        for (enabled, expected_tools) in [(false, 0_usize), (true, 1_usize)] {
+            let root = TempRoot::new();
+            let workspace = TempWorkspace::new();
+            let model = ScriptedModelFixture::new(vec!["final answer"]);
+            let mut config = MiniCoreRuntimeConfig::new(root.path().to_owned());
+            if enabled {
+                config = config.with_ask_user_tool().with_ask_user_tool();
+            }
+            let runtime =
+                MiniCoreRuntime::open_with_model_fixture(config, Handle::current(), &model)
+                    .await
+                    .expect("the Runtime opens with the selected ToolSet");
+            let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+            let mut events = runtime
+                .subscribe(SubscriptionRequest::new(
+                    SubscriptionScope::Session { session_id },
+                    false,
+                ))
+                .await
+                .expect("the Session subscription opens");
+            assert!(matches!(
+                events.recv().await,
+                Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+            ));
+            let submit = runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("hello").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the ordinary Turn starts");
+            let turn_id = started_turn(&submit);
+            let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match events.recv().await {
+                        Some(EventFrame::State(event))
+                            if event.msg().session_kind()
+                                == Some(SessionStateEventKind::TurnCompleted) =>
+                        {
+                            break event;
+                        }
+                        Some(EventFrame::State(_)) => continue,
+                        other => panic!("unexpected frame before ordinary completion: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("the ordinary Turn completes");
+            assert!(matches!(
+                terminal.msg().session_detail(),
+                Some(SessionEventDetail::TurnTerminal {
+                    turn_id: completed_turn,
+                    terminal: TurnTerminalView::Completed { .. },
+                }) if completed_turn == turn_id
+            ));
+
+            let requests = model.requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].input().tools().len(), expected_tools);
+            if enabled {
+                assert_eq!(requests[0].input().tools()[0].name().as_str(), "ask_user");
+            }
+            runtime.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ask_user_tool_opt_in_presents_answers_and_continues_the_turn_end_to_end() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        // The scripted model emits one ask_user call with a closed valid arguments object,
+        // then one final text response for the same Turn after the answer settles.
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_ask",
+            "ask_user",
+            r#"{"title":null,"questions":[{"questionIndex":0,"prompt":"Continue?","required":true,"input":{"type":"text","data":{"multiline":false}}}]}"#,
+            "final public answer",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_ask_user_tool(),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the opt-in Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let residency = runtime.inner.residency().expect("residency is installed");
+        let executor = residency
+            .executor_for_test(session_id)
+            .expect("the loaded executor is installed");
+        let hooks = executor.test_hooks();
+        drop(executor);
+        drop(residency);
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(snapshot)))
+                if snapshot.execution() == SessionExecutionView::Idle
+        ));
+
+        let submit_command_id = CommandId::generate().unwrap();
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                submit_command_id,
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("please ask").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+
+        // The production builtin presents the typed pending UserQuestion before any next
+        // model call: exactly one interaction, one model call, and the Turn waits on input.
+        hooks.wait_pending_interaction_publication().await;
+        let pending = runtime
+            .snapshot(SnapshotRequest::Session { session_id })
+            .await
+            .expect("the published pending Session snapshot is available");
+        let SnapshotResponse::Session(pending) = pending else {
+            panic!("the pending snapshot is a Session snapshot");
+        };
+        let interaction = pending
+            .pending_interactions()
+            .first()
+            .expect("the publication contains the ask_user interaction");
+        let item_id = interaction.item_id();
+        let request_id = interaction.request_id();
+        let request_view = interaction.request().clone();
+        let pending_phase = pending
+            .current_turn()
+            .expect("the pending Turn is current")
+            .phase();
+        assert_eq!(model.request_count(), 1);
+        let expected_request = crate::turn_item_interaction::InteractionRequestView::UserQuestion(
+            crate::tools::UserQuestionRequest::reconstruct(
+                None,
+                vec![
+                    crate::tools::UserQuestionField::reconstruct(
+                        0,
+                        "Continue?",
+                        true,
+                        crate::tools::UserQuestionInput::Text { multiline: false },
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        );
+        assert!(request_view == expected_request);
+        assert_eq!(
+            pending_phase,
+            Some(TurnExecutionPhaseView::WaitingForUserInput)
+        );
+
+        // The host resolves the question through the public Interaction command; the answer
+        // binds through the production builtin and the same Turn runs its final response.
+        let resolve = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Interaction(InteractionCommand::Resolve {
+                    session_id,
+                    expected_turn_id: turn_id,
+                    item_id,
+                    request_id,
+                    resolution: InteractionResolutionInput::UserAnswer(
+                        UserQuestionAnswer::new(vec![
+                            UserQuestionFieldAnswer::text(0, "yes").unwrap(),
+                        ])
+                        .unwrap(),
+                    ),
+                    resolution_key: "irk_99999999999999999999999999999999".parse().unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Resolve dispatches");
+        assert!(matches!(
+            resolve.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::InteractionResolved,
+                ..
+            }
+        ));
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => panic!("unexpected frame before ask_user Turn completion: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the answered question resumes and the Turn completes");
+        assert_eq!(terminal.command_id(), Some(submit_command_id));
+        assert!(matches!(
+            terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == turn_id
+        ));
+        assert!(
+            terminal
+                .msg()
+                .session_snapshot()
+                .and_then(|snapshot| snapshot.usage())
+                .is_some_and(|usage| usage.model_calls() == 2)
+        );
+        assert_eq!(model.request_count(), 2);
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].input().tools().len(), 1);
+        assert_eq!(requests[0].input().tools()[0].name().as_str(), "ask_user");
+        let expected_answer =
+            r#"{"answers":[{"questionIndex":0,"value":{"type":"text","data":"yes"}}]}"#;
+        assert!(
+            requests[1]
+                .input()
+                .messages()
+                .iter()
+                .any(|message| matches!(
+                    message.as_ref(),
+                    ModelMessageRef::Tool {
+                        tool_call_id,
+                        content,
+                    } if tool_call_id.as_str() == "call_ask"
+                        && content.parts().len() == 1
+                        && content.parts()[0].as_text() == expected_answer
+                ))
+        );
+
+        // Recording keeps the truthful PreExecution Succeeded source/disposition; the exact
+        // model-visible text was asserted above from the second immutable model request.
+        let recording = fs::read_to_string(
+            root.path()
+                .join("sessions")
+                .join(session_id.to_string())
+                .join("conversation.jsonl"),
+        )
+        .expect("the recorded conversation is readable");
+        assert!(recording.contains(r#"questionIndex":0"#));
+        assert!(recording.contains(r#"pre_execution"#));
+        assert!(recording.contains(r#"succeeded"#));
+        assert!(!recording.contains("executed"));
+
         runtime.shutdown().await;
     }
 

@@ -1,6 +1,6 @@
 # MiniCore V1 → V2 版本迁移记录
 
-状态：V2目标架构已推进至ADR 0140；全部普通V4-P0/P1与conditional V4-C0-1已关闭，production Provider/Tool adapters仍未实现
+状态：V2目标架构已推进至ADR 0142；全部普通V4-P0/P1与conditional V4-C0-1已关闭，OpenAI Responses/Anthropic Messages direct provider adapters与closed/default-off production `ask_user` builtin已实现；真实credential smoke与OS-backed production Tool/Sandbox adapters仍pending
 日期：2026-08-11
 
 ## 目的

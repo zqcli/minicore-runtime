@@ -1,6 +1,6 @@
 # Tool 子系统架构设计
 
-状态：当前权威架构；M8.1最小Scripted Tool round-trip与crate-private `ToolOperationSlot`完整生命周期已实现（Prepared→Running→Settling→Terminal：per-request slot-owned `ToolStartGate` first-wins start gate、typed started proof、Running cancellation pair、signal先赢→PreExecution Cancelled且不调用factory、start先赢→Settling继续await same run后truthful settle、PreExecution/Executed/Abandoned truthful settlement），crate-private scripted approval/UserQuestion控制正确性seam亦已实现（typed `ToolExecutionPlan::{Approval, UserQuestion}`拆分、Session-private concrete `ToolExecutionControl`、Tools-owned move-only `UserQuestionAnswerBinding`、hoisted exclusive question调度与signal-first settlement）；M13/V4-C0-1已由ADR 0140关闭：class-level `ToolPermissionSet × ToolSandboxContract`差集、unavailable fail-closed、restricted candidate不得扩大、direct Execute admission、approval resume revalidation及非空permission plan的SecurityRevoked/Sandbox-unavailable/Running Session round conformance均已实现。完整ToolService/source/schema/hooks/policy、resource-level grants、production ask-user builtin ToolName/schema与answer→model-visible ToolResult text/render格式、production executor/adapter（返回前须提供有界、可确认cleanup）与Session-local mutation queue/mutation permit attachment to Settling仍待实现
+状态：当前权威架构；M8.1最小Scripted Tool round-trip与crate-private `ToolOperationSlot`完整生命周期已实现（Prepared→Running→Settling→Terminal：per-request slot-owned `ToolStartGate` first-wins start gate、typed started proof、Running cancellation pair、signal先赢→PreExecution Cancelled且不调用factory、start先赢→Settling继续await same run后truthful settle、PreExecution/Executed/Abandoned truthful settlement），crate-private scripted approval/UserQuestion控制正确性seam亦已实现（typed `ToolExecutionPlan::{Approval, UserQuestion}`拆分、Session-private concrete `ToolExecutionControl`、Tools-owned move-only `UserQuestionAnswerBinding`、hoisted exclusive question调度与signal-first settlement）；M13/V4-C0-1已由ADR 0140关闭：class-level `ToolPermissionSet × ToolSandboxContract`差集、unavailable fail-closed、restricted candidate不得扩大、direct Execute admission、approval resume revalidation及非空permission plan的SecurityRevoked/Sandbox-unavailable/Running Session round conformance均已实现。production `ask_user` builtin已由ADR 0142关闭：closed、default-off、Runtime-owned，`MiniCoreRuntimeConfig::with_ask_user_tool()` idempotent opt-in，`ToolSet::ask_user_builtin()`生产构造，零capability permission、available empty sandbox contract，仅返回UserQuestion或frozen PreExecution failure plans，answer为恰一个deterministic compact JSON Text part（binding先经exact `validate_answer`验证，render/invariant失败fail closed为Abandoned RuntimeFailure）。完整ToolService/source/schema/hooks/policy、resource-level grants、production executor/adapter（返回前须提供有界、可确认cleanup）与Session-local mutation queue/mutation permit attachment to Settling仍待实现
 日期：2026-07-31
 
 ## 目的
@@ -516,7 +516,16 @@ questions/options按index严格递增且唯一。answer必须无duplicate/unknow
 
 MVP没有`secret`、password、credential、file upload或arbitrary JSON answer variant。producer和Presentation Adapter必须明确告知用户：answer会进入live state、conversation JSONL、event/history和ask-user ToolResult，并可能发送给模型，不能输入API key、password、token或其他secret。`NonSecret`是协议约束，不是Runtime对自然语言的secret classifier。需要credential时必须未来新增独立secure host capability/one-time secret reference，raw value不得经过Interaction/ToolResult/model context。
 
-当前crate-private scripted实现状态：typed `ToolExecutionPlan::UserQuestion`与Tools-owned move-only/redacted `UserQuestionAnswerBinding`已实现（binding只接受truthful `PreExecution + Succeeded`作为answer、显式Abandoned直通、其余malformed形状fail closed为identity-bound Abandoned OutcomeUnknown）；question由typed plan shape识别、hoisted到全部ordinary sibling之前按call_index串行驱动、至多一个pending，不预留ToolStartGate或mutation ticket；每个question outcome先apply live+inline record attempt再继续；Cancel/SecurityRevoked/Unload signal-first跳过binding并settle全部unstarted calls为matching PreExecution Cancelled。production ask-user builtin ToolName、公开schema与answer→model-visible ToolResult的text/render格式仍未冻结/实现；上述字段类型是crate-private scripted carrier，不代表production Tool DTO已冻结。
+当前crate-private scripted实现状态：typed `ToolExecutionPlan::UserQuestion`与Tools-owned move-only/redacted `UserQuestionAnswerBinding`已实现（binding只接受truthful `PreExecution + Succeeded`作为answer、显式Abandoned直通、其余malformed形状fail closed为identity-bound Abandoned OutcomeUnknown）；question由typed plan shape识别、hoisted到全部ordinary sibling之前按call_index串行驱动、至多一个pending，不预留ToolStartGate或mutation ticket；每个question outcome先apply live+inline record attempt再继续；Cancel/SecurityRevoked/Unload signal-first跳过binding并settle全部unstarted calls为matching PreExecution Cancelled。上述字段类型是crate-private carrier；production builtin见下节[Production ask-user Builtin](#production-ask-user-builtin)，其ToolName/schema与answer render格式已由ADR 0142冻结。
+
+### Production ask-user Builtin
+
+ADR 0142冻结的production `ask_user`是closed、default-off、Runtime-owned builtin，唯一实现位置`src/tools/ask_user.rs`（`pub(super) fn build_tool_set() -> Arc<ToolSet>`），`src/tools.rs`只暴露narrow `ToolSet::ask_user_builtin()` production构造：
+
+- **Default-off opt-in**：默认Runtime ToolSet保持`ToolSet::empty()`；host必须调用`MiniCoreRuntimeConfig::with_ask_user_tool()`（idempotent）opt-in，`open`恰好选择一次immutable ToolSet并经既有residency capture安装。不引入generic ToolService/registry、host callback/executor安装、authoring format或public Tool DTO。
+- **Exact frozen surface**：ToolName恰为`ask_user`；description恰为“Ask the user one or more non-secret text or single-choice questions and return the answers. Use only when the task cannot continue without user input. Never request passwords, API keys, tokens, credentials, or other secrets.”；input schema是closed JSON object（optional nullable `title`、1..32 `questions`、strict adjacent `input`恰为`{"type":"text","data":{"multiline":bool}}`或`{"type":"single_choice","data":{"options":[...]}}`，每层`additionalProperties: false`）。schema是披露guidance，byte/count/index验证由既有semantic constructors执行；arguments从`BoundedJsonObject::canonical_json()`用private strict serde mirrors（每层`deny_unknown_fields`）解析，omitted/null `title`都映射`None`，indices严格递增但不要求从0开始或连续。
+- **Plan闭合**：valid call→typed `ToolExecutionPlan::UserQuestion`（binding先经exact `UserQuestionRequest::validate_answer`验证再产生`PreExecution + Succeeded`）；任何parse/semantic failure→frozen `PreExecution + Failed`、恰一个Text part、文本恰为`tool arguments are invalid`、无Interaction。builtin零`ToolCapabilityClass` permission、使用available empty sandbox contract，绝不创建`ToolExecutionStart`、executor future、cancellation pair、start-gate reservation、approval或OS资源（这是production Tool slice，不是OS-backed Sandbox completion）。
+- **Answer render**：恰一个deterministic compact JSON Text part，`{"answers":[{"questionIndex":3,"value":{"type":"text","data":"hello"}}]}`或choice `{"answers":[{"questionIndex":7,"value":{"type":"choice","data":{"optionIndex":11}}}]}`；answers保持升序，optional未答可渲染`{"answers":[]}`。escaping是canonical/deterministic（serde固定struct/enum field order，serde escaping不超过canonical escaping计数），输出受既有`ToolResultContent`约束（单part ≤65,536 bytes；projection envelope与`user_answer_encoded_len`同构，validated answer恒在界内）。binding内的answer re-validation mismatch或render失败是dynamic invariant，fail closed为identity-bound `Abandoned { RuntimeFailure }`，绝不产生malformed model-visible output。
 
 approval不替代Sandbox。无法强制required capability时production executor必须在side effect前拒绝；该能力声明、差集算法与pre-start fail-closed顺序已由ADR 0140冻结。
 
@@ -571,7 +580,7 @@ pub(crate) enum ToolExecutionPlan {
 
 - call按canonical `call_index`规范化；
 - preflight/schema/policy按call order；
-- UserQuestion/ask-user由typed plan shape识别并独占先完成（hoisted到全部ordinary sibling之前、按call_index串行、至多一个pending；每个question outcome先apply live+inline record attempt再继续；question不涉及ToolStartGate或mutation ticket）；
+- UserQuestion/ask-user由typed plan shape识别并独占先完成（hoisted到全部ordinary sibling之前、按call_index串行、至多一个pending；每个question outcome先apply live+inline record attempt再继续；question不reserve/start ToolStartGate，也不涉及mutation ticket）；
 - `Serial`、multi-file或open-world Tool使batch按call order串行；
 - 普通single-file Tool按canonical file key取得Session-local FIFO ticket；
 - 不同key可以并发；
@@ -697,7 +706,7 @@ ToolSet只产出typed terminal outcome，不拥有conversation reducer。live co
 - Prepared：Emergency先赢，不发permit，产生PreExecution Cancelled ToolResult（已实现；含pending UserQuestion：signal-first跳过binding，全部unstarted calls settle matching PreExecution Cancelled）；
 - Running：发送best-effort cancellation，等待executor teardown/result（已实现：Running slot持有operation自己的`ToolCancellationHandle`，signal先赢后cancel该pair并经Settling继续await same run至executor cooperative cleanup/result；production executor/adapter teardown仍未实现，production adapter返回前必须提供有界、可确认cleanup）；
 - Settling：等待resource/mutation permit安全释放（mutation permit attachment to Settling仍pending）；
-- UserQuestion/ask-user（已实现）：presentation/resolution/binding各阶段经move-only permit与signal first-wins，signal-first跳过binding并settle全部unstarted为PreExecution Cancelled，abandoned question对remaining无副作用（known preflight保留、其余unstarted为PreExecution Failed）；question不持mutation permit或ToolStartGate；
+- UserQuestion/ask-user（已实现）：presentation/resolution/binding各阶段经move-only permit与signal first-wins，signal-first跳过binding并settle全部unstarted为PreExecution Cancelled，abandoned question对remaining无副作用（known preflight保留、其余unstarted为PreExecution Failed）；question不持mutation permit或ToolStartPermit，也不reserve/start ToolStartGate；
 - exact outcome可得：保存ToolResult；
 - outcome unknown：Abandoned；
 - 不声称回滚OS/provider side effect；
@@ -815,6 +824,7 @@ Tool grant store
 - approval public view redaction，request-scoped option index映射AllowOnce/AllowWith且restricted不能扩大权限；
 - unknown/cross-request option拒绝，resolution后重新执行Sandbox enforceability与ToolStartGate；
 - UserQuestion Text/SingleChoice index/required/family validation且protocol无secret variant；
+- production `ask_user` builtin（ADR 0142）：default-off/opt-in config path、exact definition/schema disclosure、strict parsing与semantic failure（无question、count/index/byte边界）、valid text/choice/mixed/nullable title/non-contiguous indices、deterministic escaping与optional empty answer、无Execute/start seam、Session/runtime端到端question→ToolResult→next model call；
 - UserQuestion在mutation/start前；typed plan hoisting/exclusive scheduling（call_index串行、至多一个pending）、answer binding与signal first-wins、signal-first全部unstarted settle为PreExecution Cancelled；
 - ToolSet在task spawn前由captured control handle与Session-local queue完整构造；
 - ToolStartPermit只使用一次；
@@ -837,7 +847,7 @@ Tool grant store
 ## 开放问题
 
 1. production policy/workspace/resource-level permission producer与每个adapter的effective-enforcement conformance；
-2. production builtin Tool最小集合；
+2. production builtin Tool最小集合（`ask_user`已由ADR 0142冻结并实现；是否增加其他builtin仍开放）；
 3. `max_tool_result_bytes`和future blob handling；
 4. provider-specific ToolResult error lowering。
 
@@ -855,6 +865,7 @@ ToolStartPermit使用actor message、owner-local CAS或等价private实现属于
 - [x] 统一ToolCall/ToolExecutionRequest/ToolExecutionOutcome canonical owner与pre-execution result；
 - [x] complete Tool exchange自动projection；
 - [x] ToolStartGate first-wins start gate与typed started proof，及完整`ToolOperationSlot`生命周期（Prepared→Running→Settling→Terminal、Running cancellation pair与truthful settle；M8.3 foundation已从round-local narrow slice升级为slot）；
-- [x] UserQuestion producer与exclusive scheduler正确性（typed `ToolExecutionPlan::UserQuestion`、move-only `UserQuestionAnswerBinding`（仅truthful PreExecution+Succeeded为answer）、hoisted exclusive question调度（call_index串行、至多一个pending、不涉及ToolStartGate/mutation ticket）、signal-first settlement与abandoned question无副作用）；
+- [x] UserQuestion producer与exclusive scheduler正确性（typed `ToolExecutionPlan::UserQuestion`、move-only `UserQuestionAnswerBinding`（仅truthful PreExecution+Succeeded为answer）、hoisted exclusive question调度（call_index串行、至多一个pending、不reserve/start ToolStartGate且不涉及mutation ticket）、signal-first settlement与abandoned question无副作用）；
 - [x] O1/R7/V4-C0-1 production Sandbox gate（ADR 0140；class-level algebra、direct Execute admission、Restricted/AllowOnce resume revalidation及SecurityRevoked/Sandbox-unavailable/Running round conformance）；
-- [ ] production implementation/tests（含production ask-user builtin ToolName/schema与answer→model-visible ToolResult text/render格式、完整schema/hooks/policy/Sandbox enforcement、production ToolService/executor/adapters与Session-local file mutation queue）。
+- [x] production `ask_user` builtin（ADR 0142；closed/default-off/Runtime-owned、`MiniCoreRuntimeConfig::with_ask_user_tool()` idempotent opt-in、`ToolSet::ask_user_builtin()`、零permission+available empty sandbox、仅UserQuestion/frozen PreExecution plans、deterministic compact JSON answer与fail-closed Abandoned）；
+- [ ] production implementation/tests（含完整schema/hooks/policy/Sandbox enforcement、production ToolService/executor/adapters与Session-local file mutation queue）。

@@ -1284,7 +1284,7 @@ mod tests {
         StructuredOutputContract, TokenEstimateRate, TurnModelSnapshot, fixed_credential_source,
     };
     use crate::prompt::{ModelAssistantContent, ModelMessage};
-    use crate::tools::ToolResultContent;
+    use crate::tools::{ToolResultContent, ToolSet};
 
     struct SingleModelSource {
         definitions: std::sync::Mutex<Vec<ModelDefinition>>,
@@ -1315,6 +1315,20 @@ mod tests {
             .resolve_for_turn(gateway.initialize().await.unwrap(), resolve_request(None))
             .unwrap();
         (gateway, model)
+    }
+
+    #[test]
+    fn production_ask_user_schema_is_preserved_by_openai_tool_encoding() {
+        let tool_set = ToolSet::ask_user_builtin();
+        let view = tool_set.prompt_view();
+        let encoded = encode_tools(view.specs());
+        assert_eq!(encoded.len(), 1);
+        assert_eq!(encoded[0]["type"], "function");
+        assert_eq!(encoded[0]["name"], "ask_user");
+        assert_eq!(encoded[0]["description"], view.specs()[0].description());
+        let expected: Value =
+            serde_json::from_str(view.specs()[0].input_schema().canonical_json()).unwrap();
+        assert_eq!(encoded[0]["parameters"], expected);
     }
 
     /// Definition with explicit Low reasoning and Priority service class so the request
