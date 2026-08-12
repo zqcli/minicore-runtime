@@ -1,17 +1,18 @@
 //! M14 shared production transport/framing for the direct provider adapters.
 //!
-//! Only protocol-neutral pieces with a real second consumer live here: the
-//! locked-down reqwest client construction (no redirects, no retries, no
-//! ambient proxy, and an explicit fixed product `User-Agent` — see
-//! [`USER_AGENT`]), the response byte limit, protocol-neutral cancellation /
-//! invalid-request / invalid-provider-response / transport read / send-phase
-//! classification, the cancellation-aware bounded body drain and bounded JSON
-//! envelope read, numeric retry-after parsing, the event-stream content-type
-//! check, and the incremental bounded SSE framing. Everything provider-specific
-//! — request encoding, event dispatch, terminal parsers, typed error envelope
-//! mapping, metadata/usage normalization — stays in the owning adapter module
-//! (`openai_responses`, `anthropic_messages`). There is deliberately no generic
-//! provider response/event parser here.
+//! Only provider-neutral *framing* and *classification* helpers live here: the
+//! response byte limit, protocol-neutral cancellation / invalid-request /
+//! invalid-provider-response / transport read / send-phase classification, the
+//! cancellation-aware bounded body drain and bounded JSON envelope read, numeric
+//! retry-after parsing, the event-stream content-type check, and the incremental
+//! bounded SSE framing.  The locked-down reqwest client construction itself was
+//! lifted up to the crate-private shared owner `crate::http_transport` when the
+//! `fetch_url` builtin became its second real production consumer; the adapters
+//! install that exact builder unchanged and keep their single-attempt semantics.
+//! Everything provider-specific — request encoding, event dispatch, terminal
+//! parsers, typed error envelope mapping, metadata/usage normalization — stays in
+//! the owning adapter module (`openai_responses`, `anthropic_messages`). There is
+//! deliberately no generic provider response/event parser here.
 //!
 //! The deterministic `127.0.0.1:0` loopback server harness is shared
 //! `#[cfg(test)]` infrastructure for both adapters' contract suites.
@@ -27,31 +28,10 @@ use crate::model_gateway::{
     ModelCallErrorReason, ProviderAttemptError, ProviderRequestDeliveryState,
 };
 
-/// The fixed product `User-Agent` every shared-client POST carries. Compiled
-/// from the Cargo package name/version so it can never drift from the shipped
-/// artifact; stable, nonsecret, and provider-neutral (no browser disguise, no
-/// per-provider value). Gateway/WAF policy may rely on it: a compatible HTTPS
-/// gateway behind a Cloudflare-style rule rejects UA-less requests with HTTP
-/// 403 while this identifier passes, and it is identical for the OpenAI and
-/// Anthropic adapters.
-pub(super) const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
-
-/// Builds the locked-down production HTTP client shared by every direct adapter:
-/// redirects disabled, automatic retries disabled, ambient proxy disabled, and
-/// an explicit fixed product [`USER_AGENT`] installed on every request. An
-/// adapter attempt therefore never sends more than one POST, any POST it sends
-/// carries the complete full request (pre-send cancellation, `AuthMissing`,
-/// validation and encoding/build failures can produce zero POSTs), and every
-/// POST identifies itself with the exact same nonsecret product UA.
-pub(super) fn build_client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never())
-        .no_proxy()
-        .user_agent(USER_AGENT)
-        .build()
-}
-
+// The fixed product `User-Agent` and the locked-down client construction moved up to
+// the crate-private shared owner `crate::http_transport` (see
+// `crate::http_transport::USER_AGENT` and `crate::http_transport::build_client`);
+// the adapters install that exact builder unchanged.
 pub(super) fn response_byte_limit() -> usize {
     usize::try_from(
         crate::wire::ProtocolLimits::v1_0()

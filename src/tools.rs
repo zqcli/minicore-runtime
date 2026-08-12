@@ -36,6 +36,17 @@ mod list_directory;
 /// contents or creating the file when its parent directory exists.
 mod write_file;
 
+/// The `fetch_url` builtin's host-authority slice (ADR 0147): the public redacted
+/// exact-origin config type and its payload-free validation error, plus the crate-private
+/// pinned client materialization and same-origin authorization seam.  The builtin's Tool
+/// definition and executor are later slices; this module deliberately discloses no Tool.
+mod fetch_url;
+
+/// Public re-export of the minimal `fetch_url` host config surface: the validated exact
+/// origin plus pinned addresses, and its payload-free validation error.  No hostname,
+/// address, or port accessor exists on either type; Debug/Display are fully redacted.
+pub use fetch_url::{FetchUrlOrigin, FetchUrlOriginError};
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolNameError {
     #[error("tool name must be 1..=64 bytes")]
