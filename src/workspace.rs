@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroU64;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use tokio::sync::Notify;
 
+use cap_std::fs::Dir as CapabilityDir;
 use thiserror::Error;
 
 use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError};
@@ -811,6 +812,31 @@ impl fmt::Display for CanonicalWorkspacePath {
     }
 }
 
+/// Exact identity of an opened workspace directory, captured with the safe
+/// `same_file` handle so candidate equality and revalidation detect root
+/// replacement even when the canonical path text is unchanged. The handle is
+/// kept behind an `Arc` so the identity stays cloneable without ever duplicating
+/// the open file it is bound to.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct WorkspaceRootIdentity(Arc<same_file::Handle>);
+
+impl WorkspaceRootIdentity {
+    fn from_file(file: std::fs::File) -> Result<Self, WorkspacePathError> {
+        let handle = same_file::Handle::from_file(file).map_err(map_path_io_error)?;
+        Ok(Self(Arc::new(handle)))
+    }
+
+    fn matches(&self, handle: &same_file::Handle) -> bool {
+        &*self.0 == handle
+    }
+}
+
+impl fmt::Debug for WorkspaceRootIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WorkspaceRootIdentity { .. }")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum WorkspaceRootRole {
     Primary,
@@ -883,11 +909,51 @@ enum WorkspacePathError {
 
 /// The path seam is synchronous because the resolver owns its complete path phase
 /// on one owner-tracked blocking worker.
+///
+/// `open_directory` is the only ambient-authority use on the Workspace path: it
+/// opens a declared root capability and captures its exact identity in one trusted
+/// step. Everything after this phase resolves strictly capability-relative from the
+/// captured `Dir`; model and Tool paths never reopen a root by ambient path.
+///
+/// `canonicalize_directory_in_root` resolves the cwd inside the exact root
+/// capability captured by `open_directory`: production opens the cwd
+/// capability-relative through that `Dir` and proves its safe same-file identity
+/// against the ambient canonical path, so a root rename/replacement between root
+/// capture and cwd proof fails closed instead of binding the cwd to a
+/// replacement. Deterministic test adapters may preserve their pure path-text
+/// mapping.
 trait WorkspacePathAdapter: Send + Sync {
     fn canonicalize_directory(
         &self,
         path: &Path,
     ) -> Result<CanonicalWorkspacePath, WorkspacePathError>;
+
+    fn open_directory(&self, path: &Path) -> Result<OpenedWorkspaceRoot, WorkspacePathError>;
+
+    /// Resolve the cwd directory bound to the exact `opened_root` capability.
+    ///
+    /// `relative` is the declared cwd path inside the root (empty when the cwd is
+    /// the root itself); `ambient_path` is the declared root path joined with the
+    /// relative path and supplies only the canonical path text claim. Production
+    /// opens the cwd capability-relative through `opened_root.dir` and proves the
+    /// opened handle is the same file as the ambient canonical path.
+    fn canonicalize_directory_in_root(
+        &self,
+        opened_root: &OpenedWorkspaceRoot,
+        relative: &str,
+        ambient_path: &Path,
+    ) -> Result<CanonicalWorkspacePath, WorkspacePathError>;
+}
+
+/// A declared root resolved on the owner-tracked path phase: the canonical path,
+/// the exact safe identity of the opened directory, and the open capability bound
+/// to that exact directory. Capability and identity are captured together so
+/// candidate equality can detect root replacement, not only equal path text.
+#[derive(Clone)]
+struct OpenedWorkspaceRoot {
+    canonical: CanonicalWorkspacePath,
+    identity: WorkspaceRootIdentity,
+    dir: Arc<CapabilityDir>,
 }
 
 struct LocalWorkspacePathAdapter;
@@ -904,11 +970,74 @@ impl WorkspacePathAdapter for LocalWorkspacePathAdapter {
         }
         Ok(CanonicalWorkspacePath::new(canonical))
     }
+
+    fn open_directory(&self, path: &Path) -> Result<OpenedWorkspaceRoot, WorkspacePathError> {
+        // Canonicalize first, then open the *declared* path as a capability and prove
+        // the opened directory is exactly the canonical directory. If a replacement or
+        // race makes them differ, resolution fails instead of silently binding a
+        // different root to the workspace.
+        let canonical = self.canonicalize_directory(path)?;
+        let dir = CapabilityDir::open_ambient_dir(path, cap_std::ambient_authority())
+            .map_err(map_path_io_error)?;
+        let identity = WorkspaceRootIdentity::from_file(
+            dir.try_clone().map_err(map_path_io_error)?.into_std_file(),
+        )?;
+        let canonical_identity =
+            same_file::Handle::from_path(canonical.as_path()).map_err(map_path_io_error)?;
+        if !identity.matches(&canonical_identity) {
+            return Err(WorkspacePathError::CanonicalizationFailed);
+        }
+        Ok(OpenedWorkspaceRoot {
+            canonical,
+            identity,
+            dir: Arc::new(dir),
+        })
+    }
+
+    fn canonicalize_directory_in_root(
+        &self,
+        opened_root: &OpenedWorkspaceRoot,
+        relative: &str,
+        ambient_path: &Path,
+    ) -> Result<CanonicalWorkspacePath, WorkspacePathError> {
+        // The ambient canonical text is only a claim about the cwd's location.
+        // The cwd is opened capability-relative through the exact captured root
+        // and its safe identity is compared with the ambient canonical path
+        // identity. A root rename/replacement between root capture and this proof
+        // leaves the capability bound to the old directory while the ambient path
+        // names the replacement, so the comparison fails closed. A symlink cwd
+        // escaping the root fails through cap-std's sandboxed open, never via the
+        // ambient canonical text.
+        let canonical = self.canonicalize_directory(ambient_path)?;
+        let cwd_dir = if relative.is_empty() {
+            Arc::clone(&opened_root.dir)
+        } else {
+            Arc::new(
+                opened_root
+                    .dir
+                    .open_dir(relative)
+                    .map_err(map_path_io_error)?,
+            )
+        };
+        let cwd_identity = WorkspaceRootIdentity::from_file(
+            cwd_dir
+                .try_clone()
+                .map_err(map_path_io_error)?
+                .into_std_file(),
+        )?;
+        let canonical_identity =
+            same_file::Handle::from_path(canonical.as_path()).map_err(map_path_io_error)?;
+        if !cwd_identity.matches(&canonical_identity) {
+            return Err(WorkspacePathError::CanonicalizationFailed);
+        }
+        Ok(canonical)
+    }
 }
 
 fn map_path_io_error(error: std::io::Error) -> WorkspacePathError {
     match error.kind() {
         std::io::ErrorKind::NotFound => WorkspacePathError::Unavailable,
+        std::io::ErrorKind::NotADirectory => WorkspacePathError::NotDirectory,
         _ => WorkspacePathError::CanonicalizationFailed,
     }
 }
@@ -1181,7 +1310,7 @@ struct DeclaredWorkspaceRoot {
 
 #[derive(Clone)]
 struct WorkspacePathPhase {
-    canonical_roots: Vec<CanonicalWorkspacePath>,
+    opened_roots: Vec<OpenedWorkspaceRoot>,
     canonical_cwd: CanonicalWorkspacePath,
 }
 
@@ -1191,28 +1320,30 @@ fn resolve_path_phase(
     cwd_root: WorkspaceRootKey,
     cwd_relative_path: WorkspaceRelativePath,
 ) -> Result<WorkspacePathPhase, WorkspaceResolveError> {
-    let mut canonical_roots = Vec::with_capacity(roots.len());
+    let mut opened_roots = Vec::with_capacity(roots.len());
     for root in &roots {
-        canonical_roots.push(
-            adapter
-                .canonicalize_directory(&root.path)
-                .map_err(map_path_error)?,
-        );
+        opened_roots.push(adapter.open_directory(&root.path).map_err(map_path_error)?);
     }
 
-    for (index, root) in canonical_roots.iter().enumerate() {
-        if canonical_roots[..index]
+    for (index, opened) in opened_roots.iter().enumerate() {
+        if opened_roots[..index]
             .iter()
-            .any(|previous| previous.as_path() == root.as_path())
+            .any(|previous| previous.canonical.as_path() == opened.canonical.as_path())
         {
             return Err(WorkspaceResolveError::DuplicateRoot);
         }
     }
 
-    for (index, root) in canonical_roots.iter().enumerate() {
-        if canonical_roots[..index].iter().any(|previous| {
-            previous.as_path().starts_with(root.as_path())
-                || root.as_path().starts_with(previous.as_path())
+    for (index, opened) in opened_roots.iter().enumerate() {
+        if opened_roots[..index].iter().any(|previous| {
+            previous
+                .canonical
+                .as_path()
+                .starts_with(opened.canonical.as_path())
+                || opened
+                    .canonical
+                    .as_path()
+                    .starts_with(previous.canonical.as_path())
         }) {
             return Err(WorkspaceResolveError::OverlappingRoots);
         }
@@ -1223,14 +1354,26 @@ fn resolve_path_phase(
         .position(|root| root.key == cwd_root)
         .ok_or(WorkspaceResolveError::CwdRootMismatch)?;
     let cwd_native_path = roots[cwd_root_index].path.join(cwd_relative_path.as_str());
+    // The cwd proof is bound to the exact captured root capability selected by
+    // `cwd_root`, never to matching canonical path text: the cwd is opened
+    // capability-relative through that root's `Dir` and proven to be the same
+    // file as the ambient canonical path inside the same owner-tracked phase.
     let canonical_cwd = adapter
-        .canonicalize_directory(&cwd_native_path)
+        .canonicalize_directory_in_root(
+            &opened_roots[cwd_root_index],
+            cwd_relative_path.as_str(),
+            &cwd_native_path,
+        )
         .map_err(map_path_error)?;
 
-    let containing_roots = canonical_roots
+    let containing_roots = opened_roots
         .iter()
         .enumerate()
-        .filter(|(_, root)| canonical_cwd.as_path().starts_with(root.as_path()))
+        .filter(|(_, opened)| {
+            canonical_cwd
+                .as_path()
+                .starts_with(opened.canonical.as_path())
+        })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     if containing_roots.is_empty() {
@@ -1241,21 +1384,41 @@ fn resolve_path_phase(
     }
 
     Ok(WorkspacePathPhase {
-        canonical_roots,
+        opened_roots,
         canonical_cwd,
     })
 }
 
-#[derive(Clone, Eq, PartialEq)]
+/// One authorized root of a resolved Workspace. Equality deliberately compares the
+/// captured safe identity rather than only canonical path text, so candidate
+/// revalidation detects root replacement at the same path.
+#[derive(Clone)]
 pub(crate) struct ResolvedWorkspaceRoot {
     key: WorkspaceRootKey,
     role: WorkspaceRootRole,
     canonical_path: CanonicalWorkspacePath,
+    identity: WorkspaceRootIdentity,
+    dir: Arc<CapabilityDir>,
     trust: WorkspaceRootTrust,
     filesystem: WorkspaceFilesystemGrant,
     prompt_source: bool,
     skill_source: bool,
 }
+
+impl PartialEq for ResolvedWorkspaceRoot {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.role == other.role
+            && self.canonical_path == other.canonical_path
+            && self.identity == other.identity
+            && self.trust == other.trust
+            && self.filesystem == other.filesystem
+            && self.prompt_source == other.prompt_source
+            && self.skill_source == other.skill_source
+    }
+}
+
+impl Eq for ResolvedWorkspaceRoot {}
 
 impl fmt::Debug for ResolvedWorkspaceRoot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1304,8 +1467,11 @@ fn intersect_filesystem_grants(
 fn resolve_authority(
     expected_request: &WorkspaceAuthorityRequest,
     decision: WorkspaceAuthorityDecision,
+    opened_roots: Vec<OpenedWorkspaceRoot>,
 ) -> Result<Vec<ResolvedWorkspaceRoot>, WorkspaceResolveError> {
-    if decision.roots().len() != expected_request.roots().len() {
+    if decision.roots().len() != expected_request.roots().len()
+        || opened_roots.len() != expected_request.roots().len()
+    {
         return Err(WorkspaceResolveError::InternalDispatchUnavailable);
     }
 
@@ -1322,13 +1488,16 @@ fn resolve_authority(
         .roots()
         .iter()
         .zip(decision.roots())
-        .map(|(root, authority)| {
+        .zip(opened_roots)
+        .map(|((root, authority), opened)| {
             let filesystem =
                 intersect_filesystem_grants(root.requested_access, authority.filesystem_ceiling);
             Ok(ResolvedWorkspaceRoot {
                 key: root.key.clone(),
                 role: root.role,
-                canonical_path: root.canonical_path.clone(),
+                canonical_path: opened.canonical,
+                identity: opened.identity,
+                dir: opened.dir,
                 trust: authority.trust,
                 filesystem,
                 prompt_source: root.sources.prompt()
@@ -1459,12 +1628,12 @@ impl WorkspaceResolver {
 
         let request_roots = declared_roots
             .iter()
-            .zip(&path_phase.canonical_roots)
-            .map(|(root, canonical_path)| {
+            .zip(&path_phase.opened_roots)
+            .map(|(root, opened)| {
                 WorkspaceAuthorityRootRequest::new(
                     root.key.clone(),
                     root.role,
-                    canonical_path.clone(),
+                    opened.canonical.clone(),
                     root.requested_access,
                     root.sources,
                 )
@@ -1480,14 +1649,15 @@ impl WorkspaceResolver {
                 WorkspaceAuthorityError::Unavailable => WorkspaceResolveError::AuthorityUnavailable,
                 WorkspaceAuthorityError::Denied => WorkspaceResolveError::AuthorityDenied,
             })?;
-        let resolved_roots = match resolve_authority(&expected_request, decision) {
-            Ok(roots) => roots,
-            Err(WorkspaceResolveError::InternalDispatchUnavailable) => {
-                self.task_context.request_closing();
-                return Err(WorkspaceResolveError::InternalDispatchUnavailable);
-            }
-            Err(error) => return Err(error),
-        };
+        let resolved_roots =
+            match resolve_authority(&expected_request, decision, path_phase.opened_roots) {
+                Ok(roots) => roots,
+                Err(WorkspaceResolveError::InternalDispatchUnavailable) => {
+                    self.task_context.request_closing();
+                    return Err(WorkspaceResolveError::InternalDispatchUnavailable);
+                }
+                Err(error) => return Err(error),
+            };
 
         let candidate = WorkspaceSnapshotCandidate::new(
             session_id,
@@ -2082,6 +2252,7 @@ pub(crate) fn prompt_candidate_for_test(
             NonZeroU64::new(1).expect("the fixed test trust revision is non-zero"),
         ),
     );
+    let (identity, dir) = test_capability_scratch();
     let roots = root_keys
         .into_iter()
         .enumerate()
@@ -2096,6 +2267,8 @@ pub(crate) fn prompt_candidate_for_test(
                 key.as_str()
             ))),
             key,
+            identity: identity.clone(),
+            dir: Arc::clone(&dir),
             trust,
             filesystem: WorkspaceFilesystemGrant::ReadOnly,
             prompt_source: true,
@@ -2111,6 +2284,36 @@ pub(crate) fn prompt_candidate_for_test(
         roots,
         cwd,
     )
+}
+
+/// One shared real directory used as the test-only capability stand-in for fake
+/// candidates and fake path adapters. Fake resolutions never read through it, so a
+/// single per-process scratch keeps the deterministic tests free of per-path
+/// registries without weakening the production capability invariant.
+#[cfg(test)]
+fn test_capability_scratch() -> (WorkspaceRootIdentity, Arc<CapabilityDir>) {
+    use std::sync::OnceLock;
+
+    static SCRATCH: OnceLock<(WorkspaceRootIdentity, Arc<CapabilityDir>)> = OnceLock::new();
+    SCRATCH
+        .get_or_init(|| {
+            let path = std::env::temp_dir().join(format!(
+                "minicore-runtime-workspace-test-capability-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path)
+                .expect("the test capability scratch directory is creatable");
+            let dir = CapabilityDir::open_ambient_dir(&path, cap_std::ambient_authority())
+                .expect("the test capability scratch directory is openable");
+            let identity = WorkspaceRootIdentity::from_file(
+                dir.try_clone()
+                    .expect("the test capability scratch directory is cloneable")
+                    .into_std_file(),
+            )
+            .expect("the test capability scratch identity is capturable");
+            (identity, Arc::new(dir))
+        })
+        .clone()
 }
 
 pub(crate) struct WorkspaceSnapshot {
@@ -2151,6 +2354,25 @@ impl WorkspaceSnapshot {
             session_id: self.session_id,
             cwd: self.cwd.clone(),
             sources: Arc::clone(&self.skill_sources),
+        }
+    }
+
+    pub(crate) fn tool_context(&self) -> WorkspaceToolContext {
+        WorkspaceToolContext {
+            access: WorkspaceAccessView {
+                session_id: self.session_id,
+                cwd: self.cwd.clone(),
+                roots: self
+                    .roots
+                    .iter()
+                    .map(|root| WorkspaceAccessRoot {
+                        canonical_path: root.canonical_path.clone(),
+                        dir: Arc::clone(&root.dir),
+                        filesystem: root.filesystem,
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            },
         }
     }
 
@@ -2264,6 +2486,185 @@ impl fmt::Debug for WorkspaceSkillContext {
     }
 }
 
+/// One effective filesystem access root projected from a resolved root. The open
+/// capability `dir` is bound to the exact directory the resolver verified, so the
+/// synchronous authorization below never touches ambient paths.
+#[derive(Clone)]
+pub(crate) struct WorkspaceAccessRoot {
+    canonical_path: CanonicalWorkspacePath,
+    dir: Arc<CapabilityDir>,
+    filesystem: WorkspaceFilesystemGrant,
+}
+
+impl fmt::Debug for WorkspaceAccessRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceAccessRoot")
+            .field("filesystem", &self.filesystem)
+            .finish()
+    }
+}
+
+/// The narrow filesystem ceiling a loaded WorkspaceSnapshot projects for Tools.
+/// It exposes only the captured canonical cwd, the effective access roots with
+/// their bound capabilities, and synchronous cwd-relative read authorization.
+/// Roots are non-overlapping and cwd lies within exactly one root, so this first
+/// slice authorizes only cwd-relative read paths; additional roots are not
+/// directly addressable through this schema.
+#[derive(Clone)]
+pub(crate) struct WorkspaceAccessView {
+    session_id: SessionId,
+    cwd: CanonicalWorkspacePath,
+    roots: Arc<[WorkspaceAccessRoot]>,
+}
+
+impl WorkspaceAccessView {
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) fn cwd(&self) -> &CanonicalWorkspacePath {
+        &self.cwd
+    }
+
+    pub(crate) fn roots(&self) -> &[WorkspaceAccessRoot] {
+        &self.roots
+    }
+
+    /// Authorizes one cwd-relative read target against the captured facts. The
+    /// containing root is the exact root holding the captured canonical cwd; the
+    /// cwd's relative position inside that root is prepended to the requested
+    /// relative path, and the resulting capability-relative target must be fully
+    /// normal. The returned path is the only value a Tool may use to open files.
+    pub(crate) fn authorize_read(
+        &self,
+        relative: &WorkspaceRelativePath,
+    ) -> Result<AuthorizedWorkspaceReadPath, WorkspaceAccessError> {
+        if relative.is_root() {
+            return Err(WorkspaceAccessError::InvalidPath);
+        }
+        let root = self
+            .roots
+            .iter()
+            .find(|root| {
+                self.cwd
+                    .as_path()
+                    .starts_with(root.canonical_path.as_path())
+            })
+            .ok_or(WorkspaceAccessError::Unavailable)?;
+        if !root.filesystem.is_readable() {
+            return Err(WorkspaceAccessError::NotAuthorized);
+        }
+        let cwd_in_root = self
+            .cwd
+            .as_path()
+            .strip_prefix(root.canonical_path.as_path())
+            .map_err(|_| WorkspaceAccessError::Unavailable)?;
+        let target = cwd_in_root.join(relative.as_str());
+        if !target
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(WorkspaceAccessError::InvalidPath);
+        }
+        Ok(AuthorizedWorkspaceReadPath {
+            root_dir: Arc::clone(&root.dir),
+            relative: target,
+        })
+    }
+}
+
+impl fmt::Debug for WorkspaceAccessView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceAccessView")
+            .field("root_count", &self.roots.len())
+            .finish()
+    }
+}
+
+/// The workspace projection a ToolSet pins for a loaded Session. It is cloneable
+/// and carries no Prompt/Skill source, approval, registry or provider facts.
+#[derive(Clone)]
+pub(crate) struct WorkspaceToolContext {
+    access: WorkspaceAccessView,
+}
+
+impl WorkspaceToolContext {
+    pub(crate) fn access(&self) -> &WorkspaceAccessView {
+        &self.access
+    }
+}
+
+impl fmt::Debug for WorkspaceToolContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceToolContext")
+            .field("access", &self.access)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum WorkspaceAccessError {
+    #[error("workspace read access is not authorized")]
+    NotAuthorized,
+    #[error("workspace read target is invalid")]
+    InvalidPath,
+    #[error("workspace read target is unavailable")]
+    Unavailable,
+    #[error("workspace read failed")]
+    OpenFailed,
+}
+
+fn map_access_io_error(error: std::io::Error) -> WorkspaceAccessError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => WorkspaceAccessError::Unavailable,
+        _ => WorkspaceAccessError::OpenFailed,
+    }
+}
+
+/// The only authorized read value a Tool can consume: the open capability bound
+/// to the authorized root plus a normalized capability-relative target. It never
+/// exposes ambient absolute paths; opening always resolves through the captured
+/// `Dir`, which cannot escape the root it was bound to.
+#[derive(Clone)]
+pub(crate) struct AuthorizedWorkspaceReadPath {
+    root_dir: Arc<CapabilityDir>,
+    relative: PathBuf,
+}
+
+impl AuthorizedWorkspaceReadPath {
+    /// The normalized capability-relative target; safe to expose because it
+    /// contains no ambient root text.
+    #[cfg(test)]
+    pub(crate) fn relative_path(&self) -> &Path {
+        &self.relative
+    }
+
+    /// Opens the target read-only and nonblocking through the captured root
+    /// capability. A symlink that would leave the root fails at this open; a
+    /// FIFO or other special entry cannot block the open (no writer is needed to
+    /// pair with it) and is rejected by the caller's regular-file metadata check.
+    pub(crate) fn open_nonblocking(&self) -> Result<cap_std::fs::File, WorkspaceAccessError> {
+        // The hidden `_cap_fs_ext_nonblock` extension is the only way cap-std
+        // exposes O_NONBLOCK without the cap-fs-ext crate; the pinned exact
+        // cap-std version makes this stable for this repository.
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true);
+        options._cap_fs_ext_nonblock(true);
+        self.root_dir
+            .open_with(&self.relative, &options)
+            .map_err(map_access_io_error)
+    }
+}
+
+impl fmt::Debug for AuthorizedWorkspaceReadPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthorizedWorkspaceReadPath { .. }")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -2276,17 +2677,18 @@ mod tests {
     use std::thread;
 
     use super::{
-        CanonicalWorkspacePath, CapturedWorkspacePromptSource, CapturedWorkspaceSkillSource,
-        LocalWorkspacePathAdapter, RequestedFilesystemAccess, RestrictedWorkspaceAuthority,
-        Workspace, WorkspaceAuthority, WorkspaceAuthorityDecision, WorkspaceAuthorityError,
+        AuthorizedWorkspaceReadPath, CanonicalWorkspacePath, CapturedWorkspacePromptSource,
+        CapturedWorkspaceSkillSource, LocalWorkspacePathAdapter, OpenedWorkspaceRoot,
+        RequestedFilesystemAccess, RestrictedWorkspaceAuthority, Workspace, WorkspaceAccessError,
+        WorkspaceAuthority, WorkspaceAuthorityDecision, WorkspaceAuthorityError,
         WorkspaceAuthorityRequest, WorkspaceAuthorityRootDecision, WorkspaceAuthorityRootRequest,
         WorkspaceConstructionError, WorkspaceCwdSpec, WorkspaceDefinitionInput,
         WorkspaceFilesystemGrant, WorkspaceInputLoweringError, WorkspacePathAdapter,
         WorkspacePathError, WorkspacePathTarget, WorkspaceResolveError, WorkspaceResolver,
-        WorkspaceRootInput, WorkspaceRootRole, WorkspaceRootSpec, WorkspaceRootTrust,
-        WorkspaceSnapshotFinishError, WorkspaceSourceCaptureError, WorkspaceSourcePolicy,
-        WorkspaceTrustLevel, WorkspaceTrustRevision, checked_native_uri, lower_workspace,
-        uri_from_spec,
+        WorkspaceRootIdentity, WorkspaceRootInput, WorkspaceRootRole, WorkspaceRootSpec,
+        WorkspaceRootTrust, WorkspaceSnapshotFinishError, WorkspaceSourceCaptureError,
+        WorkspaceSourcePolicy, WorkspaceTrustLevel, WorkspaceTrustRevision, checked_native_uri,
+        lower_workspace, test_capability_scratch, uri_from_spec,
     };
     use crate::runtime_task::RuntimeTaskContext;
     use crate::wire::{CanonicalFileUri, SessionId, WorkspaceRelativePath, WorkspaceRevision};
@@ -2296,6 +2698,8 @@ mod tests {
     #[derive(Clone)]
     struct DeterministicWorkspacePathAdapter {
         mappings: BTreeMap<PathBuf, Result<CanonicalWorkspacePath, WorkspacePathError>>,
+        identity: WorkspaceRootIdentity,
+        dir: Arc<cap_std::fs::Dir>,
         entered: Option<Arc<Barrier>>,
         release: Option<Arc<Barrier>>,
         block_once: Arc<AtomicBool>,
@@ -2304,8 +2708,11 @@ mod tests {
 
     impl DeterministicWorkspacePathAdapter {
         fn identity() -> Self {
+            let (identity, dir) = test_capability_scratch();
             Self {
                 mappings: BTreeMap::new(),
+                identity,
+                dir,
                 entered: None,
                 release: None,
                 block_once: Arc::new(AtomicBool::new(false)),
@@ -2322,8 +2729,11 @@ mod tests {
         }
 
         fn blocking(entered: Arc<Barrier>, release: Arc<Barrier>) -> Self {
+            let (identity, dir) = test_capability_scratch();
             Self {
                 mappings: BTreeMap::new(),
+                identity,
+                dir,
                 entered: Some(entered),
                 release: Some(release),
                 block_once: Arc::new(AtomicBool::new(true)),
@@ -2362,16 +2772,43 @@ mod tests {
                 .cloned()
                 .unwrap_or_else(|| Ok(CanonicalWorkspacePath::new(path.to_path_buf())))
         }
+
+        fn open_directory(&self, path: &Path) -> Result<OpenedWorkspaceRoot, WorkspacePathError> {
+            // The deterministic adapter substitutes the shared test scratch
+            // capability; fake resolutions never read through it.
+            let canonical = self.canonicalize_directory(path)?;
+            Ok(OpenedWorkspaceRoot {
+                canonical,
+                identity: self.identity.clone(),
+                dir: Arc::clone(&self.dir),
+            })
+        }
+
+        fn canonicalize_directory_in_root(
+            &self,
+            _opened_root: &OpenedWorkspaceRoot,
+            _relative: &str,
+            ambient_path: &Path,
+        ) -> Result<CanonicalWorkspacePath, WorkspacePathError> {
+            // The deterministic adapter keeps its pure declared-path mapping for
+            // the cwd claim; it does not emulate the production capability proof.
+            self.canonicalize_directory(ambient_path)
+        }
     }
 
     struct ChangingCanonicalWorkspacePathAdapter {
         calls: AtomicUsize,
+        identity: WorkspaceRootIdentity,
+        dir: Arc<cap_std::fs::Dir>,
     }
 
     impl ChangingCanonicalWorkspacePathAdapter {
         fn new() -> Self {
+            let (identity, dir) = test_capability_scratch();
             Self {
                 calls: AtomicUsize::new(0),
+                identity,
+                dir,
             }
         }
     }
@@ -2387,6 +2824,125 @@ mod tests {
                 "/deterministic/second"
             };
             Ok(CanonicalWorkspacePath::new(PathBuf::from(path)))
+        }
+
+        fn open_directory(&self, path: &Path) -> Result<OpenedWorkspaceRoot, WorkspacePathError> {
+            let canonical = self.canonicalize_directory(path)?;
+            Ok(OpenedWorkspaceRoot {
+                canonical,
+                identity: self.identity.clone(),
+                dir: Arc::clone(&self.dir),
+            })
+        }
+
+        fn canonicalize_directory_in_root(
+            &self,
+            _opened_root: &OpenedWorkspaceRoot,
+            _relative: &str,
+            ambient_path: &Path,
+        ) -> Result<CanonicalWorkspacePath, WorkspacePathError> {
+            // Delegate so the deterministic call-counting sequence is preserved.
+            self.canonicalize_directory(ambient_path)
+        }
+    }
+
+    /// Wraps the production local adapter and counts how many times the
+    /// capability-relative cwd proof ran, so a deterministic test can prove the
+    /// production path phase exercises it for a normal nested cwd.
+    struct RecordingLocalAdapter {
+        inner: LocalWorkspacePathAdapter,
+        cwd_proof_calls: Arc<AtomicUsize>,
+    }
+
+    impl RecordingLocalAdapter {
+        fn new() -> Self {
+            Self {
+                inner: LocalWorkspacePathAdapter,
+                cwd_proof_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn cwd_proof_calls(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.cwd_proof_calls)
+        }
+    }
+
+    impl WorkspacePathAdapter for RecordingLocalAdapter {
+        fn canonicalize_directory(
+            &self,
+            path: &Path,
+        ) -> Result<CanonicalWorkspacePath, WorkspacePathError> {
+            self.inner.canonicalize_directory(path)
+        }
+
+        fn open_directory(&self, path: &Path) -> Result<OpenedWorkspaceRoot, WorkspacePathError> {
+            self.inner.open_directory(path)
+        }
+
+        fn canonicalize_directory_in_root(
+            &self,
+            opened_root: &OpenedWorkspaceRoot,
+            relative: &str,
+            ambient_path: &Path,
+        ) -> Result<CanonicalWorkspacePath, WorkspacePathError> {
+            self.cwd_proof_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .canonicalize_directory_in_root(opened_root, relative, ambient_path)
+        }
+    }
+
+    /// Replaces the declared root with a fresh directory at the same path exactly
+    /// between root capture and the cwd proof, simulating the rename/replacement
+    /// race the capability-relative identity proof must fail closed against.
+    struct ReplacingRootLocalAdapter {
+        inner: LocalWorkspacePathAdapter,
+        declared_root: PathBuf,
+        displaced_root: PathBuf,
+        replaced: AtomicBool,
+    }
+
+    impl ReplacingRootLocalAdapter {
+        fn new(declared_root: PathBuf, displaced_root: PathBuf) -> Self {
+            Self {
+                inner: LocalWorkspacePathAdapter,
+                declared_root,
+                displaced_root,
+                replaced: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl WorkspacePathAdapter for ReplacingRootLocalAdapter {
+        fn canonicalize_directory(
+            &self,
+            path: &Path,
+        ) -> Result<CanonicalWorkspacePath, WorkspacePathError> {
+            self.inner.canonicalize_directory(path)
+        }
+
+        fn open_directory(&self, path: &Path) -> Result<OpenedWorkspaceRoot, WorkspacePathError> {
+            self.inner.open_directory(path)
+        }
+
+        fn canonicalize_directory_in_root(
+            &self,
+            opened_root: &OpenedWorkspaceRoot,
+            relative: &str,
+            ambient_path: &Path,
+        ) -> Result<CanonicalWorkspacePath, WorkspacePathError> {
+            if !self.replaced.swap(true, Ordering::SeqCst) {
+                // Root capture has finished and the cwd proof is about to run:
+                // rename the captured root away and create a replacement at the
+                // same path, including the cwd subdirectory, so the ambient
+                // canonical text is unchanged while the captured capability still
+                // names the displaced directory.
+                std::fs::rename(&self.declared_root, &self.displaced_root)
+                    .expect("the captured root is displaceable");
+                std::fs::create_dir_all(self.declared_root.join(relative))
+                    .expect("the replacement cwd directory is creatable");
+            }
+            self.inner
+                .canonicalize_directory_in_root(opened_root, relative, ambient_path)
         }
     }
 
@@ -2958,6 +3514,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn local_nested_cwd_resolves_capability_relative_through_the_captured_root() {
+        let temporary = TempDirectory::new("cwd-proof");
+        let primary = temporary.path().join("primary");
+        let nested = primary.join("src/nested");
+        std::fs::create_dir_all(&nested).expect("the nested cwd directory is creatable");
+
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                primary.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", "src/nested"),
+        )
+        .unwrap();
+
+        let task_context = initialized_context().await;
+        let adapter = RecordingLocalAdapter::new();
+        let proof_calls = adapter.cwd_proof_calls();
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            adapter,
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadWrite, false, false),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        assert_eq!(
+            candidate.cwd.as_path(),
+            std::fs::canonicalize(&nested).unwrap()
+        );
+        assert_eq!(candidate.roots.len(), 1);
+        assert_eq!(
+            proof_calls.load(Ordering::SeqCst),
+            1,
+            "the production path phase must run the capability-relative cwd proof"
+        );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn requested_access_and_source_flags_are_tightened_independently() {
         let workspace = resolver_workspace(
             (
@@ -3091,7 +3689,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn cwd_symlink_escape_and_root_key_mismatch_are_distinct() {
+    async fn cwd_symlink_escapes_fail_through_the_capability_relative_proof() {
         use std::os::unix::fs::symlink;
 
         let temporary = TempDirectory::new("cwd-links");
@@ -3101,6 +3699,10 @@ mod tests {
         std::fs::create_dir_all(&primary).unwrap();
         std::fs::create_dir_all(&additional).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
+        // Both escape flavors are final-component symlinks: one to an absolute
+        // path outside the roots, one into the other declared root. Either way
+        // the ambient canonical text would resolve, so only the capability-
+        // relative open through the captured root can reject them.
         symlink(&outside, primary.join("escape")).unwrap();
         symlink(&additional, primary.join("to-additional")).unwrap();
 
@@ -3129,7 +3731,7 @@ mod tests {
         )
         .unwrap();
         let (primary_root, additional_roots) = roots();
-        let mismatch_workspace = Workspace::new(
+        let into_other_root_workspace = Workspace::new(
             revision(),
             primary_root,
             additional_roots,
@@ -3139,9 +3741,56 @@ mod tests {
 
         let task_context = initialized_context().await;
         let resolver = WorkspaceResolver::new(task_context.clone());
+        for workspace in [escape_workspace, into_other_root_workspace] {
+            assert_eq!(
+                resolver
+                    .resolve(session_id(), &workspace)
+                    .await
+                    .unwrap_err(),
+                WorkspaceResolveError::CanonicalizationFailed
+            );
+        }
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deterministic_cwd_outside_and_mismatch_keep_their_semantics() {
+        // The capability proof is production-only; the deterministic adapter
+        // keeps its pure path-text mapping, so the containment checks still have
+        // deterministic coverage for cwd canonical text that is outside every
+        // root or inside a root that is not the declared cwd root.
+        let workspace_for = |relative: &str| {
+            resolver_workspace(
+                (
+                    "primary",
+                    "/deterministic/primary",
+                    RequestedFilesystemAccess::ReadWrite,
+                    WorkspaceSourcePolicy::new(false, false),
+                ),
+                vec![(
+                    "additional",
+                    "/deterministic/additional",
+                    RequestedFilesystemAccess::ReadOnly,
+                    WorkspaceSourcePolicy::new(false, false),
+                )],
+                "primary",
+                relative,
+            )
+        };
+        let outside_workspace = workspace_for("x");
+        let mismatch_workspace = workspace_for("y");
+
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::identity()
+                .mapping("/deterministic/primary/x", "/elsewhere")
+                .mapping("/deterministic/primary/y", "/deterministic/additional"),
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadOnly, false, false),
+        );
         assert_eq!(
             resolver
-                .resolve(session_id(), &escape_workspace)
+                .resolve(session_id(), &outside_workspace)
                 .await
                 .unwrap_err(),
             WorkspaceResolveError::CwdOutsideRoots
@@ -3153,6 +3802,45 @@ mod tests {
                 .unwrap_err(),
             WorkspaceResolveError::CwdRootMismatch
         );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cwd_proof_rejects_root_replaced_between_capture_and_proof() {
+        let temporary = TempDirectory::new("cwd-replacement-race");
+        let primary = temporary.path().join("primary");
+        let displaced = temporary.path().join("displaced");
+        std::fs::create_dir_all(primary.join("src")).expect("the cwd directory is creatable");
+
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                primary.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", "src"),
+        )
+        .unwrap();
+
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            ReplacingRootLocalAdapter::new(primary.clone(), displaced),
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadWrite, false, false),
+        );
+        let error = resolver
+            .resolve(session_id(), &workspace)
+            .await
+            .unwrap_err();
+        // The canonical path text is unchanged by the replacement, so only the
+        // same-file identity proof can detect that the cwd belongs to the
+        // displaced captured root rather than the replacement at the same path.
+        assert_eq!(error, WorkspaceResolveError::CanonicalizationFailed);
+        let error_text = format!("{error:?} {error}");
+        assert!(!error_text.contains(temporary.path().to_str().unwrap()));
         task_context.shutdown().await;
     }
 
@@ -3201,6 +3889,275 @@ mod tests {
                 .await
                 .unwrap_err(),
             WorkspaceResolveError::RootNotDirectory
+        );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_context_authorizes_cwd_relative_reads_and_binds_the_containing_root() {
+        let temporary = TempDirectory::new("tool-read");
+        let primary = temporary.path().join("primary");
+        let additional = temporary.path().join("additional");
+        let additional_cwd = additional.join("nested");
+        std::fs::create_dir_all(&primary).expect("the primary test root is creatable");
+        std::fs::create_dir_all(&additional_cwd).expect("the additional test root is creatable");
+        std::fs::write(additional_cwd.join("data.txt"), b"capability hello").unwrap();
+        std::fs::write(primary.join("only-in-primary.txt"), b"unreachable").unwrap();
+
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                primary.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            vec![root_spec_with(
+                "additional",
+                additional.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            )],
+            cwd("additional", "nested"),
+        )
+        .unwrap();
+
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            LocalWorkspacePathAdapter,
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadOnly, false, false),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let context = snapshot.tool_context();
+        let cloned_context = context.clone();
+        let access = cloned_context.access();
+        assert_eq!(access.session_id(), session_id());
+        assert_eq!(access.roots().len(), 2);
+        assert_eq!(
+            access.cwd().as_path(),
+            std::fs::canonicalize(&additional_cwd).unwrap()
+        );
+
+        // The cwd-relative target is resolved inside the exact root containing the
+        // captured canonical cwd, with the cwd's position in that root prepended.
+        let authorized: AuthorizedWorkspaceReadPath =
+            access.authorize_read(&"data.txt".parse().unwrap()).unwrap();
+        assert_eq!(authorized.relative_path(), Path::new("nested/data.txt"));
+        // The authorized target is a known regular fixture file, so the test reads it
+        // through the nonblocking capability open and `Read::read_to_end` itself.
+        let mut file = authorized
+            .open_nonblocking()
+            .expect("the regular fixture file opens nonblocking");
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes)
+            .expect("the regular fixture file reads to the end");
+        assert_eq!(bytes, b"capability hello");
+
+        // Other roots are not directly addressable through this cwd-relative schema:
+        // the target resolves inside the cwd's root only, where the primary-root file
+        // does not exist, so the capability open reports it unavailable.
+        let unreachable = access
+            .authorize_read(&"only-in-primary.txt".parse().unwrap())
+            .unwrap();
+        assert_eq!(
+            unreachable.relative_path(),
+            Path::new("nested/only-in-primary.txt")
+        );
+        assert_eq!(
+            unreachable.open_nonblocking().unwrap_err(),
+            WorkspaceAccessError::Unavailable
+        );
+
+        // A cwd at the root itself resolves targets directly under that root.
+        let root_cwd_workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                primary.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+        let root_cwd_candidate = resolver
+            .resolve(session_id(), &root_cwd_workspace)
+            .await
+            .unwrap();
+        let root_cwd_snapshot = root_cwd_candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let root_cwd_tool_context = root_cwd_snapshot.tool_context();
+        let root_cwd_access = root_cwd_tool_context.access();
+        let root_authorized = root_cwd_access
+            .authorize_read(&"only-in-primary.txt".parse().unwrap())
+            .unwrap();
+        assert_eq!(
+            root_authorized.relative_path(),
+            Path::new("only-in-primary.txt")
+        );
+        // A known regular fixture file: read it through the nonblocking capability
+        // open with the test's own `Read::read_to_end`.
+        let mut file = root_authorized
+            .open_nonblocking()
+            .expect("the regular fixture file opens nonblocking");
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes)
+            .expect("the regular fixture file reads to the end");
+        assert_eq!(bytes, b"unreachable");
+
+        let debug = format!("{context:?} {access:?} {authorized:?}");
+        assert!(!debug.contains(temporary.path().to_str().unwrap()));
+        assert!(!debug.contains("nested/data.txt"));
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_authorization_denies_without_a_readable_grant_and_rejects_root_paths() {
+        let temporary = TempDirectory::new("tool-deny");
+        let root = temporary.path().join("root");
+        std::fs::create_dir_all(&root).expect("the test root is creatable");
+        std::fs::write(root.join("notes.txt"), b"secret body").unwrap();
+
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            LocalWorkspacePathAdapter,
+            authority_with_ceiling(WorkspaceFilesystemGrant::None, false, false),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = snapshot.tool_context();
+        let access = tool_context.access();
+
+        let error = access
+            .authorize_read(&"notes.txt".parse().unwrap())
+            .unwrap_err();
+        assert_eq!(error, WorkspaceAccessError::NotAuthorized);
+        assert_eq!(
+            access
+                .authorize_read(&WorkspaceRelativePath::default())
+                .unwrap_err(),
+            WorkspaceAccessError::InvalidPath
+        );
+        let error_text = format!("{error:?} {error}");
+        assert!(!error_text.contains("notes.txt"));
+        assert!(!error_text.contains(root.to_str().unwrap()));
+        task_context.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn capability_read_rejects_symlink_escape_outside_the_root() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDirectory::new("tool-escape");
+        let root = temporary.path().join("root");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(&root).expect("the test root is creatable");
+        std::fs::create_dir_all(&outside).expect("the outside directory is creatable");
+        std::fs::write(outside.join("secret.txt"), b"outside secret").unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            LocalWorkspacePathAdapter,
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadOnly, false, false),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = snapshot.tool_context();
+        let access = tool_context.access();
+
+        let authorized = access
+            .authorize_read(&"escape/secret.txt".parse().unwrap())
+            .unwrap();
+        let error = authorized.open_nonblocking().unwrap_err();
+        assert_eq!(error, WorkspaceAccessError::OpenFailed);
+        let error_text = format!("{error:?} {error}");
+        assert!(!error_text.contains("secret"));
+        assert!(!error_text.contains("escape"));
+        // The target file itself exists and is readable through ordinary std access.
+        assert_eq!(
+            std::fs::read(outside.join("secret.txt")).unwrap(),
+            b"outside secret"
+        );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn candidate_revalidation_detects_root_replacement_identity() {
+        let temporary = TempDirectory::new("root-replacement");
+        let root = temporary.path().join("root");
+        let displaced = temporary.path().join("displaced");
+        std::fs::create_dir_all(&root).expect("the test root is creatable");
+
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+        let task_context = initialized_context().await;
+        let resolver = WorkspaceResolver::new(task_context.clone());
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+
+        // Replace the root with a different directory at the same path: the canonical
+        // path text is unchanged, but the captured safe identity must differ.
+        std::fs::rename(&root, &displaced).expect("the old root is displaceable");
+        std::fs::create_dir_all(&root).expect("the replacement root is creatable");
+
+        let fresh = resolver.resolve(session_id(), &workspace).await.unwrap();
+        assert_eq!(
+            candidate.roots[0].canonical_path,
+            fresh.roots[0].canonical_path
+        );
+        assert_ne!(candidate.roots[0].identity, fresh.roots[0].identity);
+        assert!(
+            !resolver
+                .revalidate_candidate(&candidate, &workspace)
+                .await
+                .unwrap()
         );
         task_context.shutdown().await;
     }
