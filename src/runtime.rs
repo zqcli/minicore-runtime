@@ -853,6 +853,10 @@ struct RuntimeInner {
 }
 
 impl RuntimeInner {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one Runtime owner constructor binds the exact validated services, residency, lifecycle settings, and optional read-authority control"
+    )]
     fn new(
         task_context: RuntimeTaskContext,
         durable_state: DurableState,
