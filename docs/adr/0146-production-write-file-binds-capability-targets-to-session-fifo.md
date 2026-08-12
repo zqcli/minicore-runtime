@@ -3,6 +3,8 @@
 状态：Accepted
 日期：2026-08-12
 
+> 实现状态：Workspace capability target、Session-local queue/slot lifecycle与production `write_file`/Runtime wiring已分别由`075ff91`、`1984944`与`2048d23`交付；existing与initially-missing same-target sibling FIFO、before/after-job cancellation、16种closed selection、ReadOnly ceiling与joint revocation均有deterministic tests。完整acceptance：stable/真实Rust 1.85主crate均为library `984 passed / 3 ignored`与integration `159 passed / 3 ignored`；stable另通过standalone provider-gate `25/25`、Clippy、format、current/archive docs、Wire V1 `144 active / 0 pending`与Durable Store fixtures。
+
 ## 背景
 
 M14已经交付closed/default-off的`ask_user`、`read_file`与`list_directory` production builtins，但仍没有真实file mutation consumer。ADR 0116要求首个file mutation adapter同时交付Session-local canonical-target FIFO、按原始`call_index`预留ticket、waiting cancellation与permit-through-settlement；ADR 0140又要求`FilesystemWrite`在任何side effect start前被Sandbox与resource-level Workspace authority共同强制。

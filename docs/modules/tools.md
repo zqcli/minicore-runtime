@@ -1,6 +1,6 @@
 # Tool 子系统架构设计
 
-状态：当前权威架构；M8.1最小Scripted Tool round-trip与crate-private `ToolOperationSlot`完整生命周期已实现（Prepared→Running→Settling→Terminal：per-request slot-owned `ToolStartGate` first-wins start gate、typed started proof、Running cancellation pair、signal先赢→PreExecution Cancelled且不调用factory、start先赢→Settling继续await same run后truthful settle、PreExecution/Executed/Abandoned truthful settlement），crate-private scripted approval/UserQuestion控制正确性seam亦已实现（typed `ToolExecutionPlan::{Approval, UserQuestion}`拆分、Session-private concrete `ToolExecutionControl`、Tools-owned move-only `UserQuestionAnswerBinding`、hoisted exclusive question调度与signal-first settlement）；M13/V4-C0-1已由ADR 0140关闭：class-level `ToolPermissionSet × ToolSandboxContract`差集、unavailable fail-closed、restricted candidate不得扩大、direct Execute admission、approval resume revalidation及非空permission plan的SecurityRevoked/Sandbox-unavailable/Running Session round conformance均已实现。production `ask_user` builtin已由ADR 0142关闭：closed、default-off、Runtime-owned，`MiniCoreRuntimeConfig::with_ask_user_tool()` idempotent opt-in，`ToolSet::ask_user_builtin()`生产构造，零capability permission、available empty sandbox contract，仅返回UserQuestion或frozen PreExecution failure plans，answer为恰一个deterministic compact JSON Text part（binding先经exact `validate_answer`验证，render/invariant失败fail closed为Abandoned RuntimeFailure）。production `read_file` builtin亦已实现（workspace file capability capture、revocable read grants、composition与installation slices已落地）：closed、default-off、Runtime-owned，`MiniCoreRuntimeConfig::with_read_file_tool()` idempotent opt-in同时是Tool安装与read-only Workspace authority ceiling（`WorkspaceResolver::new_with_read_access` + owner-held `WorkspaceReadAccessControl` per-Session永久read revocation），`ToolSet::read_file_builtin()`与`ProductionToolConfig`生产构造，恰一个`FilesystemRead` capability、available-exactly-for-FilesystemRead sandbox contract，仅cwd-relative可读授权（opaque `AuthorizedWorkspaceReadPath`经captured root capability open，symlink逃逸/特殊文件/超界均fail closed为frozen text），执行使用owner-tracked blocking job（一次nonblocking capability open + 至多65,537字节有界读取）与truthful cooperative cancellation。production `list_directory` builtin也已由ADR 0144实现：closed/default-off、共享同一ReadOnly authority与revocation、cwd-relative direct enumeration（empty path为cwd）、opaque `AuthorizedWorkspaceReadDirectory` capability open、entry symlink不跟随、256-entry/8,192 retained-name-byte/65,536 JSON bounds、deterministic compact JSON与owner-tracked no-detach settlement。完整generic ToolService/source/schema/hooks/policy、resource-level grants（FilesystemRead之外）、其余production executor/adapter（返回前须提供有界、可确认cleanup）与Session-local mutation queue/mutation permit attachment to Settling仍待实现
+状态：当前权威架构；M8.1最小Scripted Tool round-trip与crate-private `ToolOperationSlot`完整生命周期已实现（Prepared→Running→Settling→Terminal：per-request slot-owned `ToolStartGate` first-wins start gate、typed started proof、Running cancellation pair、signal先赢→PreExecution Cancelled且不调用factory、start先赢→Settling继续await same run后truthful settle、PreExecution/Executed/Abandoned truthful settlement），crate-private scripted approval/UserQuestion控制正确性seam亦已实现；M13/V4-C0-1已由ADR 0140关闭。M14四个closed/default-off production builtins现均已实现：`ask_user`（ADR 0142）、`read_file`（ADR 0143）、`list_directory`（ADR 0144）与`write_file`（ADR 0146）。`write_file`交付了真实typed `ToolExecutionPlan::FileMutation`、owner-tracked non-mutating preparation、capability-opened physical target identity、每loaded Session一个`SessionFileMutationQueue`、exact-request-bound FIFO ticket，以及由`ToolOperationSlot`在Running/Settling持有至Terminal的mutation permit；四个独立opt-in形成16种closed selection，固定顺序为`ask_user → read_file → list_directory → write_file`。完整generic ToolService/source/schema/hooks/policy、filesystem之外的resource-level grants、network/process及其他production executor/adapter与public Tool DTO仍待实现。
 日期：2026-07-31
 
 ## 目的
@@ -538,7 +538,7 @@ production `read_file`是closed、default-off、Runtime-owned builtin，唯一�
 - **Plan闭合与授权**：valid call→`ToolExecutionPlan::Execute`，permission恰为`ToolCapabilityClass::FilesystemRead`；授权在**任何start factory存在之前同步**经`WorkspaceAccessView::authorize_read(&path)`完成：containing root是持有canonical cwd的exact root，cwd在该root内的相对位置被prepend到requested path，结果capability-relative target必须fully normal。授权成功返回opaque `AuthorizedWorkspaceReadPath`（captured root capability `Arc<cap_std::fs::Dir>` + normalized capability-relative target；绝不暴露ambient absolute path，raw model path不能越过该类型）。每个授权错误（无readable grant、root path本身即cwd是目录不是read target、basis unavailable）collapse为同一个frozen `PreExecution + Denied`文本`workspace file access is denied`（bounded、non-secret）；absolute、dot/dotdot、平台prefix等非canonical path在更早的`WorkspaceRelativePath` semantic parse阶段归入`tool arguments are invalid`。builtin的outer sandbox contract available恰为`FilesystemRead`；Execute plan在离开Tools owner前被admit一次，拒绝即frozen Denied。composed ToolSet保持同一contract：read_file route被admit恰一次（绝不二次），ask_user route只产生UserQuestion/PreExecution shape，根本不进入Execute-only Sandbox admission。
 - **Capability-relative open与有界读取**：started executor绝不使用ambient path、`std::fs::read`或`canonicalize`：经`AuthorizedWorkspaceReadPath::open_nonblocking()`（read + O_NONBLOCK，cap-std `Dir.open_with`）打开，open解析经captured root `Dir`——symlink escape在该open处fail（读为frozen unreadable）；FIFO等special entry的nonblocking open无需writer配对、立即返回，随后fstat regular-file check拒绝（目录/FIFO/socket/device等non-regular一律frozen unreadable，绝不挂起）；metadata size已超界时先拒绝、不读一个byte；随后有界读取至多65,537 bytes（超界检测无需unbounded allocation）。成功内容恰一个Text part ≤65,536 bytes：valid UTF-8 + safe-text（既有`ToolResultContent` owner contract）。frozen `Completed + Failed`文本恰为：`file could not be read`（missing、non-regular、open/read error、symlink escape、或valid UTF-8但protocol不能作为single safe Text part披露）、`file is not valid UTF-8`、`file is too large`（>65,536 bytes）；空regular file成功为恰一个empty Text part。
 - **Owner-tracked blocking execution与truthful cancellation**：executor经`RuntimeTaskContext::spawn_blocking_tracked`调度一个tracked blocking job，job一旦scheduled绝不drop或detach：cancellation在job创建前已赢（或与scheduling race先赢）时，biased select证明零I/O，settle为frozen `Completed + Cancelled`文本`file read was cancelled`（truthful，绝非OutcomeUnknown）；cancellation在read运行中到达（即使nonblocking open注册期间）时保持await同一tracked job直到它settle并保留truthful result（known success/failure绝不重写）。只有`RuntimeTaskError`（owner closing、worker unavailable、operation panic）settle为`Abandoned { RuntimeFailure }`；signal-before-start情形由ToolSet gate slot拥有，在executor构造前settle自己的PreExecution Cancelled。这是production executor slice（非scripted）：application work与allocation有界（一次nonblocking capability open + 至多65,537 bytes read），owner不会detach且settlement可确认。诚实边界：special files被nonblocking-reject，但regular-file wall-clock I/O依赖OS/filesystem，runtime不fabricate timeout或wall-clock上界。
-- **八种frozen selection与per-admission materialization**：`ProductionToolConfig::new(ask_user, read_file, list_directory)`在`open`时冻结exact base一次（empty default或single ask_user builtin），三个bool恰有八种closed selection；definition/spec固定顺序为`ask_user → read_file → list_directory`，只包含enabled成员、无重复。default/ask-only反复materialize复用captured base Arc；只要任一Workspace-bound read builtin开启，每次admission都对exact captured Workspace snapshot materialize新ToolSet并绑定exact Runtime task context。composer只有三个frozen name route，unknown name经正常ToolSet lookup不可用；outer sandbox在任一read route开启时available exactly for `FilesystemRead`，read/list各自只经过一次admission，ask_user不进入Execute-only admission。`ReloadSharedResources`保留该frozen config不变（per-admission materialization只影响future Turn）。
+- **十六种frozen selection与per-admission materialization**：`ProductionToolConfig::new(ask_user, read_file, list_directory, write_file)`在`open`时冻结exact base一次（empty default或single ask_user builtin），四个bool恰有16种closed selection；definition/spec固定顺序为`ask_user → read_file → list_directory → write_file`，只包含enabled成员、无重复。default/ask-only反复materialize复用captured base Arc；只要任一Workspace-bound builtin开启，每次admission都对exact captured Workspace snapshot materialize新ToolSet并绑定exact Runtime task context与同一Session mutation queue。composer只有四个frozen name route，unknown name经正常ToolSet lookup不可用；outer sandbox是enabled routes所需的exact `FilesystemRead`/`FilesystemWrite` union，各route只经过一次admission。`ReloadSharedResources`保留该frozen config不变。
 
 ### Production list_directory Builtin
 
@@ -548,6 +548,16 @@ ADR 0144冻结的production `list_directory`是closed、default-off、Runtime-ow
 - **Plan与capability open**：strict serde mirror + `WorkspaceRelativePath`是semantic authority；invalid→`tool arguments are invalid`，authorization failure→`workspace directory access is denied`，均在start factory前。valid plan permission恰为`FilesystemRead`。`authorize_read_directory`与`authorize_read`共享containing-root/read-grant/cwd prepend/fully-normal实现，返回opaque `AuthorizedWorkspaceReadDirectory`；请求empty path表示cwd：cwd恰为root时authorized target为空并clone captured root Dir，cwd在root子目录时则经captured root `Dir::open_dir(cwd_in_root)`；其他target同样capability-relative open，symlink escape在open处fail closed。
 - **Direct bounded enumeration**：一个owner-tracked blocking job只调用opened Dir的`entries()`，最多消费257项以证明256-entry boundary；不递归、不读文件内容、不构造ambient path。每个in-bound entry只取bare UTF-8 name与不跟随target的`DirEntry::file_type()`；成功取得第257项后立即证明overflow而不再检查其name/type，type恰为`file | directory | symlink | other`。retained names总计≤8,192 bytes，先借用检查UTF-8/budget再复制；按UTF-8 name bytes排序后render恰一个≤65,536-byte safe Text，shape`{"entries":[{"name":"...","type":"file"},...]}`。
 - **Truthful outcomes/cancellation**：missing/not-directory/open/iteration error或in-bound entry type error→`directory could not be listed`；in-bound non-UTF-8 name→`directory contains an unsupported entry name`；bounds→`directory listing is too large`；job scheduling前cancel→零I/O证明的`directory listing was cancelled`。job一旦scheduled就等待同一settlement并保留known result；`RuntimeTaskError`或closed serialization invariant panic→`Abandoned { RuntimeFailure }`。filesystem open/enumeration wall-clock依赖OS/filesystem，不声称timeout。
+
+### Production write_file Builtin
+
+ADR 0146冻结的production `write_file`是closed、default-off、Runtime-owned builtin，唯一实现位置`src/tools/write_file.rs`；focused构造为`ToolSet::write_file_builtin(workspace, task_context, queue)`，production安装走`ProductionToolConfig`：
+
+- **Exact surface与authority**：ToolName恰为`write_file`，mode为`Parallel`；closed schema只有required `path`（`maxLength: 4096`）与`content`（`maxLength: 16384`），`additionalProperties: false`。content是safe UTF-8、允许empty、exact bytes写入、不normalize newline。`with_write_file_tool()`选择ReadWrite authority ceiling，但requested `ReadOnly` root仍保持ReadOnly并在plan时以`workspace file write access is denied`拒绝；Prompt/Skill source ceilings保持false。
+- **Typed preparation与opaque target**：valid call产生`ToolExecutionPlan::FileMutation { permissions = FilesystemWrite, prepare, queue }`。planner只同步授权`WorkspaceAccessView::authorize_write`并构造move-only preparation factory，不执行I/O。round owner按`call_index`串行调用factory；每个factory调度一个owner-tracked blocking job，prepare只打开capability handle/metadata并产生opaque `WorkspaceFileMutationKey`与move-only target，不create/truncate/write。existing target以exact opened regular-file `same_file::Handle`为key并保留同一File；create target以exact direct-parent Dir identity加normalized final name为key并保留该Dir。
+- **Session-local FIFO与slot-owned permit**：preparation完整settle且exact emergency basis仍current后，round owner同步按`call_index`在同一loaded Session queue预留exact-request-bound ticket。same key FIFO、different key独立；waiting ticket drop/cancel移除自身并唤醒next，foreign request fail closed，last ticket/permit离开后删除entry。ticket取得permit后才允许ToolStartGate reservation；Running与Settling slot持有permit，只有exact outcome已绑定、Settling→Terminal时释放。不同Session/Runtime/process不协调。
+- **Capability-relative full replacement**：existing target在保留的exact File上从offset zero truncate并`write_all`；create target只经保留parent Dir以final-component no-follow方式open/create/truncate。没有ambient path、`canonicalize`、mkdir、append、patch、atomic rename或fsync；write failure可能留下truncate/partial file，不retry、不声称crash durability。
+- **Two tracked jobs and truthful cancellation**：preparation与write是两个独立owner-tracked blocking jobs；move-only target只经private single-consumer handoff从preparation移到write。write job创建前cancellation获胜时证明零mutation并返回`file write was cancelled`；job一旦scheduled，后到signal仍等待同一job并保留truthful success/failure。ordinary target/write failure为`file could not be written`；success为`file written`；owner/worker/panic/join uncertainty为`Abandoned { RuntimeFailure }`。application bytes/allocation有界，ordinary filesystem wall-clock不声明timeout。
 
 ### Tool Execution Control
 
@@ -573,6 +583,15 @@ pub(crate) enum ToolExecutionPlan {
     UserQuestion {
         request: UserQuestionRequest,
         answer: UserQuestionAnswerBinding,
+    },
+    FileMutation {
+        permissions: ToolPermissionSet,
+        prepare: ToolExecutionPreparation,
+        queue: Arc<SessionFileMutationQueue>,
+    },
+    PreparedFileMutation {
+        ticket: SessionFileMutationTicket,
+        start: ToolExecutionStart,
     },
     PreExecution(ToolExecutionResult),
 }
@@ -602,7 +621,7 @@ pub(crate) enum ToolExecutionPlan {
 - preflight/schema/policy按call order；
 - UserQuestion/ask-user由typed plan shape识别并独占先完成（hoisted到全部ordinary sibling之前、按call_index串行、至多一个pending；每个question outcome先apply live+inline record attempt再继续；question不reserve/start ToolStartGate，也不涉及mutation ticket）；
 - `Serial`、multi-file或open-world Tool使batch按call order串行；
-- 普通single-file Tool按canonical file key取得Session-local FIFO ticket；
+- typed single-file mutation plan按opaque physical key取得Session-local FIFO ticket；
 - 不同key可以并发；
 - result允许逆序完成；
 - model-visible output始终按assistant call order。
@@ -615,13 +634,13 @@ pub(crate) struct SessionFileMutationQueue {
 
 mutation permit：
 
-- 基于fully canonical target；
-- create target使用nearest existing ancestor + normalized suffix；
+- existing target基于exact capability-opened regular-file identity；
+- create target使用exact direct-parent identity + normalized final filename；
 - underlying I/O settle前不释放；
 - Cancel可以忽略业务结果，但不能提前释放permit；
 - 不跨Session/Runtime/process协调。
 
-实现状态：Session-local file mutation queue与mutation permit仍未实现（mutation permit attachment to Settling仍pending）；上述调度规则中的question部分已由crate-private scripted control seam落地，file queue部分仍只是设计。
+实现状态：上述queue、ticket、permit与slot attachment均已实现。round先完整settle全部UserQuestion，再按`call_index`串行prepare并reserve mutation tickets；signal在preparation前获胜时factory不调用，scheduled preparation后获胜时仍等待同一preparation settle、随后不reserve ticket；waiting signal移除ticket并阻止start；started mutation的permit由Running移入Settling，只有Settling→Terminal后释放。
 
 ## Tool 执行流程
 
@@ -724,8 +743,8 @@ ToolSet只产出typed terminal outcome，不拥有conversation reducer。live co
 ## Cancellation 与 SecurityRevoked
 
 - Prepared：Emergency先赢，不发permit，产生PreExecution Cancelled ToolResult（已实现；含pending UserQuestion：signal-first跳过binding，全部unstarted calls settle matching PreExecution Cancelled）；
-- Running：发送best-effort cancellation，等待executor teardown/result（已实现：Running slot持有operation自己的`ToolCancellationHandle`，signal先赢后cancel该pair并经Settling继续await same run至executor cooperative cleanup/result；production `read_file` builtin executor已实现工作量/分配有界、owner-tracked且不detach的cleanup——一次nonblocking capability open + 至多65,537 bytes读取，signal后保持await同一job至truthful result，但regular-file wall-clock settlement无上界承诺；generic production executor/adapter teardown仍未实现，production adapter返回前必须提供有界工作量与可确认settlement）；
-- Settling：等待resource/mutation permit安全释放（mutation permit attachment to Settling仍pending）；
+- Running：发送best-effort cancellation，等待executor teardown/result（已实现：Running slot持有operation自己的`ToolCancellationHandle`；production `read_file`/`list_directory`/`write_file`都保持await同一owner-tracked job，write mutation还持有`SessionFileMutationPermit`）；
+- Settling：继续等待same run与outcome capture；started mutation permit从Running移动到Settling，只在exact outcome绑定并转入Terminal时释放；
 - UserQuestion/ask-user（已实现）：presentation/resolution/binding各阶段经move-only permit与signal first-wins，signal-first跳过binding并settle全部unstarted为PreExecution Cancelled，abandoned question对remaining无副作用（known preflight保留、其余unstarted为PreExecution Failed）；question不持mutation permit或ToolStartPermit，也不reserve/start ToolStartGate；
 - exact outcome可得：保存ToolResult；
 - outcome unknown：Abandoned；
@@ -845,8 +864,9 @@ Tool grant store
 - unknown/cross-request option拒绝，resolution后重新执行Sandbox enforceability与ToolStartGate；
 - UserQuestion Text/SingleChoice index/required/family validation且protocol无secret variant；
 - production `ask_user` builtin（ADR 0142）：default-off/opt-in config path、exact definition/schema disclosure、strict parsing与semantic failure（无question、count/index/byte边界）、valid text/choice/mixed/nullable title/non-contiguous indices、deterministic escaping与optional empty answer、无Execute/start seam、Session/runtime端到端question→ToolResult→next model call；
-- production `read_file` builtin：default-off/opt-in config path与八种closed selection中的exact disclosure（含frozen schema字节与顺序）、strict parsing与semantic failure（absolute/dot/drive/backslash/control/byte/segment边界）、授权Denied（无grant、root path、cwd外）、capability-relative open的symlink escape拒绝、regular-file/UTF-8/65,536-byte边界（65,536成功、65,537 too large、invalid UTF-8、unsafe text、空文件、missing/目录/FIFO）、cancellation before/after scheduling与RuntimeTaskError→Abandoned、end-to-end read_file→ToolResult→next model call、per-Session read revocation后future resolve/read denied；
-- production `list_directory` builtin（ADR 0144）：exact definition/schema、empty cwd与nested direct listing、sorted compact JSON/type mapping、strict path/unknown-field failures、no-grant/symlink-target denial、entry symlink与special type不跟随、non-UTF-8 name、256/257 entries与8,192 retained-name-byte边界、iteration-error precedence、cancellation before/after scheduling、RuntimeTaskError→Abandoned、八种selection/固定顺序、Runtime end-to-end与per-Session revocation后future denial；
+- production `read_file` builtin：default-off/opt-in config path与16种closed selection中的exact disclosure（含frozen schema字节与顺序）、strict parsing与semantic failure（absolute/dot/drive/backslash/control/byte/segment边界）、授权Denied（无grant、root path、cwd外）、capability-relative open的symlink escape拒绝、regular-file/UTF-8/65,536-byte边界（65,536成功、65,537 too large、invalid UTF-8、unsafe text、空文件、missing/目录/FIFO）、cancellation before/after scheduling与RuntimeTaskError→Abandoned、end-to-end read_file→ToolResult→next model call、per-Session read revocation后future resolve/read denied；
+- production `list_directory` builtin（ADR 0144）：exact definition/schema、empty cwd与nested direct listing、sorted compact JSON/type mapping、strict path/unknown-field failures、no-grant/symlink-target denial、entry symlink与special type不跟随、non-UTF-8 name、256/257 entries与8,192 retained-name-byte边界、iteration-error precedence、cancellation before/after scheduling、RuntimeTaskError→Abandoned、Runtime end-to-end与per-Session revocation后future denial；
+- production `write_file` builtin（ADR 0146）：exact definition/schema与16,384-byte content boundary、ReadOnly/no-grant denial、existing/create/no-mkdir/full-replacement、symlink/hard-link physical identity与create final no-follow、two tracked jobs/private move-only handoff、before-job zero-mutation cancellation、after-job truthful settlement、RuntimeFailure mapping、existing与initially-missing same-target sibling FIFO、16种selection/固定顺序、Runtime end-to-end与read/write joint revocation；
 - UserQuestion在mutation/start前；typed plan hoisting/exclusive scheduling（call_index串行、至多一个pending）、answer binding与signal first-wins、signal-first全部unstarted settle为PreExecution Cancelled；
 - ToolSet在task spawn前由captured control handle与Session-local queue完整构造；
 - ToolStartPermit只使用一次；
@@ -869,7 +889,7 @@ Tool grant store
 ## 开放问题
 
 1. production policy/workspace/resource-level permission producer与每个adapter的effective-enforcement conformance；
-2. production builtin Tool最小集合（`ask_user`/`read_file`/`list_directory`已分别由ADR 0142/0143/0144冻结并实现；是否增加其他builtin仍开放）；
+2. production builtin Tool最小集合（`ask_user`/`read_file`/`list_directory`/`write_file`已分别由ADR 0142/0143/0144/0146冻结并实现；是否增加其他builtin仍开放）；
 3. `max_tool_result_bytes`和future blob handling；
 4. provider-specific ToolResult error lowering。
 
@@ -882,7 +902,7 @@ ToolStartPermit使用actor message、owner-local CAS或等价private实现属于
 - [x] ToolSpec-only prompt view；
 - [x] ToolCall/Item identity；
 - [x] policy/approval/UserQuestion/Sandbox顺序；
-- [ ] Session-local file mutation queue（设计已冻结，实现与mutation permit attachment to Settling仍pending）；
+- [x] Session-local file mutation queue、exact-request-bound ticket与mutation permit attachment through Running/Settling；
 - [x] 删除durable ToolExecutionStarted和ToolRoundCompleted；
 - [x] 统一ToolCall/ToolExecutionRequest/ToolExecutionOutcome canonical owner与pre-execution result；
 - [x] complete Tool exchange自动projection；
@@ -891,5 +911,6 @@ ToolStartPermit使用actor message、owner-local CAS或等价private实现属于
 - [x] O1/R7/V4-C0-1 production Sandbox gate（ADR 0140；class-level algebra、direct Execute admission、Restricted/AllowOnce resume revalidation及SecurityRevoked/Sandbox-unavailable/Running round conformance）；
 - [x] production `ask_user` builtin（ADR 0142；closed/default-off/Runtime-owned、`MiniCoreRuntimeConfig::with_ask_user_tool()` idempotent opt-in、`ToolSet::ask_user_builtin()`、零permission+available empty sandbox、仅UserQuestion/frozen PreExecution plans、deterministic compact JSON answer与fail-closed Abandoned）；
 - [x] production `read_file` builtin（closed/default-off/Runtime-owned、`MiniCoreRuntimeConfig::with_read_file_tool()` idempotent opt-in与read-only authority ceiling、`WorkspaceResolver::new_with_read_access` + owner-held `WorkspaceReadAccessControl` per-Session永久read revocation（host security invalidation先revoke再signal）、`ToolSet::read_file_builtin()`与`ProductionToolConfig` per-admission materialization、cwd-relative opaque `AuthorizedWorkspaceReadPath`授权、capability-relative nonblocking open（symlink escape/特殊文件fail closed）、regular-file/UTF-8/65,536-byte有界读取、owner-tracked blocking execution与truthful cooperative cancellation）；
-- [x] production `list_directory` builtin（ADR 0144；closed/default-off、共享read-only authority/revocation、`with_list_directory_tool()`、三个bool/八种closed selection与固定`ask_user → read_file → list_directory`顺序、opaque `AuthorizedWorkspaceReadDirectory` capability open、direct nonrecursive enumeration、entry symlink不跟随、256-entry/8,192 retained-name-byte/65,536 JSON bounds、deterministic compact JSON、owner-tracked truthful settlement）；
-- [ ] production implementation/tests（含完整schema/hooks/policy/Sandbox enforcement、generic production ToolService/其余production executor/adapter与Session-local file mutation queue）。
+- [x] production `list_directory` builtin（ADR 0144；closed/default-off、共享filesystem authority/revocation、`with_list_directory_tool()`、opaque `AuthorizedWorkspaceReadDirectory` capability open、direct nonrecursive enumeration、entry symlink不跟随、256-entry/8,192 retained-name-byte/65,536 JSON bounds、deterministic compact JSON、owner-tracked truthful settlement）；
+- [x] production `write_file` builtin（ADR 0146；closed/default-off、ReadWrite authority ceiling/requested-access intersection、`authorize_write` opaque capability target、existing/create physical identity、two tracked jobs、same-Session FIFO、permit through Settling、16种closed selection与Runtime e2e/revocation）；
+- [ ] production implementation/tests（含完整generic schema/hooks/policy、generic production ToolService、network/process及其余production executor/adapter与public Tool DTO）。

@@ -3,6 +3,8 @@
 状态：Accepted
 日期：2026-08-12
 
+> 2026-08-12：[ADR 0146](0146-production-write-file-binds-capability-targets-to-session-fifo.md)把production selection扩为四个bool/16种closed形状与固定顺序`ask_user → read_file → list_directory → write_file`，并把owner-held revocation推广为filesystem read/write共同revocation。本文的`list_directory` schema、ReadOnly-only行为、direct enumeration与bounds保持不变；文中“三个bool/八种selection”描述其冻结时点。
+
 ## 背景
 
 ADR 0140冻结了Tool Sandbox在start前fail-closed admission，ADR 0143又以production `read_file`证明了第一个真实`FilesystemRead` resource-level route：Runtime显式opt-in、per-admission绑定exact WorkspaceSnapshot、captured `cap_std::fs::Dir` capability-relative open、ReadOnly authority ceiling与per-Session永久revocation都已可运行。

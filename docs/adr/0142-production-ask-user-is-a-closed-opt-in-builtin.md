@@ -5,6 +5,8 @@
 
 > 2026-08-12：后续production Workspace read builtins已由[ADR 0143](0143-production-read-file-uses-workspace-capabilities.md)与[ADR 0144](0144-production-list-directory-uses-bounded-capability-enumeration.md)冻结：生产ToolSet selection现由`ask_user`/`read_file`/`list_directory`三个独立bool形成八种closed形状，固定顺序`ask_user → read_file → list_directory`且无generic registry；两个read routes按per-admission WorkspaceSnapshot-bound materialization安装。本ADR的`ask_user`冻结surface、zero-permission与closed opt-in决策不变；resource-level Workspace read grants已由0143/0144局部交付，其余pending项保持pending。
 
+> 2026-08-12：[ADR 0146](0146-production-write-file-binds-capability-targets-to-session-fifo.md)再把production selection扩为四个bool/16种closed形状与固定顺序`ask_user → read_file → list_directory → write_file`。本ADR的`ask_user` surface、zero-permission和UserQuestion-only执行路径不变。
+
 ## 背景
 
 M8/M13已实现crate-private scripted approval/UserQuestion控制正确性seam（typed `ToolExecutionPlan::{Approval, UserQuestion}`、move-only `UserQuestionAnswerBinding`、hoisted exclusive question调度与signal-first settlement），但production ask-user builtin的ToolName、input schema与answer→model-visible ToolResult text/render格式一直未冻结，任何Runtime ToolSet在production下仍为空。M14需要第一个production Tool slice，同时不能引入generic ToolService/registry、host callback/executor安装、authoring格式或public Tool DTO——那些仍属于后续独立slice。

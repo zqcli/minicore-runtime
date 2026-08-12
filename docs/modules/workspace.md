@@ -1,6 +1,6 @@
 # Workspace 子系统架构设计
 
-状态：当前权威架构（ADR 0135；M6.1 `WorkspaceResolver`、immutable `WorkspaceSnapshot`、loaded Ready+Idle publication及Runtime residency统一loaded/unloaded definition routing foundation已实现；Workspace Prompt candidate capture已接入Load和loaded Idle publication；窄WorkspaceAccessView/WorkspaceToolContext contract亦已实现（crate-private `authorize_read`与`authorize_read_directory` cwd-relative read-only APIs、opaque capability-bound `AuthorizedWorkspaceReadPath`/`AuthorizedWorkspaceReadDirectory`、opened root capability capture与safe same-file root/cwd identity、final readable-candidate revalidation）；production `read_file`/`list_directory` opt-ins共用的Runtime-owned read-only authority ceiling与owner-held `WorkspaceReadAccessControl` per-Session永久read revocation亦已实现（host security invalidation先revoke再signal、recovery re-resolve观察到已revoke）；具体Prompt/Skill source adapter、Skill capture、其余public routing仍pending）
+状态：当前权威架构（ADR 0135/0146；M6.1 `WorkspaceResolver`、immutable `WorkspaceSnapshot`、loaded publication与Prompt candidate capture已实现；`WorkspaceAccessView`现拥有crate-private cwd-relative `authorize_read`、`authorize_read_directory`与`authorize_write`，并只签发opaque capability carriers。read/list使用`AuthorizedWorkspaceReadPath`/`AuthorizedWorkspaceReadDirectory`；write preparation使用`AuthorizedWorkspaceWritePath`，产生opaque cloneable `WorkspaceFileMutationKey`与move-only `PreparedWorkspaceWriteTarget`，existing target绑定exact opened regular file identity，create target绑定exact direct-parent identity+normalized final name，所有write都capability-relative且create final component no-follow。production filesystem opt-ins共享一个Runtime-owned `WorkspaceFilesystemAccessControl`永久per-Session revocation：read-only opt-ins选择ReadOnly ceiling，write opt-in选择ReadWrite ceiling但requested-access intersection仍权威，revocation后read/write共同Denied。具体Prompt/Skill source adapter、Skill capture、其余public routing仍pending）
 日期：2026-07-31
 
 ## 目的
@@ -353,7 +353,7 @@ root capability capture与safe same-file identity：生产path phase在canonical
 
 - WorkspaceSnapshot 表达 Turn 的授权上限；
 - Tool requirements 在具体调用时规范化目标路径；
-- WorkspaceAccessView 对 nearest existing ancestor 和目标相对路径做检查（future设计；当前实现只有cwd-relative `authorize_read`，尚无写入目标检查）；
+- WorkspaceAccessView 对cwd-relative write target同步授权；`AuthorizedWorkspaceWritePath::prepare()`再通过captured capability打开exact existing file或direct parent，建立physical mutation identity且不create/truncate/write；
 - ToolSandbox 在真实 open/create/rename 时继续执行强制限制；
 - approval 不能扩大 WorkspaceAccessView 的上限。
 
@@ -773,7 +773,7 @@ pub(crate) struct WorkspaceAccessRoot {
 }
 ```
 
-WorkspaceAccessView 隐藏 path containment 和 capability 检查。**当前实现API是窄的cwd-relative file/directory read contract**：
+WorkspaceAccessView 隐藏 path containment 和 capability 检查。**当前实现API是窄的cwd-relative file read、directory read与single-file write contract**：
 
 ```rust
 impl WorkspaceAccessView {
@@ -789,14 +789,21 @@ impl WorkspaceAccessView {
         &self,
         relative: &WorkspaceRelativePath,
     ) -> Result<AuthorizedWorkspaceReadDirectory, WorkspaceAccessError>;
+
+    pub(crate) fn authorize_write(
+        &self,
+        relative: &WorkspaceRelativePath,
+    ) -> Result<AuthorizedWorkspaceWritePath, WorkspaceWriteError>;
 }
 ```
 
-- 只接受semantic `WorkspaceRelativePath`（canonical cwd-relative carrier）；实现**没有**通用`authorize(input, mode)` promise，**没有**`Absolute`输入variant，也**没有**`Write` mode；
+- 三个方法都只接受semantic `WorkspaceRelativePath`（canonical cwd-relative carrier）；实现**没有**通用`authorize(input, mode)` promise，也没有`Absolute`输入variant；
 - containing root是持有canonical cwd的exact root（`cwd`位于且只位于一个root内）；cwd在该root内的相对位置被prepend到requested relative path，结果capability-relative target必须fully normal（所有component均为Normal）；
 - file read的root path本身（`relative.is_root()`）拒绝——cwd是目录，不是file read target；directory read允许empty relative并把它解释为captured cwd本身，cwd在root时empty target通过clone captured root Dir打开；
 - 两个authorization方法共享唯一containing-root/read-grant/cwd prepend/fully-normal实现，不建立第二套containment模型；`AuthorizedWorkspaceReadDirectory::open`对非空target调用captured root `Dir::open_dir`，目标directory symlink escape在该open处fail closed；
+- write authorization要求effective grant恰为`ReadWrite`，empty/root target拒绝；返回opaque `AuthorizedWorkspaceWritePath`，其`prepare()`只做capability open/metadata/identity proof，不create、truncate或write。existing target保留exact opened regular-file handle并以safe `same_file::Handle`形成physical key；missing target只在direct parent已存在时保留exact parent Dir并以parent identity+normalized final name形成create key。`PreparedWorkspaceWriteTarget`是move-only，只暴露`key()`与`write(&mut self, bytes)`；existing write使用保留File，create write使用保留parent且final-component no-follow；
 - 无readable grant、root缺失/basis unavailable、或target非法分别映射`WorkspaceAccessError::{NotAuthorized, Unavailable, InvalidPath}`（open失败另映射`OpenFailed`）；
+- write路径使用独立redacted `WorkspaceWriteError`分类；Tools在plan/preparation/execution边界将其冻结为non-secret Denied/Failed/Abandoned结果，不把path或OS source带出owner；
 - 每个root的`dir`是resolve时经captured root capability打开的`Arc<CapabilityDir>`，同步授权绝不touch ambient path；`roots`是non-overlapping的，cwd恰在其中一个root内；
 - Tool policy、Tool requirements 和 Sandbox 使用该 view 作为文件权限硬上限。普通 Tool 不能直接使用 roots 自行实现包含判断。
 
@@ -820,7 +827,7 @@ pub enum WorkspaceFileMode {
 }
 ```
 
-future `CwdRelative`只能相对Snapshot中的canonical cwd解析；future `Absolute`必须重新执行root containment；任何其他相对`Path`、平台prefix、`..`逃逸或ambient process cwd解释都必须拒绝。future `AuthorizedWorkspacePath`是文件类ToolRequirement、Session-local `FileMutationKey`推导和Sandbox可以消费的唯一已授权path值；raw model path不能越过该类型直接进入executor——当前`AuthorizedWorkspaceReadPath`与`AuthorizedWorkspaceReadDirectory`已经是这个opaque已授权carrier的两个read-only实例。
+future `CwdRelative`只能相对Snapshot中的canonical cwd解析；future `Absolute`必须重新执行root containment；任何其他相对`Path`、平台prefix、`..`逃逸或ambient process cwd解释都必须拒绝。当前不建立generic `AuthorizedWorkspacePath`：`AuthorizedWorkspaceReadPath`、`AuthorizedWorkspaceReadDirectory`与`AuthorizedWorkspaceWritePath`是三个真实consumer所需的opaque carrier，raw model path不能越过它们直接进入executor。
 
 ### WorkspaceToolContext
 
@@ -838,8 +845,9 @@ ToolService通过该context获得（当前实现）：
 
 - canonical cwd（Snapshot捕获值）；
 - effective access roots及其bound capabilities（`WorkspaceAccessRoot { canonical_path, dir, filesystem }`）；
-- cwd-relative file/directory read授权（`authorize_read`/`authorize_read_directory`）与effective filesystem grant（production authority只产生`ReadOnly`/`None`：default restricted authority fail-closed为`None`，read-only opt-in授予`ReadOnly`或revoke后`None`——见[Runtime-owned read-only authority](#runtime-owned-read-only-authorityworkspace-read-opt-ins)）；
-- future设计中的read/write root ceiling、authority revision-bound effective grants的完整披露、以及`Absolute`/write路径仍不是current API。
+- cwd-relative file/directory read授权（`authorize_read`/`authorize_read_directory`）与single-file write授权（`authorize_write`）；
+- effective filesystem grant：default restricted authority为`None`；read-only opt-ins的ceiling为`ReadOnly`；write opt-in的ceiling为`ReadWrite`但与requested access取intersection；revocation后为`None`；
+- future设计中的`Absolute`路径与generic `authorize(input, mode)`仍不是current API。
 
 它不包含 Prompt source、Skill source、Tool registry、approval 或 provider 信息。
 
@@ -1078,11 +1086,11 @@ FollowUp可以在Finishing期间排队，但terminal和重新resolve完成前不
 
 如果security event发生在provider request、kernel syscall、子进程或remote side effect开始之后，MiniCore无法撤回已经看到或发生的内容。它只保证signal获胜后不启动新的sanctioned operation，并对in-flight work执行truthful settlement。已打开OS handle不会被动态撤销，该限制不再作为Workspace feature承诺。
 
-### Runtime-Owned Read-Only Authority（Workspace read opt-ins）
+### Runtime-Owned Filesystem Authority（Workspace Tool opt-ins）
 
-production `read_file`或`list_directory`任一opt-in时使用同一个Runtime-owned read-only authority：`WorkspaceResolver::new_with_read_access(task_context)`返回`(resolver, WorkspaceReadAccessControl)`。`ReadOnlyWorkspaceAuthority`对每个declared root授予恰`ReadOnly` filesystem ceiling（requested `ReadWrite`被收窄为`ReadOnly`，绝不`ReadWrite`）、Prompt/Skill source ceilings保持false、trust为`Restricted`（filesystem grant独立于source trust）；revocation检查同步于authorize time（decision在future构造前exact）。
+production `read_file`或`list_directory`任一opt-in且没有write opt-in时，`WorkspaceResolver::new_with_read_access(task_context)`安装ReadOnly ceiling：requested `ReadWrite`收窄为`ReadOnly`，绝不授予write。`write_file` opt-in时，`WorkspaceResolver::new_with_write_access(task_context)`安装ReadWrite ceiling，但`intersect_filesystem_grants`保持requested access权威：requested `ReadOnly`仍是`ReadOnly`，只有requested `ReadWrite`可得到`ReadWrite`。两者都保持Prompt/Skill source ceilings false、trust为`Restricted`；write opt-in优先选择ReadWrite resolver，以便同一Runtime中的read/list routes继续消费readable grant。
 
-`WorkspaceReadAccessControl`是owner-held process-local registry（`Arc<Mutex<HashSet<SessionId>>>`），由resolver authority与Runtime owner seam共享同一个clone：`MiniCoreRuntime::invalidate_session_workspace_authority(session_id)`在任一Workspace read opt-in下**先**经该control发布permanent per-Session read revocation（在timestamp采样与residency invalidation之前），因此hard restriction在recovery re-resolve时已经current，即使residency返回`SessionNotLoaded`/`Closing`/internal也保持published。revoked Session的每次future resolve/revalidation授予filesystem `None`（永不`AuthorityDenied`、永不恢复`ReadOnly`），后续`authorize_read`与`authorize_read_directory`一律denied，idempotent、本Runtime lifetime内无unrevoke。default/no-read Runtime没有该control，保持既有restricted authority与invalidation行为。
+`WorkspaceFilesystemAccessControl`是owner-held process-local registry（既有`WorkspaceReadAccessControl`名称保留为type alias兼容read seams），由resolver authority与Runtime owner共享同一个clone：`MiniCoreRuntime::invalidate_session_workspace_authority(session_id)`在任一filesystem builtin opt-in下**先**发布permanent per-Session filesystem revocation（timestamp/signal/re-resolve之前）。revoked Session的每次future resolve/revalidation授予filesystem `None`，`authorize_read`、`authorize_read_directory`与`authorize_write`共同Denied；idempotent、本Runtime lifetime内无unrevoke。default/no-filesystem Runtime不安装该control。
 
 ## 多 Session 语义
 
@@ -1344,11 +1352,12 @@ upload / telemetry
 - `authorize_read`窄cwd-relative contract：root path本身拒绝、cwd外/无grant拒绝、capability-relative target fully normal校验、每个root的bound capability不touch ambient path；
 - root capability capture与safe same-file identity：root/cwd replacement在capture与proof之间fail closed（不静默绑定替换目录）、cwd symlink escape在capability open处拒绝；
 - final readable-candidate revalidation：readable/source candidate在installation前重新resolve并检测root replacement/authority facts/canonical path变化，无readable/source candidate保持final；
-- read-only opt-in authority：requested `ReadWrite`收窄为`ReadOnly`、Prompt/Skill source ceiling false、per-Session永久revocation后future resolve授予filesystem `None`且后续read denied、security invalidation先revoke再signal且recovery re-resolve观察到已revoke；
+- filesystem opt-in authority：read-only ceiling把requested `ReadWrite`收窄为`ReadOnly`；write ceiling仍不提升requested `ReadOnly`；Prompt/Skill source ceiling false；per-Session永久revocation后future resolve授予filesystem `None`且后续read/write共同denied；
+- `authorize_write`与prepared target：root/ReadOnly拒绝，cwd prepend与fully-normal containment，existing direct/symlink/hard-link aliases收敛到same physical key，missing target使用exact direct-parent identity+final name，missing parent/special/directory/escape fail closed，create final symlink no-follow；
 - Tool approval不能扩大WorkspaceAccessView；
 - Tool executor 不能访问 WorkspaceAccessView 或为未声明 path 重新授权；
 - 不同Session即使通过不同root anchor指向同一physical target也使用各自的SessionFileMutationQueue，不互相等待；fixture明确展示可能并发与lost update；
-- create/rename target 使用 nearest-existing-ancestor 校验，并覆盖 symlink race；
+- create target使用direct-parent capability identity并覆盖final symlink race；rename仍未实现；
 - cwd 位于 source-denied root 时不自动获得 Prompt/Skill source grant；
 - Workspace Prompt source在Session load、Idle definition update或`/reload workspace`时捕获immutable content；SecurityRevoked后重新resolve时不复用不匹配的新authority basis；
 - Workspace Skill adapter的capture只能使用WorkspaceSkillCaptureContext，并必须通过context构造CapturedWorkspaceSkillSource；
@@ -1405,5 +1414,5 @@ upload / telemetry
 - [x] conversation JSONL不保存Turn-start Workspace摘要；WorkspaceSnapshotRef与WorkspaceRevision execution binding均不进入recording。
 - [x] 实现M6.1 crate-private resolver/snapshot foundation：owner-tracked local canonicalization、duplicate/overlap/cwd校验、fail-closed restricted authority、exact authority-request binding、Prompt/Skill capture contexts与immutable Snapshot；Workspace Prompt candidate capture已接入Load与loaded Idle Workspace publication并保持candidate失败不发布，host security authority invalidation已由后续slice闭合，actual filesystem discovery与Skill capture仍待后续实现。
 - [x] 实现root capability capture与safe same-file identity：production path phase把declared root打开为capability并捕获safe identity（root/cwd replacement在capture与proof之间fail closed、cwd经captured root capability-relative打开并证明同一file、identity进入ResolvedWorkspaceRoot equality供revalidation）。
-- [x] 实现窄WorkspaceAccessView/WorkspaceToolContext read contract：crate-private `authorize_read`（cwd-relative file、root path拒绝）与`authorize_read_directory`（cwd-relative directory、empty path表示cwd），共享containing-root/read-grant/cwd prepend/fully-normal实现；opaque `AuthorizedWorkspaceReadPath`（captured root `Dir` + normalized target、`open_nonblocking`）与`AuthorizedWorkspaceReadDirectory`（captured root `Dir` + normalized target、capability-relative `open`），`WorkspaceAccessError`四路closed mapping；`Absolute`/`Write`/generic `authorize(input, mode)`保持future设计。
-- [x] 实现final readable-candidate revalidation（`requires_revalidation()`/`revalidate_candidate`/`has_same_resolution_as`，含safe identity比较）与production read-only opt-in authority（`WorkspaceResolver::new_with_read_access`、`ReadOnlyWorkspaceAuthority`、owner-held `WorkspaceReadAccessControl` per-Session永久read revocation；host security invalidation先revoke再signal，recovery re-resolve观察到已revoke，revoked Session后续resolve授予filesystem `None`且read denied）。
+- [x] 实现窄WorkspaceAccessView/WorkspaceToolContext read/write contract：crate-private `authorize_read`、`authorize_read_directory`与`authorize_write`，共享captured cwd/containing-root/capability-relative containment；opaque read carriers，以及`AuthorizedWorkspaceWritePath`→move-only `PreparedWorkspaceWriteTarget`+opaque `WorkspaceFileMutationKey`（existing exact File identity、create exact parent identity+final name、final no-follow）。`Absolute`/generic `authorize(input, mode)`保持future设计。
+- [x] 实现final capability-candidate revalidation与production filesystem opt-in authority（`new_with_read_access` ReadOnly ceiling、`new_with_write_access` ReadWrite ceiling、requested-access intersection、owner-held `WorkspaceFilesystemAccessControl` per-Session永久revocation；host security invalidation先revoke再signal，revoked Session后续resolve授予filesystem `None`且read/write共同denied）。
