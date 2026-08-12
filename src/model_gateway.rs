@@ -1860,6 +1860,44 @@ impl ScriptedModelFixture {
         Self::from_scripts(scripts, 128_000)
     }
 
+    /// Two sequential Tool rounds, each `(tool_call_id, tool_name, arguments, final_text)`, as
+    /// exactly four scripts: the first ToolCall response, the first Turn's final text, the
+    /// second ToolCall response, and the second Turn's final text.  The two rounds carry
+    /// distinct tool_call_ids so their ToolResults are distinguishable in the exact model
+    /// request sequence across two public Submits.
+    pub(crate) fn with_two_tool_rounds(
+        first: (&str, &str, &str, &str),
+        second: (&str, &str, &str, &str),
+    ) -> Self {
+        let scripts = vec![
+            Self::scripted_success(
+                ProviderAttemptContent::ToolCall {
+                    tool_call_id: first.0.parse().unwrap(),
+                    name: first.1.parse().unwrap(),
+                    arguments: first.2.parse().unwrap(),
+                },
+                ModelFinishReason::ToolCalls,
+            ),
+            Self::scripted_success(
+                ProviderAttemptContent::Text(Arc::from(first.3)),
+                ModelFinishReason::Stop,
+            ),
+            Self::scripted_success(
+                ProviderAttemptContent::ToolCall {
+                    tool_call_id: second.0.parse().unwrap(),
+                    name: second.1.parse().unwrap(),
+                    arguments: second.2.parse().unwrap(),
+                },
+                ModelFinishReason::ToolCalls,
+            ),
+            Self::scripted_success(
+                ProviderAttemptContent::Text(Arc::from(second.3)),
+                ModelFinishReason::Stop,
+            ),
+        ];
+        Self::from_scripts(scripts, 128_000)
+    }
+
     pub(crate) fn with_failure_reasons_then_responses(
         failures: Vec<ModelCallErrorReason>,
         responses: Vec<&str>,
@@ -1951,6 +1989,24 @@ impl ScriptedModelFixture {
             catalog,
             adapter,
         }
+    }
+
+    /// One private scripted-success helper: a single ToolCall result or a single text result
+    /// with its exact finish reason.
+    fn scripted_success(
+        content: ProviderAttemptContent,
+        finish_reason: ModelFinishReason,
+    ) -> ScriptedProviderScript {
+        ScriptedProviderScript::success(
+            Vec::new(),
+            ProviderAttemptResult {
+                response_id: None,
+                content: Arc::from([content]),
+                finish_reason,
+                usage: None,
+                metadata: ProviderResponseMetadata::new(None, None, None),
+            },
+        )
     }
 
     pub(crate) const fn gateway(&self) -> &Arc<ModelGateway> {

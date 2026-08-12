@@ -76,7 +76,8 @@ use crate::tools::{
     ApprovalSettlement, ToolAbandonReason, ToolApprovalDecision, ToolApprovalRequest, ToolCall,
     ToolCancellationHandle, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionPlan,
     ToolExecutionRequest, ToolExecutionResult, ToolExecutionRun, ToolExecutionStart, ToolSet,
-    ToolStartError, ToolStartGate, ToolStartedExecution, UserQuestionAnswer, UserQuestionRequest,
+    ToolStartError, ToolStartGate, ToolStartedExecution, TurnToolResources, UserQuestionAnswer,
+    UserQuestionRequest,
 };
 use crate::turn_execution_context::{
     TurnContextCapture, TurnContextCaptureError, TurnExecutionContext,
@@ -1445,7 +1446,7 @@ struct TurnResources {
     prompt_resources: Arc<PromptResourceView>,
     model_gateway: Arc<ModelGateway>,
     model_catalog: Arc<ModelCatalogView>,
-    tool_set: Arc<ToolSet>,
+    tools: TurnToolResources,
     compaction: CompactionSettingsSnapshot,
 }
 
@@ -1523,6 +1524,37 @@ impl SessionExecutorDependencies {
         tool_set: Arc<ToolSet>,
         compaction: CompactionSettingsSnapshot,
     ) -> Self {
+        Self::with_turn_resources_and_tool_resources_and_compaction(
+            task_context,
+            durable_state,
+            resolver,
+            prompt_service,
+            prompt_resources,
+            model_gateway,
+            model_catalog,
+            TurnToolResources::Captured(tool_set),
+            compaction,
+        )
+    }
+
+    /// The carrier-accepting core constructor: a `Captured` set is passed through unchanged
+    /// and a `Production` config is materialized per admission against the exact captured
+    /// Workspace snapshot.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one Turn resource bundle binds the exact runtime owners and settings"
+    )]
+    pub(crate) fn with_turn_resources_and_tool_resources_and_compaction(
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+        resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
+        prompt_resources: Arc<PromptResourceView>,
+        model_gateway: Arc<ModelGateway>,
+        model_catalog: Arc<ModelCatalogView>,
+        tools: TurnToolResources,
+        compaction: CompactionSettingsSnapshot,
+    ) -> Self {
         Self {
             task_context,
             durable_state,
@@ -1532,7 +1564,7 @@ impl SessionExecutorDependencies {
                 prompt_resources,
                 model_gateway,
                 model_catalog,
-                tool_set,
+                tools,
                 compaction,
             }),
         }
@@ -4140,6 +4172,7 @@ impl SessionExecutorActor {
             .clone();
 
         let completion_sender = self.completion_sender.clone();
+        let task_context = self.task_context.clone();
         let durable_state = self.durable_state.clone();
         let definition = Arc::clone(self.current.definition());
         let workspace = Arc::clone(self.current.workspace());
@@ -4153,6 +4186,7 @@ impl SessionExecutorActor {
             let mut guard = guard;
             let result = run_admission(AdmissionWork {
                 closing,
+                task_context,
                 durable_state,
                 definition,
                 workspace,
@@ -7839,6 +7873,7 @@ enum CompletionHandling {
 struct AdmissionWork {
     closing: CancellationToken,
     cancellation: CancellationToken,
+    task_context: RuntimeTaskContext,
     durable_state: DurableState,
     definition: Arc<SessionDefinition>,
     workspace: Arc<WorkspaceSnapshot>,
@@ -7859,6 +7894,7 @@ async fn run_admission(
     let AdmissionWork {
         closing,
         cancellation,
+        task_context,
         durable_state,
         definition,
         workspace,
@@ -7891,6 +7927,15 @@ async fn run_admission(
         result = &mut agent_read => result,
     }
     .map_err(map_agent_definition_read_error)?;
+    // The ToolSet is materialized exactly once per admission, after the exact Workspace
+    // snapshot is captured and before the Turn context capture: a captured test-injected
+    // set is consumed unchanged, while the frozen production config installs its ToolSet
+    // against this exact snapshot's tool context (no task-time filesystem discovery or raw
+    // spawn).  An active Turn keeps this captured set; a later Workspace reload or
+    // definition update only affects future admissions.
+    let tool_set = resources
+        .tools
+        .materialize(workspace.tool_context(), task_context.clone());
     let context = TurnExecutionContext::capture(TurnContextCapture {
         turn_id,
         session: definition,
@@ -7900,7 +7945,7 @@ async fn run_admission(
         prompt_resources: resources.prompt_resources,
         model_gateway: resources.model_gateway,
         model_catalog: resources.model_catalog,
-        tool_set: resources.tool_set,
+        tool_set,
         compaction: resources.compaction,
     })
     .map_err(map_turn_context_capture_error)?;
@@ -10146,7 +10191,7 @@ async fn run_publication(
             );
         }
         let prompt_context = candidate.prompt_capture_context();
-        let requires_revalidation = !prompt_context.roots().is_empty();
+        let requires_revalidation = candidate.requires_revalidation();
         let capture = context
             .prompt_service
             .capture_workspace_sources(prompt_context);
@@ -10318,7 +10363,7 @@ async fn resolve_reload_workspace_snapshot(
         return Err(WorkspaceReloadErrorKind::Internal);
     }
     let prompt_context = candidate.prompt_capture_context();
-    let requires_revalidation = !prompt_context.roots().is_empty();
+    let requires_revalidation = candidate.requires_revalidation();
     let capture = context
         .prompt_service
         .capture_workspace_sources(prompt_context);
