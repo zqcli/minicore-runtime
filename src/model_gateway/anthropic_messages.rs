@@ -18,9 +18,11 @@
 //!   non-empty string, preceded by a valid `message_start` whose `message.model`
 //!   is a non-empty string exactly equal to the pinned private API model name of
 //!   the request's definition (mismatch, missing, non-string, or empty fails
-//!   closed as `InvalidProviderResponse`) and with all content blocks closed;
-//!   `message_stop` alone is never success, and early EOF is a truthful transport
-//!   failure, never a synthetic success;
+//!   closed as `InvalidProviderResponse`); the start's `stop_reason` and
+//!   `stop_sequence` are absent or explicit null (a present non-null stop field
+//!   is malformed, and the start is never a stop proof), and all content blocks
+//!   must be closed; `message_stop` alone is never success, and early EOF is a
+//!   truthful transport failure, never a synthetic success;
 //! - request headers are exactly `x-api-key`, `anthropic-version`,
 //!   `Content-Type: application/json` and `Accept: text/event-stream`; the
 //!   metadata header allowlist is `request-id` / `retry-after` only; the
@@ -843,7 +845,9 @@ fn dispatch(
 /// start per attempt, `message.type`/`message.role` exact, `message.model` a
 /// non-empty string exactly equal to the pinned private API model name of the
 /// request's definition (mismatch, missing, non-string, or empty fails), empty
-/// content, null stop fields, a valid response id, and the required usage base.
+/// content, absent-or-null `stop_reason`/`stop_sequence` (explicit null and
+/// missing are equivalent; any present non-null value is malformed — the start
+/// is never a stop proof), a valid response id, and the required usage base.
 fn handle_message_start(
     value: &Value,
     state: &mut AnthropicStreamState,
@@ -872,8 +876,17 @@ fn handle_message_start(
     if !content.is_empty() {
         return Err(());
     }
-    if message.get("stop_reason") != Some(&Value::Null)
-        || message.get("stop_sequence") != Some(&Value::Null)
+    // Live-wire evidence: the real start omits both stop fields entirely, so
+    // absent and explicit null are equivalent (no stop has happened yet). A
+    // present non-null value of any shape (string/number/bool/object/array) is
+    // malformed. The start is never a stop proof: success still requires the
+    // terminal message_delta stop_reason.
+    if message
+        .get("stop_reason")
+        .is_some_and(|stop_reason| !stop_reason.is_null())
+        || message
+            .get("stop_sequence")
+            .is_some_and(|stop_sequence| !stop_sequence.is_null())
     {
         return Err(());
     }
@@ -1510,6 +1523,19 @@ mod tests {
             .as_object_mut()
             .expect("the start message is an object")
             .remove("model");
+        start
+    }
+
+    /// Removes both optional stop fields from a message_start event entirely,
+    /// matching the live-wire shape where the start carries exactly
+    /// content,id,model,role,type,usage.
+    fn without_stop_fields(start: Value) -> Value {
+        let mut start = start;
+        let message = start["message"]
+            .as_object_mut()
+            .expect("the start message is an object");
+        message.remove("stop_reason");
+        message.remove("stop_sequence");
         start
     }
 
@@ -2804,10 +2830,42 @@ mod tests {
                 }),
             ),
             (
+                "stop_reason numeric",
+                start_with({
+                    let mut message = base_message();
+                    message.insert("stop_reason".into(), json!(42));
+                    message
+                }),
+            ),
+            (
+                "stop_reason object",
+                start_with({
+                    let mut message = base_message();
+                    message.insert("stop_reason".into(), json!({}));
+                    message
+                }),
+            ),
+            (
                 "stop_sequence non-null",
                 start_with({
                     let mut message = base_message();
                     message.insert("stop_sequence".into(), json!("seq"));
+                    message
+                }),
+            ),
+            (
+                "stop_sequence boolean",
+                start_with({
+                    let mut message = base_message();
+                    message.insert("stop_sequence".into(), json!(true));
+                    message
+                }),
+            ),
+            (
+                "stop_sequence array",
+                start_with({
+                    let mut message = base_message();
+                    message.insert("stop_sequence".into(), json!([]));
                     message
                 }),
             ),
@@ -2875,6 +2933,41 @@ mod tests {
         ])
         .expect_err("a second message_start must fail closed");
         assert_eq!(error.reason, ModelCallErrorReason::InvalidProviderResponse);
+
+        // Live-wire start stop fields: absent and explicit null are equivalent,
+        // so a start with both fields omitted and starts with exactly one of
+        // them present as null all reach a terminal success (the existing
+        // explicit-null baseline keeps passing through every other test via
+        // `message_start`).
+        for (label, message) in [
+            ("both stop fields absent", {
+                let mut message = base_message();
+                message.remove("stop_reason");
+                message.remove("stop_sequence");
+                message
+            }),
+            ("stop_reason absent, stop_sequence null", {
+                let mut message = base_message();
+                message.remove("stop_reason");
+                message
+            }),
+            ("stop_reason null, stop_sequence absent", {
+                let mut message = base_message();
+                message.remove("stop_sequence");
+                message
+            }),
+        ] {
+            let terminal = dispatch_events(&[
+                start_with(message),
+                text_block_start(0),
+                text_delta(0, "ok"),
+                content_block_stop(0),
+                message_delta("end_turn", 3),
+            ])
+            .unwrap()
+            .unwrap_or_else(|| panic!("{label} must reach a terminal success"));
+            assert_eq!(terminal.finish_reason, ModelFinishReason::Stop, "{label}");
+        }
     }
 
     #[test]
@@ -4998,6 +5091,81 @@ mod tests {
         }
         match &result.response().content()[1] {
             FinalizedAssistantContent::Text { text } => assert_eq!(&**text, "final answer"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loopback_live_shape_omitted_start_stop_fields_succeeds() {
+        // Live-shape evidence: the real /v1/messages SSE message_start carries
+        // exactly the keys content,id,model,role,type,usage — stop_reason and
+        // stop_sequence are omitted entirely (the same wire-shape helper this
+        // slice reuses from the unsigned-thinking live-wire test). An unsigned
+        // thinking block, a text block, and a valid message_delta terminal must
+        // all succeed exactly as with the explicit-null start shape, and the
+        // unsigned thinking must stay text-only.
+        let mut events = vec![without_stop_fields(message_start(
+            "msg_live_omit",
+            None,
+            25,
+        ))];
+        events.push(content_block_start(
+            0,
+            json!({"type": "thinking", "thinking": ""}),
+        ));
+        events.push(thinking_delta(0, "live reasoning "));
+        events.push(content_block_stop(0));
+        events.push(text_block_start(1));
+        events.push(text_delta(1, "live answer"));
+        events.push(content_block_stop(1));
+        events.push(message_delta("end_turn", 30));
+
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: sse(&events),
+            gate: 0,
+        }]);
+        let adapter = Arc::new(
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
+        );
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let (gateway, model) = gateway_and_model(definition_with(
+            ModelReasoningSummary::ProviderDefault,
+            ModelServiceClass::Standard,
+            None,
+            provider,
+        ))
+        .await;
+
+        let result = gateway
+            .generate_model_turn(
+                request_for_model(model).await,
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let requests = server.join();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(result.response().finish_reason(), ModelFinishReason::Stop);
+        assert_eq!(result.response().content().len(), 2);
+        match &result.response().content()[0] {
+            FinalizedAssistantContent::Reasoning(reasoning) => {
+                assert_eq!(reasoning.text(), Some("live reasoning "));
+                assert_eq!(
+                    reasoning.signature(),
+                    None,
+                    "unsigned live-shape thinking must never gain a signature"
+                );
+            }
+            other => panic!("expected text-only reasoning, got {other:?}"),
+        }
+        match &result.response().content()[1] {
+            FinalizedAssistantContent::Text { text } => assert_eq!(&**text, "live answer"),
             other => panic!("expected text, got {other:?}"),
         }
     }
