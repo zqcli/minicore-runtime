@@ -5,6 +5,8 @@ use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 #[cfg(test)]
+use std::sync::Barrier;
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
@@ -133,11 +135,20 @@ impl RuntimeTaskContext {
                 return handle;
             }
             #[cfg(test)]
+            let entry_gate = self.owner.take_next_blocking_job_entry_gate();
+            #[cfg(test)]
             let panic_after_operation = self.owner.take_post_operation_panic();
             self.owner.handle.spawn_blocking(move || {
                 // The task owns the owner while it is running, so dropping every caller-side
                 // context or job cannot detach an admitted blocking operation.
                 let _owner = task_owner;
+                #[cfg(test)]
+                if let Some(entry_gate) = entry_gate {
+                    // The worker has entered the spawned job: hold it before the operation
+                    // closure so a test can deterministically observe the exact scheduled
+                    // job while it is held in flight.
+                    entry_gate.hold_worker();
+                }
                 let outcome = catch_unwind(AssertUnwindSafe(operation))
                     .map_err(|_| RuntimeTaskError::OperationPanicked);
                 task_settlement.resolve(outcome);
@@ -257,6 +268,19 @@ impl RuntimeTaskContext {
     #[cfg(test)]
     pub(crate) fn inject_next_blocking_job_post_operation_panic(&self) {
         self.owner.inject_next_blocking_job_post_operation_panic();
+    }
+
+    /// Test-only one-shot seam: the exact next `spawn_blocking_tracked` admission holds its
+    /// worker inside the spawned job after entry and before the operation closure until the
+    /// returned controller releases it.  The controller observes the worker's entry and the
+    /// release as deterministic barrier rendezvous (no sleeps, timeouts, or polling), so a
+    /// test can prove a cancellation arrived while the exact job was scheduled and held in
+    /// flight.  The gate is consumed by that exact ordinary admission and never touches any
+    /// other registered task; the existing join-failure and post-operation-panic seams remain
+    /// independently one-shot.
+    #[cfg(test)]
+    pub(crate) fn arm_next_blocking_job_entry_gate(&self) -> BlockingJobEntryController {
+        self.owner.arm_next_blocking_job_entry_gate()
     }
 
     #[cfg(test)]
@@ -457,6 +481,45 @@ where
     }
 }
 
+/// Test-only one-shot controller for the exact next blocking job admission: the worker
+/// signals its entry and then blocks inside the spawned job, before the operation closure,
+/// until the test releases it.  Both sides are `std::sync::Barrier` pairs, so entry
+/// observation and release are deterministic rendezvous points, never sleeps or polls.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct BlockingJobEntryController {
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+#[cfg(test)]
+impl BlockingJobEntryController {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new(Barrier::new(2)),
+            release: Arc::new(Barrier::new(2)),
+        }
+    }
+
+    /// Deterministically observes the gated worker's entry: returns exactly when the worker
+    /// has entered the spawned job and is blocked before its operation closure.
+    pub(crate) fn wait_until_entered(&self) {
+        self.entered.wait();
+    }
+
+    /// Releases the held worker so it invokes its operation closure and settles.  Returns
+    /// exactly when the worker has passed the gate.
+    pub(crate) fn release(&self) {
+        self.release.wait();
+    }
+
+    /// The worker side of the gate: signal entry, then block until the test releases.
+    fn hold_worker(&self) {
+        self.entered.wait();
+        self.release.wait();
+    }
+}
+
 struct RuntimeTaskOwner {
     handle: Handle,
     registry: Mutex<Registry>,
@@ -465,6 +528,8 @@ struct RuntimeTaskOwner {
     next_blocking_job_join_failure: AtomicBool,
     #[cfg(test)]
     next_blocking_job_post_operation_panic: AtomicBool,
+    #[cfg(test)]
+    next_blocking_job_entry_gate: Mutex<Option<BlockingJobEntryController>>,
 }
 
 impl RuntimeTaskOwner {
@@ -477,6 +542,8 @@ impl RuntimeTaskOwner {
             next_blocking_job_join_failure: AtomicBool::new(false),
             #[cfg(test)]
             next_blocking_job_post_operation_panic: AtomicBool::new(false),
+            #[cfg(test)]
+            next_blocking_job_entry_gate: Mutex::new(None),
         }
     }
 
@@ -492,6 +559,23 @@ impl RuntimeTaskOwner {
     fn inject_next_blocking_job_post_operation_panic(&self) {
         self.next_blocking_job_post_operation_panic
             .store(true, Ordering::Release);
+    }
+
+    /// Test-only one-shot entry-gate arming for the next blocking job admission: stores a
+    /// private controller and returns its test-side clone, so the test and the exact next
+    /// worker share the same barrier pair.
+    #[cfg(test)]
+    fn arm_next_blocking_job_entry_gate(&self) -> BlockingJobEntryController {
+        let controller = BlockingJobEntryController::new();
+        *lock(&self.next_blocking_job_entry_gate) = Some(controller.clone());
+        controller
+    }
+
+    /// Test-only one-shot consumption of the entry gate: `Some` holds the exact next admitted
+    /// blocking operation's worker at the gate until its controller releases it.
+    #[cfg(test)]
+    fn take_next_blocking_job_entry_gate(&self) -> Option<BlockingJobEntryController> {
+        lock(&self.next_blocking_job_entry_gate).take()
     }
 
     /// Test-only one-shot consumption of the post-operation panic seam: `true` arms the next
@@ -1148,6 +1232,42 @@ mod tests {
 
         // The seam is one-shot and targets exactly the next admission: the next blocking job
         // runs normally on the same owner, untouched by the consumed fault.
+        let next = context.spawn_blocking_tracked(|| 5_u8);
+        assert_eq!(next.wait().await, Ok(5));
+        context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn armed_blocking_entry_gate_holds_the_exact_next_job_before_its_operation_closure() {
+        let context = initialized_context().await;
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_by_operation = Arc::clone(&ran);
+
+        let gate = context.arm_next_blocking_job_entry_gate();
+        let job = context.spawn_blocking_tracked(move || {
+            ran_by_operation.fetch_add(1, Ordering::SeqCst);
+            13_u8
+        });
+
+        // The worker has entered the spawned job and is held at the gate before its
+        // operation closure: a deterministic barrier rendezvous, no sleeps or polling.
+        gate.wait_until_entered();
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "the gated worker is held before its operation closure runs"
+        );
+
+        gate.release();
+        assert_eq!(job.wait().await, Ok(13));
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "releasing the gate lets the exact operation closure run and settle"
+        );
+
+        // The seam is one-shot and targets exactly the next admission: the next blocking job
+        // runs normally on the same owner, untouched by the consumed gate.
         let next = context.spawn_blocking_tracked(|| 5_u8);
         assert_eq!(next.wait().await, Ok(5));
         context.shutdown().await;
