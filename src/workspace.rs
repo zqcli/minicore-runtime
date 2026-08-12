@@ -3,14 +3,14 @@
     reason = "M6.1 workspace resolution is a crate-private seam awaiting Session publication"
 )]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1102,12 +1102,17 @@ impl fmt::Debug for WorkspaceAuthorityRootRequest {
 
 #[derive(Clone)]
 struct WorkspaceAuthorityRequest {
+    session_id: SessionId,
     roots: Vec<WorkspaceAuthorityRootRequest>,
 }
 
 impl WorkspaceAuthorityRequest {
-    fn new(roots: Vec<WorkspaceAuthorityRootRequest>) -> Self {
-        Self { roots }
+    fn new(session_id: SessionId, roots: Vec<WorkspaceAuthorityRootRequest>) -> Self {
+        Self { session_id, roots }
+    }
+
+    fn session_id(&self) -> SessionId {
+        self.session_id
     }
 
     fn roots(&self) -> &[WorkspaceAuthorityRootRequest] {
@@ -1222,6 +1227,86 @@ impl WorkspaceAuthority for RestrictedWorkspaceAuthority {
                         root.clone(),
                         WorkspaceRootTrust::new(WorkspaceTrustLevel::Untrusted, revision),
                         WorkspaceFilesystemGrant::None,
+                        false,
+                        false,
+                    )
+                })
+                .collect();
+            Ok(WorkspaceAuthorityDecision::new(roots))
+        })
+    }
+}
+
+/// The process-local revocation register that makes the production read-only Workspace
+/// opt-in revocable by the existing host Workspace authority invalidation seam.  It is one
+/// safe synchronized set of revoked `SessionId`s shared (through clones) by the read
+/// authority installed in the resolver and the Runtime owner seam: a revoked Session can
+/// never receive a read grant again for this Runtime lifetime.  There is no generic policy
+/// store, no trait, no callback, and no public DTO — only this concrete owner-held control.
+#[derive(Clone, Default)]
+pub(crate) struct WorkspaceReadAccessControl {
+    revoked: Arc<Mutex<HashSet<SessionId>>>,
+}
+
+impl WorkspaceReadAccessControl {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publishes the permanent read revocation for one Session.  Idempotent: a repeated
+    /// revoke inserts the same Session into the same set and never re-grants.  There is no
+    /// unrevoke/recovery for this Runtime lifetime.
+    pub(crate) fn revoke(&self, session_id: SessionId) {
+        self.revoked
+            .lock()
+            .expect("the process-local revocation set is not poisoned")
+            .insert(session_id);
+    }
+
+    fn is_revoked(&self, session_id: SessionId) -> bool {
+        self.revoked
+            .lock()
+            .expect("the process-local revocation set is not poisoned")
+            .contains(&session_id)
+    }
+}
+
+/// The production read-only opt-in policy for trusted host wiring.  It grants an
+/// authority ceiling of exactly `ReadOnly` filesystem access to every declared
+/// root — never `ReadWrite` — and keeps Prompt and Skill source ceilings false:
+/// this opt-in authorizes filesystem reads only and must not silently authorize
+/// source discovery.  Trust is `Restricted` (not `Trusted`): the filesystem
+/// grant is independent from source trust.  The authority holds the same
+/// [`WorkspaceReadAccessControl`] as the Runtime owner seam: once the host revokes one
+/// Session, every future resolve/revalidation for that Session grants filesystem `None`
+/// (never `AuthorityDenied`, never `ReadOnly` again), while Prompt/Skill stay false and
+/// trust stays `Restricted`.
+struct ReadOnlyWorkspaceAuthority {
+    control: WorkspaceReadAccessControl,
+}
+
+impl WorkspaceAuthority for ReadOnlyWorkspaceAuthority {
+    fn authorize(&self, request: WorkspaceAuthorityRequest) -> WorkspaceAuthorityFuture {
+        // The revocation check is synchronous and happens before the future is built, so the
+        // decision is exact at authorize time; the resolver never observes a revocation that
+        // lands between the check and the returned decision.
+        let filesystem_ceiling = if self.control.is_revoked(request.session_id()) {
+            WorkspaceFilesystemGrant::None
+        } else {
+            WorkspaceFilesystemGrant::ReadOnly
+        };
+        Box::pin(async move {
+            let revision = WorkspaceTrustRevision::new(
+                NonZeroU64::new(1).expect("the read-only authority revision is non-zero"),
+            );
+            let roots = request
+                .roots()
+                .iter()
+                .map(|root| {
+                    WorkspaceAuthorityRootDecision::new(
+                        root.clone(),
+                        WorkspaceRootTrust::new(WorkspaceTrustLevel::Restricted, revision),
+                        filesystem_ceiling,
                         false,
                         false,
                     )
@@ -1542,6 +1627,29 @@ impl WorkspaceResolver {
         )
     }
 
+    /// Production opt-in for trusted host wiring: every declared root receives
+    /// an authority ceiling of exactly `ReadOnly` filesystem access. The
+    /// requested-access intersection remains authoritative, so `ReadOnly` stays
+    /// `ReadOnly` while `ReadWrite` is tightened to `ReadOnly`; `ReadWrite` is
+    /// never granted. Prompt/Skill source ceilings stay false, so this opt-in
+    /// never silently authorizes source discovery.  The returned
+    /// [`WorkspaceReadAccessControl`] is the owner seam: the host publishes a
+    /// permanent per-Session read revocation through it, and every later
+    /// resolve/revalidation for that Session grants filesystem `None` instead.
+    pub(crate) fn new_with_read_access(
+        task_context: RuntimeTaskContext,
+    ) -> (Self, WorkspaceReadAccessControl) {
+        let control = WorkspaceReadAccessControl::new();
+        let resolver = Self::new_with_adapters(
+            task_context,
+            Arc::new(LocalWorkspacePathAdapter),
+            Arc::new(ReadOnlyWorkspaceAuthority {
+                control: control.clone(),
+            }),
+        );
+        (resolver, control)
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_source_grants_for_test(
         task_context: RuntimeTaskContext,
@@ -1639,7 +1747,7 @@ impl WorkspaceResolver {
                 )
             })
             .collect();
-        let request = WorkspaceAuthorityRequest::new(request_roots);
+        let request = WorkspaceAuthorityRequest::new(session_id, request_roots);
         let expected_request = request.clone();
         let decision = self
             .authority
@@ -2133,6 +2241,18 @@ impl WorkspaceSnapshotCandidate {
 
     pub(crate) const fn revision(&self) -> WorkspaceRevision {
         self.revision
+    }
+
+    /// Whether this candidate must pass the final resolver revalidation before
+    /// installation: any resolved root that carries a readable filesystem grant or an
+    /// authorized Prompt/Skill source reads fresh contents through the async
+    /// authority/capture window, so a root replacement in that window could otherwise
+    /// publish a stale capability.  Candidates without any readable/source root have no
+    /// fresh read authority behind them and remain final without revalidation.
+    pub(crate) fn requires_revalidation(&self) -> bool {
+        self.roots.iter().any(|root| {
+            root.filesystem.is_readable() || root.prompt_source || root.skill_source
+        })
     }
 
     fn has_same_resolution_as(&self, other: &Self) -> bool {
@@ -3613,6 +3733,267 @@ mod tests {
         task_context.shutdown().await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_resolver_remains_fail_closed_with_none_grants() {
+        let temporary = TempDirectory::new("default-resolver");
+        let root = temporary.path().join("root");
+        std::fs::create_dir_all(&root).expect("the test root is creatable");
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, true),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+
+        let task_context = initialized_context().await;
+        let resolver = WorkspaceResolver::new(task_context.clone());
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let resolved = &candidate.roots[0];
+        assert_eq!(resolved.trust.level(), WorkspaceTrustLevel::Untrusted);
+        assert_eq!(resolved.filesystem, WorkspaceFilesystemGrant::None);
+        assert!(!resolved.prompt_source);
+        assert!(!resolved.skill_source);
+        assert!(candidate.prompt_capture_context().roots().is_empty());
+        assert!(candidate.skill_capture_context().roots().is_empty());
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_access_opt_in_tightens_every_root_to_read_only_and_never_grants_write() {
+        let temporary = TempDirectory::new("read-access-ceiling");
+        let primary = temporary.path().join("primary");
+        let additional = temporary.path().join("additional");
+        std::fs::create_dir_all(&primary).expect("the primary test root is creatable");
+        std::fs::create_dir_all(&additional).expect("the additional test root is creatable");
+
+        // The primary root requests ReadOnly and the additional root requests
+        // ReadWrite; the opt-in ceiling must map both to exactly ReadOnly.
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                primary.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(true, true),
+            ),
+            vec![root_spec_with(
+                "additional",
+                additional.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, true),
+            )],
+            cwd("primary", ""),
+        )
+        .unwrap();
+
+        let task_context = initialized_context().await;
+        let (resolver, _control) = WorkspaceResolver::new_with_read_access(task_context.clone());
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        assert_eq!(candidate.roots.len(), 2);
+        assert_eq!(
+            workspace.primary_root().requested_access(),
+            RequestedFilesystemAccess::ReadOnly
+        );
+        assert_eq!(
+            workspace.additional_roots()[0].requested_access(),
+            RequestedFilesystemAccess::ReadWrite
+        );
+        for root in candidate.roots.iter() {
+            // Requested ReadOnly stays ReadOnly; requested ReadWrite is tightened
+            // to ReadOnly. Write never appears.
+            assert_eq!(root.filesystem, WorkspaceFilesystemGrant::ReadOnly);
+            assert_ne!(root.filesystem, WorkspaceFilesystemGrant::ReadWrite);
+            // Source ceilings stay false: the opt-in is filesystem read only.
+            assert!(!root.prompt_source);
+            assert!(!root.skill_source);
+            // Trust is Restricted, not Trusted, at the fixed non-zero revision.
+            assert_eq!(root.trust.level(), WorkspaceTrustLevel::Restricted);
+            assert_eq!(root.trust.revision().get(), 1);
+        }
+        assert!(candidate.prompt_capture_context().roots().is_empty());
+        assert!(candidate.skill_capture_context().roots().is_empty());
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_access_control_revoke_is_idempotent_and_denies_only_the_revoked_session() {
+        let temporary = TempDirectory::new("read-access-revoke");
+        let root = temporary.path().join("root");
+        std::fs::create_dir_all(&root).expect("the test root is creatable");
+        std::fs::write(root.join("notes.txt"), b"read access body").unwrap();
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, true),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+        let revoked_session = session_id();
+        let other_session = "ses_22222222222222222222222222222222"
+            .parse()
+            .expect("the other test session id is canonical");
+        let relative = "notes.txt".parse().unwrap();
+
+        let task_context = initialized_context().await;
+        let (resolver, control) = WorkspaceResolver::new_with_read_access(task_context.clone());
+
+        // Before any revocation both Sessions resolve exactly ReadOnly and the tool read
+        // authorizes through the real temp capability.
+        for session in [revoked_session, other_session] {
+            let candidate = resolver.resolve(session, &workspace).await.unwrap();
+            assert_eq!(
+                candidate.roots[0].filesystem,
+                WorkspaceFilesystemGrant::ReadOnly
+            );
+            let snapshot = candidate
+                .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+                .unwrap();
+            assert!(
+                snapshot
+                    .tool_context()
+                    .access()
+                    .authorize_read(&relative)
+                    .is_ok()
+            );
+        }
+
+        // Revocation is idempotent: revoking the same Session twice keeps exactly the same
+        // permanent restriction.
+        control.revoke(revoked_session);
+        control.revoke(revoked_session);
+
+        // After revocation the same Session resolves filesystem None (never AuthorityDenied,
+        // never ReadOnly again): Prompt/Skill stay false and trust stays Restricted at the
+        // same fixed revision, and the tool read is denied.
+        let revoked_candidate = resolver.resolve(revoked_session, &workspace).await.unwrap();
+        assert_eq!(
+            revoked_candidate.roots[0].filesystem,
+            WorkspaceFilesystemGrant::None
+        );
+        assert!(!revoked_candidate.roots[0].prompt_source);
+        assert!(!revoked_candidate.roots[0].skill_source);
+        assert_eq!(
+            revoked_candidate.roots[0].trust.level(),
+            WorkspaceTrustLevel::Restricted
+        );
+        assert_eq!(revoked_candidate.roots[0].trust.revision().get(), 1);
+        let revoked_snapshot = revoked_candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        assert_eq!(
+            revoked_snapshot
+                .tool_context()
+                .access()
+                .authorize_read(&relative)
+                .unwrap_err(),
+            WorkspaceAccessError::NotAuthorized
+        );
+
+        // Another Session is untouched: it still resolves exactly ReadOnly and the tool read
+        // still authorizes.
+        let other_candidate = resolver.resolve(other_session, &workspace).await.unwrap();
+        assert_eq!(
+            other_candidate.roots[0].filesystem,
+            WorkspaceFilesystemGrant::ReadOnly
+        );
+        assert_eq!(
+            other_candidate.roots[0].trust.level(),
+            WorkspaceTrustLevel::Restricted
+        );
+        let other_snapshot = other_candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        assert!(
+            other_snapshot
+                .tool_context()
+                .access()
+                .authorize_read(&relative)
+                .is_ok()
+        );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_authorization_succeeds_only_with_the_read_access_opt_in_resolver() {
+        let temporary = TempDirectory::new("read-access-tool");
+        let root = temporary.path().join("root");
+        std::fs::create_dir_all(&root).expect("the test root is creatable");
+        std::fs::write(root.join("notes.txt"), b"read access body").unwrap();
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+
+        let task_context = initialized_context().await;
+        let default_resolver = WorkspaceResolver::new(task_context.clone());
+        let default_candidate = default_resolver
+            .resolve(session_id(), &workspace)
+            .await
+            .unwrap();
+        assert_eq!(
+            default_candidate.roots[0].filesystem,
+            WorkspaceFilesystemGrant::None
+        );
+        let default_snapshot = default_candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        assert_eq!(
+            default_snapshot
+                .tool_context()
+                .access()
+                .authorize_read(&"notes.txt".parse().unwrap())
+                .unwrap_err(),
+            WorkspaceAccessError::NotAuthorized
+        );
+
+        let read_resolver = WorkspaceResolver::new_with_read_access(task_context.clone()).0;
+        let read_candidate = read_resolver
+            .resolve(session_id(), &workspace)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_candidate.roots[0].filesystem,
+            WorkspaceFilesystemGrant::ReadOnly
+        );
+        let read_snapshot = read_candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let authorized = read_snapshot
+            .tool_context()
+            .access()
+            .authorize_read(&"notes.txt".parse().unwrap())
+            .unwrap();
+        // A known regular fixture file: read it through the nonblocking
+        // capability open with the test's own `Read::read_to_end`.
+        let mut file = authorized
+            .open_nonblocking()
+            .expect("the regular fixture file opens nonblocking");
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes)
+            .expect("the regular fixture file reads to the end");
+        assert_eq!(bytes, b"read access body");
+        task_context.shutdown().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn canonical_duplicate_via_symlink_alias_is_rejected() {
@@ -4159,6 +4540,61 @@ mod tests {
                 .await
                 .unwrap()
         );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn candidate_requires_revalidation_tracks_readable_grants_and_sources() {
+        let workspace = resolver_workspace(
+            (
+                "primary",
+                "/deterministic/primary",
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, true),
+            ),
+            Vec::new(),
+            "primary",
+            "",
+        );
+        let task_context = initialized_context().await;
+
+        // Default fail-closed resolution (filesystem None, no sources) stays final.
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::identity(),
+            authority_with_ceiling(WorkspaceFilesystemGrant::None, true, true),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        assert_eq!(candidate.roots[0].filesystem, WorkspaceFilesystemGrant::None);
+        assert!(!candidate.roots[0].prompt_source);
+        assert!(!candidate.roots[0].skill_source);
+        assert!(!candidate.requires_revalidation());
+
+        // A readable filesystem grant alone (Prompt/Skill sources still false) must
+        // revalidate: this is the production read_file authority shape.
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::identity(),
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadOnly, false, false),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        assert_eq!(candidate.roots[0].filesystem, WorkspaceFilesystemGrant::ReadOnly);
+        assert!(!candidate.roots[0].prompt_source);
+        assert!(!candidate.roots[0].skill_source);
+        assert!(candidate.requires_revalidation());
+
+        // A granted Prompt source requires revalidation even when no filesystem grant
+        // read of its own would be fresh without the revalidation boundary.
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::identity(),
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadWrite, true, false),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        assert!(candidate.roots[0].prompt_source);
+        assert!(!candidate.roots[0].skill_source);
+        assert!(candidate.requires_revalidation());
+
         task_context.shutdown().await;
     }
 
