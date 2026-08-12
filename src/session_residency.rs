@@ -66,7 +66,7 @@ use crate::session_execution::{
     SessionSubmitError, SessionWorkspaceDefinitionError, model_available_for_definition,
     prompt_available_for_definition,
 };
-use crate::tools::ToolSet;
+use crate::tools::{ProductionToolConfig, ToolSet, TurnToolResources};
 use crate::turn_item_interaction::InteractionResolutionInput;
 use crate::wire::{
     AgentId, CommandId, InteractionResolutionKey, ItemId, RequestId, SessionDefinitionRevision,
@@ -1180,7 +1180,7 @@ struct ResidencyTurnResources {
     prompt_resources: Arc<PromptResourceView>,
     model_gateway: Arc<ModelGateway>,
     model_catalog: Arc<ModelCatalogView>,
-    tool_set: Arc<ToolSet>,
+    tools: TurnToolResources,
     compaction: CompactionSettingsSnapshot,
 }
 
@@ -2539,7 +2539,43 @@ impl SessionResidencyRegistry {
                 prompt_resources,
                 model_gateway,
                 model_catalog,
-                tool_set,
+                tools: TurnToolResources::Captured(tool_set),
+                compaction,
+            }),
+            unload_grace,
+        )
+    }
+
+    /// The narrow production start seam: installs the frozen production Tool config (instead
+    /// of one test-injected ToolSet) together with the Runtime-validated graceful-Unload
+    /// grace.  The config is materialized per admission against the exact captured Workspace
+    /// snapshot; nothing is materialized here.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one Turn resource bundle plus the frozen production Tool config and the configured Unload grace binds the exact runtime owners and settings"
+    )]
+    pub(crate) fn start_with_turn_resources_and_production_tools_and_compaction_and_unload_grace(
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+        resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
+        prompt_resources: Arc<PromptResourceView>,
+        model_gateway: Arc<ModelGateway>,
+        model_catalog: Arc<ModelCatalogView>,
+        tool_config: ProductionToolConfig,
+        compaction: CompactionSettingsSnapshot,
+        unload_grace: StdDuration,
+    ) -> Result<Self, SessionResidencyStartError> {
+        Self::start_inner(
+            task_context,
+            durable_state,
+            resolver,
+            prompt_service,
+            Some(ResidencyTurnResources {
+                prompt_resources,
+                model_gateway,
+                model_catalog,
+                tools: TurnToolResources::Production(tool_config),
                 compaction,
             }),
             unload_grace,
@@ -3557,7 +3593,7 @@ async fn run_load(
                 return Err(context.internal_load());
             }
             let prompt_context = candidate.prompt_capture_context();
-            let requires_revalidation = !prompt_context.roots().is_empty();
+            let requires_revalidation = candidate.requires_revalidation();
             let capture = context
                 .prompt_service
                 .capture_workspace_sources(prompt_context);
@@ -3739,7 +3775,7 @@ async fn run_load(
     let executor_result = match (context.turn_resources.as_ref(), readiness) {
         (Some(resources), SessionReadinessView::Ready) => {
             SessionExecutor::start_loaded_idle_with_turn_resources_and_lifecycle(
-                SessionExecutorDependencies::with_turn_resources_and_tools_and_compaction(
+                SessionExecutorDependencies::with_turn_resources_and_tool_resources_and_compaction(
                     context.task_context.clone(),
                     context.durable_state.clone(),
                     Arc::clone(&context.resolver),
@@ -3747,7 +3783,7 @@ async fn run_load(
                     Arc::clone(&resources.prompt_resources),
                     Arc::clone(&resources.model_gateway),
                     Arc::clone(&resources.model_catalog),
-                    Arc::clone(&resources.tool_set),
+                    resources.tools.clone(),
                     resources.compaction.clone(),
                 ),
                 definition,
@@ -3764,7 +3800,7 @@ async fn run_load(
         }
         (Some(resources), SessionReadinessView::Unavailable(cause)) => {
             SessionExecutor::start_loaded_idle_with_turn_resources_and_lifecycle(
-                SessionExecutorDependencies::with_turn_resources_and_tools_and_compaction(
+                SessionExecutorDependencies::with_turn_resources_and_tool_resources_and_compaction(
                     context.task_context.clone(),
                     context.durable_state.clone(),
                     Arc::clone(&context.resolver),
@@ -3772,7 +3808,7 @@ async fn run_load(
                     Arc::clone(&resources.prompt_resources),
                     Arc::clone(&resources.model_gateway),
                     Arc::clone(&resources.model_catalog),
-                    Arc::clone(&resources.tool_set),
+                    resources.tools.clone(),
                     resources.compaction.clone(),
                 ),
                 definition,
@@ -4671,7 +4707,10 @@ async fn run_shared_resources(
         prompt_resources: Arc::clone(&prompt_resources),
         model_gateway: Arc::clone(&current.model_gateway),
         model_catalog: Arc::clone(&model_catalog),
-        tool_set: Arc::clone(&current.tool_set),
+        // The Tool resource carrier is preserved unchanged: a captured ToolSet stays the
+        // exact captured set, and the production config stays frozen (per-admission
+        // materialization against the future Workspace snapshot).
+        tools: current.tools.clone(),
         compaction: current.compaction.clone(),
     };
     for entry in &precomputed {
@@ -6835,6 +6874,67 @@ mod tests {
         let snapshot = registry.snapshot(session_id).await.unwrap();
         assert_eq!(snapshot.definition_revision().get(), 2);
         assert_eq!(snapshot.workspace_revision().get(), 2);
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_access_load_revalidates_readable_candidate_and_rejects_replaced_root() {
+        let store = TempStore::new();
+        empty_fixture_prompt_selections(&store);
+        let (context, state) = open_state(&store.root).await;
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+
+        // The production read_file authority grants a readable filesystem ceiling with no
+        // Prompt/Skill source ceilings: the resolved candidate is readable with no sources,
+        // so only candidate-driven revalidation closes the async authority/capture window.
+        let (resolver, _control) = WorkspaceResolver::new_with_read_access(context.clone());
+        let hooks = resolver.test_hooks();
+        hooks.arm_after_candidate_before_final_recheck();
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap(),
+        );
+        let registry = open_registry_with_turn_resources(
+            context.clone(),
+            state.clone(),
+            Arc::new(resolver),
+            prompt_service,
+        )
+        .await;
+
+        let mut load = Box::pin(registry.load_ready_idle(session_id));
+        tokio::select! {
+            _ = hooks.wait_after_candidate_before_final_recheck() => {}
+            result = &mut load => {
+                panic!("load settled before the after-candidate revalidation: {result:?}")
+            }
+        }
+
+        // Replace the resolved root at the same path while the Load holds its stale
+        // candidate: the canonical path text is unchanged, but the safe identity differs.
+        let displaced = store.root.join("displaced-workspace");
+        fs::rename(&store.old_workspace, &displaced).expect("the old root is displaceable");
+        fs::create_dir(&store.old_workspace).expect("the replacement root is created");
+        fs::create_dir(store.old_workspace.join("src")).expect("the replacement cwd is created");
+        set_private_directory_mode(&store.old_workspace);
+        set_private_directory_mode(&store.old_workspace.join("src"));
+
+        hooks.release_after_candidate_before_final_recheck();
+
+        // The candidate-driven revalidation runs because the read-only root is readable,
+        // observes the replaced identity, and installs no stale Ready snapshot.
+        assert_eq!(load.await, Ok(SessionResidencyLoadOutcome::Loaded));
+        let unavailable = registry.snapshot(session_id).await.unwrap();
+        assert_eq!(
+            unavailable.readiness(),
+            SessionReadinessView::Unavailable(SessionUnavailableView::WorkspaceUnavailable)
+        );
+        assert!(
+            unavailable.workspace_optional().is_none(),
+            "a replaced root must not install the stale Ready snapshot"
+        );
+        assert_eq!(registry.loaded_count_for_test(), 1);
+
+        let _ = fs::remove_dir_all(&displaced);
         close_fixture(context, state, registry).await;
     }
 

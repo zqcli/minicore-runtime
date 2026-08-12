@@ -65,8 +65,8 @@ use crate::wire::{
     Timestamp, WorkspaceRevision,
 };
 use crate::workspace::{
-    Workspace, WorkspaceDefinitionSummaryView, WorkspacePathTarget, WorkspaceResolver,
-    WorkspaceRootSummaryView, lower_workspace,
+    Workspace, WorkspaceDefinitionSummaryView, WorkspacePathTarget, WorkspaceReadAccessControl,
+    WorkspaceResolver, WorkspaceRootSummaryView, lower_workspace,
 };
 
 const DEFAULT_RUNTIME_REQUIRED_POLICY: &str = "Respond helpfully to the user's request.";
@@ -89,6 +89,7 @@ pub struct MiniCoreRuntimeConfig {
     unload_grace: StdDuration,
     model_providers: Vec<ModelProviderConfig>,
     ask_user_tool: bool,
+    read_file_tool: bool,
 }
 
 impl MiniCoreRuntimeConfig {
@@ -99,6 +100,7 @@ impl MiniCoreRuntimeConfig {
             unload_grace: DEFAULT_UNLOAD_GRACE,
             model_providers: Vec::new(),
             ask_user_tool: false,
+            read_file_tool: false,
         }
     }
 
@@ -129,11 +131,26 @@ impl MiniCoreRuntimeConfig {
 
     /// Opts the Runtime into the closed production `ask_user` builtin ToolSet.
     ///
-    /// The default Runtime ToolSet stays empty; this opt-in is idempotent and `open` selects
-    /// exactly one immutable ToolSet (the empty default or this builtin) and passes it through
-    /// the existing residency capture.
+    /// The default Runtime ToolSet stays empty; this opt-in is idempotent and `open` freezes
+    /// it into the single production Tool config passed through the residency start.
     pub fn with_ask_user_tool(mut self) -> Self {
         self.ask_user_tool = true;
+        self
+    }
+
+    /// Opts the Runtime into the closed production `read_file` builtin ToolSet and the
+    /// read-only Workspace resolution authority.
+    ///
+    /// The default Runtime ToolSet stays empty; this opt-in is idempotent and independent of
+    /// `with_ask_user_tool`.  `open` freezes it into the single production Tool config and
+    /// selects the read-only Workspace resolver, so every declared root is resolved with an
+    /// authority ceiling of exactly `ReadOnly` filesystem access — never `ReadWrite` — and
+    /// Prompt/Skill source ceilings stay false: the opt-in is both the Tool installation and
+    /// the read-only authority ceiling.  The read_file ToolSet is materialized per admission
+    /// against the exact captured Workspace snapshot, so no single static ToolSet is selected
+    /// here.
+    pub fn with_read_file_tool(mut self) -> Self {
+        self.read_file_tool = true;
         self
     }
 }
@@ -307,16 +324,27 @@ impl MiniCoreRuntime {
                 }
             };
 
-        let resolver = Arc::new(WorkspaceResolver::new(task_context.clone()));
-        // The production ToolSet is selected exactly once at `open`: the empty default stays
-        // the default, and the host opt-in installs the closed `ask_user` builtin through the
-        // existing residency ToolSet capture path.
-        let tool_set = if config.ask_user_tool {
-            crate::tools::ToolSet::ask_user_builtin()
+        // The read_file opt-in selects the read-only Workspace resolver and its revocation
+        // control: every declared root resolves with an authority ceiling of exactly
+        // `ReadOnly` filesystem access (never `ReadWrite`), Prompt/Skill source ceilings stay
+        // false, and the Runtime owner keeps the control so the host Workspace authority
+        // invalidation seam can revoke read access per Session.  The default resolver keeps
+        // the existing restricted authority unchanged and has no control.
+        let (resolver, read_access_control) = if config.read_file_tool {
+            let (resolver, control) = WorkspaceResolver::new_with_read_access(task_context.clone());
+            (Arc::new(resolver), Some(control))
         } else {
-            crate::tools::ToolSet::empty()
+            (Arc::new(WorkspaceResolver::new(task_context.clone())), None)
         };
-        let session_residency = match SessionResidencyRegistry::start_with_turn_resources_and_tools_and_compaction_and_unload_grace(
+        // The production Tool config is frozen exactly once at `open`: the two closed host
+        // opt-ins (ask_user, read_file) are captured in one immutable config and passed
+        // through the residency start.  Nothing is materialized here — each admission
+        // materializes its ToolSet against the exact captured Workspace snapshot, so no
+        // single static ToolSet is selected when read_file is enabled and the default
+        // Runtime ToolSet stays empty.
+        let tool_config =
+            crate::tools::ProductionToolConfig::new(config.ask_user_tool, config.read_file_tool);
+        let session_residency = match SessionResidencyRegistry::start_with_turn_resources_and_production_tools_and_compaction_and_unload_grace(
             task_context.clone(),
             durable_state.clone(),
             resolver,
@@ -324,7 +352,7 @@ impl MiniCoreRuntime {
             Arc::clone(&prompt_resources),
             Arc::clone(&model_gateway),
             Arc::clone(&model_catalog),
-            tool_set,
+            tool_config,
             compaction,
             unload_grace,
         ) {
@@ -348,6 +376,7 @@ impl MiniCoreRuntime {
             SharedResourceRoots::new(prompt_resources, model_catalog),
             model_gateway,
             unload_grace,
+            read_access_control,
         ));
         inner.retain_until_shutdown();
         Ok(Self { inner })
@@ -385,15 +414,20 @@ impl MiniCoreRuntime {
         self.inner.subscribe(request).await
     }
 
-    /// Host-only security Workspace authority invalidation (not a wire command).  The host has
-    /// already published the current hard restriction fact; the Runtime routes out-of-band to
-    /// the loaded Session executor — without the runtime publication semaphore and without
-    /// waiting on any ordinary work lane — samples one `SystemClock` timestamp, signals the
-    /// active admission/Turn first-wins with `SecurityRevoked` (or enters Preparing directly
-    /// when Idle), and re-resolves the installed Workspace with the exact current definition.
-    /// The await resolves only after the recovery final state is installed (Ready or the new
-    /// Workspace/Prompt Unavailable cause).  The durable definition/revision/metadata/
-    /// conversation are never changed.  No `CommandId` is generated.
+    /// Host-only security Workspace authority invalidation (not a wire command).  Except for
+    /// the Runtime-owned read_file authority, the host has already published the current hard
+    /// restriction fact; the Runtime routes out-of-band to the loaded Session executor —
+    /// without the runtime publication semaphore and without waiting on any ordinary work
+    /// lane — samples one `SystemClock` timestamp, signals the active admission/Turn
+    /// first-wins with `SecurityRevoked` (or enters Preparing directly when Idle), and
+    /// re-resolves the installed Workspace with the exact current definition.  For a Runtime
+    /// opened with the read_file opt-in, this method itself first publishes the permanent
+    /// read revocation for the Session through the owner-held control, so the read authority
+    /// is already restricted when the recovery re-resolves — the restriction stays current
+    /// even if the residency reports SessionNotLoaded/Closing/internal.  The await resolves
+    /// only after the recovery final state is installed (Ready or the new Workspace/Prompt
+    /// Unavailable cause).  The durable definition/revision/metadata/conversation are never
+    /// changed.  No `CommandId` is generated.
     pub async fn invalidate_session_workspace_authority(
         &self,
         session_id: SessionId,
@@ -798,6 +832,13 @@ struct RuntimeInner {
     // This is a multi-reader gate, so Submits across different Sessions never serialize against
     // each other.
     shared_resource_gate: Arc<RwLock<()>>,
+    // The Runtime-owned read_file Workspace read-authority revocation control, installed only
+    // by the read_file opt-in at `open`.  The default/no-read Runtime stores None and keeps
+    // its existing invalidation behavior; the read_file Runtime revokes through this exact
+    // control before every host Workspace authority invalidation so the restriction is
+    // published before the recovery re-resolves.  It is a separate owner clone of the same
+    // process-local set the resolver authority checks, so no authority state is duplicated.
+    read_access_control: Option<WorkspaceReadAccessControl>,
     retained_until_shutdown: Mutex<Option<Arc<RuntimeInner>>>,
     session_residency: Mutex<Option<Arc<SessionResidencyRegistry>>>,
     durable_state: Mutex<Option<DurableState>>,
@@ -820,6 +861,7 @@ impl RuntimeInner {
         shared_resources: SharedResourceRoots,
         model_gateway: Arc<ModelGateway>,
         unload_grace: StdDuration,
+        read_access_control: Option<WorkspaceReadAccessControl>,
     ) -> Self {
         let (runtime_events, _) = broadcast::channel(RUNTIME_EVENT_CAPACITY);
         Self {
@@ -829,6 +871,7 @@ impl RuntimeInner {
             unload_grace,
             shared_resources: Mutex::new(shared_resources),
             shared_resource_gate: Arc::new(RwLock::new(())),
+            read_access_control,
             retained_until_shutdown: Mutex::new(None),
             session_residency: Mutex::new(Some(session_residency)),
             durable_state: Mutex::new(Some(durable_state)),
@@ -1942,8 +1985,14 @@ impl RuntimeInner {
 
     /// The host-only security invalidation route: no runtime publication semaphore, no ordinary
     /// work-lane wait.  A missing loaded executor is `SessionNotLoaded`; a registry/runtime
-    /// closing is `RuntimeClosing`; an impossible actor failure is `Internal`.  The single
-    /// `SystemClock` timestamp is sampled here and carried through the executor recovery events.
+    /// closing is `RuntimeClosing`; an impossible actor failure is `Internal`.  For the
+    /// Runtime-owned read_file authority, the permanent per-Session read revocation is
+    /// published here first (after the Open lifecycle and residency existence checks, before
+    /// the timestamp sample and the residency invalidation), so the hard restriction is
+    /// current before the recovery re-resolves and stays published even when the residency
+    /// returns SessionNotLoaded/Closing/internal.  The default/no-read Runtime has no control
+    /// and keeps its existing behavior.  The single `SystemClock` timestamp is sampled here
+    /// and carried through the executor recovery events.
     async fn invalidate_session_workspace_authority(
         &self,
         session_id: SessionId,
@@ -1954,6 +2003,13 @@ impl RuntimeInner {
         let Some(residency) = self.residency() else {
             return Err(SessionWorkspaceInvalidationError::RuntimeClosing);
         };
+        // The Runtime-owned read_file authority publishes its permanent read revocation for
+        // this Session before the host restriction is routed: the revoke is the hard
+        // restriction for that authority, stays current even if the residency below returns
+        // SessionNotLoaded/Closing/internal, and is observed by the recovery's re-resolve.
+        if let Some(control) = self.read_access_control.as_ref() {
+            control.revoke(session_id);
+        }
         let timestamp = SystemClock.now();
         match residency
             .invalidate_workspace_authority(session_id, timestamp)
@@ -4117,9 +4173,9 @@ mod tests {
         RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery,
         RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionExecutionView,
         SessionLifecycleView, SessionReadinessView, SessionRecordingState, SessionStateEventKind,
-        SessionUnavailableView, SnapshotRequest, SnapshotResponse, StateEventMsg,
-        SubscriptionRequest, SubscriptionScope, TurnCommand, TurnExecutionPhaseView,
-        TurnFailureView, TurnTerminalView,
+        SessionUnavailableView, SessionWorkspaceInvalidationError, SnapshotRequest,
+        SnapshotResponse, StateEventMsg, SubscriptionRequest, SubscriptionScope, TurnCommand,
+        TurnExecutionPhaseView, TurnFailureView, TurnTerminalView,
     };
     use crate::runtime_task::RuntimeTaskError;
     use crate::session_execution::SessionExecutionState;
@@ -4135,9 +4191,9 @@ mod tests {
         RequestId, SessionId, SessionMetadataRevision, TurnId,
     };
     use crate::workspace::{
-        RequestedFilesystemAccess, Workspace, WorkspaceCwdSpec, WorkspaceDefinitionInput,
-        WorkspacePathTarget, WorkspaceRootInput, WorkspaceRootKey, WorkspaceSourcePolicy,
-        lower_workspace,
+        RequestedFilesystemAccess, Workspace, WorkspaceAccessError, WorkspaceCwdSpec,
+        WorkspaceDefinitionInput, WorkspacePathTarget, WorkspaceRootInput, WorkspaceRootKey,
+        WorkspaceSourcePolicy, lower_workspace,
     };
 
     static NEXT_TEMP_SUFFIX: AtomicU64 = AtomicU64::new(1);
@@ -7011,6 +7067,627 @@ mod tests {
             }
             runtime.shutdown().await;
         }
+    }
+
+    #[test]
+    fn runtime_config_read_file_tool_is_default_off_and_the_opt_in_is_idempotent_and_independent() {
+        let default = MiniCoreRuntimeConfig::new(PathBuf::from("/unused"));
+        assert!(
+            !default.read_file_tool,
+            "the default Runtime ToolSet stays empty"
+        );
+        let opted = default.with_read_file_tool();
+        assert!(opted.read_file_tool);
+        // The opt-in is idempotent: opting in twice keeps the exact same flag.
+        let twice = opted.with_read_file_tool();
+        assert!(twice.read_file_tool);
+        // The read_file opt-in is independent of ask_user in both directions.
+        let read_only = MiniCoreRuntimeConfig::new(PathBuf::from("/unused")).with_read_file_tool();
+        assert!(
+            !read_only.ask_user_tool,
+            "the read_file opt-in never enables ask_user"
+        );
+        let ask_only = MiniCoreRuntimeConfig::new(PathBuf::from("/unused")).with_ask_user_tool();
+        assert!(
+            !ask_only.read_file_tool,
+            "the ask_user opt-in never enables read_file"
+        );
+        let both = ask_only.with_read_file_tool();
+        assert!(both.ask_user_tool && both.read_file_tool);
+        // A fresh default config is unaffected, and the redacted Debug shape is unchanged
+        // by the new field.
+        let fresh = MiniCoreRuntimeConfig::new(PathBuf::from("/unused"));
+        assert!(!fresh.read_file_tool);
+        assert_eq!(format!("{fresh:?}"), "MiniCoreRuntimeConfig { .. }");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_open_tool_opt_ins_disclose_exactly_the_opted_builtins() {
+        // The frozen production Tool config discloses exactly the opted builtins once: the
+        // default stays empty, each single opt-in discloses its one builtin, and the
+        // combined opt-in discloses exactly ask_user then read_file (never twice, never
+        // any unopted builtin).
+        for (ask_user, read_file, expected_names) in [
+            (false, false, Vec::<&str>::new()),
+            (true, false, vec!["ask_user"]),
+            (false, true, vec!["read_file"]),
+            (true, true, vec!["ask_user", "read_file"]),
+        ] {
+            let root = TempRoot::new();
+            let workspace = TempWorkspace::new();
+            let model = ScriptedModelFixture::new(vec!["final answer"]);
+            let mut config = MiniCoreRuntimeConfig::new(root.path().to_owned());
+            if ask_user {
+                config = config.with_ask_user_tool().with_ask_user_tool();
+            }
+            if read_file {
+                config = config.with_read_file_tool().with_read_file_tool();
+            }
+            let runtime =
+                MiniCoreRuntime::open_with_model_fixture(config, Handle::current(), &model)
+                    .await
+                    .expect("the Runtime opens with the selected Tool config");
+            let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+            let mut events = runtime
+                .subscribe(SubscriptionRequest::new(
+                    SubscriptionScope::Session { session_id },
+                    false,
+                ))
+                .await
+                .expect("the Session subscription opens");
+            assert!(matches!(
+                events.recv().await,
+                Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+            ));
+            let submit = runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("hello").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the ordinary Turn starts");
+            let turn_id = started_turn(&submit);
+            let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match events.recv().await {
+                        Some(EventFrame::State(event))
+                            if event.msg().session_kind()
+                                == Some(SessionStateEventKind::TurnCompleted) =>
+                        {
+                            break event;
+                        }
+                        Some(EventFrame::State(_)) => continue,
+                        other => {
+                            panic!("unexpected frame before ordinary completion: {other:?}")
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the ordinary Turn completes");
+            assert!(matches!(
+                terminal.msg().session_detail(),
+                Some(SessionEventDetail::TurnTerminal {
+                    turn_id: completed_turn,
+                    terminal: TurnTerminalView::Completed { .. },
+                }) if completed_turn == turn_id
+            ));
+
+            let requests = model.requests();
+            assert_eq!(requests.len(), 1);
+            let tools = requests[0].input().tools();
+            let mut disclosed = tools
+                .iter()
+                .map(|tool| tool.name().as_str())
+                .collect::<Vec<_>>();
+            disclosed.sort_unstable();
+            assert_eq!(disclosed, expected_names);
+            if read_file {
+                let schema: crate::wire::BoundedJsonSchema = r#"{"type":"object","properties":{"path":{"type":"string","maxLength":4096}},"required":["path"],"additionalProperties":false}"#
+                    .parse()
+                    .expect("the frozen read_file schema is valid");
+                let read_file_tool = tools
+                    .iter()
+                    .find(|tool| tool.name().as_str() == "read_file")
+                    .expect("the read_file opt-in discloses its builtin exactly once");
+                assert_eq!(read_file_tool.input_schema(), &schema);
+            }
+            runtime.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_file_tool_opt_in_reads_a_workspace_file_and_continues_the_turn_end_to_end() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        // A real UTF-8 file under the Workspace cwd (`src`): the production read_file
+        // builtin must read it through the read-only authority ceiling over a Workspace
+        // whose requested access is ReadWrite, tightened to ReadOnly at resolution.
+        fs::write(
+            workspace.path().join("src").join("note.txt"),
+            "hello from the workspace\n",
+        )
+        .expect("the Workspace cwd file is written");
+        // The scripted model emits one read_file ToolCall for the cwd-relative file, then
+        // one final text response for the same Turn after the read result settles.
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_read",
+            "read_file",
+            r#"{"path":"note.txt"}"#,
+            "final public answer",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_read_file_tool(),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the read_file opt-in Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+        let submit_command_id = CommandId::generate().unwrap();
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                submit_command_id,
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("read it").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+
+        // The one Tool round runs the production read_file builtin against the exact
+        // captured Workspace snapshot and the same Turn runs its final response.
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => {
+                        panic!("unexpected frame before read_file Turn completion: {other:?}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the read_file Turn completes");
+        assert_eq!(terminal.command_id(), Some(submit_command_id));
+        assert!(matches!(
+            terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == turn_id
+        ));
+        assert!(
+            terminal
+                .msg()
+                .session_snapshot()
+                .and_then(|snapshot| snapshot.usage())
+                .is_some_and(|usage| usage.model_calls() == 2)
+        );
+        assert_eq!(model.request_count(), 2);
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        // The first request discloses the exact frozen read_file schema.
+        assert_eq!(requests[0].input().tools().len(), 1);
+        assert_eq!(requests[0].input().tools()[0].name().as_str(), "read_file");
+        let schema: crate::wire::BoundedJsonSchema = r#"{"type":"object","properties":{"path":{"type":"string","maxLength":4096}},"required":["path"],"additionalProperties":false}"#
+            .parse()
+            .expect("the frozen read_file schema is valid");
+        assert_eq!(requests[0].input().tools()[0].input_schema(), &schema);
+        // The second request carries the exact immutable ToolResult content of the read:
+        // one text part with the file's full contents.
+        assert!(
+            requests[1]
+                .input()
+                .messages()
+                .iter()
+                .any(|message| matches!(
+                    message.as_ref(),
+                    ModelMessageRef::Tool {
+                        tool_call_id,
+                        content,
+                    } if tool_call_id.as_str() == "call_read"
+                        && content.parts().len() == 1
+                        && content.parts()[0].as_text() == "hello from the workspace\n"
+                ))
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_file_authority_invalidation_revokes_read_access_and_restores_no_grant() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        fs::write(
+            workspace.path().join("src").join("note.txt"),
+            "hello from the workspace\n",
+        )
+        .expect("the Workspace cwd file is written");
+        // The scripted model emits one read_file ToolCall per Turn round, then one final
+        // text response for that same Turn, across two rounds: the first Turn proves the
+        // read grant, the post-revocation recovery is inspected through the installed
+        // snapshot, and the second Turn is the real future admission — every admission
+        // materializes the read_file ToolSet against exactly the current snapshot.  The
+        // two rounds use distinct tool_call_ids so their ToolResults are distinguishable.
+        let model = ScriptedModelFixture::with_two_tool_rounds(
+            (
+                "call_read",
+                "read_file",
+                r#"{"path":"note.txt"}"#,
+                "final public answer",
+            ),
+            (
+                "call_read_again",
+                "read_file",
+                r#"{"path":"note.txt"}"#,
+                "second final answer",
+            ),
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_read_file_tool(),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the read_file opt-in Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+
+        // One read_file Turn succeeds end-to-end: the read authority grant is genuinely
+        // present before the host revocation.
+        let submit_command_id = CommandId::generate().unwrap();
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                submit_command_id,
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("read it").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => {
+                        panic!("unexpected frame before read_file Turn completion: {other:?}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the read_file Turn completes");
+        assert!(matches!(
+            terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == turn_id
+        ));
+        assert_eq!(model.request_count(), 2);
+        let requests = model.requests();
+        assert!(requests[1].input().messages().iter().any(|message| {
+            matches!(
+                message.as_ref(),
+                ModelMessageRef::Tool {
+                    tool_call_id,
+                    content,
+                } if tool_call_id.as_str() == "call_read"
+                    && content.parts().len() == 1
+                    && content.parts()[0].as_text() == "hello from the workspace\n"
+            )
+        }));
+
+        // The host Workspace authority invalidation seam revokes the read authority for this
+        // Session and recovers the loaded Idle Session; it resolves only after the recovery
+        // final state is installed.
+        runtime
+            .invalidate_session_workspace_authority(session_id)
+            .await
+            .expect("the host-only invalidation seam recovers the read_file Session");
+
+        // The recovery re-resolves with the revoked authority: resolve succeeds with filesystem
+        // None (never AuthorityDenied), so it finishes a snapshot and readiness returns to
+        // Ready through the exact existing projection — Preparing then Ready, both with no
+        // CommandId, never a WorkspaceReloaded event.
+        let mut readiness_events = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while readiness_events.len() < 2 {
+                let Some(EventFrame::State(event)) = events.recv().await else {
+                    panic!("the Session stream stays open through the recovery");
+                };
+                assert_ne!(
+                    event.msg().session_kind(),
+                    Some(SessionStateEventKind::SessionWorkspaceReloaded),
+                    "the host-only invalidation never publishes WorkspaceReloaded"
+                );
+                if event.msg().session_kind()
+                    == Some(SessionStateEventKind::SessionReadinessChanged)
+                {
+                    readiness_events.push(event);
+                }
+            }
+        })
+        .await
+        .expect("the recovery publishes both readiness events");
+        let (preparing, ready) = (&readiness_events[0], &readiness_events[1]);
+        assert_eq!(preparing.command_id(), None);
+        assert_eq!(ready.command_id(), None);
+        assert_eq!(
+            preparing
+                .msg()
+                .session_snapshot()
+                .expect("readiness events carry a Session snapshot")
+                .readiness(),
+            SessionReadinessView::Preparing
+        );
+        assert_eq!(
+            ready
+                .msg()
+                .session_snapshot()
+                .expect("readiness events carry a Session snapshot")
+                .readiness(),
+            SessionReadinessView::Ready
+        );
+
+        // The critical proof: the recovered installed WorkspaceSnapshot carries no read
+        // grant — the exact snapshot every future admission materializes the read_file
+        // ToolSet against, so a future Submit can start (readiness Ready) but the read_file
+        // Tool cannot execute.
+        let residency = runtime
+            .inner
+            .residency()
+            .expect("the open Runtime retains its residency");
+        let executor = residency
+            .executor_for_test(session_id)
+            .expect("the recovered Session stays loaded");
+        let recovered_snapshot = executor.published_snapshot();
+        assert_eq!(recovered_snapshot.readiness(), SessionReadinessView::Ready);
+        let workspace_snapshot = recovered_snapshot
+            .workspace_optional()
+            .expect("a Ready recovery installs its WorkspaceSnapshot");
+        assert_eq!(workspace_snapshot.session_id(), session_id);
+        assert_eq!(
+            workspace_snapshot
+                .tool_context()
+                .access()
+                .authorize_read(&"note.txt".parse().unwrap())
+                .unwrap_err(),
+            WorkspaceAccessError::NotAuthorized
+        );
+        // The revocation is permanent for this Runtime lifetime: the resolver's control was
+        // the one revoked, and no further model call was made by the recovery.
+        assert_eq!(model.request_count(), 2);
+
+        // The real future admission: a second public Submit starts against the recovered
+        // no-grant Workspace snapshot (readiness Ready), the same Turn path discloses the
+        // read_file ToolSet against that snapshot, and the model's second read_file
+        // ToolCall to the same note.txt settles PreExecution + Denied with the exact frozen
+        // text before any start factory exists — the same Turn then receives its scripted
+        // final text and completes.
+        let second_command_id = CommandId::generate().unwrap();
+        let second_submit = runtime
+            .dispatch(CommandRequest::new(
+                second_command_id,
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("read it again").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("the second public Submit dispatches");
+        let second_turn_id = started_turn(&second_submit);
+        let second_terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => {
+                        panic!(
+                            "unexpected frame before the post-revocation read_file Turn completion: {other:?}"
+                        )
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the post-revocation read_file Turn completes");
+        assert_eq!(second_terminal.command_id(), Some(second_command_id));
+        assert!(matches!(
+            second_terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == second_turn_id
+        ));
+        assert!(
+            second_terminal
+                .msg()
+                .session_snapshot()
+                .and_then(|snapshot| snapshot.usage())
+                .is_some_and(|usage| usage.model_calls() == 4)
+        );
+        assert_eq!(model.request_count(), 4);
+
+        // The exact model request sequence across both admissions, four requests total:
+        // request 0 is the first Turn's first request disclosing read_file; request 1
+        // carries the first success ToolResult with the exact file content; request 2 is
+        // the second Turn's first request and still discloses read_file against the
+        // recovered no-grant snapshot; request 3 carries the second ToolResult with the
+        // exact denial text, never the file content.
+        let requests = model.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].input().tools().len(), 1);
+        assert_eq!(requests[0].input().tools()[0].name().as_str(), "read_file");
+        assert!(requests[1].input().messages().iter().any(|message| {
+            matches!(
+                message.as_ref(),
+                ModelMessageRef::Tool {
+                    tool_call_id,
+                    content,
+                } if tool_call_id.as_str() == "call_read"
+                    && content.parts().len() == 1
+                    && content.parts()[0].as_text() == "hello from the workspace\n"
+            )
+        }));
+        assert_eq!(requests[2].input().tools().len(), 1);
+        assert_eq!(requests[2].input().tools()[0].name().as_str(), "read_file");
+        assert!(requests[3].input().messages().iter().any(|message| {
+            matches!(
+                message.as_ref(),
+                ModelMessageRef::Tool {
+                    tool_call_id,
+                    content,
+                } if tool_call_id.as_str() == "call_read_again"
+                    && content.parts().len() == 1
+                    && content.parts()[0].as_text() == "workspace file access is denied"
+            )
+        }));
+        // The denied second read never leaks the file content into its own ToolResult: the
+        // call_read_again result is exactly the one denial part (the first Turn's success
+        // ToolResult legitimately stays in the conversation history, but no second read
+        // result ever carries the file content).
+        assert!(!requests[3].input().messages().iter().any(|message| {
+            matches!(
+                message.as_ref(),
+                ModelMessageRef::Tool {
+                    tool_call_id,
+                    content,
+                } if tool_call_id.as_str() == "call_read_again"
+                    && content
+                        .parts()
+                        .iter()
+                        .any(|part| part.as_text() == "hello from the workspace\n")
+            )
+        }));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_file_authority_revocation_stays_current_when_invalidation_meets_a_not_loaded_session()
+     {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        fs::write(
+            workspace.path().join("src").join("note.txt"),
+            "hello from the workspace\n",
+        )
+        .expect("the Workspace cwd file is written");
+        // The model fixture only keeps the catalog non-empty; this test runs no Turn.
+        let model = ScriptedModelFixture::new(Vec::<&str>::new());
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_read_file_tool(),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the read_file opt-in Runtime opens");
+        // Create but do NOT load: the invalidation seam must still publish the permanent read
+        // revocation before it reports the missing loaded executor.
+        let session_id = create_runtime_session(&runtime, workspace.path()).await;
+        assert_eq!(
+            runtime
+                .invalidate_session_workspace_authority(session_id)
+                .await,
+            Err(SessionWorkspaceInvalidationError::SessionNotLoaded)
+        );
+
+        // The later public Load resolves the exact same Workspace with the revocation
+        // current: resolve succeeds with filesystem None (never AuthorityDenied), so the
+        // Session loads Ready but the read Tool cannot execute.
+        let load = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Load { session_id }),
+            ))
+            .await
+            .expect("public Load dispatches");
+        assert_eq!(command_output(&load), "session loaded");
+        let residency = runtime
+            .inner
+            .residency()
+            .expect("the open Runtime retains its residency");
+        let executor = residency
+            .executor_for_test(session_id)
+            .expect("the revoked Session is loaded");
+        let loaded_snapshot = executor.published_snapshot();
+        assert_eq!(loaded_snapshot.readiness(), SessionReadinessView::Ready);
+        let workspace_snapshot = loaded_snapshot
+            .workspace_optional()
+            .expect("a Ready load installs its WorkspaceSnapshot");
+        assert_eq!(workspace_snapshot.session_id(), session_id);
+        assert_eq!(
+            workspace_snapshot
+                .tool_context()
+                .access()
+                .authorize_read(&"note.txt".parse().unwrap())
+                .unwrap_err(),
+            WorkspaceAccessError::NotAuthorized
+        );
+        assert_eq!(model.request_count(), 0);
+        runtime.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
