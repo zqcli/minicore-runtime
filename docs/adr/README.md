@@ -23,6 +23,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0144](0144-production-list-directory-uses-bounded-capability-enumeration.md) | Production `list_directory`是closed、default-off、Workspace-bound direct enumeration builtin：与`read_file`共享ReadOnly authority/revocation，empty path表示cwd，capability-relative directory open，不递归/不跟随entry symlink，256-entry/8,192-name-byte/65,536-JSON bounds与deterministic compact JSON |
 | [0145](0145-live-provider-evidence-refines-direct-adapter-wire-truth.md) | 真实OpenAI Responses/Anthropic Messages public Runtime release evidence细化direct adapter wire truth：固定产品User-Agent、unsigned Anthropic thinking truthful normalization/replay omission、message_start stop fields absent-or-null；live smoke仍默认ignored |
 | [0146](0146-production-write-file-binds-capability-targets-to-session-fifo.md) | Production `write_file`是closed、default-off、Workspace-bound mutation builtin：ReadWrite authority仍受requested access约束，existing/create target使用capability-opened physical identity，same-Session ticket按`call_index` FIFO，mutation permit由`ToolOperationSlot`持有through `Settling`，16,384-byte safe UTF-8 full replacement且不mkdir/append/atomic rename |
+| [0147](0147-production-fetch-url-pins-exact-https-origins-to-host-addresses.md) | Production `fetch_url`冻结为closed/default-off exact-origin HTTPS GET builtin：host安装DNS hostname与1..=8个fixed SocketAddr的交集authority，per-origin reject-all DNS client关闭redirect/retry/proxy/compression，2xx-only bounded safe UTF-8 text，30秒request timeout与owner-contained cancellation cleanup |
 
 ## Current With Later Refinements
 
