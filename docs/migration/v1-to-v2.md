@@ -1,6 +1,6 @@
 # MiniCore V1 → V2 版本迁移记录
 
-状态：V2目标架构已推进至ADR 0143；全部普通V4-P0/P1与conditional V4-C0-1已关闭，OpenAI Responses/Anthropic Messages direct provider adapters、closed/default-off production `ask_user` builtin与首个narrow OS-backed production `read_file` builtin（ADR 0143）已实现；真实credential smoke与其余OS-backed production Tool/Sandbox adapters仍pending
+状态：V2目标架构已推进至ADR 0144；全部普通V4-P0/P1与conditional V4-C0-1已关闭，OpenAI Responses/Anthropic Messages direct provider adapters、closed/default-off production `ask_user` builtin与narrow OS-backed production `read_file`/`list_directory` builtins（ADR 0143/0144）已实现；真实credential smoke与其余OS-backed production Tool/Sandbox adapters仍pending
 日期：2026-08-11
 
 ## 目的
@@ -182,7 +182,7 @@ ADR 0134关闭wire/storage format门禁：Wire Schema冻结JSON casing/tag、typ
 
 ### 阶段4：Prompt、Skill、Tool与Workspace capture
 
-状态：目标设计完成；生产实现已推进：M6 Workspace/Prompt capture与immutable snapshot、M8 Tool/Interaction/Cancel与crate-private approval/UserQuestion控制seam、M13/ADR 0140 Sandbox contract、M14 production `ask_user`（ADR 0142）与首个narrow OS-backed `read_file`（ADR 0143）builtins已完成；完整schema/hooks/policy/approval enforcement、generic ToolService与Skill composition/source仍pending。
+状态：目标设计完成；生产实现已推进：M6 Workspace/Prompt capture与immutable snapshot、M8 Tool/Interaction/Cancel与crate-private approval/UserQuestion控制seam、M13/ADR 0140 Sandbox contract、M14 production `ask_user`（ADR 0142）与narrow OS-backed `read_file`/`list_directory`（ADR 0143/0144）builtins已完成；完整schema/hooks/policy/approval enforcement、generic ToolService与Skill composition/source仍pending。
 
 - PromptSet从LiveConversationView组装；
 - PromptContent在candidate build期间完全materialize并由强Arc共享，PromptSet不解析source locator；
@@ -193,7 +193,7 @@ ADR 0134关闭wire/storage format门禁：Wire Schema冻结JSON casing/tag、typ
 - ToolStartGate独立于Session recording；
 - Workspace update Idle-only，SecurityRevoked保持。
 
-Prompt Q1/Q4已分别由ADR 0128/0129关闭。Tool/Sandbox O1/R7已由M13/ADR 0140关闭；production实现属于M14（`ask_user`与首个narrow `read_file` builtin已完成，其余write/network/process与其它file adapter仍待交付）。
+Prompt Q1/Q4已分别由ADR 0128/0129关闭。Tool/Sandbox O1/R7已由M13/ADR 0140关闭；production实现属于M14（`ask_user`与narrow `read_file`/`list_directory` builtins已完成，其余write/network/process及其他未实现adapter仍待交付）。
 
 ### 阶段5：Agent/Session lifecycle
 
@@ -265,7 +265,7 @@ Recorder问题见[`docs/review/async-loop-best-effort-recording-open-questions.m
 - 第四轮全部普通V4-P0/P1与conditional V4-C0-1已关闭；V4-P1-3由M12/ADR 0138/0139关闭，V4-C0-1由M13/ADR 0140关闭；
 - 首个Rust crate已经消费ADR 0134/Format V1/Wire V1 fixtures并实现semantic conformance runner；
 - production OpenAI Responses/Anthropic Messages direct adapters已实现（M14），必须消费M12 contract suite；
-- production Tool/Sandbox adapters必须消费ADR 0140 contract suite（`read_file`已按该suite实现首个narrow OS-backed slice）；首个file-mutation adapter另须实现ADR 0116的Session-local queue。
+- production Tool/Sandbox adapters必须消费ADR 0140 contract suite（`read_file`/`list_directory`已按该suite实现两个narrow OS-backed read slices）；首个file-mutation adapter另须实现ADR 0116的Session-local queue。
 
 ## 文档治理
 

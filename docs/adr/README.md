@@ -17,10 +17,11 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0135](0135-workspace-public-input-is-host-neutral.md) | Workspace public input在command application前保持host-neutral |
 | [0136](0136-durablestate-operation-owned-generations.md) | DurableState使用operation-owned immutable generations、permanent reservations与root lease；read with ADR 0137 |
 | [0137](0137-tokio-owner-tracked-async-foundation.md) | Tokio owner-tracked async foundation与deterministic persistent seams；refines ADR 0117 and supports ADR 0136 |
-| [0140](0140-tool-sandbox-admission-fails-closed-before-start.md) | Tool Sandbox capability admission在start前fail closed；ADR 0143提供首个production consumer |
+| [0140](0140-tool-sandbox-admission-fails-closed-before-start.md) | Tool Sandbox capability admission在start前fail closed；ADR 0143/0144提供production `FilesystemRead` consumers |
 | [0141](0141-provider-calls-are-stateless-full-request.md) | Provider调用是无状态full-request wire policy：一次invocation零或一次`ProviderAdapter::execute`、独立地零或一次POST（若发送则携带完整full request）、无optimization fallback/continuation；显式cache annotation与continuation保持omission |
-| [0142](0142-production-ask-user-is-a-closed-opt-in-builtin.md) | Production `ask_user`是closed、default-off、Runtime-owned builtin：`MiniCoreRuntimeConfig::with_ask_user_tool()` idempotent opt-in、zero permission、仅UserQuestion或frozen PreExecution failure plans、deterministic compact JSON answer；ADR 0143增加独立可组合的`read_file` selection |
+| [0142](0142-production-ask-user-is-a-closed-opt-in-builtin.md) | Production `ask_user`是closed、default-off、Runtime-owned builtin：`MiniCoreRuntimeConfig::with_ask_user_tool()` idempotent opt-in、zero permission、仅UserQuestion或frozen PreExecution failure plans、deterministic compact JSON answer；ADR 0143/0144增加独立可组合的Workspace read selections |
 | [0143](0143-production-read-file-uses-workspace-capabilities.md) | Production `read_file`是closed、default-off、Workspace-bound builtin：`MiniCoreRuntimeConfig::with_read_file_tool()` idempotent opt-in、ReadOnly Workspace authority ceiling（requested ReadWrite收紧为ReadOnly、Prompt/Skill source保持false）、per-admission WorkspaceSnapshot-bound materialization、cwd-relative `WorkspaceRelativePath` only、`FilesystemRead` exact sandbox、fixed result texts与65,536-byte单Text part bound、per-Session permanent revocation integrated with host invalidation |
+| [0144](0144-production-list-directory-uses-bounded-capability-enumeration.md) | Production `list_directory`是closed、default-off、Workspace-bound direct enumeration builtin：与`read_file`共享ReadOnly authority/revocation，empty path表示cwd，capability-relative directory open，不递归/不跟随entry symlink，256-entry/8,192-name-byte/65,536-JSON bounds与deterministic compact JSON |
 
 ## Current With Later Refinements
 
@@ -43,7 +44,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0118](0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md) | ADR 0124、0126、0127、0133 |
 | [0119](0119-model-calls-use-session-logical-retries.md) | ADR 0126、0139、0141 |
 | [0120](0120-failures-stay-with-owning-modules.md) | ADR 0126 |
-| [0121](0121-workspace-updates-require-idle.md) | ADR 0124、0126、0127、0140、0143 |
+| [0121](0121-workspace-updates-require-idle.md) | ADR 0124、0126、0127、0140、0143、0144 |
 | [0123](0123-identity-uses-refs-and-explicit-reload.md) | ADR 0124、0126、0127、0129、0132、0141 |
 | [0124](0124-session-replay-is-tolerant-and-links-are-minimal.md) | ADR 0126、0127、0131、0132、0134、0136、0137 |
 | [0125](0125-model-gateway-has-no-local-call-permits.md) | ADR 0141 |

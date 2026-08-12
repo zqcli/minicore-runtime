@@ -5,7 +5,10 @@
 //! ToolSet capture path.  This first slice is deliberately narrow: one required `path`
 //! string argument (the empty path is the cwd itself, a legal listing target), no
 //! recursion, no file-content reads, no options, no absolute paths, no additional-root
-//! addressing.  It is not composed with `ask_user`; Runtime wiring is a later worker.
+//! addressing.  The builtin itself stays narrow: production composition belongs to the
+//! closed `ProductionToolConfig`, which fixes exactly the three frozen builtins in one
+//! order (`ask_user` → `read_file` → `list_directory`) — there is no generic registry and
+//! no dynamic composition.
 //!
 //! A call plans synchronously to one of exactly three shapes:
 //!
@@ -36,9 +39,10 @@
 //! otherwise:
 //!
 //! - `directory could not be listed` for a missing path, a non-directory entry, an open or
-//!   iteration error, a file-type error, or a symlink escape denied at the capability open;
-//! - `directory contains an unsupported entry name` for any entry name that is not valid
-//!   UTF-8;
+//!   iteration error, a file-type error on a checked in-bound entry, or a symlink escape
+//!   denied at the capability open;
+//! - `directory contains an unsupported entry name` for any checked in-bound entry name that
+//!   is not valid UTF-8;
 //! - `directory listing is too large` for more than 256 direct entries (the 257th item is
 //!   consumed only to detect the overflow) or retained UTF-8 name bytes summing beyond
 //!   8,192 (or the final JSON beyond 65,536 bytes / not safe Text, which fails closed the
@@ -100,11 +104,12 @@ const DIRECTORY_ACCESS_DENIED_TEXT: &str = "workspace directory access is denied
 /// Cancelled with this one Text part, never OutcomeUnknown.
 const DIRECTORY_CANCELLED_TEXT: &str = "directory listing was cancelled";
 
-/// The exact frozen Completed Failed text for a missing/not-directory/open/iteration/
-/// file-type error (or a symlink escape denied at the capability open).
+/// The exact frozen Completed Failed text for a missing/not-directory/open/iteration error,
+/// an in-bound entry file-type error (or a symlink escape denied at the capability open).
 const DIRECTORY_UNLISTABLE_TEXT: &str = "directory could not be listed";
 
-/// The exact frozen Completed Failed text for any entry name that is not valid UTF-8.
+/// The exact frozen Completed Failed text for any checked in-bound entry name that is not
+/// valid UTF-8.
 const DIRECTORY_UNSUPPORTED_NAME_TEXT: &str = "directory contains an unsupported entry name";
 
 /// The exact frozen Completed Failed text for any closed bound violation: more than 256
@@ -159,7 +164,7 @@ pub(super) fn definition() -> ToolDefinition {
                 .expect("the frozen list_directory schema is valid"),
         },
         // One bounded direct-entry listing per call; the definition does not impose Serial
-        // execution semantics on unrelated operations in a future composed ToolSet.
+        // execution semantics on unrelated operations in the composed production ToolSet.
         mode: ToolExecutionMode::Parallel,
     }
 }
@@ -310,10 +315,10 @@ async fn schedule_list_job(
 enum ListDirectoryOutcome {
     /// A bounded listing's exact compact JSON: one safe Text part at most 65,536 bytes.
     Listing(Arc<str>),
-    /// Missing path, non-directory entry, any open/iteration/file-type error, or a symlink
-    /// escape denied at the capability open.
+    /// Missing path, non-directory entry, any open/iteration error, an in-bound entry
+    /// file-type error, or a symlink escape denied at the capability open.
     Unlistable,
-    /// Any entry name that is not valid UTF-8.
+    /// Any checked in-bound entry name that is not valid UTF-8.
     UnsupportedName,
     /// More than 256 direct entries, retained name bytes beyond 8,192, or a final JSON
     /// beyond the one-part content bound / not safe Text.
@@ -325,8 +330,9 @@ enum ListDirectoryOutcome {
 /// `cap_std::fs::Dir`, so it can never leave the root; a symlink escape fails at that open.
 /// Only direct entries are read — never recursively, never a file's content — and each
 /// entry is classified by its own `DirEntry::file_type` (lstat semantics, so entry
-/// symlinks are reported as `symlink`, never followed).  The 257th item is consumed only
-/// to detect the overflow, and the retained UTF-8 name bytes are budgeted: each name is
+/// symlinks are reported as `symlink`, never followed).  A proven `Ok` 257th item settles
+/// overflow immediately without checking its name/type; otherwise the retained UTF-8 name
+/// bytes of the in-bound entries are budgeted: each name is
 /// UTF-8-checked and measured as a borrow (`to_str`) against the cumulative 8,192 budget
 /// before any copy, so the listing stops immediately once the budget is exceeded, before
 /// any further iteration or any copy of an over-budget name.  The budget governs only
