@@ -5,6 +5,8 @@
 
 > 2026-08-12：[ADR 0144](0144-production-list-directory-uses-bounded-capability-enumeration.md)复用本ADR冻结的ReadOnly authority、per-Session permanent revocation、per-admission Workspace capability materialization与`FilesystemRead` sandbox，增加独立closed `list_directory` route，并把`ProductionToolConfig`从两个bool/四种selection扩为三个bool/八种selection。本ADR的`read_file` schema、result、bounded regular-file read与cancellation合同保持不变。
 
+> 2026-08-12：[ADR 0146](0146-production-write-file-binds-capability-targets-to-session-fifo.md)把同一revocation control推广为filesystem read/write共同revocation，并在write opt-in存在时选择ReadWrite ceiling；requested ReadOnly仍保持ReadOnly。production selection现为四个bool/16种closed形状。本ADR的`read_file` schema、bounded read与truthful cancellation合同不变。
+
 ## 背景
 
 M14需要第一个production OS-backed Tool adapter slice。ADR 0140已建立class-level admission门禁（`FilesystemRead`等closed capability class、`ToolSandboxContract`、direct Execute admission与frozen denial），ADR 0142已冻结第一个production builtin `ask_user`（zero permission、无OS资源、closed opt-in），但production ToolSet仍无任何OS-backed adapter：Workspace的resource-level read grant、capability directory capture、read authority与per-Session revocation都没有production consumer，任何Runtime ToolSet在production下要么为空要么只有`ask_user`。

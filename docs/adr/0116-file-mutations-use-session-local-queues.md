@@ -7,6 +7,8 @@
 
 > 2026-07-31：构造路径明确为SessionExecutor持有queue，并在Starting candidate capture时把同一`Arc<SessionFileMutationQueue>`连同Turn-scoped `ToolExecutionControl` handle注入ToolSet；ToolSet不在task spawn后补注入依赖。
 
+> 2026-08-12：[ADR 0146](0146-production-write-file-binds-capability-targets-to-session-fifo.md)交付首个真实consumer并细化本ADR的canonical-target规则：existing target使用capability-opened exact physical file identity，create target使用exact direct-parent identity+normalized final filename；queue、exact-request-bound ticket、waiting cancellation与permit-through-Settling均已实现。跨Session不协调与multi-resource abstraction rejection保持不变。
+
 ## 背景
 
 模型可以在同一个 assistant step 中返回多个 ToolCall。若同一 Session 的两个 `edit` / `write` 调用并行读取同一个旧文件并分别写回，后完成的调用会覆盖先完成的修改。MiniCore 能完整控制这些 sibling ToolCall 的本地调度，因此需要给出确定性顺序。

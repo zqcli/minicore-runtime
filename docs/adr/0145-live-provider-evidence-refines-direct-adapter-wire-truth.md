@@ -3,6 +3,8 @@
 状态：Accepted
 日期：2026-08-12
 
+> 2026-08-12：[ADR 0146](0146-production-write-file-binds-capability-targets-to-session-fifo.md)及其implementation随后关闭了本文后果中列出的`write_file`、Session-local mutation queue与permit-through-Settling pending项。M14仍未关闭的Tool/Sandbox范围现为network/process及其他未实现adapters、generic ToolService/policy与public Tool DTO；provider live evidence本身不变。
+
 ## 背景
 
 M12通过standalone Rig evidence与离线loopback合同冻结了OpenAI Responses、Anthropic Messages的协议、terminal、metadata、delivery与single-attempt baseline；ADR 0139又把Rig隔离在Rust 1.88 evidence package之外，M14由两个private direct adapters拥有production wire truth。随后host-only installation与两个explicit ignored live smoke harness已经接通完整public Runtime path，但此前只完成默认离线编译，没有真实credential release run。
