@@ -2,7 +2,7 @@
 
 日期：2026-08-08
 
-状态：当前权威架构（M6.2 scripted foundation、M8.1最小ToolCall、M10 CompactionSummary purpose/budget request validation与ActiveTurnTask orchestration，以及crate-private Structured output foundation已实现；M12 protocol reality gate已关闭并因Rust 1.85拒绝Rig production dependency；M14 `OpenAiResponsesProviderAdapter`与`AnthropicMessagesProviderAdapter`、provider-native Structured mapping、默认离线loopback contract suites、host-only dynamic credential/catalog installation及explicit ignored live smoke harness已实现；实际real-credential smoke run、cache/continuation与production Tool/Sandbox adapters仍待实现）
+状态：当前权威架构（M6.2 scripted foundation、M8.1最小ToolCall、M10 CompactionSummary purpose/budget request validation与ActiveTurnTask orchestration，以及crate-private Structured output foundation已实现；M12 protocol reality gate已关闭并因Rust 1.85拒绝Rig production dependency；M14 `OpenAiResponsesProviderAdapter`与`AnthropicMessagesProviderAdapter`、provider-native Structured mapping、默认离线loopback contract suites、host-only dynamic credential/catalog installation及explicit ignored live smoke harness已实现，stateless full-request wire policy由ADR 0141冻结；实际real-credential smoke run与production Tool/Sandbox adapters仍待实现）
 
 ## 目的
 
@@ -16,6 +16,7 @@
 - 单次provider attempt与Session logical retry如何区分；
 - cancellation、authentication、secret redaction、跨Session并发调用和provider rate limit反馈如何治理；
 - provider prompt cache、connection reuse和continuation如何保持完整logical input等价性；
+- M14 stateless full-request wire policy（[ADR 0141](../adr/0141-provider-calls-are-stateless-full-request.md)）为何冻结为omission：每次`generate_model_turn`至多调用一次`ProviderAdapter::execute`（owner validation/pre-send cancellation/`AuthMissing`在调用adapter前以typed error terminal），独立地发送零或一个HTTP POST——adapter编码/build失败或adapter级pre-send cancellation发生在那一次`execute`内部且不产生POST——若发送POST则携带完整full request，显式cache annotation与continuation保持intentionally disabled/omitted；
 - M12 Rig 0.40.0 evidence揭示了哪些provider协议事实与SDK损失点，以及为何production `ProviderAdapter`直接拥有HTTP/SSE mapping。
 
 本文不定义：
@@ -27,7 +28,7 @@
 - provider-native compaction artifact的持久化格式；
 - 完整pricing、billing ledger或成本审计。
 
-当前M6.2 foundation与M8.1最小ToolCall路径已运行：Runtime仍默认拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行。M10新增`CompactionSummary` purpose，并要求assembly budget proof、`NoToolCalls`、empty ToolSpec和explicit max output exact匹配，仍复用同一个single-attempt Gateway。crate-private Structured foundation已实现：`OutputContract::Structured` contract由绑定exact `TurnModelSnapshot`的constructor创建（capability与`max_schema_bytes` cap校验、schema v1 subset验证），optional name按[stable symbolic key](wire-schema.md#stable-symbolic-keys)共同floor限制为1..64 bytes，`ModelCallRequest` constructor按proof复验exact model/OutputContract绑定，Gateway对terminal执行exact JSON object parse与本地schema validation（`Refused` bypass；`UnexpectedToolCall`/`IncompleteResponse`/`InvalidStructuredOutput` precedence），并由ScriptedProviderAdapter端到端conformance覆盖；无JSON repair、type coercion或Markdown code-fence extraction。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。M14 production provider/install slices现已实现：exact `reqwest = 0.13.4`关闭default features并只启用`json + rustls + stream`，共享private client construction、bounded body drain与增量SSE framing，client显式关闭retry、redirect和ambient proxy；`OpenAiResponsesProviderAdapter`独立编码Responses instructions/items/Tools/NoToolCalls/Structured/reasoning/service tier，仅以`response.completed + status=completed + response.model exact匹配pinned private API model name`为success terminal；`AnthropicMessagesProviderAdapter`独立编码Messages system/messages/Tools/Structured+adaptive effort/service tier，仅以valid `message_start.message.model` exact匹配加non-empty `message_delta.stop_reason`为success terminal，并保存thinking/signature/redacted artifact、cumulative usage/cache、request ID、typed envelope、delivery与cancellation truth，`x-api-key` HeaderValue显式标记sensitive。33+36个默认离线测试分别通过真实`ModelGateway.generate_model_turn → ProviderAdapter`与`127.0.0.1:0` HTTP路径验证。public host-only `ProviderCredential`/`CredentialSource`、explicit model descriptor、endpoint policy与`ModelProviderConfig`已接入`MiniCoreRuntimeConfig::with_model_provider`：未配置时Runtime保持empty catalog；trusted host显式安装后catalog只保存nonsecret exact definition，credential在每次attempt前动态解析，missing/cancel在adapter前保持`AuthMissing|Cancelled/NotSent`。stable `ModelId`与private API model name完全分离，后者不进入Session/Wire/provenance。installation 11个、credential 3个与Runtime focused tests及真实Rust 1.85 all-target check均通过；两个public Runtime-path live smoke tests已在stable/真实Rust 1.85编译，默认2 ignored且不读env/访问network。仍pending：任何public requester/Wire/SessionDefinition structured字段、Runtime/ActiveTurnTask structured激活（ordinary AgentRun路径仍`output_contract=None`，toolful Turn在普通ToolRound后的第二次Structured call未激活，Compaction仍固定`NoToolCalls`）、完整ToolSpec schema、实际real-credential smoke run、connection/cache/continuation policy以及production Tool/Sandbox adapters。
+当前M6.2 foundation与M8.1最小ToolCall路径已运行：Runtime仍默认拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行。M10新增`CompactionSummary` purpose，并要求assembly budget proof、`NoToolCalls`、empty ToolSpec和explicit max output exact匹配，仍复用同一个single-attempt Gateway。crate-private Structured foundation已实现：`OutputContract::Structured` contract由绑定exact `TurnModelSnapshot`的constructor创建（capability与`max_schema_bytes` cap校验、schema v1 subset验证），optional name按[stable symbolic key](wire-schema.md#stable-symbolic-keys)共同floor限制为1..64 bytes，`ModelCallRequest` constructor按proof复验exact model/OutputContract绑定，Gateway对terminal执行exact JSON object parse与本地schema validation（`Refused` bypass；`UnexpectedToolCall`/`IncompleteResponse`/`InvalidStructuredOutput` precedence），并由ScriptedProviderAdapter端到端conformance覆盖；无JSON repair、type coercion或Markdown code-fence extraction。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。M14 production provider/install slices现已实现：exact `reqwest = 0.13.4`关闭default features并只启用`json + rustls + stream`，共享private client construction、bounded body drain与增量SSE framing，client显式关闭retry、redirect和ambient proxy；`OpenAiResponsesProviderAdapter`独立编码Responses instructions/items/Tools/NoToolCalls/Structured/reasoning/service tier，仅以`response.completed + status=completed + response.model exact匹配pinned private API model name`为success terminal；`AnthropicMessagesProviderAdapter`独立编码Messages system/messages/Tools/Structured+adaptive effort/service tier，仅以valid `message_start.message.model` exact匹配加non-empty `message_delta.stop_reason`为success terminal，并保存thinking/signature/redacted artifact、cumulative usage/cache、request ID、typed envelope、delivery与cancellation truth，`x-api-key` HeaderValue显式标记sensitive。35+38个默认离线测试分别通过真实`ModelGateway.generate_model_turn → ProviderAdapter`与`127.0.0.1:0` HTTP路径验证。public host-only `ProviderCredential`/`CredentialSource`、explicit model descriptor、endpoint policy与`ModelProviderConfig`已接入`MiniCoreRuntimeConfig::with_model_provider`：未配置时Runtime保持empty catalog；trusted host显式安装后catalog只保存nonsecret exact definition，credential在每次attempt前动态解析，missing/cancel在adapter前保持`AuthMissing|Cancelled/NotSent`。stable `ModelId`与private API model name完全分离，后者不进入Session/Wire/provenance。installation 11个、credential 3个与Runtime focused tests及真实Rust 1.85 all-target check均通过；两个public Runtime-path live smoke tests已在stable/真实Rust 1.85编译，默认2 ignored且不读env/访问network。仍pending：任何public requester/Wire/SessionDefinition structured字段、Runtime/ActiveTurnTask structured激活（ordinary AgentRun路径仍`output_contract=None`，toolful Turn在普通ToolRound后的第二次Structured call未激活，Compaction仍固定`NoToolCalls`）、完整ToolSpec schema、实际real-credential smoke run以及production Tool/Sandbox adapters。显式cache annotation、`previous_response_id`/incremental input与continuation不是pending实现：M14 wire policy（[ADR 0141](../adr/0141-provider-calls-are-stateless-full-request.md)）已冻结为有意omission——每次`generate_model_turn`至多调用一次`ProviderAdapter::execute`（owner validation/pre-send cancellation/`AuthMissing`在调用adapter前以typed error terminal，零execute/零POST；adapter编码/build失败或adapter级pre-send cancellation为一次execute/零POST），独立地发送零或一个HTTP POST，若发送POST则携带完整full request，没有optimization-specific fallback POST、重试或continuation state；这些省略不声称provider不做automatic caching/retention，MiniCore只是不请求/不控制，正确性从不依赖它们。
 
 相关权威文档：
 
@@ -65,11 +66,11 @@
 - finalized response或typed error是一次gateway调用唯一terminal result；
 - provider-reported usage随成功assistant response进入live state并成为record candidate；recording degraded时可能无法跨restart恢复；失败attempt usage只属于ModelGateway internal telemetry；
 - authentication secret、raw headers、raw request/response body和provider SDK类型不越过ModelGateway seam；
-- prompt cache、connection reuse、`previous_response_id`和incremental request只是wire optimization；
-- 所有optimization必须能退回完整`AssembledModelContext`请求；
+- prompt cache、connection reuse、`previous_response_id`和incremental request只是wire optimization，且M14有意不请求/不控制它们（[ADR 0141](../adr/0141-provider-calls-are-stateless-full-request.md)）：每次`generate_model_turn`至多调用一次`ProviderAdapter::execute`，独立地发送零或一个HTTP POST，若发送POST则携带完整full request，没有optimization-specific fallback POST、重试或continuation state；
+- 任何未来optimization若要激活，必须退回完整`AssembledModelContext`请求并满足ADR 0141的独立门槛（provider-specific evidence/ADR、稳定credential binding与tenant/session privacy scope、canonical full-wire successor proof、retention/billing policy、one-POST reconciliation）；
 - ProviderAdapter是private internal seam，首批实现为`ScriptedProviderAdapter`、`OpenAiResponsesProviderAdapter`与`AnthropicMessagesProviderAdapter`；
-- 两个production adapter各自负责其provider request/SSE/response/error映射与单次attempt执行；model resolution、request validation、auth policy与credential resolution、progress lifecycle、cache/continuation policy和terminal result归一化均由ModelGateway拥有；
-- 默认Runtime不安装provider；trusted host通过validated `ModelProviderConfig`显式安装route与model descriptors。credential source与catalog availability分离，secret不进入definition/catalog；同一个retained Turn snapshot的每次Gateway invocation都会重新resolve source；
+- 两个production adapter各自负责其provider request/SSE/response/error映射与单次attempt执行；model resolution、request validation、auth policy与credential resolution、progress lifecycle和terminal result归一化均由ModelGateway拥有；M14不实现cache/continuation policy（ADR 0141：显式cache annotation与continuation为有意omission，credential由request绑定的`CredentialSource`在每次attempt动态解析）；
+- 默认Runtime不安装provider；trusted host通过validated `ModelProviderConfig`显式安装route与model descriptors。credential source与catalog availability分离，secret不进入definition/catalog；同一个retained Turn snapshot的每次Gateway invocation都会重新resolve source（一个installed source代表一个稳定nonsecret credential binding，token可逐attempt轮换，静默切换binding identity属于配置变更）；
 - 不增加`ModelStep`、`ModelAttempt`领域entity、provider session public object或第二conversation state。
 
 ## 同类项目研究
@@ -224,16 +225,16 @@ Rig 0.40.0的integration gaps：
 | 维度 | pi | Codex | Grok Build | Rig 0.40.0 | MiniCore决策 |
 | --- | --- | --- | --- | --- | --- |
 | model invocation seam | AgentLoop调用pi-ai stream | ModelClientSession stream | 独立sampler crate | CompletionModel stream | 一个`generate_model_turn` |
-| provider state | Model/registry + provider module | thread/turn client state | sampler内部 | provider client/model | Gateway内部connection pool |
+| provider state | Model/registry + provider module | thread/turn client state | sampler内部 | provider client/model | 每个installation一个adapter-owned无状态reqwest client（reload复用，普通transport pooling eligibility） |
 | Prompt assembly | AgentSession/AgentLoop context | Turn构造Responses input | chat state/sampling types | CompletionRequest | 只接受PromptSet输出 |
 | streaming | typed content events | typed Responses events | ACP/update stream | typed assistant content stream | droppable progress + one terminal result |
 | retry owner | AgentSession为主 | client/turn loop协作 | sampler retry | caller决定 | Gateway single attempt，ActiveTurnTask logical retry |
 | transport fallback | provider-specific | WebSocket → HTTP | backend显式配置 | adapter-specific | MVP不启用 |
 | cross-model fallback | model selection层 | 不作为transparent stream fallback | 未确认 | 无统一语义 | active Turn内禁止 |
-| continuation/cache | provider compat/cache flags | strict prefix + previous response | 未确认 | provider additional params | strict equivalence，full request fallback |
+| continuation/cache | provider compat/cache flags | strict prefix + previous response | 未确认 | provider additional params | 有意omission（ADR 0141）：始终full request，无continuation/显式cache请求 |
 | usage | assistant response usage | terminal response usage | telemetry/model usage | generic Usage | 成功response usage durable |
 | error taxonomy | helper + string patterns | CodexErr mapping | typed sampler errors | CompletionError | MiniCore typed recovery classes |
-| auth | registry + AuthStorage | AuthManager + refresh | API key/OAuth/OIDC | provider client setup | Gateway-private AuthStore |
+| auth | registry + AuthStorage | AuthManager + refresh | API key/OAuth/OIDC | provider client setup | host-injected `CredentialSource`，per-attempt resolve |
 
 ## Interface方案比较
 
@@ -303,13 +304,8 @@ ModelGateway是一个深模块：对外只有Turn model resolution和一次完�
 ```text
 MiniCoreRuntime
 └─ Arc<ModelGateway>
-   ├─ ProviderCatalog
-   ├─ AuthStore
-   ├─ private ProviderAdapter
-   ├─ ProviderConnectionPool
-   ├─ ContinuationCache
-   ├─ ProviderRateLimitState
-   └─ RedactionPolicy
+   ├─ ProviderCatalog（ModelCatalogView）
+   └─ private ProviderAdapter（每installation一个，持有其reqwest client）
 
 ActiveTurnTask
 ├─ await ModelGateway::generate_model_turn
@@ -323,7 +319,7 @@ ActiveTurnTask
 
 规则：
 
-- ProviderCatalog、AuthStore和ProviderAdapter是ModelGateway implementation details；
+- ProviderCatalog和ProviderAdapter是ModelGateway implementation details；AuthStore/ProviderConnectionPool/ContinuationCache/auth-principal类型不存在——credential由request绑定的host-owned `CredentialSource`在每次attempt解析，连接政策就是adapter-owned的无状态reqwest client；
 - Runtime公开model query以后通过MiniCoreRuntime facade取得safe catalog view；
 - ActiveTurnTask不直接resolve auth、base URL、API model name或provider protocol；
 - ToolService、PromptService和SkillService不调用ModelGateway；
@@ -426,7 +422,7 @@ cache/role/tool/output mapping policy
 adapter encoding version
 ```
 
-它不覆盖credential内容、OAuth access token或resolved auth principal。`ModelExecutionRef`持有private nonsecret AuthBindingRef；credential和opaque principal identity在每个attempt即时解析。当前host installation API显式接收non-zero definition version；host必须在protocol、endpoint、private API model name、capabilities、limits、estimate rate、generation defaults或credential binding identity等nonsecret调用语义变化时递增/替换version，单纯轮换同一binding的token不改变version。MiniCore不为此计算hash/fingerprint。
+它不覆盖credential内容、OAuth access token或resolved auth principal（MiniCore没有auth-principal类型）。当前host installation API显式接收non-zero definition version；host必须在protocol、endpoint、private API model name、capabilities、limits、estimate rate、generation defaults或credential binding identity等nonsecret调用语义变化时递增/替换version，单纯轮换同一binding的token不改变version。一个installed `CredentialSource`被信任为表示一个稳定nonsecret credential binding（一个account/project/tenant scope）；静默切换binding identity属于配置变更，需要新的installation/definition version/runtime config publication，MiniCore不能从credential bytes推断且没有运行时检查。MiniCore不为此计算hash/fingerprint。
 
 ### TurnModelSnapshot
 
@@ -521,13 +517,7 @@ pub struct EffectiveGenerationPolicy {
     pub max_output_tokens: NonZeroU32,
     pub reasoning: EffectiveReasoningPolicy,
     pub sampling: SamplingPolicy,
-    pub prompt_cache: PromptCachePolicy,
     pub service_class: ModelServiceClass,
-}
-
-pub enum PromptCachePolicy {
-    Auto,
-    Disabled,
 }
 
 pub enum ModelServiceClass {
@@ -541,6 +531,8 @@ pub enum ModelServiceClass {
 `EffectiveReasoningPolicy`是requested preference经过model capability映射后的provider-neutral结果；unsupported preference在resolve_for_turn时失败或按explicit Session policy降级，不能在provider adapter中临时猜测。`SamplingPolicy`只保存validated temperature/top-p等stable values；NaN、Infinity或provider不支持的组合在Turn capture时拒绝。
 
 cache和service class属于Turn-pinned execution policy。它们不改变conversation visibility，但会影响provider request和cost。
+
+当前M14政策（[ADR 0141](../adr/0141-provider-calls-are-stateless-full-request.md)）：显式prompt cache annotation与continuation是intentionally disabled/omitted——MiniCore不请求/不控制cache，每次invocation至多调用一次`ProviderAdapter::execute`、独立地发送零或一个POST（owner validation/pre-send cancellation/`AuthMissing`→零execute/零POST；adapter编码/build失败或adapter级pre-send cancellation→一次execute/零POST），若发送POST则携带完整full request，正确性从不依赖cache。不存在`PromptCachePolicy`实现；未来激活必须满足ADR 0141门槛（provider-specific evidence/ADR、稳定credential binding与tenant/session privacy scope、canonical full-wire successor proof、retention/billing policy、one-POST reconciliation），且不能改变conversation visibility。
 
 ## Model Capabilities
 
@@ -669,7 +661,7 @@ pub(crate) struct AssembledModelContext {
 }
 ```
 
-`AssembledModelContext` fields are private; this module consumes only the crate-private narrow getters frozen in Prompt. PromptSet System sections、前置User context和ToolSpec在active Turn内天然稳定；Gateway可以利用canonical section/message/tool boundaries选择cache breakpoint，不需要额外stability flag。ProviderAdapter是Prompt授权read-ref consumers之一；for every transcript message it must use Prompt's crate-private `ModelMessage::as_ref()` / `ModelAssistantContent::as_ref()` rather than destructuring a storage kind or private transcript kind. `AssembledModelContext`没有flat `contribution_stamps`：stamp只保存在各个User `ModelMessage`内部，任何read ref都不提供它。stamp不是provider payload、cache-control input、source locator或authorization；adapter不得据此重新读取Skill/Workspace正文或影响cache choice。
+`AssembledModelContext` fields are private; this module consumes only the crate-private narrow getters frozen in Prompt. PromptSet System sections、前置User context和ToolSpec在active Turn内天然稳定；这些canonical section/message/tool boundaries只为未来provider-specific cache evidence提供可审计输入，M14不会选择cache breakpoint或发出cache annotation（ADR 0141）。ProviderAdapter是Prompt授权read-ref consumers之一；for every transcript message it must use Prompt's crate-private `ModelMessage::as_ref()` / `ModelAssistantContent::as_ref()` rather than destructuring a storage kind or private transcript kind. `AssembledModelContext`没有flat `contribution_stamps`：stamp只保存在各个User `ModelMessage`内部，任何read ref都不提供它。stamp不是provider payload、cache-control input、source locator或authorization；adapter不得据此重新读取Skill/Workspace正文或影响future cache choice。
 
 `PromptAssemblyProof`是PromptSet生成的crate-private consistency proof，绑定ModelCallPurpose、exact TurnModelRef、OutputContract结构值和optional CompactionSummaryBudget proof。它不提供第二个caller-controlled purpose；ModelCallRequest constructor必须校验proof与request一致。
 
@@ -710,8 +702,9 @@ ModelGateway可以：
 - 把ModelMessage编码成provider message/item；
 - 把ToolSpec编码成provider tool schema；
 - 把OutputContract编码成tool choice、response format或JSON schema；
-- 对provider schema限制执行不改变业务含义的canonical sanitization；
-- 在canonical section边界添加cache-control metadata。
+- 对provider schema限制执行不改变业务含义的canonical sanitization。
+
+ModelGateway当前不能：在canonical section边界添加cache-control metadata——M14 wire policy（ADR 0141）冻结为omission，未来激活必须先满足独立门槛，且不能改变conversation visibility。
 
 ModelGateway不能：
 
@@ -838,7 +831,7 @@ ProviderAdapter不能：
 
 - 选择或替换provider/model，解析catalog current value或改变Turn-pinned model identity；
 - 重新组装Prompt、判断conversation visibility或执行Tool；
-- 决定logical retry、执行transport fallback、cache/continuation policy或terminal Turn结果；
+- 决定logical retry、执行transport fallback或terminal Turn结果（M14不存在cache/continuation policy可决定：ADR 0141冻结为stateless full-request omission）；
 - 发布ModelGateway attempt lifecycle、构造最终`ModelCallResult`或把provider/transport raw type泄漏给caller。
 
 首个production实现：
@@ -865,10 +858,9 @@ ProviderAttemptRequest可以包含：
 - resolved auth；
 - provider-specific typed options；
 - canonical encoded payload；
-- connection/continuation candidate；
 - single-attempt request correlation。
 
-这些类型都必须private、non-serializable并使用redacted Debug。
+这些类型都必须private、non-serializable并使用redacted Debug。M14的`ProviderAttemptRequest`只携带effective max output、same request Arc与resolved credential；不携带connection/continuation candidate（ADR 0141：无此类state）。
 
 只有private adapter可以使用provider wire DTO、HTTP/SSE transport types和typed provider options。调用方不能提交arbitrary JSON。
 
@@ -884,7 +876,7 @@ ModelCallRequest
 → FinalizedAssistantResponse或ModelCallError
 ```
 
-`OpenAiResponsesProviderAdapter`与`AnthropicMessagesProviderAdapter`直接拥有各自request body、SSE event、typed error envelope和terminal parser，避免generic SDK先擦除finish、delivery或metadata事实后再用旁路重建。两个adapter仍不能越过private seam，也不是ModelGateway implementation的替代品；它们不拥有provider选择、logical retry、cache/continuation判定或最终错误分类。private HTTP client的内建retry必须显式为0。
+`OpenAiResponsesProviderAdapter`与`AnthropicMessagesProviderAdapter`直接拥有各自request body、SSE event、typed error envelope和terminal parser，避免generic SDK先擦除finish、delivery或metadata事实后再用旁路重建。两个adapter仍不能越过private seam，也不是ModelGateway implementation的替代品；它们不拥有provider选择、logical retry或最终错误分类，也不实现cache/continuation判定（M14没有这种判定：ADR 0141冻结为stateless full-request omission）。private HTTP client的内建retry必须显式为0。
 
 映射要求：
 
@@ -899,7 +891,7 @@ ModelCallRequest
 - finish reason从protocol terminal与provider-specific response字段提取；仍不可得则使用`Unknown`；optional request ID/metadata不可得时保持None；
 - provider error envelope与transport error必须在adapter内转换成ProviderAttemptError。
 
-两个adapter只共享private connection client construction、bounded body drain、numeric Retry-After、event-stream content-type check与bounded SSE framing；不能共享会抹平OpenAI/Anthropic request、terminal、typed envelope、metadata或delivery差异的generic response model。M14已把shared transport固定为exact `reqwest = 0.13.4`的`json + rustls + stream`最小features，并由真实Rust 1.85冷编译、OpenAI 33个与Anthropic 36个local loopback/focused tests验证；两个protocol parser仍完全独立。
+两个adapter只共享private connection client construction、bounded body drain、numeric Retry-After、event-stream content-type check与bounded SSE framing；不能共享会抹平OpenAI/Anthropic request、terminal、typed envelope、metadata或delivery差异的generic response model。M14已把shared transport固定为exact `reqwest = 0.13.4`的`json + rustls + stream`最小features，并由真实Rust 1.85冷编译、OpenAI 35个与Anthropic 38个local loopback/focused tests验证；两个protocol parser仍完全独立。
 
 M12 standalone Rig evidence已经验证：
 
@@ -1141,7 +1133,7 @@ pub struct ModelUsage {
 规则：
 
 - provider未返回的字段保持`None`；
-- `provider_total_tokens`只保存provider报告值，不通过其他字段相加伪造；
+- `provider_total_tokens`只保存provider报告值，不通过其他字段相加伪造；Anthropic Messages在consumed contract中不报告total，因此Anthropic normalized usage恒为`None`（各provider-reported cumulative component原样保留并继续执行monotonic检查；usage finalization是infallible，individually valid的大计数器即使本地求和会溢出也不得使terminal失败）；
 - locally estimated tokens属于ContextUsage projection，不进入ModelUsage；
 - locally calculated price属于rebuildable cost estimate，不写`reported_cost`；
 - `reported_cost`只用于provider明确返回billed cost的情况；
@@ -1157,16 +1149,18 @@ StoredAssistantMessage的`logical_retry_count`定义为ActiveTurnTask对同一lo
 
 ### Single Provider Attempt
 
-MVP中一次`generate_model_turn`最多执行一个provider attempt：
+MVP中一次`generate_model_turn`至多执行一个provider attempt，并独立地至多发送一个HTTP POST：
 
 ```text
-validate request
-→ resolve/refresh credential before request
-→ preflight/cooldown typed terminal error：0次ProviderAdapter.execute
-  或
-→ ProviderAdapter.execute exactly once
+validate request（owner validation失败 → typed error terminal：0次execute、0个POST）
+→ resolve/refresh credential before request（cancel/`AuthMissing` → 0次execute、0个POST）
+→ ProviderAdapter.execute（至多一次）
+   → adapter编码/build失败或adapter级pre-send cancellation → 1次execute、0个POST
+   → 发送POST：携带完整full request（1次execute、1个POST）
 → normalize one terminal result or typed error
 ```
+
+从不调用第二次`execute`，从不发送第二个POST，从不发送optimization-specific fallback POST。
 
 adapter与private HTTP client automatic retry必须配置为0。ModelGateway不执行DNS/connect/TLS retry、429/5xx retry、401 refresh-and-resend、stream restart或WebSocket → HTTP fallback。失败后本次Gateway operation立即terminal，由ActiveTurnTask根据typed error决定是否logical retry。
 
@@ -1189,13 +1183,12 @@ HTTP status或“尚无delta”本身不能决定delivery state。adapter必须�
 每次attempt：
 
 1. 检查cancellation；
-2. resolve current credential和opaque auth principal identity；
-3. build provider payload；
-4. start provider request并更新delivery state；
-5. consume stream；
-6. normalize terminal result。
+2. resolve current credential；
+3. 调用`ProviderAdapter::execute`：build provider payload、start provider request并更新delivery state；
+4. consume stream；
+5. normalize terminal result。
 
-request前credential可以resolve/refresh。当前M14 `CredentialSource`是public host-only async capability：`resolve()`只构造future，future拥有全部工作且drop必须停止owner-visible work；`None`表示当前无可用credential并映射`AuthMissing/NotSent`。Gateway不读取env/home、不缓存secret、不内建refresh/singleflight；需要的bounded refresh/singleflight由trusted host source内部拥有，且不能detach未受owner跟踪的工作。provider返回401时terminal为`AuthRejected`，不在本次Gateway operation中refresh-and-resend。
+request前credential可以resolve/refresh。当前M14 `CredentialSource`是public host-only async capability：`resolve()`只构造future，future拥有全部工作且drop必须停止owner-visible work；`None`表示当前无可用credential并映射`AuthMissing/NotSent`。Gateway不读取env/home、不缓存secret、不内建refresh/singleflight；需要的bounded refresh/singleflight由trusted host source内部拥有，且不能detach未受owner跟踪的工作。provider返回401时terminal为`AuthRejected`，不在本次Gateway operation中refresh-and-resend。每次invocation（包括Session logical retry对同一`Arc<ModelCallRequest>`的再次调用）至多调用一次`ProviderAdapter::execute`，独立地发送零或一个HTTP POST（owner validation/pre-send cancellation/`AuthMissing`在调用adapter前以typed error terminal→零execute/零POST；adapter编码/build失败或adapter级pre-send cancellation为一次execute/零POST；若发送POST则携带完整full request，ADR 0141），credential逐attempt重新解析，不pin到request。
 
 ### Semantic Delta Rule
 
@@ -1219,8 +1212,7 @@ request前credential可以resolve/refresh。当前M14 `CredentialSource`是publi
 
 - Gateway规范化typed `Retry-After`但不sleep；
 - ActiveTurnTask只在provider hint不超过60秒时按logical retry policy等待；
-- rate-limit state按provider route和auth principal的opaque identity隔离；
-- active cooldown只对对应route/principal快速返回`RateLimited { retry_after }`，Gateway本身不sleep，也不影响无关provider。
+- Gateway不保留retained route/principal cooldown state：当前实现没有`ProviderRateLimitState`、route/principal cooldown cache或preflight cooldown fast-fail；限流一律作为terminal `RateLimited { retry_after }`返回，由ActiveTurnTask裁决logical retry（MiniCore没有auth-principal类型，credential binding identity不进入Gateway状态）。
 
 ### Transport Fallback
 
@@ -1384,22 +1376,13 @@ pub enum ModelCallErrorReason {
 
 ## Authentication And Secret Redaction
 
-ModelGateway implementation包含：
-
-```text
-ProviderCatalog
-AuthStore
-ResolvedAuth
-ProviderClientFactory
-```
-
-AuthBindingRef固定credential source/account binding，不包含secret。ResolvedAuth另外产生opaque AuthPrincipalIdentity，只用于connection/cache隔离和continuation compatibility，不形成Gateway-local permit或admission policy；该identity不进入TurnModelSnapshot、diagnostics或storage。若同一AuthBindingRef在active Turn期间解析为不同principal，Gateway必须清除旧connection/continuation candidate，不能跨principal复用provider state。
+ModelGateway implementation不包含`AuthStore`、`ResolvedAuth`、`AuthBindingRef`或`AuthPrincipalIdentity`类型。credential resolution是request-bound的每attempt操作：`ModelCallRequest`不携带secret，其model execution持有crate-private `CredentialSource`引用，`generate_model_turn`在adapter执行前动态resolve（ADR 0141）。一个installed source代表一个稳定nonsecret credential binding（account/project/tenant scope）；token可逐attempt轮换，静默切换binding identity属于配置变更（新installation/definition version/runtime config publication），MiniCore不推断也不检查。不存在connection/cache隔离键或continuation compatibility principal。
 
 secret只允许存在于：
 
 ```text
-AuthStore
-ModelGateway private ResolvedAuth
+host-owned CredentialSource（secret保存在source内部）
+attempt期间解析的ProviderCredential
 provider client/request
 actual transport request
 ```
@@ -1421,7 +1404,7 @@ logs或Debug output
 
 要求：
 
-- ResolvedAuth不实现revealing Debug/Display/Serialize；
+- `ProviderCredential`不实现revealing Debug/Display/Serialize；resolved value只在单次attempt内由Gateway转交private direct adapter做header injection；
 - headers和URL query在diagnostics前redact；
 - API key、OAuth token、cookie和signed URL使用typed secret wrappers；
 - request前auth resolve/refresh若需要singleflight，由trusted host credential source内部实现；Gateway本身不缓存或singleflight secret，401后不重发；
@@ -1474,73 +1457,35 @@ pub struct CustomProviderDefinition {
 
 Prompt cache不是response memoization，也不是conversation state。
 
-Gateway可以根据exact model definition和canonical instruction/tool/message boundaries选择provider cache-control：
+**M14 current policy（[ADR 0141](../adr/0141-provider-calls-are-stateless-full-request.md)）：显式prompt cache是intentionally disabled/omitted。** MiniCore不请求、不控制、不选择provider cache：OpenAI请求永不携带`prompt_cache_key`/`prompt_cache_retention`/`cache_control`；Anthropic请求在任何递归位置（system blocks、message/content blocks、tool definitions）永不携带`cache_control`，也永不发送`anthropic-beta` cache header。若发送POST则总是携带完整system/messages/tools。provider报告的cache read/write token（OpenAI `input_tokens_details.cached_tokens`、Anthropic `cache_read_input_tokens`/`cache_creation_input_tokens`）只作为usage evidence，不构成请求或控制。
 
-- stable System sections和前置User context；
-- stable ToolSpec集合；
-- provider允许的conversation prefix；
-- provider-specific cache retention。
+这些省略不声称provider执行zero automatic caching或retention：provider可能自动缓存；MiniCore只是不请求/不控制，正确性从不依赖cache。cache miss、eviction或自动命中的语义差异都不改变conversation truth。
 
-规则：
+未来激活门槛（ADR 0141，未实现、不预留抽象）：
 
-- cache annotation只能添加到canonical content边界；
-- 不为了cache重排、删除、复制或改写content；
-- cache key不得包含secret或raw user content；
-- cache key可以基于opaque runtime salt和private canonical encoding；
-- cache miss不改变语义；
-- cache eviction直接发送full request；
-- cache read/write token只作为usage；
-- provider cache key不是PromptSet、Turn或conversation identity；
-- cache policy变化不改变conversation truth。
+- 独立的provider-specific evidence与新ADR；
+- 稳定credential binding加显式tenant/session privacy scope；
+- canonical full-wire successor proof（新请求必须是旧完整请求+finalized response+exact sanitized live suffix，可审计）；
+- retention/billing policy；
+- 与one-POST语义的reconciliation（同一次operation内不得出现第二个POST）。
+
+激活后仍必须遵守：cache annotation只能添加到canonical content边界；不为了cache重排、删除、复制或改写content；cache key不得包含secret或raw user content；cache miss不改变语义；provider cache key不是PromptSet、Turn或conversation identity。
 
 ## Connection Reuse And Continuation
 
-ProviderConnectionPool和ContinuationCache都属于ModelGateway implementation。
+**M14 current policy（[ADR 0141](../adr/0141-provider-calls-are-stateless-full-request.md)）：不存在`ProviderConnectionPool`或`ContinuationCache`实现，也不存在`ProviderRuntime`/`ProviderWirePlan`/`ProviderRateLimitState`类型。**
 
 ### Connection Reuse
 
-允许按以下safe identity复用connection：
-
-```text
-provider protocol
-endpoint identity
-auth principal opaque identity
-transport configuration
-```
-
-不能按SessionId保存credential-bearingclient作为Session state。
+连接政策就是adapter-owned的reqwest client：每个provider installation在`MiniCoreRuntime::open`时构建一个direct adapter（一个reqwest client），shared-resource reload复用同一source/client，不重建。这只描述普通无状态reqwest transport pooling eligibility（HTTP连接复用能力），不承诺物理socket必然复用，也不携带auth或session state；不能按SessionId保存credential-bearing client作为Session state。
 
 ### Continuation
 
-`previous_response_id`、incremental input或sticky provider state只在以下条件全部满足时使用：
+`previous_response_id`、incremental input或sticky provider state在M14不发送、不缓存、不规划：每次invocation至多调用一次`ProviderAdapter::execute`，独立地发送零或一个HTTP POST（若发送POST则携带完整full request），没有optimization-specific fallback POST、重试或continuation state。
 
-```text
-same provider protocol and endpoint
-same ModelDefinitionRef
-same auth principal opaque identity
-same purpose
-same effective generation policy
-same tool schemas and output contract
-same adapter encoding version
-previous call completed successfully
-new full logical input可证明为previous full input + previous finalized response + exact sanitized live suffix
-```
+旧语言“provider rejects continuation then fallback full request”不能解释为同一次operation内的第二次POST——每次`generate_model_turn`至多一个POST，fallback只能作为later distinct logical request之前的新ADR规划。
 
-必须使用完整provider-neutral input和private canonical equivalence proof证明prefix；不能只比较SessionId、TurnId、response_id或message count。
-
-以下情况清除continuation candidate并发送full request：
-
-- process restart；
-- Cancel或Steer丢弃previous response；
-- previous stream partial/error；
-- Compaction Replace projection；
-- model definition变化；
-- ToolSpec或OutputContract变化；
-- capability/encoding version变化；
-- prefix proof失败；
-- provider拒绝continuation。
-
-ContinuationCache是process-local optimization，不进入TurnExecutionContext，不通过Session recording恢复。
+未来若激活continuation，必须满足ADR 0141门槛，且至少：same provider protocol and endpoint、same ModelDefinitionRef、same purpose、same effective generation policy、same tool schemas and output contract、same adapter encoding version、previous call completed successfully、新完整logical input可证明为previous full input + previous finalized response + exact sanitized live suffix；必须使用完整provider-neutral input和private canonical equivalence proof证明prefix，不能只比较SessionId、TurnId、response_id或message count。ContinuationCache即使激活也是process-local optimization，不进入TurnExecutionContext，不通过Session recording恢复。
 
 ## Concurrent Calls And Rate Governance
 
@@ -1552,8 +1497,7 @@ ModelGateway不提供Runtime global、per-provider route、per-model或per-auth-
 - 不用Gateway-wide mutex或其他长guard包围credential resolution、provider request或stream读取；
 - 每个Session最多一个ActiveTurnTask，task内部最多await一个current model call，不形成跨Session容量限制；
 - request前auth refresh只对同一credential执行singleflight，不阻塞无关credential的调用；
-- provider cooldown只对对应route/principal fast-fail，不在Gateway内等待；
-- provider `RateLimited`、`QuotaExceeded`和typed `Retry-After`继续规范化为terminal result，由ActiveTurnTask裁决logical retry；
+- 不存在route/principal cooldown cache或preflight cooldown fast-fail；`RateLimited`、`QuotaExceeded`和typed `Retry-After`继续规范化为terminal result，由ActiveTurnTask裁决logical retry；
 - Provider SDK/HTTP connection pool的transport资源管理是private implementation detail，不成为MiniCore admission policy；
 - progress publisher阻塞不能占用provider stream读取。
 
@@ -1573,9 +1517,8 @@ ActiveTurnTask requests next model step
 → ModelGateway.generate_model_turn
    → validate snapshot/request binding
    → choose exact provider adapter and route
-   → resolve credential and opaque auth principal
-   → encode full AssembledModelContext
-   → optional cache/continuation optimization with equivalence proof
+   → resolve current credential（逐attempt，ADR 0141）
+   → encode full AssembledModelContext（无cache/continuation optimization；至多一次execute、独立地零或一个POST，若发送则携带完整full request）
    → provider stream
    → publish ModelProgressEvent to operation-local adapter
       → lossless StreamingItem/ItemId update
@@ -1597,13 +1540,12 @@ ActiveTurnTask requests next model step
 ```text
 provider stream
 connection
-ContinuationCache
 resolved credential
 partial draft
 single-attempt state
 ```
 
-process restart直接丢弃active Turn与旧TurnStatus。下一Turn从recorded conversation prefix重建sanitized live context并建立新provider request；未record tail不可恢复。
+process restart直接丢弃active Turn与旧TurnStatus。下一Turn从recorded conversation prefix重建sanitized live context并建立新provider request；未record tail不可恢复。M14不存在continuation state或connection pool state可恢复（ADR 0141）：每次invocation都是fresh full request。
 
 ### Outcome Ambiguity
 
@@ -1658,7 +1600,7 @@ provider SDK object
 partial stream
 provider attempt trace
 ActiveTurnTask retry timer
-connection/continuation state
+connection/continuation state（M14不存在；每次invocation都是fresh full request）
 full AssembledModelContext
 ```
 
@@ -1674,12 +1616,12 @@ Provider response ID和ReasoningContent opaque artifact使用Wire/Format v1 exac
 
 - `resolve_for_turn`只做local catalog lookup和validation；
 - full context encoding与provider I/O在ActiveTurnTask await的Gateway operation内执行；
-- connection pool和HTTP client跨Session共享；
+- adapter-owned reqwest client跨installation/reload共享（普通无状态transport pooling，非admission policy）；
 - 多个Session可并发执行provider request，不经过Gateway本地admission queue；
 - progress delta可以合并；
 - provider stream reader不等待slow observer；
-- request前auth refresh singleflight；
-- cache/continuation failure快速退回full request；
+- request前auth refresh singleflight（host source内部）；
+- M14没有cache/continuation optimization可失败，因此不存在fallback路径；未来optimization必须先满足ADR 0141门槛；
 - 不因optimization额外复制完整conversation多次。
 
 性能不能牺牲：
@@ -1701,10 +1643,10 @@ adapter kind
 transport kind
 timing category
 status class
-cache hit/miss/unsupported
-continuation used/full-request fallback
 request/response allowlisted IDs
 ```
+
+M14不产生cache hit/miss/unsupported或continuation used/full-request fallback诊断（ADR 0141：无cache/continuation optimization）；这些category只保留给未来激活后的diagnostic shape。
 
 不得包含：
 
@@ -1789,7 +1731,7 @@ opaque encrypted reasoning
 
 ### Retry
 
-- admitted request每次generate_model_turn只调用一次ProviderAdapter.execute；preflight validation或active route/principal cooldown可以在provider调用前以typed error terminal，因此总调用数为0或1；
+- admitted request每次generate_model_turn至多调用一次ProviderAdapter.execute；owner validation、pre-send cancellation和AuthMissing在调用adapter前以typed error terminal（零次execute），adapter编码/build失败或adapter级pre-send cancellation发生在那一次execute内部且不产生POST（一次execute、零个POST），因此execute总数为0或1、POST总数为0或1，且POST总数独立于execute计数；
 - adapter与private HTTP client automatic retry固定为0；
 - connect failure、429、5xx和timeout都以typed error terminal返回Gateway caller；
 - delivery state准确区分NotSent、RejectedBeforeExecution、AcceptedNoOutput、OutputStarted和Unknown；
@@ -1797,7 +1739,6 @@ opaque encrypted reasoning
 - first semantic delta后failure返回StreamInterrupted；
 - 401不refresh-and-resend；request前credential refresh可以singleflight；
 - 429返回typed Retry-After，Gateway不sleep；
-- active cooldown零provider attempt并返回typed Retry-After，但仍算当前logical call chain的一次Gateway invocation；若该调用由retry启动，对应logical_retry_count已经消耗；
 - MVP不做WebSocket → HTTP fallback；
 - 不允许provider/model substitution；
 - AgentRun最多3次Session logical retry，backoff 2s/4s/8s；
@@ -1852,23 +1793,26 @@ opaque encrypted reasoning
 
 ### Cache And Continuation
 
-- deterministic cache annotation不改变content；
-- cache miss/full request equivalence；
-- cache token usage；
-- strict prefix continuation success；
-- Steer/Cancel/Compaction/model/tool/output change使continuation失效；
-- process restart不恢复continuation；
-- provider拒绝continuation后full request fallback；
-- concurrent continuation candidate race不发送错误delta。
+M14 wire policy（ADR 0141）的loopback evidence：
+
+- OpenAI recursive request denylist（context-aware traversal）：wrapper从provider-wire context开始，只在adapter-emitted schema-root成员（tool definition `parameters`、Structured `text.format.schema`）进入JSON Schema context；只有schema context内的`properties`把user property-name keys当data——schema property VALUE递归、key不比较。provider-wire对象（含假设的provider-owned `properties`对象）的forbidden key比较始终active；ordinary/toolful/replay/Structured/Compaction五种代表性请求的完整JSON value递归遍历，任何protocol/schema节点上都不存在provider-owned optimization member（`previous_response_id`/`prompt_cache_key`/`prompt_cache_retention`/`cache_control`/`conversation`作为实际成员）——Structured fixture schema故意包含名为`conversation`/`cache_control`的user property，且captured provider schema中这两个property name原样保留（各自为string schema），证明无false positive、无sanitization删除；replay shape经OpenAI-truthful helper（reasoning带provider item id+text/summary、无Anthropic signature；Turn-pinned tool set含echo）并逐item断言captured wire：initial user → replayed reasoning item id → assistant text → function_call `call_replay`/echo → matching function_call_output → steer user，tools含echo定义；且`store == false`；
+- Anthropic recursive request denylist（context-aware traversal）：同样只在adapter-emitted schema-root成员（tool definition `input_schema`、Structured `output_config.format.schema`）进入schema context；system blocks、message/content blocks与tool definitions递归无provider-owned `cache_control` annotation（user-authored schema property names保持为data），Structured fixture schema的`cache_control`/`conversation` user properties在captured provider schema中原样保留；replay shape经Anthropic-truthful helper（reasoning带exact text+signature、无provider item id/OpenAI-only artifact）并逐message断言captured wire：initial user → assistant thinking（text+signature）/text/tool_use `call_replay`/echo → user tool_result for `call_replay` → steer user，tools含echo定义；captured request无`anthropic-beta` header，若发送则始终完整system/messages/tools；
+- 同一`Arc<ModelCallRequest>`经ModelGateway调用两次（mutable credential source）各恰好一次POST，两次body bytes逐字节相同（始终full request），auth header随两次解析到的credential变化；
+- provider-reported cache read/write token只作为usage evidence，Anthropic `provider_total_tokens`恒为`None`。
+
+未来激活门槛（未实现、不预留抽象）：
+
+- 独立provider-specific evidence/ADR、稳定credential binding与显式tenant/session privacy scope、canonical full-wire successor proof、retention/billing policy、与one-POST语义的reconciliation；
+- 激活后仍需证明：deterministic cache annotation不改变content、cache miss/full request equivalence、cache token usage、strict prefix continuation success、Steer/Cancel/Compaction/model/tool/output change使continuation失效、process restart不恢复continuation、provider拒绝continuation的处理（只能作为later distinct logical request之前规划，不能是同一operation内第二次POST）、concurrent continuation candidate race不发送错误delta。
 
 ### Multi-Session And Performance
 
 - shared ModelGateway并发执行多个Session的provider request；
 - 不存在Gateway-local model permit wait或admission fairness语义；
 - one Session cancellation不影响另一个；
-- one provider cooldown只fast-fail对应route/principal，不影响另一个；
+- 不存在route/principal cooldown cache；每个并发Session的限流都以terminal `RateLimited`返回并各自裁决；
 - slow progress observer不阻塞stream；
-- connection pool按endpoint/auth principal隔离；
+- adapter-owned reqwest client按installation共享（普通stateless transport pooling，无auth-principal隔离键）；
 - slow credential resolution/request前auth refresh不持有Gateway-wide长guard；
 - 两个Session同时调用同一provider/model时都可以进入各自attempt。
 
@@ -1890,27 +1834,17 @@ MVP首版只选择HTTP Responses/Messages streaming，不启用WebSocket或trans
 
 ## Source Plan
 
-推荐实现：
+当前实现（M14）文件布局：
 
 ```text
 src/model_gateway.rs
-src/model_gateway/model.rs
-src/model_gateway/request.rs
-src/model_gateway/response.rs
-src/model_gateway/error.rs
-src/model_gateway/catalog.rs
-src/model_gateway/auth.rs
-src/model_gateway/cache.rs
-src/model_gateway/continuation.rs
-src/model_gateway/redaction.rs
-src/model_gateway/provider.rs
-src/model_gateway/provider/openai_responses.rs
-src/model_gateway/provider/anthropic_messages.rs
-src/model_gateway/provider/transport.rs
-src/model_gateway/provider/scripted.rs
+src/model_gateway/openai_responses.rs
+src/model_gateway/anthropic_messages.rs
+src/model_gateway/provider_installation.rs
+src/model_gateway/provider_transport.rs
 ```
 
-这是一个module及其private implementation文件，不建立provider crate hierarchy，除非真实build time或dependency isolation证明需要拆分。
+`model_gateway.rs`拥有Gateway core、private `ProviderAdapter`/`ModelCallRequest`/`ProviderAttempt*`类型、`ProviderCatalog`与crate-private test helpers；`ScriptedProviderAdapter`是test-only实现，定义在`model_gateway.rs`内部供vertical-slice tests使用，不进入production路径。两个production adapter各自拥有protocol wire mapping（`openai_responses.rs`、`anthropic_messages.rs`），`provider_installation.rs`实现host-only dynamic credential/catalog installation（`ModelProviderConfig`、`CredentialSource`接线），`provider_transport.rs`保存两个adapter共享的protocol-neutral transport/framing。这是一个module及其private implementation文件，不建立provider crate hierarchy，除非真实build time或dependency isolation证明需要拆分。M14不新增`cache.rs`/`continuation.rs`：显式cache annotation与continuation保持omission（ADR 0141），不预留实现文件。
 
 ## Rejected Designs
 
@@ -1928,7 +1862,7 @@ src/model_gateway/provider/scripted.rs
 
 ### 公开ModelTurnSession
 
-否决原因：让ActiveTurnTask管理第二个provider-session state owner；connection/continuation可以private复用。
+否决原因：让ActiveTurnTask管理第二个provider-session state owner；adapter-owned reqwest client保持private（每installation一个、reload复用，普通stateless transport pooling），continuation保持omission——M14不存在可private复用的continuation state，旧“connection/continuation可以private复用”的说法不成立。
 
 ### 返回raw provider stream
 
@@ -1978,6 +1912,17 @@ src/model_gateway/provider/scripted.rs
 - [x] 实现OpenAI Responses direct private adapter、provider-native Structured strict mapping、bounded SSE terminal/delivery/error/cancellation与默认离线production loopback suite；transport由真实Rust 1.85验证。
 - [x] 实现host-only dynamic credential/catalog installation：redacted typed credential/source、explicit model descriptor、stable/API model identity分离、endpoint policy、Runtime source installation、missing/cancel NotSent与exact terminal model binding。
 - [x] 实现两个explicit opt-in live smoke harness；默认tests只编译并报告ignored，不读取env或访问network。
-- [ ] 在显式release环境执行并记录real-credential live smoke；实现connection/cache/continuation policy，并激活public structured requester/Wire/SessionDefinition字段与Runtime/ActiveTurnTask structured调用。
+- [ ] 在显式release环境执行并记录real-credential live smoke；激活public structured requester/Wire/SessionDefinition字段与Runtime/ActiveTurnTask structured调用（显式cache/continuation保持ADR 0141 omission，见下节）。
 - [x] 完成OpenAI Responses与Anthropic Messages M12 mock-server contract tests，以及M14两个direct production adapter/local contract suites。
 - [x] 在阶段9冻结公开model catalog/query协议。
+
+## M14 Stateless Full-Request Policy（ADR 0141）
+
+- [x] 冻结：每次`generate_model_turn`至多调用一次`ProviderAdapter::execute`（owner validation/pre-send cancellation/`AuthMissing`→零execute/零POST；adapter编码/build失败或adapter级pre-send cancellation→一次execute/零POST），独立地发送零或一个HTTP POST；若发送POST则携带完整full request；无optimization-specific fallback POST、重试或continuation state；
+- [x] OpenAI：保留`store=false`；无`previous_response_id`/`prompt_cache_key`/`prompt_cache_retention`/`cache_control`/`conversation`/incremental-input；cached_tokens只作为usage evidence；
+- [x] Anthropic：递归无provider-owned `cache_control` annotation（user-authored schema property names保持为data）、无`anthropic-beta` header、若发送则始终完整system/messages/tools；cache read/write只作为usage evidence；
+- [x] `ModelUsage.provider_total_tokens`为provider-reported only；Anthropic恒为`None`（无derived sum、无overflow error路径、usage finalization infallible）；
+- [x] credential逐attempt动态解析（不memoize/pin到request），one installed source=一个稳定nonsecret binding scope，token可轮换、binding identity切换是配置变更；
+- [x] 文档与ADR 0106/0119/0123/0125/0138/0139 refined：旧“provider rejects continuation→fallback full request”不能是第二次POST；
+- [ ] 未来激活显式cache/continuation必须另立provider-specific evidence/ADR并满足本表门槛（当前M14保持omission，不是pending实现）；
+- [ ] 在显式release环境执行并记录real-credential live smoke；激活public structured requester/Wire/SessionDefinition字段与Runtime/ActiveTurnTask structured调用。

@@ -27,8 +27,11 @@ use crate::model_gateway::{
 };
 
 /// Builds the locked-down production HTTP client shared by every direct adapter:
-/// redirects disabled, automatic retries disabled, ambient proxy disabled. One
-/// adapter attempt therefore makes exactly one POST.
+/// redirects disabled, automatic retries disabled, ambient proxy disabled. An
+/// adapter attempt therefore never sends more than one POST, and any POST it
+/// sends carries the complete full request (pre-send cancellation,
+/// `AuthMissing`, validation and encoding/build failures can produce zero
+/// POSTs).
 pub(super) fn build_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -361,6 +364,12 @@ pub(crate) mod loopback {
 
         pub(crate) fn json_body(&self) -> Value {
             serde_json::from_slice(&self.body).expect("captured request body must be JSON")
+        }
+
+        /// The exact body bytes read per `Content-Length`, for byte-equality
+        /// assertions between attempts.
+        pub(crate) fn body_bytes(&self) -> &[u8] {
+            &self.body
         }
 
         pub(crate) fn body_len(&self) -> usize {

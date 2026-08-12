@@ -5,14 +5,27 @@
 //!
 //! - `ProviderCredential`: the validated owned credential value (printable ASCII,
 //!   non-empty, at most 256 bytes). Debug always redacts; there is no Display,
-//!   Serialize, Eq/Hash, or public revealing getter. The only reader is the
-//!   gateway, which hands the resolved credential to the direct adapters for
-//!   header injection.
+//!   Serialize, Eq/Hash, or public revealing getter. The gateway resolves and
+//!   transfers the opaque credential value as-is; the private direct provider
+//!   adapters are the only readers, via the crate-private `for_header()`
+//!   accessor, and perform the header injection. The credential never enters the
+//!   catalog, Session, Wire, or Debug.
 //! - `CredentialSource`: the dynamic per-attempt credential seam. The gateway
 //!   resolves it on every `generate_model_turn` attempt, cancellation-aware,
 //!   before any provider adapter executes. `None` means the credential is
-//!   missing (typed `AuthMissing`/`NotSent`); the source itself never caches,
-//!   singleflights, refreshes, or resends.
+//!   missing (typed `AuthMissing`/`NotSent`). The MiniCore runtime/Gateway never
+//!   caches, singleflights, refreshes, or resends credentials, and a provider
+//!   401 never causes the Gateway to resend; a trusted host source MAY
+//!   internally implement bounded caching/refresh/singleflight for its stable
+//!   binding, provided `resolve()` stays nonblocking, the returned future owns
+//!   all work, and drop/cancellation stops owner-visible work with no detached
+//!   task outliving it. One installed source is trusted to
+//!   represent one stable nonsecret credential binding/account/project/tenant
+//!   scope: token content may rotate per attempt, but silently switching the
+//!   binding identity is a configuration change that requires a new
+//!   installation/definition version/runtime config publication — MiniCore can
+//!   never infer this from credential bytes, and deliberately has no runtime
+//!   check or type for it.
 //! - `ModelProviderDescriptor`: the provider-neutral model descriptor. Every
 //!   capability is explicit and validated; conservative defaults are Provider
 //!   default reasoning only, Standard service class, and no structured output.
@@ -63,9 +76,11 @@ pub enum ProviderCredentialError {
 
 /// A validated owned provider credential value: non-empty printable ASCII, at most
 /// 256 bytes. Debug always redacts the value; there is deliberately no Display,
-/// Serialize, Eq/Hash, or public getter that reveals it. The only reader is the
-/// gateway's per-attempt header injection into the direct provider adapters
-/// (crate-private).
+/// Serialize, Eq/Hash, or public getter that reveals it. The gateway resolves and
+/// transfers the opaque value as-is to the direct provider adapter, which is the
+/// only reader: the crate-private `for_header()` hands the value to the private
+/// adapter for header injection. The credential never enters the catalog,
+/// Session, Wire, or Debug.
 #[derive(Clone)]
 pub struct ProviderCredential(Box<str>);
 
@@ -100,9 +115,20 @@ pub type CredentialSourceFuture<'a> =
 /// every `generate_model_turn` attempt, cancellation-aware, before any provider
 /// adapter executes; `None` means no usable credential is currently available and
 /// maps to a typed `AuthMissing` failure that is always `NotSent` — the adapter is
-/// never invoked and the gateway never retries on its own. The source is
-/// host-owned and intentionally free of caching, singleflight, refresh-and-resend,
-/// and connection caching.
+/// never invoked, and a provider 401 never causes the gateway to resend on its
+/// own. The MiniCore runtime/Gateway itself never caches, singleflights,
+/// refreshes, or resends credentials; a trusted host source MAY internally
+/// implement bounded caching/refresh/singleflight for its stable binding,
+/// subject to the contract obligations below.
+///
+/// Credential binding semantics (ADR 0141): one installed source is trusted to
+/// represent exactly one stable nonsecret credential binding — one account,
+/// project, or tenant scope. The token content returned by `resolve()` may rotate
+/// between attempts (per-attempt freshness), but the binding identity itself must
+/// not silently change: switching the binding identity is a configuration change
+/// that requires a new installation, definition version, or runtime config
+/// publication by the trusted host. MiniCore cannot infer binding identity from
+/// credential bytes and deliberately performs no runtime check for it.
 ///
 /// Contract obligations on `resolve()`:
 /// - it must only construct and return its future: it must not block, and it must
@@ -110,7 +136,11 @@ pub type CredentialSourceFuture<'a> =
 /// - the returned future must own all resolution work: it must not detach any task
 ///   that outlives the future, and dropping the future (which the gateway does on
 ///   cancellation) must stop all owner-visible work — no background refresh, no
-///   detached I/O, no lingering locks or timers.
+///   detached I/O, no lingering locks or timers;
+/// - any internal bounded caching/refresh/singleflight a host source implements
+///   must hold within these obligations: `resolve()` stays nonblocking, the
+///   returned future owns all work, drop/cancellation stops owner-visible work,
+///   and no detached task outlives it.
 pub trait CredentialSource: Send + Sync {
     fn resolve(&self) -> CredentialSourceFuture<'_>;
 }
@@ -189,8 +219,12 @@ pub enum ModelProviderDescriptorError {
 /// nonsecret calling semantics of the definition change — protocol, endpoint,
 /// API model name, capabilities, limits, defaults, or the credential binding
 /// identity. Rotating the credential contents (a new token for the same binding
-/// identity) never changes the version. The runtime never computes a version or
-/// fingerprint: it stores and reports the host-supplied value exactly.
+/// identity) never changes the version. Silently switching the binding identity
+/// (a different account/project/tenant behind the same source) is a configuration
+/// change and therefore requires a new installation/definition version/runtime
+/// config publication; MiniCore cannot detect it from credential bytes and has no
+/// runtime check for it. The runtime never computes a version or fingerprint: it
+/// stores and reports the host-supplied value exactly.
 pub struct ModelProviderDescriptor {
     selection: ModelSelection,
     version: NonZeroU64,

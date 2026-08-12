@@ -1,7 +1,9 @@
 # ADR 0123：执行一致性使用Exact Ref、不可变快照与显式Reload
 
-状态：Partially Superseded by ADRs 0124, 0126, 0127, 0129 and 0132
+状态：Partially Superseded by ADRs 0124, 0126, 0127, 0129, 0132 and 0141
 日期：2026-07-28
+
+> 2026-08-12：[ADR 0141](0141-provider-calls-are-stateless-full-request.md)细化logical retry的wire语义：复用同一个`Arc<ModelCallRequest>`的每次invocation都是stateless full-request尝试（至多一次`ProviderAdapter::execute`；独立地零或一个POST，若发送POST则携带完整full request），credential逐attempt重新解析；retry不携带continuation或incremental state。
 
 > 2026-07-31：[ADR 0132](0132-compaction-derives-markers-from-live-stable-units.md)细化本文第6/17条：Compaction source改为reducer-owned Session/revision-bound stable units；plan从source+cut派生single marker，automatic provenance字段完整且总是Some。本文不再支持独立caller-provided prefix/suffix/marker。
 

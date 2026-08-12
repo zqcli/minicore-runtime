@@ -1,7 +1,9 @@
 # ADR 0119: 模型调用使用Session逻辑重试
 
-状态：Partially Superseded by ADR 0126
+状态：Partially Superseded by ADRs 0126 and 0141
 日期：2026-07-27
+
+> 2026-08-12：[ADR 0141](0141-provider-calls-are-stateless-full-request.md)细化Gateway single-attempt条款：M14一次`generate_model_turn`至多调用一次`ProviderAdapter::execute`（owner validation/pre-send cancellation/`AuthMissing`在调用adapter前以typed error terminal，零execute/零POST；adapter编码/build失败或adapter级pre-send cancellation为一次execute/零POST），独立地发送零或一个HTTP POST，若发送POST则携带完整full request，没有optimization-specific fallback POST。Session logical retry的每一次invocation都是新的stateless full-request尝试（若发送则是一个完整POST），并重新动态resolve credential（不pin credential/body到request）。retry次数/backoff与delivery-safe error policy不变。
 
 > 2026-07-30：Gateway single attempt、retry次数/backoff和delivery-safe error policy保留；logical retry owner改为ActiveTurnTask，basis改为control generation + `ConversationRevision`，删除`RunningOperation`和durable checkpoint校验。
 

@@ -2509,13 +2509,15 @@ ToolService / ToolSet
 SkillService / SkillView / LoadedSkill
 WorkspaceSnapshot / EmergencyControl signal
 ModelGateway / TurnModelSnapshot private execution ref
-ProviderAdapter / AuthStore
+ProviderAdapter
 SessionRecorder / ConversationStorage implementation
 LiveSessionState / LiveConversation reducer
 ToolExecutionControl / ToolStartPermit
 ```
 
 公开view可以投影其安全状态，但不能携带内部handle或允许调用方拼接不一致快照。
+
+`CredentialSource`和`ProviderCredential`是public host-only runtime configuration类型，但它们从不进入public snapshots/events/commands/Wire或renderer-safe views；resolved credentials保持private，只属于单次provider attempt。No public surface change：上述internal-objects列表只禁止private runtime machinery（如`ProviderAdapter`）进入public surface，host-only configuration seam不是public runtime surface。
 
 ## Error 分层
 
