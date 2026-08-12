@@ -2250,9 +2250,9 @@ impl WorkspaceSnapshotCandidate {
     /// publish a stale capability.  Candidates without any readable/source root have no
     /// fresh read authority behind them and remain final without revalidation.
     pub(crate) fn requires_revalidation(&self) -> bool {
-        self.roots.iter().any(|root| {
-            root.filesystem.is_readable() || root.prompt_source || root.skill_source
-        })
+        self.roots
+            .iter()
+            .any(|root| root.filesystem.is_readable() || root.prompt_source || root.skill_source)
     }
 
     fn has_same_resolution_as(&self, other: &Self) -> bool {
@@ -4565,7 +4565,10 @@ mod tests {
             authority_with_ceiling(WorkspaceFilesystemGrant::None, true, true),
         );
         let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
-        assert_eq!(candidate.roots[0].filesystem, WorkspaceFilesystemGrant::None);
+        assert_eq!(
+            candidate.roots[0].filesystem,
+            WorkspaceFilesystemGrant::None
+        );
         assert!(!candidate.roots[0].prompt_source);
         assert!(!candidate.roots[0].skill_source);
         assert!(!candidate.requires_revalidation());
@@ -4578,7 +4581,10 @@ mod tests {
             authority_with_ceiling(WorkspaceFilesystemGrant::ReadOnly, false, false),
         );
         let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
-        assert_eq!(candidate.roots[0].filesystem, WorkspaceFilesystemGrant::ReadOnly);
+        assert_eq!(
+            candidate.roots[0].filesystem,
+            WorkspaceFilesystemGrant::ReadOnly
+        );
         assert!(!candidate.roots[0].prompt_source);
         assert!(!candidate.roots[0].skill_source);
         assert!(candidate.requires_revalidation());
