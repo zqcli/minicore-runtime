@@ -1471,33 +1471,35 @@ impl ToolSet {
     }
 }
 
-/// The frozen production Tool composition config: exactly the two closed Runtime-owned
-/// builtins (`ask_user`, `read_file`), each independently opt-in at [`ProductionToolConfig::new`]
-/// and never changed afterwards.
+/// The frozen production Tool composition config: exactly the three closed Runtime-owned
+/// builtins (`ask_user`, `read_file`, `list_directory`), each independently opt-in at
+/// [`ProductionToolConfig::new`] and never changed afterwards.
 ///
 /// The config freezes its base exactly once at `new` — the empty default or the single
 /// `ask_user` builtin — and `for_workspace` composes at the module planner level.  There is
 /// no generic registry, no arbitrary merge API, no dynamic callbacks, and no name-based
-/// open-world lookup: the composed set contains exactly the two frozen names in one frozen
-/// order (`ask_user` first, `read_file` second) and routes each valid call to exactly one
-/// builtin planner, while invalid/unknown names stay unavailable through the normal ToolSet
-/// lookup.
+/// open-world lookup: the composed set contains exactly the three frozen names in one frozen
+/// order (`ask_user` → `read_file` → `list_directory`) with only the enabled members, and
+/// routes each valid call to exactly one builtin planner, while invalid/unknown names stay
+/// unavailable through the normal ToolSet lookup.
 #[derive(Clone)]
 pub(crate) struct ProductionToolConfig {
     /// Whether the selection includes the frozen `ask_user` builtin.
     ask_user: bool,
     /// Whether the selection includes the workspace-bound `read_file` builtin.
     read_file: bool,
+    /// Whether the selection includes the workspace-bound `list_directory` builtin.
+    list_directory: bool,
     /// The frozen base captured exactly once at `new`: the empty default or the single
-    /// `ask_user` builtin.  With `read_file` off, every `for_workspace` call returns this
-    /// exact same captured `Arc`.
+    /// `ask_user` builtin.  With no workspace-bound tool enabled, every `for_workspace`
+    /// call returns this exact same captured `Arc`.
     base: Arc<ToolSet>,
 }
 
 impl ProductionToolConfig {
     /// Freezes the production selection and its base exactly once: the empty default when
     /// `ask_user` is off, otherwise the exact `ask_user` builtin ToolSet.
-    pub(crate) fn new(ask_user: bool, read_file: bool) -> Self {
+    pub(crate) fn new(ask_user: bool, read_file: bool, list_directory: bool) -> Self {
         let base = if ask_user {
             ask_user::build_tool_set()
         } else {
@@ -1506,29 +1508,35 @@ impl ProductionToolConfig {
         Self {
             ask_user,
             read_file,
+            list_directory,
             base,
         }
     }
 
     /// Materializes the exact selected ToolSet for one Workspace/task context.
     ///
-    /// With `read_file` off, every call returns the same captured base `Arc` (the empty
-    /// default or the single `ask_user` builtin).  With `read_file` on, the workspace-bound
-    /// read_file set is materialized per call: exactly that set when `ask_user` is off,
-    /// otherwise one immutable composed set containing exactly `ask_user` then `read_file`
-    /// definitions and specs with one frozen two-route planner.
+    /// With no workspace-bound tool (`read_file`, `list_directory`) enabled, every call
+    /// returns the same captured base `Arc` (the empty default or the single `ask_user`
+    /// builtin).  Otherwise the selection is materialized per admission: one immutable
+    /// composed set containing exactly the enabled members in the frozen `ask_user` →
+    /// `read_file` → `list_directory` order, bound to the exact Workspace tool context and
+    /// Runtime task context, with one frozen three-route planner and the `FilesystemRead`
+    /// outer sandbox contract.
     pub(crate) fn for_workspace(
         &self,
         workspace: WorkspaceToolContext,
         task_context: RuntimeTaskContext,
     ) -> Arc<ToolSet> {
-        if !self.read_file {
+        if !self.read_file && !self.list_directory {
             return Arc::clone(&self.base);
         }
-        if !self.ask_user {
-            return read_file::build_tool_set(workspace, task_context);
-        }
-        composed_ask_user_read_file(workspace, task_context)
+        composed_production_tool_set(
+            self.ask_user,
+            self.read_file,
+            self.list_directory,
+            workspace,
+            task_context,
+        )
     }
 }
 
@@ -1562,42 +1570,58 @@ impl TurnToolResources {
     }
 }
 
-/// The frozen two-route composed ToolSet: exactly `ask_user` then `read_file` definitions
-/// and specs in one deterministic order (mirrored in the prompt spec projection), one frozen
-/// planner that routes exactly the two frozen names to exactly one builtin planner each, and
-/// read_file's outer sandbox contract (available exactly for `FilesystemRead`).
+/// The frozen closed composer for one production selection: exactly the enabled builtin
+/// definitions/specs pushed by bool in one deterministic order (`ask_user` → `read_file` →
+/// `list_directory`, only enabled members, never a duplicate), one frozen planner that
+/// routes exactly the three frozen names to exactly one builtin planner each, and the
+/// shared `FilesystemRead` outer sandbox contract (the caller composes only when at least
+/// one workspace-bound tool is enabled).
 ///
-/// The composition happens at the module planner level, so the read_file route is admitted
-/// exactly once against the outer contract (never twice), while the ask_user route never
-/// touches admission at all: its plans are UserQuestion/PreExecution shapes carrying no
-/// Execute permissions, and the empty permission plan remains admitted under the
-/// `FilesystemRead` contract.
-fn composed_ask_user_read_file(
+/// The composition happens at the module planner level, so each enabled workspace-bound
+/// route is admitted exactly once against the outer contract (never twice), while the
+/// ask_user route never touches admission at all: its plans are UserQuestion/PreExecution
+/// shapes carrying no Execute permissions.
+fn composed_production_tool_set(
+    ask_user: bool,
+    read_file: bool,
+    list_directory: bool,
     workspace: WorkspaceToolContext,
     task_context: RuntimeTaskContext,
 ) -> Arc<ToolSet> {
-    let ask_definition = ask_user::definition();
-    let read_definition = read_file::definition();
-    let specs: Arc<[ToolSpec]> =
-        Arc::from([ask_definition.spec.clone(), read_definition.spec.clone()]);
-    let definitions: Arc<[ToolDefinition]> = Arc::from([ask_definition, read_definition]);
+    let mut definitions: Vec<ToolDefinition> = Vec::new();
+    if ask_user {
+        definitions.push(ask_user::definition());
+    }
+    if read_file {
+        definitions.push(read_file::definition());
+    }
+    if list_directory {
+        definitions.push(list_directory::definition());
+    }
+    let specs: Arc<[ToolSpec]> = definitions
+        .iter()
+        .map(|definition| definition.spec.clone())
+        .collect();
     let planner: Arc<ToolPlanner> = Arc::new({
         let workspace = workspace.clone();
         let task_context = task_context.clone();
         move |request| match request.call().name().as_str() {
             ask_user::ASK_USER_NAME => ask_user::plan(request),
             read_file::READ_FILE_NAME => read_file::plan(&workspace, &task_context, request),
+            list_directory::LIST_DIRECTORY_NAME => {
+                list_directory::plan(&workspace, &task_context, request)
+            }
             // The normal ToolSet lookup invokes the planner only for a name present in this
-            // set's definitions, which are exactly the two frozen names above, so no other
-            // name can ever reach the composed planner.
+            // set's definitions, which are exactly the enabled frozen names above, so no
+            // other name can ever reach the composed planner.
             _ => unreachable!(
-                "the composed production ToolSet routes exactly ask_user and read_file"
+                "the composed production ToolSet routes exactly the three frozen builtin names"
             ),
         }
     });
     Arc::new(ToolSet {
         inner: Arc::new(ToolSetInner {
-            definitions,
+            definitions: definitions.into(),
             specs,
             planner: Some(planner),
             sandbox: read_file::sandbox(),
@@ -4958,236 +4982,256 @@ mod tests {
         )
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn production_config_empty_selection_materializes_the_empty_default() {
-        let rig = composition_workspace().await;
-        let config = ProductionToolConfig::new(false, false);
-        let set = config.for_workspace(rig.workspace.clone(), rig.task_context.clone());
-        assert!(set.definitions().is_empty());
-        assert!(set.prompt_view().is_empty());
-
-        // The default selection stays empty: even the two frozen builtin names plan to the
-        // identity-bound unavailable path through the normal ToolSet lookup.
-        let ask = composition_request(0x11, "call_ask", ask_user::ASK_USER_NAME, "{}");
-        let read = composition_request(
-            0x12,
-            "call_read",
-            read_file::READ_FILE_NAME,
-            r#"{"path":"notes.txt"}"#,
-        );
-        for request in [&ask, &read] {
-            assert!(set.plan(request).is_none());
-            assert!(matches!(
-                ToolSet::unavailable_outcome(request),
-                ToolExecutionOutcome::Completed {
-                    source: ToolOutcomeSource::PreExecution,
-                    disposition: ToolResultDisposition::Failed,
-                    ref content,
-                    ..
-                } if content.parts()[0].as_text() == "tool is unavailable"
-            ));
-        }
-
-        // Every materialization returns the same frozen empty base Arc.
-        let again = config.for_workspace(rig.workspace.clone(), rig.task_context.clone());
-        assert!(Arc::ptr_eq(&set, &again));
-        rig.task_context.shutdown().await;
+    #[derive(Clone, Copy, Debug)]
+    struct Selection {
+        ask_user: bool,
+        read_file: bool,
+        list_directory: bool,
+        names: &'static [&'static str],
     }
 
+    /// The closed eight-selection surface: every combination of the three frozen builtin
+    /// opt-ins, with the exact expected ordered names (the fixed definition/spec order
+    /// `ask_user` → `read_file` → `list_directory`, only enabled members, no duplicates).
+    const SELECTIONS: [Selection; 8] = [
+        Selection {
+            ask_user: false,
+            read_file: false,
+            list_directory: false,
+            names: &[],
+        },
+        Selection {
+            ask_user: true,
+            read_file: false,
+            list_directory: false,
+            names: &[ask_user::ASK_USER_NAME],
+        },
+        Selection {
+            ask_user: false,
+            read_file: true,
+            list_directory: false,
+            names: &[read_file::READ_FILE_NAME],
+        },
+        Selection {
+            ask_user: false,
+            read_file: false,
+            list_directory: true,
+            names: &[list_directory::LIST_DIRECTORY_NAME],
+        },
+        Selection {
+            ask_user: true,
+            read_file: true,
+            list_directory: false,
+            names: &[ask_user::ASK_USER_NAME, read_file::READ_FILE_NAME],
+        },
+        Selection {
+            ask_user: true,
+            read_file: false,
+            list_directory: true,
+            names: &[ask_user::ASK_USER_NAME, list_directory::LIST_DIRECTORY_NAME],
+        },
+        Selection {
+            ask_user: false,
+            read_file: true,
+            list_directory: true,
+            names: &[
+                read_file::READ_FILE_NAME,
+                list_directory::LIST_DIRECTORY_NAME,
+            ],
+        },
+        Selection {
+            ask_user: true,
+            read_file: true,
+            list_directory: true,
+            names: &[
+                ask_user::ASK_USER_NAME,
+                read_file::READ_FILE_NAME,
+                list_directory::LIST_DIRECTORY_NAME,
+            ],
+        },
+    ];
+
     #[tokio::test(flavor = "current_thread")]
-    async fn production_config_ask_user_only_returns_the_same_captured_arc_with_one_definition() {
+    async fn production_config_all_eight_selections_freeze_exact_names_specs_reuse_and_sandbox() {
         let rig = composition_workspace().await;
-        let config = ProductionToolConfig::new(true, false);
-        let first = config.for_workspace(rig.workspace.clone(), rig.task_context.clone());
-        let second = config.for_workspace(rig.workspace.clone(), rig.task_context.clone());
-        // ask_user-only behavior is the exact same captured Arc on repeated calls, even
-        // though every call hands in a fresh workspace context.
-        assert!(Arc::ptr_eq(&first, &second));
-        let definitions = first.definitions();
-        assert_eq!(definitions.len(), 1);
-        assert_eq!(definitions[0].name().as_str(), ask_user::ASK_USER_NAME);
-        let view = first.prompt_view();
-        assert_eq!(view.specs().len(), 1);
-        assert_eq!(view.specs()[0].name().as_str(), ask_user::ASK_USER_NAME);
+        for selection in SELECTIONS {
+            let config = ProductionToolConfig::new(
+                selection.ask_user,
+                selection.read_file,
+                selection.list_directory,
+            );
+            let set = config.for_workspace(rig.workspace.clone(), rig.task_context.clone());
 
-        // The exact ask_user route still plans its typed UserQuestion.
-        let request = composition_request(
-            0x13,
-            "call_ask",
-            ask_user::ASK_USER_NAME,
-            r#"{"questions":[{"questionIndex":0,"prompt":"Continue?","required":true,"input":{"type":"text","data":{"multiline":false}}}]}"#,
-        );
-        assert!(matches!(
-            first.plan(&request),
-            Some(ToolExecutionPlan::UserQuestion { .. })
-        ));
-        // read_file is not selected: its frozen name stays unavailable.
-        let read = composition_request(
-            0x14,
-            "call_read",
-            read_file::READ_FILE_NAME,
-            r#"{"path":"notes.txt"}"#,
-        );
-        assert!(first.plan(&read).is_none());
-        rig.task_context.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn production_config_read_file_only_returns_exactly_the_workspace_bound_read_file_set() {
-        let rig = composition_workspace().await;
-        let config = ProductionToolConfig::new(false, true);
-        let set = config.for_workspace(rig.workspace.clone(), rig.task_context.clone());
-        let definitions = set.definitions();
-        assert_eq!(definitions.len(), 1);
-        assert_eq!(definitions[0].name().as_str(), read_file::READ_FILE_NAME);
-        assert_eq!(set.prompt_view().specs().len(), 1);
-
-        // The outer read_file sandbox contract stays available exactly for FilesystemRead.
-        assert_eq!(
-            set.inner.sandbox,
-            ToolSandboxContract::available([C::FilesystemRead])
-        );
-
-        // The read_file route plans Execute with exactly FilesystemRead and survives the
-        // single outer admission.
-        let request = composition_request(
-            0x15,
-            "call_read",
-            read_file::READ_FILE_NAME,
-            r#"{"path":"notes.txt"}"#,
-        );
-        match set.plan(&request) {
-            Some(ToolExecutionPlan::Execute { permissions, .. }) => {
-                assert_eq!(permissions, ToolPermissionSet::new([C::FilesystemRead]));
+            // Exactly the enabled definitions and prompt specs in the one frozen order,
+            // with no duplicates.
+            let definitions = set.definitions();
+            assert_eq!(
+                definitions.len(),
+                selection.names.len(),
+                "selection {selection:?}"
+            );
+            for (definition, name) in definitions.iter().zip(selection.names) {
+                assert_eq!(definition.name().as_str(), *name, "selection {selection:?}");
             }
-            _ => panic!("the valid read_file call plans an Execute shape"),
-        }
+            let view = set.prompt_view();
+            assert_eq!(
+                view.specs().len(),
+                selection.names.len(),
+                "selection {selection:?}"
+            );
+            for (spec, name) in view.specs().iter().zip(selection.names) {
+                assert_eq!(spec.name().as_str(), *name, "selection {selection:?}");
+            }
 
-        // A path the Workspace authorization refuses settles the frozen Denied result.
-        let denied = composition_request(
-            0x16,
-            "call_root",
-            read_file::READ_FILE_NAME,
-            r#"{"path":""}"#,
-        );
-        assert!(matches!(
-            set.plan(&denied),
-            Some(ToolExecutionPlan::PreExecution(result))
-                if matches!(result, ToolExecutionResult::PreExecution {
-                    disposition: ToolResultDisposition::Denied,
-                    ..
-                })
-        ));
+            // The outer sandbox contract is available exactly for FilesystemRead when any
+            // workspace-bound tool is enabled, and the empty available contract otherwise.
+            let has_workspace_tools = selection.read_file || selection.list_directory;
+            let expected_sandbox = if has_workspace_tools {
+                ToolSandboxContract::available([C::FilesystemRead])
+            } else {
+                ToolSandboxContract::available([])
+            };
+            assert_eq!(
+                set.inner.sandbox, expected_sandbox,
+                "selection {selection:?}"
+            );
 
-        // ask_user is not selected, and unknown names stay unavailable.
-        for (suffix, call, name, arguments) in [
-            (0x17, "call_ask", ask_user::ASK_USER_NAME, "{}"),
-            (0x18, "call_other", "other_tool", "{}"),
-        ] {
-            let request = composition_request(suffix, call, name, arguments);
-            assert!(set.plan(&request).is_none());
+            // Arc reuse: no workspace-bound tool means every materialization returns the
+            // same captured base Arc; any workspace-bound tool means a fresh Arc per
+            // admission, bound to the exact Workspace/task contexts.
+            let again = config.for_workspace(rig.workspace.clone(), rig.task_context.clone());
+            if has_workspace_tools {
+                assert!(!Arc::ptr_eq(&set, &again), "selection {selection:?}");
+                assert_eq!(
+                    again.definitions().len(),
+                    selection.names.len(),
+                    "selection {selection:?}"
+                );
+            } else {
+                assert!(Arc::ptr_eq(&set, &again), "selection {selection:?}");
+            }
         }
         rig.task_context.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn production_config_both_selections_compose_in_the_exact_frozen_order_and_route_once() {
+    async fn production_config_routes_plan_exactly_once_in_the_selections_that_include_them() {
         let rig = composition_workspace().await;
-        let config = ProductionToolConfig::new(true, true);
-        let set = config.for_workspace(rig.workspace.clone(), rig.task_context.clone());
+        for selection in SELECTIONS {
+            let config = ProductionToolConfig::new(
+                selection.ask_user,
+                selection.read_file,
+                selection.list_directory,
+            );
+            let set = config.for_workspace(rig.workspace.clone(), rig.task_context.clone());
+            let enabled = |name: &'static str| selection.names.contains(&name);
 
-        // Exactly two definitions and two prompt specs in one deterministic order:
-        // ask_user first, read_file second.
-        let definitions = set.definitions();
-        assert_eq!(definitions.len(), 2);
-        assert_eq!(definitions[0].name().as_str(), ask_user::ASK_USER_NAME);
-        assert_eq!(definitions[1].name().as_str(), read_file::READ_FILE_NAME);
-        let view = set.prompt_view();
-        assert_eq!(view.specs().len(), 2);
-        assert_eq!(view.specs()[0].name().as_str(), ask_user::ASK_USER_NAME);
-        assert_eq!(view.specs()[1].name().as_str(), read_file::READ_FILE_NAME);
-
-        // The outer sandbox contract stays read_file's exact FilesystemRead contract, so
-        // the read_file route is admitted exactly once and ask_user's plans never touch
-        // admission.
-        assert_eq!(
-            set.inner.sandbox,
-            ToolSandboxContract::available([C::FilesystemRead])
-        );
-
-        // The ask_user route plans exactly its typed UserQuestion.
-        let ask = composition_request(
-            0x19,
-            "call_ask",
-            ask_user::ASK_USER_NAME,
-            r#"{"questions":[{"questionIndex":0,"prompt":"Continue?","required":true,"input":{"type":"text","data":{"multiline":false}}}]}"#,
-        );
-        assert!(matches!(
-            set.plan(&ask),
-            Some(ToolExecutionPlan::UserQuestion { .. })
-        ));
-
-        // Invalid ask_user arguments settle the frozen failed pre-execution result.
-        let invalid = composition_request(0x1a, "call_ask_invalid", ask_user::ASK_USER_NAME, "{}");
-        assert!(matches!(
-            set.plan(&invalid),
-            Some(ToolExecutionPlan::PreExecution(result))
-                if matches!(result, ToolExecutionResult::PreExecution {
-                    disposition: ToolResultDisposition::Failed,
-                    ..
-                })
-        ));
-
-        // The read_file route plans Execute with exactly FilesystemRead and survives the
-        // single outer admission.
-        let read = composition_request(
-            0x1b,
-            "call_read",
-            read_file::READ_FILE_NAME,
-            r#"{"path":"notes.txt"}"#,
-        );
-        match set.plan(&read) {
-            Some(ToolExecutionPlan::Execute { permissions, .. }) => {
-                assert_eq!(permissions, ToolPermissionSet::new([C::FilesystemRead]));
+            // ask_user route: exactly its typed UserQuestion when selected (invalid
+            // arguments settle the frozen Failed pre-execution), unavailable otherwise.
+            let ask = composition_request(
+                0x21,
+                "call_ask",
+                ask_user::ASK_USER_NAME,
+                r#"{"questions":[{"questionIndex":0,"prompt":"Continue?","required":true,"input":{"type":"text","data":{"multiline":false}}}]}"#,
+            );
+            if enabled(ask_user::ASK_USER_NAME) {
+                assert!(
+                    matches!(set.plan(&ask), Some(ToolExecutionPlan::UserQuestion { .. })),
+                    "selection {selection:?}"
+                );
+                let invalid =
+                    composition_request(0x22, "call_ask_invalid", ask_user::ASK_USER_NAME, "{}");
+                assert!(
+                    matches!(
+                        set.plan(&invalid),
+                        Some(ToolExecutionPlan::PreExecution(result))
+                            if matches!(result, ToolExecutionResult::PreExecution {
+                                disposition: ToolResultDisposition::Failed,
+                                ..
+                            })
+                    ),
+                    "selection {selection:?}"
+                );
+            } else {
+                assert!(set.plan(&ask).is_none(), "selection {selection:?}");
             }
-            _ => panic!("the valid read_file call plans an Execute shape"),
+
+            // read_file route: the file path plans Execute with exactly FilesystemRead
+            // and survives the single outer admission, and the root path settles the
+            // frozen Denied pre-execution; unavailable otherwise.  Each call runs through
+            // ToolSet::plan exactly once, whose one admit against the FilesystemRead outer
+            // contract is exactly what the returned Execute shape proves: there is no
+            // second admission anywhere.
+            let read = composition_request(
+                0x23,
+                "call_read",
+                read_file::READ_FILE_NAME,
+                r#"{"path":"notes.txt"}"#,
+            );
+            if enabled(read_file::READ_FILE_NAME) {
+                match set.plan(&read) {
+                    Some(ToolExecutionPlan::Execute { permissions, .. }) => {
+                        assert_eq!(
+                            permissions,
+                            ToolPermissionSet::new([C::FilesystemRead]),
+                            "selection {selection:?}"
+                        );
+                    }
+                    _ => panic!("the valid read_file call plans an Execute shape ({selection:?})"),
+                }
+                let read_root = composition_request(
+                    0x24,
+                    "call_root",
+                    read_file::READ_FILE_NAME,
+                    r#"{"path":""}"#,
+                );
+                assert!(
+                    matches!(
+                        set.plan(&read_root),
+                        Some(ToolExecutionPlan::PreExecution(result))
+                            if matches!(result, ToolExecutionResult::PreExecution {
+                                disposition: ToolResultDisposition::Denied,
+                                ..
+                            })
+                    ),
+                    "selection {selection:?}"
+                );
+            } else {
+                assert!(set.plan(&read).is_none(), "selection {selection:?}");
+            }
+
+            // list_directory route: the empty cwd plans Execute with exactly
+            // FilesystemRead through the same single outer admission; unavailable
+            // otherwise.
+            let list = composition_request(
+                0x25,
+                "call_list",
+                list_directory::LIST_DIRECTORY_NAME,
+                r#"{"path":""}"#,
+            );
+            if enabled(list_directory::LIST_DIRECTORY_NAME) {
+                match set.plan(&list) {
+                    Some(ToolExecutionPlan::Execute { permissions, .. }) => {
+                        assert_eq!(
+                            permissions,
+                            ToolPermissionSet::new([C::FilesystemRead]),
+                            "selection {selection:?}"
+                        );
+                    }
+                    _ => panic!(
+                        "the valid list_directory call plans an Execute shape ({selection:?})"
+                    ),
+                }
+            } else {
+                assert!(set.plan(&list).is_none(), "selection {selection:?}");
+            }
+
+            // A name that is not one of the three frozen builtins stays unavailable
+            // through the normal ToolSet lookup in every selection: there is no generic
+            // registry or open-world route.
+            let unknown = composition_request(0x26, "call_other", "other_tool", "{}");
+            assert!(set.plan(&unknown).is_none(), "selection {selection:?}");
         }
-
-        // A path the Workspace authorization refuses still settles the frozen Denied
-        // result through the composed read_file route.
-        let denied = composition_request(
-            0x1c,
-            "call_root",
-            read_file::READ_FILE_NAME,
-            r#"{"path":""}"#,
-        );
-        assert!(matches!(
-            set.plan(&denied),
-            Some(ToolExecutionPlan::PreExecution(result))
-                if matches!(result, ToolExecutionResult::PreExecution {
-                    disposition: ToolResultDisposition::Denied,
-                    ..
-                })
-        ));
-
-        // An invalid/unknown name remains unavailable through the normal ToolSet lookup:
-        // there is no third route.
-        let unknown = composition_request(0x1d, "call_other", "other_tool", "{}");
-        assert!(set.plan(&unknown).is_none());
-
-        // The composed selection is workspace-bound and materialized per call, never
-        // cached, and every materialization keeps the same frozen two-definition shape.
-        let again = config.for_workspace(rig.workspace.clone(), rig.task_context.clone());
-        assert!(!Arc::ptr_eq(&set, &again));
-        assert_eq!(again.definitions().len(), 2);
-        assert_eq!(
-            again.definitions()[0].name().as_str(),
-            ask_user::ASK_USER_NAME
-        );
-        assert_eq!(
-            again.definitions()[1].name().as_str(),
-            read_file::READ_FILE_NAME
-        );
         rig.task_context.shutdown().await;
     }
 
@@ -5212,7 +5256,7 @@ mod tests {
     async fn turn_tool_resources_production_materialize_installs_the_workspace_bound_read_file_set()
     {
         let rig = composition_workspace().await;
-        let set = TurnToolResources::Production(ProductionToolConfig::new(false, true))
+        let set = TurnToolResources::Production(ProductionToolConfig::new(false, true, false))
             .materialize(rig.workspace.clone(), rig.task_context.clone());
         // The production read_file selection materializes the exact workspace-bound set:
         // one read_file definition and prompt spec with the FilesystemRead outer contract.
@@ -5224,6 +5268,84 @@ mod tests {
             set.inner.sandbox,
             ToolSandboxContract::available([C::FilesystemRead])
         );
+        rig.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn turn_tool_resources_production_materialize_installs_the_workspace_bound_list_directory_set()
+     {
+        let rig = composition_workspace().await;
+        let set = TurnToolResources::Production(ProductionToolConfig::new(false, false, true))
+            .materialize(rig.workspace.clone(), rig.task_context.clone());
+        // The production list_directory selection materializes the exact workspace-bound
+        // set: one list_directory definition and prompt spec with the FilesystemRead outer
+        // contract, and its empty-cwd route plans Execute with exactly FilesystemRead.
+        let definitions = set.definitions();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(
+            definitions[0].name().as_str(),
+            list_directory::LIST_DIRECTORY_NAME
+        );
+        assert_eq!(set.prompt_view().specs().len(), 1);
+        assert_eq!(
+            set.inner.sandbox,
+            ToolSandboxContract::available([C::FilesystemRead])
+        );
+        let list = composition_request(
+            0x31,
+            "call_list",
+            list_directory::LIST_DIRECTORY_NAME,
+            r#"{"path":""}"#,
+        );
+        assert!(
+            matches!(set.plan(&list), Some(ToolExecutionPlan::Execute { .. })),
+            "the materialized list_directory set plans its Execute route"
+        );
+        rig.task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn turn_tool_resources_production_materialize_installs_the_composed_read_and_list_set() {
+        let rig = composition_workspace().await;
+        let set = TurnToolResources::Production(ProductionToolConfig::new(false, true, true))
+            .materialize(rig.workspace.clone(), rig.task_context.clone());
+        // The production read_file + list_directory selection materializes one composed
+        // workspace-bound set in the frozen order, both routes planning Execute with the
+        // same FilesystemRead outer contract.
+        let definitions = set.definitions();
+        assert_eq!(definitions.len(), 2);
+        assert_eq!(definitions[0].name().as_str(), read_file::READ_FILE_NAME);
+        assert_eq!(
+            definitions[1].name().as_str(),
+            list_directory::LIST_DIRECTORY_NAME
+        );
+        assert_eq!(set.prompt_view().specs().len(), 2);
+        assert_eq!(
+            set.inner.sandbox,
+            ToolSandboxContract::available([C::FilesystemRead])
+        );
+        let read = composition_request(
+            0x32,
+            "call_read",
+            read_file::READ_FILE_NAME,
+            r#"{"path":"notes.txt"}"#,
+        );
+        let list = composition_request(
+            0x33,
+            "call_list",
+            list_directory::LIST_DIRECTORY_NAME,
+            r#"{"path":""}"#,
+        );
+        for request in [&read, &list] {
+            assert!(
+                matches!(
+                    set.plan(request),
+                    Some(ToolExecutionPlan::Execute { permissions, .. })
+                        if permissions == ToolPermissionSet::new([C::FilesystemRead])
+                ),
+                "each composed workspace-bound route plans Execute with exactly FilesystemRead"
+            );
+        }
         rig.task_context.shutdown().await;
     }
 }
