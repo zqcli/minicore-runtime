@@ -1,7 +1,9 @@
 # ADR 0141: Provider调用是Stateless Full-Request Wire Policy
 
-状态：Accepted
+状态：Partially Superseded by ADR 0145
 日期：2026-08-12
+
+> 2026-08-12：[ADR 0145](0145-live-provider-evidence-refines-direct-adapter-wire-truth.md)记录真实HTTPS/public Runtime release evidence并细化direct adapter wire truth：shared client固定发送artifact-derived产品User-Agent，Anthropic unsigned thinking被truthfully保留但不回放，`message_start` stop fields接受absent或null。该refinement不改变本ADR的零/一次execute、零/一个POST、完整full request、无fallback/retry/continuation政策。
 
 ## 背景
 
