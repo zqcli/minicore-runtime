@@ -6,6 +6,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::future::Future;
+use std::io::{Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
@@ -17,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use tokio::sync::Notify;
 
+use cap_primitives::fs::FollowSymlinks;
 use cap_std::fs::Dir as CapabilityDir;
 use thiserror::Error;
 
@@ -1237,23 +1239,29 @@ impl WorkspaceAuthority for RestrictedWorkspaceAuthority {
     }
 }
 
-/// The process-local revocation register that makes the production read-only Workspace
-/// opt-in revocable by the existing host Workspace authority invalidation seam.  It is one
-/// safe synchronized set of revoked `SessionId`s shared (through clones) by the read
-/// authority installed in the resolver and the Runtime owner seam: a revoked Session can
-/// never receive a read grant again for this Runtime lifetime.  There is no generic policy
-/// store, no trait, no callback, and no public DTO — only this concrete owner-held control.
+/// The process-local revocation register that makes the production filesystem opt-ins
+/// (read-only or read-write) revocable by the existing host Workspace authority
+/// invalidation seam.  It is one safe synchronized set of revoked `SessionId`s shared
+/// (through clones) by the filesystem authority installed in the resolver and the Runtime
+/// owner seam: a revoked Session can never receive a filesystem grant again for this
+/// Runtime lifetime.  There is no generic policy store, no trait, no callback, and no
+/// public DTO — only this concrete owner-held control.
 #[derive(Clone, Default)]
-pub(crate) struct WorkspaceReadAccessControl {
+pub(crate) struct WorkspaceFilesystemAccessControl {
     revoked: Arc<Mutex<HashSet<SessionId>>>,
 }
 
-impl WorkspaceReadAccessControl {
+/// The established spelling of the same owner-held filesystem control for the existing
+/// read opt-in seams; the host invalidation path stays source-compatible while the
+/// control itself now covers the write opt-in too.
+pub(crate) type WorkspaceReadAccessControl = WorkspaceFilesystemAccessControl;
+
+impl WorkspaceFilesystemAccessControl {
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    /// Publishes the permanent read revocation for one Session.  Idempotent: a repeated
+    /// Publishes the permanent filesystem revocation for one Session.  Idempotent: a repeated
     /// revoke inserts the same Session into the same set and never re-grants.  There is no
     /// unrevoke/recovery for this Runtime lifetime.
     pub(crate) fn revoke(&self, session_id: SessionId) {
@@ -1271,21 +1279,23 @@ impl WorkspaceReadAccessControl {
     }
 }
 
-/// The production read-only opt-in policy for trusted host wiring.  It grants an
-/// authority ceiling of exactly `ReadOnly` filesystem access to every declared
-/// root — never `ReadWrite` — and keeps Prompt and Skill source ceilings false:
-/// this opt-in authorizes filesystem reads only and must not silently authorize
-/// source discovery.  Trust is `Restricted` (not `Trusted`): the filesystem
-/// grant is independent from source trust.  The authority holds the same
-/// [`WorkspaceReadAccessControl`] as the Runtime owner seam: once the host revokes one
-/// Session, every future resolve/revalidation for that Session grants filesystem `None`
-/// (never `AuthorityDenied`, never `ReadOnly` again), while Prompt/Skill stay false and
-/// trust stays `Restricted`.
-struct ReadOnlyWorkspaceAuthority {
-    control: WorkspaceReadAccessControl,
+/// The production filesystem opt-in policy for trusted host wiring.  It grants an
+/// authority ceiling of exactly the configured `ceiling` (`ReadOnly` for the read
+/// opt-in, `ReadWrite` for the write opt-in) to every declared root — never beyond
+/// it — and keeps Prompt and Skill source ceilings false: filesystem authorization
+/// must not silently authorize source discovery.  Trust is `Restricted` (not
+/// `Trusted`): the filesystem grant is independent from source trust.  The authority
+/// holds the same [`WorkspaceFilesystemAccessControl`] as the Runtime owner seam: once
+/// the host revokes one Session, every future resolve/revalidation for that Session
+/// grants filesystem `None` (never `AuthorityDenied`, never the ceiling again), which
+/// denies the read and write routes together, while Prompt/Skill stay false and trust
+/// stays `Restricted`.
+struct FilesystemWorkspaceAuthority {
+    control: WorkspaceFilesystemAccessControl,
+    ceiling: WorkspaceFilesystemGrant,
 }
 
-impl WorkspaceAuthority for ReadOnlyWorkspaceAuthority {
+impl WorkspaceAuthority for FilesystemWorkspaceAuthority {
     fn authorize(&self, request: WorkspaceAuthorityRequest) -> WorkspaceAuthorityFuture {
         // The revocation check is synchronous and happens before the future is built, so the
         // decision is exact at authorize time; the resolver never observes a revocation that
@@ -1293,11 +1303,11 @@ impl WorkspaceAuthority for ReadOnlyWorkspaceAuthority {
         let filesystem_ceiling = if self.control.is_revoked(request.session_id()) {
             WorkspaceFilesystemGrant::None
         } else {
-            WorkspaceFilesystemGrant::ReadOnly
+            self.ceiling
         };
         Box::pin(async move {
             let revision = WorkspaceTrustRevision::new(
-                NonZeroU64::new(1).expect("the read-only authority revision is non-zero"),
+                NonZeroU64::new(1).expect("the filesystem authority revision is non-zero"),
             );
             let roots = request
                 .roots()
@@ -1634,17 +1644,45 @@ impl WorkspaceResolver {
     /// never granted. Prompt/Skill source ceilings stay false, so this opt-in
     /// never silently authorizes source discovery.  The returned
     /// [`WorkspaceReadAccessControl`] is the owner seam: the host publishes a
-    /// permanent per-Session read revocation through it, and every later
+    /// permanent per-Session filesystem revocation through it, and every later
     /// resolve/revalidation for that Session grants filesystem `None` instead.
     pub(crate) fn new_with_read_access(
         task_context: RuntimeTaskContext,
     ) -> (Self, WorkspaceReadAccessControl) {
-        let control = WorkspaceReadAccessControl::new();
+        let control = WorkspaceFilesystemAccessControl::new();
         let resolver = Self::new_with_adapters(
             task_context,
             Arc::new(LocalWorkspacePathAdapter),
-            Arc::new(ReadOnlyWorkspaceAuthority {
+            Arc::new(FilesystemWorkspaceAuthority {
                 control: control.clone(),
+                ceiling: WorkspaceFilesystemGrant::ReadOnly,
+            }),
+        );
+        (resolver, control)
+    }
+
+    /// Production opt-in for trusted host wiring that may mutate files: every
+    /// declared root receives an authority ceiling of exactly `ReadWrite`
+    /// filesystem access. The requested-access intersection remains
+    /// authoritative, so `ReadOnly` stays `ReadOnly` while a requested
+    /// `ReadWrite` can become `ReadWrite`; no root is ever promoted beyond what
+    /// its definition requested. Prompt/Skill source ceilings stay false and
+    /// trust stays `Restricted`, exactly like the read opt-in. The returned
+    /// [`WorkspaceFilesystemAccessControl`] is the same owner seam the read
+    /// opt-in exposes (spelled `WorkspaceReadAccessControl` there): the host
+    /// publishes a permanent per-Session filesystem revocation through it, and
+    /// every later resolve/revalidation for that Session grants filesystem
+    /// `None`, which denies the read and write routes together.
+    pub(crate) fn new_with_write_access(
+        task_context: RuntimeTaskContext,
+    ) -> (Self, WorkspaceFilesystemAccessControl) {
+        let control = WorkspaceFilesystemAccessControl::new();
+        let resolver = Self::new_with_adapters(
+            task_context,
+            Arc::new(LocalWorkspacePathAdapter),
+            Arc::new(FilesystemWorkspaceAuthority {
+                control: control.clone(),
+                ceiling: WorkspaceFilesystemGrant::ReadWrite,
             }),
         );
         (resolver, control)
@@ -2627,9 +2665,9 @@ impl fmt::Debug for WorkspaceAccessRoot {
 
 /// The narrow filesystem ceiling a loaded WorkspaceSnapshot projects for Tools.
 /// It exposes only the captured canonical cwd, the effective access roots with
-/// their bound capabilities, and synchronous cwd-relative read and
-/// directory-read authorization. Roots are non-overlapping and cwd lies within
-/// exactly one root, so this slice authorizes only cwd-relative read paths;
+/// their bound capabilities, and synchronous cwd-relative read, directory-read
+/// and write authorization. Roots are non-overlapping and cwd lies within
+/// exactly one root, so this slice authorizes only cwd-relative paths;
 /// additional roots are not directly addressable through this schema.
 #[derive(Clone)]
 pub(crate) struct WorkspaceAccessView {
@@ -2699,6 +2737,63 @@ impl WorkspaceAccessView {
             root_dir: Arc::clone(&root.dir),
             relative: target,
         })
+    }
+
+    /// Authorizes one cwd-relative write target against the captured facts. The
+    /// containing root is the exact root holding the captured canonical cwd and
+    /// its effective grant must be exactly `ReadWrite` (a `ReadOnly` or `None`
+    /// grant denies the write route while leaving the read route untouched); the
+    /// cwd's relative position inside that root is prepended to the requested
+    /// relative path, and the resulting capability-relative target must be fully
+    /// normal. Empty and root paths are rejected. The returned path is the only
+    /// value a Tool may use to prepare a file mutation.
+    pub(crate) fn authorize_write(
+        &self,
+        relative: &WorkspaceRelativePath,
+    ) -> Result<AuthorizedWorkspaceWritePath, WorkspaceWriteError> {
+        if relative.is_root() {
+            return Err(WorkspaceWriteError::InvalidTarget);
+        }
+        let (root, cwd_in_root) = self.containing_write_root()?;
+        let target = cwd_in_root.join(relative.as_str());
+        if !target
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(WorkspaceWriteError::InvalidTarget);
+        }
+        Ok(AuthorizedWorkspaceWritePath {
+            root_dir: Arc::clone(&root.dir),
+            relative: target,
+        })
+    }
+
+    /// The single shared basis for cwd-relative write authorization: the exact
+    /// root holding the captured canonical cwd plus the cwd's
+    /// capability-relative position inside it, or the error that makes the
+    /// schema inapplicable. Unlike the read basis, only an effective grant of
+    /// exactly `ReadWrite` authorizes; reads stay authorized under `ReadOnly`.
+    fn containing_write_root(
+        &self,
+    ) -> Result<(&WorkspaceAccessRoot, PathBuf), WorkspaceWriteError> {
+        let root = self
+            .roots
+            .iter()
+            .find(|root| {
+                self.cwd
+                    .as_path()
+                    .starts_with(root.canonical_path.as_path())
+            })
+            .ok_or(WorkspaceWriteError::Unavailable)?;
+        if !matches!(root.filesystem, WorkspaceFilesystemGrant::ReadWrite) {
+            return Err(WorkspaceWriteError::NotAuthorized);
+        }
+        let cwd_in_root = self
+            .cwd
+            .as_path()
+            .strip_prefix(root.canonical_path.as_path())
+            .map_err(|_| WorkspaceWriteError::Unavailable)?;
+        Ok((root, cwd_in_root.to_path_buf()))
     }
 
     /// The single shared basis for cwd-relative read and directory-read
@@ -2860,6 +2955,283 @@ impl fmt::Debug for AuthorizedWorkspaceReadDirectory {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum WorkspaceWriteError {
+    #[error("workspace file write access is not authorized")]
+    NotAuthorized,
+    #[error("workspace file write target is invalid")]
+    InvalidTarget,
+    #[error("workspace file write target is unavailable")]
+    Unavailable,
+    #[error("workspace file write target is not a regular file")]
+    NotRegularFile,
+    #[error("workspace file write target open failed")]
+    OpenFailed,
+    #[error("workspace file write failed")]
+    WriteFailed,
+}
+
+fn map_write_io_error(error: std::io::Error) -> WorkspaceWriteError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => WorkspaceWriteError::Unavailable,
+        _ => WorkspaceWriteError::OpenFailed,
+    }
+}
+
+/// Exact physical identity of one opened file or directory captured for mutation
+/// keys, via the safe `same_file` handle (Unix inode / Windows file identity), so
+/// direct paths, in-root symlink aliases and hard-link aliases of the same file
+/// produce one equal key. Kept behind an `Arc` so the identity stays cloneable
+/// without ever duplicating the open handle it was bound to. The identity is
+/// private to workspace ownership: only `Eq`/`Hash`/`Debug` are visible here,
+/// never the underlying path or handle, and no other module can name the type.
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct WorkspaceMutationIdentity(Arc<same_file::Handle>);
+
+impl WorkspaceMutationIdentity {
+    fn from_file(file: std::fs::File) -> Result<Self, WorkspaceWriteError> {
+        let handle =
+            same_file::Handle::from_file(file).map_err(|_| WorkspaceWriteError::OpenFailed)?;
+        Ok(Self(Arc::new(handle)))
+    }
+}
+
+impl fmt::Debug for WorkspaceMutationIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WorkspaceMutationIdentity { .. }")
+    }
+}
+
+/// The opaque cloneable mutation identity a Session-local queue later serializes
+/// on. The internal representation distinguishes one exact physical file that
+/// already existed at preparation (opened through the captured root capability)
+/// from one exact parent directory plus the normalized final filename of a target
+/// that did not exist, but downstream modules can only `Clone`/`Eq`/`Hash`/`Debug`
+/// the key: they can never pattern-match the physical identity or the filename,
+/// and the key itself carries no ambient path text.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub(crate) struct WorkspaceFileMutationKey {
+    kind: WorkspaceFileMutationKeyKind,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+enum WorkspaceFileMutationKeyKind {
+    Existing(WorkspaceMutationIdentity),
+    Create {
+        parent: WorkspaceMutationIdentity,
+        final_name: PathBuf,
+    },
+}
+
+impl fmt::Debug for WorkspaceFileMutationKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WorkspaceFileMutationKey { .. }")
+    }
+}
+
+/// The only authorized write value a Tool can consume: the open capability bound
+/// to the authorized root plus a normalized capability-relative target. It never
+/// exposes ambient absolute paths; opening always resolves through the captured
+/// `Dir`, which cannot escape the root it was bound to.
+#[derive(Clone)]
+pub(crate) struct AuthorizedWorkspaceWritePath {
+    root_dir: Arc<CapabilityDir>,
+    relative: PathBuf,
+}
+
+impl AuthorizedWorkspaceWritePath {
+    /// The normalized capability-relative target; safe to expose because it
+    /// contains no ambient root text.
+    #[cfg(test)]
+    pub(crate) fn relative_path(&self) -> &Path {
+        &self.relative
+    }
+
+    /// Prepares the write target without any mutation: no create, truncate or
+    /// write happens here, only capability opens and metadata proofs. An existing
+    /// target is opened write-only nonblocking through the captured root (the
+    /// final symlink is followed inside cap-std containment, so an escape fails
+    /// closed) and its exact physical identity is captured from the opened file;
+    /// a missing target falls back to the create shape only when its direct
+    /// parent already exists and opens through the same capability — no mkdir,
+    /// no intermediate creation.
+    pub(crate) fn prepare(&self) -> Result<PreparedWorkspaceWriteTarget, WorkspaceWriteError> {
+        match self.open_existing() {
+            Ok(file) => {
+                let metadata = file.metadata().map_err(map_write_io_error)?;
+                if !metadata.is_file() {
+                    return Err(WorkspaceWriteError::NotRegularFile);
+                }
+                let identity = WorkspaceMutationIdentity::from_file(
+                    file.try_clone().map_err(map_write_io_error)?.into_std(),
+                )?;
+                Ok(PreparedWorkspaceWriteTarget {
+                    kind: PreparedWorkspaceWriteTargetKind::Existing { file, identity },
+                })
+            }
+            Err(WorkspaceWriteError::Unavailable) => self.prepare_create(),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Opens the target write-only and nonblocking without truncate or create,
+    /// following the final symlink inside cap-std containment. `NotFound` is the
+    /// only trigger for the create shape.
+    fn open_existing(&self) -> Result<cap_std::fs::File, WorkspaceWriteError> {
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true);
+        options._cap_fs_ext_nonblock(true);
+        self.root_dir
+            .open_with(&self.relative, &options)
+            .map_err(map_write_io_error)
+    }
+
+    /// The create shape: the direct parent must already exist and open
+    /// capability-relative (no mkdir anywhere); its exact identity plus the
+    /// normalized final filename form the create key, and later writes open the
+    /// final name only through the retained parent capability.
+    fn prepare_create(&self) -> Result<PreparedWorkspaceWriteTarget, WorkspaceWriteError> {
+        let final_name = self
+            .relative
+            .file_name()
+            .ok_or(WorkspaceWriteError::InvalidTarget)?;
+        let parent_relative = self.relative.parent().unwrap_or(Path::new(""));
+        let (parent, parent_identity) = if parent_relative.as_os_str().is_empty() {
+            let identity = WorkspaceMutationIdentity::from_file(
+                self.root_dir
+                    .try_clone()
+                    .map_err(map_write_io_error)?
+                    .into_std_file(),
+            )?;
+            (Arc::clone(&self.root_dir), identity)
+        } else {
+            let opened = self
+                .root_dir
+                .open_dir(parent_relative)
+                .map_err(map_write_io_error)?;
+            let identity = WorkspaceMutationIdentity::from_file(
+                opened
+                    .try_clone()
+                    .map_err(map_write_io_error)?
+                    .into_std_file(),
+            )?;
+            (Arc::new(opened), identity)
+        };
+        Ok(PreparedWorkspaceWriteTarget {
+            kind: PreparedWorkspaceWriteTargetKind::Create {
+                parent,
+                parent_identity,
+                final_name: PathBuf::from(final_name),
+            },
+        })
+    }
+}
+
+impl fmt::Debug for AuthorizedWorkspaceWritePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthorizedWorkspaceWritePath { .. }")
+    }
+}
+
+/// The move-only prepared mutation carrier: it retains the exact handles opened at
+/// preparation and performs the in-place full replacement later without ever
+/// re-opening by path. Downstream modules can only call [`key`](Self::key) for the
+/// cloneable opaque identity a Session queue serializes on and
+/// [`write`](Self::write) to perform the single full-content replacement; the
+/// retained handles and the final filename stay private, and neither method
+/// exposes ambient paths.
+pub(crate) struct PreparedWorkspaceWriteTarget {
+    kind: PreparedWorkspaceWriteTargetKind,
+}
+
+enum PreparedWorkspaceWriteTargetKind {
+    Existing {
+        /// The exact file opened at preparation; the write truncates and rewrites
+        /// this very handle, so a path replaced after preparation never redirects
+        /// the authorized mutation.
+        file: cap_std::fs::File,
+        identity: WorkspaceMutationIdentity,
+    },
+    Create {
+        /// The exact parent directory opened at preparation; the write opens the
+        /// final name only through this capability.
+        parent: Arc<CapabilityDir>,
+        parent_identity: WorkspaceMutationIdentity,
+        final_name: PathBuf,
+    },
+}
+
+impl PreparedWorkspaceWriteTarget {
+    /// The cloneable opaque key: one exact physical file for an existing target,
+    /// or one exact parent directory plus normalized final filename for a target
+    /// that did not exist at preparation.
+    pub(crate) fn key(&self) -> WorkspaceFileMutationKey {
+        let kind = match &self.kind {
+            PreparedWorkspaceWriteTargetKind::Existing { identity, .. } => {
+                WorkspaceFileMutationKeyKind::Existing(identity.clone())
+            }
+            PreparedWorkspaceWriteTargetKind::Create {
+                parent_identity,
+                final_name,
+                ..
+            } => WorkspaceFileMutationKeyKind::Create {
+                parent: parent_identity.clone(),
+                final_name: final_name.clone(),
+            },
+        };
+        WorkspaceFileMutationKey { kind }
+    }
+
+    /// Performs the in-place full replacement of the prepared target. The
+    /// existing shape seeks to offset zero, truncates to zero bytes and writes
+    /// the exact content through the retained file handle; the create shape
+    /// opens the final name through the retained parent with
+    /// create+truncate+write+nonblock and a final-component no-follow option,
+    /// proves the opened entry is a regular file, then writes the exact content.
+    /// No append, no newline normalization, no fsync, no atomic rename, no
+    /// retries; a failed write is a truthful failure that may have partially
+    /// replaced the target.
+    pub(crate) fn write(&mut self, content: &[u8]) -> Result<(), WorkspaceWriteError> {
+        match &mut self.kind {
+            PreparedWorkspaceWriteTargetKind::Existing { file, .. } => {
+                file.seek(SeekFrom::Start(0))
+                    .map_err(|_| WorkspaceWriteError::WriteFailed)?;
+                file.set_len(0)
+                    .map_err(|_| WorkspaceWriteError::WriteFailed)?;
+                file.write_all(content)
+                    .map_err(|_| WorkspaceWriteError::WriteFailed)?;
+                Ok(())
+            }
+            PreparedWorkspaceWriteTargetKind::Create {
+                parent, final_name, ..
+            } => {
+                let mut options = cap_std::fs::OpenOptions::new();
+                options.write(true);
+                options.create(true);
+                options.truncate(true);
+                options._cap_fs_ext_nonblock(true);
+                options._cap_fs_ext_follow(FollowSymlinks::No);
+                let mut file = parent
+                    .open_with(final_name.as_path(), &options)
+                    .map_err(map_write_io_error)?;
+                let metadata = file.metadata().map_err(map_write_io_error)?;
+                if !metadata.is_file() {
+                    return Err(WorkspaceWriteError::NotRegularFile);
+                }
+                file.write_all(content)
+                    .map_err(|_| WorkspaceWriteError::WriteFailed)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl fmt::Debug for PreparedWorkspaceWriteTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedWorkspaceWriteTarget { .. }")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -2872,19 +3244,20 @@ mod tests {
     use std::thread;
 
     use super::{
-        AuthorizedWorkspaceReadPath, CanonicalWorkspacePath, CapturedWorkspacePromptSource,
-        CapturedWorkspaceSkillSource, LocalWorkspacePathAdapter, OpenedWorkspaceRoot,
+        AuthorizedWorkspaceReadPath, AuthorizedWorkspaceWritePath, CanonicalWorkspacePath,
+        CapturedWorkspacePromptSource, CapturedWorkspaceSkillSource, LocalWorkspacePathAdapter,
+        OpenedWorkspaceRoot, PreparedWorkspaceWriteTarget, PreparedWorkspaceWriteTargetKind,
         RequestedFilesystemAccess, RestrictedWorkspaceAuthority, Workspace, WorkspaceAccessError,
         WorkspaceAccessRoot, WorkspaceAccessView, WorkspaceAuthority, WorkspaceAuthorityDecision,
         WorkspaceAuthorityError, WorkspaceAuthorityRequest, WorkspaceAuthorityRootDecision,
         WorkspaceAuthorityRootRequest, WorkspaceConstructionError, WorkspaceCwdSpec,
-        WorkspaceDefinitionInput, WorkspaceFilesystemGrant, WorkspaceInputLoweringError,
-        WorkspacePathAdapter, WorkspacePathError, WorkspacePathTarget, WorkspaceResolveError,
-        WorkspaceResolver, WorkspaceRootIdentity, WorkspaceRootInput, WorkspaceRootRole,
-        WorkspaceRootSpec, WorkspaceRootTrust, WorkspaceSnapshotFinishError,
+        WorkspaceDefinitionInput, WorkspaceFileMutationKey, WorkspaceFilesystemGrant,
+        WorkspaceInputLoweringError, WorkspacePathAdapter, WorkspacePathError, WorkspacePathTarget,
+        WorkspaceResolveError, WorkspaceResolver, WorkspaceRootIdentity, WorkspaceRootInput,
+        WorkspaceRootRole, WorkspaceRootSpec, WorkspaceRootTrust, WorkspaceSnapshotFinishError,
         WorkspaceSourceCaptureError, WorkspaceSourcePolicy, WorkspaceTrustLevel,
-        WorkspaceTrustRevision, checked_native_uri, lower_workspace, test_capability_scratch,
-        uri_from_spec,
+        WorkspaceTrustRevision, WorkspaceWriteError, checked_native_uri, lower_workspace,
+        test_capability_scratch, uri_from_spec,
     };
     use crate::runtime_task::RuntimeTaskContext;
     use crate::wire::{CanonicalFileUri, SessionId, WorkspaceRelativePath, WorkspaceRevision};
@@ -5479,6 +5852,607 @@ mod tests {
         assert!(poll_once_pending(shutdown.as_mut()).await);
         release.wait();
         shutdown.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_resolver_intersects_requested_access_and_read_resolver_stays_read_only() {
+        let temporary = TempDirectory::new("write-access-intersection");
+        let root = temporary.path().join("root");
+        std::fs::create_dir_all(&root).expect("the test root is creatable");
+        std::fs::write(root.join("notes.txt"), b"body").unwrap();
+        let workspace_for = |requested_access| {
+            Workspace::new(
+                revision(),
+                root_spec_with(
+                    "primary",
+                    root.to_str().unwrap(),
+                    requested_access,
+                    WorkspaceSourcePolicy::new(true, true),
+                ),
+                Vec::new(),
+                cwd("primary", ""),
+            )
+            .unwrap()
+        };
+        let read_only_workspace = workspace_for(RequestedFilesystemAccess::ReadOnly);
+        let read_write_workspace = workspace_for(RequestedFilesystemAccess::ReadWrite);
+        let relative = "notes.txt".parse().unwrap();
+
+        let task_context = initialized_context().await;
+
+        // The read opt-in resolver keeps its exact ReadOnly ceiling: a requested ReadWrite is
+        // tightened to ReadOnly, reads stay authorized, and write authorization is denied.
+        let (read_resolver, _read_control) =
+            WorkspaceResolver::new_with_read_access(task_context.clone());
+        let read_candidate = read_resolver
+            .resolve(session_id(), &read_write_workspace)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_candidate.roots[0].filesystem,
+            WorkspaceFilesystemGrant::ReadOnly
+        );
+        let read_snapshot = read_candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = read_snapshot.tool_context();
+        let read_access = tool_context.access();
+        assert!(read_access.authorize_read(&relative).is_ok());
+        assert_eq!(
+            read_access.authorize_write(&relative).unwrap_err(),
+            WorkspaceWriteError::NotAuthorized
+        );
+
+        // The write opt-in resolver raises the ceiling to ReadWrite, but the
+        // requested-access intersection stays authoritative: a requested ReadOnly root still
+        // ends exactly ReadOnly with the same Restricted trust / false source ceilings, and
+        // its write route is denied.
+        let (write_resolver, _write_control) =
+            WorkspaceResolver::new_with_write_access(task_context.clone());
+        let readonly_candidate = write_resolver
+            .resolve(session_id(), &read_only_workspace)
+            .await
+            .unwrap();
+        assert_eq!(
+            readonly_candidate.roots[0].filesystem,
+            WorkspaceFilesystemGrant::ReadOnly
+        );
+        assert!(!readonly_candidate.roots[0].prompt_source);
+        assert!(!readonly_candidate.roots[0].skill_source);
+        assert_eq!(
+            readonly_candidate.roots[0].trust.level(),
+            WorkspaceTrustLevel::Restricted
+        );
+        let readonly_snapshot = readonly_candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        assert_eq!(
+            readonly_snapshot
+                .tool_context()
+                .access()
+                .authorize_write(&relative)
+                .unwrap_err(),
+            WorkspaceWriteError::NotAuthorized
+        );
+
+        // A requested ReadWrite root under the write resolver resolves exactly ReadWrite
+        // (Prompt/Skill still false, trust Restricted at the fixed revision), and both the
+        // read and the write route authorize.
+        let write_candidate = write_resolver
+            .resolve(session_id(), &read_write_workspace)
+            .await
+            .unwrap();
+        assert_eq!(
+            write_candidate.roots[0].filesystem,
+            WorkspaceFilesystemGrant::ReadWrite
+        );
+        assert!(!write_candidate.roots[0].prompt_source);
+        assert!(!write_candidate.roots[0].skill_source);
+        assert_eq!(
+            write_candidate.roots[0].trust.level(),
+            WorkspaceTrustLevel::Restricted
+        );
+        assert_eq!(write_candidate.roots[0].trust.revision().get(), 1);
+        let write_snapshot = write_candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = write_snapshot.tool_context();
+        let write_access = tool_context.access();
+        assert!(write_access.authorize_read(&relative).is_ok());
+        assert!(write_access.authorize_write(&relative).is_ok());
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn filesystem_revocation_denies_read_and_write_together() {
+        let temporary = TempDirectory::new("write-access-revoke");
+        let root = temporary.path().join("root");
+        std::fs::create_dir_all(&root).expect("the test root is creatable");
+        std::fs::write(root.join("notes.txt"), b"body").unwrap();
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+        let relative = "notes.txt".parse().unwrap();
+
+        let task_context = initialized_context().await;
+        let (resolver, control) = WorkspaceResolver::new_with_write_access(task_context.clone());
+
+        // Before revocation the Session resolves exactly ReadWrite and both routes authorize.
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        assert_eq!(
+            candidate.roots[0].filesystem,
+            WorkspaceFilesystemGrant::ReadWrite
+        );
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = snapshot.tool_context();
+        let access = tool_context.access();
+        assert!(access.authorize_read(&relative).is_ok());
+        assert!(access.authorize_write(&relative).is_ok());
+
+        // Revocation is idempotent and permanent: the same Session now resolves filesystem
+        // None (never AuthorityDenied, never ReadWrite again), Prompt/Skill stay false and
+        // trust stays Restricted, and read and write are denied together.
+        control.revoke(session_id());
+        control.revoke(session_id());
+        let revoked_candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        assert_eq!(
+            revoked_candidate.roots[0].filesystem,
+            WorkspaceFilesystemGrant::None
+        );
+        assert!(!revoked_candidate.roots[0].prompt_source);
+        assert!(!revoked_candidate.roots[0].skill_source);
+        assert_eq!(
+            revoked_candidate.roots[0].trust.level(),
+            WorkspaceTrustLevel::Restricted
+        );
+        let revoked_snapshot = revoked_candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = revoked_snapshot.tool_context();
+        let revoked_access = tool_context.access();
+        assert_eq!(
+            revoked_access.authorize_read(&relative).unwrap_err(),
+            WorkspaceAccessError::NotAuthorized
+        );
+        assert_eq!(
+            revoked_access.authorize_write(&relative).unwrap_err(),
+            WorkspaceWriteError::NotAuthorized
+        );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_authorization_denies_read_only_grants_and_root_paths_and_prepends_cwd() {
+        let temporary = TempDirectory::new("write-deny");
+        let root = temporary.path().join("root");
+        std::fs::create_dir_all(root.join("nested")).expect("the nested cwd is creatable");
+        std::fs::write(root.join("notes.txt"), b"secret body").unwrap();
+        std::fs::write(root.join("nested/data.txt"), b"nested body").unwrap();
+
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", "nested"),
+        )
+        .unwrap();
+        let task_context = initialized_context().await;
+
+        // A ReadOnly effective grant (the read opt-in shape) denies the write route while
+        // leaving the read route untouched: reads are not weakened by the new check.
+        let read_only_resolver = resolver_with_adapters(
+            task_context.clone(),
+            LocalWorkspacePathAdapter,
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadOnly, false, false),
+        );
+        let read_only_candidate = read_only_resolver
+            .resolve(session_id(), &workspace)
+            .await
+            .unwrap();
+        let read_only_snapshot = read_only_candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = read_only_snapshot.tool_context();
+        let read_only_access = tool_context.access();
+        assert!(
+            read_only_access
+                .authorize_read(&"data.txt".parse().unwrap())
+                .is_ok()
+        );
+        assert_eq!(
+            read_only_access
+                .authorize_write(&"data.txt".parse().unwrap())
+                .unwrap_err(),
+            WorkspaceWriteError::NotAuthorized
+        );
+
+        // An exactly-ReadWrite grant authorizes the write route, resolves the target inside
+        // the exact root holding the captured cwd (cwd position prepended), and the prepared
+        // existing carrier replaces the real file through the capability.
+        let write_resolver = resolver_with_adapters(
+            task_context.clone(),
+            LocalWorkspacePathAdapter,
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadWrite, false, false),
+        );
+        let write_candidate = write_resolver
+            .resolve(session_id(), &workspace)
+            .await
+            .unwrap();
+        let write_snapshot = write_candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = write_snapshot.tool_context();
+        let write_access = tool_context.access();
+        let authorized: AuthorizedWorkspaceWritePath = write_access
+            .authorize_write(&"data.txt".parse().unwrap())
+            .unwrap();
+        assert_eq!(authorized.relative_path(), Path::new("nested/data.txt"));
+        let mut prepared = authorized.prepare().unwrap();
+        assert_eq!(prepared.key(), prepared.key());
+        prepared.write(b"replaced nested body").unwrap();
+        assert_eq!(
+            std::fs::read(root.join("nested/data.txt")).unwrap(),
+            b"replaced nested body"
+        );
+
+        // Empty and root paths are invalid write targets.
+        assert_eq!(
+            write_access
+                .authorize_write(&WorkspaceRelativePath::default())
+                .unwrap_err(),
+            WorkspaceWriteError::InvalidTarget
+        );
+        let debug = format!("{authorized:?} {prepared:?}");
+        assert!(!debug.contains("nested/data.txt"));
+        assert!(!debug.contains(temporary.path().to_str().unwrap()));
+        task_context.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn existing_write_target_identity_is_physical_across_symlink_and_hard_link_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDirectory::new("write-existing-identity");
+        let root = temporary.path().join("root");
+        std::fs::create_dir_all(&root).expect("the test root is creatable");
+        std::fs::write(root.join("target.txt"), b"original body").unwrap();
+        symlink("target.txt", root.join("alias.txt")).unwrap();
+        std::fs::hard_link(root.join("target.txt"), root.join("hard.txt")).unwrap();
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+
+        let task_context = initialized_context().await;
+        let (resolver, _control) = WorkspaceResolver::new_with_write_access(task_context.clone());
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = snapshot.tool_context();
+        let access = tool_context.access();
+        let prepared_direct = access
+            .authorize_write(&"target.txt".parse().unwrap())
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let prepared_alias = access
+            .authorize_write(&"alias.txt".parse().unwrap())
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let prepared_hard = access
+            .authorize_write(&"hard.txt".parse().unwrap())
+            .unwrap()
+            .prepare()
+            .unwrap();
+
+        // All three names open to the same physical file: identical opaque mutation keys.
+        let direct_key: WorkspaceFileMutationKey = prepared_direct.key();
+        let alias_key = prepared_alias.key();
+        let hard_key = prepared_hard.key();
+        assert_eq!(direct_key, alias_key);
+        assert_eq!(direct_key, hard_key);
+
+        // Preparation mutates nothing: the body is unchanged after all three prepares.
+        assert_eq!(
+            std::fs::read(root.join("target.txt")).unwrap(),
+            b"original body"
+        );
+
+        // Writing through the direct carrier replaces the shared physical content; the alias
+        // and hard-link carriers observe the same replacement through the same key.
+        let mut direct = prepared_direct;
+        direct.write(b"replaced through direct").unwrap();
+        assert_eq!(
+            std::fs::read(root.join("target.txt")).unwrap(),
+            b"replaced through direct"
+        );
+        assert_eq!(
+            std::fs::read(root.join("hard.txt")).unwrap(),
+            b"replaced through direct"
+        );
+
+        // Writing through the alias carrier replaces the same physical file, and the
+        // truncate-first order drops the old tail: the shorter body is exact.
+        let mut alias = prepared_alias;
+        alias.write(b"short").unwrap();
+        assert_eq!(std::fs::read(root.join("alias.txt")).unwrap(), b"short");
+
+        // Empty content is a truthful full replacement to zero bytes.
+        let mut hard = prepared_hard;
+        hard.write(b"").unwrap();
+        assert_eq!(std::fs::read(root.join("hard.txt")).unwrap(), b"");
+
+        // Key Debug is opaque and redacts paths and physical identity.
+        let debug = format!("{direct_key:?} {alias_key:?} {hard_key:?}");
+        assert!(!debug.contains("target.txt"));
+        assert!(!debug.contains(temporary.path().to_str().unwrap()));
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_write_target_key_binds_exact_parent_and_final_name() {
+        let temporary = TempDirectory::new("write-create-key");
+        let root = temporary.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).expect("the sub directory is creatable");
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+
+        let task_context = initialized_context().await;
+        let (resolver, _control) = WorkspaceResolver::new_with_write_access(task_context.clone());
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = snapshot.tool_context();
+        let access = tool_context.access();
+
+        // The same missing target prepared twice binds the same parent identity plus the
+        // same normalized final filename, so the create keys are equal even though each
+        // preparation re-opens the parent separately.
+        let first: PreparedWorkspaceWriteTarget = access
+            .authorize_write(&"sub/missing.txt".parse().unwrap())
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let second = access
+            .authorize_write(&"sub/missing.txt".parse().unwrap())
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert_eq!(first.key(), second.key());
+
+        // Preparation does no create: the target still does not exist after preparing.
+        assert!(!root.join("sub/missing.txt").exists());
+        assert!(!root.join("missing.txt").exists());
+
+        // A different final filename in the same parent is a different key.
+        let other_name = access
+            .authorize_write(&"sub/other.txt".parse().unwrap())
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert_ne!(first.key(), other_name.key());
+
+        // The same final filename under a different parent (the root) is a different key.
+        let other_parent = access
+            .authorize_write(&"missing.txt".parse().unwrap())
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert_ne!(first.key(), other_parent.key());
+
+        // The create write creates the file through the retained parent capability and a
+        // later write is a full replacement (including empty content).
+        let mut created = first;
+        created.write(b"created body").unwrap();
+        assert_eq!(
+            std::fs::read(root.join("sub/missing.txt")).unwrap(),
+            b"created body"
+        );
+        created.write(b"replaced").unwrap();
+        assert_eq!(
+            std::fs::read(root.join("sub/missing.txt")).unwrap(),
+            b"replaced"
+        );
+        created.write(b"").unwrap();
+        assert_eq!(std::fs::read(root.join("sub/missing.txt")).unwrap(), b"");
+
+        // A regular file that appears after preparation is opened by the same overwrite
+        // semantics: no create-new-only surprise, the full content is replaced.
+        let mut appeared = other_name;
+        std::fs::write(root.join("sub/other.txt"), b"appeared body").unwrap();
+        appeared.write(b"overwrote it").unwrap();
+        assert_eq!(
+            std::fs::read(root.join("sub/other.txt")).unwrap(),
+            b"overwrote it"
+        );
+        task_context.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_preparation_fails_closed_for_missing_parent_special_directory_and_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDirectory::new("write-prepare-fail");
+        let root = temporary.path().join("root");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(root.join("sub")).expect("the sub directory is creatable");
+        std::fs::create_dir_all(&outside).expect("the outside directory is creatable");
+        std::fs::write(root.join("file.txt"), b"a regular file").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"outside secret").unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        let fifo = root.join("gate.fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg("-m")
+            .arg("600")
+            .arg(&fifo)
+            .status()
+            .expect("the mkfifo command runs");
+        assert!(made.success(), "the test FIFO is creatable");
+
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+
+        let task_context = initialized_context().await;
+        let (resolver, _control) = WorkspaceResolver::new_with_write_access(task_context.clone());
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = snapshot.tool_context();
+        let access = tool_context.access();
+        let error_for = |relative: &str| {
+            access
+                .authorize_write(&relative.parse().unwrap())
+                .unwrap()
+                .prepare()
+                .unwrap_err()
+        };
+
+        // A missing parent directory fails closed: nothing is created, no mkdir anywhere.
+        assert_eq!(
+            error_for("no-such-dir/missing.txt"),
+            WorkspaceWriteError::Unavailable
+        );
+        // A directory target cannot be opened write-only.
+        assert_eq!(error_for("sub"), WorkspaceWriteError::OpenFailed);
+        // A regular file used as an intermediate path component is not a directory.
+        assert_eq!(
+            error_for("file.txt/child.txt"),
+            WorkspaceWriteError::OpenFailed
+        );
+        // A FIFO is a special entry: the nonblocking write-only open fails closed and the
+        // preparation never hangs on it.
+        assert_eq!(error_for("gate.fifo"), WorkspaceWriteError::OpenFailed);
+        // A symlink whose target lies outside the root fails closed at the capability open,
+        // both as an intermediate component and as the final component.
+        assert_eq!(
+            error_for("escape/secret.txt"),
+            WorkspaceWriteError::OpenFailed
+        );
+        assert_eq!(error_for("escape"), WorkspaceWriteError::OpenFailed);
+        // The outside file was never touched.
+        assert_eq!(
+            std::fs::read(outside.join("secret.txt")).unwrap(),
+            b"outside secret"
+        );
+        task_context.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_write_rejects_a_final_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDirectory::new("write-create-no-follow");
+        let root = temporary.path().join("root");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(&root).expect("the test root is creatable");
+        std::fs::create_dir_all(&outside).expect("the outside directory is creatable");
+        std::fs::write(outside.join("victim.txt"), b"victim body").unwrap();
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                root.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+
+        let task_context = initialized_context().await;
+        let (resolver, _control) = WorkspaceResolver::new_with_write_access(task_context.clone());
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let tool_context = snapshot.tool_context();
+        let access = tool_context.access();
+
+        // The target is missing at preparation, so the carrier is the create shape bound to
+        // the root parent and the final filename. The key is opaque, so this workspace-local
+        // test inspects the private internal shape directly; downstream code must rely on
+        // key equality and write behavior instead.
+        let mut prepared: PreparedWorkspaceWriteTarget = access
+            .authorize_write(&"target.txt".parse().unwrap())
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert!(matches!(
+            prepared.kind,
+            PreparedWorkspaceWriteTargetKind::Create { .. }
+        ));
+
+        // Between preparation and the write an external process replaces the final name with
+        // a symlink pointing outside the root. The create open uses a final-component
+        // no-follow option, so the write fails closed instead of writing through the link.
+        symlink(outside.join("victim.txt"), root.join("target.txt")).unwrap();
+        assert_eq!(
+            prepared.write(b"attacker payload").unwrap_err(),
+            WorkspaceWriteError::OpenFailed
+        );
+        assert_eq!(
+            std::fs::read(outside.join("victim.txt")).unwrap(),
+            b"victim body"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("target.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        task_context.shutdown().await;
     }
 
     fn revision() -> WorkspaceRevision {
