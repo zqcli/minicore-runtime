@@ -7,6 +7,10 @@ pub(crate) mod compaction;
 pub use compaction::CompactionSettings;
 pub(crate) mod conversation_storage;
 pub(crate) mod durable_state;
+// Crate-private protocol-neutral shared locked-down HTTP transport owner: the one deep
+// primitive shared by the direct provider adapters and the fetch_url builtin's pinned
+// per-origin clients (see `http_transport`).
+pub(crate) mod http_transport;
 // Preserve the established crate path while making the reducer a descendant of its storage owner.
 pub(crate) use conversation_storage::live_conversation;
 pub mod model_gateway;

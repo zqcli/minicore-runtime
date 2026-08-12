@@ -45,10 +45,11 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::http_transport::build_client;
 use crate::model_gateway::provider_transport::{
-    SseParser, build_client, cancelled, classify_send_error, invalid_provider_response,
-    invalid_request_not_sent, is_event_stream, parse_retry_after, read_bounded_envelope,
-    response_byte_limit, transport_read_error,
+    SseParser, cancelled, classify_send_error, invalid_provider_response, invalid_request_not_sent,
+    is_event_stream, parse_retry_after, read_bounded_envelope, response_byte_limit,
+    transport_read_error,
 };
 use crate::model_gateway::{
     ApiModelName, ModelCallErrorReason, ModelContentDelta, ModelFinishReason, ModelProgressEvent,
@@ -114,8 +115,10 @@ impl OpenAiResponsesProviderAdapter {
         {
             return Err(OpenAiProviderConfigError::InvalidEndpoint);
         }
-        // The locked-down client (no redirects, no retries, no ambient proxy) is the
-        // shared production constructor; the typed ClientBuild mapping is preserved.
+        // The locked-down client (no redirects, no retries, no ambient proxy, fixed
+        // product UA, explicit no-compression) is the shared production constructor
+        // `crate::http_transport::build_client`; the typed ClientBuild mapping is
+        // preserved.
         let client = build_client().map_err(|_| OpenAiProviderConfigError::ClientBuild)?;
         Ok(Self { client, endpoint })
     }
@@ -1441,7 +1444,7 @@ mod tests {
         assert_eq!(request.header("accept"), Some("text/event-stream"));
         assert_eq!(
             request.header("user-agent"),
-            // The shared locked-down transport contract (provider_transport::USER_AGENT):
+            // The shared locked-down transport contract (crate::http_transport::USER_AGENT):
             // the exact fixed product UA, identical for every direct adapter, never a
             // browser disguise. Pinned literally so the wire value cannot drift from
             // the compile-time package name/version concat without failing this test.
