@@ -24,6 +24,10 @@ mod ask_user;
 /// reads one UTF-8 text file relative to the Workspace cwd.
 mod read_file;
 
+/// The production `list_directory` builtin: one closed, default-off, Runtime-owned Tool
+/// that lists the direct entries of one directory relative to the Workspace cwd.
+mod list_directory;
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolNameError {
     #[error("tool name must be 1..=64 bytes")]
@@ -1037,6 +1041,22 @@ impl ToolSet {
         task_context: RuntimeTaskContext,
     ) -> Arc<Self> {
         read_file::build_tool_set(workspace, task_context)
+    }
+
+    /// The production opt-in list_directory builtin ToolSet: exactly one immutable
+    /// `list_directory` Tool with its closed schema, its `FilesystemRead` planner, and the
+    /// available `FilesystemRead` sandbox contract, pinned to the exact captured Workspace
+    /// tool context and the exact Runtime task context.  `open` selects exactly one ToolSet
+    /// and passes it through the existing residency capture; the default Runtime ToolSet
+    /// stays empty.
+    ///
+    /// Focused/module tests keep using this method; production selection and composition use
+    /// [`ProductionToolConfig`].
+    pub(crate) fn list_directory_builtin(
+        workspace: WorkspaceToolContext,
+        task_context: RuntimeTaskContext,
+    ) -> Arc<Self> {
+        list_directory::build_tool_set(workspace, task_context)
     }
 
     #[cfg(test)]
