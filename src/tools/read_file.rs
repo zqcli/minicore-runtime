@@ -75,8 +75,9 @@ use super::{
     ToolSandboxContract, ToolSet, ToolSetInner, ToolSpec,
 };
 
-/// The exact production builtin ToolName.
-const READ_FILE_NAME: &str = "read_file";
+/// The exact production builtin ToolName.  `pub(super)` because the composed production
+/// ToolSet routes exactly this frozen name.
+pub(super) const READ_FILE_NAME: &str = "read_file";
 
 /// The exact production description disclosed for the builtin: reading one UTF-8 text file
 /// relative to the Workspace working directory.  Frozen; asserted verbatim in module tests.
@@ -128,14 +129,11 @@ const READ_FILE_SCHEMA: &str = r#"{
   "additionalProperties": false
 }"#;
 
-/// Builds the exact immutable production `read_file` ToolSet: one definition, one matching
-/// spec, the builtin planner pinned to the exact captured Workspace tool context and task
-/// context, and the available sandbox contract enforcing exactly `FilesystemRead`.
-pub(super) fn build_tool_set(
-    workspace: WorkspaceToolContext,
-    task_context: RuntimeTaskContext,
-) -> Arc<ToolSet> {
-    let definition = ToolDefinition {
+/// The exact frozen production definition/spec pair: the single source shared by the
+/// standalone builtin ToolSet and the composed production ToolSet, so the disclosed
+/// definition and spec are byte-identical in both selections.
+pub(super) fn definition() -> ToolDefinition {
+    ToolDefinition {
         spec: ToolSpec {
             name: READ_FILE_NAME
                 .parse()
@@ -148,7 +146,24 @@ pub(super) fn build_tool_set(
         // One bounded regular-file read per call; the definition does not impose Serial
         // execution semantics on unrelated operations in a future composed ToolSet.
         mode: ToolExecutionMode::Parallel,
-    };
+    }
+}
+
+/// The outer ToolSet sandbox contract of the read_file builtin: available exactly for
+/// `FilesystemRead`.  The composed production ToolSet keeps this exact contract, so the
+/// read_file route's Execute plan is admitted exactly once against the same ceiling.
+pub(super) fn sandbox() -> ToolSandboxContract {
+    ToolSandboxContract::available([ToolCapabilityClass::FilesystemRead])
+}
+
+/// Builds the exact immutable production `read_file` ToolSet: one definition, one matching
+/// spec, the builtin planner pinned to the exact captured Workspace tool context and task
+/// context, and the available sandbox contract enforcing exactly `FilesystemRead`.
+pub(super) fn build_tool_set(
+    workspace: WorkspaceToolContext,
+    task_context: RuntimeTaskContext,
+) -> Arc<ToolSet> {
+    let definition = definition();
     let specs: Arc<[ToolSpec]> = Arc::from([definition.spec.clone()]);
     let definitions: Arc<[ToolDefinition]> = Arc::from([definition]);
     let planner: Arc<super::ToolPlanner> =
@@ -158,7 +173,7 @@ pub(super) fn build_tool_set(
             definitions,
             specs,
             planner: Some(planner),
-            sandbox: ToolSandboxContract::available([ToolCapabilityClass::FilesystemRead]),
+            sandbox: sandbox(),
         }),
     })
 }
@@ -167,8 +182,9 @@ pub(super) fn build_tool_set(
 /// plans the Execute shape carrying exactly `FilesystemRead` and a move-only start factory;
 /// every parse/semantic failure plans the frozen `PreExecution + Failed` result; every
 /// authorization failure plans the frozen `PreExecution + Denied` result before any start
-/// factory exists.
-fn plan(
+/// factory exists.  `pub(super)` because the composed production ToolSet routes exactly this
+/// frozen planner.
+pub(super) fn plan(
     workspace: &WorkspaceToolContext,
     task_context: &RuntimeTaskContext,
     request: ToolExecutionRequest,
