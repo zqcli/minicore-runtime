@@ -31,6 +31,11 @@ mod read_file;
 /// that lists the direct entries of one directory relative to the Workspace cwd.
 mod list_directory;
 
+/// The production `write_file` builtin: one closed, default-off, Runtime-owned Tool that
+/// writes UTF-8 text to one file relative to the Workspace cwd, replacing its full
+/// contents or creating the file when its parent directory exists.
+mod write_file;
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolNameError {
     #[error("tool name must be 1..=64 bytes")]
@@ -399,10 +404,6 @@ impl ToolExecutionStart {
 /// start factory, or a truthful unstarted `ToolExecutionResult`.  The factory and its
 /// result stay deep and redacted: no Workspace handle or path ever leaves the producing
 /// builtin, and there is no generic resource-lock abstraction anywhere on this surface.
-#[allow(
-    dead_code,
-    reason = "the production write_file planner constructs this in its own slice; scripted test planners use the cfg(test) constructor"
-)]
 pub(crate) struct ToolExecutionPreparation {
     factory: Box<dyn FnOnce() -> ToolExecutionPreparationFuture + Send>,
 }
@@ -412,9 +413,9 @@ pub(crate) type ToolExecutionPreparationFuture =
     Pin<Box<dyn Future<Output = PreparedToolExecution> + Send + 'static>>;
 
 impl ToolExecutionPreparation {
-    /// Test-visible constructor for scripted planners; the production write_file planner
-    /// supplies the production constructor in its own slice.
-    #[cfg(test)]
+    /// The production constructor: the write_file builtin planner binds one exact
+    /// file-mutation plan to its move-only preparation factory with it; scripted planners
+    /// use it in tests.
     pub(crate) fn new(
         factory: impl FnOnce() -> ToolExecutionPreparationFuture + Send + 'static,
     ) -> Self {
@@ -447,10 +448,6 @@ impl fmt::Debug for ToolExecutionPreparation {
 /// fails closed under that same pre-execution binding.  A `Ready` that settles after the
 /// exact emergency basis was signaled meanwhile is dropped by the round owner without any
 /// queue reservation or start, keeping the operation unstarted-cancelled.
-#[allow(
-    dead_code,
-    reason = "settled by scripted test preparation futures; the production write_file preparation settles it in its own slice"
-)]
 pub(crate) enum PreparedToolExecution {
     Ready {
         key: WorkspaceFileMutationKey,
@@ -1481,6 +1478,24 @@ impl ToolSet {
         list_directory::build_tool_set(workspace, task_context)
     }
 
+    /// The production opt-in write_file builtin ToolSet: exactly one immutable
+    /// `write_file` Tool with its closed schema, its `FilesystemWrite` planner, and the
+    /// available `FilesystemWrite` sandbox contract, pinned to the exact captured
+    /// Workspace tool context, the exact Runtime task context, and the exact Session-local
+    /// mutation queue its plans reserve against.  `open` selects exactly one ToolSet and
+    /// passes it through the existing residency capture; the default Runtime ToolSet stays
+    /// empty.
+    ///
+    /// Focused/module tests use this method; production selection and composition use
+    /// [`ProductionToolConfig`].
+    pub(crate) fn write_file_builtin(
+        workspace: WorkspaceToolContext,
+        task_context: RuntimeTaskContext,
+        file_mutation_queue: Arc<SessionFileMutationQueue>,
+    ) -> Arc<Self> {
+        write_file::build_tool_set(workspace, task_context, file_mutation_queue)
+    }
+
     #[cfg(test)]
     pub(crate) fn with_executor(
         definitions: Vec<ToolDefinition>,
@@ -1909,17 +1924,17 @@ impl ToolSet {
     }
 }
 
-/// The frozen production Tool composition config: exactly the three closed Runtime-owned
-/// builtins (`ask_user`, `read_file`, `list_directory`), each independently opt-in at
-/// [`ProductionToolConfig::new`] and never changed afterwards.
+/// The frozen production Tool composition config: exactly the four closed Runtime-owned
+/// builtins (`ask_user`, `read_file`, `list_directory`, `write_file`), each independently
+/// opt-in at [`ProductionToolConfig::new`] and never changed afterwards.
 ///
 /// The config freezes its base exactly once at `new` — the empty default or the single
 /// `ask_user` builtin — and `for_workspace` composes at the module planner level.  There is
 /// no generic registry, no arbitrary merge API, no dynamic callbacks, and no name-based
-/// open-world lookup: the composed set contains exactly the three frozen names in one frozen
-/// order (`ask_user` → `read_file` → `list_directory`) with only the enabled members, and
-/// routes each valid call to exactly one builtin planner, while invalid/unknown names stay
-/// unavailable through the normal ToolSet lookup.
+/// open-world lookup: the composed set contains exactly the four frozen names in one frozen
+/// order (`ask_user` → `read_file` → `list_directory` → `write_file`) with only the
+/// enabled members, and routes each valid call to exactly one builtin planner, while
+/// invalid/unknown names stay unavailable through the normal ToolSet lookup.
 #[derive(Clone)]
 pub(crate) struct ProductionToolConfig {
     /// Whether the selection includes the frozen `ask_user` builtin.
@@ -1928,6 +1943,8 @@ pub(crate) struct ProductionToolConfig {
     read_file: bool,
     /// Whether the selection includes the workspace-bound `list_directory` builtin.
     list_directory: bool,
+    /// Whether the selection includes the workspace-bound `write_file` builtin.
+    write_file: bool,
     /// The frozen base captured exactly once at `new`: the empty default or the single
     /// `ask_user` builtin.  With no workspace-bound tool enabled, every `for_workspace`
     /// call returns this exact same captured `Arc`.
@@ -1936,8 +1953,14 @@ pub(crate) struct ProductionToolConfig {
 
 impl ProductionToolConfig {
     /// Freezes the production selection and its base exactly once: the empty default when
-    /// `ask_user` is off, otherwise the exact `ask_user` builtin ToolSet.
-    pub(crate) fn new(ask_user: bool, read_file: bool, list_directory: bool) -> Self {
+    /// `ask_user` is off, otherwise the exact `ask_user` builtin ToolSet.  The four bools
+    /// are independent and closed: exactly 16 selections exist.
+    pub(crate) fn new(
+        ask_user: bool,
+        read_file: bool,
+        list_directory: bool,
+        write_file: bool,
+    ) -> Self {
         let base = if ask_user {
             ask_user::build_tool_set()
         } else {
@@ -1947,34 +1970,37 @@ impl ProductionToolConfig {
             ask_user,
             read_file,
             list_directory,
+            write_file,
             base,
         }
     }
 
     /// Materializes the exact selected ToolSet for one Workspace/task context.
     ///
-    /// With no workspace-bound tool (`read_file`, `list_directory`) enabled, every call
-    /// returns the same captured base `Arc` (the empty default or the single `ask_user`
-    /// builtin).  Otherwise the selection is materialized per admission: one immutable
-    /// composed set containing exactly the enabled members in the frozen `ask_user` →
-    /// `read_file` → `list_directory` order, bound to the exact Workspace tool context and
-    /// Runtime task context, with one frozen three-route planner and the `FilesystemRead`
-    /// outer sandbox contract.  The exact Session-local mutation queue is captured into the
-    /// composed planner for the future write_file route; the three current builtins ignore
-    /// it.
+    /// With no workspace-bound tool (`read_file`, `list_directory`, `write_file`)
+    /// enabled, every call returns the same captured base `Arc` (the empty default or the
+    /// single `ask_user` builtin).  Otherwise the selection is materialized per admission:
+    /// one immutable composed set containing exactly the enabled members in the frozen
+    /// `ask_user` → `read_file` → `list_directory` → `write_file` order, bound to the exact
+    /// Workspace tool context and Runtime task context, with one frozen four-route planner
+    /// and the exact outer sandbox contract required by the enabled workspace routes
+    /// (`FilesystemRead`, `FilesystemWrite`, or their union).  The exact Session-local
+    /// mutation queue is captured into the composed planner and bound into every write_file
+    /// route's mutation plans.
     pub(crate) fn for_workspace(
         &self,
         workspace: WorkspaceToolContext,
         task_context: RuntimeTaskContext,
         file_mutation_queue: Arc<SessionFileMutationQueue>,
     ) -> Arc<ToolSet> {
-        if !self.read_file && !self.list_directory {
+        if !self.read_file && !self.list_directory && !self.write_file {
             return Arc::clone(&self.base);
         }
         composed_production_tool_set(
             self.ask_user,
             self.read_file,
             self.list_directory,
+            self.write_file,
             workspace,
             task_context,
             file_mutation_queue,
@@ -2000,8 +2026,8 @@ impl TurnToolResources {
     /// Materializes the exact ToolSet for one admission: a `Captured` set returns its Arc
     /// unchanged, while a `Production` config installs its set against the exact captured
     /// Workspace tool context.  The exact Session-local mutation queue is passed through so
-    /// a production ToolSet may capture the same queue per admission (the current three
-    /// builtins ignore it; the future write_file route binds its mutation plans to it).
+    /// a production ToolSet may capture the same queue per admission (the read/list
+    /// builtins ignore it; the write_file route binds its mutation plans to it).
     /// Consumes `self` so one admission materializes exactly once.
     pub(crate) fn materialize(
         self,
@@ -2020,10 +2046,12 @@ impl TurnToolResources {
 
 /// The frozen closed composer for one production selection: exactly the enabled builtin
 /// definitions/specs pushed by bool in one deterministic order (`ask_user` → `read_file` →
-/// `list_directory`, only enabled members, never a duplicate), one frozen planner that
-/// routes exactly the three frozen names to exactly one builtin planner each, and the
-/// shared `FilesystemRead` outer sandbox contract (the caller composes only when at least
-/// one workspace-bound tool is enabled).
+/// `list_directory` → `write_file`, only enabled members, never a duplicate), one frozen
+/// planner that routes exactly the four frozen names to exactly one builtin planner each,
+/// and the outer sandbox contract that is the exact union required by the enabled workspace
+/// routes: `FilesystemRead` for read/list only, `FilesystemWrite` for write only, and their
+/// union when any read/list route joins the write route (the caller composes only when at
+/// least one workspace-bound tool is enabled).
 ///
 /// The composition happens at the module planner level, so each enabled workspace-bound
 /// route is admitted exactly once against the outer contract (never twice), while the
@@ -2033,6 +2061,7 @@ fn composed_production_tool_set(
     ask_user: bool,
     read_file: bool,
     list_directory: bool,
+    write_file: bool,
     workspace: WorkspaceToolContext,
     task_context: RuntimeTaskContext,
     file_mutation_queue: Arc<SessionFileMutationQueue>,
@@ -2047,35 +2076,48 @@ fn composed_production_tool_set(
     if list_directory {
         definitions.push(list_directory::definition());
     }
+    if write_file {
+        definitions.push(write_file::definition());
+    }
     let specs: Arc<[ToolSpec]> = definitions
         .iter()
         .map(|definition| definition.spec.clone())
         .collect();
+    let sandbox = if read_file || list_directory {
+        if write_file {
+            ToolSandboxContract::available([
+                ToolCapabilityClass::FilesystemRead,
+                ToolCapabilityClass::FilesystemWrite,
+            ])
+        } else {
+            read_file::sandbox()
+        }
+    } else {
+        // Only the write route is enabled: exactly the write ceiling.
+        write_file::sandbox()
+    };
     let planner: Arc<ToolPlanner> = Arc::new({
         let workspace = workspace.clone();
         let task_context = task_context.clone();
         // The exact Session-local mutation queue captured at this admission: the frozen
-        // write_file route (the next slice) binds its mutation plans to this queue; the
-        // three current builtins never touch it.
+        // write_file route binds its mutation plans to this queue; the other three
+        // builtins never touch it.
         let file_mutation_queue = Arc::clone(&file_mutation_queue);
-        move |request| {
-            // Keep the per-admission queue capture owned by the composed planner so the
-            // future write_file route can embed it into its mutation plans; the current
-            // routes never touch it.
-            let _queue_capture = &file_mutation_queue;
-            match request.call().name().as_str() {
-                ask_user::ASK_USER_NAME => ask_user::plan(request),
-                read_file::READ_FILE_NAME => read_file::plan(&workspace, &task_context, request),
-                list_directory::LIST_DIRECTORY_NAME => {
-                    list_directory::plan(&workspace, &task_context, request)
-                }
-                // The normal ToolSet lookup invokes the planner only for a name present in this
-                // set's definitions, which are exactly the enabled frozen names above, so no
-                // other name can ever reach the composed planner.
-                _ => unreachable!(
-                    "the composed production ToolSet routes exactly the three frozen builtin names"
-                ),
+        move |request| match request.call().name().as_str() {
+            ask_user::ASK_USER_NAME => ask_user::plan(request),
+            read_file::READ_FILE_NAME => read_file::plan(&workspace, &task_context, request),
+            list_directory::LIST_DIRECTORY_NAME => {
+                list_directory::plan(&workspace, &task_context, request)
             }
+            write_file::WRITE_FILE_NAME => {
+                write_file::plan(&workspace, &task_context, &file_mutation_queue, request)
+            }
+            // The normal ToolSet lookup invokes the planner only for a name present in this
+            // set's definitions, which are exactly the enabled frozen names above, so no
+            // other name can ever reach the composed planner.
+            _ => unreachable!(
+                "the composed production ToolSet routes exactly the four frozen builtin names"
+            ),
         }
     });
     Arc::new(ToolSet {
@@ -2083,7 +2125,7 @@ fn composed_production_tool_set(
             definitions: definitions.into(),
             specs,
             planner: Some(planner),
-            sandbox: read_file::sandbox(),
+            sandbox,
         }),
     })
 }
@@ -5348,17 +5390,21 @@ mod tests {
             .expect("the composition test session id is canonical")
     }
 
-    /// Lowers one real temp-dir Workspace (one primary root, cwd at `cwd_relative` inside
-    /// it) through the production lowering path — the same Workspace test helpers the
-    /// read_file module tests use.
-    fn composition_workspace_spec(root: &Path, cwd_relative: &str) -> Workspace {
+    /// Lowers one real temp-dir Workspace (one primary root with the given requested
+    /// access, cwd at `cwd_relative` inside it) through the production lowering path — the
+    /// same Workspace test helpers the read_file module tests use.
+    fn composition_workspace_spec(
+        root: &Path,
+        cwd_relative: &str,
+        access: RequestedFilesystemAccess,
+    ) -> Workspace {
         let uri: CanonicalFileUri = format!("file://{}", root.display())
             .parse()
             .expect("the test root is a canonical native file URI");
         let root_input = WorkspaceRootInput::new(
             "primary".parse().expect("the test root key is canonical"),
             uri,
-            RequestedFilesystemAccess::ReadOnly,
+            access,
             WorkspaceSourcePolicy::new(false, false),
         );
         let input = WorkspaceDefinitionInput::new(
@@ -5412,10 +5458,40 @@ mod tests {
             .expect("the test runtime provides tracked task admission");
         let resolver =
             WorkspaceResolver::new_with_source_grants_for_test(task_context.clone(), false, false);
-        let workspace =
-            resolve_composition_context(resolver, composition_workspace_spec(temporary.path(), ""))
-                .await;
+        let workspace = resolve_composition_context(
+            resolver,
+            composition_workspace_spec(temporary.path(), "", RequestedFilesystemAccess::ReadOnly),
+        )
+        .await;
         CompositionWorkspace {
+            _temporary: temporary,
+            task_context,
+            workspace,
+        }
+    }
+
+    /// One real temp-dir ReadWrite-requested root resolved through the production
+    /// write-access resolver: a write-granted tool context with one fixture file, plus the
+    /// live task context the selection pins.
+    struct CompositionWriteWorkspace {
+        _temporary: CompositionTempDir,
+        task_context: RuntimeTaskContext,
+        workspace: WorkspaceToolContext,
+    }
+
+    async fn composition_write_workspace() -> CompositionWriteWorkspace {
+        let temporary = CompositionTempDir::new("selection-write");
+        write_fixture(temporary.path(), "target.txt", b"body");
+        let task_context = RuntimeTaskContext::new(tokio::runtime::Handle::current())
+            .await
+            .expect("the test runtime provides tracked task admission");
+        let (resolver, _control) = WorkspaceResolver::new_with_write_access(task_context.clone());
+        let workspace = resolve_composition_context(
+            resolver,
+            composition_workspace_spec(temporary.path(), "", RequestedFilesystemAccess::ReadWrite),
+        )
+        .await;
+        CompositionWriteWorkspace {
             _temporary: temporary,
             task_context,
             workspace,
@@ -5446,54 +5522,105 @@ mod tests {
         ask_user: bool,
         read_file: bool,
         list_directory: bool,
+        write_file: bool,
         names: &'static [&'static str],
     }
 
-    /// The closed eight-selection surface: every combination of the three frozen builtin
+    /// The closed sixteen-selection surface: every combination of the four frozen builtin
     /// opt-ins, with the exact expected ordered names (the fixed definition/spec order
-    /// `ask_user` → `read_file` → `list_directory`, only enabled members, no duplicates).
-    const SELECTIONS: [Selection; 8] = [
+    /// `ask_user` → `read_file` → `list_directory` → `write_file`, only enabled members,
+    /// no duplicates).
+    const SELECTIONS: [Selection; 16] = [
         Selection {
             ask_user: false,
             read_file: false,
             list_directory: false,
+            write_file: false,
             names: &[],
         },
         Selection {
             ask_user: true,
             read_file: false,
             list_directory: false,
+            write_file: false,
             names: &[ask_user::ASK_USER_NAME],
         },
         Selection {
             ask_user: false,
             read_file: true,
             list_directory: false,
+            write_file: false,
             names: &[read_file::READ_FILE_NAME],
         },
         Selection {
             ask_user: false,
             read_file: false,
             list_directory: true,
+            write_file: false,
             names: &[list_directory::LIST_DIRECTORY_NAME],
+        },
+        Selection {
+            ask_user: false,
+            read_file: false,
+            list_directory: false,
+            write_file: true,
+            names: &[write_file::WRITE_FILE_NAME],
         },
         Selection {
             ask_user: true,
             read_file: true,
             list_directory: false,
+            write_file: false,
             names: &[ask_user::ASK_USER_NAME, read_file::READ_FILE_NAME],
         },
         Selection {
             ask_user: true,
             read_file: false,
             list_directory: true,
+            write_file: false,
             names: &[ask_user::ASK_USER_NAME, list_directory::LIST_DIRECTORY_NAME],
+        },
+        Selection {
+            ask_user: true,
+            read_file: false,
+            list_directory: false,
+            write_file: true,
+            names: &[ask_user::ASK_USER_NAME, write_file::WRITE_FILE_NAME],
         },
         Selection {
             ask_user: false,
             read_file: true,
             list_directory: true,
+            write_file: false,
             names: &[
+                read_file::READ_FILE_NAME,
+                list_directory::LIST_DIRECTORY_NAME,
+            ],
+        },
+        Selection {
+            ask_user: false,
+            read_file: true,
+            list_directory: false,
+            write_file: true,
+            names: &[read_file::READ_FILE_NAME, write_file::WRITE_FILE_NAME],
+        },
+        Selection {
+            ask_user: false,
+            read_file: false,
+            list_directory: true,
+            write_file: true,
+            names: &[
+                list_directory::LIST_DIRECTORY_NAME,
+                write_file::WRITE_FILE_NAME,
+            ],
+        },
+        Selection {
+            ask_user: true,
+            read_file: true,
+            list_directory: true,
+            write_file: false,
+            names: &[
+                ask_user::ASK_USER_NAME,
                 read_file::READ_FILE_NAME,
                 list_directory::LIST_DIRECTORY_NAME,
             ],
@@ -5501,23 +5628,59 @@ mod tests {
         Selection {
             ask_user: true,
             read_file: true,
+            list_directory: false,
+            write_file: true,
+            names: &[
+                ask_user::ASK_USER_NAME,
+                read_file::READ_FILE_NAME,
+                write_file::WRITE_FILE_NAME,
+            ],
+        },
+        Selection {
+            ask_user: true,
+            read_file: false,
             list_directory: true,
+            write_file: true,
+            names: &[
+                ask_user::ASK_USER_NAME,
+                list_directory::LIST_DIRECTORY_NAME,
+                write_file::WRITE_FILE_NAME,
+            ],
+        },
+        Selection {
+            ask_user: false,
+            read_file: true,
+            list_directory: true,
+            write_file: true,
+            names: &[
+                read_file::READ_FILE_NAME,
+                list_directory::LIST_DIRECTORY_NAME,
+                write_file::WRITE_FILE_NAME,
+            ],
+        },
+        Selection {
+            ask_user: true,
+            read_file: true,
+            list_directory: true,
+            write_file: true,
             names: &[
                 ask_user::ASK_USER_NAME,
                 read_file::READ_FILE_NAME,
                 list_directory::LIST_DIRECTORY_NAME,
+                write_file::WRITE_FILE_NAME,
             ],
         },
     ];
 
     #[tokio::test(flavor = "current_thread")]
-    async fn production_config_all_eight_selections_freeze_exact_names_specs_reuse_and_sandbox() {
+    async fn production_config_all_sixteen_selections_freeze_exact_names_specs_reuse_and_sandbox() {
         let rig = composition_workspace().await;
         for selection in SELECTIONS {
             let config = ProductionToolConfig::new(
                 selection.ask_user,
                 selection.read_file,
                 selection.list_directory,
+                selection.write_file,
             );
             let set = config.for_workspace(
                 rig.workspace.clone(),
@@ -5546,13 +5709,22 @@ mod tests {
                 assert_eq!(spec.name().as_str(), *name, "selection {selection:?}");
             }
 
-            // The outer sandbox contract is available exactly for FilesystemRead when any
-            // workspace-bound tool is enabled, and the empty available contract otherwise.
-            let has_workspace_tools = selection.read_file || selection.list_directory;
-            let expected_sandbox = if has_workspace_tools {
-                ToolSandboxContract::available([C::FilesystemRead])
-            } else {
+            // The outer sandbox contract is the exact union required by the enabled
+            // workspace routes: none => available []; read/list only => FilesystemRead;
+            // write only => FilesystemWrite; any read/list + write => the union.
+            let has_workspace_tools =
+                selection.read_file || selection.list_directory || selection.write_file;
+            let expected_sandbox = if !has_workspace_tools {
                 ToolSandboxContract::available([])
+            } else {
+                let mut classes = Vec::new();
+                if selection.read_file || selection.list_directory {
+                    classes.push(C::FilesystemRead);
+                }
+                if selection.write_file {
+                    classes.push(C::FilesystemWrite);
+                }
+                ToolSandboxContract::available(classes)
             };
             assert_eq!(
                 set.inner.sandbox, expected_sandbox,
@@ -5584,11 +5756,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn production_config_routes_plan_exactly_once_in_the_selections_that_include_them() {
         let rig = composition_workspace().await;
+        let write_rig = composition_write_workspace().await;
         for selection in SELECTIONS {
             let config = ProductionToolConfig::new(
                 selection.ask_user,
                 selection.read_file,
                 selection.list_directory,
+                selection.write_file,
             );
             let set = config.for_workspace(
                 rig.workspace.clone(),
@@ -5697,13 +5871,71 @@ mod tests {
                 assert!(set.plan(&list).is_none(), "selection {selection:?}");
             }
 
-            // A name that is not one of the three frozen builtins stays unavailable
+            // write_file route: the write-granted context authorizes the exact
+            // cwd-relative target, so the valid call plans the typed FileMutation shape
+            // carrying exactly FilesystemWrite and the exact per-admission Session queue,
+            // admitted exactly once against the outer union contract; the same route
+            // settles the frozen Denied pre-execution in the ReadOnly-granted context
+            // (authorization, never a sandbox or unknown-tool outcome).  A name that is
+            // not one of the four frozen builtins stays unavailable through the normal
+            // ToolSet lookup in every selection: there is no generic registry or
+            // open-world route.
+            let write = composition_request(
+                0x27,
+                "call_write",
+                write_file::WRITE_FILE_NAME,
+                r#"{"path":"target.txt","content":"body"}"#,
+            );
+            if enabled(write_file::WRITE_FILE_NAME) {
+                let queue = SessionFileMutationQueue::new();
+                let write_set = config.for_workspace(
+                    write_rig.workspace.clone(),
+                    write_rig.task_context.clone(),
+                    Arc::clone(&queue),
+                );
+                match write_set.plan(&write) {
+                    Some(ToolExecutionPlan::FileMutation {
+                        permissions,
+                        queue: plan_queue,
+                        ..
+                    }) => {
+                        assert_eq!(
+                            permissions,
+                            ToolPermissionSet::new([C::FilesystemWrite]),
+                            "selection {selection:?}"
+                        );
+                        assert!(
+                            Arc::ptr_eq(&queue, &plan_queue),
+                            "the write route captures the exact per-admission Session queue ({selection:?})"
+                        );
+                    }
+                    _ => panic!(
+                        "the valid write_file call plans a FileMutation shape ({selection:?})"
+                    ),
+                }
+                assert!(
+                    matches!(
+                        set.plan(&write),
+                        Some(ToolExecutionPlan::PreExecution(result))
+                            if matches!(result, ToolExecutionResult::PreExecution {
+                                disposition: ToolResultDisposition::Denied,
+                                ..
+                            })
+                    ),
+                    "the write route denies without a ReadWrite grant ({selection:?})"
+                );
+            } else {
+                assert!(set.plan(&write).is_none(), "selection {selection:?}");
+            }
+
+            // A name that is not one of the four frozen builtins stays unavailable
             // through the normal ToolSet lookup in every selection: there is no generic
             // registry or open-world route.
-            let unknown = composition_request(0x26, "call_other", "other_tool", "{}");
+            let unknown = composition_request(0x28, "call_other", "other_tool", "{}");
             assert!(set.plan(&unknown).is_none(), "selection {selection:?}");
         }
         rig.task_context.shutdown().await;
+        write_rig.task_context.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5730,12 +5962,13 @@ mod tests {
     async fn turn_tool_resources_production_materialize_installs_the_workspace_bound_read_file_set()
     {
         let rig = composition_workspace().await;
-        let set = TurnToolResources::Production(ProductionToolConfig::new(false, true, false))
-            .materialize(
-                rig.workspace.clone(),
-                rig.task_context.clone(),
-                SessionFileMutationQueue::new(),
-            );
+        let set =
+            TurnToolResources::Production(ProductionToolConfig::new(false, true, false, false))
+                .materialize(
+                    rig.workspace.clone(),
+                    rig.task_context.clone(),
+                    SessionFileMutationQueue::new(),
+                );
         // The production read_file selection materializes the exact workspace-bound set:
         // one read_file definition and prompt spec with the FilesystemRead outer contract.
         let definitions = set.definitions();
@@ -5753,12 +5986,13 @@ mod tests {
     async fn turn_tool_resources_production_materialize_installs_the_workspace_bound_list_directory_set()
      {
         let rig = composition_workspace().await;
-        let set = TurnToolResources::Production(ProductionToolConfig::new(false, false, true))
-            .materialize(
-                rig.workspace.clone(),
-                rig.task_context.clone(),
-                SessionFileMutationQueue::new(),
-            );
+        let set =
+            TurnToolResources::Production(ProductionToolConfig::new(false, false, true, false))
+                .materialize(
+                    rig.workspace.clone(),
+                    rig.task_context.clone(),
+                    SessionFileMutationQueue::new(),
+                );
         // The production list_directory selection materializes the exact workspace-bound
         // set: one list_directory definition and prompt spec with the FilesystemRead outer
         // contract, and its empty-cwd route plans Execute with exactly FilesystemRead.
@@ -5789,12 +6023,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn turn_tool_resources_production_materialize_installs_the_composed_read_and_list_set() {
         let rig = composition_workspace().await;
-        let set = TurnToolResources::Production(ProductionToolConfig::new(false, true, true))
-            .materialize(
-                rig.workspace.clone(),
-                rig.task_context.clone(),
-                SessionFileMutationQueue::new(),
-            );
+        let set =
+            TurnToolResources::Production(ProductionToolConfig::new(false, true, true, false))
+                .materialize(
+                    rig.workspace.clone(),
+                    rig.task_context.clone(),
+                    SessionFileMutationQueue::new(),
+                );
         // The production read_file + list_directory selection materializes one composed
         // workspace-bound set in the frozen order, both routes planning Execute with the
         // same FilesystemRead outer contract.

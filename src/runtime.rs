@@ -65,8 +65,8 @@ use crate::wire::{
     Timestamp, WorkspaceRevision,
 };
 use crate::workspace::{
-    Workspace, WorkspaceDefinitionSummaryView, WorkspacePathTarget, WorkspaceReadAccessControl,
-    WorkspaceResolver, WorkspaceRootSummaryView, lower_workspace,
+    Workspace, WorkspaceDefinitionSummaryView, WorkspaceFilesystemAccessControl,
+    WorkspacePathTarget, WorkspaceResolver, WorkspaceRootSummaryView, lower_workspace,
 };
 
 const DEFAULT_RUNTIME_REQUIRED_POLICY: &str = "Respond helpfully to the user's request.";
@@ -91,6 +91,7 @@ pub struct MiniCoreRuntimeConfig {
     ask_user_tool: bool,
     read_file_tool: bool,
     list_directory_tool: bool,
+    write_file_tool: bool,
 }
 
 impl MiniCoreRuntimeConfig {
@@ -103,6 +104,7 @@ impl MiniCoreRuntimeConfig {
             ask_user_tool: false,
             read_file_tool: false,
             list_directory_tool: false,
+            write_file_tool: false,
         }
     }
 
@@ -144,14 +146,17 @@ impl MiniCoreRuntimeConfig {
     /// read-only Workspace resolution authority.
     ///
     /// The default Runtime ToolSet stays empty; this opt-in is idempotent and independent of
-    /// `with_ask_user_tool` and `with_list_directory_tool`.  `open` freezes it into the single
-    /// production Tool config and selects the read-only Workspace resolver — the same shared
-    /// workspace read authority the `list_directory` opt-in uses — so every declared root is
-    /// resolved with an authority ceiling of exactly `ReadOnly` filesystem access — never
-    /// `ReadWrite` — and Prompt/Skill source ceilings stay false: the workspace read opt-ins
-    /// are both the Tool installation and the read-only authority ceiling.  The read_file
-    /// ToolSet is materialized per admission against the exact captured Workspace snapshot, so
-    /// no single static ToolSet is selected here.
+    /// `with_ask_user_tool`, `with_list_directory_tool`, and `with_write_file_tool`.  `open`
+    /// freezes it into the single production Tool config and selects the read-only Workspace
+    /// resolver — the same shared workspace read authority the `list_directory` opt-in uses —
+    /// so every declared root is resolved with an authority ceiling of exactly `ReadOnly`
+    /// filesystem access — never `ReadWrite` — and Prompt/Skill source ceilings stay false:
+    /// the workspace read opt-ins are both the Tool installation and the read-only authority
+    /// ceiling.  When the write opt-in is also enabled, `open` instead selects the ReadWrite
+    /// ceiling resolver (see [`Self::with_write_file_tool`]); the requested-access
+    /// intersection stays authoritative in both cases.  The read_file ToolSet is materialized
+    /// per admission against the exact captured Workspace snapshot, so no single static
+    /// ToolSet is selected here.
     pub fn with_read_file_tool(mut self) -> Self {
         self.read_file_tool = true;
         self
@@ -161,14 +166,40 @@ impl MiniCoreRuntimeConfig {
     /// same read-only Workspace resolution authority as `with_read_file_tool`.
     ///
     /// The default Runtime ToolSet stays empty; this opt-in is idempotent and independent of
-    /// `with_ask_user_tool` and `with_read_file_tool`.  `open` freezes it into the single
-    /// production Tool config and selects the read-only Workspace resolver shared with
-    /// `read_file`, so every declared root is resolved with an authority ceiling of exactly
-    /// `ReadOnly` filesystem access — never `ReadWrite` — and Prompt/Skill source ceilings
-    /// stay false.  The list_directory ToolSet is materialized per admission against the exact
-    /// captured Workspace snapshot, so no single static ToolSet is selected here.
+    /// `with_ask_user_tool`, `with_read_file_tool`, and `with_write_file_tool`.  `open`
+    /// freezes it into the single production Tool config and selects the read-only Workspace
+    /// resolver shared with `read_file`, so every declared root is resolved with an authority
+    /// ceiling of exactly `ReadOnly` filesystem access — never `ReadWrite` — and Prompt/Skill
+    /// source ceilings stay false.  When the write opt-in is also enabled, `open` instead
+    /// selects the ReadWrite ceiling resolver (see [`Self::with_write_file_tool`]); the
+    /// requested-access intersection stays authoritative in both cases.  The list_directory
+    /// ToolSet is materialized per admission against the exact captured Workspace snapshot, so
+    /// no single static ToolSet is selected here.
     pub fn with_list_directory_tool(mut self) -> Self {
         self.list_directory_tool = true;
+        self
+    }
+
+    /// Opts the Runtime into the closed production `write_file` builtin ToolSet and the
+    /// ReadWrite filesystem authority ceiling.
+    ///
+    /// The default Runtime ToolSet stays empty; this opt-in is idempotent and independent of
+    /// `with_ask_user_tool`, `with_read_file_tool`, and `with_list_directory_tool`.  `open`
+    /// freezes it into the single production Tool config and selects the ReadWrite Workspace
+    /// resolver (taking precedence over the read-only resolver the read/list opt-ins would
+    /// otherwise select), so every declared root receives an authority ceiling of exactly
+    /// `ReadWrite` filesystem access.  The opt-in is a ceiling, never an unconditional grant:
+    /// the requested-access intersection stays authoritative, so a root that requested
+    /// `ReadOnly` resolves `ReadOnly` and the write planner denies it, while a root that
+    /// requested `ReadWrite` can resolve `ReadWrite`.  Prompt/Skill source ceilings stay
+    /// false and trust stays `Restricted`, exactly like the read opt-in.  The returned
+    /// owner-held filesystem access control (the same generalized control the read opt-ins
+    /// install) is what the host invalidation seam revokes: a revoked Session loses read and
+    /// write together, and the revocation is permanent for this Runtime lifetime.  The
+    /// write_file ToolSet is materialized per admission against the exact captured Workspace
+    /// snapshot, so no single static ToolSet is selected here.
+    pub fn with_write_file_tool(mut self) -> Self {
+        self.write_file_tool = true;
         self
     }
 }
@@ -342,30 +373,37 @@ impl MiniCoreRuntime {
                 }
             };
 
-        // The workspace read opt-ins (read_file, list_directory) select the read-only
-        // Workspace resolver and its single revocation control: every declared root resolves
-        // with an authority ceiling of exactly `ReadOnly` filesystem access (never
-        // `ReadWrite`), Prompt/Skill source ceilings stay false, and the Runtime owner keeps
-        // the control so the host Workspace authority invalidation seam can revoke read access
-        // per Session.  The default resolver keeps the existing restricted authority unchanged
-        // and has no control.
-        let (resolver, read_access_control) = if config.read_file_tool || config.list_directory_tool
-        {
+        // The workspace filesystem opt-ins select the resolver and its single revocation
+        // control: the write opt-in (write_file) selects the ReadWrite ceiling resolver — it
+        // takes precedence over the read opt-ins, but the requested-access intersection stays
+        // authoritative, so a ReadOnly-requested root stays ReadOnly and the write planner
+        // denies it — while read_file/list_directory alone keep the ReadOnly ceiling resolver
+        // (never `ReadWrite`).  Prompt/Skill source ceilings stay false in both, and the
+        // Runtime owner keeps the control so the host Workspace authority invalidation seam
+        // can revoke filesystem access (read and write routes together) per Session.  The
+        // default resolver keeps the existing restricted authority unchanged and has no
+        // control.
+        let (resolver, filesystem_access_control) = if config.write_file_tool {
+            let (resolver, control) =
+                WorkspaceResolver::new_with_write_access(task_context.clone());
+            (Arc::new(resolver), Some(control))
+        } else if config.read_file_tool || config.list_directory_tool {
             let (resolver, control) = WorkspaceResolver::new_with_read_access(task_context.clone());
             (Arc::new(resolver), Some(control))
         } else {
             (Arc::new(WorkspaceResolver::new(task_context.clone())), None)
         };
-        // The production Tool config is frozen exactly once at `open`: the three closed host
-        // opt-ins (ask_user, read_file, list_directory) are captured in one immutable config
-        // and passed through the residency start.  Nothing is materialized here — each
-        // admission materializes its ToolSet against the exact captured Workspace snapshot, so
-        // no single static ToolSet is selected when a workspace read builtin is enabled and
-        // the default Runtime ToolSet stays empty.
+        // The production Tool config is frozen exactly once at `open`: the four closed host
+        // opt-ins (ask_user, read_file, list_directory, write_file) are captured in one
+        // immutable config and passed through the residency start.  Nothing is materialized
+        // here — each admission materializes its ToolSet against the exact captured Workspace
+        // snapshot, so no single static ToolSet is selected when a workspace builtin is
+        // enabled and the default Runtime ToolSet stays empty.
         let tool_config = crate::tools::ProductionToolConfig::new(
             config.ask_user_tool,
             config.read_file_tool,
             config.list_directory_tool,
+            config.write_file_tool,
         );
         let session_residency = match SessionResidencyRegistry::start_with_turn_resources_and_production_tools_and_compaction_and_unload_grace(
             task_context.clone(),
@@ -399,7 +437,7 @@ impl MiniCoreRuntime {
             SharedResourceRoots::new(prompt_resources, model_catalog),
             model_gateway,
             unload_grace,
-            read_access_control,
+            filesystem_access_control,
         ));
         inner.retain_until_shutdown();
         Ok(Self { inner })
@@ -438,16 +476,17 @@ impl MiniCoreRuntime {
     }
 
     /// Host-only security Workspace authority invalidation (not a wire command).  Except for
-    /// the Runtime-owned workspace read authority (read_file/list_directory), the host has
+    /// the Runtime-owned workspace filesystem authority (read_file/list_directory/write_file), the host has
     /// already published the current hard restriction fact; the Runtime routes out-of-band to
     /// the loaded Session executor — without the runtime publication semaphore and without
     /// waiting on any ordinary work lane — samples one `SystemClock` timestamp, signals the
     /// active admission/Turn first-wins with `SecurityRevoked` (or enters Preparing directly
     /// when Idle), and re-resolves the installed Workspace with the exact current definition.
-    /// For a Runtime opened with a workspace read opt-in (read_file or list_directory), this
-    /// method itself first publishes the permanent read revocation for the Session through the
-    /// owner-held control, so the read authority is already restricted when the recovery
-    /// re-resolves — the restriction stays current even if the residency reports
+    /// For a Runtime opened with a workspace filesystem opt-in (read_file, list_directory, or
+    /// write_file), this method itself first publishes the permanent filesystem revocation
+    /// (the read and write routes together) for the Session through the
+    /// owner-held control, so the filesystem authority is already restricted when the
+    /// recovery re-resolves — the restriction stays current even if the residency reports
     /// SessionNotLoaded/Closing/internal.  The await resolves
     /// only after the recovery final state is installed (Ready or the new Workspace/Prompt
     /// Unavailable cause).  The durable definition/revision/metadata/conversation are never
@@ -856,14 +895,16 @@ struct RuntimeInner {
     // This is a multi-reader gate, so Submits across different Sessions never serialize against
     // each other.
     shared_resource_gate: Arc<RwLock<()>>,
-    // The Runtime-owned workspace read-authority revocation control, installed only by the
-    // workspace read opt-ins (read_file, list_directory) at `open`.  The default/no-read
-    // Runtime stores None and keeps its existing invalidation behavior; either read opt-in
-    // Runtime revokes through this exact control before every host Workspace authority
-    // invalidation so the restriction is published before the recovery re-resolves.  It is a
-    // separate owner clone of the same process-local set the resolver authority checks, so no
-    // authority state is duplicated.
-    read_access_control: Option<WorkspaceReadAccessControl>,
+    // The Runtime-owned workspace filesystem-access revocation control, installed only by
+    // the workspace tool opt-ins at `open` (read_file/list_directory install the ReadOnly
+    // ceiling, write_file the ReadWrite ceiling).  The default/no-filesystem Runtime stores
+    // None and keeps its existing invalidation behavior; any filesystem opt-in Runtime
+    // revokes through this exact control before every host Workspace authority invalidation
+    // so the restriction is published before the recovery re-resolves.  The revocation
+    // covers the read and write routes together, is permanent for this Runtime lifetime, and
+    // is a separate owner clone of the same process-local set the resolver authority checks,
+    // so no authority state is duplicated.
+    filesystem_access_control: Option<WorkspaceFilesystemAccessControl>,
     retained_until_shutdown: Mutex<Option<Arc<RuntimeInner>>>,
     session_residency: Mutex<Option<Arc<SessionResidencyRegistry>>>,
     durable_state: Mutex<Option<DurableState>>,
@@ -880,7 +921,7 @@ struct RuntimeInner {
 impl RuntimeInner {
     #[allow(
         clippy::too_many_arguments,
-        reason = "one Runtime owner constructor binds the exact validated services, residency, lifecycle settings, and optional read-authority control"
+        reason = "one Runtime owner constructor binds the exact validated services, residency, lifecycle settings, and optional filesystem-access control"
     )]
     fn new(
         task_context: RuntimeTaskContext,
@@ -890,7 +931,7 @@ impl RuntimeInner {
         shared_resources: SharedResourceRoots,
         model_gateway: Arc<ModelGateway>,
         unload_grace: StdDuration,
-        read_access_control: Option<WorkspaceReadAccessControl>,
+        filesystem_access_control: Option<WorkspaceFilesystemAccessControl>,
     ) -> Self {
         let (runtime_events, _) = broadcast::channel(RUNTIME_EVENT_CAPACITY);
         Self {
@@ -900,7 +941,7 @@ impl RuntimeInner {
             unload_grace,
             shared_resources: Mutex::new(shared_resources),
             shared_resource_gate: Arc::new(RwLock::new(())),
-            read_access_control,
+            filesystem_access_control,
             retained_until_shutdown: Mutex::new(None),
             session_residency: Mutex::new(Some(session_residency)),
             durable_state: Mutex::new(Some(durable_state)),
@@ -2032,11 +2073,12 @@ impl RuntimeInner {
         let Some(residency) = self.residency() else {
             return Err(SessionWorkspaceInvalidationError::RuntimeClosing);
         };
-        // The Runtime-owned workspace read authority publishes its permanent read revocation
-        // for this Session before the host restriction is routed: the revoke is the hard
-        // restriction for that authority, stays current even if the residency below returns
-        // SessionNotLoaded/Closing/internal, and is observed by the recovery's re-resolve.
-        if let Some(control) = self.read_access_control.as_ref() {
+        // The Runtime-owned workspace filesystem authority publishes its permanent
+        // per-Session revocation (read and write routes together) before the host restriction
+        // is routed: the revoke is the hard restriction for that authority, stays current even
+        // if the residency below returns SessionNotLoaded/Closing/internal, and is observed by
+        // the recovery's re-resolve.
+        if let Some(control) = self.filesystem_access_control.as_ref() {
             control.revoke(session_id);
         }
         let timestamp = SystemClock.now();
@@ -4222,7 +4264,7 @@ mod tests {
     use crate::workspace::{
         RequestedFilesystemAccess, Workspace, WorkspaceAccessError, WorkspaceCwdSpec,
         WorkspaceDefinitionInput, WorkspacePathTarget, WorkspaceRootInput, WorkspaceRootKey,
-        WorkspaceSourcePolicy, lower_workspace,
+        WorkspaceSourcePolicy, WorkspaceWriteError, lower_workspace,
     };
 
     static NEXT_TEMP_SUFFIX: AtomicU64 = AtomicU64::new(1);
@@ -4465,6 +4507,48 @@ mod tests {
         create_and_load_public_session_with_agent(runtime, workspace_root)
             .await
             .0
+    }
+
+    /// Creates and loads one public Session bound to the exact given Workspace definition
+    /// (not the standard ReadWrite helper input), returning its SessionId.
+    async fn create_and_load_public_session_with_definition(
+        runtime: &MiniCoreRuntime,
+        definition: WorkspaceDefinitionInput,
+    ) -> SessionId {
+        let agent_id = create_runtime_agent(runtime).await;
+        let create = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Create {
+                    agent_id,
+                    definition: Box::new(NewSessionDefinition::new(
+                        definition,
+                        SessionModelConfig::new(
+                            ModelSelection::new(
+                                "openai".parse().unwrap(),
+                                "gpt-5".parse().unwrap(),
+                            ),
+                            ReasoningPreference::Auto,
+                            Some(NonZeroU32::new(4096).unwrap()),
+                        ),
+                        SessionPromptSelection::new(Vec::new()).unwrap(),
+                    )),
+                    metadata: NewSessionMetadata::new(None::<&str>, None::<&str>).unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Create dispatches");
+        let session_id = command_output(&create).parse().unwrap();
+
+        let load = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Load { session_id }),
+            ))
+            .await
+            .expect("public Load dispatches");
+        assert_eq!(command_output(&load), "session loaded");
+        session_id
     }
 
     /// A test-only `ModelSourceAdapter` that always discovers one fixed "openai/gpt-5"
@@ -7183,25 +7267,133 @@ mod tests {
         assert_eq!(format!("{fresh:?}"), "MiniCoreRuntimeConfig { .. }");
     }
 
+    #[test]
+    fn runtime_config_write_file_tool_is_default_off_and_the_opt_in_is_idempotent_and_independent()
+    {
+        let default = MiniCoreRuntimeConfig::new(PathBuf::from("/unused"));
+        assert!(
+            !default.write_file_tool,
+            "the default Runtime ToolSet stays empty"
+        );
+        let opted = default.with_write_file_tool();
+        assert!(opted.write_file_tool);
+        // The opt-in is idempotent: opting in twice keeps the exact same flag.
+        let twice = opted.with_write_file_tool();
+        assert!(twice.write_file_tool);
+        // The write_file opt-in is independent of ask_user, read_file, and list_directory
+        // in both directions.
+        let write_only =
+            MiniCoreRuntimeConfig::new(PathBuf::from("/unused")).with_write_file_tool();
+        assert!(
+            !write_only.ask_user_tool
+                && !write_only.read_file_tool
+                && !write_only.list_directory_tool,
+            "the write_file opt-in never enables any other builtin"
+        );
+        let ask_only = MiniCoreRuntimeConfig::new(PathBuf::from("/unused")).with_ask_user_tool();
+        assert!(
+            !ask_only.write_file_tool,
+            "the ask_user opt-in never enables write_file"
+        );
+        let read_only = MiniCoreRuntimeConfig::new(PathBuf::from("/unused")).with_read_file_tool();
+        assert!(
+            !read_only.write_file_tool,
+            "the read_file opt-in never enables write_file"
+        );
+        let list_only =
+            MiniCoreRuntimeConfig::new(PathBuf::from("/unused")).with_list_directory_tool();
+        assert!(
+            !list_only.write_file_tool,
+            "the list_directory opt-in never enables write_file"
+        );
+        // Each pair combines independently, and the quadruple combines exactly once per
+        // flag.
+        let read_write = read_only.with_write_file_tool();
+        assert!(
+            read_write.read_file_tool
+                && read_write.write_file_tool
+                && !read_write.ask_user_tool
+                && !read_write.list_directory_tool
+        );
+        let all_four = read_write.with_ask_user_tool().with_list_directory_tool();
+        assert!(
+            all_four.ask_user_tool
+                && all_four.read_file_tool
+                && all_four.list_directory_tool
+                && all_four.write_file_tool
+        );
+        // A fresh default config is unaffected, and the redacted Debug shape is unchanged
+        // by the new field.
+        let fresh = MiniCoreRuntimeConfig::new(PathBuf::from("/unused"));
+        assert!(!fresh.write_file_tool);
+        assert_eq!(format!("{fresh:?}"), "MiniCoreRuntimeConfig { .. }");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_open_tool_opt_ins_disclose_exactly_the_opted_builtins() {
         // The frozen production Tool config discloses exactly the opted builtins once: the
         // default stays empty, each single opt-in discloses its one builtin, and every
         // combined opt-in discloses exactly the fixed order ask_user then read_file then
-        // list_directory (never twice, never any unopted builtin, never reordered).
-        for (ask_user, read_file, list_directory, expected_names) in [
-            (false, false, false, Vec::<&str>::new()),
-            (true, false, false, vec!["ask_user"]),
-            (false, true, false, vec!["read_file"]),
-            (false, false, true, vec!["list_directory"]),
-            (true, true, false, vec!["ask_user", "read_file"]),
-            (true, false, true, vec!["ask_user", "list_directory"]),
-            (false, true, true, vec!["read_file", "list_directory"]),
+        // list_directory then write_file (never twice, never any unopted builtin, never
+        // reordered) across the full closed sixteen-selection surface.
+        for (ask_user, read_file, list_directory, write_file, expected_names) in [
+            (false, false, false, false, Vec::<&str>::new()),
+            (true, false, false, false, vec!["ask_user"]),
+            (false, true, false, false, vec!["read_file"]),
+            (false, false, true, false, vec!["list_directory"]),
+            (false, false, false, true, vec!["write_file"]),
+            (true, true, false, false, vec!["ask_user", "read_file"]),
+            (true, false, true, false, vec!["ask_user", "list_directory"]),
+            (true, false, false, true, vec!["ask_user", "write_file"]),
+            (
+                false,
+                true,
+                true,
+                false,
+                vec!["read_file", "list_directory"],
+            ),
+            (false, true, false, true, vec!["read_file", "write_file"]),
+            (
+                false,
+                false,
+                true,
+                true,
+                vec!["list_directory", "write_file"],
+            ),
             (
                 true,
                 true,
                 true,
+                false,
                 vec!["ask_user", "read_file", "list_directory"],
+            ),
+            (
+                true,
+                true,
+                false,
+                true,
+                vec!["ask_user", "read_file", "write_file"],
+            ),
+            (
+                true,
+                false,
+                true,
+                true,
+                vec!["ask_user", "list_directory", "write_file"],
+            ),
+            (
+                false,
+                true,
+                true,
+                true,
+                vec!["read_file", "list_directory", "write_file"],
+            ),
+            (
+                true,
+                true,
+                true,
+                true,
+                vec!["ask_user", "read_file", "list_directory", "write_file"],
             ),
         ] {
             let root = TempRoot::new();
@@ -7216,6 +7408,9 @@ mod tests {
             }
             if list_directory {
                 config = config.with_list_directory_tool().with_list_directory_tool();
+            }
+            if write_file {
+                config = config.with_write_file_tool().with_write_file_tool();
             }
             let runtime =
                 MiniCoreRuntime::open_with_model_fixture(config, Handle::current(), &model)
@@ -7278,7 +7473,7 @@ mod tests {
             assert_eq!(requests.len(), 1);
             let tools = requests[0].input().tools();
             // The exact fixed disclosure order, never sorted: ask_user, read_file,
-            // list_directory in that sequence.
+            // list_directory, write_file in that sequence.
             let disclosed = tools
                 .iter()
                 .map(|tool| tool.name().as_str())
@@ -7303,6 +7498,16 @@ mod tests {
                     .find(|tool| tool.name().as_str() == "list_directory")
                     .expect("the list_directory opt-in discloses its builtin exactly once");
                 assert_eq!(list_directory_tool.input_schema(), &schema);
+            }
+            if write_file {
+                let schema: crate::wire::BoundedJsonSchema = r#"{"type":"object","properties":{"path":{"type":"string","maxLength":4096},"content":{"type":"string","maxLength":16384}},"required":["path","content"],"additionalProperties":false}"#
+                    .parse()
+                    .expect("the frozen write_file schema is valid");
+                let write_file_tool = tools
+                    .iter()
+                    .find(|tool| tool.name().as_str() == "write_file")
+                    .expect("the write_file opt-in discloses its builtin exactly once");
+                assert_eq!(write_file_tool.input_schema(), &schema);
             }
             runtime.shutdown().await;
         }
@@ -7426,6 +7631,728 @@ mod tests {
                         && content.parts().len() == 1
                         && content.parts()[0].as_text() == "hello from the workspace\n"
                 ))
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_file_tool_opt_in_writes_existing_and_creates_new_workspace_files_end_to_end() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        fs::write(workspace.path().join("src").join("note.txt"), "old body\n")
+            .expect("the existing Workspace cwd file is written");
+        // The scripted model emits two write_file ToolCalls in one round — one full
+        // replacement of an existing file, one creation of a missing file whose parent
+        // exists — then one final text response for the same Turn after both results
+        // settle.  Both targets are distinct, so both mutations run through the same
+        // Session queue independently.
+        let model = ScriptedModelFixture::with_tool_round_calls(
+            &[
+                (
+                    "call_write",
+                    "write_file",
+                    r#"{"path":"note.txt","content":"replaced body"}"#,
+                ),
+                (
+                    "call_create",
+                    "write_file",
+                    r#"{"path":"created.txt","content":"created body"}"#,
+                ),
+            ],
+            "final public answer",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_write_file_tool(),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the write_file opt-in Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+        let submit_command_id = CommandId::generate().unwrap();
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                submit_command_id,
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("write it").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+
+        // The one Tool round runs the production write_file builtin against the exact
+        // captured Workspace snapshot and the same Turn runs its final response.
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => {
+                        panic!("unexpected frame before write_file Turn completion: {other:?}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the write_file Turn completes");
+        assert_eq!(terminal.command_id(), Some(submit_command_id));
+        assert!(matches!(
+            terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == turn_id
+        ));
+        assert_eq!(model.request_count(), 2);
+
+        // Both writes settled truthfully: the existing file was replaced in place and the
+        // missing file was created with its exact content (no extra newline, no
+        // normalization).
+        assert_eq!(
+            fs::read(workspace.path().join("src").join("note.txt")).unwrap(),
+            b"replaced body"
+        );
+        assert_eq!(
+            fs::read(workspace.path().join("src").join("created.txt")).unwrap(),
+            b"created body"
+        );
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        // The first request discloses the exact frozen write_file schema.
+        assert_eq!(requests[0].input().tools().len(), 1);
+        assert_eq!(requests[0].input().tools()[0].name().as_str(), "write_file");
+        let schema: crate::wire::BoundedJsonSchema = r#"{"type":"object","properties":{"path":{"type":"string","maxLength":4096},"content":{"type":"string","maxLength":16384}},"required":["path","content"],"additionalProperties":false}"#
+            .parse()
+            .expect("the frozen write_file schema is valid");
+        assert_eq!(requests[0].input().tools()[0].input_schema(), &schema);
+        // The second request carries both exact immutable ToolResults: one `file written`
+        // part for each sibling write, in call_index order.
+        let tool_results = requests[1]
+            .input()
+            .messages()
+            .iter()
+            .filter_map(|message| match message.as_ref() {
+                ModelMessageRef::Tool {
+                    tool_call_id,
+                    content,
+                } => Some((tool_call_id.as_str(), content)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_results.len(), 2);
+        assert_eq!(tool_results[0].0, "call_write");
+        assert_eq!(tool_results[1].0, "call_create");
+        for (_, content) in &tool_results {
+            assert_eq!(content.parts().len(), 1);
+            assert_eq!(content.parts()[0].as_text(), "file written");
+        }
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_file_same_target_sibling_calls_leave_call_index_last_content() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        fs::write(workspace.path().join("src").join("note.txt"), "initial")
+            .expect("the Workspace cwd file is written");
+        // Two sibling write_file calls to the exact same physical target in one round:
+        // the Session queue reserves tickets in call_index order, so the writes serialize
+        // FIFO and the final content is exactly the later call's content, while both
+        // sibling results settle truthfully.
+        let model = ScriptedModelFixture::with_tool_round_calls(
+            &[
+                (
+                    "call_first",
+                    "write_file",
+                    r#"{"path":"note.txt","content":"first version"}"#,
+                ),
+                (
+                    "call_second",
+                    "write_file",
+                    r#"{"path":"note.txt","content":"second version"}"#,
+                ),
+            ],
+            "final public answer",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_write_file_tool(),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the write_file opt-in Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("write twice").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => panic!(
+                        "unexpected frame before the same-target write Turn completion: {other:?}"
+                    ),
+                }
+            }
+        })
+        .await
+        .expect("the same-target write Turn completes");
+        assert!(matches!(
+            terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == turn_id
+        ));
+        assert_eq!(model.request_count(), 2);
+
+        // The call_index-last sibling's exact content wins, and both siblings settled
+        // their own truthful `file written` results.
+        assert_eq!(
+            fs::read(workspace.path().join("src").join("note.txt")).unwrap(),
+            b"second version"
+        );
+        let requests = model.requests();
+        let tool_results = requests[1]
+            .input()
+            .messages()
+            .iter()
+            .filter_map(|message| match message.as_ref() {
+                ModelMessageRef::Tool {
+                    tool_call_id,
+                    content,
+                } => Some((tool_call_id.as_str(), content)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_results.len(), 2);
+        for (tool_call_id, content) in [
+            ("call_first", &tool_results[0].1),
+            ("call_second", &tool_results[1].1),
+        ] {
+            assert_eq!(
+                tool_results
+                    .iter()
+                    .find(|(id, _)| *id == tool_call_id)
+                    .unwrap()
+                    .0,
+                tool_call_id
+            );
+            assert_eq!(content.parts().len(), 1);
+            assert_eq!(content.parts()[0].as_text(), "file written");
+        }
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_file_same_target_sibling_calls_on_a_missing_target_leave_call_index_last_content()
+     {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        // The target is initially MISSING (its direct parent `src` already exists, so the
+        // create shape is legal): two sibling write_file calls to the exact same path in
+        // one round.  Both calls prepare before any write, so both bind the exact same
+        // create identity (the direct parent's physical identity plus the normalized
+        // final filename), the Session queue reserves tickets in call_index order, the
+        // writes serialize FIFO on that one identity, and the final content is exactly
+        // the later call's content, while both sibling results settle truthfully.
+        let model = ScriptedModelFixture::with_tool_round_calls(
+            &[
+                (
+                    "call_first",
+                    "write_file",
+                    r#"{"path":"note.txt","content":"first version"}"#,
+                ),
+                (
+                    "call_second",
+                    "write_file",
+                    r#"{"path":"note.txt","content":"second version"}"#,
+                ),
+            ],
+            "final public answer",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_write_file_tool(),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the write_file opt-in Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("write twice").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => panic!(
+                        "unexpected frame before the same-target create write Turn completion: {other:?}"
+                    ),
+                }
+            }
+        })
+        .await
+        .expect("the same-target create write Turn completes");
+        assert!(matches!(
+            terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == turn_id
+        ));
+        assert_eq!(model.request_count(), 2);
+
+        // The call_index-last sibling's exact content wins on the created target: the
+        // first write creates the file with its content and the second replaces it in
+        // place, and both siblings settled their own truthful `file written` results.
+        assert_eq!(
+            fs::read(workspace.path().join("src").join("note.txt")).unwrap(),
+            b"second version"
+        );
+        let requests = model.requests();
+        let tool_results = requests[1]
+            .input()
+            .messages()
+            .iter()
+            .filter_map(|message| match message.as_ref() {
+                ModelMessageRef::Tool {
+                    tool_call_id,
+                    content,
+                } => Some((tool_call_id.as_str(), content)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_results.len(), 2);
+        assert_eq!(tool_results[0].0, "call_first");
+        assert_eq!(tool_results[1].0, "call_second");
+        for (_, content) in &tool_results {
+            assert_eq!(content.parts().len(), 1);
+            assert_eq!(content.parts()[0].as_text(), "file written");
+        }
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_file_opt_in_never_overrides_a_readonly_requested_workspace() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        fs::write(
+            workspace.path().join("src").join("note.txt"),
+            "original body",
+        )
+        .expect("the Workspace cwd file is written");
+        // The scripted model emits one write_file ToolCall; the write opt-in installs the
+        // ReadWrite authority ceiling, but this Workspace requests ReadOnly, so the root
+        // resolves ReadOnly and the write planner denies.
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_write",
+            "write_file",
+            r#"{"path":"note.txt","content":"must not be written"}"#,
+            "final public answer",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_write_file_tool(),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the write_file opt-in Runtime opens");
+        let read_only_input = WorkspaceDefinitionInput::new(
+            WorkspaceRootInput::new(
+                "repo".parse().unwrap(),
+                workspace_uri(workspace.path()),
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            WorkspaceCwdSpec::new("repo".parse().unwrap(), "src".parse().unwrap()),
+        )
+        .unwrap();
+        let session_id =
+            create_and_load_public_session_with_definition(&runtime, read_only_input).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("write it").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => panic!(
+                        "unexpected frame before the ReadOnly write Turn completion: {other:?}"
+                    ),
+                }
+            }
+        })
+        .await
+        .expect("the ReadOnly write Turn completes");
+        assert!(matches!(
+            terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == turn_id
+        ));
+        assert_eq!(model.request_count(), 2);
+
+        // The write was denied with the exact frozen text before any preparation factory
+        // existed, and the file is unchanged: the write opt-in never overrides the
+        // requested ReadOnly access.
+        let requests = model.requests();
+        assert!(requests[1].input().messages().iter().any(|message| {
+            matches!(
+                message.as_ref(),
+                ModelMessageRef::Tool {
+                    tool_call_id,
+                    content,
+                } if tool_call_id.as_str() == "call_write"
+                    && content.parts().len() == 1
+                    && content.parts()[0].as_text()
+                        == "workspace file write access is denied"
+            )
+        }));
+        assert_eq!(
+            fs::read(workspace.path().join("src").join("note.txt")).unwrap(),
+            b"original body"
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_authority_invalidation_revokes_write_and_read_together() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        fs::write(
+            workspace.path().join("src").join("note.txt"),
+            "original body",
+        )
+        .expect("the Workspace cwd file is written");
+        // The scripted model emits one write_file ToolCall per Turn round across two
+        // rounds: the first Turn proves the ReadWrite grant end-to-end, the recovery is
+        // inspected through the installed snapshot, and the second Turn is the real future
+        // admission against the revoked filesystem authority.
+        let model = ScriptedModelFixture::with_two_tool_rounds(
+            (
+                "call_write",
+                "write_file",
+                r#"{"path":"note.txt","content":"changed body"}"#,
+                "final public answer",
+            ),
+            (
+                "call_write_again",
+                "write_file",
+                r#"{"path":"note.txt","content":"must not land"}"#,
+                "second final answer",
+            ),
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned())
+                .with_read_file_tool()
+                .with_write_file_tool(),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the read+write opt-in Runtime opens");
+        // The read+write Runtime holds the same generalized owner-side filesystem access
+        // control the read opt-ins install: one revocation covers both routes.
+        assert!(
+            runtime.inner.filesystem_access_control.is_some(),
+            "the read+write opt-ins install the shared workspace filesystem access control"
+        );
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+
+        // One write_file Turn succeeds end-to-end: the ReadWrite grant is genuinely
+        // present before the host revocation.
+        let submit_command_id = CommandId::generate().unwrap();
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                submit_command_id,
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("write it").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => {
+                        panic!("unexpected frame before write_file Turn completion: {other:?}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the write_file Turn completes");
+        assert!(matches!(
+            terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == turn_id
+        ));
+        assert_eq!(model.request_count(), 2);
+        assert_eq!(
+            fs::read(workspace.path().join("src").join("note.txt")).unwrap(),
+            b"changed body"
+        );
+        let requests = model.requests();
+        assert!(requests[1].input().messages().iter().any(|message| {
+            matches!(
+                message.as_ref(),
+                ModelMessageRef::Tool {
+                    tool_call_id,
+                    content,
+                } if tool_call_id.as_str() == "call_write"
+                    && content.parts().len() == 1
+                    && content.parts()[0].as_text() == "file written"
+            )
+        }));
+
+        // The host Workspace authority invalidation seam revokes the filesystem authority
+        // (read and write routes together) for this Session through the owner-held control
+        // and recovers the loaded Idle Session.
+        runtime
+            .invalidate_session_workspace_authority(session_id)
+            .await
+            .expect("the host-only invalidation seam recovers the read+write Session");
+
+        // The recovery re-resolves with the revoked authority: the recovered installed
+        // WorkspaceSnapshot carries no read grant and no write grant — the exact snapshot
+        // every future admission materializes the ToolSets against.
+        let residency = runtime
+            .inner
+            .residency()
+            .expect("the open Runtime retains its residency");
+        let executor = residency
+            .executor_for_test(session_id)
+            .expect("the recovered Session stays loaded");
+        let recovered_snapshot = executor.published_snapshot();
+        assert_eq!(recovered_snapshot.readiness(), SessionReadinessView::Ready);
+        let workspace_snapshot = recovered_snapshot
+            .workspace_optional()
+            .expect("a Ready recovery installs its WorkspaceSnapshot");
+        assert_eq!(workspace_snapshot.session_id(), session_id);
+        assert_eq!(
+            workspace_snapshot
+                .tool_context()
+                .access()
+                .authorize_write(&"note.txt".parse().unwrap())
+                .unwrap_err(),
+            WorkspaceWriteError::NotAuthorized
+        );
+        assert_eq!(
+            workspace_snapshot
+                .tool_context()
+                .access()
+                .authorize_read(&"note.txt".parse().unwrap())
+                .unwrap_err(),
+            WorkspaceAccessError::NotAuthorized
+        );
+        assert_eq!(model.request_count(), 2);
+
+        // The real future admission: a second public Submit starts against the recovered
+        // no-grant Workspace snapshot, and the model's second write_file ToolCall settles
+        // PreExecution + Denied with the exact frozen text before any preparation factory
+        // exists — the same Turn then receives its scripted final text and completes, and
+        // the file stays unchanged.
+        let second_command_id = CommandId::generate().unwrap();
+        let second_submit = runtime
+            .dispatch(CommandRequest::new(
+                second_command_id,
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("write it again").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("the second public Submit dispatches");
+        let second_turn_id = started_turn(&second_submit);
+        let second_terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => {
+                        panic!(
+                            "unexpected frame before the post-revocation write_file Turn completion: {other:?}"
+                        )
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the post-revocation write_file Turn completes");
+        assert_eq!(second_terminal.command_id(), Some(second_command_id));
+        assert!(matches!(
+            second_terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == second_turn_id
+        ));
+        assert_eq!(model.request_count(), 4);
+        let requests = model.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[3].input().messages().iter().any(|message| {
+            matches!(
+                message.as_ref(),
+                ModelMessageRef::Tool {
+                    tool_call_id,
+                    content,
+                } if tool_call_id.as_str() == "call_write_again"
+                    && content.parts().len() == 1
+                    && content.parts()[0].as_text()
+                        == "workspace file write access is denied"
+            )
+        }));
+        assert_eq!(
+            fs::read(workspace.path().join("src").join("note.txt")).unwrap(),
+            b"changed body"
         );
         runtime.shutdown().await;
     }
@@ -7593,12 +8520,12 @@ mod tests {
         )
         .await
         .expect("the list_directory opt-in Runtime opens");
-        // The list_directory-only Runtime holds the same owner-side read authority control
-        // as the read_file opt-in: revocation must work identically for either workspace
-        // read builtin.
+        // The list_directory-only Runtime holds the same owner-side filesystem access
+        // control as the read_file opt-in: revocation must work identically for either
+        // workspace read builtin.
         assert!(
-            runtime.inner.read_access_control.is_some(),
-            "the list_directory opt-in installs the shared workspace read authority control"
+            runtime.inner.filesystem_access_control.is_some(),
+            "the list_directory opt-in installs the shared workspace filesystem access control"
         );
         let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
         let mut events = runtime
