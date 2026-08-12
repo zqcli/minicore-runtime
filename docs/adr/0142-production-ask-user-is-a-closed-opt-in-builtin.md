@@ -3,7 +3,7 @@
 状态：Accepted
 日期：2026-08-12
 
-> 2026-08-12：第二个production builtin与第一个resource-level Workspace read grant已由[ADR 0143](0143-production-read-file-uses-workspace-capabilities.md)冻结：生产ToolSet selection扩展为empty/`ask_user`/`read_file`/`ask_user`+`read_file`四种frozen形状（`ask_user`在前、no generic registry），`read_file`按per-admission WorkspaceSnapshot-bound materialization安装。本ADR的`ask_user`冻结surface、zero-permission与closed opt-in决策不变；其后果一节所列pending项中，resource-level workspace read grant已由0143局部交付，其余保持pending。
+> 2026-08-12：后续production Workspace read builtins已由[ADR 0143](0143-production-read-file-uses-workspace-capabilities.md)与[ADR 0144](0144-production-list-directory-uses-bounded-capability-enumeration.md)冻结：生产ToolSet selection现由`ask_user`/`read_file`/`list_directory`三个独立bool形成八种closed形状，固定顺序`ask_user → read_file → list_directory`且无generic registry；两个read routes按per-admission WorkspaceSnapshot-bound materialization安装。本ADR的`ask_user`冻结surface、zero-permission与closed opt-in决策不变；resource-level Workspace read grants已由0143/0144局部交付，其余pending项保持pending。
 
 ## 背景
 

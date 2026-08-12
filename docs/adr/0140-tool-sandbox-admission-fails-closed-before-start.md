@@ -3,7 +3,7 @@
 状态：Accepted
 日期：2026-08-11
 
-> 2026-08-12：首个production OS-backed `FilesystemRead` route已由[ADR 0143](0143-production-read-file-uses-workspace-capabilities.md)交付：`read_file`是closed、default-off、Workspace-bound builtin，经本ADR的admission门禁（exact `FilesystemRead` ceiling、available sandbox contract、frozen denial）进入Execute。本ADR的fail-closed admission、approval pairing与truthful settlement规则继续有效；其第8条列举的production ToolService、generic permission producer与public Tool DTO等仍pending。
+> 2026-08-12：production OS-backed `FilesystemRead` routes已由[ADR 0143](0143-production-read-file-uses-workspace-capabilities.md)与[ADR 0144](0144-production-list-directory-uses-bounded-capability-enumeration.md)交付：`read_file`与`list_directory`都是closed、default-off、Workspace-bound builtins，经本ADR的admission门禁（exact `FilesystemRead` ceiling、available sandbox contract、frozen denial）进入Execute。本ADR的fail-closed admission、approval pairing与truthful settlement规则继续有效；其第8条列举的production ToolService、generic permission producer与public Tool DTO等仍pending。
 
 ## 背景
 

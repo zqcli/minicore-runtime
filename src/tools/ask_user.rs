@@ -184,7 +184,7 @@ pub(super) fn definition() -> ToolDefinition {
         },
         // UserQuestion exclusivity and call-index ordering are owned by the typed-plan
         // scheduler.  The definition itself does not impose Serial execution semantics on
-        // unrelated ordinary operations in a future composed ToolSet.
+        // unrelated ordinary operations in the composed production ToolSet.
         mode: ToolExecutionMode::Parallel,
     }
 }

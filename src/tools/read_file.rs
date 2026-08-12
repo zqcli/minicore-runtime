@@ -4,8 +4,10 @@
 //! The builtin is immutable after construction and travels through the existing residency
 //! ToolSet capture path.  This first slice is deliberately narrow: one required `path`
 //! string argument, no offset/range/encoding/options, no absolute paths, no writes, no
-//! binary/base64 output, no mutation queues.  It is not composed with `ask_user`; Runtime
-//! wiring is a later worker.
+//! binary/base64 output, no mutation queues.  The builtin itself stays narrow: production
+//! composition belongs to the closed `ProductionToolConfig`, which fixes exactly the three
+//! frozen builtins in one order (`ask_user` → `read_file` → `list_directory`) — there is no
+//! generic registry and no dynamic composition.
 //!
 //! A call plans synchronously to one of exactly three shapes:
 //!
@@ -144,7 +146,7 @@ pub(super) fn definition() -> ToolDefinition {
                 .expect("the frozen read_file schema is valid"),
         },
         // One bounded regular-file read per call; the definition does not impose Serial
-        // execution semantics on unrelated operations in a future composed ToolSet.
+        // execution semantics on unrelated operations in the composed production ToolSet.
         mode: ToolExecutionMode::Parallel,
     }
 }
