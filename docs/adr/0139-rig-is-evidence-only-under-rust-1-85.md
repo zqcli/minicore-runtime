@@ -1,7 +1,9 @@
 # ADR 0139：Rust 1.85下Rig只作为独立证据harness
 
-状态：Accepted
+状态：Partially Superseded by ADR 0141
 日期：2026-08-11
+
+> 2026-08-12：[ADR 0141](0141-provider-calls-are-stateless-full-request.md)细化本ADR对M14 adapter的连接政策描述：adapter-owned reqwest client（每installation一个、reload复用）是全部connection policy，只描述普通stateless reqwest transport pooling eligibility，不承诺物理socket复用，也不携带auth/session state；一次invocation执行零或一次HTTP POST（pre-send cancellation/AuthMissing/validation/encoding失败可为零），若发送POST则携带完整full request，无optimization fallback/continuation。Rig拒绝、direct adapters与Rust 1.85 evidence结论不变。
 
 ## 背景
 

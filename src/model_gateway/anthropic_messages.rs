@@ -7,8 +7,13 @@
 //! private request/result/error types without widening them.
 //!
 //! Frozen contracts (ADR 0138/0139, M12 fixture `docs/fixtures/provider-gate-m12`):
-//! - one `generate_model_turn` issues at most one POST; the reqwest client is
-//!   built with `redirect::Policy::none()`, `retry::never()` and `no_proxy()`;
+//! - one `generate_model_turn` performs zero or one `ProviderAdapter::execute` /
+//!   HTTP POST: pre-send cancellation, `AuthMissing`, request validation and
+//!   encoding/build failures can produce zero POSTs; whenever a POST is sent it
+//!   carries the complete full request, never an optimization fallback POST (ADR
+//!   0141: stateless full-request wire policy — no retry, no continuation state);
+//!   the reqwest client is built with `redirect::Policy::none()`,
+//!   `retry::never()` and `no_proxy()`;
 //! - success is exactly an SSE `message_delta` whose `delta.stop_reason` is a
 //!   non-empty string, preceded by a valid `message_start` whose `message.model`
 //!   is a non-empty string exactly equal to the pinned private API model name of
@@ -18,7 +23,8 @@
 //!   failure, never a synthetic success;
 //! - request headers are exactly `x-api-key`, `anthropic-version`,
 //!   `Content-Type: application/json` and `Accept: text/event-stream`; the
-//!   metadata header allowlist is `request-id` / `retry-after` only;
+//!   metadata header allowlist is `request-id` / `retry-after` only; the
+//!   `anthropic-beta` cache header is never sent (ADR 0141);
 //! - error classification is structural (status or typed `error.type`), never
 //!   human message matching;
 //! - progress `content_index` is the eventual normalized `content[]` position
@@ -411,8 +417,15 @@ fn required_u64_field(usage: &Map<String, Value>, key: &str) -> Result<u64, ()> 
 
 /// Encodes the exact provider request body. The wire model name is the private
 /// provider API model name of the exact definition bound to the request (never the
-/// stable `ModelId`); the adapter carries no model name. No cache_control, beta,
-/// temperature, store/include, or speculative fields are ever emitted.
+/// stable `ModelId`); the adapter carries no model name.
+///
+/// M14 stateless full-request policy (ADR 0141): the body always carries the full
+/// system/messages/tools and never contains a `cache_control` annotation anywhere
+/// (system blocks, message/content blocks, or tool definitions), no
+/// `anthropic-beta` header, and no temperature, store/include, or other
+/// speculative fields. This omission does not claim the provider performs zero
+/// automatic caching or retention: MiniCore merely does not request or control
+/// these optimizations, and correctness never depends on them.
 fn encode_request(request: &ProviderAttemptRequest) -> Result<Vec<u8>, ProviderAttemptError> {
     let call = request.call();
     let input = call.input();
@@ -1141,13 +1154,10 @@ fn handle_message_delta(
         .usage
         .merge(usage)
         .map_err(|_| invalid_provider_response(delivery))?;
-    // Usage finalization is fallible: a checked provider-total overflow is a
-    // malformed provider response with the current delivery, never a silent
-    // `usage: None`.
-    let usage = state
-        .usage
-        .finish()
-        .map_err(|_| invalid_provider_response(delivery))?;
+    // Usage finalization is infallible: each provider-reported cumulative counter
+    // was already validated, and provider_total_tokens is provider-reported only
+    // (always None on this protocol — never a locally derived sum).
+    let usage = state.usage.finish();
     let raw_finish_code: RedactedProviderCode = stop_reason
         .parse()
         .map_err(|_| invalid_provider_response(delivery))?;
@@ -1183,9 +1193,11 @@ fn map_stop_reason(stop_reason: &str) -> ModelFinishReason {
 /// override the base only when present and non-null, with output_tokens required
 /// at the terminal. Every present non-null cumulative counter must never decrease
 /// from the current value (a decrease is a malformed provider response).
-/// provider_total_tokens is the checked sum of input + cache read + cache write +
-/// output and its overflow fails the terminal closed; cost is never representable
-/// on this protocol.
+/// `provider_total_tokens` is provider-reported only (per the canonical
+/// `ModelUsage` contract) and Anthropic Messages does not report a total in the
+/// consumed contract, so normalized usage always carries `None` — never a locally
+/// derived sum. Cache read/write fields are usage evidence only; MiniCore does
+/// not request or control caching. Cost is never representable on this protocol.
 #[derive(Default)]
 struct UsageState {
     input_tokens: Option<u64>,
@@ -1266,32 +1278,21 @@ impl UsageState {
         Ok(())
     }
 
-    fn finish(&self) -> Result<ModelUsage, ()> {
-        let total = match (
-            self.input_tokens,
-            self.cache_read_input_tokens,
-            self.cache_creation_input_tokens,
-            self.output_tokens,
-        ) {
-            (None, None, None, None) => None,
-            (input, read, write, output) => Some(
-                input
-                    .unwrap_or(0)
-                    .checked_add(read.unwrap_or(0))
-                    .and_then(|sum| sum.checked_add(write.unwrap_or(0)))
-                    .and_then(|sum| sum.checked_add(output.unwrap_or(0)))
-                    .ok_or(())?,
-            ),
-        };
-        Ok(ModelUsage::new(
+    /// Usage finalization is infallible: every cumulative counter was already
+    /// validated and merged, and `provider_total_tokens` is provider-reported
+    /// only. Anthropic Messages does not report a total in the consumed contract,
+    /// so the normalized usage always carries `None` — a locally derived sum is
+    /// never synthesized and therefore can never overflow or fail the terminal.
+    fn finish(&self) -> ModelUsage {
+        ModelUsage::new(
             self.input_tokens,
             self.output_tokens,
             self.thinking_tokens,
             self.cache_read_input_tokens,
             self.cache_creation_input_tokens,
-            total,
             None,
-        ))
+            None,
+        )
     }
 }
 
@@ -1312,15 +1313,16 @@ mod tests {
         CapturedRequest, LoopbackServer, ScriptedResponse,
     };
     use crate::model_gateway::tests::{
-        request_for_model, request_for_model_with_tools, scripted_tool_set, structured_request,
-        structured_schema,
+        MutableCredentialSource, anthropic_replay_request_for_model, request_for_model,
+        request_for_model_with_tools, request_with_output_contract, scripted_tool_set,
+        structured_request, structured_schema,
     };
     use crate::model_gateway::{
-        EffectiveModelLimits, FinalizedAssistantContent, ModelCapabilities, ModelDefinition,
-        ModelDefinitionVersion, ModelGateway, ModelGenerationDefaults, ModelSelection,
-        ModelSourceAdapter, ModelSourceFuture, ProviderAdapter, ReasoningCapabilities,
-        ReasoningPreference, ResolveTurnModelRequest, StructuredOutputContract, TokenEstimateRate,
-        TurnModelSnapshot, fixed_credential_source,
+        EffectiveModelLimits, FinalizedAssistantContent, ModelCallRequest, ModelCapabilities,
+        ModelDefinition, ModelDefinitionVersion, ModelGateway, ModelGenerationDefaults,
+        ModelSelection, ModelSourceAdapter, ModelSourceFuture, OutputContract, ProviderAdapter,
+        ReasoningCapabilities, ReasoningPreference, ResolveTurnModelRequest,
+        StructuredOutputContract, TokenEstimateRate, TurnModelSnapshot, fixed_credential_source,
     };
     use crate::prompt::{ModelAssistantContent, ModelMessage};
     use crate::tools::ToolResultContent;
@@ -1591,6 +1593,307 @@ mod tests {
             request.body_len(),
             "the server must read exactly Content-Length body bytes"
         );
+    }
+
+    /// Returns the first forbidden provider-owned `cache_control` finding (M14
+    /// stateless full-request policy, ADR 0141): no cache annotation is ever
+    /// emitted on system blocks, message/content blocks, or tool definitions.
+    /// Never panics: tests assert on the returned finding directly. `None` means
+    /// the value is clean.
+    ///
+    /// Schema roots are entered only at their exact provider-wire paths from the
+    /// root object — a tool definition's `input_schema` VALUE under the root
+    /// `tools` array, and the Structured `output_config.format.schema` VALUE. No
+    /// other `input_schema`/`output_config`/`format`/`schema` key at any nesting
+    /// depth enters schema context: provider-owned key names are checked by name
+    /// everywhere else, including inside a hypothetical provider-owned object
+    /// named `properties`.
+    fn find_cache_control_violation(value: &Value) -> Option<String> {
+        // The root object is provider wire like any other: its own member names
+        // are checked, and only the two exact schema-root paths below are
+        // honored.
+        let object = match value.as_object() {
+            Some(object) => object,
+            None => return provider_wire_cache_violation(value),
+        };
+        for (key, child) in object {
+            if let Some(finding) = cache_control_member_finding(key, "provider-wire") {
+                return Some(finding);
+            }
+            match key.as_str() {
+                // Root `tools`: each tool object is provider wire, and only its
+                // exact `input_schema` VALUE is a schema root; every other
+                // member of the tool object (including the `input_schema` key
+                // itself) stays provider-wire checked.
+                "tools" => {
+                    let Some(tools) = child.as_array() else {
+                        if let Some(finding) = provider_wire_cache_violation(child) {
+                            return Some(finding);
+                        }
+                        continue;
+                    };
+                    for tool in tools {
+                        let Some(tool_object) = tool.as_object() else {
+                            if let Some(finding) = provider_wire_cache_violation(tool) {
+                                return Some(finding);
+                            }
+                            continue;
+                        };
+                        if let Some(input_schema) = tool_object.get("input_schema") {
+                            if let Some(finding) = schema_cache_violation(input_schema) {
+                                return Some(finding);
+                            }
+                        }
+                        for (tool_key, tool_child) in tool_object {
+                            if let Some(finding) =
+                                cache_control_member_finding(tool_key, "provider-wire")
+                            {
+                                return Some(finding);
+                            }
+                            if tool_key == "input_schema" {
+                                continue;
+                            }
+                            if let Some(finding) = provider_wire_cache_violation(tool_child) {
+                                return Some(finding);
+                            }
+                        }
+                    }
+                }
+                // Root `output_config`: the value is provider wire, and only the
+                // exact `format.schema` VALUE inside it is a schema root; every
+                // sibling key stays provider-wire checked.
+                "output_config" => {
+                    if let Some(config) = child.as_object() {
+                        for (config_key, config_child) in config {
+                            if let Some(finding) =
+                                cache_control_member_finding(config_key, "provider-wire")
+                            {
+                                return Some(finding);
+                            }
+                            if config_key == "format" {
+                                if let Some(format_object) = config_child.as_object() {
+                                    for (format_key, format_child) in format_object {
+                                        if let Some(finding) = cache_control_member_finding(
+                                            format_key,
+                                            "provider-wire",
+                                        ) {
+                                            return Some(finding);
+                                        }
+                                        if format_key == "schema" {
+                                            if let Some(finding) =
+                                                schema_cache_violation(format_child)
+                                            {
+                                                return Some(finding);
+                                            }
+                                        } else if let Some(finding) =
+                                            provider_wire_cache_violation(format_child)
+                                        {
+                                            return Some(finding);
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                            if let Some(finding) = provider_wire_cache_violation(config_child) {
+                                return Some(finding);
+                            }
+                        }
+                    } else if let Some(finding) = provider_wire_cache_violation(child) {
+                        return Some(finding);
+                    }
+                }
+                _ => {
+                    if let Some(finding) = provider_wire_cache_violation(child) {
+                        return Some(finding);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Recursively traverses plain provider-wire JSON: at every provider-owned
+    /// object member the `cache_control` check applies, and no key ever enters
+    /// schema context (schema roots exist only at the exact root paths handled
+    /// by `find_cache_control_violation`).
+    fn provider_wire_cache_violation(value: &Value) -> Option<String> {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object {
+                    if let Some(finding) = cache_control_member_finding(key, "provider-wire") {
+                        return Some(finding);
+                    }
+                    if let Some(finding) = provider_wire_cache_violation(child) {
+                        return Some(finding);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(finding) = provider_wire_cache_violation(item) {
+                        return Some(finding);
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Recursively traverses a JSON Schema node inside a schema root the adapter
+    /// emitted. Inside `properties`, the user property-name keys are data: each
+    /// property schema VALUE is recursed into but the names themselves are never
+    /// compared against `cache_control` (a schema may legitimately define a
+    /// property named `cache_control`). Every other schema member is
+    /// provider-owned structure (keywords the adapter emitted) and keeps the
+    /// `cache_control` check.
+    fn schema_cache_violation(value: &Value) -> Option<String> {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object {
+                    if key == "properties" {
+                        if let Some(property_schemas) = child.as_object() {
+                            for property_schema in property_schemas.values() {
+                                if let Some(finding) = schema_cache_violation(property_schema) {
+                                    return Some(finding);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    if let Some(finding) = cache_control_member_finding(key, "JSON Schema") {
+                        return Some(finding);
+                    }
+                    if let Some(finding) = schema_cache_violation(child) {
+                        return Some(finding);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(finding) = schema_cache_violation(item) {
+                        return Some(finding);
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// The M14 forbidden provider-owned wire member: `cache_control` (ADR 0141).
+    fn cache_control_member_finding(key: &str, context: &str) -> Option<String> {
+        (key == "cache_control").then(|| format!("cache_control present in {context} context"))
+    }
+
+    /// Asserts a complete JSON request value carries no provider-owned
+    /// `cache_control` annotation. Panics with the first finding; the underlying
+    /// `find_cache_control_violation` never panics, so tests can also assert on
+    /// the finding directly.
+    fn assert_no_cache_control(value: &Value, label: &str) {
+        if let Some(finding) = find_cache_control_violation(value) {
+            panic!("{label}: {finding}");
+        }
+    }
+
+    /// Asserts the captured Anthropic Messages wire for the replay shape carries
+    /// the complete prior exchange in the adapter's exact message order: initial
+    /// user; one assistant message with thinking (exact text + signature),
+    /// assistant text, and the echo tool_use (id `call_replay`); the user
+    /// tool_result for `call_replay`; the Steer user; and the tools array
+    /// includes the echo definition the replayed ToolCall refers to.
+    fn assert_replay_wire_content(wire: &Value, label: &str) {
+        let messages = wire["messages"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{label}: replay wire must carry a messages array"));
+        assert_eq!(messages.len(), 4, "{label}: replay message count");
+        assert_eq!(
+            messages[0],
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "SECRET live user input"}]}),
+            "{label}: initial user"
+        );
+        assert_eq!(messages[1]["role"], json!("assistant"));
+        let blocks = messages[1]["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{label}: assistant content must be blocks"));
+        assert_eq!(blocks.len(), 3, "{label}: assistant block count");
+        assert_eq!(
+            blocks[0],
+            json!({"type": "thinking", "thinking": "prior reasoning",
+                   "signature": "sig_replay"}),
+            "{label}: thinking block replays the exact text with its original signature"
+        );
+        assert_eq!(
+            blocks[1],
+            json!({"type": "text", "text": "let me check"}),
+            "{label}: assistant text"
+        );
+        assert_eq!(
+            blocks[2],
+            json!({"type": "tool_use", "id": "call_replay", "name": "echo", "input": {}}),
+            "{label}: echo tool_use keeps the exact ToolCallId"
+        );
+        assert_eq!(
+            messages[2],
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_replay",
+                 "content": [{"type": "text", "text": "ok"}]}]}),
+            "{label}: tool_result joins the exact ToolInvocation call id"
+        );
+        assert_eq!(
+            messages[3],
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "continue"}]}),
+            "{label}: steer user"
+        );
+        let tools = wire["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{label}: replay wire must carry a tools array"));
+        assert_eq!(
+            tools,
+            &[
+                json!({"name": "echo", "description": "Echo a bounded JSON value",
+                      "input_schema": {}})
+            ],
+            "{label}: tools must be exactly the echo definition the replayed \
+             ToolCall refers to — no extra tools, nulls, or schema drift"
+        );
+    }
+
+    /// Runs one scripted invocation, joins the server, and asserts the captured
+    /// request carries no `anthropic-beta` cache header and no `cache_control`
+    /// field anywhere in its body.
+    async fn invoke_and_assert_no_cache_optimization(
+        gateway: &Arc<ModelGateway>,
+        server: LoopbackServer,
+        request: Arc<ModelCallRequest>,
+        label: &str,
+    ) {
+        let result = gateway
+            .generate_model_turn(
+                request,
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("scripted terminal must succeed");
+        let requests = server.join();
+        assert_eq!(
+            requests.len(),
+            1,
+            "one attempt must make exactly one HTTP request ({label})"
+        );
+        assert_eq!(
+            result.response().finish_reason(),
+            ModelFinishReason::Stop,
+            "every denylist shape must return a successful terminal ({label})"
+        );
+        assert!(
+            requests[0].header("anthropic-beta").is_none(),
+            "{label}: the anthropic-beta cache header must never be sent"
+        );
+        assert_no_cache_control(&requests[0].json_body(), label);
     }
 
     // ------------------------------------------------------------------
@@ -2052,7 +2355,11 @@ mod tests {
         assert_eq!(usage.reasoning_tokens(), Some(6));
         assert_eq!(usage.cache_read_tokens(), Some(9));
         assert_eq!(usage.cache_write_tokens(), Some(11));
-        assert_eq!(usage.provider_total_tokens(), Some(25 + 9 + 11 + 19));
+        assert_eq!(
+            usage.provider_total_tokens(),
+            None,
+            "provider_total_tokens is provider-reported only and never a derived sum"
+        );
         assert_eq!(usage.reported_cost(), None);
         assert_eq!(delivery, ProviderRequestDeliveryState::OutputStarted);
 
@@ -3066,7 +3373,11 @@ mod tests {
         assert_eq!(usage.reasoning_tokens(), Some(6));
         assert_eq!(usage.cache_read_tokens(), Some(9));
         assert_eq!(usage.cache_write_tokens(), Some(11));
-        assert_eq!(usage.provider_total_tokens(), Some(25 + 9 + 11 + 19));
+        assert_eq!(
+            usage.provider_total_tokens(),
+            None,
+            "provider_total_tokens is provider-reported only and never a derived sum"
+        );
         assert_eq!(usage.reported_cost(), None);
     }
 
@@ -4066,20 +4377,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn loopback_usage_total_overflow_fails_closed_with_current_delivery() {
-        // The checked provider-total sum overflows (u64::MAX input + 1 output):
-        // InvalidProviderResponse with the current delivery, never a silent
-        // `usage: None` success.
+    async fn loopback_large_individually_valid_usage_counters_never_fail_on_local_sum_overflow() {
+        // provider_total_tokens is provider-reported only: Anthropic Messages does
+        // not report a total in the consumed contract, so normalized usage always
+        // carries None and never derives a local sum. Very large individually
+        // valid cumulative counters (whose local sum would overflow u64) must not
+        // fail the terminal merely because a derived sum would overflow — each
+        // provider-reported counter stays as evidence.
         let server = LoopbackServer::spawn(vec![ScriptedResponse {
             status: 200,
             content_type: "text/event-stream",
             headers: vec![],
             body: sse(&[
-                message_start("msg_overflow", None, u64::MAX),
+                message_start("msg_large", None, u64::MAX),
                 text_block_start(0),
                 text_delta(0, "ok"),
                 content_block_stop(0),
-                message_delta("end_turn", 1),
+                json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                    "usage": {
+                        "output_tokens": 1,
+                        "cache_read_input_tokens": u64::MAX,
+                        "cache_creation_input_tokens": u64::MAX,
+                    },
+                }),
             ]),
             gate: 0,
         }]);
@@ -4095,24 +4417,29 @@ mod tests {
             provider,
         ))
         .await;
-        let error = gateway
+        let result = gateway
             .generate_model_turn(
                 request_for_model(model).await,
                 ModelProgressPublisher::discard(),
                 CancellationToken::new(),
             )
             .await
-            .unwrap_err();
+            .unwrap();
         let requests = server.join();
         assert_eq!(requests.len(), 1);
+        let usage = result
+            .response()
+            .usage()
+            .expect("valid start+terminal always yields usage");
+        assert_eq!(usage.input_tokens(), Some(u64::MAX));
+        assert_eq!(usage.output_tokens(), Some(1));
+        assert_eq!(usage.cache_read_tokens(), Some(u64::MAX));
+        assert_eq!(usage.cache_write_tokens(), Some(u64::MAX));
         assert_eq!(
-            error.reason(),
-            ModelCallErrorReason::InvalidProviderResponse,
-            "provider-total overflow must fail the terminal"
-        );
-        assert_eq!(
-            error.delivery(),
-            ProviderRequestDeliveryState::OutputStarted
+            usage.provider_total_tokens(),
+            None,
+            "a locally derived sum that would overflow must never be synthesized \
+             and must never fail the terminal"
         );
     }
 
@@ -4195,7 +4522,11 @@ mod tests {
         assert_eq!(usage.cache_read_tokens(), None);
         assert_eq!(usage.cache_write_tokens(), None);
         assert_eq!(usage.reasoning_tokens(), None);
-        assert_eq!(usage.provider_total_tokens(), Some(25 + 19));
+        assert_eq!(
+            usage.provider_total_tokens(),
+            None,
+            "provider_total_tokens is provider-reported only and never a derived sum"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4625,5 +4956,372 @@ mod tests {
             error.delivery(),
             ProviderRequestDeliveryState::OutputStarted
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loopback_requests_never_emit_cache_optimization_fields() {
+        // M14 stateless full-request policy (ADR 0141): every representative
+        // request shape always sends the full system/messages/tools and never
+        // contains a provider-owned `cache_control` annotation anywhere (system
+        // blocks, message/content blocks, tool definitions, structured schema),
+        // and never sends the `anthropic-beta` cache header. The denylist
+        // traversal is context-aware: schema context is entered only through the
+        // adapter-emitted schema roots (tool `input_schema`, Structured
+        // `output_config.format.schema`), and provider-owned objects named
+        // `properties` outside schema context still get forbidden-key
+        // comparison. User-authored JSON Schema property names are data, not
+        // provider optimization members, so the Structured shape deliberately
+        // carries properties named `cache_control`/`conversation` to prove no
+        // false positive. Shapes cover the ordinary agent step, a toolful step,
+        // a replay conversation (prior reasoning/tool exchange via the
+        // Anthropic-truthful helper, with the captured wire asserted message by
+        // message), Structured output, and the Compaction NoToolCalls contract.
+        fn terminal_body(text: &str) -> String {
+            sse(&[
+                message_start("msg_deny", None, 5),
+                text_block_start(0),
+                text_delta(0, text),
+                content_block_stop(0),
+                message_delta("end_turn", 3),
+            ])
+        }
+
+        // ordinary
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: terminal_body("ok"),
+            gate: 0,
+        }]);
+        let adapter = Arc::new(
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
+        );
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let (gateway, model) = gateway_and_model(definition_with_credential(
+            ModelReasoningSummary::ProviderDefault,
+            ModelServiceClass::Standard,
+            None,
+            provider,
+            "sk-test",
+        ))
+        .await;
+        invoke_and_assert_no_cache_optimization(
+            &gateway,
+            server,
+            request_for_model(Arc::clone(&model)).await,
+            "ordinary",
+        )
+        .await;
+
+        // toolful
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: terminal_body("ok"),
+            gate: 0,
+        }]);
+        let adapter = Arc::new(
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
+        );
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let (gateway, model) = gateway_and_model(definition_with_credential(
+            ModelReasoningSummary::ProviderDefault,
+            ModelServiceClass::Standard,
+            None,
+            provider,
+            "sk-test",
+        ))
+        .await;
+        invoke_and_assert_no_cache_optimization(
+            &gateway,
+            server,
+            request_for_model_with_tools(Arc::clone(&model), scripted_tool_set()).await,
+            "toolful",
+        )
+        .await;
+
+        // replay: a conversation with a complete prior assistant reasoning + tool
+        // exchange, so the wire carries replayed reasoning/tool items. The
+        // Anthropic-truthful helper provides reasoning with the exact text and
+        // its original signature (never an OpenAI provider item id) and pins the
+        // echo tool set, so the captured wire must contain the replayed exchange
+        // message by message and the echo tool definition.
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: terminal_body("ok"),
+            gate: 0,
+        }]);
+        let adapter = Arc::new(
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
+        );
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let (gateway, model) = gateway_and_model(definition_with_credential(
+            ModelReasoningSummary::ProviderDefault,
+            ModelServiceClass::Standard,
+            None,
+            provider,
+            "sk-test",
+        ))
+        .await;
+        let result = gateway
+            .generate_model_turn(
+                anthropic_replay_request_for_model(Arc::clone(&model)).await,
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("scripted terminal must succeed");
+        let requests = server.join();
+        assert_eq!(
+            requests.len(),
+            1,
+            "one attempt must make exactly one HTTP request (replay)"
+        );
+        assert_eq!(result.response().finish_reason(), ModelFinishReason::Stop);
+        assert!(requests[0].header("anthropic-beta").is_none());
+        let wire = requests[0].json_body();
+        assert_no_cache_control(&wire, "replay");
+        assert_replay_wire_content(&wire, "replay");
+
+        // Structured
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: terminal_body(r#"{"x":"ok"}"#),
+            gate: 0,
+        }]);
+        let adapter = Arc::new(
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
+        );
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let (gateway, model) = gateway_and_model(definition_with(
+            ModelReasoningSummary::ProviderDefault,
+            ModelServiceClass::Standard,
+            Some(NonZeroU32::new(65_536).unwrap()),
+            provider,
+        ))
+        .await;
+        let contract = StructuredOutputContract::new(
+            &model,
+            None,
+            structured_schema(
+                r#"{"type":"object","properties":{"x":{"type":"string"},"cache_control":{"type":"string"},"conversation":{"type":"string"}}}"#,
+            ),
+        )
+        .unwrap();
+        // Run the Structured shape once and capture the wire: it must pass the
+        // cache denylist, and the user property names must survive verbatim in
+        // the captured provider schema (no sanitization deletion, no false
+        // positive) — the schema root reached through
+        // output_config.format.schema keeps `cache_control`/`conversation` as
+        // data alongside `x`, each a string schema.
+        let result = gateway
+            .generate_model_turn(
+                structured_request(&model, &contract).await,
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("scripted terminal must succeed");
+        let requests = server.join();
+        assert_eq!(
+            requests.len(),
+            1,
+            "one attempt must make exactly one HTTP request (Structured)"
+        );
+        assert_eq!(result.response().finish_reason(), ModelFinishReason::Stop);
+        assert!(requests[0].header("anthropic-beta").is_none());
+        let wire = requests[0].json_body();
+        assert_no_cache_control(&wire, "Structured");
+        let properties = wire["output_config"]["format"]["schema"]["properties"]
+            .as_object()
+            .expect("Structured schema must carry a properties map");
+        assert_eq!(
+            properties.len(),
+            3,
+            "Structured: user property names must be preserved"
+        );
+        assert_eq!(properties["x"], json!({"type": "string"}));
+        assert_eq!(properties["conversation"], json!({"type": "string"}));
+        assert_eq!(properties["cache_control"], json!({"type": "string"}));
+
+        // Compaction: the NoToolCalls contract is the fixed CompactionSummary
+        // shape.
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: terminal_body("ok"),
+            gate: 0,
+        }]);
+        let adapter = Arc::new(
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
+        );
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let (gateway, model) = gateway_and_model(definition_with_credential(
+            ModelReasoningSummary::ProviderDefault,
+            ModelServiceClass::Standard,
+            None,
+            provider,
+            "sk-test",
+        ))
+        .await;
+        invoke_and_assert_no_cache_optimization(
+            &gateway,
+            server,
+            request_with_output_contract(&model, Some(&OutputContract::NoToolCalls)).await,
+            "Compaction/NoToolCalls",
+        )
+        .await;
+
+        // Counterexample: a provider-owned object named `properties` is provider
+        // wire, not schema context — its members keep the `cache_control` check.
+        // The finder returns a finding (never panics as control flow), so the
+        // assertion checks the bool directly; the schema-traversal counterpart
+        // proves the `properties` name exemption exists only inside a schema
+        // root.
+        let provider_owned_properties =
+            json!({ "properties": {"cache_control": {"type": "object"}} });
+        assert!(
+            find_cache_control_violation(&provider_owned_properties).is_some(),
+            "a provider-owned object named `properties` must be checked as \
+             provider wire: member `cache_control` is forbidden"
+        );
+        assert!(
+            schema_cache_violation(&json!({"properties": {"cache_control": {"type": "object"}}}))
+                .is_none(),
+            "inside a schema root, `properties` member names are user data"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loopback_same_request_arc_twice_resolves_fresh_credentials_with_identical_bodies() {
+        // The same immutable Arc<ModelCallRequest> is invoked twice through the
+        // real gateway, exactly as Session logical retry reuses the request Arc.
+        // Each invocation must resolve the dynamic credential source afresh
+        // (per-attempt credential rotation stays intact), send exactly one POST,
+        // and encode the identical complete body — always the full
+        // system/messages/tools, never a continuation or cache-optimized variant.
+        let server = LoopbackServer::spawn(vec![
+            ScriptedResponse {
+                status: 200,
+                content_type: "text/event-stream",
+                headers: vec![],
+                body: sse(&[
+                    message_start("msg_a", None, 5),
+                    text_block_start(0),
+                    text_delta(0, "first"),
+                    content_block_stop(0),
+                    message_delta("end_turn", 3),
+                ]),
+                gate: 0,
+            },
+            ScriptedResponse {
+                status: 200,
+                content_type: "text/event-stream",
+                headers: vec![],
+                body: sse(&[
+                    message_start("msg_b", None, 5),
+                    text_block_start(0),
+                    text_delta(0, "second"),
+                    content_block_stop(0),
+                    message_delta("end_turn", 3),
+                ]),
+                gate: 0,
+            },
+        ]);
+        let adapter = Arc::new(
+            AnthropicMessagesProviderAdapter::new(&server.messages_endpoint(), "2023-06-01")
+                .unwrap(),
+        );
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let definition = ModelDefinition::new(
+            anthropic_selection(),
+            ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
+            "claude-sonnet-4-6".parse().unwrap(),
+            ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
+            EffectiveModelLimits::new(NonZeroU32::new(128_000), NonZeroU32::new(8_192)),
+            TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1).unwrap(),
+            ModelGenerationDefaults::new(
+                NonZeroU32::new(4_096).unwrap(),
+                ModelReasoningSummary::ProviderDefault,
+                ModelServiceClass::Standard,
+            ),
+            provider,
+            Arc::new(MutableCredentialSource {
+                // Vec::pop yields the last element first, so the queue is reversed.
+                credentials: Mutex::new(vec![
+                    "sk-second".parse().unwrap(),
+                    "sk-first".parse().unwrap(),
+                ]),
+            }),
+        )
+        .unwrap();
+        let source = Arc::new(SingleModelSource::new(definition));
+        let source_adapter: Arc<dyn ModelSourceAdapter> = source;
+        let gateway = Arc::new(ModelGateway::new(vec![source_adapter]));
+        let model = gateway
+            .resolve_for_turn(
+                gateway.initialize().await.unwrap(),
+                ResolveTurnModelRequest::new(
+                    anthropic_selection(),
+                    ReasoningPreference::Auto,
+                    None,
+                ),
+            )
+            .unwrap();
+        let request = request_for_model(model).await;
+
+        let first = gateway
+            .generate_model_turn(
+                Arc::clone(&request),
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let second = gateway
+            .generate_model_turn(
+                Arc::clone(&request),
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let requests = server.join();
+
+        assert_eq!(
+            requests.len(),
+            2,
+            "two invocations must make exactly one POST each"
+        );
+        assert_request_shape(&requests[0], "sk-first", "2023-06-01");
+        assert_request_shape(&requests[1], "sk-second", "2023-06-01");
+        assert_eq!(
+            requests[0].body_bytes(),
+            requests[1].body_bytes(),
+            "the same immutable request must encode the identical complete body on \
+             every attempt (always full system/messages/tools, never a \
+             continuation/cache-optimized variant)"
+        );
+        for request in &requests {
+            assert!(
+                request.header("anthropic-beta").is_none(),
+                "the anthropic-beta cache header must never be sent"
+            );
+            assert_no_cache_control(&request.json_body(), "same-Arc attempt");
+        }
+        assert_eq!(first.response().finish_reason(), ModelFinishReason::Stop);
+        assert_eq!(second.response().finish_reason(), ModelFinishReason::Stop);
     }
 }

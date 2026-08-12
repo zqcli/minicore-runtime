@@ -1,9 +1,11 @@
 # ADR 0138：Production Provider baseline只采用已验证的Rig协议合同
 
-状态：Partially Superseded by ADR 0139
+状态：Partially Superseded by ADRs 0139 and 0141
 日期：2026-08-11
 
 Refinement note：本ADR冻结的OpenAI Responses/Anthropic Messages协议、terminal、metadata、single-attempt与delivery/error合同继续有效；`rig-core`作为主crate dev/production dependency及M14 `RigProviderAdapter`的决定已被ADR 0139取代。Rig 0.40.0现只存在于standalone stable-only evidence harness，M14改为两个direct provider adapters。
+
+> 2026-08-12：[ADR 0141](0141-provider-calls-are-stateless-full-request.md)细化single-attempt wire语义：M14 adapter绝不发送optimization-specific fallback POST。“provider拒绝continuation→fallback full request”的旧语言不能解释为同一`generate_model_turn`内的第二次POST；当前政策是omission（不请求continuation），未来fallback只能在新ADR下作为later distinct logical request之前规划。
 
 ## 背景
 

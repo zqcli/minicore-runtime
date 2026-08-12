@@ -1,7 +1,9 @@
 # ADR 0125：ModelGateway不设置本地模型调用Permit
 
-状态：Accepted
+状态：Partially Superseded by ADR 0141
 日期：2026-07-29
+
+> 2026-08-12：[ADR 0141](0141-provider-calls-are-stateless-full-request.md)细化本ADR的connection/principal条款：MiniCore没有auth-principal identity类型；连接政策就是adapter-owned的无状态reqwest client（stateless transport pooling eligibility），不存在connection pool隔离键或route/principal cooldown state。no-local-permit决策本身不变。
 
 ## 背景
 

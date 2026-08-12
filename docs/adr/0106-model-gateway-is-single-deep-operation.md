@@ -1,7 +1,9 @@
 # ADR 0106: ModelGateway 是单一深异步 operation
 
-状态：Partially Superseded by ADR 0139
+状态：Partially Superseded by ADRs 0139 and 0141
 日期：2026-07-24
+
+> 2026-08-12：[ADR 0141](0141-provider-calls-are-stateless-full-request.md)冻结M14 wire policy：每次`generate_model_turn`至多调用一次`ProviderAdapter::execute`（owner validation/pre-send cancellation/`AuthMissing`在调用adapter前以typed error terminal，零execute/零POST；adapter编码/build失败或adapter级pre-send cancellation为一次execute/零POST），独立地发送零或一个HTTP POST；若发送POST则携带完整full request，从不发送optimization-specific fallback POST。显式cache annotation、`previous_response_id`/incremental input与continuation是有意omission，不是pending实现。“provider拒绝continuation后fallback full request”不能理解为同一次operation内的第二次POST；未来fallback只能在新ADR下作为later distinct logical request之前规划。本ADR的deep operation、private `ProviderAdapter`与provider-neutral ownership继续有效。
 
 > 2026-08-11：[ADR 0139](0139-rig-is-evidence-only-under-rust-1-85.md)取代首个production `RigProviderAdapter`条款。ModelGateway deep operation、private `ProviderAdapter`、single-attempt与provider-neutral ownership继续有效；M14使用两个protocol-specific direct adapters。
 

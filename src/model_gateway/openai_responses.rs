@@ -6,8 +6,13 @@
 //! without widening them.
 //!
 //! Frozen contracts (ADR 0138/0139, M12 fixture `docs/fixtures/provider-gate-m12`):
-//! - one `generate_model_turn` issues at most one POST; the reqwest client is built
-//!   with `redirect::Policy::none()`, `retry::never()` and `no_proxy()`;
+//! - one `generate_model_turn` performs zero or one `ProviderAdapter::execute` /
+//!   HTTP POST: pre-send cancellation, `AuthMissing`, request validation and
+//!   encoding/build failures can produce zero POSTs; whenever a POST is sent it
+//!   carries the complete full request, never an optimization fallback POST (ADR
+//!   0141: stateless full-request wire policy — no retry, no continuation state);
+//!   the reqwest client is built with `redirect::Policy::none()`,
+//!   `retry::never()` and `no_proxy()`;
 //! - success is exactly an SSE `response.completed` whose `response.status` is
 //!   `completed` and whose `response.model` is a non-empty string exactly equal to
 //!   the pinned private API model name of the request's definition (mismatch,
@@ -332,6 +337,15 @@ fn classify_http_error(
 /// Encodes the exact provider request body. The wire model name is the private
 /// provider API model name of the exact definition bound to the request (never the
 /// stable `ModelId`); the adapter carries no model name.
+///
+/// M14 stateless full-request policy (ADR 0141): the body always carries the full
+/// assembled context and never contains `previous_response_id`, `prompt_cache_key`,
+/// `prompt_cache_retention`, `cache_control`, a `conversation`/sticky-provider
+/// session field, or any incremental-input optimization. `store` stays `false`.
+/// This omission does not claim the provider performs zero automatic caching or
+/// retention: MiniCore merely does not request or control these optimizations, and
+/// correctness never depends on them. Provider-reported cached tokens remain usage
+/// evidence only.
 fn encode_request(request: &ProviderAttemptRequest) -> Result<Vec<u8>, ProviderAttemptError> {
     let call = request.call();
     let input = call.input();
@@ -1257,14 +1271,15 @@ mod tests {
     };
     use crate::model_gateway::provider_transport::{SseParseError, drain_bounded};
     use crate::model_gateway::tests::{
-        request_for_model, request_for_model_with_tools, request_with_output_contract,
-        resolve_request, scripted_tool_set, structured_definition_with_credential,
-        structured_request, structured_schema, text_definition, text_definition_with_credential,
+        MutableCredentialSource, openai_replay_request_for_model, request_for_model,
+        request_for_model_with_tools, request_with_output_contract, resolve_request,
+        scripted_tool_set, structured_definition_with_credential, structured_request,
+        structured_schema, text_definition, text_definition_with_credential,
     };
     use crate::model_gateway::{
-        EffectiveModelLimits, FinalizedAssistantContent, ModelCapabilities, ModelDefinition,
-        ModelDefinitionVersion, ModelGateway, ModelGenerationDefaults, ModelSelection,
-        ModelSourceAdapter, ModelSourceFuture, OutputContract, ProviderAdapter,
+        EffectiveModelLimits, FinalizedAssistantContent, ModelCallRequest, ModelCapabilities,
+        ModelDefinition, ModelDefinitionVersion, ModelGateway, ModelGenerationDefaults,
+        ModelSelection, ModelSourceAdapter, ModelSourceFuture, OutputContract, ProviderAdapter,
         ReasoningCapabilities, ReasoningPreference, ResolveTurnModelRequest,
         StructuredOutputContract, TokenEstimateRate, TurnModelSnapshot, fixed_credential_source,
     };
@@ -1420,6 +1435,314 @@ mod tests {
             request.body_len(),
             "the server must read exactly Content-Length body bytes"
         );
+    }
+
+    /// Returns the first forbidden provider-owned optimization member finding
+    /// (M14 stateless full-request policy, ADR 0141): `previous_response_id`,
+    /// prompt-cache keys, `cache_control`, or a `conversation`/sticky-provider-
+    /// session carrier. Never panics: tests assert on the returned finding
+    /// directly. `None` means the value is clean.
+    ///
+    /// Schema roots are entered only at their exact provider-wire paths from the
+    /// root object — a tool definition's `parameters` VALUE under the root
+    /// `tools` array, and the Structured `text.format.schema` VALUE. No other
+    /// `parameters`/`text`/`format`/`schema` key at any nesting depth enters
+    /// schema context: provider-owned key names are checked by name everywhere
+    /// else, including inside a hypothetical provider-owned object named
+    /// `properties`.
+    fn find_optimization_violation(value: &Value) -> Option<String> {
+        // The root object is provider wire like any other: its own member names
+        // are checked, and only the two exact schema-root paths below are
+        // honored.
+        let object = match value.as_object() {
+            Some(object) => object,
+            None => return provider_wire_violation(value),
+        };
+        for (key, child) in object {
+            if let Some(finding) = forbidden_member_finding(key, "provider-wire") {
+                return Some(finding);
+            }
+            match key.as_str() {
+                // Root `tools`: each tool object is provider wire, and only its
+                // exact `parameters` VALUE is a schema root; every other member
+                // of the tool object (including the `parameters` key itself)
+                // stays provider-wire checked.
+                "tools" => {
+                    let Some(tools) = child.as_array() else {
+                        if let Some(finding) = provider_wire_violation(child) {
+                            return Some(finding);
+                        }
+                        continue;
+                    };
+                    for tool in tools {
+                        let Some(tool_object) = tool.as_object() else {
+                            if let Some(finding) = provider_wire_violation(tool) {
+                                return Some(finding);
+                            }
+                            continue;
+                        };
+                        if let Some(parameters) = tool_object.get("parameters") {
+                            if let Some(finding) = schema_violation(parameters) {
+                                return Some(finding);
+                            }
+                        }
+                        for (tool_key, tool_child) in tool_object {
+                            if let Some(finding) =
+                                forbidden_member_finding(tool_key, "provider-wire")
+                            {
+                                return Some(finding);
+                            }
+                            if tool_key == "parameters" {
+                                continue;
+                            }
+                            if let Some(finding) = provider_wire_violation(tool_child) {
+                                return Some(finding);
+                            }
+                        }
+                    }
+                }
+                // Root `text`: the value is provider wire, and only the exact
+                // `format.schema` VALUE inside it is a schema root; every
+                // sibling key stays provider-wire checked.
+                "text" => {
+                    if let Some(text_object) = child.as_object() {
+                        for (text_key, text_child) in text_object {
+                            if let Some(finding) =
+                                forbidden_member_finding(text_key, "provider-wire")
+                            {
+                                return Some(finding);
+                            }
+                            if text_key == "format" {
+                                if let Some(format_object) = text_child.as_object() {
+                                    for (format_key, format_child) in format_object {
+                                        if let Some(finding) =
+                                            forbidden_member_finding(format_key, "provider-wire")
+                                        {
+                                            return Some(finding);
+                                        }
+                                        if format_key == "schema" {
+                                            if let Some(finding) = schema_violation(format_child) {
+                                                return Some(finding);
+                                            }
+                                        } else if let Some(finding) =
+                                            provider_wire_violation(format_child)
+                                        {
+                                            return Some(finding);
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                            if let Some(finding) = provider_wire_violation(text_child) {
+                                return Some(finding);
+                            }
+                        }
+                    } else if let Some(finding) = provider_wire_violation(child) {
+                        return Some(finding);
+                    }
+                }
+                _ => {
+                    if let Some(finding) = provider_wire_violation(child) {
+                        return Some(finding);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Recursively traverses plain provider-wire JSON: at every provider-owned
+    /// object member the forbidden-key check applies, and no key ever enters
+    /// schema context (schema roots exist only at the exact root paths handled
+    /// by `find_optimization_violation`).
+    fn provider_wire_violation(value: &Value) -> Option<String> {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object {
+                    if let Some(finding) = forbidden_member_finding(key, "provider-wire") {
+                        return Some(finding);
+                    }
+                    if let Some(finding) = provider_wire_violation(child) {
+                        return Some(finding);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(finding) = provider_wire_violation(item) {
+                        return Some(finding);
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Recursively traverses a JSON Schema node inside a schema root the adapter
+    /// emitted. Inside `properties`, the user property-name keys are data: each
+    /// property schema VALUE is recursed into but the names themselves are never
+    /// compared against the forbidden set (a schema may legitimately define a
+    /// property named `conversation` or `cache_control`). Every other schema
+    /// member is provider-owned structure (keywords the adapter emitted) and
+    /// keeps the forbidden-key check.
+    fn schema_violation(value: &Value) -> Option<String> {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object {
+                    if key == "properties" {
+                        if let Some(property_schemas) = child.as_object() {
+                            for property_schema in property_schemas.values() {
+                                if let Some(finding) = schema_violation(property_schema) {
+                                    return Some(finding);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    if let Some(finding) = forbidden_member_finding(key, "JSON Schema") {
+                        return Some(finding);
+                    }
+                    if let Some(finding) = schema_violation(child) {
+                        return Some(finding);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(finding) = schema_violation(item) {
+                        return Some(finding);
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// The M14 forbidden provider-owned wire-optimization member names (ADR
+    /// 0141): `previous_response_id`, prompt-cache keys, `cache_control`, and a
+    /// `conversation`/sticky-provider-session carrier.
+    fn forbidden_member_finding(key: &str, context: &str) -> Option<String> {
+        matches!(
+            key,
+            "previous_response_id"
+                | "prompt_cache_key"
+                | "prompt_cache_retention"
+                | "cache_control"
+                | "conversation"
+        )
+        .then(|| {
+            format!("forbidden provider-owned optimization member {key:?} in {context} context")
+        })
+    }
+
+    /// Asserts a complete JSON request value carries no forbidden provider-owned
+    /// wire-optimization member. Panics with the first finding; the underlying
+    /// `find_optimization_violation` never panics, so tests can also assert on
+    /// the finding directly.
+    fn assert_no_optimization_fields(value: &Value, label: &str) {
+        if let Some(finding) = find_optimization_violation(value) {
+            panic!("{label}: {finding}");
+        }
+    }
+
+    /// Asserts the captured OpenAI Responses wire for the replay shape carries
+    /// the complete prior exchange, in order: initial user, replayed reasoning
+    /// item (exact item id, text and summary), assistant text, the echo
+    /// function_call (call id `call_replay`), the matching
+    /// function_call_output, and the Steer user message; the tools array
+    /// includes the echo definition the replayed ToolCall refers to.
+    fn assert_replay_wire_content(wire: &Value, label: &str) {
+        let input = wire["input"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{label}: replay wire must carry an input array"));
+        assert_eq!(input.len(), 6, "{label}: replay input item count");
+        assert_eq!(
+            input[0],
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "SECRET live user input"}]}),
+            "{label}: initial user"
+        );
+        assert_eq!(input[1]["type"], json!("reasoning"));
+        assert_eq!(
+            input[1]["id"],
+            json!("rs_replay"),
+            "{label}: reasoning item id"
+        );
+        assert_eq!(
+            input[1]["content"],
+            json!([{"type": "reasoning_text", "text": "prior reasoning"}]),
+            "{label}: replayed reasoning text"
+        );
+        assert_eq!(
+            input[1]["summary"],
+            json!([{"type": "summary_text", "text": "prior summary"}]),
+            "{label}: replayed reasoning summary"
+        );
+        assert_eq!(
+            input[2],
+            json!({"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "let me check"}]}),
+            "{label}: assistant text"
+        );
+        assert_eq!(
+            input[3],
+            json!({"type": "function_call", "call_id": "call_replay", "name": "echo",
+                   "arguments": "{}", "status": "completed"}),
+            "{label}: echo function_call keeps the exact ToolCallId"
+        );
+        assert_eq!(
+            input[4],
+            json!({"type": "function_call_output", "call_id": "call_replay", "output": "ok",
+                   "status": "completed"}),
+            "{label}: tool result joins the exact ToolInvocation call id"
+        );
+        assert_eq!(
+            input[5],
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "continue"}]}),
+            "{label}: steer user"
+        );
+        let tools = wire["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{label}: replay wire must carry a tools array"));
+        assert_eq!(
+            tools,
+            &[json!({"type": "function", "name": "echo",
+                      "description": "Echo a bounded JSON value", "parameters": {}})],
+            "{label}: tools must be exactly the echo definition the replayed \
+             ToolCall refers to — no extra tools, nulls, or schema drift"
+        );
+    }
+
+    /// Spawns a scripted server, runs one `generate_model_turn`, joins the server
+    /// (always before assertions), and returns the captured wire body.
+    async fn invoke_and_capture_wire(
+        gateway: &Arc<ModelGateway>,
+        server: LoopbackServer,
+        request: Arc<ModelCallRequest>,
+    ) -> Value {
+        let result = gateway
+            .generate_model_turn(
+                request,
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("scripted terminal must succeed");
+        let requests = server.join();
+        assert_eq!(
+            requests.len(),
+            1,
+            "one attempt must make exactly one HTTP request"
+        );
+        assert_eq!(
+            result.response().finish_reason(),
+            ModelFinishReason::Stop,
+            "every denylist shape must return a successful terminal"
+        );
+        requests[0].json_body()
     }
 
     // ------------------------------------------------------------------
@@ -3477,5 +3800,290 @@ mod tests {
                 "quota is not a retryable rate limit"
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loopback_requests_never_emit_optimization_fields() {
+        // M14 stateless full-request policy (ADR 0141): every representative
+        // request shape carries the complete assembled context and never contains
+        // a provider-owned continuation/prompt-cache/sticky-session member
+        // anywhere in the JSON value (user-authored JSON Schema property names
+        // are data, not provider optimization members), and `store` stays false.
+        // The denylist traversal is context-aware: schema context is entered
+        // only through the adapter-emitted schema roots (tool `parameters`,
+        // Structured `text.format.schema`), and provider-owned objects named
+        // `properties` outside schema context still get forbidden-key
+        // comparison. The shapes cover the ordinary agent step, a toolful step,
+        // a replay conversation (prior reasoning/tool exchange via the
+        // OpenAI-truthful helper, with the captured wire asserted item by
+        // item), Structured output, and the Compaction NoToolCalls contract.
+
+        // ordinary
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: sse(&[completed_simple("ok")]),
+            gate: 0,
+        }]);
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let (gateway, model) = gateway_and_model(text_definition_with_credential(
+            1, 4_096, 128_000, provider, "sk-test",
+        ))
+        .await;
+        let wire = invoke_and_capture_wire(
+            &gateway,
+            server,
+            request_for_model(Arc::clone(&model)).await,
+        )
+        .await;
+        assert_eq!(wire["store"], false, "store must stay false");
+        assert_no_optimization_fields(&wire, "ordinary");
+
+        // toolful
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: sse(&[completed_simple("ok")]),
+            gate: 0,
+        }]);
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let (gateway, model) = gateway_and_model(text_definition_with_credential(
+            1, 4_096, 128_000, provider, "sk-test",
+        ))
+        .await;
+        let wire = invoke_and_capture_wire(
+            &gateway,
+            server,
+            request_for_model_with_tools(Arc::clone(&model), scripted_tool_set()).await,
+        )
+        .await;
+        assert_eq!(wire["store"], false);
+        assert_no_optimization_fields(&wire, "toolful");
+
+        // replay: a conversation with a complete prior assistant reasoning + tool
+        // exchange, so the wire carries replayed reasoning/tool items. The
+        // OpenAI-truthful helper provides the reasoning with a provider item id
+        // (never an Anthropic signature) and pins the echo tool set, so the
+        // captured wire must contain the replayed exchange item by item and the
+        // echo tool definition.
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: sse(&[completed_simple("ok")]),
+            gate: 0,
+        }]);
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let (gateway, model) = gateway_and_model(text_definition_with_credential(
+            1, 4_096, 128_000, provider, "sk-test",
+        ))
+        .await;
+        let wire = invoke_and_capture_wire(
+            &gateway,
+            server,
+            openai_replay_request_for_model(Arc::clone(&model)).await,
+        )
+        .await;
+        assert_eq!(wire["store"], false);
+        assert_no_optimization_fields(&wire, "replay");
+        assert_replay_wire_content(&wire, "replay");
+
+        // Structured
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: sse(&[completed_simple(r#"{"x":"ok"}"#)]),
+            gate: 0,
+        }]);
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let (gateway, model) = gateway_and_model(structured_definition_with_credential(
+            1,
+            4_096,
+            NonZeroU32::new(65_536).unwrap(),
+            provider,
+            "sk-test",
+        ))
+        .await;
+        let contract = StructuredOutputContract::new(
+            &model,
+            None,
+            structured_schema(
+                r#"{"type":"object","properties":{"x":{"type":"string"},"conversation":{"type":"string"},"cache_control":{"type":"string"}}}"#,
+            ),
+        )
+        .unwrap();
+        let wire = invoke_and_capture_wire(
+            &gateway,
+            server,
+            structured_request(&model, &contract).await,
+        )
+        .await;
+        assert_eq!(wire["store"], false);
+        assert_no_optimization_fields(&wire, "Structured");
+        // The user property names must survive verbatim in the captured provider
+        // schema (no sanitization deletion, no false positive): the schema root
+        // reached through text.format.schema keeps `conversation`/`cache_control`
+        // as data alongside `x`, each a string schema.
+        let properties = wire["text"]["format"]["schema"]["properties"]
+            .as_object()
+            .expect("Structured schema must carry a properties map");
+        assert_eq!(
+            properties.len(),
+            3,
+            "Structured: user property names must be preserved"
+        );
+        assert_eq!(properties["x"], json!({"type": "string"}));
+        assert_eq!(properties["conversation"], json!({"type": "string"}));
+        assert_eq!(properties["cache_control"], json!({"type": "string"}));
+
+        // Compaction: the NoToolCalls contract is the fixed CompactionSummary
+        // shape.
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: sse(&[completed_simple("ok")]),
+            gate: 0,
+        }]);
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let (gateway, model) = gateway_and_model(text_definition_with_credential(
+            1, 4_096, 128_000, provider, "sk-test",
+        ))
+        .await;
+        let wire = invoke_and_capture_wire(
+            &gateway,
+            server,
+            request_with_output_contract(&model, Some(&OutputContract::NoToolCalls)).await,
+        )
+        .await;
+        assert_eq!(wire["store"], false);
+        assert_no_optimization_fields(&wire, "Compaction/NoToolCalls");
+
+        // Counterexample: a provider-owned object named `properties` is provider
+        // wire, not schema context — its members keep the forbidden-key check.
+        // The finder returns a finding (never panics as control flow), so the
+        // assertion checks the bool directly; the schema-traversal counterpart
+        // proves the `properties` name exemption exists only inside a schema
+        // root.
+        let provider_owned_properties =
+            json!({ "properties": {"conversation": {"type": "object"}} });
+        assert!(
+            find_optimization_violation(&provider_owned_properties).is_some(),
+            "a provider-owned object named `properties` must be checked as \
+             provider wire: member `conversation` is forbidden"
+        );
+        assert!(
+            schema_violation(&json!({"properties": {"conversation": {"type": "object"}}}))
+                .is_none(),
+            "inside a schema root, `properties` member names are user data"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loopback_same_request_arc_twice_resolves_fresh_credentials_with_identical_bodies() {
+        // The same immutable Arc<ModelCallRequest> is invoked twice through the
+        // real gateway, exactly as Session logical retry reuses the request Arc.
+        // Each invocation must resolve the dynamic credential source afresh
+        // (per-attempt credential rotation stays intact), send exactly one POST,
+        // and encode the identical complete body — never a continuation or
+        // incremental variant, and with no forbidden optimization fields.
+        let server = LoopbackServer::spawn(vec![
+            ScriptedResponse {
+                status: 200,
+                content_type: "text/event-stream",
+                headers: vec![],
+                body: sse(&[completed_simple("first")]),
+                gate: 0,
+            },
+            ScriptedResponse {
+                status: 200,
+                content_type: "text/event-stream",
+                headers: vec![],
+                body: sse(&[completed_simple("second")]),
+                gate: 0,
+            },
+        ]);
+        let adapter =
+            Arc::new(OpenAiResponsesProviderAdapter::new(&server.responses_endpoint()).unwrap());
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let definition = ModelDefinition::new(
+            ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+            ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
+            "gpt-5".parse().unwrap(),
+            ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
+            EffectiveModelLimits::new(NonZeroU32::new(128_000), NonZeroU32::new(8_192)),
+            TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1).unwrap(),
+            ModelGenerationDefaults::new(
+                NonZeroU32::new(4_096).unwrap(),
+                ModelReasoningSummary::ProviderDefault,
+                ModelServiceClass::Standard,
+            ),
+            provider,
+            Arc::new(MutableCredentialSource {
+                // Vec::pop yields the last element first, so the queue is reversed.
+                credentials: std::sync::Mutex::new(vec![
+                    "sk-second".parse().unwrap(),
+                    "sk-first".parse().unwrap(),
+                ]),
+            }),
+        )
+        .unwrap();
+        let source = Arc::new(SingleModelSource::new(definition));
+        let source_adapter: Arc<dyn ModelSourceAdapter> = source;
+        let gateway = Arc::new(ModelGateway::new(vec![source_adapter]));
+        let model = gateway
+            .resolve_for_turn(gateway.initialize().await.unwrap(), resolve_request(None))
+            .unwrap();
+        let request = request_for_model(model).await;
+
+        let first = gateway
+            .generate_model_turn(
+                Arc::clone(&request),
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let second = gateway
+            .generate_model_turn(
+                Arc::clone(&request),
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let requests = server.join();
+
+        assert_eq!(
+            requests.len(),
+            2,
+            "two invocations must make exactly one POST each"
+        );
+        assert_request_shape(&requests[0], "sk-first");
+        assert_request_shape(&requests[1], "sk-second");
+        assert_eq!(
+            requests[0].body_bytes(),
+            requests[1].body_bytes(),
+            "the same immutable request must encode the identical complete body on \
+             every attempt (never a continuation/incremental variant)"
+        );
+        let wire: Value = requests[0].json_body();
+        assert_eq!(wire["store"], false);
+        assert_no_optimization_fields(&wire, "same-Arc attempt");
+        assert_eq!(first.response().finish_reason(), ModelFinishReason::Stop);
+        assert_eq!(second.response().finish_reason(), ModelFinishReason::Stop);
     }
 }

@@ -2956,7 +2956,10 @@ mod tests {
 
     use super::*;
     use crate::agent_session_lifecycle::AgentRevisionRef;
-    use crate::conversation_storage::StoredUserMessage;
+    use crate::conversation_storage::{
+        StoredAssistantContent, StoredAssistantMessage, StoredToolMessage, StoredToolOutcome,
+        StoredUserMessage,
+    };
     use crate::live_conversation::LiveSessionState;
     use crate::prompt::{
         AgentPromptSelection, ModelMessageRef, PromptAssemblyInput, PromptBodyIntent,
@@ -2964,8 +2967,11 @@ mod tests {
         TextIntent,
     };
     use crate::skills::SkillView;
-    use crate::tools::{ToolDefinition, ToolExecutionMode, ToolExecutionResult, ToolSet};
-    use crate::turn_item_interaction::UserMessageSource;
+    use crate::tools::{
+        ToolDefinition, ToolExecutionMode, ToolExecutionResult, ToolOutcomeSource,
+        ToolResultContent, ToolResultDisposition, ToolSet,
+    };
+    use crate::turn_item_interaction::{AssistantDisposition, UserMessageSource};
     use crate::wire::{
         AgentRevision, ItemId, SessionDefinitionRevision, SessionId, Timestamp, TurnId,
     };
@@ -3194,6 +3200,184 @@ mod tests {
         )
     }
 
+    /// The two provider-truthful replay shapes share one assembly helper: the
+    /// conversation is identical (user input, an Intermediate assistant with
+    /// replayable reasoning, text and a tool call, the tool result, and a Steer
+    /// user message); only the reasoning artifact differs per provider protocol.
+    #[derive(Clone, Copy)]
+    enum ReplayReasoningShape {
+        /// OpenAI Responses replay: provider item id + text (plus a summary so
+        /// the official-required `summary` field carries a summary_text entry);
+        /// never an Anthropic signature.
+        OpenAi,
+        /// Anthropic Messages replay: exact text + exact signature (the Claude
+        /// thinking-block requirement); never a provider item id or OpenAI-only
+        /// artifact.
+        Anthropic,
+    }
+
+    /// Assembles an OpenAI-truthful replay request: reasoning carries a
+    /// `ProviderItemId` (plus text/summary) and no Anthropic signature, and the
+    /// Turn-pinned tool set includes the `echo` tool the replayed ToolCall
+    /// refers to (the current request therefore carries the echo tool
+    /// definition). Test-only; no production interface.
+    pub(super) async fn openai_replay_request_for_model(
+        model: Arc<TurnModelSnapshot>,
+    ) -> Arc<ModelCallRequest> {
+        replay_request_for_model(model, ReplayReasoningShape::OpenAi).await
+    }
+
+    /// Assembles an Anthropic-truthful replay request: reasoning carries the
+    /// exact text with its original signature (the Claude thinking-block replay
+    /// requirement) and no `ProviderItemId`/OpenAI-only artifact, and the
+    /// Turn-pinned tool set includes the `echo` tool the replayed ToolCall
+    /// refers to. Test-only; no production interface.
+    pub(super) async fn anthropic_replay_request_for_model(
+        model: Arc<TurnModelSnapshot>,
+    ) -> Arc<ModelCallRequest> {
+        replay_request_for_model(model, ReplayReasoningShape::Anthropic).await
+    }
+
+    async fn replay_request_for_model(
+        model: Arc<TurnModelSnapshot>,
+        shape: ReplayReasoningShape,
+    ) -> Arc<ModelCallRequest> {
+        // The replayed ToolCall refers to the `echo` tool, so the Turn-pinned
+        // tool set must include it: the current request then carries the echo
+        // tool definition and the historical echo ToolCall stays compatible
+        // with the pinned tool set.
+        let prompt_set =
+            prompt_set_for_model_with_tools(Arc::clone(&model), scripted_tool_set()).await;
+        let session_id = "ses_00000000000000000000000000000001".parse().unwrap();
+        let turn_id = "trn_00000000000000000000000000000001".parse().unwrap();
+        let timestamp = "2026-08-08T00:00:00.000Z".parse().unwrap();
+        let input_user = prompt_set
+            .compose_user_message(
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("SECRET live user input").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut live = LiveSessionState::new(session_id, []);
+        live.apply_user_message(
+            StoredUserMessage::reconstruct(
+                "itm_00000000000000000000000000000001".parse().unwrap(),
+                UserMessageSource::Input,
+                input_user,
+            ),
+            turn_id,
+            timestamp,
+        )
+        .unwrap();
+        // Replayable reasoning carries a provider item id; the assistant also
+        // carries text and one tool call, and the tool result completes the
+        // exchange so the sanitized view keeps it. The reasoning artifact is
+        // provider-truthful: OpenAI replays from text/summary + item id,
+        // Anthropic replays from exact text + signature.
+        let reasoning = match shape {
+            ReplayReasoningShape::OpenAi => ReasoningContent::new(
+                Some("prior reasoning".to_owned()),
+                Some("prior summary".to_owned()),
+                None,
+                None,
+                Some("rs_replay".parse().unwrap()),
+            )
+            .unwrap(),
+            ReplayReasoningShape::Anthropic => ReasoningContent::new(
+                Some("prior reasoning".to_owned()),
+                None,
+                None,
+                Some("sig_replay".to_owned()),
+                None,
+            )
+            .unwrap(),
+        };
+        let assistant = StoredAssistantMessage::reconstruct(
+            AssistantDisposition::Intermediate,
+            vec![
+                StoredAssistantContent::Reasoning {
+                    item_id: "itm_00000000000000000000000000000002".parse().unwrap(),
+                    content: reasoning,
+                },
+                StoredAssistantContent::Text {
+                    item_id: "itm_00000000000000000000000000000003".parse().unwrap(),
+                    text: Arc::from("let me check"),
+                },
+                StoredAssistantContent::ToolCall {
+                    item_id: "itm_00000000000000000000000000000004".parse().unwrap(),
+                    tool_call_id: "call_replay".parse().unwrap(),
+                    name: "echo".parse().unwrap(),
+                    arguments: r#"{}"#.parse().unwrap(),
+                },
+            ],
+            ModelResponseSummary::new(
+                model.execution.selection.provider_id().clone(),
+                model.execution.selection.model_id().clone(),
+                ModelReasoningSummary::ProviderDefault,
+                ModelServiceClass::Standard,
+            ),
+            None,
+            ModelFinishReason::ToolCalls,
+            NonZeroU32::new(4_096).unwrap(),
+            None,
+            0,
+            ProviderResponseMetadata::reconstruct(None, None, None),
+        )
+        .unwrap();
+        live.apply_assistant_message(assistant, turn_id, timestamp)
+            .unwrap();
+        // The tool result settles the exact ToolInvocation item (the same ItemId
+        // the assistant tool call projected), completing the exchange.
+        let tool = StoredToolMessage::reconstruct(
+            "itm_00000000000000000000000000000004".parse().unwrap(),
+            "call_replay".parse().unwrap(),
+            StoredToolOutcome::completed(
+                ToolOutcomeSource::Executed,
+                ToolResultDisposition::Succeeded,
+                ToolResultContent::from_text_parts(vec!["ok".to_owned()]).unwrap(),
+            )
+            .unwrap(),
+        );
+        live.apply_tool_message(tool, turn_id, timestamp).unwrap();
+        let steer = prompt_set
+            .compose_user_message(
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("continue").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        live.apply_user_message(
+            StoredUserMessage::reconstruct(
+                "itm_00000000000000000000000000000005".parse().unwrap(),
+                UserMessageSource::Steer,
+                steer,
+            ),
+            turn_id,
+            timestamp,
+        )
+        .unwrap();
+        let views = live.capture_conversation_views().unwrap();
+        let input = Arc::new(
+            prompt_set
+                .assemble(PromptAssemblyInput::agent_run(views.conversation(), None))
+                .unwrap(),
+        );
+        Arc::new(
+            ModelCallRequest::new(
+                model,
+                ModelCallPurpose::AgentRun,
+                input,
+                views.conversation().revision(),
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn catalog_resolution_pins_exact_definition_across_reload_candidates() {
         let old_scripted = Arc::new(ScriptedProviderAdapter::new(vec![
@@ -3303,8 +3487,8 @@ mod tests {
     }
 
     /// A mutable credential source that pops the next credential per resolution.
-    struct MutableCredentialSource {
-        credentials: Mutex<Vec<ProviderCredential>>,
+    pub(super) struct MutableCredentialSource {
+        pub(super) credentials: Mutex<Vec<ProviderCredential>>,
     }
 
     impl CredentialSource for MutableCredentialSource {
