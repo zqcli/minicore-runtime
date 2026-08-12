@@ -46,8 +46,9 @@ use super::{
     UserQuestionRequest,
 };
 
-/// The exact production builtin ToolName.
-const ASK_USER_NAME: &str = "ask_user";
+/// The exact production builtin ToolName.  `pub(super)` because the composed production
+/// ToolSet routes exactly this frozen name.
+pub(super) const ASK_USER_NAME: &str = "ask_user";
 
 /// The exact production description disclosed for the builtin.
 const ASK_USER_DESCRIPTION: &str = "Ask the user one or more non-secret text or single-choice questions and return the answers. Use only when the task cannot continue without user input. Never request passwords, API keys, tokens, credentials, or other secrets.";
@@ -167,12 +168,11 @@ const ASK_USER_SCHEMA: &str = r#"{
   "additionalProperties": false
 }"#;
 
-/// Builds the exact immutable production `ask_user` ToolSet: one definition, one matching
-/// spec, the builtin planner, and the available empty sandbox contract.  `open` selects this
-/// ToolSet once when the host opts in and passes it through the existing residency capture;
-/// the default Runtime ToolSet stays empty.
-pub(super) fn build_tool_set() -> Arc<ToolSet> {
-    let definition = ToolDefinition {
+/// The exact frozen production definition/spec pair: the single source shared by the
+/// standalone builtin ToolSet and the composed production ToolSet, so the disclosed
+/// definition and spec are byte-identical in both selections.
+pub(super) fn definition() -> ToolDefinition {
+    ToolDefinition {
         spec: ToolSpec {
             name: ASK_USER_NAME
                 .parse()
@@ -186,7 +186,15 @@ pub(super) fn build_tool_set() -> Arc<ToolSet> {
         // scheduler.  The definition itself does not impose Serial execution semantics on
         // unrelated ordinary operations in a future composed ToolSet.
         mode: ToolExecutionMode::Parallel,
-    };
+    }
+}
+
+/// Builds the exact immutable production `ask_user` ToolSet: one definition, one matching
+/// spec, the builtin planner, and the available empty sandbox contract.  `open` selects this
+/// ToolSet once when the host opts in and passes it through the existing residency capture;
+/// the default Runtime ToolSet stays empty.
+pub(super) fn build_tool_set() -> Arc<ToolSet> {
+    let definition = definition();
     let specs: Arc<[ToolSpec]> = Arc::from([definition.spec.clone()]);
     let definitions: Arc<[ToolDefinition]> = Arc::from([definition]);
     let planner: Arc<super::ToolPlanner> = Arc::new(plan);
@@ -203,7 +211,8 @@ pub(super) fn build_tool_set() -> Arc<ToolSet> {
 /// The synchronous pre-start plan for one exact `ask_user` call: a valid call plans the
 /// typed UserQuestion (never an Execute/start shape), every parse or semantic failure plans
 /// the frozen `PreExecution + Failed` result, and nothing else is ever produced.
-fn plan(request: ToolExecutionRequest) -> ToolExecutionPlan {
+/// `pub(super)` because the composed production ToolSet routes exactly this frozen planner.
+pub(super) fn plan(request: ToolExecutionRequest) -> ToolExecutionPlan {
     let parsed = match parse_arguments(request.call().arguments()) {
         Ok(parsed) => parsed,
         Err(()) => return invalid_arguments_plan(),
