@@ -1,6 +1,6 @@
 # MiniCore V1 → V2 版本迁移记录
 
-状态：V2目标架构已推进至ADR 0142；全部普通V4-P0/P1与conditional V4-C0-1已关闭，OpenAI Responses/Anthropic Messages direct provider adapters与closed/default-off production `ask_user` builtin已实现；真实credential smoke与OS-backed production Tool/Sandbox adapters仍pending
+状态：V2目标架构已推进至ADR 0143；全部普通V4-P0/P1与conditional V4-C0-1已关闭，OpenAI Responses/Anthropic Messages direct provider adapters、closed/default-off production `ask_user` builtin与首个narrow OS-backed production `read_file` builtin（ADR 0143）已实现；真实credential smoke与其余OS-backed production Tool/Sandbox adapters仍pending
 日期：2026-08-11
 
 ## 目的
@@ -123,7 +123,7 @@ ADR 0134关闭wire/storage format门禁：Wire Schema冻结JSON casing/tag、typ
 
 ### 阶段2：Runtime公开协议
 
-状态：semantic payload与wire/schema contract完成；Rust typed scalar/value/path carriers已实现，Runtime协议行为尚未实现。
+状态：semantic payload与wire/schema contract完成；Rust typed carriers已实现，Runtime协议行为亦已实现（M7–M11已关闭public dispatch/query/snapshot/subscribe、typed outcomes/events与manifest closure）。
 
 - `dispatch / query / snapshot / subscribe`；
 - Command/Query/StateEvent/ProgressEvent分离；
@@ -148,7 +148,7 @@ ADR 0134关闭wire/storage format门禁：Wire Schema冻结JSON casing/tag、typ
 
 ### 阶段3：Conversation Recording与Replay
 
-状态：目标设计已按ADR 0126/0127重写，生产实现未开始。
+状态：目标设计已按ADR 0126/0127重写；生产实现已完成（M4 reducer、M5.1 Recorder与M5.2 tolerant replay、M10 Compaction），个别条目状态见下方勾选。
 
 必须实现：
 
@@ -166,23 +166,23 @@ ADR 0134关闭wire/storage format门禁：Wire Schema冻结JSON casing/tag、typ
 
 完成门槛：
 
-- [ ] live owner在apply前分配EntryId/parent，Recorder观察exact same identity；
-- [ ] replay/Fork copied IDs seed collision guard，Degraded继续分配fresh ID；
-- [ ] ordinary live mutation后inline await当前append attempt；
-- [ ] slow append只延迟同Session finalization，不串行化其他Session；
-- [ ] first failure后停止suffix并保留可恢复完整行前缀；
-- [ ] Degraded在同一loaded instance内不恢复、不创建segment或backfill；
-- [ ] Unload/Load只恢复recorded prefix并可建立new Healthy Recorder；
-- [ ] crash/failed write留下partial tail时replay不brick，writable Load只截断final unterminated tail；
-- [ ] incomplete Tool exchange不进入model input；
-- [ ] recording failure不产生SessionUnavailable；
-- [ ] no-corruption live/replay sanitizer结果一致；
-- [ ] restart后current_turn为空，不推断或追加旧Turn terminal；
+- [x] live owner在apply前分配EntryId/parent，Recorder观察exact same identity；
+- [x] replay/Fork copied IDs seed collision guard，Degraded继续分配fresh ID；
+- [x] ordinary live mutation后inline await当前append attempt；
+- [x] slow append只延迟同Session finalization，不串行化其他Session；
+- [x] first failure后停止suffix并保留可恢复完整行前缀；
+- [x] Degraded在同一loaded instance内不恢复、不创建segment或backfill；
+- [x] Unload/Load只恢复recorded prefix并可建立new Healthy Recorder；
+- [x] crash/failed write留下partial tail时replay不brick，writable Load只截断final unterminated tail；
+- [x] incomplete Tool exchange不进入model input；
+- [x] recording failure不产生SessionUnavailable；
+- [x] no-corruption live/replay sanitizer结果一致；
+- [x] restart后current_turn为空，不推断或追加旧Turn terminal；
 - [ ] historical ListTurns/GetTurn按TurnId分组且不返回execution status。
 
 ### 阶段4：Prompt、Skill、Tool与Workspace capture
 
-状态：目标设计完成，生产实现未开始。
+状态：目标设计完成；生产实现已推进：M6 Workspace/Prompt capture与immutable snapshot、M8 Tool/Interaction/Cancel与crate-private approval/UserQuestion控制seam、M13/ADR 0140 Sandbox contract、M14 production `ask_user`（ADR 0142）与首个narrow OS-backed `read_file`（ADR 0143）builtins已完成；完整schema/hooks/policy/approval enforcement、generic ToolService与Skill composition/source仍pending。
 
 - PromptSet从LiveConversationView组装；
 - PromptContent在candidate build期间完全materialize并由强Arc共享，PromptSet不解析source locator；
@@ -193,11 +193,11 @@ ADR 0134关闭wire/storage format门禁：Wire Schema冻结JSON casing/tag、typ
 - ToolStartGate独立于Session recording；
 - Workspace update Idle-only，SecurityRevoked保持。
 
-Prompt Q1/Q4已分别由ADR 0128/0129关闭。Tool/Sandbox O1/R7已由M13/ADR 0140关闭；production实现仍属于M14。
+Prompt Q1/Q4已分别由ADR 0128/0129关闭。Tool/Sandbox O1/R7已由M13/ADR 0140关闭；production实现属于M14（`ask_user`与首个narrow `read_file` builtin已完成，其余write/network/process与其它file adapter仍待交付）。
 
 ### 阶段5：Agent/Session lifecycle
 
-状态：目标设计完成，生产实现未开始。
+状态：目标设计完成；生产实现已完成（M7 ordinary AgentRun、M8 Tool/Interaction/Cancel、M9 Steer/FollowUp/retry、M10 Compaction、M11 Fork与Agent/Session lifecycle/metadata/definition CAS、readiness与recovery、grace Unload）。
 
 - Agent/Session exact revisions；
 - load/unload/archive/fork；
@@ -208,7 +208,7 @@ Prompt Q1/Q4已分别由ADR 0128/0129关闭。Tool/Sandbox O1/R7已由M13/ADR 01
 
 ### 阶段6–8：Async模型调用协同交付束
 
-状态：M6–M10 scripted async spine与M12 provider reality gate已完成；Rig已因Rust 1.85被拒绝进入production baseline，两个direct provider adapters仍属于M14。
+状态：M6–M10 scripted async spine与M12 provider reality gate已完成；Rig已因Rust 1.85被拒绝进入production baseline，两个direct provider adapters已实现（M14）。
 
 共享spine：
 
@@ -264,8 +264,8 @@ Recorder问题见[`docs/review/async-loop-best-effort-recording-open-questions.m
 
 - 第四轮全部普通V4-P0/P1与conditional V4-C0-1已关闭；V4-P1-3由M12/ADR 0138/0139关闭，V4-C0-1由M13/ADR 0140关闭；
 - 首个Rust crate已经消费ADR 0134/Format V1/Wire V1 fixtures并实现semantic conformance runner；
-- production OpenAI Responses/Anthropic Messages direct adapters仍属于M14，必须消费M12 contract suite；
-- production Tool/Sandbox adapters必须消费ADR 0140 contract suite；首个file-mutation adapter另须实现ADR 0116的Session-local queue。
+- production OpenAI Responses/Anthropic Messages direct adapters已实现（M14），必须消费M12 contract suite；
+- production Tool/Sandbox adapters必须消费ADR 0140 contract suite（`read_file`已按该suite实现首个narrow OS-backed slice）；首个file-mutation adapter另须实现ADR 0116的Session-local queue。
 
 ## 文档治理
 
