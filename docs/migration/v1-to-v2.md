@@ -193,7 +193,7 @@ ADR 0134关闭wire/storage format门禁：Wire Schema冻结JSON casing/tag、typ
 - ToolStartGate独立于Session recording；
 - Workspace update Idle-only，SecurityRevoked保持。
 
-Prompt Q1/Q4已分别由ADR 0128/0129关闭。Tool/Sandbox O1/R7已由M13/ADR 0140关闭；production实现属于M14（`ask_user`与narrow `read_file`/`list_directory` builtins已完成，其余write/network/process及其他未实现adapter仍待交付）。
+Prompt Q1/Q4已分别由ADR 0128/0129关闭。Tool/Sandbox O1/R7已由M13/ADR 0140关闭；v0.1 production实现已交付closed/default-off `ask_user`、`read_file`、`list_directory`、`write_file`与`fetch_url` builtins（ADR 0142/0143/0144/0146/0147），process、generic Tool infrastructure及其他未实现adapter属于post-MVP。
 
 ### 阶段5：Agent/Session lifecycle
 
