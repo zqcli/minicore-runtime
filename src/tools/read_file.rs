@@ -1151,18 +1151,26 @@ mod tests {
             .run_started_execution(&request, proof, start, observer)
             .expect("the exact proof revalidates and the factory constructs the run");
 
-        // One deterministic poll drives the executor through the first biased select, so
-        // the tracked blocking job provably exists and the executor is awaiting its
-        // settlement before the cancellation is signalled — no sleeps or blind polling.
+        // The workspace resolution (which itself admits a tracked blocking job) has
+        // settled, so arming the one-shot entry gate now targets the exact next blocking
+        // admission: the tracked read job.  One poll drives the executor through the
+        // biased pre-scheduling select and schedules that job; the gate then
+        // deterministically proves the worker entered the spawned job before its
+        // operation closure — no sleeps, timeouts, blind polling, or any assumption about
+        // the poll's readiness.
+        let gate = task_context.arm_next_blocking_job_entry_gate();
         let mut run = std::pin::pin!(run);
-        let first = std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx))).await;
-        assert!(
-            first.is_pending(),
-            "the executor awaits the tracked job's settlement"
-        );
+        let _ = std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx))).await;
+        // The exact read job is now provably scheduled and held at the gate before its
+        // operation closure: signal the cancellation while it is in flight, then release
+        // it.
+        gate.wait_until_entered();
         handle.cancel();
+        gate.release();
 
-        let outcome = std::future::poll_fn(|cx| run.as_mut().poll(cx)).await;
+        // The executor kept awaiting the same tracked job to its settlement and preserved
+        // the truthful result: a known success is never rewritten by the cancellation.
+        let outcome = run.await;
         assert!(matches!(
             outcome,
             ToolExecutionOutcome::Completed {
