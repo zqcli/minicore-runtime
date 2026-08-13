@@ -3,6 +3,8 @@
 状态：Accepted
 日期：2026-08-13
 
+> 实现状态：shared locked-down HTTP transport、exact-origin authority/client、bounded executor、五-builtin composition与Runtime wiring已分别由`748aed9`、`0783ecb`、`cb2a9fa`与`5f66895`收口（shared transport随authority slice进入production）。完整acceptance：stable与真实Rust 1.85主crate均为library `1031 passed / 3 ignored`、integration `159 passed / 3 ignored`；stable另通过standalone provider-gate `25/25`、Clippy、format、current/archive docs、Wire V1 `144 active / 0 pending`与Durable Store fixtures。所有production network tests默认离线；两个live provider smoke仍默认ignored。
+
 ## 背景
 
 M14已经交付closed/default-off的`ask_user`与三个Workspace filesystem builtins，但`ToolCapabilityClass::Network`仍只有class label，没有任何production resource-level authority consumer。仅把一个任意URL GET executor标成`Network`并关闭redirect/proxy/retry并不构成Sandbox：URL仍可选择任意host，系统DNS可把同一hostname在不同连接时解析到不同地址，redirect可改变authority，环境代理可把流量交给第三方，远端body也可能无限增长或以binary/压缩内容进入模型结果。
