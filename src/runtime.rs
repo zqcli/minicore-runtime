@@ -31,9 +31,9 @@ use crate::prompt::{PromptResourceView, PromptService};
 use crate::runtime_interface::{
     AgentCommand, AgentMetadataView, AgentQuery, AgentQueryResult, AgentSummary, CommandCompletion,
     CommandError, CommandErrorCode, CommandOutcome, CommandOutput, CommandRequest, CommandResponse,
-    EventFrame, InteractionCommand, LoadedSessionSummary, Page, PublicCancelTarget, PublicSubject,
-    QueryError, QueryErrorCode, QueryResponse, QueryResult, QueuedFollowUpView, QueuedSteerView,
-    RetryAdvice, RuntimeCapabilities, RuntimeCommand, RuntimeDispatchError,
+    EventFrame, InteractionCommand, LoadedSessionSummary, Page, PageRequest, PublicCancelTarget,
+    PublicSubject, QueryError, QueryErrorCode, QueryResponse, QueryResult, QueuedFollowUpView,
+    QueuedSteerView, RetryAdvice, RuntimeCapabilities, RuntimeCommand, RuntimeDispatchError,
     RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, RuntimeSnapshot,
     RuntimeStateEventKind, RuntimeStatusView, RuntimeView, SessionCommand,
     SessionDefinitionSummary, SessionExecutionView, SessionForkProvenanceView,
@@ -57,9 +57,11 @@ use crate::session_residency::{
     SessionResidencyRegistry, SessionResidencySecurityInvalidationError,
     SessionResidencySharedResourcesError, SessionResidencySnapshotError,
     SessionResidencyStartError, SessionResidencySteerError, SessionResidencySubmitError,
-    SessionResidencySubscriptionError, SessionResidencyUnloadError, SessionResidencyUnloadOutcome,
+    SessionResidencySubscriptionError, SessionResidencyTranscriptError,
+    SessionResidencyUnloadError, SessionResidencyUnloadOutcome,
     SessionResidencyWorkspaceDefinitionError, SessionResidencyWorkspaceReloadError,
 };
+use crate::session_transcript::{SessionTranscriptCapture, SessionTranscriptItem};
 use crate::tools::{FetchUrlOrigin, FetchUrlResources, FetchUrlResourcesError};
 use crate::wire::{
     PageCursor, ProtocolLimits, SessionDefinitionRevision, SessionId, SessionMetadataRevision,
@@ -586,6 +588,29 @@ impl MiniCoreRuntime {
         self.inner.subscribe(request).await
     }
 
+    /// Host-only paged transcript read for one Session, forwarded to the loaded Session's
+    /// stable history capture.
+    ///
+    /// This is a library-only entry point: it is not part of Wire V1 and is not exposed
+    /// through the wire `RuntimeQuery`/`QueryResponse` protocol.  It requires the Session
+    /// to be loaded (`QueryErrorCode::SessionNotLoaded` with `UserActionRequired` retry
+    /// advice and the Session subject otherwise).  The capture is a coherent immutable
+    /// snapshot of the selected-path transcript history at the moment of the first page,
+    /// so continuation pages with the returned cursor stay stable and never re-read the
+    /// residency or DurableState.  A Turn running in the Session is not part of the
+    /// transcript capture: its in-flight content stays surfaced by
+    /// `SessionSnapshot::active_items` instead.  The page limit is validated against the
+    /// selected protocol paging limit exactly like the other paged queries, and transcript
+    /// cursors expire and are evicted under the same TTL/capacity policy as the other
+    /// page cursors.
+    pub async fn session_transcript(
+        &self,
+        session_id: SessionId,
+        page: PageRequest,
+    ) -> Result<Page<SessionTranscriptItem>, QueryError> {
+        self.inner.session_transcript(session_id, page).await
+    }
+
     /// Host-only security Workspace authority invalidation (not a wire command).  Except for
     /// the Runtime-owned workspace filesystem authority (read_file/list_directory/write_file), the host has
     /// already published the current hard restriction fact; the Runtime routes out-of-band to
@@ -763,9 +788,18 @@ struct SessionPageCursorEntry {
 }
 
 #[derive(Clone)]
+struct TranscriptPageCursorEntry {
+    capture: SessionTranscriptCapture,
+    session_id: SessionId,
+    offset: usize,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
 enum PageCursorEntry {
     Agents(AgentPageCursorEntry),
     Sessions(SessionPageCursorEntry),
+    Transcript(TranscriptPageCursorEntry),
 }
 
 impl PageCursorEntry {
@@ -773,6 +807,7 @@ impl PageCursorEntry {
         match self {
             Self::Agents(entry) => entry.expires_at,
             Self::Sessions(entry) => entry.expires_at,
+            Self::Transcript(entry) => entry.expires_at,
         }
     }
 }
@@ -895,6 +930,67 @@ impl PageCursorStore {
             )
         } else {
             None
+        };
+        Ok(Page::new(items, next_cursor))
+    }
+
+    fn first_transcript(
+        &mut self,
+        capture: SessionTranscriptCapture,
+        session_id: SessionId,
+        limit: usize,
+    ) -> Result<Page<SessionTranscriptItem>, PageCursorStoreError> {
+        self.transcript_page(capture, session_id, 0, limit)
+    }
+
+    fn next_transcript(
+        &mut self,
+        cursor: PageCursor,
+        session_id: SessionId,
+        limit: usize,
+    ) -> Result<Page<SessionTranscriptItem>, PageCursorStoreError> {
+        self.remove_expired();
+        let Some(PageCursorEntry::Transcript(entry)) = self.entries.get(&cursor).cloned() else {
+            return Err(PageCursorStoreError::Stale);
+        };
+        // A Transcript cursor is bound to the exact Session it was created for: any
+        // other Session id is a stale cross-session cursor, never a page continuation.
+        if entry.session_id != session_id {
+            return Err(PageCursorStoreError::Stale);
+        }
+        // The capture body is never copied: the entry only owns Arc handles, and the
+        // next page is projected from the same capture before the old cursor is removed.
+        let page = self.transcript_page(entry.capture, session_id, entry.offset, limit)?;
+        self.entries.remove(&cursor);
+        Ok(page)
+    }
+
+    /// Projects one transcript page from the captured stable history.  The capture body is
+    /// never copied: `SessionTranscriptCapture` owns only `Arc` entry handles, page bodies
+    /// are cloned on demand by the capture, and the cursor keeps the same capture (its Arc
+    /// handles) for the next page.  A `None` capture page means the offset is past the last
+    /// item (the capture's stable content shrank), which is a stale cursor.
+    fn transcript_page(
+        &mut self,
+        capture: SessionTranscriptCapture,
+        session_id: SessionId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<SessionTranscriptItem>, PageCursorStoreError> {
+        let slice = capture
+            .page(offset, limit)
+            .ok_or(PageCursorStoreError::Stale)?;
+        let (items, next_offset) = slice.into_parts();
+        let next_cursor = match next_offset {
+            Some(next_offset) => Some(self.insert_cursor(PageCursorEntry::Transcript(
+                TranscriptPageCursorEntry {
+                    capture,
+                    session_id,
+                    offset: next_offset,
+                    expires_at: Instant::now() + PAGE_CURSOR_TTL,
+                },
+            ))?),
+            None => None,
         };
         Ok(Page::new(items, next_cursor))
     }
@@ -1680,6 +1776,35 @@ impl RuntimeInner {
                 )))
             }
         }
+    }
+
+    async fn session_transcript(
+        &self,
+        session_id: SessionId,
+        page: PageRequest,
+    ) -> Result<Page<SessionTranscriptItem>, QueryError> {
+        if !matches!(*lock(&self.lifecycle), RuntimeLifecycle::Open) {
+            return Err(runtime_closing_query());
+        }
+        let limit = query_page_limit(page.limit())?;
+        let result = match page.cursor() {
+            // A continuation never touches the residency: the cursor owns the exact
+            // capture it was created from, so the page is projected from that stable
+            // capture alone (the same one-shot semantics as the other page cursors).
+            Some(cursor) => lock(&self.page_cursors).next_transcript(cursor, session_id, limit),
+            None => {
+                let Some(residency) = self.residency() else {
+                    return Err(runtime_closing_query());
+                };
+                let capture = residency
+                    .transcript_capture(session_id)
+                    .await
+                    .map_err(|error| map_transcript_error(session_id, error))?;
+                lock(&self.page_cursors).first_transcript(capture, session_id, limit)
+            }
+        }
+        .map_err(map_page_cursor_error)?;
+        Ok(result)
     }
 
     async fn snapshot(&self, request: SnapshotRequest) -> Result<SnapshotResponse, SnapshotError> {
@@ -3010,6 +3135,24 @@ fn map_page_cursor_error(error: PageCursorStoreError) -> QueryError {
             None,
         ),
         PageCursorStoreError::Unavailable => unavailable_query(Some(PublicSubject::Runtime)),
+    }
+}
+
+fn map_transcript_error(
+    session_id: SessionId,
+    error: SessionResidencyTranscriptError,
+) -> QueryError {
+    match error {
+        SessionResidencyTranscriptError::Closing => runtime_closing_query(),
+        SessionResidencyTranscriptError::SessionNotLoaded => QueryError::new(
+            QueryErrorCode::SessionNotLoaded,
+            "Session is not loaded",
+            RetryAdvice::UserActionRequired,
+            Some(PublicSubject::Session(session_id)),
+        ),
+        SessionResidencyTranscriptError::InternalDispatchUnavailable => {
+            unavailable_query(Some(PublicSubject::Session(session_id)))
+        }
     }
 }
 
@@ -4352,14 +4495,15 @@ mod tests {
     use crate::runtime_interface::{
         AgentCommand, CommandCompletion, CommandErrorCode, CommandOutcome, CommandRequest,
         CommandResponse, EventFrame, EventRoute, InteractionCommand, ItemContentView,
-        NewSessionDefinition, NewSessionMetadata, PublicCancelTarget, QueryResult, RetryAdvice,
-        RuntimeCapability, RuntimeCommand, RuntimeDispatchError, RuntimeEventDetail,
-        RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery,
-        RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionExecutionView,
-        SessionLifecycleView, SessionReadinessView, SessionRecordingState, SessionStateEventKind,
-        SessionUnavailableView, SessionWorkspaceInvalidationError, SnapshotRequest,
-        SnapshotResponse, StateEventMsg, SubscriptionRequest, SubscriptionScope, TurnCommand,
-        TurnExecutionPhaseView, TurnFailureView, TurnTerminalView,
+        NewSessionDefinition, NewSessionMetadata, PageRequest, PublicCancelTarget, PublicSubject,
+        QueryErrorCode, QueryResult, RetryAdvice, RuntimeCapability, RuntimeCommand,
+        RuntimeDispatchError, RuntimeEventDetail, RuntimeLifecycleCommand, RuntimeQuery,
+        RuntimeQueryResult, RuntimeReadQuery, RuntimeStateEventKind, SessionCommand,
+        SessionEventDetail, SessionExecutionView, SessionLifecycleView, SessionReadinessView,
+        SessionRecordingState, SessionStateEventKind, SessionUnavailableView,
+        SessionWorkspaceInvalidationError, SnapshotRequest, SnapshotResponse, StateEventMsg,
+        SubscriptionRequest, SubscriptionScope, TurnCommand, TurnExecutionPhaseView,
+        TurnFailureView, TurnTerminalView,
     };
     use crate::runtime_task::RuntimeTaskError;
     use crate::session_execution::SessionExecutionState;
@@ -4367,11 +4511,12 @@ mod tests {
         SessionResidencyInteractionError, SessionResidencyLifecycleError,
         SessionResidencyLoadError, SessionResidencyLoadOutcome, SessionResidencyUnloadOutcome,
     };
+    use crate::session_transcript::SessionTranscriptItemRole;
     use crate::tools::{
         FetchUrlOrigin, FetchUrlResources, ToolApprovalDecisionInput, UserQuestionAnswer,
         UserQuestionFieldAnswer,
     };
-    use crate::turn_item_interaction::InteractionResolutionInput;
+    use crate::turn_item_interaction::{InteractionResolutionInput, UserMessageSource};
     use crate::wire::conversation_jsonl::ConversationLineCodec;
     use crate::wire::{
         AgentId, CanonicalFileUri, CommandId, FileUriFamily, InteractionResolutionKey, ItemId,
@@ -5314,6 +5459,214 @@ mod tests {
         drop(residency);
 
         runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_transcript_pages_completed_history_and_continuation_survives_unload() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::new(vec!["scripted transcript answer"]);
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the scripted Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("public Session subscription opens");
+        let EventFrame::Snapshot(SnapshotResponse::Session(_initial)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("the snapshot-first subscription responds")
+                .expect("the subscription remains open")
+        else {
+            panic!("the subscription must start with the Session snapshot");
+        };
+
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("first\nsecond").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+
+        let EventFrame::State(terminal) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("the scripted Turn reaches a terminal event")
+                .expect("the subscription remains open")
+        else {
+            panic!("the second frame must be the terminal StateEvent");
+        };
+        assert_eq!(
+            terminal.msg().session_kind(),
+            Some(SessionStateEventKind::TurnCompleted)
+        );
+
+        let first_page_request = PageRequest::new(None, NonZeroU32::new(1).unwrap());
+        let first_page = runtime
+            .session_transcript(session_id, first_page_request)
+            .await
+            .expect("the completed transcript first page reads");
+        let user_item = &first_page.items()[0];
+        assert_eq!(user_item.role(), SessionTranscriptItemRole::User);
+        assert_eq!(user_item.user_source(), Some(UserMessageSource::Input));
+        assert_eq!(user_item.body(), "first\nsecond");
+        assert_eq!(user_item.turn_id(), turn_id);
+        let cursor = first_page.next_cursor().expect("the first page continues");
+
+        let continuation_request = PageRequest::new(Some(cursor), NonZeroU32::new(1).unwrap());
+        let cross_session = runtime
+            .session_transcript(SessionId::generate().unwrap(), continuation_request)
+            .await
+            .expect_err("a cross-Session continuation is stale");
+        assert_eq!(cross_session.code(), QueryErrorCode::StaleCursor);
+
+        let unload = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Unload { session_id }),
+            ))
+            .await
+            .expect("public Unload dispatches");
+        assert_eq!(command_output(&unload), "session unloaded");
+
+        let second_page = runtime
+            .session_transcript(session_id, continuation_request)
+            .await
+            .expect("the transcript continuation survives the Unload");
+        let assistant_item = &second_page.items()[0];
+        assert_eq!(assistant_item.role(), SessionTranscriptItemRole::Assistant);
+        assert_eq!(assistant_item.body(), "scripted transcript answer");
+        assert_eq!(assistant_item.turn_id(), turn_id);
+        assert_eq!(second_page.next_cursor(), None);
+
+        let not_loaded = runtime
+            .session_transcript(session_id, first_page_request)
+            .await
+            .expect_err("a fresh transcript page needs the Session loaded");
+        assert_eq!(not_loaded.code(), QueryErrorCode::SessionNotLoaded);
+        assert_eq!(not_loaded.retry(), RetryAdvice::UserActionRequired);
+        assert!(matches!(
+            not_loaded.subject(),
+            Some(PublicSubject::Session(subject)) if *subject == session_id
+        ));
+
+        let reused = runtime
+            .session_transcript(session_id, continuation_request)
+            .await
+            .expect_err("the one-shot transcript cursor is consumed");
+        assert_eq!(reused.code(), QueryErrorCode::StaleCursor);
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_transcript_recovers_after_runtime_reopen_and_load() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::new(vec!["replayed transcript answer"]);
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the scripted Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the public Session subscription opens");
+        let Some(EventFrame::Snapshot(SnapshotResponse::Session(_))) = events.recv().await else {
+            panic!("the subscription must start with the Session snapshot");
+        };
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(
+                            TextIntent::new("persisted transcript input").unwrap(),
+                        ),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+        let Some(EventFrame::State(terminal)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("the scripted Turn reaches a terminal StateEvent frame")
+        else {
+            panic!("the second frame must be the terminal StateEvent");
+        };
+        assert!(terminal.msg().session_kind() == Some(SessionStateEventKind::TurnCompleted));
+        runtime.shutdown().await;
+        let reopened = MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+        )
+        .await
+        .expect("the Runtime reopens on the same root");
+        let load = reopened
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Load { session_id }),
+            ))
+            .await
+            .expect("public Load dispatches on the reopened Runtime");
+        assert_eq!(command_output(&load), "session loaded");
+        assert!(matches!(
+            reopened.snapshot(SnapshotRequest::Session { session_id })
+                .await
+                .expect("the reopened Session snapshot reads"),
+            SnapshotResponse::Session(snapshot)
+                if snapshot.readiness() == SessionReadinessView::Unavailable(SessionUnavailableView::ModelUnavailable)
+        ));
+
+        let request = PageRequest::new(None, NonZeroU32::new(200).unwrap());
+        let page = reopened
+            .session_transcript(session_id, request)
+            .await
+            .expect("the reopened Runtime replays the persisted transcript");
+        assert_eq!(page.items().len(), 2);
+        assert_eq!(page.next_cursor(), None);
+        assert_eq!(page.items()[0].role(), SessionTranscriptItemRole::User);
+        assert_eq!(
+            page.items()[0].user_source(),
+            Some(UserMessageSource::Input)
+        );
+        assert_eq!(page.items()[0].body(), "persisted transcript input");
+        assert_eq!(page.items()[0].turn_id(), turn_id);
+        assert_eq!(page.items()[1].role(), SessionTranscriptItemRole::Assistant);
+        assert_eq!(page.items()[1].body(), "replayed transcript answer");
+        assert_eq!(page.items()[1].turn_id(), turn_id);
+        reopened.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
