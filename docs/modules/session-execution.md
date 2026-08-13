@@ -1,7 +1,9 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0137/0146/0147后；loaded `SessionExecutor`、Runtime-owned residency、ordinary Turn、Tool/Interaction/Cancel、M9 control/observation与M10 Compaction均已接通。crate-private `ToolOperationSlot`完整生命周期现包含真实file mutation ownership：每loaded Session创建一个`SessionFileMutationQueue`；typed `ToolExecutionPlan::FileMutation`由round owner在任何start前按`call_index`串行prepare并reserve exact-request-bound ticket；ticket取得permit后才进入ToolStartGate；started mutation的permit由Running移动到Settling，只有exact outcome绑定并转Terminal后释放。UserQuestion仍先于mutation preparation完整settle。M14 production `ask_user`/`read_file`/`list_directory`/`write_file`/`fetch_url`均已实现；`write_file`使用两个owner-tracked blocking jobs和move-only prepared capability target，scheduled work不因signal detach；`fetch_url`直接在slot-owned future中poll/drop exact send/body operation，不创建adapter-owned child task。具体Prompt/Skill source、完整generic schema/hooks/policy/approval、generic ToolService、process及其他production adapters仍后置。）
+状态：当前权威架构（ADR 0137/0146/0147/0148后；loaded `SessionExecutor`、Runtime-owned residency、ordinary Turn、Tool/Interaction/Cancel、M9 control/observation与M10 Compaction均已接通。crate-private `ToolOperationSlot`完整生命周期现包含真实file mutation ownership：每loaded Session创建一个`SessionFileMutationQueue`；typed `ToolExecutionPlan::FileMutation`由round owner在任何start前按`call_index`串行prepare并reserve exact-request-bound ticket；ticket取得permit后才进入ToolStartGate；started mutation的permit由Running移动到Settling，只有exact outcome绑定并转Terminal后释放。UserQuestion仍先于mutation preparation完整settle。M14 production `ask_user`/`read_file`/`list_directory`/`write_file`/`fetch_url`均已实现；`write_file`使用两个owner-tracked blocking jobs和move-only prepared capability target，scheduled work不因signal detach；`fetch_url`直接在slot-owned future中poll/drop exact send/body operation，不创建adapter-owned child task。具体Prompt/Skill source、完整generic schema/hooks/policy/approval、generic ToolService、process及其他production adapters仍后置。）
 日期：2026-07-31
+
+v0.1前端恢复补充（[ADR 0148](../adr/0148-v0-1-session-transcript-is-a-library-only-read-seam.md)）：SessionExecutor actor新增只读transcript capture request。它在owner lane内短暂读取`LiveSessionState::selected_entries()`、排除current Turn并clone immutable entry `Arc`；guard不跨await。Residency只为first page路由loaded executor，Runtime持有same-capture分页cursor；Runtime不得绕过executor直接锁`live_state`。
 
 M9 当前补充：Session Snapshot 已公开投影 current Turn、active Items 与 Pending Interaction 的最小安全摘要，并与 Running/approval Wire V1 fixtures 对齐。
 
@@ -76,7 +78,7 @@ MiniCoreRuntime
 - safe-point Steer消费；
 - terminal candidate和settlement。
 
-`LiveSessionState`保存当前进程的conversation、Turn、Item、Interaction、usage read model和private Session-scoped `EntryIdGenerator`。实现可以使用短锁或actor methods；guard不得跨await。SessionExecutor和ActiveTurnTask不能保存两份独立mutable conversation，也不能各自拥有ID generator。
+`LiveSessionState`保存当前进程的conversation、Turn、Item、Interaction、usage read model和private Session-scoped `EntryIdGenerator`。实现可以使用短锁或actor methods；guard不得跨await。SessionExecutor和ActiveTurnTask不能保存两份独立mutable conversation，也不能各自拥有ID generator。transcript capture只是actor-owned immutable selected-entry handle snapshot，不是第三份mutable conversation，也不拥有storage reader或execution authority。
 
 每个Session最多一个ActiveTurnTask。同一个Runtime中的不同Session可以同时Running。
 
@@ -609,7 +611,7 @@ Cancellation only wins before the named barriers. A `RecorderWriteBarrier` cross
 - Snapshot完整枚举Submit admission、Steer和FollowUp cancel targets，lane-local FIFO稳定且不泄漏queued intent正文；
 - QueueView与execution/current Turn来自同一次owner snapshot，Starting→TurnStarted切换不会同时暴露旧Submit target和new Turn target；
 - task panic收口；
-- restart只恢复recorded conversation prefix，current_turn为空且无synthetic terminal。
+- restart只恢复recorded conversation prefix，current_turn为空且无synthetic terminal；Load后library-only transcript从该selected prefix分页恢复基础User/Assistant文本。
 
 ## 开放问题
 
