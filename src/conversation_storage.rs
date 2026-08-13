@@ -109,6 +109,7 @@ impl ExclusiveWritableConversationLease {
     }
 
     /// Gives the truncation handle only to Conversation Storage's internal consumer.
+    #[cfg(test)]
     pub(crate) fn into_file(self) -> Option<File> {
         self.file
     }
@@ -906,10 +907,6 @@ impl ConversationReplayDiagnosticDetail {
 
     pub(crate) const fn line_number(self) -> u64 {
         self.line_number
-    }
-
-    pub(crate) const fn offset(self) -> u64 {
-        self.offset
     }
 }
 
@@ -2327,11 +2324,6 @@ impl ReplayedConversationView {
         self.header_is_canonical
     }
 
-    /// Accepted entries in physical order: every first-valid, session-matching decoded entry.
-    pub(crate) fn accepted_entries(&self) -> &[Arc<StoredSessionEntry>] {
-        &self.accepted_entries
-    }
-
     pub(crate) fn accepted_entry_ids(&self) -> Vec<EntryId> {
         self.accepted_entries
             .iter()
@@ -3736,6 +3728,7 @@ pub(crate) struct SessionRecorder {
     reason = "the loaded SessionExecutor consumes the pending Recorder seam"
 )]
 impl SessionRecorder {
+    #[cfg(test)]
     pub(crate) fn from_published_target(
         target: PublishedConversationTarget,
         task_context: RuntimeTaskContext,
