@@ -1197,18 +1197,12 @@ pub(crate) enum ToolCapabilityClass {
 }
 
 /// The private class-level value set: one `u8` bitmask with module-private raw bits.
-#[allow(dead_code, reason = "M13.1 conformance tests")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ToolCapabilitySet(u8);
 
-#[allow(dead_code, reason = "the M13.1 admission algebra")]
 impl ToolCapabilitySet {
     fn from_classes(classes: impl IntoIterator<Item = ToolCapabilityClass>) -> Self {
         Self(classes.into_iter().fold(0, |b, c| b | (1 << c as u8)))
-    }
-
-    const fn contains(&self, class: ToolCapabilityClass) -> bool {
-        self.0 & (1 << class as u8) != 0
     }
 
     const fn difference(self, other: Self) -> Self {
@@ -1218,29 +1212,15 @@ impl ToolCapabilitySet {
     const fn is_subset_of(&self, other: &Self) -> bool {
         self.0 & !other.0 == 0
     }
-
-    const fn is_empty(&self) -> bool {
-        self.0 == 0
-    }
 }
 
 /// The final class-level permission set for one Tool execution: the admission input.
-#[allow(dead_code, reason = "M13.1 conformance tests")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ToolPermissionSet(ToolCapabilitySet);
 
-#[allow(dead_code, reason = "used by M13.1 tests and the M13 wiring slice")]
 impl ToolPermissionSet {
     pub(crate) fn new(classes: impl IntoIterator<Item = ToolCapabilityClass>) -> Self {
         Self(ToolCapabilitySet::from_classes(classes))
-    }
-
-    pub(crate) const fn contains(&self, class: ToolCapabilityClass) -> bool {
-        self.0.contains(class)
-    }
-
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 
     /// Whether every class of `self` is carried by `other`: the ceiling revalidation.
@@ -1252,29 +1232,6 @@ impl ToolPermissionSet {
     const fn difference(self, other: Self) -> Self {
         Self(self.0.difference(other.0))
     }
-
-    /// The restricted-option candidate: may equal or narrow the ceiling, never widen it.
-    pub(crate) fn restricted_candidate(
-        &self,
-        candidate: impl IntoIterator<Item = ToolCapabilityClass>,
-    ) -> Result<Self, ToolPermissionRestrictionError> {
-        let candidate = Self::new(candidate);
-        candidate
-            .0
-            .is_subset_of(&self.0)
-            .then_some(candidate)
-            .ok_or(ToolPermissionRestrictionError::ElevatesCapabilities)
-    }
-}
-
-/// The closed typed error for a restricted candidate that would widen its ceiling.
-#[allow(dead_code, reason = "M13.1 conformance tests")]
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub(crate) enum ToolPermissionRestrictionError {
-    #[error(
-        "a restricted permission candidate must not add capability classes beyond the current ceiling"
-    )]
-    ElevatesCapabilities,
 }
 
 /// The adapter's value contract for one Tool Sandbox: availability plus the enforceable
@@ -1286,12 +1243,12 @@ pub(crate) enum ToolSandboxContract {
     Unavailable,
 }
 
-#[allow(dead_code, reason = "exercised by the M13.1 fake backend")]
 impl ToolSandboxContract {
     pub(crate) fn available(classes: impl IntoIterator<Item = ToolCapabilityClass>) -> Self {
         Self::Available(ToolCapabilitySet::from_classes(classes))
     }
 
+    #[cfg(test)]
     pub(crate) const fn unavailable() -> Self {
         Self::Unavailable
     }
@@ -1316,7 +1273,6 @@ impl ToolSandboxContract {
 }
 
 /// The closed admission failure: an unavailable Sandbox and a capability gap are distinct.
-#[allow(dead_code, reason = "M13.1 conformance tests")]
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum ToolSandboxAdmissionError {
     #[error("the Tool Sandbox is unavailable")]
@@ -1325,8 +1281,8 @@ pub(crate) enum ToolSandboxAdmissionError {
     CapabilityGap { missing: ToolPermissionSet },
 }
 
-#[allow(dead_code, reason = "M13.1 conformance tests")]
 impl ToolSandboxAdmissionError {
+    #[cfg(test)]
     pub(crate) fn missing(&self) -> Option<ToolPermissionSet> {
         match self {
             Self::Unavailable => None,
@@ -1353,7 +1309,7 @@ pub(crate) struct ToolSandboxProof {
     permissions: ToolPermissionSet,
 }
 
-#[allow(dead_code, reason = "read by the M13 gate wiring slice")]
+#[cfg(test)]
 impl ToolSandboxProof {
     pub(crate) fn permissions(&self) -> ToolPermissionSet {
         self.permissions
@@ -1900,10 +1856,6 @@ impl ToolSet {
         ToolPromptView {
             inner: Arc::clone(&self.inner),
         }
-    }
-
-    pub(crate) fn owns_prompt_view(&self, view: &ToolPromptView) -> bool {
-        Arc::ptr_eq(&self.inner, &view.inner)
     }
 }
 
@@ -4400,17 +4352,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_prompt_view_retains_its_exact_parent_without_an_identity_value() {
+    fn empty_prompt_view_is_empty_cloneable_and_debug_prints_its_exact_shape() {
         let first = ToolSet::empty();
-        let second = ToolSet::empty();
         let view = first.prompt_view();
         let clone = view.clone();
 
         assert!(view.is_empty());
         assert!(clone.is_empty());
-        assert!(first.owns_prompt_view(&view));
-        assert!(first.owns_prompt_view(&clone));
-        assert!(!second.owns_prompt_view(&view));
         assert_eq!(format!("{first:?}"), "ToolSet { spec_count: 0 }");
         assert_eq!(format!("{view:?}"), "ToolPromptView { spec_count: 0 }");
     }
@@ -5010,27 +4958,6 @@ mod tests {
                 content,
             } if content.parts()[0].as_text() == TOOL_SANDBOX_UNAVAILABLE_TEXT
         ));
-    }
-
-    #[test]
-    fn tool_sandbox_restricted_candidate_may_narrow_but_never_widen_the_ceiling() {
-        let rw_net = [C::FilesystemRead, C::FilesystemWrite, C::Network];
-        let ceiling = ToolPermissionSet::new(rw_net);
-        let equal = ceiling.restricted_candidate(rw_net).unwrap();
-        let subset = ceiling
-            .restricted_candidate(rw_net[..2].iter().copied())
-            .unwrap();
-        assert_eq!(equal, ceiling);
-        assert_eq!(subset, ToolPermissionSet::new(rw_net[..2].iter().copied()));
-        let narrowed = ceiling.restricted_candidate([]).unwrap();
-        assert!(narrowed.is_empty());
-        for elevated in [
-            vec![C::FilesystemRead, C::Process],
-            ALL.to_vec(),
-            vec![C::Process],
-        ] {
-            assert!(ceiling.restricted_candidate(elevated).is_err());
-        }
     }
 
     #[test]
