@@ -123,18 +123,12 @@ impl fmt::Debug for ApiModelName {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ModelDefinitionVersion(NonZeroU64);
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "constructed by the adjacent M7 model source slice"
-    )
-)]
 impl ModelDefinitionVersion {
     pub(crate) const fn new(value: NonZeroU64) -> Self {
         Self(value)
     }
 
+    #[cfg(test)]
     pub(crate) const fn get(self) -> u64 {
         self.0.get()
     }
@@ -207,10 +201,6 @@ pub(crate) struct ModelDefinitionRef {
     version: ModelDefinitionVersion,
 }
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "read by the adjacent M7 model-call consumer")
-)]
 impl ModelDefinitionRef {
     pub(crate) const fn provider_id(&self) -> &ProviderId {
         &self.provider_id
@@ -220,6 +210,7 @@ impl ModelDefinitionRef {
         &self.model_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn version(&self) -> ModelDefinitionVersion {
         self.version
     }
@@ -285,11 +276,8 @@ pub(crate) struct ReasoningCapabilities {
     high: bool,
 }
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "validated by the adjacent M7 model source slice")
-)]
 impl ReasoningCapabilities {
+    #[cfg(test)]
     pub(crate) const fn all() -> Self {
         Self {
             disabled: true,
@@ -2510,11 +2498,8 @@ pub(crate) struct ProviderAttemptError {
     delivery: ProviderRequestDeliveryState,
 }
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "constructed by the adjacent M7 provider adapter")
-)]
 impl ProviderAttemptError {
+    #[cfg(test)]
     const fn new(reason: ModelCallErrorReason) -> Self {
         Self {
             reason,
