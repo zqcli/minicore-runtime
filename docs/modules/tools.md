@@ -458,7 +458,7 @@ pub(crate) enum ToolSandboxContract {
 }
 ```
 
-`ToolPermissionSet::restricted_candidate(...)`只接受等于或窄于current ceiling的class set；新增任何class返回closed typed error。`ToolSandboxContract::admit(final_permissions)`只在Sandbox available且`final ⊆ enforceable`时返回move-only proof；否则返回`Unavailable`或携带exact `final − enforceable`的`CapabilityGap`。两类失败都只转换为固定、bounded、non-secret的`PreExecution + Denied`文本，missing classes不进入model-visible content。M13.3后per-request planner只返回一个plan；`Execute.permissions`与`Approval.permissions`是final class-level事实唯一owner。Direct Execute在plan离开Tools owner前admit；Approval先present host，`AllowOnce`重新admit同一ceiling，`AllowWith(candidate)`先在release code证明candidate不宽于ceiling再admit candidate。只有成功才进入ToolStartGate reservation；失败直接settle PreExecution Denied。该合同不代表resource-level path/host/process grants或production Sandbox已实现。
+`ToolSandboxContract::admit(final_permissions)`只在Sandbox available且`final ⊆ enforceable`时返回move-only proof；否则返回`Unavailable`或携带exact `final − enforceable`的`CapabilityGap`。两类失败都只转换为固定、bounded、non-secret的`PreExecution + Denied`文本，missing classes不进入model-visible content。M13.3后per-request planner只返回一个plan；`Execute.permissions`与`Approval.permissions`是final class-level事实唯一owner。Direct Execute在plan离开Tools owner前admit；Approval先present host，`AllowOnce`重新admit同一ceiling，`AllowWith(candidate)`在approval settlement中直接对plan ceiling做subset revalidation（`candidate ⊆ ceiling`才重新admit，宽于ceiling立即以CapabilityGap fail closed为固定PreExecution Denied，不引入独立restricted-candidate helper）。只有成功才进入ToolStartGate reservation；失败直接settle PreExecution Denied。该合同不代表resource-level path/host/process grants或production Sandbox已实现。
 
 approval invariants：
 

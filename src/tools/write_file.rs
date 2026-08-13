@@ -828,10 +828,6 @@ mod tests {
                     permissions,
                     ToolPermissionSet::new([ToolCapabilityClass::FilesystemWrite])
                 );
-                assert!(permissions.contains(ToolCapabilityClass::FilesystemWrite));
-                assert!(!permissions.contains(ToolCapabilityClass::FilesystemRead));
-                assert!(!permissions.contains(ToolCapabilityClass::Network));
-                assert!(!permissions.contains(ToolCapabilityClass::Process));
             }
             _ => panic!("the valid call plans a FileMutation shape"),
         }

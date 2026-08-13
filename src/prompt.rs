@@ -2830,7 +2830,6 @@ mod tests {
                 "new agent content",
             ]
         );
-        assert!(tool_set.owns_prompt_view(&old_set.tools));
         assert!(skill_view.owns_prompt_view(&old_set.skills));
     }
 
@@ -2957,7 +2956,6 @@ mod tests {
                 .iter()
                 .all(|section| section.role() == PromptRole::User)
         );
-        assert!(tool_set.owns_prompt_view(&set.tools));
         assert!(skill_view.owns_prompt_view(&set.skills));
     }
 
