@@ -28,14 +28,14 @@ serde_json = { version = "1.0.140", features = ["arbitrary_precision"] }
 thiserror = "2.0.12"
 time = { version = "0.3.41", features = ["parsing"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
-tokio-util = { version = "0.7.19", default-features = false }
+tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
 file-id = "=0.2.3"
 fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
 futures-util = "0.3.33"
 # Production OpenAI Responses adapter transport. Pinned to the exact reqwest version
-# validated in the M14 Rust 1.85 cold-build spike with exactly rustls/stream;
+# validated in the M14 Rust 1.85 cold-build spike with exactly json/rustls/stream;
 # no default features: no system proxy, no HTTP/2, no compression, no cookies.
-reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "stream"] }
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "test-util"] }
