@@ -12719,7 +12719,9 @@ mod tests {
         PreparedToolExecution, SessionFileMutationQueue, ToolCapabilityClass, ToolExecutionFuture,
         ToolExecutionPreparation, ToolOutcomeSource, ToolPermissionSet, ToolSandboxContract,
     };
-    use crate::wire::{CanonicalFileUri, FileUriFamily, SessionId};
+    #[cfg(not(windows))]
+    use crate::wire::FileUriFamily;
+    use crate::wire::{CanonicalFileUri, SessionId};
     use crate::workspace::{
         RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput,
         WorkspaceFileMutationKey, WorkspacePathTarget, WorkspaceRootInput, WorkspaceRootKey,
