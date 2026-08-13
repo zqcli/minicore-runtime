@@ -67,14 +67,6 @@ pub(crate) fn client_builder() -> reqwest::ClientBuilder {
         .no_deflate()
 }
 
-/// Builds the locked-down production HTTP client shared by every direct provider
-/// adapter.  This is the historical `provider_transport::build_client` contract,
-/// lifted to the shared owner unchanged: the adapters keep their exact single-attempt
-/// semantics and their typed `ClientBuild` error mapping.
-pub(crate) fn build_client() -> Result<reqwest::Client, reqwest::Error> {
-    client_builder().build()
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -320,7 +312,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn every_request_carries_the_fixed_product_user_agent() {
         let server = TestServer::spawn(vec![ScriptedResponse::plain(200, "ok")]);
-        let client = build_client().expect("the shared client builds");
+        let client = client_builder().build().expect("the shared client builds");
         let response = client
             .get(format!("http://{}/ua", server.addr()))
             .send()
@@ -348,7 +340,7 @@ mod tests {
             headers: vec![("Location".to_owned(), "/redirected".to_owned())],
             body: Vec::new(),
         }]);
-        let client = build_client().expect("the shared client builds");
+        let client = client_builder().build().expect("the shared client builds");
         let response = client
             .get(format!("http://{}/start", server.addr()))
             .send()
@@ -380,7 +372,7 @@ mod tests {
             ],
             body: gzip.clone(),
         }]);
-        let client = build_client().expect("the shared client builds");
+        let client = client_builder().build().expect("the shared client builds");
         let response = client
             .get(format!("http://{}/gzip", server.addr()))
             .send()
@@ -411,7 +403,7 @@ mod tests {
         // back as the final response.  A retrying client would send a second
         // request, which panics the server thread and fails the test via `join`.
         let server = TestServer::spawn(vec![ScriptedResponse::plain(500, "boom")]);
-        let client = build_client().expect("the shared client builds");
+        let client = client_builder().build().expect("the shared client builds");
         let response = client
             .get(format!("http://{}/boom", server.addr()))
             .send()

@@ -19,7 +19,7 @@ M12通过standalone Rig evidence与离线loopback合同冻结了OpenAI Responses
 
 ## 决策
 
-1. **Shared transport显式发送固定产品User-Agent。** `provider_transport::build_client()`在保留`retry::never()`、`redirect::Policy::none()`与`no_proxy()`的同时，为每个direct adapter client安装`concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"))`。当前artifact wire值为`minicore-runtime/0.1.0`。该值是stable、nonsecret、provider-neutral的产品标识，不是浏览器伪装；OpenAI与Anthropic POST必须携带同一个exact值。当前不增加host-configurable UA：未来只有出现真实host consumer与identity/policy需求时才独立设计，不能为猜测提前扩大config或Wire surface。
+1. **Shared transport显式发送固定产品User-Agent。** `http_transport::client_builder()`在保留`retry::never()`、`redirect::Policy::none()`与`no_proxy()`的同时，为每个direct adapter client安装`concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"))`；两个adapter直接对该builder调用`build()`并保持各自typed `ClientBuild`映射。当前artifact wire值为`minicore-runtime/0.1.0`。该值是stable、nonsecret、provider-neutral的产品标识，不是浏览器伪装；OpenAI与Anthropic POST必须携带同一个exact值。当前不增加host-configurable UA：未来只有出现真实host consumer与identity/policy需求时才独立设计，不能为猜测提前扩大config或Wire surface。
 
 2. **UA不改变single-attempt/full-request政策。** 固定UA只是shared client metadata；每次`generate_model_turn`仍至多一次`ProviderAdapter::execute`，独立地零或一个POST，若发送则是完整full request。不得因403/401或任何gateway响应切换UA、protocol、auth header、endpoint或发送第二个POST。
 
