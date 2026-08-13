@@ -21,6 +21,7 @@ pub(crate) mod runtime_task;
 pub(crate) mod session_execution;
 pub(crate) mod session_ingress;
 pub(crate) mod session_residency;
+pub mod session_transcript;
 pub(crate) mod turn_execution_context;
 pub use runtime::{MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError};
 pub mod skills;

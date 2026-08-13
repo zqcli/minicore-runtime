@@ -61,11 +61,12 @@ use crate::session_execution::{
     SessionDefinitionPublicationOutcome, SessionExecutor, SessionExecutorCloseError,
     SessionExecutorDependencies, SessionExecutorPrepareUnloadError, SessionExecutorSnapshot,
     SessionExecutorSnapshotError, SessionExecutorStartError, SessionExecutorSubscription,
-    SessionFollowUpError, SessionInteractionError, SessionPromptAvailabilityError,
-    SessionQueuedMessageError, SessionSecurityInvalidationError, SessionSteerError,
-    SessionSubmitError, SessionWorkspaceDefinitionError, model_available_for_definition,
-    prompt_available_for_definition,
+    SessionExecutorTranscriptError, SessionFollowUpError, SessionInteractionError,
+    SessionPromptAvailabilityError, SessionQueuedMessageError, SessionSecurityInvalidationError,
+    SessionSteerError, SessionSubmitError, SessionWorkspaceDefinitionError,
+    model_available_for_definition, prompt_available_for_definition,
 };
+use crate::session_transcript::SessionTranscriptCapture;
 use crate::tools::{ProductionToolConfig, ToolSet, TurnToolResources};
 use crate::turn_item_interaction::InteractionResolutionInput;
 use crate::wire::{
@@ -175,6 +176,20 @@ pub(crate) enum SessionResidencyForkError {
 /// Redacted failures from one loaded Session snapshot request.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SessionResidencySnapshotError {
+    #[error("session residency is closing")]
+    Closing,
+    #[error("Session is not loaded")]
+    SessionNotLoaded,
+    #[error("session residency dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+/// Redacted failures from one loaded Session transcript capture request.  The capture is a
+/// loaded-only direct route: it clones the installed executor under a short standard mutex and
+/// awaits the executor actor's coherent capture, never touching DurableState or the per-Session
+/// operation gate.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencyTranscriptError {
     #[error("session residency is closing")]
     Closing,
     #[error("Session is not loaded")]
@@ -2789,6 +2804,44 @@ impl SessionResidencyRegistry {
         waiter
             .await
             .unwrap_or_else(|_| self.snapshot_waiter_fallback())
+    }
+
+    /// Returns a coherent immutable transcript capture for the loaded Session.  The registry
+    /// clones the installed executor under a short standard mutex and awaits the executor
+    /// actor's capture directly; no per-Session operation gate or residency child is involved.
+    /// An executor Closing is only the registry Closing when the registry itself is closing;
+    /// otherwise it is a normal per-Session Unload / old exact executor race and reports
+    /// SessionNotLoaded.
+    pub(crate) async fn transcript_capture(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionTranscriptCapture, SessionResidencyTranscriptError> {
+        if self.closing.is_cancelled() {
+            return Err(SessionResidencyTranscriptError::Closing);
+        }
+        let executor = self
+            .shared
+            .executor(session_id)
+            .ok_or(SessionResidencyTranscriptError::SessionNotLoaded)?;
+        executor
+            .transcript_capture()
+            .await
+            .map_err(|error| match error {
+                SessionExecutorTranscriptError::Closing => {
+                    // An executor that stopped admitting while the residency registry itself is
+                    // still open is a Session that is unloading (its admission gate closed): map
+                    // it to SessionNotLoaded instead of a Runtime shutdown.  A registry that is
+                    // itself closing stays Closing.
+                    if self.closing.is_cancelled() {
+                        SessionResidencyTranscriptError::Closing
+                    } else {
+                        SessionResidencyTranscriptError::SessionNotLoaded
+                    }
+                }
+                SessionExecutorTranscriptError::InternalDispatchUnavailable => {
+                    SessionResidencyTranscriptError::InternalDispatchUnavailable
+                }
+            })
     }
 
     pub(crate) async fn submit(

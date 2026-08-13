@@ -70,6 +70,7 @@ use crate::session_ingress::{
     FollowUpQueueError, InteractionPresentationPermit, InteractionResolutionPermit, QueuedSteer,
     SteerQueue, SteerQueueError, UserQuestionBindingPermit,
 };
+use crate::session_transcript::SessionTranscriptCapture;
 #[cfg(test)]
 use crate::tools::UserQuestionAnswerBinding;
 use crate::tools::{
@@ -1219,6 +1220,15 @@ pub(crate) enum SessionExecutorSnapshotError {
     InternalDispatchUnavailable,
 }
 
+/// Redacted failures for the immutable transcript capture request.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionExecutorTranscriptError {
+    #[error("session executor is closing")]
+    Closing,
+    #[error("session executor dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
 /// Redacted failures for the loaded Session metadata publication.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SessionMetadataPublishError {
@@ -2168,6 +2178,40 @@ impl SessionExecutor {
                 Err(SessionExecutorSnapshotError::Closing)
             } else {
                 Err(SessionExecutorSnapshotError::InternalDispatchUnavailable)
+            }
+        })
+    }
+
+    /// Returns a coherent immutable transcript capture of the loaded conversation's selected
+    /// path, excluding any running turn.  Requests sent while a publication is in flight
+    /// observe the current live state at the moment the actor settles the request.
+    pub(crate) async fn transcript_capture(
+        &self,
+    ) -> Result<SessionTranscriptCapture, SessionExecutorTranscriptError> {
+        let (response, waiter) = oneshot::channel();
+        let mut request = SessionExecutorRequest::Transcript(TranscriptRequest {
+            response: Some(response),
+        });
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionExecutorTranscriptError::Closing));
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject_closing();
+                    return waiter.await.unwrap_or(Err(SessionExecutorTranscriptError::InternalDispatchUnavailable));
+                }
+            },
+        };
+        permit.send(request);
+        waiter.await.unwrap_or_else(|_| {
+            if self.closing.is_cancelled() || self.sender.is_closed() {
+                Err(SessionExecutorTranscriptError::Closing)
+            } else {
+                Err(SessionExecutorTranscriptError::InternalDispatchUnavailable)
             }
         })
     }
@@ -3543,6 +3587,15 @@ impl SessionExecutorActor {
                 self.hooks.before_snapshot_response().await;
                 request.settle(Ok(Arc::clone(&self.current)));
             }
+            SessionExecutorRequest::Transcript(request) => match self.conversation.as_ref() {
+                Some(conversation) => {
+                    let live_state = lock(&conversation.live_state);
+                    request.settle(Ok(SessionTranscriptCapture::from_live_state(&live_state)));
+                }
+                None => request.settle(Err(
+                    SessionExecutorTranscriptError::InternalDispatchUnavailable,
+                )),
+            },
             SessionExecutorRequest::PublishMetadata(request) => {
                 self.publish_metadata(request)?;
             }
@@ -11443,6 +11496,32 @@ impl Drop for SnapshotRequest {
     }
 }
 
+struct TranscriptRequest {
+    response:
+        Option<oneshot::Sender<Result<SessionTranscriptCapture, SessionExecutorTranscriptError>>>,
+}
+
+impl TranscriptRequest {
+    fn settle(
+        &mut self,
+        outcome: Result<SessionTranscriptCapture, SessionExecutorTranscriptError>,
+    ) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionExecutorTranscriptError::Closing));
+    }
+}
+
+impl Drop for TranscriptRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
 #[cfg(test)]
 struct StartingProbeRequest {
     response: Option<oneshot::Sender<Result<(), SessionWorkspaceDefinitionError>>>,
@@ -11474,6 +11553,7 @@ enum SessionExecutorRequest {
     ReloadWorkspace(ReloadWorkspaceRequest),
     PublishMetadata(UpdateSessionMetadataRequest),
     Snapshot(SnapshotRequest),
+    Transcript(TranscriptRequest),
     Submit(SubmitRequest),
     FollowUp(FollowUpRequest),
     Steer(SteerRequest),
@@ -11498,6 +11578,7 @@ impl SessionExecutorRequest {
             Self::ReloadWorkspace(request) => request.reject_closing(),
             Self::PublishMetadata(request) => request.reject_closing(),
             Self::Snapshot(request) => request.reject_closing(),
+            Self::Transcript(request) => request.reject_closing(),
             Self::Submit(request) => request.reject_closing(),
             Self::FollowUp(request) => request.reject_closing(),
             Self::Steer(request) => request.reject_closing(),
