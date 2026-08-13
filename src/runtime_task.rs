@@ -19,25 +19,13 @@ use tokio::task::JoinHandle;
 use crate::wire::Timestamp;
 
 /// A synchronous source of wall-clock timestamps for owner-controlled operations.
-#[allow(
-    dead_code,
-    reason = "M5 publication timestamps and M7 turn operations consume the owner clock"
-)]
 pub(crate) trait Clock {
     fn now(&self) -> Timestamp;
 }
 
 /// The production wall-clock source.
-#[allow(
-    dead_code,
-    reason = "M5 publication timestamps and M7 turn operations consume the owner clock"
-)]
 pub(crate) struct SystemClock;
 
-#[allow(
-    dead_code,
-    reason = "M5 publication timestamps and M7 turn operations consume the owner clock"
-)]
 impl SystemClock {
     fn timestamp_from_utc(value: OffsetDateTime) -> Timestamp {
         let nanoseconds = value.nanosecond();
@@ -223,10 +211,6 @@ impl RuntimeTaskContext {
     }
 
     /// Reports whether this owner has stopped accepting new tracked work.
-    #[allow(
-        dead_code,
-        reason = "loaded Session execution uses this owner admission probe"
-    )]
     pub(crate) fn is_closing(&self) -> bool {
         self.owner.is_closing()
     }
@@ -348,10 +332,6 @@ impl TrackedTask {
         self.settlement.wait().await
     }
 
-    #[allow(
-        dead_code,
-        reason = "loaded Session execution uses this owner task settlement"
-    )]
     pub(crate) async fn wait(&self) -> Result<(), RuntimeTaskError> {
         loop {
             // A caller-side close may race an admitted task before its first poll.  Both
@@ -662,10 +642,6 @@ impl RuntimeTaskOwner {
         self.registry_changed.notify_waiters();
     }
 
-    #[allow(
-        dead_code,
-        reason = "RuntimeTaskContext exposes this owner admission probe"
-    )]
     fn is_closing(&self) -> bool {
         let registry = lock(&self.registry);
         registry.phase != OwnerPhase::Open

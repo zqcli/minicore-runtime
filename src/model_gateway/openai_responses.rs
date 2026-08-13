@@ -66,13 +66,6 @@ use crate::wire::{BoundedJsonObject, ProtocolLimits};
 /// never stored, so Debug/Display can never leak them. The credential is not part
 /// of adapter configuration: it is resolved per attempt by the gateway and owned
 /// by the attempt request.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "constructed by the adjacent M14 model source/catalog slice"
-    )
-)]
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum OpenAiProviderConfigError {
     #[error("OpenAI endpoint must be an absolute http(s) URL without query, fragment, or userinfo")]
@@ -96,13 +89,6 @@ pub(crate) struct OpenAiResponsesProviderAdapter {
 impl OpenAiResponsesProviderAdapter {
     /// Builds the adapter against an explicit full `/responses` endpoint URL. No
     /// environment or home-directory lookup ever runs.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "constructed by the adjacent M14 model source/catalog slice"
-        )
-    )]
     pub(crate) fn new(endpoint: &str) -> Result<Self, OpenAiProviderConfigError> {
         let endpoint = reqwest::Url::parse(endpoint)
             .map_err(|_| OpenAiProviderConfigError::InvalidEndpoint)?;

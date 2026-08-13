@@ -80,13 +80,6 @@ use crate::wire::{BoundedJsonObject, ProtocolLimits};
 /// details are never stored, so Debug/Display can never leak them. The API key is
 /// not part of adapter configuration: it is resolved per attempt by the gateway
 /// and owned by the attempt request.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "constructed by the adjacent M14 model source/catalog slice"
-    )
-)]
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum AnthropicProviderConfigError {
     #[error(
@@ -117,13 +110,6 @@ impl AnthropicMessagesProviderAdapter {
     /// Builds the adapter against an explicit full `/v1/messages` endpoint URL with
     /// an explicit `anthropic-version` header value. No environment or
     /// home-directory lookup ever runs.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "constructed by the adjacent M14 model source/catalog slice"
-        )
-    )]
     pub(crate) fn new(endpoint: &str, version: &str) -> Result<Self, AnthropicProviderConfigError> {
         let endpoint = reqwest::Url::parse(endpoint)
             .map_err(|_| AnthropicProviderConfigError::InvalidEndpoint)?;
