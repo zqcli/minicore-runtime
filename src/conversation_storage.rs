@@ -790,10 +790,6 @@ fn map_unpublished_conversation_recovery_scan_error(
 /// The set is exact and closed: every replay outcome maps to one code, and no free-form
 /// diagnostic string can be produced. Codes are snake_case in `Display` to match the authoritative
 /// fixture metadata vocabulary.
-#[allow(
-    dead_code,
-    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
-)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ConversationReplayDiagnosticCode {
     PartialTail,
@@ -820,10 +816,6 @@ pub(crate) enum ConversationReplayDiagnosticCode {
     HistoryTooLarge,
 }
 
-#[allow(
-    dead_code,
-    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
-)]
 impl ConversationReplayDiagnosticCode {
     const fn name(self) -> &'static str {
         match self {
@@ -848,8 +840,9 @@ impl ConversationReplayDiagnosticCode {
         }
     }
 
-    /// Resolves the exact closed snake_case name back to its code. Crate-private so tests and
-    /// the future Load seam can interpret the authoritative fixture vocabulary.
+    /// Resolves the exact closed snake_case name back to its code. Crate-private so tests can
+    /// interpret the authoritative fixture vocabulary.
+    #[cfg(test)]
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "partial_tail" => Self::PartialTail,
@@ -885,10 +878,6 @@ impl fmt::Display for ConversationReplayDiagnosticCode {
 ///
 /// The detail never carries IDs, user text, tool output, provider data, a raw line, or a path,
 /// so both `Debug` and `Display` of the enclosing diagnostics are inherently redacted.
-#[allow(
-    dead_code,
-    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ConversationReplayDiagnosticDetail {
     code: ConversationReplayDiagnosticCode,
@@ -896,10 +885,7 @@ pub(crate) struct ConversationReplayDiagnosticDetail {
     offset: u64,
 }
 
-#[allow(
-    dead_code,
-    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
-)]
+#[cfg(test)]
 impl ConversationReplayDiagnosticDetail {
     pub(crate) const fn code(self) -> ConversationReplayDiagnosticCode {
         self.code
@@ -912,20 +898,13 @@ impl ConversationReplayDiagnosticDetail {
 
 /// One truncation summary: how many detail facts were omitted beyond the retained first 100, plus
 /// the exact aggregate totals at the end of replay.
-#[allow(
-    dead_code,
-    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConversationReplayTruncationSummary {
     omitted_details: u64,
     totals: BTreeMap<ConversationReplayDiagnosticCode, u64>,
 }
 
-#[allow(
-    dead_code,
-    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
-)]
+#[cfg(test)]
 impl ConversationReplayTruncationSummary {
     pub(crate) const fn omitted_details(&self) -> u64 {
         self.omitted_details
@@ -942,10 +921,6 @@ impl ConversationReplayTruncationSummary {
 /// are retained in physical order. When more facts arrive, one truncation summary records the
 /// omitted count and the final totals, and the aggregate `DiagnosticsTruncated` counter becomes
 /// exactly one.
-#[allow(
-    dead_code,
-    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
-)]
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ConversationReplayDiagnostics {
     details: Vec<ConversationReplayDiagnosticDetail>,
@@ -954,10 +929,6 @@ pub(crate) struct ConversationReplayDiagnostics {
     total_facts: u64,
 }
 
-#[allow(
-    dead_code,
-    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
-)]
 impl ConversationReplayDiagnostics {
     const MAX_RETAINED_DETAILS: usize = 100;
 
@@ -1029,23 +1000,28 @@ impl ConversationReplayDiagnostics {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn count(&self, code: ConversationReplayDiagnosticCode) -> u64 {
         self.counts.get(&code).copied().unwrap_or(0)
     }
 
+    #[cfg(test)]
     pub(crate) fn counts(&self) -> &BTreeMap<ConversationReplayDiagnosticCode, u64> {
         &self.counts
     }
 
     /// The first 100 retained detail facts in physical order.
+    #[cfg(test)]
     pub(crate) fn details(&self) -> &[ConversationReplayDiagnosticDetail] {
         &self.details
     }
 
+    #[cfg(test)]
     pub(crate) fn truncation(&self) -> Option<&ConversationReplayTruncationSummary> {
         self.truncation.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.counts.is_empty()
     }
