@@ -24,6 +24,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0145](0145-live-provider-evidence-refines-direct-adapter-wire-truth.md) | 真实OpenAI Responses/Anthropic Messages public Runtime release evidence细化direct adapter wire truth：固定产品User-Agent、unsigned Anthropic thinking truthful normalization/replay omission、message_start stop fields absent-or-null；live smoke仍默认ignored |
 | [0146](0146-production-write-file-binds-capability-targets-to-session-fifo.md) | Production `write_file`是closed、default-off、Workspace-bound mutation builtin：ReadWrite authority仍受requested access约束，existing/create target使用capability-opened physical identity，same-Session ticket按`call_index` FIFO，mutation permit由`ToolOperationSlot`持有through `Settling`，16,384-byte safe UTF-8 full replacement且不mkdir/append/atomic rename |
 | [0147](0147-production-fetch-url-pins-exact-https-origins-to-host-addresses.md) | Production `fetch_url`冻结为closed/default-off exact-origin HTTPS GET builtin：host安装DNS hostname与1..=8个fixed SocketAddr的交集authority，per-origin reject-all DNS client关闭redirect/retry/proxy/compression，2xx-only bounded safe UTF-8 text，30秒request timeout与owner-contained cancellation cleanup |
+| [0148](0148-v0-1-session-transcript-is-a-library-only-read-seam.md) | v0.1以library-only `MiniCoreRuntime::session_transcript`恢复loaded Session的基础User/Assistant selected history；首次capture由Session actor拥有，分页cursor绑定immutable capture，不修改Wire V1或Store V1，完整history Query生态后置 |
 
 ## Current With Later Refinements
 
@@ -35,12 +36,12 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0103](0103-turn-item-interaction-model.md) | ADR 0124、0126、0127 |
 | [0105](0105-session-executor-owns-loaded-session.md) | ADR 0126、0127、0139 |
 | [0106](0106-model-gateway-is-single-deep-operation.md) | ADR 0139、0141、0145 |
-| [0108](0108-runtime-public-protocol.md) | ADR 0126、0127、0133 |
+| [0108](0108-runtime-public-protocol.md) | ADR 0126、0127、0133、0148 |
 | [0109](0109-review-b-determinism-and-serialized-operations.md) | ADR 0124、0126 |
 | [0110](0110-prompt-and-skill-use-shared-reloadable-views.md) | ADR 0127、0129 |
 | [0111](0111-session-ingress-separates-control-and-work-lanes.md) | ADR 0124、0126、0127 |
 | [0113](0113-user-question-uses-runtime-protocol-and-ui-presentation.md) | ADR 0124、0126、0127、0133、0142 |
-| [0114](0114-runtime-observation-uses-snapshot-first-streams.md) | ADR 0126、0127、0133 |
+| [0114](0114-runtime-observation-uses-snapshot-first-streams.md) | ADR 0126、0127、0133、0148 |
 | [0116](0116-file-mutations-use-session-local-queues.md) | ADR 0126、0146 |
 | [0117](0117-async-synchronization-uses-single-owner-and-typed-permits.md) | ADR 0124、0125、0126、0127、0136、0137 |
 | [0118](0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md) | ADR 0124、0126、0127、0133 |
@@ -51,7 +52,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0124](0124-session-replay-is-tolerant-and-links-are-minimal.md) | ADR 0126、0127、0131、0132、0134、0136、0137 |
 | [0125](0125-model-gateway-has-no-local-call-permits.md) | ADR 0141 |
 | [0126](0126-turn-execution-is-async-and-session-recording-is-best-effort.md) | ADR 0127、0130、0132、0136、0137、0139 |
-| [0133](0133-runtime-public-payload-is-snapshot-recoverable.md) | ADR 0135、0136、0137 |
+| [0133](0133-runtime-public-payload-is-snapshot-recoverable.md) | ADR 0135、0136、0137、0148 |
 | [0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md) | ADR 0135 |
 | [0138](0138-production-provider-baseline-uses-verified-rig-contracts.md) | ADR 0139、0141、0145 |
 | [0139](0139-rig-is-evidence-only-under-rust-1-85.md) | ADR 0141、0145 |

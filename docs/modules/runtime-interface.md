@@ -4,6 +4,8 @@
 
 状态：当前权威架构（ADR 0136/0137；M5 durable foundation与replay/Recorder-backed hydration、Workspace resolver/Snapshot及Runtime-owned residency foundation已实现；minimal public dispatch/query/snapshot/subscribe已接通Agent Create/Enable/Disable/Delete/UpdateDefinition/UpdateMetadata与Session Create/Load/Submit/Unload/Fork/Archive/Unarchive/Delete/UpdateDefinition/UpgradeAgentRevision/ReloadWorkspace/UpdateMetadata、typed ResolveInteraction/NoChange、durable `ListAgents`/`ListSessions`分页、`GetSessionForkProvenance`、snapshot-first Runtime/Session subscription、Runtime Agent/Session membership/lifecycle/definition/metadata StateEvent、loaded Session metadata/definition/workspace-reload StateEvent、loaded Ready+Idle与Workspace/Prompt Unavailable Snapshot及Turn Completed/Failed Event；M9 Starting/Running/Finishing observation、current Turn/active Items/Pending Interaction安全摘要已接通；Session usage、Degraded recording与bounded diagnostics也已接通；selected-V1 Agent/Session metadata mutation、ordinary Session definition CAS、Agent revision upgrade、Ready-state与Unavailable恢复的reload workspace、Progress/Closed及SessionDefinitionUpdated codec已关闭public manifest pending；Workspace/Prompt Unavailable loaded readiness与ReloadWorkspace恢复已实现；Agent readiness fan-out亦已实现（`SetStatus/Delete` durable Updated后按同一owner timestamp经residency per-Session gate逐个fan-out `set_agent_availability`，Idle立即应用、非Idle保存最新pending并在回Idle后应用，仅public readiness真实变化发布Session-scope `session_readiness_changed`，Agent Disabled/Deleted的Load仍返回Loaded并投影AgentUnavailable，Enable恢复底层Ready或原resource Unavailable，active Turn不变且future admission拒绝）；ModelUnavailable load/definition projection亦已实现（`SessionExecutorSnapshot`新增独立`model_available: bool`事实并收窄重命名`resource_unavailable`为`workspace_unavailable`，readiness只在Idle按固定优先级为AgentUnavailable→workspace cause→ModelUnavailable→Ready（非Idle执行始终投影Ready；facts是future-only，new Unavailable只在回Idle后显现）；Load用现有`resolve_for_turn`按captured definition.model同步分类model_available，普通model incompatibility→false且Load仍Loaded而catalog owner/source/definition internal→现有internal load路径，任何install新definition的publication install前按当前catalog计算新definition的model_available并与definition一起安装，ReloadWorkspace保留当前事实，true Workspace publication只清workspace cause，DefinitionUpdated/WorkspaceReloaded event snapshot只在Idle publication携带derived readiness——Running等非Idle执行时保持Ready、new facts经terminal/回Idle显现）；selected PromptUnavailable load/definition projection亦已实现（`SessionExecutorSnapshot`新增独立`prompt_available: bool`事实，readiness只在Idle按固定优先级为AgentUnavailable→workspace cause→selected prompt unavailable→PromptUnavailable→ModelUnavailable→Ready（非Idle执行始终投影Ready；facts是future-only，new Unavailable只在回Idle后显现）；Load与任何install新definition的publication在install前经`read_agent_definition`读exact retained Agent revision并复用`for_turn` selection阶段验证exact Agent+Session Prompt selection，missing/wrong role/duplicate resolved key→PromptUnavailable而非Workspace cause，Agent read的Closing→Load Closing、其余Agent read失败与owner/identity mismatch→internal路径，ReloadWorkspace保留当前事实）；shared-resource reload recovery/fanout亦已实现（`ReloadSharedResources`并行build candidates并预计算后经residency per-Session gate fan-out new Prompt/Model roots至全部loaded executors，非Idle合并单一pending availability composite在terminal/admission failure后应用，随后一次原子替换Runtime root pair并发布`shared_resources_reloaded`）；active-Turn graceful Unload亦已实现（`MiniCoreRuntimeConfig::with_unload_grace` default 30s/≤5min验证；public Unload经runtime publication gate与residency per-Session gate执行prepare→close→remove_exact，executor先同步关admission gate并经unbounded emergency lane接受`PrepareUnloadRequest`，grace内active admission/Turn自然完成，deadline到期对exact current emergency target signal `PrepareForUnload`（sticky first-wins，更早Cancel/SecurityRevoked保留原reason）并cancel其cancellation token、以`SessionUnloaded` settle pending Interaction、不直接drop task；Starting Submit在Input未live apply时经internal `SessionSubmitError::PrepareForUnload`公开映射`SessionNotLoaded`而非`SubmitCancelled`，Input先赢仍`TurnStarted`随后同一Turn `Interrupted(PrepareForUnload)`；registry shutdown先广播begin_prepare使grace并行再逐个await waiter再close；不新增queue_updated event，manifest现为144项）；host security Workspace authority invalidation亦已实现（`MiniCoreRuntime::invalidate_session_workspace_authority(session_id)`为public host-only非wire async seam，返回redacted `SessionWorkspaceInvalidationError{RuntimeClosing,SessionNotLoaded,InternalDispatchUnavailable}`，host已先发布current hard restriction fact、Runtime只驱动loaded executor的signal+Workspace re-resolve且不改durable definition/revision/metadata/conversation；route不获取runtime_publication semaphore、不等待普通work lane，经residency loaded map直接clone executor调用out-of-band API（先同步close admission gate再经unbounded emergency lane发送），采样single SystemClock timestamp、无CommandId；missing loaded executor或executor普通Closing且registry未closing（per-Session Unload/old exact executor race）→SessionNotLoaded，仅registry/runtime closing→RuntimeClosing，fatal→Internal；active admission/Turn对exact current emergency target发sticky `SecurityRevoked` first-wins（更早Cancel/PrepareUnload保留原reason、仅形成Turn投影Finishing、pre-Input Starting legal、pending Interaction按SecurityRevoked truthful settlement；即使active publication在飞也立即signal——publication不屏蔽security signal），仅无admission/Turn而publication在飞也立即进入`Preparing`（drop旧WorkspaceSnapshot、发布唯一一次`ReadinessChanged(None)`、publication不取消不阻塞）但recovery worker仍等其settlement并以post-publication exact definition启动（settle后幂等re-enter不重复start event、settled snapshot不重新安装），只要Idle且无active admission/Turn即进入`Preparing`（active publication不阻塞Preparing entry、只等Turn/admission settle；`workspace_preparing`最高readiness优先级、必须Idle+workspace None+空public queues/accepting false），recovery worker单独等待publication settle后才spawn（全空Idle立即spawn，owner-tracked；重复invalidation join同一state）；recovery复用ReloadWorkspace resolve/capture/revalidate/finish（最小shared helper，install前验证Arc ptr_eq与snapshot SessionId/revision、不调用DurableState），非internal resolver失败（含AuthorityDenied）→WorkspaceUnavailable、Workspace Prompt SourceDiscovery/ContentLoad/DuplicateKey→PromptUnavailable、Closing→Closing、shape/task mismatch→fatal Internal；start/finish各发布一次`session_readiness_changed`（command_id None）、不发WorkspaceReloaded event、No Runtime event；recovery pending禁止FollowUp pop/start、新Submit因gate close失败（Preparing→`SessionNotReady`+RetryWithBackoff）；close/fatal/reap settle security waiters exactly once（closing→Closing、fatal→Internal）、worker owner-tracked并reap；`SessionExecutorEvent::ReadinessChanged.command_id`改`Option<CommandId>`（Agent/shared reload传Some、security传None、Runtime EventStream直接复用Option）。manifest现为144项，wire `Preparing`由并行worker激活、host security Preparing/active Turn duplicate recovery fixtures/tests已补齐，scenario/fixture closure已实现、统一质量门禁已通过）；RuntimeDependencyUnavailable loaded readiness与probe recovery亦已实现（唯一producer为loaded Turn admission读pinned historical AgentRevisionRef时的transient StorageUnavailable、owner-tracked无TurnId probe与Submit re-arm恢复），full recovery scenario/fixture closure已实现并通过统一质量门禁；完整cross-platform native matrix acceptance已通过（全部七个`platform_m5_0`坐标均有对应的production行为与测试覆盖；GitHub Actions run 31433810296四个job全部通过：Ubuntu Rust stable、Ubuntu Rust 1.85.0、cargo test macos-latest、cargo test windows-latest）））；production `ask_user`/`read_file`/`list_directory`/`write_file`/`fetch_url` builtins亦已实现（五个public host opt-ins均default-off/idempotent且相互独立，`with_fetch_url_origin(...)`独立安装authority；`open`把四个ask/filesystem bool与materialized fetch authority Option冻结为32种closed selection，固定顺序`ask_user → read_file → list_directory → write_file → fetch_url`；每次Turn admission对exact captured Workspace snapshot materialize enabled filesystem routes，read/list-only选择ReadOnly ceiling，write opt-in选择ReadWrite ceiling但requested ReadOnly绝不提升，任一filesystem opt-in下host invalidation先经owner-held `WorkspaceFilesystemAccessControl`永久revoke，future read/list/write共同Denied；`write_file`另实现capability physical target、same-Session FIFO与permit-through-Settling；`fetch_url`实现exact HTTPS origin + pinned addresses、无ambient DNS/redirect/retry/proxy/compression、bounded safe text与owner-contained cancellation））
 
+> v0.1前端闭环细化：`c99ccf7`已增加[ADR 0148](../adr/0148-v0-1-session-transcript-is-a-library-only-read-seam.md)冻结的library-only `MiniCoreRuntime::session_transcript`。它从loaded Session的canonical selected history分页恢复基础User/Assistant文本，并明确把`GetHistoryTree/ListTurns/GetTurn/ListItems`、unloaded direct history read与Wire transcript route冻结为post-MVP。Public Wire V1 manifest仍为144 active / 0 pending，Store V1与Conversation JSONL V1均未变化。
+
 ## 目的
 
 本文定义 MiniCore 的公开 Runtime interface，回答：
@@ -12,7 +14,7 @@
 - Command、Query、Snapshot 和 Event 各自负责什么；
 - Agent、Session、Turn、Item 和 Interaction 如何进入公开 payload；
 - Command 何时返回、异步业务完成如何通知；
-- Conversation Storage message tree 如何通过 Runtime 读取和操作；
+- v0.1基础聊天transcript如何通过library-only Runtime seam恢复，以及完整message tree/history生态为何后置；
 - streaming progress 与可靠状态变化如何分离；
 - 多 loaded Session 如何订阅、恢复和避免全 Runtime snapshot barrier；
 - slash command 和 GUI command palette 如何共享 CommandSurface；
@@ -44,7 +46,7 @@
 ## 决策摘要
 
 - `MiniCoreRuntime` 是外部宿主接触 MiniCore 的唯一顶层门面；
-- 公开 interface 固定为 `dispatch`、`query`、`snapshot` 和 `subscribe` 四类能力；
+- Wire-compatible transport interface固定为`dispatch`、`query`、`snapshot`和`subscribe`四类能力；Rust embedding另有少量明确标注的host-only/library-only seams；
 - Command 修改事实或启动工作；Query 只读；Snapshot 恢复当前读模型；Event 通知状态变化和进度；
 - 公开领域 identity 使用 `AgentId → SessionId → TurnId → ItemId → RequestId`；
 - 不定义公开 `RunId` 或 `WorkspaceId`；
@@ -58,7 +60,7 @@
 - `RuntimeSnapshot`只覆盖Runtime/Agent/Session summary和loaded membership；
 - `SessionSnapshot`覆盖一个loaded Session的current Turn、Items、Pending Interaction和queues；
 - 不要求 all-loaded Session 在一个全局水位上 stop-the-world snapshot；
-- SessionRecorder保存best-effort recorded entry tree；Runtime通过Query暴露recorded history和loaded live read model，通过Fork command创建新Session branch；
+- SessionRecorder保存best-effort recorded entry tree；v0.1通过library-only `session_transcript`暴露loaded selected history中的基础User/Assistant文本，通过Snapshot/Event暴露current live read model，通过Fork command创建新Session branch；
 - 同一 Session 内不提供原地 checkout/navigation mutation；
 - CommandSurface 是 MiniCoreRuntime 内部无状态命令解释模块；slash command 只是 command text 的一种语法；
 - 所有改变 Runtime 事实的 UI 操作都经过 MiniCoreRuntime；纯 UI 状态留在 adapter；
@@ -83,7 +85,10 @@ External host
    ├─ dispatch(CommandRequest)
    ├─ query(RuntimeQuery)
    ├─ snapshot(SnapshotRequest)
-   └─ subscribe(SubscriptionRequest)
+   ├─ subscribe(SubscriptionRequest)
+   ├─ session_transcript(SessionId, PageRequest) [library-only]
+   ├─ invalidate_session_workspace_authority(SessionId) [host-only]
+   └─ shutdown() [host-only]
 
 MiniCoreRuntime private implementation
 ├─ DurableStateActor / immutable Agent / Session durable catalog
@@ -130,7 +135,7 @@ pub trait MiniCoreRuntimeInterface: Send + Sync {
 }
 ```
 
-四个 entry point 是同一个深模块的公开 interface。它们共享 identity、error、view、revision 和 redaction 类型，但职责不重叠。Host-only lifecycle API固定为：
+四个Wire-compatible entry families是同一个深模块的transport-neutral interface。它们共享identity、error、view、revision和redaction类型，但职责不重叠。Rust embedding还可以调用ADR 0148的library-only transcript read与host-only Workspace invalidation/lifecycle seams；这些方法不是新的Wire V1 route。Host-only lifecycle API固定为：
 
 ```rust
 impl MiniCoreRuntime {
@@ -140,6 +145,12 @@ impl MiniCoreRuntime {
     ) -> Result<Self, RuntimeInitializationError>;
 
     pub async fn shutdown(&self);
+
+    pub async fn session_transcript(
+        &self,
+        session_id: SessionId,
+        page: PageRequest,
+    ) -> Result<Page<SessionTranscriptItem>, QueryError>;
 }
 
 pub enum RuntimeInitializationError {
@@ -1004,23 +1015,24 @@ Command catalog是UI-safe read model，不是执行授权。UI可以查询catalo
 
 Query提供typed、只读、立即request/response数据。
 
+本节必须区分**current v0.1 exact surface**与**post-MVP target sketch**。只有下面第一段列出的variants已经存在于`RuntimeQuery/QueryResult`与Wire V1；后面的CommandSurface/Model/Prompt/Skill/Tool/Usage/Diagnostics及完整history query只是未来设计方向，不能由前端当作当前可调用接口。
+
 ```rust
 pub enum RuntimeQuery {
     Runtime(RuntimeReadQuery),
     Agent(AgentQuery),
     Session(SessionQuery),
-    CommandSurface(CommandSurfaceQuery),
-    Model(ModelQuery),
-    Prompt(PromptQuery),
-    Skill(SkillQuery),
-    Tool(ToolQuery),
-    Usage(UsageQuery),
-    Diagnostics(DiagnosticsQuery),
 }
 
 pub struct PageRequest {
-    pub cursor: Option<PageCursor>,
-    pub limit: NonZeroU32,
+    cursor: Option<PageCursor>,
+    limit: NonZeroU32,
+}
+
+impl PageRequest {
+    pub const fn new(cursor: Option<PageCursor>, limit: NonZeroU32) -> Self;
+    pub const fn cursor(self) -> Option<PageCursor>;
+    pub const fn limit(self) -> NonZeroU32;
 }
 ```
 
@@ -1029,8 +1041,6 @@ pub struct PageRequest {
 ```rust
 pub enum RuntimeReadQuery {
     GetCapabilities,
-    GetRuntimeInfo,
-    ListLoadedSessions,
 }
 ```
 
@@ -1041,16 +1051,6 @@ pub enum AgentQuery {
     ListAgents {
         page: PageRequest,
         include_deleted: bool,
-    },
-    GetAgent {
-        agent_id: AgentId,
-    },
-    ListAgentRevisions {
-        agent_id: AgentId,
-        page: PageRequest,
-    },
-    GetAgentRevision {
-        agent: AgentRevisionRef,
     },
 }
 ```
@@ -1063,19 +1063,54 @@ pub enum SessionQuery {
         page: PageRequest,
         include_archived: bool,
     },
-    GetSession {
-        session_id: SessionId,
-    },
-    GetSessionDefinition {
-        session_id: SessionId,
-        revision: Option<SessionDefinitionRevision>,
-    },
-    GetSessionReadiness {
-        session_id: SessionId,
-    },
     GetSessionForkProvenance {
         session_id: SessionId,
     },
+}
+```
+
+### v0.1 Session Transcript（Library-only）
+
+completed聊天恢复不经过`RuntimeQuery`，而使用[ADR 0148](../adr/0148-v0-1-session-transcript-is-a-library-only-read-seam.md)冻结的Rust embedding method：
+
+```rust
+impl MiniCoreRuntime {
+    pub async fn session_transcript(
+        &self,
+        session_id: SessionId,
+        page: PageRequest,
+    ) -> Result<Page<SessionTranscriptItem>, QueryError>;
+}
+
+pub enum SessionTranscriptItemRole {
+    User,
+    Assistant,
+}
+
+pub struct SessionTranscriptItem {
+    // private fields; public getters expose ItemId, TurnId, role,
+    // optional UserMessageSource, body and Timestamp.
+}
+```
+
+exact合同：
+
+- first page只接受loaded Session；未loaded返回`SessionNotLoaded + UserActionRequired + Session subject`；
+- Session actor在串行点从canonical selected path捕获immutable entry `Arc`，不做storage I/O且guard不跨await；
+- current Turn全部entries从capture排除，继续由`SessionSnapshot.active_items`与events展示；
+- 只投影User正文与Assistant Text items；Reasoning、Tool、Interaction、Compaction不进入v0.1 transcript DTO；
+- User multi-part以单个`\n`连接；顺序为selected path顺序与Assistant content顺序；
+- page cursor绑定same Session与首次immutable capture，continuation不重新访问residency，Session后续append或Unload不改变已开始的分页；
+- cursor与catalog query共用1..=200 page limit、15分钟TTL、4,096 capacity及one-shot successor；
+- restart后先`Load`，transcript从tolerant replay实际恢复的recorded prefix读取；unrecorded live tail仍不可恢复；
+- 该method不属于Wire V1，remote transport若需要它必须走独立protocol minor。
+
+### Post-MVP History Query Targets
+
+以下是完整history/navigation生态的target sketch，**当前未实现、未进入Wire V1，也不阻塞v0.1**：
+
+```rust
+pub enum FutureSessionHistoryQuery {
     GetHistoryTree {
         session_id: SessionId,
     },
@@ -1095,9 +1130,6 @@ pub enum SessionQuery {
         session_id: SessionId,
         turn_id: TurnId,
         item_id: ItemId,
-    },
-    ListPendingInteractions {
-        session_id: SessionId,
     },
 }
 ```
@@ -1137,15 +1169,19 @@ pub struct SessionForkProvenanceView {
 
 non-fork Session的`GetSessionForkProvenance`返回`None`；fork child返回durable provenance。该query不重新判断source当前是否loaded，也不根据后续recording health改写`source`。
 
-History node使用Turn/Item/message语义，不向普通UI暴露raw StoredSessionEntry、recorder internals或physical recorded head。`GetHistoryTree`首版从owner一次性捕获完整compact branch topology，不内联Turn Item bodies，也不分页；它可以标注orphan root、ignored entry和replay warning，服务fork/navigation与损坏历史检查，不代替聊天timeline读取，因此不需要额外history revision或generation。
+History node未来使用Turn/Item/message语义，不向普通UI暴露raw StoredSessionEntry、recorder internals或physical recorded head。`GetHistoryTree`若实现，将从owner一次性捕获完整compact branch topology，不内联Turn Item bodies，也不分页；它服务fork/navigation与损坏历史检查，不代替当前v0.1基础聊天timeline。
 
-`ListTurns`与`GetTurn`中的历史Turn只是按recorded `TurnId`分组的conversation segment。它们可以返回User/Assistant/Tool/Interaction Items、timestamps和是否存在Final AgentMessage等稳定内容事实，但不返回`Running | Completed | Interrupted | Failed` execution status。current loaded Turn状态只从`SessionSnapshot.current_turn`和实时StateEvent读取。
+未来`ListTurns`与`GetTurn`中的历史Turn只会是按recorded `TurnId`分组的conversation segment；不会虚构`Running | Completed | Interrupted | Failed` execution status。current loaded Turn状态仍只从`SessionSnapshot.current_turn`和实时StateEvent读取。
 
-History query不返回或重放Session definition/metadata/lifecycle transition timeline。`GetAgent/GetAgentRevision/GetSession/GetSessionDefinition`从各自durable entity owner读取current或exact revision；conversation JSONL只提供message、Interaction和Compaction history。
+未来history query也不返回或重放Session definition/metadata/lifecycle transition timeline；conversation JSONL只提供conversation facts。
 
-MVP只要求真正可能持续增长的`ListAgents`、`ListAgentRevisions`、`ListSessions`、`ListTurns`和Prompt/Skill/Tool/Provider/Model catalog支持分页。实际场景是长期Session包含数千个Turn，UI首次加载最近一段历史、向上滚动时继续读取；`GetTurn`、turn-scoped `ListItems`、`GetHistoryTree`和`SessionSnapshot.active_items`首版完整返回，但仍受ProtocolLimits总量约束。canonical sort固定为：Agent与Prompt/Skill/Tool/Provider按stable ID升序，Agent revisions按revision降序，Session按`created_at desc + SessionId`，historical Turn按`last_timestamp desc + TurnId`，Model按`ProviderId + ModelId`。PageCursor绑定query family、filter、sort和captured immutable query snapshot；调用方不能跨family/filter/snapshot复用或拼接page。
+v0.1当前分页面只有`ListAgents`、`ListSessions`与library-only `session_transcript`。长期Session的newest-first滚动、reverse pagination、`ListTurns`与catalog families均是post-MVP。所有现有cursor都绑定query family/filter或Session identity与captured immutable snapshot，调用方不能跨family/filter/Session复用或拼接page。
 
-### CommandSurfaceQuery
+### Post-MVP Query Families
+
+从这里开始的`CommandSurfaceQuery`、`ModelQuery`、`PromptQuery`、`SkillQuery`、`ToolQuery`、`UsageQuery`与`DiagnosticsQuery`同样是future target sketches；当前v0.1没有对应`RuntimeQuery` variant。
+
+#### CommandSurfaceQuery
 
 ```rust
 pub enum CommandSurfaceQuery {
@@ -2133,7 +2169,7 @@ Item order
 → 同一assistant entry内的Reasoning/Text/ToolCall content顺序
 ```
 
-`ItemId`、`EntryId`、`ToolCallId`、timestamp、Tool completion time和ProgressEvent arrival都不能用于排序。`SessionSnapshot.active_items`和turn-scoped `ListItems`按canonical Item order返回；Host必须保留Vec顺序。
+`ItemId`、`EntryId`、`ToolCallId`、timestamp、Tool completion time和ProgressEvent arrival都不能用于推断current Item顺序。`SessionSnapshot.active_items`按canonical Item order返回；Host必须保留Vec顺序。未来turn-scoped `ListItems`若实现也必须复用同一排序语义。
 
 新live Item的StateEvent按canonical创建顺序发布并追加到live Item list。ToolInvocation的Completed/Abandoned事件和Tool progress都只按`ItemId`更新原位置，不移动Item；因此Tool B可以先结束，展示位置仍保持call order A、B。
 
@@ -2191,7 +2227,8 @@ SessionExecutor / ActiveTurnTask
 └─ requests ConversationStorage history/fork operations
 
 MiniCoreRuntime
-├─ exposes SessionQuery::GetHistoryTree / ListTurns / ListItems
+├─ exposes library-only session_transcript for loaded basic User/Assistant history
+├─ exposes SessionQuery::GetSessionForkProvenance
 └─ exposes SessionCommand::Fork
 ```
 
@@ -2206,10 +2243,12 @@ UI不能：
 
 公开能力：
 
-- 读取完整compact history tree以及按TurnId分组的conversation/Item read model；历史查询不返回execution status，长期Session的`ListTurns`使用分页，`GetTurn`和turn-scoped `ListItems`首版完整返回；
+- v0.1在Session loaded后分页读取selected history中的基础User/Assistant文本；current Turn仍从Snapshot/Event读取；
 - 使用Genesis、UserMessage或FinalAgentMessage anchor创建Fork Session；
 - 查询fork provenance；
 - 在新Session继续future Turn。
+
+完整compact history tree、按TurnId分组的Tool/Interaction/Compaction read model、unloaded browsing、search/export与same-Session checkout均为post-MVP。
 
 同一Session原地navigation/checkout需要额外定义head mutation、active Turn conflict、compaction overlay和event语义，留到出现真实产品需求后设计。
 
@@ -2676,12 +2715,13 @@ Public interface是 contract test surface。
 - Query/Snapshot/Subscription closed error code、retry和subject vectors；
 - QueryResponse所有family使用closed QueryResult variant，domain CAS token内联在对应summary/definition，不存在generic QueryRevision；
 - session list不加载SessionExecutor；
-- GetHistoryTree由owner一次性捕获并返回自洽的完整compact branch topology，不内联Item bodies、不分页、也不返回额外history revision；
-- history tree不暴露internal entry/event；
-- 长期Session的ListTurns分页可用于首次加载最近历史和向上滚动，cursor绑定sort与revision；
-- historical ListTurns/GetTurn按TurnId分组conversation且不返回execution status；
-- history query不从conversation JSONL返回Session definition/metadata/lifecycle timeline；
-- GetTurn、turn-scoped ListItems和active_items首版不分页；
+- library-only transcript first page要求Session loaded，continuation绑定same immutable capture与Session；
+- transcript continuation在Unload后仍可读，fresh read返回SessionNotLoaded，cross-Session/consumed cursor返回StaleCursor；
+- transcript排除current Turn、Reasoning/Tool/Interaction/Compaction，只按selected path投影基础User/Assistant safe text；
+- normal shutdown/reopen/Load后只恢复recorded prefix，ModelUnavailable不阻止transcript read；
+- transcript/capture Debug不暴露正文；
+- post-MVP `GetHistoryTree/ListTurns/GetTurn/ListItems`若实现，再增加完整branch topology、historical grouping与unloaded read gates；
+- `SessionSnapshot.active_items`保持current Turn canonical Item顺序且不分页；
 - SessionSnapshot读取immutable published view，active_items保持canonical Item顺序；
 - first/new SessionSnapshot完整枚举Submit admission、Steer和FollowUp CommandId，lane-local顺序稳定且不公开prompt preview；
 - Snapshot中每个Submit entry可用Cancel(Submit)定位，每个Steer/FollowUp可用CancelQueuedMessage定位；Starting转TurnStarted后Submit CommandId消失并由current TurnId成为cancel target；
@@ -2803,7 +2843,7 @@ Public interface是 contract test surface。
 
 ## 完成检查
 
-- [x] 确定MiniCoreRuntime四类公开能力。
+- [x] 确定MiniCoreRuntime四个Wire-compatible families及明确标注的library-only/host-only seams。
 - [x] 确定Agent/Session/Turn/Item/Interaction公开identity。
 - [x] 删除公开RunId和WorkspaceId。
 - [x] 确定typed CommandOutcome和线性化点。

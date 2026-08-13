@@ -688,7 +688,7 @@ RuntimeDependencyUnavailable readiness与probe recovery纵向切片已实现：`
 
 ## M14 · Production Adapters
 
-状态：In Progress。M12 provider gate与M13 Tool/Sandbox gate均已关闭，按独立adapter交付：
+状态：v0.1范围Completed。M12 provider gate与M13 Tool/Sandbox gate均已关闭；v0.1冻结为两个direct provider adapters与五个closed/default-off production builtins。process及generic Tool ecosystem不再作为本里程碑的退出条件：
 
 - [x] OpenAI Responses direct private `ProviderAdapter`：exact `reqwest = 0.13.4`最小features、single POST、no retry/redirect/proxy、固定artifact-derived产品User-Agent、explicit endpoint、ordered request/terminal mapping、provider-native Structured strict schema、bounded fragmented SSE、metadata redaction、delivery/error和cancellation；success额外要求terminal `response.model` exact匹配pinned private API model name。36个默认离线测试通过真实`ModelGateway.generate_model_turn → ProviderAdapter`与`127.0.0.1:0/responses`路径，stable及真实Rust 1.85 all-target/focused门禁通过；
 - [x] Anthropic Messages direct private `ProviderAdapter`：复用已证明的private reqwest client/bounded drain/SSE framing，但独立拥有`/v1/messages` request、non-empty `message_delta.stop_reason` terminal、thinking/signature/redacted replay、Structured+adaptive effort、service tier、usage/cache与typed envelope/delivery mapping；`message_start.message.model`必须exact匹配pinned private API model name，start stop fields接受absent或null，visible unsigned thinking truthfully保留但不回放，late signature delta仍建立exact signed artifact，`x-api-key` HeaderValue显式标记sensitive。43个默认离线测试通过真实`ModelGateway.generate_model_turn → ProviderAdapter`与`127.0.0.1:0/v1/messages`路径，stable及真实Rust 1.85 all-target/focused门禁通过；
@@ -701,11 +701,27 @@ RuntimeDependencyUnavailable readiness与probe recovery纵向切片已实现：`
 - [x] production `list_directory` builtin（[ADR 0144](adr/0144-production-list-directory-uses-bounded-capability-enumeration.md)）：closed/default-off、cwd-relative bounded direct enumeration、shared filesystem authority/revocation、opaque directory capability与owner-tracked truthful settlement；
 - [x] production `write_file` builtin（[ADR 0146](adr/0146-production-write-file-binds-capability-targets-to-session-fifo.md)）：closed/default-off；ReadWrite ceiling仍与requested access取intersection；`authorize_write`签发opaque capability target；existing/create physical key；两个owner-tracked blocking jobs与private move-only handoff；same-Session FIFO、exact-request ticket、permit through Settling；full replacement/create/no mkdir/append/atomic rename/fsync；Runtime end-to-end、ReadOnly denial与joint read/write revocation；
 - [x] production `fetch_url` builtin（[ADR 0147](adr/0147-production-fetch-url-pins-exact-https-origins-to-host-addresses.md)）：closed/default-off；Tool opt-in与origin installation分离；exact HTTPS DNS origin + 1..=8 host-pinned addresses；reject-all ambient resolver、no redirect/retry/proxy/compression；single GET、2xx-only、65,536-byte safe UTF-8 response；32种fixed selection与顺序`ask_user → read_file → list_directory → write_file → fetch_url`；Runtime config fail-closed与loopback end-to-end；
-- [ ] 其余production Tool/Sandbox adapters，每个声明并证明effective enforcement capability（filesystem read/list/write与network `fetch_url` slices已完成；process及其他未实现adapter仍待交付）；
+- Post-MVP：process及其他production Tool/Sandbox adapters；任何新增adapter仍须声明并证明effective enforcement capability，不能只有class label或裸执行fallback；
 - production tests默认只使用local mock/fake backend，真实credential/network测试必须显式opt-in；
 - adapter失败不能改变MiniCore domain truth、retry owner或ToolStartGate语义。
 
-退出条件：每个adapter独立通过contract suite，未配置credential时整个默认test suite仍可运行。当前两个provider direct adapters、stateless full-request policy、dynamic credential/catalog、ignored live smoke，以及`ask_user`、filesystem `read_file`/`list_directory`/`write_file`和network `fetch_url`均已完成；provider live evidence由ADR 0145关闭，首个mutation adapter由ADR 0146关闭，首个resource-level network adapter由ADR 0147关闭。process及其他adapters、generic ToolService/schema/hooks/full policy/approval、public Structured activation、public Tool DTO与concrete Prompt/Skill sources冻结为post-MVP，不阻塞v0.1 front-end integration。
+退出条件：v0.1 selected adapters各自通过contract suite，未配置credential时整个默认test suite仍可运行。两个provider direct adapters、stateless full-request policy、dynamic credential/catalog、ignored live smoke，以及`ask_user`、filesystem `read_file`/`list_directory`/`write_file`和network `fetch_url`均已完成；provider live evidence由ADR 0145关闭，首个mutation adapter由ADR 0146关闭，首个resource-level network adapter由ADR 0147关闭。process及其他adapters、generic ToolService/schema/hooks/full policy/approval、public Structured activation、public Tool DTO与concrete Prompt/Skill sources冻结为post-MVP。
+
+## v0.1 · Front-end Closure
+
+状态：Implementation Complete；final stable/MSRV gates与发布同步待本milestone收口。
+
+- [x] 审计外部host可构造Runtime/provider/Workspace/Agent/Session/Prompt/Submit/Cancel/Interaction所需owner values；未发现第二个constructor blocker；
+- [x] 关闭completed chat恢复缺口：`MiniCoreRuntime::session_transcript(session_id, PageRequest)`返回`Page<SessionTranscriptItem>`；
+- [x] capture由Session actor从canonical selected entries线性化，current Turn由Snapshot/Event单独展示；
+- [x] 只投影User与Assistant Text，分页按display item且只复制当前page正文；
+- [x] continuation绑定immutable capture与Session，Unload后仍可续页，fresh read要求loaded；
+- [x] normal shutdown/reopen/Load后从tolerant replay实际recorded prefix恢复；
+- [x] 不修改RuntimeQuery、Public Wire V1、capability manifest、Conversation JSONL V1或Store V1；
+- [x] [ADR 0148](adr/0148-v0-1-session-transcript-is-a-library-only-read-seam.md)冻结library-only contract与post-MVP history边界；
+- [ ] `./scripts/check.sh`与`./scripts/check-msrv.sh`通过当前closure HEAD，fetch后证明fast-forward并push。
+
+前端可依赖的v0.1闭环是：open Runtime → create/load Session → snapshot-first subscribe → submit/control/resolve Interaction → terminal refresh transcript → unload/reload或restart/load后恢复recorded prefix。独立server/CLI、Wire transcript route、unloaded/full history、process/generic Tool、public Structured与Prompt/Skill authoring生态不阻塞该闭环。
 
 ## M15 · Hardening与发布准备
 

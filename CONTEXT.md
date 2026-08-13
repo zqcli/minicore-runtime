@@ -4,6 +4,8 @@
 
 当前开发分支是`dev`。M12 Production Provider Gate（V4-P1-3）与M13 Production Tool/Sandbox Gate（V4-C0-1）均已完成；M13 acceptance HEAD为`76a33c2 docs: record M13 sandbox acceptance`。Rig 0.40.0已因真实Rust 1.85冷编译失败被拒绝进入production baseline，协议证据保留在standalone `provider-gate/` package。当前进入M14：`OpenAiResponsesProviderAdapter`与`AnthropicMessagesProviderAdapter`两个direct slices、默认离线contract suites、host-only dynamic credential/catalog installation及两个显式ignored live smoke harness均已实现；stateless full-request wire policy已由ADR 0141冻结（每次`generate_model_turn`至多调用一次`ProviderAdapter::execute`——owner validation/pre-send cancellation/`AuthMissing`在调用adapter前以typed error terminal；独立地发送零或一个HTTP POST，adapter编码/build失败或adapter级pre-send cancellation为一次execute/零POST；若发送POST则携带完整full request，显式cache/continuation为有意omission），Anthropic `provider_total_tokens`恒为`None`（provider-reported only）；2026-08-12两个real-credential public Runtime release smoke均通过，固定产品User-Agent、Anthropic unsigned thinking与omitted start-stop字段由ADR 0145冻结；production Tool/Sandbox adapters中，`read_file`/`list_directory`/`write_file` filesystem slices已由ADR 0143/0144/0146完成，exact-origin/pinned-address `fetch_url` network slice已由ADR 0147完成；process、generic ToolService/schema/hooks/完整policy/approval及其他未实现adapter冻结为post-MVP。换机后执行`git switch dev && git pull --ff-only origin dev`，再用`git status --short --branch`确认工作树。与本任务无关的`stash@{0}: On refactor/async-loop-eventual-session-log: wip: paused bounded JSON implementation before dev merge`仍保留，不要自动apply/drop。
 
+v0.1前端闭环审计已完成：此前唯一真实blocker是completed User/Assistant conversation在terminal、重连与cold load后没有public read seam。`c99ccf7 feat: expose paged session transcripts`与[ADR 0148](docs/adr/0148-v0-1-session-transcript-is-a-library-only-read-seam.md)已新增library-only `MiniCoreRuntime::session_transcript`：first page要求Session loaded；Session actor从canonical selected history捕获immutable entry Arcs；current Turn仍由Snapshot/Event展示；continuation绑定same capture且Unload后仍可读；restart后重新Load可恢复实际recorded prefix。Public Wire V1、capability manifest、Conversation JSONL V1与Store V1均未改变。当前剩余工作是v0.1文档/门禁/发布收口，不再扩张process、generic Tool、Structured或Prompt/Skill authoring生态。
+
 M12 checkpoint series：
 
 - `30effd5 docs: align provider retry and concurrency rules`；
@@ -45,10 +47,10 @@ M13 Production Tool/Sandbox Gate（V4-C0-1）已由ADR 0140关闭：closed四类
 可嵌入CLI、TUI、GUI可信宿主的原生Agent harness runtime core。负责Session、async Turn执行、Prompt、Tool、Skill、ModelGateway、Runtime协议、观察事件和best-effort recording。
 
 **MiniCoreRuntime**：
-下游host唯一顶层门面，通过`dispatch / query / snapshot / subscribe`提供能力。内部拥有PromptService、ToolService、SkillService、ModelGateway和LoadedSessionExecutors，不保存UI selected Session。
+下游host唯一顶层门面。`dispatch / query / snapshot / subscribe`是Wire-compatible transport families；Rust embedding另可调用library-only `session_transcript`与host-only lifecycle/security seams。内部拥有PromptService、ToolService、SkillService、ModelGateway和LoadedSessionExecutors，不保存UI selected Session。
 
 **Runtime Interface**：
-由RuntimeCommand/CommandResponse、RuntimeQuery/QueryResponse、RuntimeSnapshot/SessionSnapshot和StateEvent/ProgressEvent组成的transport-neutral interface。
+由RuntimeCommand/CommandResponse、RuntimeQuery/QueryResponse、RuntimeSnapshot/SessionSnapshot和StateEvent/ProgressEvent组成的transport-neutral interface；ADR 0148 transcript是并列的library-only read seam，不属于Wire V1 RuntimeQuery。
 
 **Wire Schema**：
 public/storage representation唯一owner。v1固定camelCase fields、snake_case variants、adjacent `type/data`、typed IDs/revisions、Timestamp/Duration/Money/path/cursor、ProtocolLimits、canonical BoundedJson和bounded scanner；不拥有domain business semantics。
