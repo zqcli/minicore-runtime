@@ -79,9 +79,10 @@ use crate::workspace::{AuthorizedWorkspaceReadDirectory, WorkspaceToolContext};
 use super::{
     ToolAbandonReason, ToolCancellationObserver, ToolCapabilityClass, ToolDefinition,
     ToolExecutionMode, ToolExecutionPlan, ToolExecutionRequest, ToolExecutionResult,
-    ToolExecutionStart, ToolPermissionSet, ToolResultContent, ToolResultDisposition,
-    ToolSandboxContract, ToolSet, ToolSetInner, ToolSpec,
+    ToolExecutionStart, ToolPermissionSet, ToolResultContent, ToolResultDisposition, ToolSpec,
 };
+#[cfg(test)]
+use super::{ToolSandboxContract, ToolSet, ToolSetInner};
 
 /// The exact production builtin ToolName.  `pub(super)` because the composed production
 /// ToolSet routes exactly this frozen name.
@@ -150,7 +151,7 @@ const LIST_DIRECTORY_SCHEMA: &str = r#"{
 }"#;
 
 /// The exact frozen production definition/spec pair: the single source shared by the
-/// standalone builtin ToolSet and the composed production ToolSet, so the disclosed
+/// focused-test standalone ToolSet and the composed production ToolSet, so the disclosed
 /// definition and spec are byte-identical in both selections.
 pub(super) fn definition() -> ToolDefinition {
     ToolDefinition {
@@ -169,16 +170,16 @@ pub(super) fn definition() -> ToolDefinition {
     }
 }
 
-/// The outer ToolSet sandbox contract of the list_directory builtin: available exactly for
-/// `FilesystemRead`.  The composed production ToolSet keeps this exact contract, so the
-/// list_directory route's Execute plan is admitted exactly once against the same ceiling.
+/// The focused-test sandbox contract of the list_directory builtin: available exactly for
+/// `FilesystemRead`, matching the composed production ToolSet's admission ceiling.
+#[cfg(test)]
 pub(super) fn sandbox() -> ToolSandboxContract {
     ToolSandboxContract::available([ToolCapabilityClass::FilesystemRead])
 }
 
-/// Builds the exact immutable production `list_directory` ToolSet: one definition, one
-/// matching spec, the builtin planner pinned to the exact captured Workspace tool context
-/// and task context, and the available sandbox contract enforcing exactly `FilesystemRead`.
+/// Builds the focused-test standalone `list_directory` ToolSet from the same definition and
+/// planner the closed production composer uses.
+#[cfg(test)]
 pub(super) fn build_tool_set(
     workspace: WorkspaceToolContext,
     task_context: RuntimeTaskContext,
