@@ -1461,38 +1461,6 @@ impl ToolSet {
         ask_user::build_tool_set()
     }
 
-    /// The production opt-in read_file builtin ToolSet: exactly one immutable `read_file`
-    /// Tool with its closed schema, its `FilesystemRead` planner, and the available
-    /// `FilesystemRead` sandbox contract, pinned to the exact captured Workspace tool
-    /// context and the exact Runtime task context.  `open` selects exactly one ToolSet and
-    /// passes it through the existing residency capture; the default Runtime ToolSet stays
-    /// empty.
-    ///
-    /// Focused/module tests keep using this method; production selection and composition use
-    /// [`ProductionToolConfig`].
-    pub(crate) fn read_file_builtin(
-        workspace: WorkspaceToolContext,
-        task_context: RuntimeTaskContext,
-    ) -> Arc<Self> {
-        read_file::build_tool_set(workspace, task_context)
-    }
-
-    /// The production opt-in list_directory builtin ToolSet: exactly one immutable
-    /// `list_directory` Tool with its closed schema, its `FilesystemRead` planner, and the
-    /// available `FilesystemRead` sandbox contract, pinned to the exact captured Workspace
-    /// tool context and the exact Runtime task context.  `open` selects exactly one ToolSet
-    /// and passes it through the existing residency capture; the default Runtime ToolSet
-    /// stays empty.
-    ///
-    /// Focused/module tests keep using this method; production selection and composition use
-    /// [`ProductionToolConfig`].
-    pub(crate) fn list_directory_builtin(
-        workspace: WorkspaceToolContext,
-        task_context: RuntimeTaskContext,
-    ) -> Arc<Self> {
-        list_directory::build_tool_set(workspace, task_context)
-    }
-
     /// The production opt-in write_file builtin ToolSet: exactly one immutable
     /// `write_file` Tool with its closed schema, its `FilesystemWrite` planner, and the
     /// available `FilesystemWrite` sandbox contract, pinned to the exact captured
@@ -1509,18 +1477,6 @@ impl ToolSet {
         file_mutation_queue: Arc<SessionFileMutationQueue>,
     ) -> Arc<Self> {
         write_file::build_tool_set(workspace, task_context, file_mutation_queue)
-    }
-
-    /// The production opt-in fetch_url builtin ToolSet: exactly one immutable
-    /// `fetch_url` Tool with its closed schema, its `Network` planner, and the available
-    /// `Network` sandbox contract, pinned to the exact immutable per-origin authority
-    /// materialized at `open`.  `open` selects exactly one ToolSet and passes it through
-    /// the existing residency capture; the default Runtime ToolSet stays empty.
-    ///
-    /// Focused/module tests use this method; production selection and composition use
-    /// [`ProductionToolConfig`].
-    pub(crate) fn fetch_url_builtin(resources: Arc<FetchUrlResources>) -> Arc<Self> {
-        fetch_url::build_tool_set(resources)
     }
 
     #[cfg(test)]

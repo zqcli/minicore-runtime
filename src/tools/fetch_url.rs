@@ -73,9 +73,10 @@ use crate::wire::lexical::validate_safe_text;
 use super::{
     ToolAbandonReason, ToolCancellationObserver, ToolCapabilityClass, ToolDefinition,
     ToolExecutionMode, ToolExecutionPlan, ToolExecutionRequest, ToolExecutionResult,
-    ToolExecutionStart, ToolPermissionSet, ToolResultContent, ToolResultDisposition,
-    ToolSandboxContract, ToolSet, ToolSetInner, ToolSpec,
+    ToolExecutionStart, ToolPermissionSet, ToolResultContent, ToolResultDisposition, ToolSpec,
 };
+#[cfg(test)]
+use super::{ToolSandboxContract, ToolSet, ToolSetInner};
 
 /// Maximum origin input bytes (ADR 0147 decision 3).
 const MAX_ORIGIN_TEXT_BYTES: usize = 2048;
@@ -693,7 +694,7 @@ const FETCH_URL_SCHEMA: &str = r#"{
 }"#;
 
 /// The exact frozen production definition/spec pair: the single source shared by the
-/// standalone builtin ToolSet and the composed production ToolSet, so the disclosed
+/// focused-test standalone ToolSet and the composed production ToolSet, so the disclosed
 /// definition and spec are byte-identical in both selections.
 pub(super) fn definition() -> ToolDefinition {
     ToolDefinition {
@@ -712,16 +713,16 @@ pub(super) fn definition() -> ToolDefinition {
     }
 }
 
-/// The outer ToolSet sandbox contract of the fetch_url builtin: available exactly for
-/// `Network`.  The composed production ToolSet keeps this exact contract, so the
-/// fetch_url route's Execute plan is admitted exactly once against the same ceiling.
+/// The focused-test sandbox contract of the fetch_url builtin: available exactly for
+/// `Network`, matching the composed production ToolSet's admission ceiling.
+#[cfg(test)]
 pub(super) fn sandbox() -> ToolSandboxContract {
     ToolSandboxContract::available([ToolCapabilityClass::Network])
 }
 
-/// Builds the exact immutable production `fetch_url` ToolSet: one definition, one
-/// matching spec, the builtin planner pinned to the exact immutable per-origin
-/// authority, and the available sandbox contract enforcing exactly `Network`.
+/// Builds the focused-test standalone `fetch_url` ToolSet from the same definition and
+/// planner the closed production composer uses.
+#[cfg(test)]
 pub(super) fn build_tool_set(resources: Arc<FetchUrlResources>) -> Arc<ToolSet> {
     let definition = definition();
     let specs: Arc<[ToolSpec]> = Arc::from([definition.spec.clone()]);
