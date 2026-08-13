@@ -60,6 +60,7 @@ use crate::session_residency::{
     SessionResidencySubscriptionError, SessionResidencyUnloadError, SessionResidencyUnloadOutcome,
     SessionResidencyWorkspaceDefinitionError, SessionResidencyWorkspaceReloadError,
 };
+use crate::tools::{FetchUrlOrigin, FetchUrlResources, FetchUrlResourcesError};
 use crate::wire::{
     PageCursor, ProtocolLimits, SessionDefinitionRevision, SessionId, SessionMetadataRevision,
     Timestamp, WorkspaceRevision,
@@ -92,6 +93,14 @@ pub struct MiniCoreRuntimeConfig {
     read_file_tool: bool,
     list_directory_tool: bool,
     write_file_tool: bool,
+    fetch_url_tool: bool,
+    fetch_url_origins: Vec<FetchUrlOrigin>,
+    /// Test-only injected immutable fetch_url authority (ADR 0147 decision 16): present
+    /// only in `#[cfg(test)]` builds and never callable from production code, so the
+    /// deterministic local HTTP Runtime e2e tests can pin the loopback seam without any
+    /// public production HTTP constructor or fallback.
+    #[cfg(test)]
+    fetch_url_test_resources: Option<Arc<FetchUrlResources>>,
 }
 
 impl MiniCoreRuntimeConfig {
@@ -105,6 +114,10 @@ impl MiniCoreRuntimeConfig {
             read_file_tool: false,
             list_directory_tool: false,
             write_file_tool: false,
+            fetch_url_tool: false,
+            fetch_url_origins: Vec::new(),
+            #[cfg(test)]
+            fetch_url_test_resources: None,
         }
     }
 
@@ -202,6 +215,54 @@ impl MiniCoreRuntimeConfig {
         self.write_file_tool = true;
         self
     }
+
+    /// Opts the Runtime into the closed production `fetch_url` builtin ToolSet.
+    ///
+    /// The default Runtime ToolSet stays empty; this opt-in is idempotent and independent of
+    /// the four filesystem/ask opt-ins.  It selects the builtin only: the network authority
+    /// itself is installed separately with [`Self::with_fetch_url_origin`], and a selected
+    /// tool with zero installed origins fails `open` with
+    /// `RuntimeInitializationError::InvalidConfiguration` before any Tool disclosure.
+    /// `open` materializes the immutable per-origin authority exactly once and captures it
+    /// into the frozen production Tool config; origins installed without this opt-in are
+    /// never materialized and never disclosed.
+    pub fn with_fetch_url_tool(mut self) -> Self {
+        self.fetch_url_tool = true;
+        self
+    }
+
+    /// Installs one validated exact HTTPS origin plus its host-pinned addresses as part of
+    /// the Runtime's immutable `fetch_url` authority (ADR 0147 decision 3).
+    ///
+    /// The origin is already fully validated by the pure `FetchUrlOrigin::new`
+    /// constructor (exact `https` DNS-host URL, path exactly `/`, no userinfo/query/
+    /// fragment, 1..=8 port-matching addresses); this method only installs it.  It
+    /// independently opts nothing in: with the tool opt-in off, `open` does not materialize
+    /// any client and the Tool stays undisclosed, so duplicate unselected origins never
+    /// fail.  When the tool opt-in is on, `open` materializes the origin set exactly once
+    /// and duplicate canonical origins fail `open` with
+    /// `RuntimeInitializationError::InvalidConfiguration`.
+    pub fn with_fetch_url_origin(mut self, origin: FetchUrlOrigin) -> Self {
+        self.fetch_url_origins.push(origin);
+        self
+    }
+
+    /// Test-only injection of the immutable loopback fetch_url authority (ADR 0147
+    /// decision 16), present only in `#[cfg(test)]` builds: the deterministic local HTTP
+    /// Runtime e2e tests pin `FetchUrlResources::loopback` into the config without any
+    /// public production HTTP constructor or fallback.  The injected resources replace the
+    /// installed origins only when the tool opt-in is also on (a selected-with-test-
+    /// resources config still requires `with_fetch_url_tool`); with the tool off they are
+    /// never materialized and the Tool stays undisclosed.  Production builds have no such
+    /// entry point.
+    #[cfg(test)]
+    pub(crate) fn with_fetch_url_test_resources(
+        mut self,
+        resources: Arc<FetchUrlResources>,
+    ) -> Self {
+        self.fetch_url_test_resources = Some(resources);
+        self
+    }
 }
 
 impl fmt::Debug for MiniCoreRuntimeConfig {
@@ -252,6 +313,42 @@ impl fmt::Display for RuntimeInitializationError {
 
 impl Error for RuntimeInitializationError {}
 
+/// Settles the immutable `fetch_url` authority for one `open` (ADR 0147 decisions 2 and
+/// 15): `None` when the tool opt-in is off (origins are never materialized, the Tool stays
+/// undisclosed), otherwise the authority materialized exactly once — the test-only
+/// injected loopback authority in `#[cfg(test)]` builds, or the installed origin set.
+/// Zero origins with the tool selected fail closed as `InvalidConfiguration` before any
+/// Tool disclosure; duplicate canonical origins fail closed as `InvalidConfiguration`;
+/// a pinned-client build failure is `RuntimeDependencyUnavailable`.  Pure materialization:
+/// no environment, home, or network read happens here.
+fn fetch_url_resources_for_open(
+    config: &MiniCoreRuntimeConfig,
+) -> Result<Option<Arc<FetchUrlResources>>, RuntimeInitializationError> {
+    if !config.fetch_url_tool {
+        return Ok(None);
+    }
+    #[cfg(test)]
+    if let Some(resources) = &config.fetch_url_test_resources {
+        return Ok(Some(Arc::clone(resources)));
+    }
+    if config.fetch_url_origins.is_empty() {
+        return Err(RuntimeInitializationError::InvalidConfiguration);
+    }
+    match FetchUrlResources::materialize(config.fetch_url_origins.clone()) {
+        Ok(resources) => Ok(Some(Arc::new(resources))),
+        Err(FetchUrlResourcesError::DuplicateOrigin) => {
+            Err(RuntimeInitializationError::InvalidConfiguration)
+        }
+        Err(FetchUrlResourcesError::ClientBuild) => {
+            Err(RuntimeInitializationError::RuntimeDependencyUnavailable)
+        }
+        #[cfg(test)]
+        Err(FetchUrlResourcesError::InvalidTestAuthority) => {
+            unreachable!("materialize never returns the test-only loopback-seam rejection")
+        }
+    }
+}
+
 /// The host lifecycle facade for the currently supported Store V1 runtime foundation.
 pub struct MiniCoreRuntime {
     inner: Arc<RuntimeInner>,
@@ -295,6 +392,17 @@ impl MiniCoreRuntime {
             return Err(RuntimeInitializationError::InvalidConfiguration);
         }
         let unload_grace = config.unload_grace;
+        // The fetch_url network authority is settled exactly once at `open` (ADR 0147
+        // decisions 2 and 15), before any Tool disclosure: the tool opt-in with zero
+        // installed origins fails closed as InvalidConfiguration; the selected origin set
+        // is materialized exactly once (duplicate canonical origins fail closed as
+        // InvalidConfiguration, a pinned-client build failure is a runtime dependency
+        // failure); origins installed without the tool opt-in are never materialized, so
+        // the Runtime ToolSet keeps its existing selection and duplicate unselected
+        // origins cannot fail because no authority is consumed.  No environment, home,
+        // or network read happens here: materialization only builds the locked-down
+        // clients for the host-pinned addresses.
+        let fetch_url_resources = fetch_url_resources_for_open(&config)?;
         let task_context = RuntimeTaskContext::new(handle)
             .await
             .map_err(|_| RuntimeInitializationError::RuntimeDependencyUnavailable)?;
@@ -394,16 +502,19 @@ impl MiniCoreRuntime {
             (Arc::new(WorkspaceResolver::new(task_context.clone())), None)
         };
         // The production Tool config is frozen exactly once at `open`: the four closed host
-        // opt-ins (ask_user, read_file, list_directory, write_file) are captured in one
-        // immutable config and passed through the residency start.  Nothing is materialized
-        // here — each admission materializes its ToolSet against the exact captured Workspace
-        // snapshot, so no single static ToolSet is selected when a workspace builtin is
-        // enabled and the default Runtime ToolSet stays empty.
+        // opt-ins (ask_user, read_file, list_directory, write_file) and the settled fetch_url
+        // authority (materialized exactly once above, present exactly when the fetch_url
+        // opt-in is on) are captured in one immutable config and passed through the residency
+        // start.  Nothing is materialized here — each admission materializes its ToolSet
+        // against the exact captured Workspace snapshot, so no single static ToolSet is
+        // selected when a workspace builtin is enabled and the default Runtime ToolSet stays
+        // empty.
         let tool_config = crate::tools::ProductionToolConfig::new(
             config.ask_user_tool,
             config.read_file_tool,
             config.list_directory_tool,
             config.write_file_tool,
+            fetch_url_resources,
         );
         let session_residency = match SessionResidencyRegistry::start_with_turn_resources_and_production_tools_and_compaction_and_unload_grace(
             task_context.clone(),
@@ -4204,11 +4315,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use std::fs;
     use std::future::{Future, poll_fn};
+    use std::net::SocketAddr;
     use std::num::{NonZeroU32, NonZeroU64};
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
 
     use tokio::runtime::Handle;
     use tokio::sync::Notify;
@@ -4254,7 +4367,10 @@ mod tests {
         SessionResidencyInteractionError, SessionResidencyLifecycleError,
         SessionResidencyLoadError, SessionResidencyLoadOutcome, SessionResidencyUnloadOutcome,
     };
-    use crate::tools::{ToolApprovalDecisionInput, UserQuestionAnswer, UserQuestionFieldAnswer};
+    use crate::tools::{
+        FetchUrlOrigin, FetchUrlResources, ToolApprovalDecisionInput, UserQuestionAnswer,
+        UserQuestionFieldAnswer,
+    };
     use crate::turn_item_interaction::InteractionResolutionInput;
     use crate::wire::conversation_jsonl::ConversationLineCodec;
     use crate::wire::{
@@ -7334,36 +7450,103 @@ mod tests {
         // The frozen production Tool config discloses exactly the opted builtins once: the
         // default stays empty, each single opt-in discloses its one builtin, and every
         // combined opt-in discloses exactly the fixed order ask_user then read_file then
-        // list_directory then write_file (never twice, never any unopted builtin, never
-        // reordered) across the full closed sixteen-selection surface.
-        for (ask_user, read_file, list_directory, write_file, expected_names) in [
-            (false, false, false, false, Vec::<&str>::new()),
-            (true, false, false, false, vec!["ask_user"]),
-            (false, true, false, false, vec!["read_file"]),
-            (false, false, true, false, vec!["list_directory"]),
-            (false, false, false, true, vec!["write_file"]),
-            (true, true, false, false, vec!["ask_user", "read_file"]),
-            (true, false, true, false, vec!["ask_user", "list_directory"]),
-            (true, false, false, true, vec!["ask_user", "write_file"]),
+        // list_directory then write_file then fetch_url (never twice, never any unopted
+        // builtin, never reordered) across the full closed thirty-two-selection surface.
+        // The fetch_url selections carry the test-only loopback authority (the disclosure
+        // never connects, so the injected resources only pin the Tool's immutable
+        // authority), exactly like a production origin set materialized once at `open`.
+        for (ask_user, read_file, list_directory, write_file, fetch_url, expected_names) in [
+            (false, false, false, false, false, Vec::<&str>::new()),
+            (true, false, false, false, false, vec!["ask_user"]),
+            (false, true, false, false, false, vec!["read_file"]),
+            (false, false, true, false, false, vec!["list_directory"]),
+            (false, false, false, true, false, vec!["write_file"]),
+            (false, false, false, false, true, vec!["fetch_url"]),
+            (
+                true,
+                true,
+                false,
+                false,
+                false,
+                vec!["ask_user", "read_file"],
+            ),
+            (
+                true,
+                false,
+                true,
+                false,
+                false,
+                vec!["ask_user", "list_directory"],
+            ),
+            (
+                true,
+                false,
+                false,
+                true,
+                false,
+                vec!["ask_user", "write_file"],
+            ),
+            (
+                true,
+                false,
+                false,
+                false,
+                true,
+                vec!["ask_user", "fetch_url"],
+            ),
             (
                 false,
                 true,
                 true,
+                false,
                 false,
                 vec!["read_file", "list_directory"],
             ),
-            (false, true, false, true, vec!["read_file", "write_file"]),
+            (
+                false,
+                true,
+                false,
+                true,
+                false,
+                vec!["read_file", "write_file"],
+            ),
+            (
+                false,
+                true,
+                false,
+                false,
+                true,
+                vec!["read_file", "fetch_url"],
+            ),
             (
                 false,
                 false,
                 true,
                 true,
+                false,
                 vec!["list_directory", "write_file"],
+            ),
+            (
+                false,
+                false,
+                true,
+                false,
+                true,
+                vec!["list_directory", "fetch_url"],
+            ),
+            (
+                false,
+                false,
+                false,
+                true,
+                true,
+                vec!["write_file", "fetch_url"],
             ),
             (
                 true,
                 true,
                 true,
+                false,
                 false,
                 vec!["ask_user", "read_file", "list_directory"],
             ),
@@ -7372,28 +7555,126 @@ mod tests {
                 true,
                 false,
                 true,
+                false,
                 vec!["ask_user", "read_file", "write_file"],
             ),
             (
                 true,
+                true,
+                false,
+                false,
+                true,
+                vec!["ask_user", "read_file", "fetch_url"],
+            ),
+            (
+                true,
                 false,
                 true,
                 true,
+                false,
                 vec!["ask_user", "list_directory", "write_file"],
             ),
             (
+                true,
+                false,
+                true,
+                false,
+                true,
+                vec!["ask_user", "list_directory", "fetch_url"],
+            ),
+            (
+                true,
+                false,
+                false,
+                true,
+                true,
+                vec!["ask_user", "write_file", "fetch_url"],
+            ),
+            (
                 false,
                 true,
                 true,
                 true,
+                false,
                 vec!["read_file", "list_directory", "write_file"],
+            ),
+            (
+                false,
+                true,
+                true,
+                false,
+                true,
+                vec!["read_file", "list_directory", "fetch_url"],
+            ),
+            (
+                false,
+                true,
+                false,
+                true,
+                true,
+                vec!["read_file", "write_file", "fetch_url"],
+            ),
+            (
+                false,
+                false,
+                true,
+                true,
+                true,
+                vec!["list_directory", "write_file", "fetch_url"],
             ),
             (
                 true,
                 true,
                 true,
                 true,
+                false,
                 vec!["ask_user", "read_file", "list_directory", "write_file"],
+            ),
+            (
+                true,
+                true,
+                true,
+                false,
+                true,
+                vec!["ask_user", "read_file", "list_directory", "fetch_url"],
+            ),
+            (
+                true,
+                true,
+                false,
+                true,
+                true,
+                vec!["ask_user", "read_file", "write_file", "fetch_url"],
+            ),
+            (
+                true,
+                false,
+                true,
+                true,
+                true,
+                vec!["ask_user", "list_directory", "write_file", "fetch_url"],
+            ),
+            (
+                false,
+                true,
+                true,
+                true,
+                true,
+                vec!["read_file", "list_directory", "write_file", "fetch_url"],
+            ),
+            (
+                true,
+                true,
+                true,
+                true,
+                true,
+                vec![
+                    "ask_user",
+                    "read_file",
+                    "list_directory",
+                    "write_file",
+                    "fetch_url",
+                ],
             ),
         ] {
             let root = TempRoot::new();
@@ -7411,6 +7692,12 @@ mod tests {
             }
             if write_file {
                 config = config.with_write_file_tool().with_write_file_tool();
+            }
+            if fetch_url {
+                config = config
+                    .with_fetch_url_tool()
+                    .with_fetch_url_tool()
+                    .with_fetch_url_test_resources(loopback_fetch_url_resources());
             }
             let runtime =
                 MiniCoreRuntime::open_with_model_fixture(config, Handle::current(), &model)
@@ -7473,7 +7760,7 @@ mod tests {
             assert_eq!(requests.len(), 1);
             let tools = requests[0].input().tools();
             // The exact fixed disclosure order, never sorted: ask_user, read_file,
-            // list_directory, write_file in that sequence.
+            // list_directory, write_file, fetch_url in that sequence.
             let disclosed = tools
                 .iter()
                 .map(|tool| tool.name().as_str())
@@ -7509,8 +7796,396 @@ mod tests {
                     .expect("the write_file opt-in discloses its builtin exactly once");
                 assert_eq!(write_file_tool.input_schema(), &schema);
             }
+            if fetch_url {
+                let schema: crate::wire::BoundedJsonSchema = r#"{"type":"object","properties":{"url":{"type":"string","maxLength":4096}},"required":["url"],"additionalProperties":false}"#
+                    .parse()
+                    .expect("the frozen fetch_url schema is valid");
+                let fetch_url_tool = tools
+                    .iter()
+                    .find(|tool| tool.name().as_str() == "fetch_url")
+                    .expect("the fetch_url opt-in discloses its builtin exactly once");
+                assert_eq!(fetch_url_tool.input_schema(), &schema);
+            }
             runtime.shutdown().await;
         }
+    }
+
+    /// The canonical test hostname of the loopback fetch_url authority (ADR 0147 decision
+    /// 16): one DNS test host pinned to a numeric loopback address, exactly like the
+    /// Tools slice's focused tests.
+    const FETCH_URL_LOOPBACK_HOST: &str = "fetch-url.loopback.test";
+
+    /// The test-only loopback fetch_url authority (ADR 0147 decision 16) bound to one
+    /// ephemeral loopback address: the disclosure tests materialize it but never connect,
+    /// while the end-to-end test serves its own live listener on the exact same address.
+    fn loopback_fetch_url_resources() -> Arc<FetchUrlResources> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("an ephemeral loopback address binds for the test-only authority");
+        let addr = listener.local_addr().expect("the bound loopback address");
+        Arc::new(
+            FetchUrlResources::loopback(FETCH_URL_LOOPBACK_HOST, addr)
+                .expect("the test-only loopback authority materializes"),
+        )
+    }
+
+    /// One validated production exact-origin config slice (ADR 0147 decision 3) for the
+    /// canonical test hostname: a pure constructor with no I/O, never connected by tests
+    /// that only assert open-time configuration behavior.
+    fn loopback_test_origin() -> FetchUrlOrigin {
+        FetchUrlOrigin::new(
+            "https://fetch-url.loopback.test/",
+            &[SocketAddr::from(([127, 0, 0, 1], 443))],
+        )
+        .expect("the loopback test origin is valid")
+    }
+
+    #[test]
+    fn runtime_config_fetch_url_tool_is_default_off_and_the_opt_in_is_idempotent_and_independent() {
+        let default = MiniCoreRuntimeConfig::new(PathBuf::from("/unused"));
+        assert!(
+            !default.fetch_url_tool,
+            "the default Runtime ToolSet stays empty"
+        );
+        let opted = default.with_fetch_url_tool();
+        assert!(opted.fetch_url_tool);
+        // The opt-in is idempotent: opting in twice keeps the exact same flag.
+        let twice = opted.with_fetch_url_tool();
+        assert!(twice.fetch_url_tool);
+        // The fetch_url opt-in is independent of ask_user, read_file, list_directory, and
+        // write_file in both directions.
+        let fetch_only = MiniCoreRuntimeConfig::new(PathBuf::from("/unused")).with_fetch_url_tool();
+        assert!(
+            !fetch_only.ask_user_tool
+                && !fetch_only.read_file_tool
+                && !fetch_only.list_directory_tool
+                && !fetch_only.write_file_tool,
+            "the fetch_url opt-in never enables any other builtin"
+        );
+        let ask_only = MiniCoreRuntimeConfig::new(PathBuf::from("/unused")).with_ask_user_tool();
+        assert!(
+            !ask_only.fetch_url_tool,
+            "the ask_user opt-in never enables fetch_url"
+        );
+        let read_only = MiniCoreRuntimeConfig::new(PathBuf::from("/unused")).with_read_file_tool();
+        assert!(
+            !read_only.fetch_url_tool,
+            "the read_file opt-in never enables fetch_url"
+        );
+        let list_only =
+            MiniCoreRuntimeConfig::new(PathBuf::from("/unused")).with_list_directory_tool();
+        assert!(
+            !list_only.fetch_url_tool,
+            "the list_directory opt-in never enables fetch_url"
+        );
+        let write_only =
+            MiniCoreRuntimeConfig::new(PathBuf::from("/unused")).with_write_file_tool();
+        assert!(
+            !write_only.fetch_url_tool,
+            "the write_file opt-in never enables fetch_url"
+        );
+        // The origin installation is an independent authority install: it never opts the
+        // tool in, and installing twice (even the exact same canonical origin) just
+        // accumulates the two installations.
+        let origin_only = MiniCoreRuntimeConfig::new(PathBuf::from("/unused"))
+            .with_fetch_url_origin(loopback_test_origin());
+        assert!(
+            !origin_only.fetch_url_tool,
+            "installing an origin never opts the tool in"
+        );
+        assert_eq!(origin_only.fetch_url_origins.len(), 1);
+        let origin_twice = origin_only.with_fetch_url_origin(loopback_test_origin());
+        assert_eq!(
+            origin_twice.fetch_url_origins.len(),
+            2,
+            "each origin installation is installed independently"
+        );
+        assert!(
+            !origin_twice.fetch_url_tool,
+            "duplicate installations never opt the tool in"
+        );
+        // A fresh default config is unaffected, and the redacted Debug shape is unchanged
+        // by the new fields — including when origins are installed.
+        let fresh = MiniCoreRuntimeConfig::new(PathBuf::from("/unused"));
+        assert!(!fresh.fetch_url_tool);
+        assert_eq!(format!("{fresh:?}"), "MiniCoreRuntimeConfig { .. }");
+        assert_eq!(format!("{origin_twice:?}"), "MiniCoreRuntimeConfig { .. }");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_open_with_fetch_url_origins_but_no_tool_opt_in_keeps_the_tool_undisclosed() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::new(vec!["final answer"]);
+        // The exact same canonical origin installed twice: with the tool opt-in off the
+        // origins are never materialized and never fail, even as duplicates, and the
+        // Runtime ToolSet keeps its existing empty selection.
+        let config = MiniCoreRuntimeConfig::new(root.path().to_owned())
+            .with_fetch_url_origin(loopback_test_origin())
+            .with_fetch_url_origin(loopback_test_origin());
+        let runtime = MiniCoreRuntime::open_with_model_fixture(config, Handle::current(), &model)
+            .await
+            .expect("unselected fetch_url origins do not fail open");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("hello").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("the ordinary Turn starts");
+        let turn_id = started_turn(&submit);
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => {
+                        panic!("unexpected frame before ordinary completion: {other:?}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the ordinary Turn completes");
+        assert!(matches!(
+            terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == turn_id
+        ));
+        let requests = model.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].input().tools().len(),
+            0,
+            "origins installed without the tool opt-in never disclose the fetch_url Tool"
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_open_with_fetch_url_tool_but_no_origin_fails_invalid_configuration() {
+        let root = TempRoot::new();
+        let error = MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_fetch_url_tool(),
+            Handle::current(),
+        )
+        .await
+        .expect_err("a selected fetch_url tool with zero installed origins fails closed");
+        assert_eq!(error, RuntimeInitializationError::InvalidConfiguration);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_open_with_duplicate_selected_fetch_url_origins_fails_invalid_configuration() {
+        let root = TempRoot::new();
+        let config = MiniCoreRuntimeConfig::new(root.path().to_owned())
+            .with_fetch_url_tool()
+            .with_fetch_url_origin(loopback_test_origin())
+            .with_fetch_url_origin(loopback_test_origin());
+        let error = MiniCoreRuntime::open(config, Handle::current())
+            .await
+            .expect_err("duplicate selected canonical origins fail closed");
+        assert_eq!(error, RuntimeInitializationError::InvalidConfiguration);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_url_tool_opt_in_fetches_a_loopback_body_and_continues_the_turn_end_to_end() {
+        use std::io::{Read, Write};
+
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        const RESPONSE_BODY: &[u8] = b"hello from the loopback server\n";
+        // One blocking loopback listener serving exactly one GET: the server thread reads
+        // the full request head, reports the request line over the channel, writes the
+        // exact response, and exits — no sleep, no yield, no long timeout.  The Turn can
+        // only complete after the body is read, so the capture is already delivered and
+        // the thread has finished its work by the time the test joins it.
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("the loopback test server binds");
+        let addr = listener.local_addr().expect("the loopback test address");
+        let (captured_sender, captured_receiver) = std::sync::mpsc::channel::<String>();
+        let server = thread::spawn(move || {
+            let (mut stream, _peer) = listener
+                .accept()
+                .expect("the one fetch_url GET is accepted");
+            let mut request = Vec::new();
+            let mut scratch = [0u8; 4096];
+            let header_end = loop {
+                if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    break position;
+                }
+                let read = stream
+                    .read(&mut scratch)
+                    .expect("the request bytes are read");
+                if read == 0 {
+                    panic!("the client closed before the request head completed");
+                }
+                request.extend_from_slice(&scratch[..read]);
+            };
+            let request_line = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .next()
+                .expect("the request line is present")
+                .to_owned();
+            captured_sender
+                .send(request_line)
+                .expect("the captured request line is reported");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 31\r\nConnection: close\r\n\r\n",
+                )
+                .expect("the response head is written");
+            stream
+                .write_all(RESPONSE_BODY)
+                .expect("the response body is written");
+        });
+
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_fetch",
+            "fetch_url",
+            &format!(
+                r#"{{"url":"http://{FETCH_URL_LOOPBACK_HOST}:{}/note.txt"}}"#,
+                addr.port()
+            ),
+            "final public answer",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned())
+                .with_fetch_url_tool()
+                .with_fetch_url_tool()
+                .with_fetch_url_test_resources(Arc::new(
+                    FetchUrlResources::loopback(FETCH_URL_LOOPBACK_HOST, addr)
+                        .expect("the loopback authority materializes"),
+                )),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the fetch_url opt-in Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+        let submit_command_id = CommandId::generate().unwrap();
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                submit_command_id,
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("fetch it").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+
+        // The one Tool round runs the production fetch_url builtin against the loopback
+        // authority pinned at `open` and the same Turn runs its final response.
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => {
+                        panic!("unexpected frame before fetch_url Turn completion: {other:?}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the fetch_url Turn completes");
+        assert_eq!(terminal.command_id(), Some(submit_command_id));
+        assert!(matches!(
+            terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == turn_id
+        ));
+        assert!(
+            terminal
+                .msg()
+                .session_snapshot()
+                .and_then(|snapshot| snapshot.usage())
+                .is_some_and(|usage| usage.model_calls() == 2)
+        );
+        assert_eq!(model.request_count(), 2);
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        // The first request discloses the exact frozen fetch_url schema.
+        assert_eq!(requests[0].input().tools().len(), 1);
+        assert_eq!(requests[0].input().tools()[0].name().as_str(), "fetch_url");
+        let schema: crate::wire::BoundedJsonSchema = r#"{"type":"object","properties":{"url":{"type":"string","maxLength":4096}},"required":["url"],"additionalProperties":false}"#
+            .parse()
+            .expect("the frozen fetch_url schema is valid");
+        assert_eq!(requests[0].input().tools()[0].input_schema(), &schema);
+        // The second request carries the exact immutable ToolResult body of the fetch: one
+        // text part with the server's exact body, untrimmed and unnormalized.
+        assert!(
+            requests[1]
+                .input()
+                .messages()
+                .iter()
+                .any(|message| matches!(
+                    message.as_ref(),
+                    ModelMessageRef::Tool {
+                        tool_call_id,
+                        content,
+                    } if tool_call_id.as_str() == "call_fetch"
+                        && content.parts().len() == 1
+                        && content.parts()[0].as_text() == "hello from the loopback server\n"
+                ))
+        );
+        // Exactly one request was served, and the loopback server thread has finished.
+        let request_line = captured_receiver
+            .recv()
+            .expect("the one fetch_url request is captured");
+        assert_eq!(request_line, "GET /note.txt HTTP/1.1");
+        server.join().expect("the loopback server thread joins");
+        runtime.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
