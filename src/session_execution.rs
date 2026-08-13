@@ -22180,6 +22180,11 @@ mod tests {
         close_loaded(loaded).await;
     }
 
+    // Unix-only: this and the other two tests below remove the old Workspace root while the
+    // loaded Workspace capability handle is still open.  Windows intentionally denies deleting
+    // an open directory (no FILE_SHARE_DELETE -> sharing violation), so the "root disappears
+    // while opened" scenarios only run on Unix.
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn canonical_noop_is_zero_resolver_io_and_stale_wins_before_noop() {
         let store = TempStore::new();
@@ -22926,6 +22931,8 @@ mod tests {
         close_loaded(loaded).await;
     }
 
+    // Unix-only: same "root disappears while the loaded handle is open" scenario as above.
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn agent_upgrade_during_running_preserves_active_turn_and_next_admission_uses_new_ref() {
         let store = TempStore::new();
@@ -23298,6 +23305,8 @@ mod tests {
         close_loaded(loaded).await;
     }
 
+    // Unix-only: same "root disappears while the loaded handle is open" scenario as above.
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn reload_workspace_ordinary_failure_preserves_old_snapshot_and_no_event_then_recovers() {
         let store = TempStore::new();

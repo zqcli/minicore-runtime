@@ -4593,8 +4593,10 @@ mod tests {
     impl Drop for TempWorkspace {
         fn drop(&mut self) {
             if self.path.exists() {
-                fs::remove_dir_all(&self.path)
-                    .expect("the temporary Workspace root is removed deterministically");
+                // Best-effort only: on Windows a capability handle may still be held by a
+                // neighbor owner that drops just after this one, so removal can fail with
+                // ERROR_SHARING_VIOLATION. Leftover dirs live in the OS temp dir.
+                let _ = fs::remove_dir_all(&self.path);
             }
         }
     }
