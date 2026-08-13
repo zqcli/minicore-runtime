@@ -2094,6 +2094,10 @@ enum DurableStateActorRequest {
     #[cfg(test)]
     ReserveAgent(TestAgentReservation),
     #[cfg(test)]
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "constructed only by Unix reservation tests")
+    )]
     ReserveSession(TestSessionReservation),
 }
 
@@ -2285,12 +2289,12 @@ enum DurableStateActorProbeDelivery {
     Rejected,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 struct TestReservationWaiter<T> {
     response: oneshot::Receiver<Result<T, TestReservationError>>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl<T> TestReservationWaiter<T> {
     async fn wait(self) -> Result<T, TestReservationError> {
         self.response
@@ -2966,7 +2970,7 @@ impl DurableStateActorHandle {
         DurableStateActorProbeWaiter { response }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn reserve_agent_with_script(
         &self,
         candidates: impl IntoIterator<Item = Result<AgentId, ()>>,
@@ -2975,7 +2979,7 @@ impl DurableStateActorHandle {
         self.reserve_agent_with_script_at_maximum(candidates, calls, AGENT_RESERVATION_ENTRY_CAP)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn reserve_agent_with_script_at_maximum(
         &self,
         candidates: impl IntoIterator<Item = Result<AgentId, ()>>,
@@ -2998,7 +3002,7 @@ impl DurableStateActorHandle {
         TestReservationWaiter { response: waiter }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn reserve_session_with_script(
         &self,
         candidates: impl IntoIterator<Item = Result<SessionId, ()>>,
@@ -3011,7 +3015,7 @@ impl DurableStateActorHandle {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn reserve_session_with_script_at_maximum(
         &self,
         candidates: impl IntoIterator<Item = Result<SessionId, ()>>,
@@ -3034,7 +3038,7 @@ impl DurableStateActorHandle {
         TestReservationWaiter { response: waiter }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn reserve_agent_with_script_at_maximum_and_cancel_ack(
         &self,
         candidates: impl IntoIterator<Item = Result<AgentId, ()>>,
@@ -3058,7 +3062,7 @@ impl DurableStateActorHandle {
         TestReservationWaiter { response: waiter }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn enqueue_test_reservation(&self, mut request: DurableStateActorRequestEnvelope) {
         if self.closing.is_cancelled() {
             request.reject_closing();
@@ -10784,7 +10788,7 @@ enum DirectorySync {
     Unsupported,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn open_root(root: PathBuf) -> Result<OpenRoot, DurableOpenError> {
     open_root_with_durable_filesystem(root, &LocalFilesystem)
 }
@@ -14228,18 +14232,21 @@ mod tests {
 
     use super::{
         AGENTS_DIRECTORY, DurableAgentDefinitionReadError, DurableConversationTargetError,
-        DurableOpenError, DurableSessionDefinitionError, DurableSessionDefinitionReadError,
-        DurableSessionHead, DurableState, FORMAT_MARKER, GENERATION_PAYLOAD_ENTRY_CAP, LOCK_FILE,
-        RESERVATIONS_DIRECTORY, RESERVATIONS_ENTRY_CAP, ROOT_ENTRY_CAP, RecoveryCaps,
-        SESSIONS_DIRECTORY, StorageGeneration, parse_agent_id_name, prove_same_target_identity,
-        read_durable_document, read_entries_bounded, recover_marked_root_with_caps,
+        DurableOpenError, DurableSessionDefinitionReadError, DurableSessionHead, DurableState,
+        FORMAT_MARKER, GENERATION_PAYLOAD_ENTRY_CAP, LOCK_FILE, RESERVATIONS_DIRECTORY,
+        RESERVATIONS_ENTRY_CAP, ROOT_ENTRY_CAP, RecoveryCaps, SESSIONS_DIRECTORY,
+        StorageGeneration, prove_same_target_identity, read_durable_document, read_entries_bounded,
+        recover_marked_root_with_caps,
     };
     use super::{
         CapturedForkConversation, DirectorySync, DurableFilesystem, ForkAnchorResolutionError,
         SessionHeader,
     };
     #[cfg(unix)]
-    use super::{classify_directory_sync, open_root, open_root_with_durable_filesystem};
+    use super::{
+        DurableSessionDefinitionError, classify_directory_sync, open_root,
+        open_root_with_durable_filesystem, parse_agent_id_name,
+    };
     use crate::agent_session_lifecycle::{
         AgentMetadataDescriptionPatch, AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind,
         SealedAgentDefinitionAttempt, SealedAgentMetadataAttempt, SealedAgentStatusAttempt,
@@ -14352,6 +14359,13 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "fault variants are constructed only by Unix tests"
+        )
+    )]
     enum CleanupFault {
         Before(CleanupOperation),
         After(CleanupOperation),
@@ -14398,6 +14412,13 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "fault variants are constructed only by Unix tests"
+        )
+    )]
     enum PublicationFault {
         Before(PublicationOperation),
         After(PublicationOperation),
@@ -14420,6 +14441,7 @@ mod tests {
     }
 
     impl ReservationBarrier {
+        #[cfg(unix)]
         fn new(
             entered: std::sync::mpsc::Sender<()>,
             release: std::sync::mpsc::Receiver<()>,
@@ -14448,6 +14470,7 @@ mod tests {
     }
 
     impl ReservationFinalReadback {
+        #[cfg(unix)]
         fn new(
             entered: std::sync::mpsc::Sender<()>,
             release: std::sync::mpsc::Receiver<()>,
@@ -14469,6 +14492,7 @@ mod tests {
     }
 
     impl CleanupFault {
+        #[cfg(unix)]
         const fn operation(self) -> CleanupOperation {
             match self {
                 Self::Before(operation) | Self::After(operation) => operation,
@@ -14523,6 +14547,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn with_reservation_faults(
             faults: impl IntoIterator<Item = super::ReservationFault>,
         ) -> Self {
@@ -14548,6 +14573,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn with_publication_faults(faults: impl IntoIterator<Item = PublicationFault>) -> Self {
             let filesystem = Self::new([]);
             *super::lock(&filesystem.publication_faults) = faults.into_iter().collect();
@@ -14558,6 +14584,7 @@ mod tests {
             self.publication_armed.store(true, Ordering::Release);
         }
 
+        #[cfg(unix)]
         fn operations(&self) -> Vec<CleanupOperation> {
             super::lock(&self.operations).clone()
         }
@@ -14566,6 +14593,7 @@ mod tests {
             super::lock(&self.publication_operations).clone()
         }
 
+        #[cfg(unix)]
         fn install_publication_operation_barrier(
             &self,
             operation: PublicationOperation,
@@ -14646,6 +14674,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn install_commit_barrier(&self, barrier: ReservationBarrier) {
             *super::lock(&self.before_commit_barrier) = Some(barrier);
         }
@@ -14657,6 +14686,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn install_reservation_barrier(&self, barrier: ReservationBarrier) {
             *super::lock(&self.before_reservation_barrier) = Some(barrier);
         }
@@ -14668,6 +14698,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn install_collision_settlement(&self, barrier: ReservationBarrier) {
             *super::lock(&self.collision_settlement) = Some(barrier);
         }
@@ -14679,10 +14710,12 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn install_final_readback(&self, gate: ReservationFinalReadback) {
             *super::lock(&self.final_readback) = Some(gate);
         }
 
+        #[cfg(unix)]
         fn close_task_owner_before_reservation_readback(&self, context: RuntimeTaskContext) {
             *super::lock(&self.close_task_owner_before_reservation_readback) = Some(context);
         }
@@ -23621,6 +23654,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     fn create_agent_both_payload_staging(root: &Path) -> PathBuf {
         create_marked_empty_store(root);
         create_valid_g1_agent(root);
@@ -30943,6 +30977,7 @@ mod tests {
         let child = SessionId::from_str(SESSION_TWO).unwrap();
         let conversation_path = session_path(root.path(), SESSION_TWO).join("conversation.jsonl");
         let conversation_before = fs::read(&conversation_path).unwrap();
+        #[cfg(unix)]
         let conversation_metadata_before = fs::symlink_metadata(&conversation_path).unwrap();
         let state = open(root.path()).await.expect("the fork store opens");
         let original_head = state.session_head(child).unwrap();
