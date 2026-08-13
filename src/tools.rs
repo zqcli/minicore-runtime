@@ -36,16 +36,20 @@ mod list_directory;
 /// contents or creating the file when its parent directory exists.
 mod write_file;
 
-/// The `fetch_url` builtin's host-authority slice (ADR 0147): the public redacted
-/// exact-origin config type and its payload-free validation error, plus the crate-private
-/// pinned client materialization and same-origin authorization seam.  The builtin's Tool
-/// definition and executor are later slices; this module deliberately discloses no Tool.
+/// The `fetch_url` builtin (ADR 0147): the public redacted exact-origin config type and
+/// its payload-free validation error, plus the crate-private pinned client
+/// materialization, same-origin authorization seam, and the closed Tool definition,
+/// planner, and owner-tracked executor.
 mod fetch_url;
 
 /// Public re-export of the minimal `fetch_url` host config surface: the validated exact
 /// origin plus pinned addresses, and its payload-free validation error.  No hostname,
 /// address, or port accessor exists on either type; Debug/Display are fully redacted.
 pub use fetch_url::{FetchUrlOrigin, FetchUrlOriginError};
+
+/// Crate-private re-export of the immutable fetch_url authority: the Runtime materializes
+/// it once at `open` and captures it into the production Tool config.
+pub(crate) use fetch_url::{FetchUrlResources, FetchUrlResourcesError};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolNameError {
@@ -1507,6 +1511,18 @@ impl ToolSet {
         write_file::build_tool_set(workspace, task_context, file_mutation_queue)
     }
 
+    /// The production opt-in fetch_url builtin ToolSet: exactly one immutable
+    /// `fetch_url` Tool with its closed schema, its `Network` planner, and the available
+    /// `Network` sandbox contract, pinned to the exact immutable per-origin authority
+    /// materialized at `open`.  `open` selects exactly one ToolSet and passes it through
+    /// the existing residency capture; the default Runtime ToolSet stays empty.
+    ///
+    /// Focused/module tests use this method; production selection and composition use
+    /// [`ProductionToolConfig`].
+    pub(crate) fn fetch_url_builtin(resources: Arc<FetchUrlResources>) -> Arc<Self> {
+        fetch_url::build_tool_set(resources)
+    }
+
     #[cfg(test)]
     pub(crate) fn with_executor(
         definitions: Vec<ToolDefinition>,
@@ -1935,17 +1951,21 @@ impl ToolSet {
     }
 }
 
-/// The frozen production Tool composition config: exactly the four closed Runtime-owned
-/// builtins (`ask_user`, `read_file`, `list_directory`, `write_file`), each independently
-/// opt-in at [`ProductionToolConfig::new`] and never changed afterwards.
+/// The frozen production Tool composition config: exactly the five closed Runtime-owned
+/// builtins (`ask_user`, `read_file`, `list_directory`, `write_file`, `fetch_url`), each
+/// independently opt-in at [`ProductionToolConfig::new`] and never changed afterwards.
 ///
-/// The config freezes its base exactly once at `new` — the empty default or the single
-/// `ask_user` builtin — and `for_workspace` composes at the module planner level.  There is
-/// no generic registry, no arbitrary merge API, no dynamic callbacks, and no name-based
-/// open-world lookup: the composed set contains exactly the four frozen names in one frozen
-/// order (`ask_user` → `read_file` → `list_directory` → `write_file`) with only the
-/// enabled members, and routes each valid call to exactly one builtin planner, while
-/// invalid/unknown names stay unavailable through the normal ToolSet lookup.
+/// The config freezes its base exactly once at `new` — the empty default, the single
+/// `ask_user` builtin, or the frozen static `fetch_url` composition (`fetch_url` alone
+/// or `ask_user` + `fetch_url`) — and `for_workspace` composes at the module planner
+/// level.  There is no generic registry, no arbitrary merge API, no dynamic callbacks,
+/// and no name-based open-world lookup: the composed set contains exactly the five
+/// frozen names in one frozen order (`ask_user` → `read_file` → `list_directory` →
+/// `write_file` → `fetch_url`) with only the enabled members, and routes each valid call
+/// to exactly one builtin planner, while invalid/unknown names stay unavailable through
+/// the normal ToolSet lookup.  The immutable per-origin network authority is captured
+/// as one `Arc` at `new` (materialized exactly once at `open`); there is no generic
+/// registry or callback seam for it.
 #[derive(Clone)]
 pub(crate) struct ProductionToolConfig {
     /// Whether the selection includes the frozen `ask_user` builtin.
@@ -1956,32 +1976,44 @@ pub(crate) struct ProductionToolConfig {
     list_directory: bool,
     /// Whether the selection includes the workspace-bound `write_file` builtin.
     write_file: bool,
-    /// The frozen base captured exactly once at `new`: the empty default or the single
-    /// `ask_user` builtin.  With no workspace-bound tool enabled, every `for_workspace`
-    /// call returns this exact same captured `Arc`.
+    /// The immutable per-origin network authority captured at `new`, present exactly
+    /// when the frozen `fetch_url` builtin is selected: the Option is the single fetch
+    /// fact (there is no pairing bool to mismatch).  Never a generic registry: the one
+    /// Arc travels unchanged into every composed planner of this config.
+    fetch_url_resources: Option<Arc<FetchUrlResources>>,
+    /// The frozen base captured exactly once at `new`: the empty default, the single
+    /// `ask_user` builtin, or the frozen static `fetch_url` composition (`fetch_url`
+    /// alone or `ask_user` + `fetch_url`).  With no workspace-bound tool enabled, every
+    /// `for_workspace` call returns this exact same captured `Arc`.
     base: Arc<ToolSet>,
 }
 
 impl ProductionToolConfig {
     /// Freezes the production selection and its base exactly once: the empty default when
-    /// `ask_user` is off, otherwise the exact `ask_user` builtin ToolSet.  The four bools
-    /// are independent and closed: exactly 16 selections exist.
+    /// nothing non-workspace is enabled, the single `ask_user` builtin when only
+    /// `ask_user` is enabled, or the frozen static `fetch_url` composition otherwise
+    /// (`fetch_url` alone or `ask_user` + `fetch_url`).  The four bools and the fetch
+    /// authority Option are independent and closed: exactly 32 selections exist.
+    ///
+    /// The fetch selection is the Option itself: the frozen `fetch_url` builtin is
+    /// selected exactly when the materialized authority is present
+    /// (`fetch_url_resources.is_some()`), so there is no pairing bool and no mismatch to
+    /// fail closed.  The Runtime passes `None` while the `fetch_url_tool` host opt-in is
+    /// off and the authority materialized exactly once at `open` otherwise.
     pub(crate) fn new(
         ask_user: bool,
         read_file: bool,
         list_directory: bool,
         write_file: bool,
+        fetch_url_resources: Option<Arc<FetchUrlResources>>,
     ) -> Self {
-        let base = if ask_user {
-            ask_user::build_tool_set()
-        } else {
-            ToolSet::empty()
-        };
+        let base = static_production_base(ask_user, fetch_url_resources.as_ref());
         Self {
             ask_user,
             read_file,
             list_directory,
             write_file,
+            fetch_url_resources,
             base,
         }
     }
@@ -1989,15 +2021,17 @@ impl ProductionToolConfig {
     /// Materializes the exact selected ToolSet for one Workspace/task context.
     ///
     /// With no workspace-bound tool (`read_file`, `list_directory`, `write_file`)
-    /// enabled, every call returns the same captured base `Arc` (the empty default or the
-    /// single `ask_user` builtin).  Otherwise the selection is materialized per admission:
-    /// one immutable composed set containing exactly the enabled members in the frozen
-    /// `ask_user` → `read_file` → `list_directory` → `write_file` order, bound to the exact
-    /// Workspace tool context and Runtime task context, with one frozen four-route planner
-    /// and the exact outer sandbox contract required by the enabled workspace routes
-    /// (`FilesystemRead`, `FilesystemWrite`, or their union).  The exact Session-local
-    /// mutation queue is captured into the composed planner and bound into every write_file
-    /// route's mutation plans.
+    /// enabled, every call returns the same captured base `Arc` (the empty default, the
+    /// single `ask_user` builtin, or the frozen static `fetch_url` composition).
+    /// Otherwise the selection is materialized per admission: one immutable composed set
+    /// containing exactly the enabled members in the frozen
+    /// `ask_user` → `read_file` → `list_directory` → `write_file` → `fetch_url` order,
+    /// bound to the exact Workspace tool context and Runtime task context, with one
+    /// frozen five-route planner and the exact outer sandbox contract required by the
+    /// enabled routes (`FilesystemRead`, `FilesystemWrite`, `Network`, or their union).
+    /// The exact Session-local mutation queue is captured into the composed planner and
+    /// bound into every write_file route's mutation plans, and the captured immutable
+    /// network authority travels unchanged into the composed fetch_url route.
     pub(crate) fn for_workspace(
         &self,
         workspace: WorkspaceToolContext,
@@ -2012,11 +2046,64 @@ impl ProductionToolConfig {
             self.read_file,
             self.list_directory,
             self.write_file,
+            self.fetch_url_resources.as_ref(),
             workspace,
             task_context,
             file_mutation_queue,
         )
     }
+}
+
+/// The frozen static base of one production selection (ADR 0147 decision 15): exactly
+/// the enabled non-workspace builtins (`ask_user`, `fetch_url`) in the frozen order,
+/// materialized exactly once at [`ProductionToolConfig::new`] and returned unchanged
+/// (the same `Arc`) by every `for_workspace` call when no workspace-bound builtin is
+/// enabled.  The immutable per-origin authority is captured into the frozen planner, so
+/// `fetch_url`-only and `ask_user` + `fetch_url` selections reuse the same authority
+/// across every materialization.  No generic registry or callback: the closed two-name
+/// composition is the whole static surface.  The fetch composition exists exactly when
+/// the authority is present: the Option is the single fetch fact, so there is no pairing
+/// bool to mismatch.
+fn static_production_base(
+    ask_user: bool,
+    fetch_url_resources: Option<&Arc<FetchUrlResources>>,
+) -> Arc<ToolSet> {
+    let Some(resources) = fetch_url_resources else {
+        return if ask_user {
+            ask_user::build_tool_set()
+        } else {
+            ToolSet::empty()
+        };
+    };
+    let mut definitions: Vec<ToolDefinition> = Vec::new();
+    if ask_user {
+        definitions.push(ask_user::definition());
+    }
+    definitions.push(fetch_url::definition());
+    let specs: Arc<[ToolSpec]> = definitions
+        .iter()
+        .map(|definition| definition.spec.clone())
+        .collect();
+    let planner: Arc<ToolPlanner> = Arc::new({
+        let resources = Arc::clone(resources);
+        move |request| match request.call().name().as_str() {
+            ask_user::ASK_USER_NAME => ask_user::plan(request),
+            fetch_url::FETCH_URL_NAME => fetch_url::plan(&resources, request),
+            // The normal ToolSet lookup invokes the planner only for a name present in
+            // this set's definitions, which are exactly the enabled frozen names above.
+            _ => unreachable!(
+                "the frozen static base routes exactly the enabled non-workspace builtin names"
+            ),
+        }
+    });
+    Arc::new(ToolSet {
+        inner: Arc::new(ToolSetInner {
+            definitions: definitions.into(),
+            specs,
+            planner: Some(planner),
+            sandbox: ToolSandboxContract::available([ToolCapabilityClass::Network]),
+        }),
+    })
 }
 
 /// The closed Tool resource carrier that distinguishes a test-injected immutable [`ToolSet`]
@@ -2056,27 +2143,38 @@ impl TurnToolResources {
 }
 
 /// The frozen closed composer for one production selection: exactly the enabled builtin
-/// definitions/specs pushed by bool in one deterministic order (`ask_user` → `read_file` →
-/// `list_directory` → `write_file`, only enabled members, never a duplicate), one frozen
-/// planner that routes exactly the four frozen names to exactly one builtin planner each,
-/// and the outer sandbox contract that is the exact union required by the enabled workspace
-/// routes: `FilesystemRead` for read/list only, `FilesystemWrite` for write only, and their
-/// union when any read/list route joins the write route (the caller composes only when at
-/// least one workspace-bound tool is enabled).
+/// definitions/specs pushed in one deterministic order (`ask_user` → `read_file` →
+/// `list_directory` → `write_file` → `fetch_url`, only enabled members, never a
+/// duplicate), one frozen planner that routes exactly the five frozen names to exactly
+/// one builtin planner each, and the outer sandbox contract that is the exact union
+/// required by the enabled routes: `FilesystemRead` for read/list only, `FilesystemWrite`
+/// for write only, `Network` for fetch only, and the union of the enabled classes when
+/// routes join (the caller composes only when at least one workspace-bound tool is
+/// enabled; the frozen static base owns the non-workspace-only selections).
 ///
 /// The composition happens at the module planner level, so each enabled workspace-bound
 /// route is admitted exactly once against the outer contract (never twice), while the
 /// ask_user route never touches admission at all: its plans are UserQuestion/PreExecution
-/// shapes carrying no Execute permissions.
+/// shapes carrying no Execute permissions.  The fetch route is decided by the authority
+/// Option alone (`fetch_url_resources.is_some()`): there is no pairing bool, so the
+/// definition, the sandbox `Network` class, and the composed planner all follow the one
+/// fact.  The immutable per-origin network authority is captured into the composed
+/// planner unchanged.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one frozen selection config plus the exact Workspace/task/queue/resources bindings of one admission"
+)]
 fn composed_production_tool_set(
     ask_user: bool,
     read_file: bool,
     list_directory: bool,
     write_file: bool,
+    fetch_url_resources: Option<&Arc<FetchUrlResources>>,
     workspace: WorkspaceToolContext,
     task_context: RuntimeTaskContext,
     file_mutation_queue: Arc<SessionFileMutationQueue>,
 ) -> Arc<ToolSet> {
+    let fetch_url = fetch_url_resources.is_some();
     let mut definitions: Vec<ToolDefinition> = Vec::new();
     if ask_user {
         definitions.push(ask_user::definition());
@@ -2090,47 +2188,78 @@ fn composed_production_tool_set(
     if write_file {
         definitions.push(write_file::definition());
     }
+    if fetch_url {
+        definitions.push(fetch_url::definition());
+    }
     let specs: Arc<[ToolSpec]> = definitions
         .iter()
         .map(|definition| definition.spec.clone())
         .collect();
-    let sandbox = if read_file || list_directory {
-        if write_file {
-            ToolSandboxContract::available([
-                ToolCapabilityClass::FilesystemRead,
-                ToolCapabilityClass::FilesystemWrite,
-            ])
-        } else {
-            read_file::sandbox()
+    let sandbox = production_sandbox_contract(read_file || list_directory, write_file, fetch_url);
+    let planner: Arc<ToolPlanner> = {
+        match fetch_url_resources {
+            // The immutable per-origin network authority captured at open, present exactly
+            // when the fetch_url definition above is pushed: the composed fetch route
+            // plans against this exact captured Arc directly — no pairing bool, no
+            // per-call Option match.
+            Some(resources) => {
+                let workspace = workspace.clone();
+                let task_context = task_context.clone();
+                // The exact Session-local mutation queue captured at this admission: the
+                // frozen write_file route binds its mutation plans to this queue; the
+                // other four builtins never touch it.
+                let file_mutation_queue = Arc::clone(&file_mutation_queue);
+                let resources = Arc::clone(resources);
+                Arc::new(move |request| match request.call().name().as_str() {
+                    ask_user::ASK_USER_NAME => ask_user::plan(request),
+                    read_file::READ_FILE_NAME => {
+                        read_file::plan(&workspace, &task_context, request)
+                    }
+                    list_directory::LIST_DIRECTORY_NAME => {
+                        list_directory::plan(&workspace, &task_context, request)
+                    }
+                    write_file::WRITE_FILE_NAME => {
+                        write_file::plan(&workspace, &task_context, &file_mutation_queue, request)
+                    }
+                    fetch_url::FETCH_URL_NAME => fetch_url::plan(&resources, request),
+                    // The normal ToolSet lookup invokes the planner only for a name present
+                    // in this set's definitions, which are exactly the enabled frozen names
+                    // above, so no other name can ever reach the composed planner.
+                    _ => unreachable!(
+                        "the composed production ToolSet routes exactly the five frozen builtin names"
+                    ),
+                })
+            }
+            // No fetch_url definition, so no fetch route: the same four frozen routes and
+            // the same closed routing guarantee.
+            None => {
+                let workspace = workspace.clone();
+                let task_context = task_context.clone();
+                // The exact Session-local mutation queue captured at this admission: the
+                // frozen write_file route binds its mutation plans to this queue; the
+                // other three builtins never touch it.
+                let file_mutation_queue = Arc::clone(&file_mutation_queue);
+                Arc::new(move |request| match request.call().name().as_str() {
+                    ask_user::ASK_USER_NAME => ask_user::plan(request),
+                    read_file::READ_FILE_NAME => {
+                        read_file::plan(&workspace, &task_context, request)
+                    }
+                    list_directory::LIST_DIRECTORY_NAME => {
+                        list_directory::plan(&workspace, &task_context, request)
+                    }
+                    write_file::WRITE_FILE_NAME => {
+                        write_file::plan(&workspace, &task_context, &file_mutation_queue, request)
+                    }
+                    // The normal ToolSet lookup invokes the planner only for a name present
+                    // in this set's definitions, which are exactly the enabled frozen names
+                    // above, so no other name can ever reach the composed planner.
+                    _ => unreachable!(
+                        "the composed production ToolSet routes exactly the four frozen builtin names"
+                    ),
+                })
+            }
         }
-    } else {
-        // Only the write route is enabled: exactly the write ceiling.
-        write_file::sandbox()
     };
-    let planner: Arc<ToolPlanner> = Arc::new({
-        let workspace = workspace.clone();
-        let task_context = task_context.clone();
-        // The exact Session-local mutation queue captured at this admission: the frozen
-        // write_file route binds its mutation plans to this queue; the other three
-        // builtins never touch it.
-        let file_mutation_queue = Arc::clone(&file_mutation_queue);
-        move |request| match request.call().name().as_str() {
-            ask_user::ASK_USER_NAME => ask_user::plan(request),
-            read_file::READ_FILE_NAME => read_file::plan(&workspace, &task_context, request),
-            list_directory::LIST_DIRECTORY_NAME => {
-                list_directory::plan(&workspace, &task_context, request)
-            }
-            write_file::WRITE_FILE_NAME => {
-                write_file::plan(&workspace, &task_context, &file_mutation_queue, request)
-            }
-            // The normal ToolSet lookup invokes the planner only for a name present in this
-            // set's definitions, which are exactly the enabled frozen names above, so no
-            // other name can ever reach the composed planner.
-            _ => unreachable!(
-                "the composed production ToolSet routes exactly the four frozen builtin names"
-            ),
-        }
-    });
     Arc::new(ToolSet {
         inner: Arc::new(ToolSetInner {
             definitions: definitions.into(),
@@ -2139,6 +2268,31 @@ fn composed_production_tool_set(
             sandbox,
         }),
     })
+}
+
+/// The exact outer sandbox contract of one production selection: the union of the
+/// capability classes the enabled routes require — `FilesystemRead` for the read/list
+/// routes, `FilesystemWrite` for the write route, `Network` for the fetch route — which
+/// is the available empty set when no route is enabled.  The class union is the whole
+/// contract: every enabled route's Execute/FileMutation plan is admitted exactly once
+/// against this exact outer ceiling by [`ToolSet::plan`], and the ask_user route never
+/// touches admission at all.
+fn production_sandbox_contract(
+    filesystem_read: bool,
+    filesystem_write: bool,
+    network: bool,
+) -> ToolSandboxContract {
+    let mut classes = Vec::new();
+    if filesystem_read {
+        classes.push(ToolCapabilityClass::FilesystemRead);
+    }
+    if filesystem_write {
+        classes.push(ToolCapabilityClass::FilesystemWrite);
+    }
+    if network {
+        classes.push(ToolCapabilityClass::Network);
+    }
+    ToolSandboxContract::available(classes)
 }
 
 /// The pre-start settlement decision for one resolved Tool approval.
@@ -3303,6 +3457,7 @@ fn strictly_increasing(values: impl IntoIterator<Item = u32>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -5537,10 +5692,13 @@ mod tests {
         names: &'static [&'static str],
     }
 
-    /// The closed sixteen-selection surface: every combination of the four frozen builtin
-    /// opt-ins, with the exact expected ordered names (the fixed definition/spec order
-    /// `ask_user` → `read_file` → `list_directory` → `write_file`, only enabled members,
-    /// no duplicates).
+    /// The sixteen closed base selections: every combination of the four non-fetch
+    /// opt-ins (`ask_user`, `read_file`, `list_directory`, `write_file`), with the
+    /// exact expected ordered names (the fixed definition/spec order `ask_user` →
+    /// `read_file` → `list_directory` → `write_file`, only enabled members, no
+    /// duplicates).  The `fetch_url` opt-in doubles this base to the closed 32
+    /// selections: the tests loop the same 16 base selections over `fetch_url`
+    /// false/true and append the frozen fetch_url name last.
     const SELECTIONS: [Selection; 16] = [
         Selection {
             ask_user: false,
@@ -5683,82 +5841,130 @@ mod tests {
         },
     ];
 
+    /// The exact expected ordered names of one of the closed 32 selections: the 16 base
+    /// names plus `fetch_url` last exactly when the fetch opt-in is on.
+    fn selection_names(selection: Selection, fetch_url: bool) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = selection.names.to_vec();
+        if fetch_url {
+            names.push(fetch_url::FETCH_URL_NAME);
+        }
+        names
+    }
+
+    /// The immutable test-only loopback fetch_url authority for one selection, present
+    /// exactly when the fetch opt-in is on.  The pinned address never needs a live server
+    /// for planning/composition tests (client construction only).
+    fn fetch_selection_resources(selected: bool) -> Option<Arc<FetchUrlResources>> {
+        selected.then(|| {
+            Arc::new(
+                FetchUrlResources::loopback(
+                    "fetch-url.loopback.test",
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+                )
+                .expect("the test loopback authority materializes"),
+            )
+        })
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn production_config_all_sixteen_selections_freeze_exact_names_specs_reuse_and_sandbox() {
+    async fn production_config_all_thirty_two_selections_freeze_exact_names_specs_reuse_and_sandbox()
+     {
         let rig = composition_workspace().await;
-        for selection in SELECTIONS {
-            let config = ProductionToolConfig::new(
-                selection.ask_user,
-                selection.read_file,
-                selection.list_directory,
-                selection.write_file,
-            );
-            let set = config.for_workspace(
-                rig.workspace.clone(),
-                rig.task_context.clone(),
-                SessionFileMutationQueue::new(),
-            );
-
-            // Exactly the enabled definitions and prompt specs in the one frozen order,
-            // with no duplicates.
-            let definitions = set.definitions();
-            assert_eq!(
-                definitions.len(),
-                selection.names.len(),
-                "selection {selection:?}"
-            );
-            for (definition, name) in definitions.iter().zip(selection.names) {
-                assert_eq!(definition.name().as_str(), *name, "selection {selection:?}");
-            }
-            let view = set.prompt_view();
-            assert_eq!(
-                view.specs().len(),
-                selection.names.len(),
-                "selection {selection:?}"
-            );
-            for (spec, name) in view.specs().iter().zip(selection.names) {
-                assert_eq!(spec.name().as_str(), *name, "selection {selection:?}");
-            }
-
-            // The outer sandbox contract is the exact union required by the enabled
-            // workspace routes: none => available []; read/list only => FilesystemRead;
-            // write only => FilesystemWrite; any read/list + write => the union.
-            let has_workspace_tools =
-                selection.read_file || selection.list_directory || selection.write_file;
-            let expected_sandbox = if !has_workspace_tools {
-                ToolSandboxContract::available([])
-            } else {
-                let mut classes = Vec::new();
-                if selection.read_file || selection.list_directory {
-                    classes.push(C::FilesystemRead);
-                }
-                if selection.write_file {
-                    classes.push(C::FilesystemWrite);
-                }
-                ToolSandboxContract::available(classes)
-            };
-            assert_eq!(
-                set.inner.sandbox, expected_sandbox,
-                "selection {selection:?}"
-            );
-
-            // Arc reuse: no workspace-bound tool means every materialization returns the
-            // same captured base Arc; any workspace-bound tool means a fresh Arc per
-            // admission, bound to the exact Workspace/task contexts.
-            let again = config.for_workspace(
-                rig.workspace.clone(),
-                rig.task_context.clone(),
-                SessionFileMutationQueue::new(),
-            );
-            if has_workspace_tools {
-                assert!(!Arc::ptr_eq(&set, &again), "selection {selection:?}");
-                assert_eq!(
-                    again.definitions().len(),
-                    selection.names.len(),
-                    "selection {selection:?}"
+        for fetch_url in [false, true] {
+            for selection in SELECTIONS {
+                let names = selection_names(selection, fetch_url);
+                let config = ProductionToolConfig::new(
+                    selection.ask_user,
+                    selection.read_file,
+                    selection.list_directory,
+                    selection.write_file,
+                    fetch_selection_resources(fetch_url),
                 );
-            } else {
-                assert!(Arc::ptr_eq(&set, &again), "selection {selection:?}");
+                let set = config.for_workspace(
+                    rig.workspace.clone(),
+                    rig.task_context.clone(),
+                    SessionFileMutationQueue::new(),
+                );
+
+                // Exactly the enabled definitions and prompt specs in the one frozen order
+                // (ask_user → read_file → list_directory → write_file → fetch_url), with
+                // no duplicates.
+                let definitions = set.definitions();
+                assert_eq!(
+                    definitions.len(),
+                    names.len(),
+                    "selection {selection:?} fetch {fetch_url}"
+                );
+                for (definition, name) in definitions.iter().zip(&names) {
+                    assert_eq!(
+                        definition.name().as_str(),
+                        *name,
+                        "selection {selection:?} fetch {fetch_url}"
+                    );
+                }
+                let view = set.prompt_view();
+                assert_eq!(
+                    view.specs().len(),
+                    names.len(),
+                    "selection {selection:?} fetch {fetch_url}"
+                );
+                for (spec, name) in view.specs().iter().zip(&names) {
+                    assert_eq!(
+                        spec.name().as_str(),
+                        *name,
+                        "selection {selection:?} fetch {fetch_url}"
+                    );
+                }
+
+                // The outer sandbox contract is the exact union required by the enabled
+                // routes: none => available []; read/list => FilesystemRead; write =>
+                // FilesystemWrite; fetch => Network; joined routes => the union.
+                let expected_sandbox = {
+                    let mut classes = Vec::new();
+                    if selection.read_file || selection.list_directory {
+                        classes.push(C::FilesystemRead);
+                    }
+                    if selection.write_file {
+                        classes.push(C::FilesystemWrite);
+                    }
+                    if fetch_url {
+                        classes.push(C::Network);
+                    }
+                    ToolSandboxContract::available(classes)
+                };
+                assert_eq!(
+                    set.inner.sandbox, expected_sandbox,
+                    "selection {selection:?} fetch {fetch_url}"
+                );
+
+                // Arc reuse: no workspace-bound tool means every materialization returns
+                // the same captured base Arc — including the frozen static fetch_url
+                // composition (fetch-only and ask+fetch reuse the same authority); any
+                // workspace-bound tool means a fresh Arc per admission, bound to the exact
+                // Workspace/task contexts.
+                let again = config.for_workspace(
+                    rig.workspace.clone(),
+                    rig.task_context.clone(),
+                    SessionFileMutationQueue::new(),
+                );
+                let has_workspace_tools =
+                    selection.read_file || selection.list_directory || selection.write_file;
+                if has_workspace_tools {
+                    assert!(
+                        !Arc::ptr_eq(&set, &again),
+                        "selection {selection:?} fetch {fetch_url}"
+                    );
+                    assert_eq!(
+                        again.definitions().len(),
+                        names.len(),
+                        "selection {selection:?} fetch {fetch_url}"
+                    );
+                } else {
+                    assert!(
+                        Arc::ptr_eq(&set, &again),
+                        "selection {selection:?} fetch {fetch_url}"
+                    );
+                }
             }
         }
         rig.task_context.shutdown().await;
@@ -5768,182 +5974,255 @@ mod tests {
     async fn production_config_routes_plan_exactly_once_in_the_selections_that_include_them() {
         let rig = composition_workspace().await;
         let write_rig = composition_write_workspace().await;
-        for selection in SELECTIONS {
-            let config = ProductionToolConfig::new(
-                selection.ask_user,
-                selection.read_file,
-                selection.list_directory,
-                selection.write_file,
-            );
-            let set = config.for_workspace(
-                rig.workspace.clone(),
-                rig.task_context.clone(),
-                SessionFileMutationQueue::new(),
-            );
-            let enabled = |name: &'static str| selection.names.contains(&name);
-
-            // ask_user route: exactly its typed UserQuestion when selected (invalid
-            // arguments settle the frozen Failed pre-execution), unavailable otherwise.
-            let ask = composition_request(
-                0x21,
-                "call_ask",
-                ask_user::ASK_USER_NAME,
-                r#"{"questions":[{"questionIndex":0,"prompt":"Continue?","required":true,"input":{"type":"text","data":{"multiline":false}}}]}"#,
-            );
-            if enabled(ask_user::ASK_USER_NAME) {
-                assert!(
-                    matches!(set.plan(&ask), Some(ToolExecutionPlan::UserQuestion { .. })),
-                    "selection {selection:?}"
+        for fetch_url in [false, true] {
+            for selection in SELECTIONS {
+                let names = selection_names(selection, fetch_url);
+                let config = ProductionToolConfig::new(
+                    selection.ask_user,
+                    selection.read_file,
+                    selection.list_directory,
+                    selection.write_file,
+                    fetch_selection_resources(fetch_url),
                 );
-                let invalid =
-                    composition_request(0x22, "call_ask_invalid", ask_user::ASK_USER_NAME, "{}");
-                assert!(
-                    matches!(
-                        set.plan(&invalid),
-                        Some(ToolExecutionPlan::PreExecution(result))
-                            if matches!(result, ToolExecutionResult::PreExecution {
-                                disposition: ToolResultDisposition::Failed,
-                                ..
-                            })
-                    ),
-                    "selection {selection:?}"
+                let set = config.for_workspace(
+                    rig.workspace.clone(),
+                    rig.task_context.clone(),
+                    SessionFileMutationQueue::new(),
                 );
-            } else {
-                assert!(set.plan(&ask).is_none(), "selection {selection:?}");
-            }
+                let enabled = |name: &'static str| names.contains(&name);
 
-            // read_file route: the file path plans Execute with exactly FilesystemRead
-            // and survives the single outer admission, and the root path settles the
-            // frozen Denied pre-execution; unavailable otherwise.  Each call runs through
-            // ToolSet::plan exactly once, whose one admit against the FilesystemRead outer
-            // contract is exactly what the returned Execute shape proves: there is no
-            // second admission anywhere.
-            let read = composition_request(
-                0x23,
-                "call_read",
-                read_file::READ_FILE_NAME,
-                r#"{"path":"notes.txt"}"#,
-            );
-            if enabled(read_file::READ_FILE_NAME) {
-                match set.plan(&read) {
-                    Some(ToolExecutionPlan::Execute { permissions, .. }) => {
-                        assert_eq!(
-                            permissions,
-                            ToolPermissionSet::new([C::FilesystemRead]),
-                            "selection {selection:?}"
-                        );
-                    }
-                    _ => panic!("the valid read_file call plans an Execute shape ({selection:?})"),
+                // ask_user route: exactly its typed UserQuestion when selected (invalid
+                // arguments settle the frozen Failed pre-execution), unavailable otherwise.
+                let ask = composition_request(
+                    0x21,
+                    "call_ask",
+                    ask_user::ASK_USER_NAME,
+                    r#"{"questions":[{"questionIndex":0,"prompt":"Continue?","required":true,"input":{"type":"text","data":{"multiline":false}}}]}"#,
+                );
+                if enabled(ask_user::ASK_USER_NAME) {
+                    assert!(
+                        matches!(set.plan(&ask), Some(ToolExecutionPlan::UserQuestion { .. })),
+                        "selection {selection:?}"
+                    );
+                    let invalid = composition_request(
+                        0x22,
+                        "call_ask_invalid",
+                        ask_user::ASK_USER_NAME,
+                        "{}",
+                    );
+                    assert!(
+                        matches!(
+                            set.plan(&invalid),
+                            Some(ToolExecutionPlan::PreExecution(result))
+                                if matches!(result, ToolExecutionResult::PreExecution {
+                                    disposition: ToolResultDisposition::Failed,
+                                    ..
+                                })
+                        ),
+                        "selection {selection:?}"
+                    );
+                } else {
+                    assert!(set.plan(&ask).is_none(), "selection {selection:?}");
                 }
-                let read_root = composition_request(
-                    0x24,
-                    "call_root",
+
+                // read_file route: the file path plans Execute with exactly FilesystemRead
+                // and survives the single outer admission, and the root path settles the
+                // frozen Denied pre-execution; unavailable otherwise.  Each call runs through
+                // ToolSet::plan exactly once, whose one admit against the FilesystemRead outer
+                // contract is exactly what the returned Execute shape proves: there is no
+                // second admission anywhere.
+                let read = composition_request(
+                    0x23,
+                    "call_read",
                     read_file::READ_FILE_NAME,
+                    r#"{"path":"notes.txt"}"#,
+                );
+                if enabled(read_file::READ_FILE_NAME) {
+                    match set.plan(&read) {
+                        Some(ToolExecutionPlan::Execute { permissions, .. }) => {
+                            assert_eq!(
+                                permissions,
+                                ToolPermissionSet::new([C::FilesystemRead]),
+                                "selection {selection:?}"
+                            );
+                        }
+                        _ => panic!(
+                            "the valid read_file call plans an Execute shape ({selection:?})"
+                        ),
+                    }
+                    let read_root = composition_request(
+                        0x24,
+                        "call_root",
+                        read_file::READ_FILE_NAME,
+                        r#"{"path":""}"#,
+                    );
+                    assert!(
+                        matches!(
+                            set.plan(&read_root),
+                            Some(ToolExecutionPlan::PreExecution(result))
+                                if matches!(result, ToolExecutionResult::PreExecution {
+                                    disposition: ToolResultDisposition::Denied,
+                                    ..
+                                })
+                        ),
+                        "selection {selection:?}"
+                    );
+                } else {
+                    assert!(set.plan(&read).is_none(), "selection {selection:?}");
+                }
+
+                // list_directory route: the empty cwd plans Execute with exactly
+                // FilesystemRead through the same single outer admission; unavailable
+                // otherwise.
+                let list = composition_request(
+                    0x25,
+                    "call_list",
+                    list_directory::LIST_DIRECTORY_NAME,
                     r#"{"path":""}"#,
                 );
-                assert!(
-                    matches!(
-                        set.plan(&read_root),
-                        Some(ToolExecutionPlan::PreExecution(result))
-                            if matches!(result, ToolExecutionResult::PreExecution {
-                                disposition: ToolResultDisposition::Denied,
-                                ..
-                            })
-                    ),
-                    "selection {selection:?}"
-                );
-            } else {
-                assert!(set.plan(&read).is_none(), "selection {selection:?}");
-            }
-
-            // list_directory route: the empty cwd plans Execute with exactly
-            // FilesystemRead through the same single outer admission; unavailable
-            // otherwise.
-            let list = composition_request(
-                0x25,
-                "call_list",
-                list_directory::LIST_DIRECTORY_NAME,
-                r#"{"path":""}"#,
-            );
-            if enabled(list_directory::LIST_DIRECTORY_NAME) {
-                match set.plan(&list) {
-                    Some(ToolExecutionPlan::Execute { permissions, .. }) => {
-                        assert_eq!(
-                            permissions,
-                            ToolPermissionSet::new([C::FilesystemRead]),
-                            "selection {selection:?}"
-                        );
+                if enabled(list_directory::LIST_DIRECTORY_NAME) {
+                    match set.plan(&list) {
+                        Some(ToolExecutionPlan::Execute { permissions, .. }) => {
+                            assert_eq!(
+                                permissions,
+                                ToolPermissionSet::new([C::FilesystemRead]),
+                                "selection {selection:?}"
+                            );
+                        }
+                        _ => panic!(
+                            "the valid list_directory call plans an Execute shape ({selection:?})"
+                        ),
                     }
-                    _ => panic!(
-                        "the valid list_directory call plans an Execute shape ({selection:?})"
-                    ),
+                } else {
+                    assert!(set.plan(&list).is_none(), "selection {selection:?}");
                 }
-            } else {
-                assert!(set.plan(&list).is_none(), "selection {selection:?}");
-            }
 
-            // write_file route: the write-granted context authorizes the exact
-            // cwd-relative target, so the valid call plans the typed FileMutation shape
-            // carrying exactly FilesystemWrite and the exact per-admission Session queue,
-            // admitted exactly once against the outer union contract; the same route
-            // settles the frozen Denied pre-execution in the ReadOnly-granted context
-            // (authorization, never a sandbox or unknown-tool outcome).  A name that is
-            // not one of the four frozen builtins stays unavailable through the normal
-            // ToolSet lookup in every selection: there is no generic registry or
-            // open-world route.
-            let write = composition_request(
-                0x27,
-                "call_write",
-                write_file::WRITE_FILE_NAME,
-                r#"{"path":"target.txt","content":"body"}"#,
-            );
-            if enabled(write_file::WRITE_FILE_NAME) {
-                let queue = SessionFileMutationQueue::new();
-                let write_set = config.for_workspace(
-                    write_rig.workspace.clone(),
-                    write_rig.task_context.clone(),
-                    Arc::clone(&queue),
+                // write_file route: the write-granted context authorizes the exact
+                // cwd-relative target, so the valid call plans the typed FileMutation shape
+                // carrying exactly FilesystemWrite and the exact per-admission Session queue,
+                // admitted exactly once against the outer union contract; the same route
+                // settles the frozen Denied pre-execution in the ReadOnly-granted context
+                // (authorization, never a sandbox or unknown-tool outcome).  A name that is
+                // not one of the five frozen builtins stays unavailable through the normal
+                // ToolSet lookup in every selection: there is no generic registry or
+                // open-world route.
+                let write = composition_request(
+                    0x27,
+                    "call_write",
+                    write_file::WRITE_FILE_NAME,
+                    r#"{"path":"target.txt","content":"body"}"#,
                 );
-                match write_set.plan(&write) {
-                    Some(ToolExecutionPlan::FileMutation {
-                        permissions,
-                        queue: plan_queue,
-                        ..
-                    }) => {
-                        assert_eq!(
+                if enabled(write_file::WRITE_FILE_NAME) {
+                    let queue = SessionFileMutationQueue::new();
+                    let write_set = config.for_workspace(
+                        write_rig.workspace.clone(),
+                        write_rig.task_context.clone(),
+                        Arc::clone(&queue),
+                    );
+                    match write_set.plan(&write) {
+                        Some(ToolExecutionPlan::FileMutation {
                             permissions,
-                            ToolPermissionSet::new([C::FilesystemWrite]),
-                            "selection {selection:?}"
-                        );
-                        assert!(
-                            Arc::ptr_eq(&queue, &plan_queue),
-                            "the write route captures the exact per-admission Session queue ({selection:?})"
-                        );
+                            queue: plan_queue,
+                            ..
+                        }) => {
+                            assert_eq!(
+                                permissions,
+                                ToolPermissionSet::new([C::FilesystemWrite]),
+                                "selection {selection:?}"
+                            );
+                            assert!(
+                                Arc::ptr_eq(&queue, &plan_queue),
+                                "the write route captures the exact per-admission Session queue ({selection:?})"
+                            );
+                        }
+                        _ => panic!(
+                            "the valid write_file call plans a FileMutation shape ({selection:?})"
+                        ),
                     }
-                    _ => panic!(
-                        "the valid write_file call plans a FileMutation shape ({selection:?})"
-                    ),
+                    assert!(
+                        matches!(
+                            set.plan(&write),
+                            Some(ToolExecutionPlan::PreExecution(result))
+                                if matches!(result, ToolExecutionResult::PreExecution {
+                                    disposition: ToolResultDisposition::Denied,
+                                    ..
+                                })
+                        ),
+                        "the write route denies without a ReadWrite grant ({selection:?})"
+                    );
+                } else {
+                    assert!(set.plan(&write).is_none(), "selection {selection:?}");
                 }
-                assert!(
-                    matches!(
-                        set.plan(&write),
-                        Some(ToolExecutionPlan::PreExecution(result))
-                            if matches!(result, ToolExecutionResult::PreExecution {
-                                disposition: ToolResultDisposition::Denied,
-                                ..
-                            })
-                    ),
-                    "the write route denies without a ReadWrite grant ({selection:?})"
-                );
-            } else {
-                assert!(set.plan(&write).is_none(), "selection {selection:?}");
-            }
 
-            // A name that is not one of the four frozen builtins stays unavailable
-            // through the normal ToolSet lookup in every selection: there is no generic
-            // registry or open-world route.
-            let unknown = composition_request(0x28, "call_other", "other_tool", "{}");
-            assert!(set.plan(&unknown).is_none(), "selection {selection:?}");
+                // fetch_url route: the exact loopback-origin URL plans Execute with exactly
+                // Network and survives the single outer admission; a foreign-origin URL settles
+                // the frozen Denied pre-execution, and a malformed URL settles the frozen
+                // Failed pre-execution; unavailable otherwise.  Each call runs through
+                // ToolSet::plan exactly once, whose one admit against the Network outer
+                // contract is exactly what the returned Execute shape proves.
+                let fetch = composition_request(
+                    0x2a,
+                    "call_fetch",
+                    fetch_url::FETCH_URL_NAME,
+                    "{\"url\":\"http://fetch-url.loopback.test:8080/some/path?q=1\"}",
+                );
+                if enabled(fetch_url::FETCH_URL_NAME) {
+                    match set.plan(&fetch) {
+                        Some(ToolExecutionPlan::Execute { permissions, .. }) => {
+                            assert_eq!(
+                                permissions,
+                                ToolPermissionSet::new([C::Network]),
+                                "selection {selection:?} fetch {fetch_url}"
+                            );
+                        }
+                        _ => panic!(
+                            "the valid fetch_url call plans an Execute shape ({selection:?} fetch {fetch_url})"
+                        ),
+                    }
+                    let foreign = composition_request(
+                        0x2b,
+                        "call_fetch_denied",
+                        fetch_url::FETCH_URL_NAME,
+                        "{\"url\":\"https://example.com/\"}",
+                    );
+                    assert!(
+                        matches!(
+                            set.plan(&foreign),
+                            Some(ToolExecutionPlan::PreExecution(result))
+                                if matches!(result, ToolExecutionResult::PreExecution {
+                                    disposition: ToolResultDisposition::Denied,
+                                    ..
+                                })
+                        ),
+                        "the fetch route denies without an exact origin ({selection:?} fetch {fetch_url})"
+                    );
+                    let malformed = composition_request(
+                        0x2c,
+                        "call_fetch_invalid",
+                        fetch_url::FETCH_URL_NAME,
+                        "{\"url\":\"not a url\"}",
+                    );
+                    assert!(
+                        matches!(
+                            set.plan(&malformed),
+                            Some(ToolExecutionPlan::PreExecution(result))
+                                if matches!(result, ToolExecutionResult::PreExecution {
+                                    disposition: ToolResultDisposition::Failed,
+                                    ..
+                                })
+                        ),
+                        "the fetch route settles the frozen failed text ({selection:?} fetch {fetch_url})"
+                    );
+                } else {
+                    assert!(set.plan(&fetch).is_none(), "selection {selection:?}");
+                }
+
+                // A name that is not one of the five frozen builtins stays unavailable
+                // through the normal ToolSet lookup in every selection: there is no generic
+                // registry or open-world route.
+                let unknown = composition_request(0x28, "call_other", "other_tool", "{}");
+                assert!(set.plan(&unknown).is_none(), "selection {selection:?}");
+            }
         }
         rig.task_context.shutdown().await;
         write_rig.task_context.shutdown().await;
@@ -5973,13 +6252,14 @@ mod tests {
     async fn turn_tool_resources_production_materialize_installs_the_workspace_bound_read_file_set()
     {
         let rig = composition_workspace().await;
-        let set =
-            TurnToolResources::Production(ProductionToolConfig::new(false, true, false, false))
-                .materialize(
-                    rig.workspace.clone(),
-                    rig.task_context.clone(),
-                    SessionFileMutationQueue::new(),
-                );
+        let set = TurnToolResources::Production(ProductionToolConfig::new(
+            false, true, false, false, None,
+        ))
+        .materialize(
+            rig.workspace.clone(),
+            rig.task_context.clone(),
+            SessionFileMutationQueue::new(),
+        );
         // The production read_file selection materializes the exact workspace-bound set:
         // one read_file definition and prompt spec with the FilesystemRead outer contract.
         let definitions = set.definitions();
@@ -5997,13 +6277,14 @@ mod tests {
     async fn turn_tool_resources_production_materialize_installs_the_workspace_bound_list_directory_set()
      {
         let rig = composition_workspace().await;
-        let set =
-            TurnToolResources::Production(ProductionToolConfig::new(false, false, true, false))
-                .materialize(
-                    rig.workspace.clone(),
-                    rig.task_context.clone(),
-                    SessionFileMutationQueue::new(),
-                );
+        let set = TurnToolResources::Production(ProductionToolConfig::new(
+            false, false, true, false, None,
+        ))
+        .materialize(
+            rig.workspace.clone(),
+            rig.task_context.clone(),
+            SessionFileMutationQueue::new(),
+        );
         // The production list_directory selection materializes the exact workspace-bound
         // set: one list_directory definition and prompt spec with the FilesystemRead outer
         // contract, and its empty-cwd route plans Execute with exactly FilesystemRead.
@@ -6034,13 +6315,14 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn turn_tool_resources_production_materialize_installs_the_composed_read_and_list_set() {
         let rig = composition_workspace().await;
-        let set =
-            TurnToolResources::Production(ProductionToolConfig::new(false, true, true, false))
-                .materialize(
-                    rig.workspace.clone(),
-                    rig.task_context.clone(),
-                    SessionFileMutationQueue::new(),
-                );
+        let set = TurnToolResources::Production(ProductionToolConfig::new(
+            false, true, true, false, None,
+        ))
+        .materialize(
+            rig.workspace.clone(),
+            rig.task_context.clone(),
+            SessionFileMutationQueue::new(),
+        );
         // The production read_file + list_directory selection materializes one composed
         // workspace-bound set in the frozen order, both routes planning Execute with the
         // same FilesystemRead outer contract.
