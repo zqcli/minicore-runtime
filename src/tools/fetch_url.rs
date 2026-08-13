@@ -1,7 +1,8 @@
-//! The `fetch_url` builtin's host-authority slice (ADR 0147).
+//! The closed production `fetch_url` builtin (ADR 0147): one default-off, Runtime-owned
+//! Tool that fetches bounded UTF-8 text with exactly one HTTP GET from one
+//! host-authorized exact origin and returns the response body as a single text part.
 //!
-//! This slice delivers exactly the resource-level authority half of the closed
-//! `fetch_url` builtin, with no Tool definition and no executor yet:
+//! The slice delivers:
 //!
 //! - the public redacted host config type [`FetchUrlOrigin`] and its payload-free
 //!   validation error [`FetchUrlOriginError`]: one exact `https` DNS-host origin plus
@@ -39,20 +40,42 @@
 //! text/plain, application/json`, `Accept-Encoding: identity`, `Connection: close`)
 //! and an empty body, so the executor can await the response but can never alter
 //! the scheme, host, port, path, query, or headers, and never touches a raw
-//! `reqwest::Url` or `reqwest::Client` (ADR 0147 decision 8).
+//! `reqwest::Url` or `reqwest::Client` (ADR 0147 decision 8);
+//! - the closed Tool surface: exact name `fetch_url`, `Parallel` mode, the verbatim
+//!   ADR 0147 description, the closed one-required-string `url` schema, the standalone
+//!   [`build_tool_set`] used by focused tests, and the synchronous planner that
+//!   authorizes through [`FetchUrlResources::authorize`] (invalid arguments settle
+//!   `PreExecution + Failed`, no exact origin settles `PreExecution + Denied`, success
+//!   carries exactly `ToolCapabilityClass::Network` and a move-only start factory);
+//! - the owner-tracked executor: the whole send + response inspect + bounded body
+//!   drain runs as one operation future inside the started run, with a biased outer
+//!   select cancellation vs operation (a pre-cancelled token proves zero GET, an
+//!   in-flight cancellation drops the exact operation state and settles Cancelled,
+//!   a natural result is never rewritten after mapping), a strict 2xx-only disclosure
+//!   contract with a small private Content-Type/Content-Encoding validator, known
+//!   oversize rejection before streaming, a 65,537-byte cancellation-aware stream
+//!   read, and the fixed ADR 0147 decision-14 model-visible texts.
 //!
-//! The executor slice (Tool definition, planner, start factory, bounded text response
-//! policy) and the Runtime config wiring are later slices; this module deliberately
-//! discloses no Tool.
+//! The Runtime config wiring (default-off opt-in, origin installation, materialization)
+//! lives in `runtime.rs`; this module keeps the Tool surface and its authority closed.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::dns::{Name, Resolve, Resolving};
 use thiserror::Error;
 
+use crate::wire::BoundedJsonObject;
 use crate::wire::lexical::validate_safe_text;
+
+use super::{
+    ToolAbandonReason, ToolCancellationObserver, ToolCapabilityClass, ToolDefinition,
+    ToolExecutionMode, ToolExecutionPlan, ToolExecutionRequest, ToolExecutionResult,
+    ToolExecutionStart, ToolPermissionSet, ToolResultContent, ToolResultDisposition,
+    ToolSandboxContract, ToolSet, ToolSetInner, ToolSpec,
+};
 
 /// Maximum origin input bytes (ADR 0147 decision 3).
 const MAX_ORIGIN_TEXT_BYTES: usize = 2048;
@@ -167,6 +190,7 @@ pub enum FetchUrlOriginError {
 /// same origin).  The origin URL and the addresses are stored privately: there is no
 /// hostname, port, or address accessor, and [`fmt::Debug`]/[`fmt::Display`] print a
 /// fixed redacted marker only (ADR 0147 decision 3).
+#[derive(Clone)]
 pub struct FetchUrlOrigin {
     /// The validated canonical origin URL: `https`, DNS hostname, path exactly `/`,
     /// no userinfo/query/fragment.
@@ -310,13 +334,6 @@ impl fmt::Display for FetchUrlOrigin {
 /// and [`FetchUrlResourcesError::ClientBuild`]; the loopback seam's
 /// `InvalidTestAuthority` rejection exists only under `#[cfg(test)]` and is absent
 /// from production builds.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "consumed by the adjacent fetch_url executor/Runtime wiring slice"
-    )
-)]
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum FetchUrlResourcesError {
     #[error("two fetch_url origins normalized to the same canonical origin")]
@@ -347,15 +364,8 @@ struct PinnedFetchUrlOrigin {
 ///
 /// Every origin gets its own independent locked-down client so future connection reuse
 /// can never carry origin A's address authority into origin B (ADR 0147 decision 7).
-/// An empty set is representable (the future origin-only-undisclosed config slice);
-/// duplicate canonical origins fail closed at materialization.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "consumed by the adjacent fetch_url executor/Runtime wiring slice and Tools wire tests"
-    )
-)]
+/// An empty set is representable (the origin-only-undisclosed config slice); duplicate
+/// canonical origins fail closed at materialization.
 pub(crate) struct FetchUrlResources {
     origins: Vec<PinnedFetchUrlOrigin>,
 }
@@ -368,13 +378,6 @@ impl FetchUrlResources {
     /// `pool_max_idle_per_host(0)`, fixed 10s connect / 30s request timeouts, and a
     /// reject-all DNS resolver under the exact hostname's `resolve_to_addrs` override:
     /// only the host-pinned addresses can ever be connected, and no ambient DNS runs.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "consumed by the adjacent fetch_url executor/Runtime wiring slice"
-        )
-    )]
     pub(crate) fn materialize(
         origins: impl IntoIterator<Item = FetchUrlOrigin>,
     ) -> Result<Self, FetchUrlResourcesError> {
@@ -411,13 +414,6 @@ impl FetchUrlResources {
     /// URL with the exact per-origin client; the executor never re-parses the string
     /// and never sees the origin set, and the target's only consuming operation is its
     /// own fixed exact `send` (ADR 0147 decision 8).
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "consumed by the adjacent fetch_url executor/Runtime wiring slice"
-        )
-    )]
     pub(crate) fn authorize(
         &self,
         url: &str,
@@ -477,7 +473,9 @@ impl FetchUrlResources {
     /// numeric loopback IP with a nonzero port; any violation returns the payload-free
     /// [`FetchUrlResourcesError::InvalidTestAuthority`].  This is `#[cfg(test)]` only:
     /// production code, the public interface, and the Runtime config can never call
-    /// it, and it is not an HTTP fallback.
+    /// it, and it is not an HTTP fallback.  `pub(crate)` so the Runtime's test-only
+    /// config injection seam and the Tools composition tests can capture the same
+    /// immutable authority.
     #[cfg(test)]
     pub(crate) fn loopback(
         host: &str,
@@ -588,13 +586,6 @@ impl fmt::Display for RejectAllDnsError {
 impl std::error::Error for RejectAllDnsError {}
 
 /// Payload-free classification of one same-origin authorization attempt.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "consumed by the adjacent fetch_url executor/Runtime wiring slice"
-    )
-)]
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum FetchUrlAuthorizationError {
     #[error("the fetch_url URL argument is invalid")]
@@ -611,25 +602,11 @@ pub(crate) enum FetchUrlAuthorizationError {
 /// scheme, host, port, path, query, or headers, and never sees a raw `reqwest::Url`
 /// or `reqwest::Client`.  It is deliberately not Clone, carries no origin identity,
 /// and never prints anything secret.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "consumed by the adjacent fetch_url executor/Runtime wiring slice"
-    )
-)]
 pub(crate) struct AuthorizedFetchUrl {
     url: reqwest::Url,
     client: reqwest::Client,
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "consumed by the adjacent fetch_url executor/Runtime wiring slice"
-    )
-)]
 impl AuthorizedFetchUrl {
     /// The target's only consuming operation: builds exactly one GET against the
     /// bound URL through the bound per-origin locked-down client and sends it once
@@ -654,6 +631,532 @@ impl AuthorizedFetchUrl {
     }
 }
 
+/// The exact production builtin ToolName.  `pub(super)` because the composed production
+/// ToolSet routes exactly this frozen name.
+pub(super) const FETCH_URL_NAME: &str = "fetch_url";
+
+/// The exact production description disclosed for the builtin (ADR 0147 decision 1,
+/// verbatim).  Frozen; asserted verbatim in module tests.
+const FETCH_URL_DESCRIPTION: &str = "Fetch bounded UTF-8 text with HTTP GET from one host-authorized HTTPS origin and return the response body as a single text part.";
+
+/// The exact frozen PreExecution Failed text for every parse or semantic URL argument
+/// failure (ADR 0147 decision 14).
+const INVALID_ARGUMENTS_TEXT: &str = "tool arguments are invalid";
+
+/// The exact frozen PreExecution Denied text for a well-formed URL without an exact
+/// installed origin authority (ADR 0147 decision 14).
+const NETWORK_DENIED_TEXT: &str = "network URL access is denied";
+
+/// The exact frozen Completed Cancelled text for a cancellation that wins the started
+/// executor's biased select before the operation completes (ADR 0147 decision 14).
+const FETCH_CANCELLED_TEXT: &str = "URL fetch was cancelled";
+
+/// The exact frozen Completed Failed text for connect/send/timeout/body-stream failures
+/// and every non-2xx status (ADR 0147 decision 14).
+const FETCH_FAILED_TEXT: &str = "URL could not be fetched";
+
+/// The exact frozen Completed Failed text for a missing/duplicate/malformed/unsupported
+/// Content-Type or a non-identity Content-Encoding (ADR 0147 decision 14).
+const UNSUPPORTED_RESPONSE_TEXT: &str = "URL response type is unsupported";
+
+/// The exact frozen Completed Failed text for a body beyond 65,536 bytes (ADR 0147
+/// decision 14).
+const TOO_LARGE_TEXT: &str = "URL response is too large";
+
+/// The exact frozen Completed Failed text for a body that is not valid UTF-8 or not
+/// safe Text (ADR 0147 decision 14).
+const NOT_VALID_TEXT: &str = "URL response is not valid text";
+
+/// The closed response body bound: exactly one Text part of at most 65,536 bytes
+/// (ADR 0147 decision 11).
+const MAX_RESPONSE_BYTES: usize = 65_536;
+
+/// One byte beyond the body bound: reading at most 65,537 bytes detects oversize without
+/// unbounded allocation (ADR 0147 decision 11).
+const MAX_READ_BYTES: usize = MAX_RESPONSE_BYTES + 1;
+
+/// The closed input schema disclosed for the builtin (ADR 0147 decision 1): one required
+/// string `url` capped at 4,096 bytes, `additionalProperties: false`.  Structural
+/// guidance only: the semantic URL gate (safe non-empty text, at most 4,096 bytes,
+/// absolute, no userinfo/fragment) is enforced by [`FetchUrlResources::authorize`],
+/// never by this schema.
+const FETCH_URL_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string",
+      "maxLength": 4096
+    }
+  },
+  "required": ["url"],
+  "additionalProperties": false
+}"#;
+
+/// The exact frozen production definition/spec pair: the single source shared by the
+/// standalone builtin ToolSet and the composed production ToolSet, so the disclosed
+/// definition and spec are byte-identical in both selections.
+pub(super) fn definition() -> ToolDefinition {
+    ToolDefinition {
+        spec: ToolSpec {
+            name: FETCH_URL_NAME
+                .parse()
+                .expect("the frozen fetch_url ToolName is valid"),
+            description: Arc::from(FETCH_URL_DESCRIPTION),
+            input_schema: FETCH_URL_SCHEMA
+                .parse()
+                .expect("the frozen fetch_url schema is valid"),
+        },
+        // One bounded GET per call; the definition does not impose Serial execution
+        // semantics on unrelated operations in the composed production ToolSet.
+        mode: ToolExecutionMode::Parallel,
+    }
+}
+
+/// The outer ToolSet sandbox contract of the fetch_url builtin: available exactly for
+/// `Network`.  The composed production ToolSet keeps this exact contract, so the
+/// fetch_url route's Execute plan is admitted exactly once against the same ceiling.
+pub(super) fn sandbox() -> ToolSandboxContract {
+    ToolSandboxContract::available([ToolCapabilityClass::Network])
+}
+
+/// Builds the exact immutable production `fetch_url` ToolSet: one definition, one
+/// matching spec, the builtin planner pinned to the exact immutable per-origin
+/// authority, and the available sandbox contract enforcing exactly `Network`.
+pub(super) fn build_tool_set(resources: Arc<FetchUrlResources>) -> Arc<ToolSet> {
+    let definition = definition();
+    let specs: Arc<[ToolSpec]> = Arc::from([definition.spec.clone()]);
+    let definitions: Arc<[ToolDefinition]> = Arc::from([definition]);
+    let planner: Arc<super::ToolPlanner> = Arc::new(move |request| plan(&resources, request));
+    Arc::new(ToolSet {
+        inner: Arc::new(ToolSetInner {
+            definitions,
+            specs,
+            planner: Some(planner),
+            sandbox: sandbox(),
+        }),
+    })
+}
+
+/// The synchronous pre-start plan for one exact `fetch_url` call (ADR 0147 decisions 1,
+/// 4, 12, 14): the planner only authorizes and constructs the move-only start factory —
+/// it never constructs or sends any request, and the target's exact send stays owned by
+/// the executor.  Every parse or semantic URL failure (malformed, oversize,
+/// unsafe-text, empty, userinfo, fragment) settles the frozen `PreExecution + Failed`
+/// text `tool arguments are invalid`; a well-formed URL with no exact installed origin
+/// settles the frozen `PreExecution + Denied` text `network URL access is denied`; a
+/// valid, authorized call plans the Execute shape carrying exactly
+/// `ToolCapabilityClass::Network` and a move-only start factory consuming the exact
+/// [`AuthorizedFetchUrl`].  `pub(super)` because the composed production ToolSet routes
+/// exactly this frozen planner.
+pub(super) fn plan(
+    resources: &FetchUrlResources,
+    request: ToolExecutionRequest,
+) -> ToolExecutionPlan {
+    let arguments = match parse_arguments(request.call().arguments()) {
+        Ok(arguments) => arguments,
+        Err(()) => return invalid_arguments_plan(),
+    };
+    // The semantic URL gate (safe non-empty text, at most 4,096 bytes, absolute, no
+    // userinfo/fragment) and the same-origin authority comparison both live in the one
+    // authorization seam; the executor never re-parses the string and never sees the
+    // origin set.
+    let target = match resources.authorize(&arguments.url) {
+        Ok(target) => target,
+        Err(FetchUrlAuthorizationError::InvalidUrl) => return invalid_arguments_plan(),
+        Err(FetchUrlAuthorizationError::Denied) => return denied_plan(),
+    };
+    ToolExecutionPlan::Execute {
+        permissions: ToolPermissionSet::new([ToolCapabilityClass::Network]),
+        start: ToolExecutionStart::new(move |observer| Box::pin(execute_fetch(target, observer))),
+    }
+}
+
+/// The strict private serde mirror of the closed arguments object: unknown fields are
+/// rejected, and the semantic `FetchUrlResources::authorize` gate stays the URL
+/// authority (the schema maxLength is guidance only).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FetchUrlArguments {
+    url: String,
+}
+
+fn parse_arguments(arguments: &BoundedJsonObject) -> Result<FetchUrlArguments, ()> {
+    serde_json::from_str(arguments.canonical_json()).map_err(|_| ())
+}
+
+fn invalid_arguments_plan() -> ToolExecutionPlan {
+    ToolExecutionPlan::PreExecution(pre_execution_failed(INVALID_ARGUMENTS_TEXT))
+}
+
+fn denied_plan() -> ToolExecutionPlan {
+    ToolExecutionPlan::PreExecution(ToolExecutionResult::PreExecution {
+        disposition: ToolResultDisposition::Denied,
+        content: ToolResultContent::from_text_parts(vec![NETWORK_DENIED_TEXT.to_owned()])
+            .expect("the frozen denied text is a valid bounded part"),
+    })
+}
+
+fn pre_execution_failed(text: &str) -> ToolExecutionResult {
+    ToolExecutionResult::PreExecution {
+        disposition: ToolResultDisposition::Failed,
+        content: ToolResultContent::from_text_parts(vec![text.to_owned()])
+            .expect("the frozen failure texts are valid bounded parts"),
+    }
+}
+
+/// The bounded outcome of one fetch operation after the operation future settled; the
+/// cancellation outcome is owned by the executor's outer select, never this enum.
+#[derive(Clone)]
+enum FetchOperationOutcome {
+    /// A complete 2xx body: valid UTF-8 and safe Text, at most 65,536 bytes.
+    Content(Arc<str>),
+    /// Connect/send/timeout/body-stream failure or any non-2xx status.
+    CouldNotFetch,
+    /// Missing/duplicate/malformed/unsupported Content-Type or non-identity
+    /// Content-Encoding.
+    UnsupportedResponse,
+    /// Body beyond 65,536 bytes (known Content-Length or streamed).
+    TooLarge,
+    /// Body that is not valid UTF-8 or not safe Text.
+    NotValidText,
+}
+
+/// The owner-tracked executor for one started fetch (ADR 0147 decisions 9, 11, 13).
+///
+/// The whole operation — exact send, response inspect, bounded body drain — runs as one
+/// operation future polled inside this executor's future; nothing is spawned and no
+/// blocking job exists.  The biased outer select checks cancellation first: a token
+/// already cancelled before the executor is polled wins without ever polling the
+/// operation, so zero GET is provable; a cancellation arriving while the send waits for
+/// headers, while the response is inspected, or while the body streams drops the exact
+/// in-flight operation state (the send future or the response stream, together with its
+/// operation-local request state) in the same owner future and settles the frozen
+/// `Completed + Cancelled` text.  A simultaneously-ready cancellation deterministically
+/// wins the biased tie (cancellation is never silently ignored), while a natural result
+/// is mapped after the select and is never rewritten by a later cancellation.
+///
+/// Transport errors, the fixed 10s connect / 30s request timeouts, body-stream errors,
+/// and every non-2xx status settle the frozen `Completed + Failed` text `URL could not
+/// be fetched`; only an owner invariant (a validated success the owner's own result
+/// contract refuses) settles `Abandoned { RuntimeFailure }`.
+async fn execute_fetch(
+    target: AuthorizedFetchUrl,
+    observer: ToolCancellationObserver,
+) -> ToolExecutionResult {
+    let outcome = tokio::select! {
+        biased;
+        _ = observer.cancelled() => {
+            return ToolExecutionResult::Completed {
+                disposition: ToolResultDisposition::Cancelled,
+                content: ToolResultContent::from_text_parts(vec![FETCH_CANCELLED_TEXT.to_owned()])
+                    .expect("the frozen cancelled text is a valid bounded part"),
+            };
+        }
+        outcome = fetch_operation(target) => outcome,
+    };
+    bind_fetch_outcome(outcome)
+}
+
+/// The one operation future: exactly one `AuthorizedFetchUrl::send`, then the strict
+/// response policy, then the bounded body drain.  Constructing this future performs no
+/// I/O; the exact GET happens only when the future is polled.
+async fn fetch_operation(target: AuthorizedFetchUrl) -> FetchOperationOutcome {
+    let response = match target.send().await {
+        Ok(response) => response,
+        Err(_) => return FetchOperationOutcome::CouldNotFetch,
+    };
+    fetch_response_outcome(response).await
+}
+
+/// The response policy (ADR 0147 decisions 10 and 11): only a 2xx status reads or
+/// discloses anything; every non-2xx status drops the response without reading its body,
+/// status, or headers and settles the frozen could-not-fetch text.  A 2xx response must
+/// carry exactly one parseable Content-Type field with a case-insensitive base media
+/// type of exactly `text/plain` or `application/json` (parameters never transcode; the
+/// bytes must still be UTF-8), and Content-Encoding must be absent or exactly one
+/// trim/case-insensitive `identity` field.  A known Content-Length above 65,536 bytes is
+/// rejected before any streaming; otherwise the body streams at most 65,537
+/// cancellation-aware bytes, stopping at the bound, and a stream error settles
+/// could-not-fetch.
+async fn fetch_response_outcome(mut response: reqwest::Response) -> FetchOperationOutcome {
+    if !response.status().is_success() {
+        // Non-2xx: the response is dropped unread — no body, status, or header is ever
+        // disclosed.  `Connection: close` plus the zero idle pool keep the connection
+        // from becoming a later-call resource.
+        return FetchOperationOutcome::CouldNotFetch;
+    }
+    if validate_content_type(&response).is_none() {
+        return FetchOperationOutcome::UnsupportedResponse;
+    }
+    if !validate_content_encoding(&response) {
+        return FetchOperationOutcome::UnsupportedResponse;
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        // Known oversize: rejected before any streaming.
+        return FetchOperationOutcome::TooLarge;
+    }
+    let mut bytes: Vec<u8> = Vec::with_capacity(MAX_READ_BYTES);
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => return FetchOperationOutcome::CouldNotFetch,
+        };
+        let remaining = MAX_READ_BYTES - bytes.len();
+        let take = remaining.min(chunk.len());
+        bytes.extend_from_slice(&chunk[..take]);
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return FetchOperationOutcome::TooLarge;
+        }
+    }
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => return FetchOperationOutcome::NotValidText,
+    };
+    if validate_safe_text(&text, MAX_RESPONSE_BYTES, true).is_err() {
+        return FetchOperationOutcome::NotValidText;
+    }
+    FetchOperationOutcome::Content(text.into())
+}
+
+fn bind_fetch_outcome(outcome: FetchOperationOutcome) -> ToolExecutionResult {
+    match outcome {
+        FetchOperationOutcome::Content(text) => {
+            // The content already passed the owner's safe-Text and byte gates above, so
+            // a failure here is an owner invariant that fails closed.
+            match ToolResultContent::from_text_parts(vec![text.as_ref().to_owned()]) {
+                Ok(content) => ToolExecutionResult::Completed {
+                    disposition: ToolResultDisposition::Succeeded,
+                    content,
+                },
+                Err(_) => ToolExecutionResult::Abandoned {
+                    reason: ToolAbandonReason::RuntimeFailure,
+                },
+            }
+        }
+        FetchOperationOutcome::CouldNotFetch => completed_failed(FETCH_FAILED_TEXT),
+        FetchOperationOutcome::UnsupportedResponse => completed_failed(UNSUPPORTED_RESPONSE_TEXT),
+        FetchOperationOutcome::TooLarge => completed_failed(TOO_LARGE_TEXT),
+        FetchOperationOutcome::NotValidText => completed_failed(NOT_VALID_TEXT),
+    }
+}
+
+fn completed_failed(text: &str) -> ToolExecutionResult {
+    ToolExecutionResult::Completed {
+        disposition: ToolResultDisposition::Failed,
+        content: ToolResultContent::from_text_parts(vec![text.to_owned()])
+            .expect("the frozen failure texts are valid bounded parts"),
+    }
+}
+
+/// One accepted Content-Type base media type (ADR 0147 decision 10): exactly
+/// `text/plain` or `application/json`, case-insensitive.  Parameters never transcode;
+/// the body bytes must still be valid UTF-8, so the kind is informational only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContentTypeKind {
+    TextPlain,
+    ApplicationJson,
+}
+
+/// Validates the response's Content-Type contract (ADR 0147 decision 10): exactly one
+/// field whose value is valid visible-ASCII header text and parses as
+/// `type "/" subtype` with a case-insensitive base of exactly `text/plain` or
+/// `application/json`, optionally followed by `;`-separated parameters, each a nonempty
+/// `token=token-or-quoted-string` (space/tab OWS allowed around each segment).  A
+/// quoted-string value supports visible ASCII plus space/tab with backslash escapes and
+/// rejects controls, an unclosed quote, and trailing junk after the closing quote.
+fn validate_content_type(response: &reqwest::Response) -> Option<ContentTypeKind> {
+    let mut fields = response
+        .headers()
+        .get_all(reqwest::header::CONTENT_TYPE)
+        .iter();
+    let field = match (fields.next(), fields.next()) {
+        (Some(field), None) => field,
+        // Missing (zero fields) and duplicate fields are both unsupported.
+        _ => return None,
+    };
+    let value = field.to_str().ok()?;
+    let (media_type, parameters) = match value.find(';') {
+        Some(index) => (&value[..index], &value[index + 1..]),
+        None => (value, ""),
+    };
+    // The base media type is exactly `token "/" token` (no OWS): a token cannot
+    // contain space or tab, so any whitespace in the base part is rejected.
+    let (type_name, subtype) = media_type.split_once('/')?;
+    if !is_token(type_name) || !is_token(subtype) {
+        return None;
+    }
+    let kind = if type_name.eq_ignore_ascii_case("text") && subtype.eq_ignore_ascii_case("plain") {
+        ContentTypeKind::TextPlain
+    } else if type_name.eq_ignore_ascii_case("application") && subtype.eq_ignore_ascii_case("json")
+    {
+        ContentTypeKind::ApplicationJson
+    } else {
+        return None;
+    };
+    // A present `;` starts the parameter list, and every segment of it (including an
+    // empty trailing segment) must validate: `text/plain;` is malformed.
+    if value.contains(';') && !validate_content_type_parameters(parameters) {
+        return None;
+    }
+    Some(kind)
+}
+
+/// Scans the `;`-separated parameter list quote-aware (a quoted-string value may
+/// contain `;`) and validates every segment as a nonempty `token=token-or-quoted-
+/// string` with space/tab OWS trimmed around it.
+fn validate_content_type_parameters(parameters: &str) -> bool {
+    let bytes = parameters.as_bytes();
+    let mut start = 0;
+    let mut index = 0;
+    while index <= bytes.len() {
+        if index == bytes.len() || bytes[index] == b';' {
+            let segment = parameters[start..index].trim_matches([' ', '\t']);
+            if !validate_parameter_segment(segment) {
+                return false;
+            }
+            if index == bytes.len() {
+                return true;
+            }
+            start = index + 1;
+            index += 1;
+        } else if bytes[index] == b'"' {
+            // Skip the quoted string (honoring backslash escapes) so a `;` inside it is
+            // not a segment boundary; the segment itself is validated wholesale below.
+            index += 1;
+            loop {
+                if index >= bytes.len() {
+                    return false;
+                }
+                match bytes[index] {
+                    b'\\' => {
+                        index += 2;
+                        if index > bytes.len() {
+                            return false;
+                        }
+                    }
+                    b'"' => {
+                        index += 1;
+                        break;
+                    }
+                    _ => index += 1,
+                }
+            }
+        } else {
+            index += 1;
+        }
+    }
+    false
+}
+
+/// One nonempty `token=token-or-quoted-string` parameter segment (after OWS trim).
+fn validate_parameter_segment(segment: &str) -> bool {
+    if segment.is_empty() {
+        return false;
+    }
+    let Some((name, value)) = segment.split_once('=') else {
+        return false;
+    };
+    is_token(name) && is_parameter_value(value)
+}
+
+fn is_parameter_value(value: &str) -> bool {
+    is_token(value) || is_quoted_string(value)
+}
+
+/// Whether `value` is a full quoted-string: opening `"`, then visible ASCII plus
+/// space/tab (never controls, `"`, or raw `\`) with `\`-escaped pairs (backslash plus
+/// visible ASCII or space/tab), then a closing `"` as the very last character — an
+/// unclosed quote and trailing junk after the closing quote are rejected.
+fn is_quoted_string(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix('"') else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => return index == bytes.len() - 1,
+            b'\\' => {
+                let Some(&escaped) = bytes.get(index + 1) else {
+                    return false;
+                };
+                if !(escaped == b'\t' || escaped == b' ' || (0x21..=0x7e).contains(&escaped)) {
+                    return false;
+                }
+                index += 2;
+            }
+            b'\t' | b' ' | 0x21 | 0x23..=0x5b | 0x5d..=0x7e => index += 1,
+            _ => return false,
+        }
+    }
+    // The closing quote never arrived.
+    false
+}
+
+/// The RFC 7230 token character set; a token is non-empty and all `tchar`.
+fn is_token(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(is_tchar)
+}
+
+fn is_tchar(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+            | b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+    )
+}
+
+/// Validates the response's Content-Encoding contract (ADR 0147 decision 10): zero
+/// fields are allowed; exactly one field is allowed only when its value trimmed and
+/// case-insensitively equals `identity`; duplicates, a comma list, an empty value, and
+/// anything else are unsupported (the client never decompresses).
+fn validate_content_encoding(response: &reqwest::Response) -> bool {
+    let mut fields = response
+        .headers()
+        .get_all(reqwest::header::CONTENT_ENCODING)
+        .iter();
+    match (fields.next(), fields.next()) {
+        (None, _) => true,
+        (Some(field), None) => field
+            .to_str()
+            .is_ok_and(|value| value.trim().eq_ignore_ascii_case("identity")),
+        (Some(_), Some(_)) => false,
+    }
+}
+
+impl fmt::Debug for FetchOperationOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Content(_) => formatter.write_str("FetchOperationOutcome::Content(..)"),
+            Self::CouldNotFetch => formatter.write_str("FetchOperationOutcome::CouldNotFetch"),
+            Self::UnsupportedResponse => {
+                formatter.write_str("FetchOperationOutcome::UnsupportedResponse")
+            }
+            Self::TooLarge => formatter.write_str("FetchOperationOutcome::TooLarge"),
+            Self::NotValidText => formatter.write_str("FetchOperationOutcome::NotValidText"),
+        }
+    }
+}
+
 impl fmt::Debug for AuthorizedFetchUrl {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Fully redacted: the bound URL, hostname, port, and client never print.
@@ -670,7 +1173,9 @@ impl fmt::Debug for FetchUrlResources {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -678,9 +1183,17 @@ mod tests {
 
     use futures_util::FutureExt;
 
+    use crate::tools::{
+        ToolCall, ToolCancellationHandle, ToolCapabilityClass, ToolExecutionOutcome,
+        ToolExecutionPlan, ToolExecutionRequest, ToolExecutionRun, ToolExecutionStart,
+        ToolOutcomeSource, ToolPermissionSet, ToolResultContent, ToolResultDisposition,
+        ToolSandboxAdmissionError, ToolSandboxContract, ToolSet, ToolStartGate,
+    };
+
     use super::*;
 
     const LOOPBACK_HOST: &str = "fetch-url.loopback.test";
+    const ITEM_ID: &str = "itm_00000000000000000000000000000001";
 
     fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
@@ -702,6 +1215,127 @@ mod tests {
     fn example_resources() -> FetchUrlResources {
         FetchUrlResources::materialize([example_origin(v4(127, 0, 0, 1))])
             .expect("the example resources materialize")
+    }
+
+    // ---------- Tool surface and planning helpers ----------
+
+    fn request_for(arguments: &str) -> ToolExecutionRequest {
+        ToolExecutionRequest::new(
+            ITEM_ID.parse().unwrap(),
+            ToolCall::new(
+                "call_fetch".parse().unwrap(),
+                FETCH_URL_NAME.parse().unwrap(),
+                arguments.parse().unwrap(),
+                0,
+            ),
+        )
+    }
+
+    /// Plans one call and returns the frozen PreExecution result; panics on any other shape.
+    fn plan_failure(set: &ToolSet, request: &ToolExecutionRequest) -> ToolExecutionResult {
+        match set.plan(request) {
+            Some(ToolExecutionPlan::PreExecution(result)) => result,
+            _plan => panic!(
+                "expected a PreExecution plan for arguments {}",
+                request.call().arguments().canonical_json()
+            ),
+        }
+    }
+
+    /// Plans one call and panics unless it produces an Execute plan with exactly the
+    /// `Network` permission set.
+    fn assert_plans_execute(set: &ToolSet, request: &ToolExecutionRequest) {
+        match set.plan(request) {
+            Some(ToolExecutionPlan::Execute { permissions, .. }) => {
+                assert_eq!(
+                    permissions,
+                    ToolPermissionSet::new([ToolCapabilityClass::Network])
+                );
+            }
+            _plan => panic!(
+                "expected an Execute plan for arguments {}",
+                request.call().arguments().canonical_json()
+            ),
+        }
+    }
+
+    /// Plans one call and returns its move-only start factory; panics on any other shape.
+    fn plan_start(set: &ToolSet, request: &ToolExecutionRequest) -> ToolExecutionStart {
+        match set.plan(request) {
+            Some(ToolExecutionPlan::Execute { start, .. }) => start,
+            Some(ToolExecutionPlan::PreExecution(result)) => {
+                panic!("expected an Execute plan, got {result:?}")
+            }
+            _plan => panic!("expected an Execute plan"),
+        }
+    }
+
+    /// Drives one Execute plan through the exact proof path to its identity-bound outcome,
+    /// isolated by one spawn like the Session Execution slot's consuming drive.  For
+    /// natural-completion response tests only (the spawned run is driven by the runtime
+    /// while the scripted server answers independently).
+    async fn execute(set: Arc<ToolSet>, request: ToolExecutionRequest) -> ToolExecutionOutcome {
+        let start = plan_start(&set, &request);
+        let proof = ToolStartGate::new(request.clone())
+            .reserve(&request)
+            .expect("the exact request reserves its gate")
+            .start()
+            .expect("the reserved gate starts");
+        let (_handle, observer) = ToolCancellationHandle::new();
+        let run = set
+            .run_started_execution(&request, proof, start, observer)
+            .expect("the exact proof revalidates and the factory constructs the run");
+        tokio::spawn(run).await.expect("the started run settles")
+    }
+
+    /// Awaits one positive server event while the run future is polled in parallel, which
+    /// is what drives the exact send and the body drain forward.  The executor must stay
+    /// pending until the event arrives; it settles first only if the server handshake
+    /// broke, which fails the test with a precise message.  The event is the exit
+    /// condition — never a poll count, sleep, or timeout.
+    async fn await_server_event(
+        run: &mut Pin<Box<ToolExecutionRun>>,
+        event: impl std::future::Future<Output = ()>,
+        what: &'static str,
+    ) {
+        tokio::select! {
+            _ = event => {}
+            _ = run.as_mut() => panic!("the executor settled before {what}"),
+        }
+    }
+
+    /// One loopback authority over a scripted server: the canonical test host pinned to
+    /// the server's exact address.
+    fn loopback_resources(server: &TestLoopbackServer) -> FetchUrlResources {
+        FetchUrlResources::loopback(LOOPBACK_HOST, server.addr())
+            .expect("the loopback authority materializes")
+    }
+
+    /// The exact same-origin URL for one loopback server and path.
+    fn loopback_url(server: &TestLoopbackServer, path: &str) -> String {
+        format!("http://{LOOPBACK_HOST}:{}/{path}", server.addr().port())
+    }
+
+    fn outcome_content(outcome: &ToolExecutionOutcome) -> &ToolResultContent {
+        match outcome {
+            ToolExecutionOutcome::Completed { content, .. } => content,
+            _ => panic!("expected a Completed outcome"),
+        }
+    }
+
+    /// The exact frozen PreExecution result for one text.
+    fn preexecution_failed_text(text: &str) -> ToolExecutionResult {
+        ToolExecutionResult::PreExecution {
+            disposition: ToolResultDisposition::Failed,
+            content: ToolResultContent::from_text_parts(vec![text.to_owned()]).unwrap(),
+        }
+    }
+
+    fn preexecution_denied_text(text: &str) -> ToolExecutionResult {
+        ToolExecutionResult::PreExecution {
+            disposition: ToolResultDisposition::Denied,
+            content: ToolResultContent::from_text_parts(vec![text.to_owned()]).unwrap(),
+        }
     }
 
     #[test]
@@ -1272,6 +1906,241 @@ mod tests {
         );
     }
 
+    // ---------- Tool surface and planning ----------
+
+    #[test]
+    fn builtin_defines_exactly_fetch_url_with_the_frozen_description_and_closed_schema() {
+        let resources = example_resources();
+        let set = build_tool_set(Arc::new(resources));
+
+        let definitions = set.definitions();
+        assert_eq!(definitions.len(), 1);
+        let definition = &definitions[0];
+        assert_eq!(definition.name().as_str(), FETCH_URL_NAME);
+        assert_eq!(definition.mode(), ToolExecutionMode::Parallel);
+        // The frozen description is documented by this assertion: any edit to the disclosed
+        // description must be reflected here deliberately (ADR 0147 decision 1, verbatim).
+        assert_eq!(definition.spec.description.as_ref(), FETCH_URL_DESCRIPTION);
+
+        // The prompt view discloses exactly the same single spec (name, description,
+        // closed schema); planner and sandbox internals never enter the model context.
+        let view = set.prompt_view();
+        assert!(!view.is_empty());
+        assert_eq!(view.specs().len(), 1);
+        assert_eq!(view.specs()[0].name().as_str(), FETCH_URL_NAME);
+        assert_eq!(view.specs()[0].description(), FETCH_URL_DESCRIPTION);
+
+        // The disclosed schema is exactly the frozen schema: canonical bytes round-trip to
+        // the same semantic value and stay within the bounded schema limit.
+        let schema = view.specs()[0].input_schema();
+        assert_eq!(
+            schema.canonical_json(),
+            FETCH_URL_SCHEMA
+                .parse::<crate::wire::BoundedJsonSchema>()
+                .unwrap()
+                .canonical_json()
+        );
+        assert!(
+            schema.canonical_bytes().len()
+                <= crate::wire::ProtocolLimits::v1_0()
+                    .embedded_json
+                    .schema
+                    .max_encoded_bytes as usize
+        );
+
+        // The canonical disclosure is a closed object with exactly one required `url`
+        // string capped at 4,096 bytes (the semantic authorize gate is the authority).
+        let canonical: serde_json::Value =
+            serde_json::from_str(schema.canonical_json()).expect("the schema is valid JSON");
+        let root = canonical.as_object().expect("the schema root is an object");
+        assert_eq!(
+            root.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(root.get("required"), Some(&serde_json::json!(["url"])));
+        let properties = root
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("the schema discloses properties");
+        assert_eq!(
+            properties.len(),
+            1,
+            "the builtin discloses exactly one property"
+        );
+        assert_eq!(
+            properties.get("url"),
+            Some(&serde_json::json!({"type": "string", "maxLength": 4096}))
+        );
+    }
+
+    #[test]
+    fn fetch_url_declares_exactly_network_parallel_mode_and_an_exact_sandbox_contract() {
+        let resources = example_resources();
+        let set = build_tool_set(Arc::new(resources));
+
+        assert_eq!(set.definitions()[0].mode(), ToolExecutionMode::Parallel);
+
+        // The Execute plan's final permission set is exactly Network.
+        let request = request_for(r#"{"url":"https://example.com/some/path"}"#);
+        match set.plan(&request) {
+            Some(ToolExecutionPlan::Execute { permissions, .. }) => {
+                assert_eq!(
+                    permissions,
+                    ToolPermissionSet::new([ToolCapabilityClass::Network])
+                );
+                assert!(permissions.contains(ToolCapabilityClass::Network));
+                assert!(!permissions.contains(ToolCapabilityClass::FilesystemRead));
+                assert!(!permissions.contains(ToolCapabilityClass::FilesystemWrite));
+                assert!(!permissions.contains(ToolCapabilityClass::Process));
+            }
+            _ => panic!("the valid call plans an Execute shape"),
+        }
+
+        // The captured sandbox contract is available exactly for Network, so the
+        // planner's own admission passes and every other class fails closed.
+        let sandbox = &set.inner.sandbox;
+        assert_eq!(
+            *sandbox,
+            ToolSandboxContract::available([ToolCapabilityClass::Network])
+        );
+        assert!(
+            sandbox
+                .admit(ToolPermissionSet::new([ToolCapabilityClass::Network]))
+                .is_ok()
+        );
+        assert!(matches!(
+            sandbox.admit(ToolPermissionSet::new([
+                ToolCapabilityClass::FilesystemRead
+            ])),
+            Err(ToolSandboxAdmissionError::CapabilityGap { .. })
+        ));
+        assert!(
+            set.plan(&request)
+                .is_some_and(|plan| matches!(plan, ToolExecutionPlan::Execute { .. }))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parse_and_semantic_failures_settle_the_frozen_preexecution_failed_result() {
+        let server = TestLoopbackServer::spawn();
+        let resources = loopback_resources(&server);
+        let set = build_tool_set(Arc::new(resources));
+        let invalid = vec![
+            // Structural parse failures at every layer.
+            "{}".to_owned(),
+            r#"{"url":"https://example.com/","extra":1}"#.to_owned(),
+            r#"{"Url":"https://example.com/"}"#.to_owned(),
+            r#"{"url":null}"#.to_owned(),
+            r#"{"url":1}"#.to_owned(),
+            r#"{"url":true}"#.to_owned(),
+            r#"{"url":[]}"#.to_owned(),
+            r#"{"url":{}}"#.to_owned(),
+            // The semantic authorize gate: empty, non-absolute, userinfo, fragment, and
+            // the WHATWG parser-recovery spellings are all invalid arguments, never a
+            // denial (ADR 0147 decisions 1 and 4).
+            r#"{"url":""}"#.to_owned(),
+            r#"{"url":"not a url"}"#.to_owned(),
+            r#"{"url":"https://user@example.com/"}"#.to_owned(),
+            r#"{"url":"https://user:pass@example.com/"}"#.to_owned(),
+            r#"{"url":"https://@example.com/"}"#.to_owned(),
+            r#"{"url":"https://:@example.com/"}"#.to_owned(),
+            r#"{"url":"https:/@example.com/"}"#.to_owned(),
+            r#"{"url":"https:example.com"}"#.to_owned(),
+            r#"{"url":"https://example.com/#frag"}"#.to_owned(),
+            r#"{"url":"https://example.com/path#frag"}"#.to_owned(),
+            r#"{"url":"https://example.com/\u0001"}"#.to_owned(),
+            format!(r#"{{"url":"https://example.com/{}"}}"#, "a".repeat(4200)),
+        ];
+
+        for (index, arguments) in invalid.iter().enumerate() {
+            let request = request_for(arguments);
+            let result = plan_failure(&set, &request);
+            assert_eq!(
+                result,
+                preexecution_failed_text(INVALID_ARGUMENTS_TEXT),
+                "arguments #{index} {arguments:?} must settle the frozen failed pre-execution result"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_exact_origin_authority_settles_the_frozen_preexecution_denied_result() {
+        let server = TestLoopbackServer::spawn();
+        let port = server.addr().port();
+        let resources = loopback_resources(&server);
+        let set = build_tool_set(Arc::new(resources));
+        for (arguments, reason) in [
+            (
+                r#"{"url":"https://example.com/"}"#.to_owned(),
+                "foreign host",
+            ),
+            (
+                format!(r#"{{"url":"http://{LOOPBACK_HOST}:{}/"}}"#, port + 1),
+                "foreign port",
+            ),
+            (
+                format!(r#"{{"url":"https://{LOOPBACK_HOST}:{}/"}}"#, port),
+                "foreign scheme",
+            ),
+            (
+                format!(r#"{{"url":"http://sub.{LOOPBACK_HOST}:{}/"}}"#, port),
+                "subdomain",
+            ),
+            (
+                format!(r#"{{"url":"http://127.0.0.1:{}/"}}"#, port),
+                "IP literal",
+            ),
+        ] {
+            let request = request_for(&arguments);
+            let result = plan_failure(&set, &request);
+            assert_eq!(
+                result,
+                preexecution_denied_text(NETWORK_DENIED_TEXT),
+                "{reason} ({arguments}) must settle the frozen denied pre-execution result"
+            );
+        }
+
+        // A denied URL never produces a start factory: the exact request's gate still
+        // accepts its single reservation and start exactly like a never-touched gate.
+        let denied = request_for(&format!(
+            r#"{{"url":"http://{LOOPBACK_HOST}:{}/"}}"#,
+            port + 1
+        ));
+        let gate = ToolStartGate::new(denied.clone());
+        assert!(gate.reserve(&denied).unwrap().start().is_ok());
+
+        // The same loopback origin authorizes its exact path/query (case-folded host,
+        // explicit port): denial is exact per origin, never per path.
+        assert_plans_execute(
+            &set,
+            &request_for(&format!(
+                r#"{{"url":"{}"}}"#,
+                loopback_url(&server, "some/path?q=1")
+            )),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn valid_authorized_plan_executes_exactly_network_and_the_executor_never_sends_at_plan_time()
+     {
+        let server = TestLoopbackServer::spawn();
+        let resources = loopback_resources(&server);
+        let set = build_tool_set(Arc::new(resources));
+        let request = request_for(&format!(
+            r#"{{"url":"{}"}}"#,
+            loopback_url(&server, "plan-only/path")
+        ));
+
+        // Planning authorizes and constructs the move-only start factory; the exact send
+        // is owned by the executor and no connection exists yet.
+        assert_plans_execute(&set, &request);
+        let _start = plan_start(&set, &request);
+        assert!(
+            server.captured().is_empty(),
+            "the planner must never send: zero requests reach the wire at plan time"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn reject_all_resolver_client_fails_closed_without_ambient_dns() {
         let client = crate::http_transport::client_builder()
@@ -1477,6 +2346,755 @@ mod tests {
         );
     }
 
+    // ---------- Response policy matrix ----------
+
+    /// One 200 response head with the given extra header lines and Content-Length.
+    fn ok_head(extra_headers: &str, body_len: usize) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\n{extra_headers}Content-Length: {body_len}\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    /// A 200 response head with the given extra header lines and chunked framing.
+    fn chunked_head(extra_headers: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\n{extra_headers}Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    /// Encodes `body` as HTTP/1.1 chunked framing in 8,192-byte chunks, ending with the
+    /// terminal zero chunk.
+    fn chunked_body(body: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(body.len() + 64);
+        for chunk in body.chunks(8192) {
+            encoded.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            encoded.extend_from_slice(chunk);
+            encoded.extend_from_slice(b"\r\n");
+        }
+        encoded.extend_from_slice(b"0\r\n\r\n");
+        encoded
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_2xx_text_plain_and_application_json_bodies_are_returned_verbatim() {
+        let cases: &[(&str, &[u8])] = &[
+            // text/plain with parameters (charset never transcodes; bytes stay UTF-8).
+            ("Content-Type: text/plain\r\n", b"hello world"),
+            (
+                "Content-Type: text/plain; charset=utf-8\r\n",
+                "plain é".as_bytes(),
+            ),
+            ("Content-Type: TEXT/PLAIN;charset=utf-8\r\n", b"case folded"),
+            ("Content-Type: application/json\r\n", b"{\"a\":1}"),
+            (
+                "Content-Type: application/json; charset=UTF-8\r\n",
+                b"[1,2,3]",
+            ),
+            (
+                "Content-Type: text/plain; note=\"a;b\"; charset=utf-8\r\n",
+                b"quoted semicolon",
+            ),
+            (
+                "Content-Type: text/plain; boundary=xyz; x=1\r\n",
+                b"multiple params",
+            ),
+            // Empty body: exactly one empty Text part.
+            ("Content-Type: text/plain\r\n", b""),
+        ];
+        for (index, (content_type, body)) in cases.iter().enumerate() {
+            let mut server = TestLoopbackServer::spawn_with(ServerScript::Respond {
+                head: ok_head(content_type, body.len()),
+                body: body.to_vec(),
+            });
+            let set = build_tool_set(Arc::new(loopback_resources(&server)));
+            let outcome = execute(
+                set,
+                request_for(&format!(
+                    r#"{{"url":"{}"}}"#,
+                    loopback_url(&server, "exact")
+                )),
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    ToolExecutionOutcome::Completed {
+                        source: ToolOutcomeSource::Executed,
+                        disposition: ToolResultDisposition::Succeeded,
+                        ref content,
+                        ..
+                    } if content.parts().len() == 1
+                        && content.parts()[0].as_text().as_bytes() == *body
+                ),
+                "case #{index} must return the exact body bytes as one Text part: {outcome:?}"
+            );
+            server.wait_finished().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn content_type_matrix_settles_the_frozen_unsupported_text() {
+        // Missing, duplicate, malformed, and unsupported Content-Type fields all settle
+        // the same frozen Completed + Failed text; the response body is never read or
+        // disclosed, so each case can carry a secret body that must never surface.
+        let secret_body = b"SECRET-CONTENT-TYPE-BODY";
+        let cases: Vec<String> = vec![
+            // Missing field entirely.
+            "".to_owned(),
+            // Duplicate fields.
+            "Content-Type: text/plain\r\nContent-Type: text/plain\r\n".to_owned(),
+            // Unsupported base media types.
+            "Content-Type: text/html\r\n".to_owned(),
+            "Content-Type: application/pdf\r\n".to_owned(),
+            "Content-Type: text/plain+extra\r\n".to_owned(),
+            "Content-Type: text\r\n".to_owned(),
+            "Content-Type: text/plain/extra\r\n".to_owned(),
+            "Content-Type: /plain\r\n".to_owned(),
+            "Content-Type: text/\r\n".to_owned(),
+            "Content-Type: text /plain\r\n".to_owned(),
+            // Malformed parameter lists.
+            "Content-Type: text/plain;\r\n".to_owned(),
+            "Content-Type: text/plain; charset\r\n".to_owned(),
+            "Content-Type: text/plain; =utf-8\r\n".to_owned(),
+            "Content-Type: text/plain; charset=\r\n".to_owned(),
+            "Content-Type: text/plain; charset=\"unclosed\r\n".to_owned(),
+            "Content-Type: text/plain; charset=utf-8 junk\r\n".to_owned(),
+            "Content-Type: text/plain; charset=\"a\"x\r\n".to_owned(),
+            // A raw control byte in the header value (e.g. the backspace 0x08) is
+            // rejected by hyper's HTTP/1 parser before reqwest ever builds a Response,
+            // so it is a transport failure, not a Content-Type validator case: see
+            // `a_raw_control_byte_in_a_response_header_maps_to_could_not_fetch`.
+        ];
+        for (index, content_type) in cases.iter().enumerate() {
+            let head = ok_head(content_type, secret_body.len());
+            let mut server = TestLoopbackServer::spawn_with(ServerScript::Respond {
+                head,
+                body: secret_body.to_vec(),
+            });
+            let set = build_tool_set(Arc::new(loopback_resources(&server)));
+            let outcome = execute(
+                set,
+                request_for(&format!(r#"{{"url":"{}"}}"#, loopback_url(&server, "type"))),
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    ToolExecutionOutcome::Completed {
+                        source: ToolOutcomeSource::Executed,
+                        disposition: ToolResultDisposition::Failed,
+                        ref content,
+                        ..
+                    } if content.parts().len() == 1
+                        && content.parts()[0].as_text() == UNSUPPORTED_RESPONSE_TEXT
+                ),
+                "Content-Type case #{index} {content_type:?} must settle the frozen unsupported result"
+            );
+            assert!(
+                !outcome_content(&outcome).parts()[0]
+                    .as_text()
+                    .contains("SECRET"),
+                "case #{index} must never disclose the unread body"
+            );
+            server.wait_finished().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn content_encoding_matrix_settles_identity_or_the_frozen_unsupported_text() {
+        // Absent and exactly-one identity (trim, case-insensitive) succeed; duplicates, a
+        // comma list, an empty value, and any real coding settle the frozen unsupported
+        // text without reading the body.
+        let body = b"encoding body";
+        let succeeded: &[&str] = &[
+            "",
+            "Content-Encoding: identity\r\n",
+            "Content-Encoding: Identity\r\n",
+            "Content-Encoding:  identity  \r\n",
+        ];
+        for (index, encoding) in succeeded.iter().enumerate() {
+            let mut server = TestLoopbackServer::spawn_with(ServerScript::Respond {
+                head: ok_head(
+                    &format!("Content-Type: text/plain\r\n{encoding}"),
+                    body.len(),
+                ),
+                body: body.to_vec(),
+            });
+            let set = build_tool_set(Arc::new(loopback_resources(&server)));
+            let outcome = execute(
+                set,
+                request_for(&format!(
+                    r#"{{"url":"{}"}}"#,
+                    loopback_url(&server, "encoding")
+                )),
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    ToolExecutionOutcome::Completed {
+                        source: ToolOutcomeSource::Executed,
+                        disposition: ToolResultDisposition::Succeeded,
+                        ref content,
+                        ..
+                    } if content.parts().len() == 1
+                        && content.parts()[0].as_text() == "encoding body"
+                ),
+                "encoding case #{index} {encoding:?} must succeed"
+            );
+            server.wait_finished().await;
+        }
+        let rejected: &[&str] = &[
+            "Content-Encoding: gzip\r\n",
+            "Content-Encoding: br\r\n",
+            "Content-Encoding: identity\r\nContent-Encoding: identity\r\n",
+            "Content-Encoding: gzip\r\nContent-Encoding: identity\r\n",
+            "Content-Encoding: identity, gzip\r\n",
+            "Content-Encoding: \r\n",
+        ];
+        for (index, encoding) in rejected.iter().enumerate() {
+            let mut server = TestLoopbackServer::spawn_with(ServerScript::Respond {
+                head: ok_head(
+                    &format!("Content-Type: text/plain\r\n{encoding}"),
+                    body.len(),
+                ),
+                body: body.to_vec(),
+            });
+            let set = build_tool_set(Arc::new(loopback_resources(&server)));
+            let outcome = execute(
+                set,
+                request_for(&format!(
+                    r#"{{"url":"{}"}}"#,
+                    loopback_url(&server, "encoding")
+                )),
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    ToolExecutionOutcome::Completed {
+                        source: ToolOutcomeSource::Executed,
+                        disposition: ToolResultDisposition::Failed,
+                        ref content,
+                        ..
+                    } if content.parts().len() == 1
+                        && content.parts()[0].as_text() == UNSUPPORTED_RESPONSE_TEXT
+                ),
+                "encoding case #{index} {encoding:?} must settle the frozen unsupported result"
+            );
+            server.wait_finished().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_2xx_responses_never_disclose_body_status_or_headers() {
+        // A 404 with a secret body, a 500, and a 301 with a secret Location all settle the
+        // one frozen could-not-fetch text; the body, status, and headers are never read
+        // into any model-visible result.
+        let cases: &[&str] = &[
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\n",
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n",
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: https://secret-evil.example/\r\nContent-Length: 13\r\n\r\n",
+        ];
+        for (index, head) in cases.iter().enumerate() {
+            let mut server = TestLoopbackServer::spawn_with(ServerScript::Respond {
+                head: (*head).to_owned(),
+                body: b"SECRET-404-BODY".to_vec(),
+            });
+            let set = build_tool_set(Arc::new(loopback_resources(&server)));
+            let outcome = execute(
+                set,
+                request_for(&format!(
+                    r#"{{"url":"{}"}}"#,
+                    loopback_url(&server, "missing")
+                )),
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    ToolExecutionOutcome::Completed {
+                        source: ToolOutcomeSource::Executed,
+                        disposition: ToolResultDisposition::Failed,
+                        ref content,
+                        ..
+                    } if content.parts().len() == 1
+                        && content.parts()[0].as_text() == FETCH_FAILED_TEXT
+                ),
+                "non-2xx case #{index} must settle the frozen could-not-fetch result"
+            );
+            let disclosed = outcome_content(&outcome).parts()[0].as_text();
+            assert!(
+                !disclosed.contains("SECRET")
+                    && !disclosed.contains("404")
+                    && !disclosed.contains("secret-evil"),
+                "case #{index} must never disclose body/status/header content"
+            );
+            server.wait_finished().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_65536_byte_boundary_succeeds_and_65537_is_too_large() {
+        // Exactly 65,536 bytes (declared and streamed) succeeds as one Text part.
+        let boundary = "x".repeat(MAX_RESPONSE_BYTES);
+        let mut server = TestLoopbackServer::spawn_with(ServerScript::Respond {
+            head: ok_head("Content-Type: text/plain\r\n", boundary.len()),
+            body: boundary.as_bytes().to_vec(),
+        });
+        let set = build_tool_set(Arc::new(loopback_resources(&server)));
+        let outcome = execute(
+            set,
+            request_for(&format!(
+                r#"{{"url":"{}"}}"#,
+                loopback_url(&server, "boundary")
+            )),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::Completed {
+                source: ToolOutcomeSource::Executed,
+                disposition: ToolResultDisposition::Succeeded,
+                ref content,
+                ..
+            } if content.parts().len() == 1 && content.parts()[0].as_text() == boundary
+        ));
+        server.wait_finished().await;
+
+        // 65,537 bytes without a known Content-Length (chunked framing) is stopped at the
+        // bound while streaming: the frozen too-large text.
+        let oversized = "y".repeat(MAX_READ_BYTES);
+        let mut server = TestLoopbackServer::spawn_with(ServerScript::Respond {
+            head: chunked_head("Content-Type: text/plain\r\n"),
+            body: chunked_body(oversized.as_bytes()),
+        });
+        let set = build_tool_set(Arc::new(loopback_resources(&server)));
+        let outcome = execute(
+            set,
+            request_for(&format!(
+                r#"{{"url":"{}"}}"#,
+                loopback_url(&server, "oversized-stream")
+            )),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::Completed {
+                source: ToolOutcomeSource::Executed,
+                disposition: ToolResultDisposition::Failed,
+                ref content,
+                ..
+            } if content.parts().len() == 1 && content.parts()[0].as_text() == TOO_LARGE_TEXT
+        ));
+        server.wait_finished().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_known_content_length_above_the_bound_is_rejected_before_any_streaming() {
+        // The server declares Content-Length: 65537 and then sends zero body bytes while
+        // keeping the connection open: the executor settles the frozen too-large result
+        // from the headers alone.  If it tried to stream, it would wait forever for body
+        // bytes that never arrive, so the prompt settlement itself is the proof of the
+        // reject-before-streaming rule (deterministic, no timeout).
+        let mut server = TestLoopbackServer::spawn_with(ServerScript::RespondThenStall {
+            head: ok_head("Content-Type: text/plain\r\n", MAX_READ_BYTES),
+            body_prefix: Vec::new(),
+        });
+        let set = build_tool_set(Arc::new(loopback_resources(&server)));
+        let outcome = execute(
+            set,
+            request_for(&format!(
+                r#"{{"url":"{}"}}"#,
+                loopback_url(&server, "known-oversize")
+            )),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::Completed {
+                source: ToolOutcomeSource::Executed,
+                disposition: ToolResultDisposition::Failed,
+                ref content,
+                ..
+            } if content.parts().len() == 1 && content.parts()[0].as_text() == TOO_LARGE_TEXT
+        ));
+        server.release();
+        server.wait_finished().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_utf8_and_unsafe_text_settle_the_frozen_not_valid_text() {
+        let cases: &[&[u8]] = &[&[0xc3, 0x28, 0xff, 0xfe], b"control \x01 byte".as_slice()];
+        for (index, body) in cases.iter().enumerate() {
+            let mut server = TestLoopbackServer::spawn_with(ServerScript::Respond {
+                head: ok_head("Content-Type: text/plain\r\n", body.len()),
+                body: body.to_vec(),
+            });
+            let set = build_tool_set(Arc::new(loopback_resources(&server)));
+            let outcome = execute(
+                set,
+                request_for(&format!(r#"{{"url":"{}"}}"#, loopback_url(&server, "text"))),
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    ToolExecutionOutcome::Completed {
+                        source: ToolOutcomeSource::Executed,
+                        disposition: ToolResultDisposition::Failed,
+                        ref content,
+                        ..
+                    } if content.parts().len() == 1
+                        && content.parts()[0].as_text() == NOT_VALID_TEXT
+                ),
+                "body case #{index} must settle the frozen not-valid-text result"
+            );
+            server.wait_finished().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_early_fin_body_stream_error_settles_the_frozen_could_not_fetch_text() {
+        // The server declares Content-Length: 100, writes 10 bytes, and closes: the body
+        // stream errors mid-read and settles the frozen could-not-fetch text.
+        let mut server = TestLoopbackServer::spawn_with(ServerScript::Abort {
+            head: ok_head("Content-Type: text/plain\r\n", 100),
+            body_prefix: b"partial body".to_vec(),
+        });
+        let set = build_tool_set(Arc::new(loopback_resources(&server)));
+        let outcome = execute(
+            set,
+            request_for(&format!(
+                r#"{{"url":"{}"}}"#,
+                loopback_url(&server, "abort")
+            )),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::Completed {
+                source: ToolOutcomeSource::Executed,
+                disposition: ToolResultDisposition::Failed,
+                ref content,
+                ..
+            } if content.parts().len() == 1 && content.parts()[0].as_text() == FETCH_FAILED_TEXT
+        ));
+        server.wait_finished().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_raw_control_byte_in_a_response_header_maps_to_could_not_fetch() {
+        // The server writes a header value containing a raw backspace byte (0x08):
+        // hyper's HTTP/1 parser rejects the invalid header value while parsing the
+        // response head — before reqwest ever builds a Response — so the failure
+        // surfaces from the send/stream and maps to the frozen could-not-fetch text
+        // (transport), never to the Content-Type validator (which only ever sees
+        // parsed, valid header values).
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=ut\u{8}-8\r\nContent-Length: 4\r\nConnection: close\r\n\r\n"
+            .to_owned();
+        let mut server = TestLoopbackServer::spawn_with(ServerScript::Respond {
+            head,
+            body: b"body".to_vec(),
+        });
+        let set = build_tool_set(Arc::new(loopback_resources(&server)));
+        let outcome = execute(
+            set,
+            request_for(&format!(
+                r#"{{"url":"{}"}}"#,
+                loopback_url(&server, "bad-header")
+            )),
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                ToolExecutionOutcome::Completed {
+                    source: ToolOutcomeSource::Executed,
+                    disposition: ToolResultDisposition::Failed,
+                    ref content,
+                    ..
+                } if content.parts().len() == 1
+                    && content.parts()[0].as_text() == FETCH_FAILED_TEXT
+            ),
+            "a raw control byte in a response header is a transport failure: {outcome:?}"
+        );
+        server.wait_finished().await;
+    }
+
+    // ---------- Cancellation and lifecycle ----------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_before_the_send_is_polled_proves_zero_get() {
+        let server = TestLoopbackServer::spawn();
+        let set = build_tool_set(Arc::new(loopback_resources(&server)));
+        let request = request_for(&format!(
+            r#"{{"url":"{}"}}"#,
+            loopback_url(&server, "never-sent")
+        ));
+
+        let start = plan_start(&set, &request);
+        let proof = ToolStartGate::new(request.clone())
+            .reserve(&request)
+            .expect("the exact request reserves its gate")
+            .start()
+            .expect("the reserved gate starts");
+        // The operation's own pair is already cancelled before the executor future is
+        // ever constructed: the biased select must win with the exact frozen Cancelled
+        // text without ever polling the operation future, so zero GET is provable.
+        let (handle, observer) = ToolCancellationHandle::new();
+        handle.cancel();
+        let run = set
+            .run_started_execution(&request, proof, start, observer)
+            .expect("the exact proof revalidates and the factory constructs the run");
+        let outcome = tokio::spawn(run).await.expect("the run settles");
+
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: ToolResultDisposition::Cancelled,
+                ref content,
+            } if item_id == request.item_id()
+                && tool_call_id == *request.call().tool_call_id()
+                && content.parts().len() == 1
+                && content.parts()[0].as_text() == FETCH_CANCELLED_TEXT
+        ));
+        assert!(
+            server.captured().is_empty(),
+            "a pre-cancelled token must never poll the operation: zero GET reaches the wire"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_mid_headers_drops_the_exact_send_state_and_closes_the_connection() {
+        // The server captures the request and then writes nothing until released: the
+        // executor is mid-send (headers never arrive) when the cancellation arrives.
+        let mut server = TestLoopbackServer::spawn_with(ServerScript::Stall);
+        let set = build_tool_set(Arc::new(loopback_resources(&server)));
+        let request = request_for(&format!(
+            r#"{{"url":"{}"}}"#,
+            loopback_url(&server, "stall")
+        ));
+        let start = plan_start(&set, &request);
+        let proof = ToolStartGate::new(request.clone())
+            .reserve(&request)
+            .expect("the exact request reserves its gate")
+            .start()
+            .expect("the reserved gate starts");
+        let (handle, observer) = ToolCancellationHandle::new();
+        let run = set
+            .run_started_execution(&request, proof, start, observer)
+            .expect("the exact proof revalidates and the factory constructs the run");
+        let mut run = Box::pin(run);
+
+        // Deterministic handshake: poll the run until the server's request-captured
+        // event fires (the connection is established and the send awaits response
+        // headers; the server wrote nothing yet, so the executor cannot settle).
+        await_server_event(
+            &mut run,
+            server.capture_event(),
+            "the server captured the request",
+        )
+        .await;
+        assert_eq!(server.captured().len(), 1);
+        handle.cancel();
+        let outcome = run.await;
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::Completed {
+                source: ToolOutcomeSource::Executed,
+                disposition: ToolResultDisposition::Cancelled,
+                ref content,
+                ..
+            } if content.parts().len() == 1 && content.parts()[0].as_text() == FETCH_CANCELLED_TEXT
+        ));
+
+        // Cleanup evidence is the positive EOF/closed event: releasing the stall lets
+        // the server observe the peer.  The dropped send future tears down hyper's
+        // connection task (Connection: close plus the zero idle pool forbid handing it
+        // to a later call), so the server must observe the client closed the
+        // connection, and the finished event only resolves after that observation.  The
+        // guardrail timeout is a failure fence only — it never supplies evidence.
+        server.release();
+        server.wait_finished().await;
+        assert!(
+            server.eof_observed(),
+            "the cancelled send must close the connection"
+        );
+        assert_eq!(
+            server.captured().len(),
+            1,
+            "no second request may ever be sent"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_mid_body_drops_the_response_stream_and_closes_the_connection() {
+        // The server writes the full headers plus a 10-byte body prefix and then stalls:
+        // the body-prefix-written event proves the response head and the first body
+        // bytes are on the wire, so the cancellation arrives while the executor is
+        // mid-operation — still awaiting the response head or inside the bounded body
+        // drain — and it can never settle (the declared body is incomplete and the
+        // connection stays open until released).
+        let mut server = TestLoopbackServer::spawn_with(ServerScript::RespondThenStall {
+            head: ok_head("Content-Type: text/plain\r\n", 100),
+            body_prefix: b"0123456789".to_vec(),
+        });
+        let set = build_tool_set(Arc::new(loopback_resources(&server)));
+        let request = request_for(&format!(
+            r#"{{"url":"{}"}}"#,
+            loopback_url(&server, "stall-body")
+        ));
+        let start = plan_start(&set, &request);
+        let proof = ToolStartGate::new(request.clone())
+            .reserve(&request)
+            .expect("the exact request reserves its gate")
+            .start()
+            .expect("the reserved gate starts");
+        let (handle, observer) = ToolCancellationHandle::new();
+        let run = set
+            .run_started_execution(&request, proof, start, observer)
+            .expect("the exact proof revalidates and the factory constructs the run");
+        let mut run = Box::pin(run);
+
+        // Deterministic handshake: the request-captured event proves the send is on the
+        // wire, and the body-prefix-written event proves the response head and the first
+        // body bytes are on the wire too.  The executor cannot settle before the events
+        // arrive (the server writes nothing before capture, and the body stays
+        // incomplete), so the events pin the cancellation to the mid-operation phase.
+        await_server_event(
+            &mut run,
+            server.capture_event(),
+            "the server captured the request",
+        )
+        .await;
+        assert_eq!(server.captured().len(), 1);
+        await_server_event(
+            &mut run,
+            server.body_prefix_event(),
+            "the server wrote the body prefix",
+        )
+        .await;
+        handle.cancel();
+        let outcome = run.await;
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::Completed {
+                source: ToolOutcomeSource::Executed,
+                disposition: ToolResultDisposition::Cancelled,
+                ref content,
+                ..
+            } if content.parts().len() == 1 && content.parts()[0].as_text() == FETCH_CANCELLED_TEXT
+        ));
+
+        // Cleanup evidence is the positive EOF/closed event, exactly as in the
+        // mid-headers test: releasing the stall lets the server observe the peer, and
+        // the finished event only resolves after the dropped response stream closed the
+        // connection.
+        server.release();
+        server.wait_finished().await;
+        assert!(
+            server.eof_observed(),
+            "the dropped response stream must close the connection"
+        );
+        assert_eq!(
+            server.captured().len(),
+            1,
+            "no second request may ever be sent"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_natural_result_is_never_rewritten_by_a_late_cancellation() {
+        // The scripted body is exactly 16 bytes and the head declares Content-Length: 16,
+        // so the natural completion reads the full declared body (a mismatched length
+        // would surface as a body-stream error instead of the natural success).
+        let mut server = TestLoopbackServer::spawn_with(ServerScript::Respond {
+            head: ok_head("Content-Type: text/plain\r\n", 16),
+            body: b"late-cancel-body".to_vec(),
+        });
+        let set = build_tool_set(Arc::new(loopback_resources(&server)));
+        let request = request_for(&format!(
+            r#"{{"url":"{}"}}"#,
+            loopback_url(&server, "natural")
+        ));
+        let start = plan_start(&set, &request);
+        let proof = ToolStartGate::new(request.clone())
+            .reserve(&request)
+            .expect("the exact request reserves its gate")
+            .start()
+            .expect("the reserved gate starts");
+        let (handle, observer) = ToolCancellationHandle::new();
+        let run = set
+            .run_started_execution(&request, proof, start, observer)
+            .expect("the exact proof revalidates and the factory constructs the run");
+        let run = Box::pin(run);
+
+        // Drive the natural completion to its terminal outcome first, then cancel: the
+        // mapped natural result must stay untouched by the late cancellation.
+        let outcome = run.await;
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::Completed {
+                source: ToolOutcomeSource::Executed,
+                disposition: ToolResultDisposition::Succeeded,
+                ref content,
+                ..
+            } if content.parts().len() == 1 && content.parts()[0].as_text() == "late-cancel-body"
+        ));
+        handle.cancel();
+        assert!(
+            matches!(
+                outcome,
+                ToolExecutionOutcome::Completed {
+                    disposition: ToolResultDisposition::Succeeded,
+                    ref content,
+                    ..
+                } if content.parts().len() == 1
+                    && content.parts()[0].as_text() == "late-cancel-body"
+            ),
+            "the late cancellation must never rewrite the mapped natural result"
+        );
+        server.wait_finished().await;
+    }
+
+    #[test]
+    fn the_fixed_transport_timeouts_are_the_frozen_adr_0147_constants() {
+        // The fixed 10s connect / 30s request timeouts are frozen constants (ADR 0147
+        // decision 9).  The timeout behavior itself is not wall-clock-tested: a
+        // transport failure already has focused wire evidence in
+        // `transport_error_before_any_server_contact_maps_to_could_not_fetch`, and a
+        // paused tokio clock cannot drive hyper's real socket/timer machinery
+        // deterministically.
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_error_before_any_server_contact_maps_to_could_not_fetch() {
+        // A pinned client whose address has nothing listening fails at connect: the
+        // transport error maps to the frozen could-not-fetch text, and no retry happens
+        // (exactly one refused connection attempt).
+        let resources =
+            FetchUrlResources::loopback(LOOPBACK_HOST, SocketAddr::new(v4(127, 0, 0, 1), 1))
+                .expect("the loopback authority materializes");
+        let set = build_tool_set(Arc::new(resources));
+        let request = request_for(&format!(r#"{{"url":"http://{LOOPBACK_HOST}:1/refused"}}"#));
+        let outcome = execute(set, request).await;
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::Completed {
+                source: ToolOutcomeSource::Executed,
+                disposition: ToolResultDisposition::Failed,
+                ref content,
+                ..
+            } if content.parts().len() == 1 && content.parts()[0].as_text() == FETCH_FAILED_TEXT
+        ));
+    }
+
     /// One captured client request line plus lowercased headers.
     #[derive(Clone, Debug)]
     struct CapturedRequest {
@@ -1492,96 +3110,164 @@ mod tests {
         }
     }
 
-    /// Minimal deterministic single-request loopback server, owned by this module's
-    /// tests (Tools cannot depend on the provider-owned loopback parser): it accepts
-    /// one connection, captures the exact request head, and answers `200 ok` with
-    /// `Connection: close`.
+    /// One scripted loopback response/behavior for one accepted connection.  The
+    /// response bytes are fixed at spawn; the only dynamic control is the stall release
+    /// (see [`TestLoopbackServer::release`]) and the positive tokio events the server
+    /// emits (capture, body prefix, finished).
+    enum ServerScript {
+        /// Write the exact response head and body, then close the write side.
+        Respond { head: String, body: Vec<u8> },
+        /// Write the exact head and the first body bytes, signal the body-prefix-written
+        /// event, then wait for a release before closing without writing the rest: the
+        /// connection stays open with an incomplete body (mid-body cancellation and
+        /// known-oversize rejection observe this).
+        RespondThenStall { head: String, body_prefix: Vec<u8> },
+        /// Write nothing; wait for a release before closing: the response headers never
+        /// arrive (mid-headers cancellation observes this).
+        Stall,
+        /// Write the exact head and the first body bytes, then close immediately without
+        /// the declared full body: an early-fin body-stream error.
+        Abort { head: String, body_prefix: Vec<u8> },
+    }
+
+    /// Minimal deterministic single-request loopback server, owned by this module's tests
+    /// (Tools cannot depend on the provider-owned loopback parser): it accepts one
+    /// connection, captures the exact request head, executes the fixed script, and emits
+    /// the positive tokio events the tests await — the request-captured event, the
+    /// body-prefix-written event, and the finished event, which for the stall phases only
+    /// resolves after the server observed whether the client closed the connection
+    /// (`Connection: close` plus the zero idle pool forbid handing the connection to a
+    /// later call).
     struct TestLoopbackServer {
         addr: SocketAddr,
         captured: Arc<Mutex<Vec<CapturedRequest>>>,
+        eof_observed: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        capture_event: Option<tokio::sync::oneshot::Receiver<()>>,
+        body_prefix_event: Option<tokio::sync::oneshot::Receiver<()>>,
+        finished: Option<tokio::sync::oneshot::Receiver<()>>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
+    /// Failure fences only: a regression that never closes the connection must fail
+    /// instead of hanging.  They never supply evidence — the positive EOF/reset and
+    /// finished events do.
+    const CONNECTION_CLOSE_GUARDRAIL: Duration = Duration::from_secs(2);
+    const FINISHED_EVENT_GUARDRAIL: Duration = Duration::from_secs(3);
+    const POISON_BYTE: u8 = 0;
+
     impl TestLoopbackServer {
         fn spawn() -> Self {
+            Self::spawn_with(ServerScript::Respond {
+                head: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\n"
+                    .to_owned(),
+                body: b"ok".to_vec(),
+            })
+        }
+
+        fn spawn_with(script: ServerScript) -> Self {
             use std::io::{Read, Write};
 
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback bind");
-            listener.set_nonblocking(true).expect("nonblocking accept");
             let addr = listener.local_addr().expect("loopback address");
             let captured = Arc::new(Mutex::new(Vec::new()));
+            let eof_observed = Arc::new(AtomicBool::new(false));
             let shutdown = Arc::new(AtomicBool::new(false));
+            let (release_sender, release_receiver) = std::sync::mpsc::channel::<()>();
+            let (capture_sender, capture_receiver) = tokio::sync::oneshot::channel::<()>();
+            let (prefix_sender, prefix_receiver) = tokio::sync::oneshot::channel::<()>();
+            let (finished_sender, finished_receiver) = tokio::sync::oneshot::channel::<()>();
             let thread_captured = Arc::clone(&captured);
-            let thread_shutdown = Arc::clone(&shutdown);
+            let thread_eof = Arc::clone(&eof_observed);
             let handle = thread::spawn(move || {
-                let mut buf = Vec::new();
+                let Ok((mut stream, _peer)) = listener.accept() else {
+                    let _ = finished_sender.send(());
+                    return;
+                };
+                let mut first = [0u8; 1];
+                if stream.read_exact(&mut first).is_err() || first[0] == POISON_BYTE {
+                    let _ = finished_sender.send(());
+                    return;
+                }
+                let mut buf = vec![first[0]];
                 let mut scratch = [0u8; 4096];
-                loop {
-                    if thread_shutdown.load(Ordering::SeqCst) {
-                        return;
+                let header_end = loop {
+                    if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break pos;
                     }
-                    match listener.accept() {
-                        Ok((mut stream, _peer)) => {
-                            // The listener is nonblocking only so the accept loop can
-                            // poll the shutdown flag; the accepted stream inherits that
-                            // nonblocking mode on macOS (and other platforms), which
-                            // would make the blocking read loop below fail with
-                            // WouldBlock.  Reset the stream to blocking before any read.
-                            stream.set_nonblocking(false).expect("blocking stream");
-                            let header_end = loop {
-                                if let Some(pos) =
-                                    buf.windows(4).position(|window| window == b"\r\n\r\n")
-                                {
-                                    break pos;
-                                }
-                                let n = stream.read(&mut scratch).expect("read request bytes");
-                                if n == 0 {
-                                    panic!("client closed before request headers were complete");
-                                }
-                                buf.extend_from_slice(&scratch[..n]);
-                            };
-                            let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-                            let mut lines = head.split("\r\n");
-                            let request_line = lines.next().expect("request line").to_string();
-                            let headers = lines
-                                .filter(|line| !line.is_empty())
-                                .map(|line| {
-                                    let (name, value) =
-                                        line.split_once(':').expect("header name colon");
-                                    (name.trim().to_ascii_lowercase(), value.trim().to_string())
-                                })
-                                .collect();
-                            thread_captured
-                                .lock()
-                                .expect("captured requests mutex is not poisoned")
-                                .push(CapturedRequest {
-                                    request_line,
-                                    headers,
-                                });
-                            let body = "ok";
-                            let response = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                body.len(),
-                                body
-                            );
-                            stream
-                                .write_all(response.as_bytes())
-                                .expect("write scripted response");
-                            let _ = stream.shutdown(std::net::Shutdown::Write);
-                            return;
+                    let n = stream.read(&mut scratch).expect("read request bytes");
+                    if n == 0 {
+                        panic!("client closed before request headers were complete");
+                    }
+                    buf.extend_from_slice(&scratch[..n]);
+                };
+                let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+                let mut lines = head.split("\r\n");
+                let request_line = lines.next().expect("request line").to_string();
+                let headers = lines
+                    .filter(|line| !line.is_empty())
+                    .map(|line| {
+                        let (name, value) = line.split_once(':').expect("header name colon");
+                        (name.trim().to_ascii_lowercase(), value.trim().to_string())
+                    })
+                    .collect();
+                thread_captured
+                    .lock()
+                    .expect("captured requests mutex is not poisoned")
+                    .push(CapturedRequest {
+                        request_line,
+                        headers,
+                    });
+                let _ = capture_sender.send(());
+                match script {
+                    ServerScript::Respond { head, body } => {
+                        stream
+                            .write_all(head.as_bytes())
+                            .expect("write scripted head");
+                        stream.write_all(&body).expect("write scripted body");
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
+                    }
+                    ServerScript::RespondThenStall { head, body_prefix } => {
+                        stream
+                            .write_all(head.as_bytes())
+                            .expect("write scripted head");
+                        stream
+                            .write_all(&body_prefix)
+                            .expect("write scripted body prefix");
+                        let _ = prefix_sender.send(());
+                        let _ = release_receiver.recv();
+                        if observe_peer_close(&mut stream) {
+                            thread_eof.store(true, Ordering::SeqCst);
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(5));
+                    }
+                    ServerScript::Stall => {
+                        let _ = release_receiver.recv();
+                        if observe_peer_close(&mut stream) {
+                            thread_eof.store(true, Ordering::SeqCst);
                         }
-                        Err(_) => return,
+                    }
+                    ServerScript::Abort { head, body_prefix } => {
+                        stream
+                            .write_all(head.as_bytes())
+                            .expect("write scripted head");
+                        stream
+                            .write_all(&body_prefix)
+                            .expect("write scripted body prefix");
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
                     }
                 }
+                let _ = finished_sender.send(());
             });
             Self {
                 addr,
                 captured,
+                eof_observed,
                 shutdown,
+                release: Some(release_sender),
+                capture_event: Some(capture_receiver),
+                body_prefix_event: Some(prefix_receiver),
+                finished: Some(finished_receiver),
                 handle: Some(handle),
             }
         }
@@ -1596,14 +3282,101 @@ mod tests {
                 .expect("captured requests mutex is not poisoned")
                 .clone()
         }
+
+        /// Whether the stall-phase observation saw the client close the connection.
+        fn eof_observed(&self) -> bool {
+            self.eof_observed.load(Ordering::SeqCst)
+        }
+
+        /// Releases a stall-phase server: the server then observes the client connection
+        /// (a closed connection records `eof_observed`) and finishes.
+        fn release(&self) {
+            if let Some(release) = &self.release {
+                let _ = release.send(());
+            }
+        }
+
+        /// The positive request-captured event: resolves when the server thread has
+        /// captured the exact request head (consumed at most once per server).
+        async fn capture_event(&mut self) {
+            self.capture_event
+                .take()
+                .expect("the capture event is consumed once")
+                .await
+                .expect("the server captured the request");
+        }
+
+        /// The positive body-prefix-written event: resolves when the server thread has
+        /// written the response head and the scripted body prefix (consumed at most once
+        /// per server).
+        async fn body_prefix_event(&mut self) {
+            self.body_prefix_event
+                .take()
+                .expect("the body-prefix event is consumed once")
+                .await
+                .expect("the server wrote the body prefix");
+        }
+
+        /// The positive finished event: resolves only after the server thread executed
+        /// its script and, for the stall phases, observed whether the client closed the
+        /// connection.  The guardrail timeout is a failure fence only — the event itself
+        /// is the evidence, and a regression that never closes the connection fails the
+        /// test instead of hanging it (the shutdown flag keeps the server joinable).
+        async fn wait_finished(&mut self) {
+            let finished = self
+                .finished
+                .take()
+                .expect("the finished event is consumed once");
+            tokio::time::timeout(FINISHED_EVENT_GUARDRAIL, finished)
+                .await
+                .expect("failure fence: the scripted server never finished")
+                .expect("the scripted server finished");
+        }
     }
 
     impl Drop for TestLoopbackServer {
         fn drop(&mut self) {
-            // Always stop and join the accept loop so no thread outlives the test.
+            // Always stop and join the server so no thread outlives the test.  Release
+            // any stall first, then poison a still-blocked accept with one non-HTTP byte.
             self.shutdown.store(true, Ordering::SeqCst);
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
             if let Some(handle) = self.handle.take() {
+                if let Ok(mut stream) = std::net::TcpStream::connect(self.addr) {
+                    use std::io::Write;
+                    let _ = stream.write_all(&[POISON_BYTE]);
+                }
                 let _ = handle.join();
+            }
+        }
+    }
+
+    /// Reads the peer connection to completion and reports positive close evidence: a
+    /// clean FIN or a connection-reset/aborted error.  The read timeout is only a failure
+    /// guardrail; it never counts as close evidence.
+    fn observe_peer_close(stream: &mut std::net::TcpStream) -> bool {
+        stream
+            .set_read_timeout(Some(CONNECTION_CLOSE_GUARDRAIL))
+            .expect("connection-close guardrail");
+        let mut one = [0u8; 1];
+        loop {
+            match stream.read(&mut one) {
+                Ok(0) => return true,
+                Ok(_) => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::NotConnected
+                            | std::io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    return true;
+                }
+                Err(_) => return false,
             }
         }
     }
