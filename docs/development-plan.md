@@ -709,7 +709,7 @@ RuntimeDependencyUnavailable readiness与probe recovery纵向切片已实现：`
 
 ## v0.1 · Front-end Closure
 
-状态：Implementation Complete；final stable/MSRV gates与发布同步待本milestone收口。
+状态：Completed；implementation、canonical docs及stable/MSRV full gates已关闭，远端同步按仓库发布流程执行。
 
 - [x] 审计外部host可构造Runtime/provider/Workspace/Agent/Session/Prompt/Submit/Cancel/Interaction所需owner values；未发现第二个constructor blocker；
 - [x] 关闭completed chat恢复缺口：`MiniCoreRuntime::session_transcript(session_id, PageRequest)`返回`Page<SessionTranscriptItem>`；
@@ -719,7 +719,7 @@ RuntimeDependencyUnavailable readiness与probe recovery纵向切片已实现：`
 - [x] normal shutdown/reopen/Load后从tolerant replay实际recorded prefix恢复；
 - [x] 不修改RuntimeQuery、Public Wire V1、capability manifest、Conversation JSONL V1或Store V1；
 - [x] [ADR 0148](adr/0148-v0-1-session-transcript-is-a-library-only-read-seam.md)冻结library-only contract与post-MVP history边界；
-- [ ] `./scripts/check.sh`与`./scripts/check-msrv.sh`通过当前closure HEAD，fetch后证明fast-forward并push。
+- [x] `./scripts/check.sh`与`./scripts/check-msrv.sh`在`0e72c06`上从头通过：stable与exact Rust 1.85 main library均`1035 passed / 3 ignored`，main integration均合计`159 passed / 3 ignored`；stable provider-gate `25/25`，Clippy/format/docs/Wire/Store fixtures全绿。
 
 前端可依赖的v0.1闭环是：open Runtime → create/load Session → snapshot-first subscribe → submit/control/resolve Interaction → terminal refresh transcript → unload/reload或restart/load后恢复recorded prefix。独立server/CLI、Wire transcript route、unloaded/full history、process/generic Tool、public Structured与Prompt/Skill authoring生态不阻塞该闭环。
 

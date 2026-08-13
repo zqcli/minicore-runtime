@@ -22,6 +22,8 @@ MiniCoreRuntime.session_transcript(SessionId, PageRequest) -> Page<SessionTransc
 
 Post-MVP：独立CLI/server/daemon；Wire transcript route与unloaded/full history browsing；process adapter、generic Tool registry/policy/Sandbox与public Tool DTO；public Structured activation；Prompt/Skill authoring/source生态。
 
+v0.1 closure acceptance：stable与exact Rust 1.85 main library均`1035 passed / 3 ignored`，main integration均合计`159 passed / 3 ignored`；stable provider-gate `25/25`，Clippy、format、docs、Wire V1与Store V1 fixtures全绿。
+
 文档入口见 [docs/README.md](docs/README.md)；架构说明见 [docs/architecture.md](docs/architecture.md) 和 [docs/modules/README.md](docs/modules/README.md)，分阶段交付、依赖与验收条件见 [MiniCore V2开发计划](docs/development-plan.md)。
 
 ## 文档权威顺序

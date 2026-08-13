@@ -3,7 +3,7 @@
 状态：Accepted
 日期：2026-08-13
 
-> 实现状态：`c99ccf7 feat: expose paged session transcripts`新增`MiniCoreRuntime::session_transcript`、public `session_transcript` DTO module、Session actor coherent capture、Runtime-owned immutable page cursor与restart/load evidence。该实现不修改Public Wire V1、Wire capability manifest、Conversation JSONL V1或Durable Store V1。
+> 实现状态：`c99ccf7 feat: expose paged session transcripts`新增`MiniCoreRuntime::session_transcript`、public `session_transcript` DTO module、Session actor coherent capture、Runtime-owned immutable page cursor与restart/load evidence；`96f3ac4 docs: freeze v0.1 frontend closure`同步canonical current合同；`0e72c06 test: arm fetch cleanup guardrail before cancellation`只修正全量并发门禁暴露的test-only macOS socket guardrail时序，不改变production `fetch_url`或transcript。该实现不修改Public Wire V1、Wire capability manifest、Conversation JSONL V1或Durable Store V1。
 
 ## 背景
 
@@ -67,6 +67,15 @@ v0.1前端闭环已经具备Runtime生命周期、Agent/Session管理、Submit/S
 - Assistant item offset忽略Reasoning并从多Text entry中只复制命中page的正文；
 - transcript item/capture Debug不披露User、Assistant或Reasoning正文；
 - stable full library suite、Clippy、format与真实Rust 1.85 focused transcript tests通过。
+
+## Acceptance
+
+2026-08-13在`0e72c06`上从头运行完整门禁：
+
+- `./scripts/check.sh`：main library `1035 passed / 3 ignored`；main integration合计`159 passed / 3 ignored`；standalone provider-gate `25/25`；Clippy、format、current/archive docs、Wire V1 `144 active / 0 pending`与Durable Store fixtures全绿；
+- `./scripts/check-msrv.sh`：exact `rustc 1.85.0 (4d91de4e4 2025-02-17)`、隔离`target/msrv-1.85.0`；main library `1035 passed / 3 ignored`，main integration合计`159 passed / 3 ignored`；
+- production network tests保持默认离线，两个real-provider smoke保持显式`#[ignore]`；
+- stable log：`/tmp/minicore-v0.1-stable-check-rerun.log`；MSRV log：`/tmp/minicore-v0.1-msrv-check.log`。日志只含nonsecret local acceptance evidence，不进入Git。
 
 ## 后果
 
