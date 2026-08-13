@@ -3219,6 +3219,14 @@ mod tests {
                         request_line,
                         headers,
                     });
+                // Arm the failure guardrail while the peer is known live and before
+                // publishing the capture event that allows cancellation.  On macOS,
+                // setting SO_RCVTIMEO after the peer has already reset can return
+                // EINVAL even though that reset is the positive close evidence this
+                // test is about.
+                stream
+                    .set_read_timeout(Some(CONNECTION_CLOSE_GUARDRAIL))
+                    .expect("connection-close guardrail");
                 let _ = capture_sender.send(());
                 match script {
                     ServerScript::Respond { head, body } => {
@@ -3356,9 +3364,6 @@ mod tests {
     /// clean FIN or a connection-reset/aborted error.  The read timeout is only a failure
     /// guardrail; it never counts as close evidence.
     fn observe_peer_close(stream: &mut std::net::TcpStream) -> bool {
-        stream
-            .set_read_timeout(Some(CONNECTION_CLOSE_GUARDRAIL))
-            .expect("connection-close guardrail");
         let mut one = [0u8; 1];
         loop {
             match stream.read(&mut one) {
