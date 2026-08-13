@@ -4517,17 +4517,15 @@ mod tests {
         UserQuestionFieldAnswer,
     };
     use crate::turn_item_interaction::{InteractionResolutionInput, UserMessageSource};
-    #[cfg(not(windows))]
-    use crate::wire::FileUriFamily;
     use crate::wire::conversation_jsonl::ConversationLineCodec;
     use crate::wire::{
-        AgentId, CanonicalFileUri, CommandId, InteractionResolutionKey, ItemId, RequestId,
-        SessionId, SessionMetadataRevision, TurnId,
+        AgentId, CommandId, InteractionResolutionKey, ItemId, RequestId, SessionId,
+        SessionMetadataRevision, TurnId,
     };
     use crate::workspace::{
         RequestedFilesystemAccess, Workspace, WorkspaceAccessError, WorkspaceCwdSpec,
         WorkspaceDefinitionInput, WorkspacePathTarget, WorkspaceRootInput, WorkspaceRootKey,
-        WorkspaceSourcePolicy, WorkspaceWriteError, lower_workspace,
+        WorkspaceSourcePolicy, WorkspaceWriteError, lower_workspace, native_path_uri_for_test,
     };
 
     static NEXT_TEMP_SUFFIX: AtomicU64 = AtomicU64::new(1);
@@ -4603,32 +4601,12 @@ mod tests {
         }
     }
 
-    fn workspace_uri(path: &Path) -> CanonicalFileUri {
-        #[cfg(windows)]
-        {
-            let path = path.to_string_lossy().replace('\\', "/");
-            let path = path.strip_prefix('/').unwrap_or(&path);
-            return format!("file:///{path}")
-                .parse()
-                .expect("temporary Windows URI");
-        }
-        #[cfg(not(windows))]
-        {
-            CanonicalFileUri::from_decoded_parts(
-                FileUriFamily::Posix,
-                None,
-                path.to_str().expect("temporary path is UTF-8"),
-            )
-            .expect("temporary POSIX URI")
-        }
-    }
-
     fn workspace_input(path: &Path) -> WorkspaceDefinitionInput {
         let key: WorkspaceRootKey = "repo".parse().unwrap();
         WorkspaceDefinitionInput::new(
             WorkspaceRootInput::new(
                 key.clone(),
-                workspace_uri(path),
+                native_path_uri_for_test(path),
                 RequestedFilesystemAccess::ReadWrite,
                 WorkspaceSourcePolicy::new(false, false),
             ),
@@ -9074,7 +9052,7 @@ mod tests {
         let read_only_input = WorkspaceDefinitionInput::new(
             WorkspaceRootInput::new(
                 "repo".parse().unwrap(),
-                workspace_uri(workspace.path()),
+                native_path_uri_for_test(workspace.path()),
                 RequestedFilesystemAccess::ReadOnly,
                 WorkspaceSourcePolicy::new(false, false),
             ),

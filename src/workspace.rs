@@ -2474,6 +2474,20 @@ fn test_capability_scratch() -> (WorkspaceRootIdentity, Arc<CapabilityDir>) {
         .clone()
 }
 
+/// Test-only owner seam: converts a native path (typically a real temp-dir path)
+/// into the canonical file URI of the current host platform through the same
+/// production lowering the Workspace Store uses (`checked_native_uri` bound to
+/// `WorkspacePathTarget::current()`), panicking with a clear test-fixture message
+/// on any conversion error. Native paths must never be interpolated into
+/// `file://` strings — the wire grammar is family-specific, so Windows paths like
+/// `C:\...` do not parse.
+#[cfg(test)]
+pub(crate) fn native_path_uri_for_test(path: &Path) -> CanonicalFileUri {
+    checked_native_uri(path, WorkspacePathTarget::current()).expect(
+        "the test fixture native path converts to a canonical file URI for the current host",
+    )
+}
+
 pub(crate) struct WorkspaceSnapshot {
     session_id: SessionId,
     revision: WorkspaceRevision,
@@ -3863,6 +3877,30 @@ mod tests {
             ),
             Err(WorkspaceInputLoweringError::NativePathNotLossless),
         );
+    }
+
+    /// The test-only native-path URI seam round-trips the current host's real temp
+    /// paths through the production lowering: the emitted URI family matches the
+    /// host and lowering the URI back yields the exact native path.
+    #[test]
+    fn native_path_uri_for_test_round_trips_current_host_paths() {
+        let temporary = TempDirectory::new("native-uri-seam");
+        let root = temporary.path().join("nested");
+        std::fs::create_dir_all(&root).expect("the nested test root is creatable");
+
+        let uri = super::native_path_uri_for_test(&root);
+        assert_eq!(
+            uri.family(),
+            if cfg!(windows) {
+                crate::wire::FileUriFamily::Drive
+            } else {
+                crate::wire::FileUriFamily::Posix
+            },
+            "the test URI family matches the current host"
+        );
+        let lowered = super::lower_uri(&uri, WorkspacePathTarget::current())
+            .expect("the test URI lowers back to the native path");
+        assert_eq!(lowered, root.as_path());
     }
 
     #[test]

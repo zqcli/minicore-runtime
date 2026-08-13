@@ -12719,13 +12719,10 @@ mod tests {
         PreparedToolExecution, SessionFileMutationQueue, ToolCapabilityClass, ToolExecutionFuture,
         ToolExecutionPreparation, ToolOutcomeSource, ToolPermissionSet, ToolSandboxContract,
     };
-    #[cfg(not(windows))]
-    use crate::wire::FileUriFamily;
-    use crate::wire::{CanonicalFileUri, SessionId};
     use crate::workspace::{
         RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput,
         WorkspaceFileMutationKey, WorkspacePathTarget, WorkspaceRootInput, WorkspaceRootKey,
-        WorkspaceSourcePolicy, lower_workspace,
+        WorkspaceSourcePolicy, lower_workspace, native_path_uri_for_test,
     };
 
     const AGENT_ID: &str = "agt_11111111111111111111111111111111";
@@ -12966,26 +12963,6 @@ mod tests {
         create_dir(&root.join("sessions"));
     }
 
-    fn workspace_uri(path: &Path) -> CanonicalFileUri {
-        #[cfg(windows)]
-        {
-            let path = path.to_string_lossy().replace('\\', "/");
-            let path = path.strip_prefix('/').unwrap_or(&path);
-            return format!("file:///{path}")
-                .parse()
-                .expect("temporary Windows URI");
-        }
-        #[cfg(not(windows))]
-        {
-            CanonicalFileUri::from_decoded_parts(
-                FileUriFamily::Posix,
-                None,
-                path.to_str().expect("temporary path is UTF-8"),
-            )
-            .expect("temporary POSIX URI")
-        }
-    }
-
     fn replace_fixture(input: &[u8], from: &str, to: &str) -> Vec<u8> {
         let input = std::str::from_utf8(input).expect("fixture bytes are UTF-8");
         assert_eq!(
@@ -13001,7 +12978,7 @@ mod tests {
         replace_fixture(
             input,
             "file:///Users/example/project",
-            workspace_uri(workspace).as_str(),
+            native_path_uri_for_test(workspace).as_str(),
         )
     }
 
@@ -13358,7 +13335,7 @@ mod tests {
             WorkspaceDefinitionInput::new(
                 WorkspaceRootInput::new(
                     key.clone(),
-                    workspace_uri(path),
+                    native_path_uri_for_test(path),
                     RequestedFilesystemAccess::ReadWrite,
                     WorkspaceSourcePolicy::new(true, true),
                 ),
@@ -19075,7 +19052,7 @@ mod tests {
             WorkspaceDefinitionInput::new(
                 WorkspaceRootInput::new(
                     "repo".parse().unwrap(),
-                    workspace_uri(temporary.path()),
+                    native_path_uri_for_test(temporary.path()),
                     RequestedFilesystemAccess::ReadWrite,
                     WorkspaceSourcePolicy::new(false, false),
                 ),
