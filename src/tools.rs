@@ -1232,6 +1232,28 @@ impl ToolPermissionSet {
     const fn difference(self, other: Self) -> Self {
         Self(self.0.difference(other.0))
     }
+
+    /// The typed ADR 0140 restricted-option seam: accepts an exact candidate that is equal
+    /// to or narrower than this ceiling, never wider.  Equal, subset and empty candidates
+    /// succeed and return the candidate; any elevation returns the closed typed error.
+    pub(crate) fn restricted_candidate(
+        &self,
+        candidate: ToolPermissionSet,
+    ) -> Result<Self, ToolPermissionRestrictionError> {
+        candidate
+            .is_subset_of(self)
+            .then_some(candidate)
+            .ok_or(ToolPermissionRestrictionError::ElevatesCapabilities)
+    }
+}
+
+/// The closed typed error for a restricted candidate that would widen its ceiling.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum ToolPermissionRestrictionError {
+    #[error(
+        "a restricted permission candidate must not add capability classes beyond the current ceiling"
+    )]
+    ElevatesCapabilities,
 }
 
 /// The adapter's value contract for one Tool Sandbox: availability plus the enforceable
@@ -1668,8 +1690,9 @@ impl ToolSet {
     /// The approval settlement from the exact request's private decision.  `Deny` settles
     /// the exact denied shape fail-closed through the same pre-execution binding as any
     /// other unstarted result.  `AllowOnce` re-admits the plan's final permission set, and
-    /// `AllowWith(candidate)` first revalidates in release code that the candidate is within
-    /// that ceiling and then re-admits it; every revalidation failure settles the fixed
+    /// `AllowWith(candidate)` first revalidates through the typed ADR 0140
+    /// `restricted_candidate` seam in release code that the candidate is within that
+    /// ceiling and then re-admits it; every revalidation failure settles the fixed
     /// generic `PreExecution { Denied }` without ever reserving the gate.
     pub(crate) fn approval_settlement(
         &self,
@@ -1686,18 +1709,22 @@ impl ToolSet {
                 Err(error) => ApprovalSettlement::PreExecution(error.denied_result()),
             },
             ToolApprovalDecision::AllowWith(candidate) => {
-                // The candidate may only narrow the plan ceiling: elevation fails closed even when the sandbox could enforce it.
-                if !candidate.is_subset_of(&permissions) {
-                    return ApprovalSettlement::PreExecution(
-                        ToolSandboxAdmissionError::CapabilityGap {
-                            missing: candidate.difference(permissions),
-                        }
-                        .denied_result(),
-                    );
-                }
-                match self.inner.sandbox.admit(*candidate) {
-                    Ok(_) => ApprovalSettlement::Resume,
-                    Err(error) => ApprovalSettlement::PreExecution(error.denied_result()),
+                // The typed restricted-option seam: the candidate may only equal or narrow
+                // the plan ceiling; elevation fails closed even when the sandbox could
+                // enforce it, settling the fixed capability-gap text.
+                match permissions.restricted_candidate(*candidate) {
+                    Err(ToolPermissionRestrictionError::ElevatesCapabilities) => {
+                        ApprovalSettlement::PreExecution(
+                            ToolSandboxAdmissionError::CapabilityGap {
+                                missing: candidate.difference(permissions),
+                            }
+                            .denied_result(),
+                        )
+                    }
+                    Ok(_) => match self.inner.sandbox.admit(*candidate) {
+                        Ok(_) => ApprovalSettlement::Resume,
+                        Err(error) => ApprovalSettlement::PreExecution(error.denied_result()),
+                    },
                 }
             }
         }
@@ -4958,6 +4985,32 @@ mod tests {
                 content,
             } if content.parts()[0].as_text() == TOOL_SANDBOX_UNAVAILABLE_TEXT
         ));
+    }
+
+    #[test]
+    fn tool_sandbox_restricted_candidate_may_narrow_but_never_widen_the_ceiling() {
+        let rw_net = [C::FilesystemRead, C::FilesystemWrite, C::Network];
+        let ceiling = ToolPermissionSet::new(rw_net);
+        let equal = ceiling.restricted_candidate(ceiling).unwrap();
+        let subset = ceiling
+            .restricted_candidate(ToolPermissionSet::new(rw_net[..2].iter().copied()))
+            .unwrap();
+        assert_eq!(equal, ceiling);
+        assert_eq!(subset, ToolPermissionSet::new(rw_net[..2].iter().copied()));
+        let narrowed = ceiling
+            .restricted_candidate(ToolPermissionSet::new([]))
+            .unwrap();
+        assert_eq!(narrowed, ToolPermissionSet::new([]));
+        for elevated in [
+            ToolPermissionSet::new([C::FilesystemRead, C::Process]),
+            ToolPermissionSet::new(ALL),
+            ToolPermissionSet::new([C::Process]),
+        ] {
+            assert_eq!(
+                ceiling.restricted_candidate(elevated).unwrap_err(),
+                ToolPermissionRestrictionError::ElevatesCapabilities
+            );
+        }
     }
 
     #[test]
