@@ -1,6 +1,6 @@
 # Turn、Item 与 Interaction 架构设计
 
-状态：当前权威架构（ADR 0146后；Tool/Interaction/Cancel与crate-private `ToolOperationSlot`完整生命周期、scripted approval/UserQuestion控制seam，以及closed/default-off production `ask_user`/`read_file`/`list_directory`/`write_file` builtins均已实现；started file mutation permit由Running移动到Settling并只在Terminal后释放。network/process、generic ToolService及其他未实现Tool/Sandbox adapters仍pending）
+状态：当前权威架构（ADR 0147后；Tool/Interaction/Cancel与crate-private `ToolOperationSlot`完整生命周期、scripted approval/UserQuestion控制seam，以及closed/default-off production `ask_user`/`read_file`/`list_directory`/`write_file`/`fetch_url` builtins均已实现；started file mutation permit由Running移动到Settling并只在Terminal后释放，started fetch由same slot-owned future持有exact send/body state直至natural/cancel settlement。process、generic ToolService及其他未实现Tool/Sandbox adapters仍pending）
 日期：2026-07-31
 
 ## 目的
@@ -210,7 +210,7 @@ policy/approval/sandbox validation
 
 start reservation前Cancel/SecurityRevoked获胜时Tool不执行。Running后获胜只能best-effort cancel并truthful settle或Abandoned。
 
-INV-401 start first-wins已落地：每个exact `ToolExecutionRequest` capture绑定slot自己的`ToolStartGate`；reservation与`signal`在EmergencyControl owner mutex内线性化。signal/stale先赢→不调用factory、matching PreExecution Cancelled；start先赢→signal只触发operation cancellation observer、slot经Settling继续await same run后truthful settle。file mutation另在start前等待exact-request-bound Session FIFO ticket；permit-first后才reserve/start gate，started permit由Running移动到Settling并在exact Terminal outcome绑定后释放。production network/process及generic ToolService teardown仍pending。
+INV-401 start first-wins已落地：每个exact `ToolExecutionRequest` capture绑定slot自己的`ToolStartGate`；reservation与`signal`在EmergencyControl owner mutex内线性化。signal/stale先赢→不调用factory、matching PreExecution Cancelled；start先赢→signal只触发operation cancellation observer、slot经Settling继续await same run后truthful settle。file mutation另在start前等待exact-request-bound Session FIFO ticket；permit-first后才reserve/start gate，started permit由Running移动到Settling并在exact Terminal outcome绑定后释放。production `fetch_url` start后由same slot-owned future poll reqwest operation，cancel drop exact send/body state且不spawn adapter task；process及generic ToolService teardown仍pending。
 
 SessionRecorder不参与Tool start，不记录`ToolExecutionStarted`。process crash可能丢失side-effect事实，restart不自动重跑Tool。UserQuestion/ask-user绝不预留ToolStartGate或mutation ticket（hoisted exclusive question调度，见[UserQuestion](#userquestion)）；Cancel/SecurityRevoked/Unload signal-first跳过binding并settle全部unstarted calls为matching PreExecution Cancelled。
 
