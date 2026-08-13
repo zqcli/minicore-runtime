@@ -472,7 +472,7 @@ mod tests {
         ToolOutcomeSource, ToolPermissionSet, ToolResultContent, ToolResultDisposition,
         ToolSandboxAdmissionError, ToolSandboxContract, ToolSet, ToolStartGate,
     };
-    use crate::wire::{CanonicalFileUri, SessionId, WorkspaceRevision};
+    use crate::wire::{CanonicalFileUri, FileUriFamily, SessionId, WorkspaceRevision};
     use crate::workspace::{
         RequestedFilesystemAccess, Workspace, WorkspaceCwdSpec, WorkspaceDefinitionInput,
         WorkspacePathTarget, WorkspaceResolver, WorkspaceRootInput, WorkspaceSourcePolicy,
@@ -543,6 +543,44 @@ mod tests {
             .expect("the test session id is canonical")
     }
 
+    /// The canonical file URI of one test root: the native temp path is converted to
+    /// the decoded path of the current host's file-URI family and constructed through
+    /// the public typed constructor, never by interpolating a native path into a URI
+    /// string (on Windows, `file://C:\...` is not a valid file URI).
+    fn workspace_uri(path: &Path) -> CanonicalFileUri {
+        #[cfg(windows)]
+        {
+            // The CI temp is a native drive path (`C:\...`), never a UNC share:
+            // canonicalize it to the decoded `C:/...` Drive path (uppercase drive
+            // letter, colon retained, forward slashes) and build the Drive-family
+            // URI — the Drive grammar requires `X:/...`, so the drive colon is
+            // never dropped.
+            let native = path.to_string_lossy();
+            let bytes = native.as_bytes();
+            assert!(
+                bytes.len() >= 3 && bytes[1] == b':' && bytes[2] == b'\\',
+                "the Windows temp path must be a native drive path, got {native}"
+            );
+            let decoded_path = format!(
+                "{}{}/{}",
+                native[..1].to_ascii_uppercase(),
+                &native[1..2],
+                native[3..].replace('\\', "/")
+            );
+            CanonicalFileUri::from_decoded_parts(FileUriFamily::Drive, None, &decoded_path)
+                .expect("the test root is a canonical drive file URI")
+        }
+        #[cfg(not(windows))]
+        {
+            CanonicalFileUri::from_decoded_parts(
+                FileUriFamily::Posix,
+                None,
+                path.to_str().expect("the test root is a UTF-8 path"),
+            )
+            .expect("the test root is a canonical POSIX file URI")
+        }
+    }
+
     /// Lowers one real temp-dir Workspace (one primary root with the given requested
     /// access, cwd at `cwd_relative` inside it) through the production lowering path.
     fn workspace_spec(
@@ -550,9 +588,7 @@ mod tests {
         cwd_relative: &str,
         access: RequestedFilesystemAccess,
     ) -> Workspace {
-        let uri: CanonicalFileUri = format!("file://{}", root.display())
-            .parse()
-            .expect("the test root is a canonical native file URI");
+        let uri = workspace_uri(root);
         let root_input = WorkspaceRootInput::new(
             "primary".parse().expect("the test root key is canonical"),
             uri,
@@ -573,7 +609,7 @@ mod tests {
         lower_workspace(
             input,
             WorkspaceRevision::new(NonZeroU64::new(1).expect("the test revision is non-zero")),
-            WorkspacePathTarget::Posix,
+            WorkspacePathTarget::current(),
         )
         .expect("the test workspace lowers")
     }

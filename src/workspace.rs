@@ -3463,6 +3463,12 @@ mod tests {
     /// Replaces the declared root with a fresh directory at the same path exactly
     /// between root capture and the cwd proof, simulating the rename/replacement
     /// race the capability-relative identity proof must fail closed against.
+    ///
+    /// Only Unix can rename a directory that the resolver already holds open as a
+    /// captured capability: cap-primitives deliberately opens Windows directories
+    /// without `FILE_SHARE_DELETE`, so the rename fails with
+    /// `ERROR_SHARING_VIOLATION` and this scenario is not executable on Windows.
+    #[cfg(unix)]
     struct ReplacingRootLocalAdapter {
         inner: LocalWorkspacePathAdapter,
         declared_root: PathBuf,
@@ -3470,6 +3476,7 @@ mod tests {
         replaced: AtomicBool,
     }
 
+    #[cfg(unix)]
     impl ReplacingRootLocalAdapter {
         fn new(declared_root: PathBuf, displaced_root: PathBuf) -> Self {
             Self {
@@ -3481,6 +3488,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl WorkspacePathAdapter for ReplacingRootLocalAdapter {
         fn canonicalize_directory(
             &self,
@@ -4635,6 +4643,7 @@ mod tests {
         task_context.shutdown().await;
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn cwd_proof_rejects_root_replaced_between_capture_and_proof() {
         let temporary = TempDirectory::new("cwd-replacement-race");
@@ -5229,6 +5238,7 @@ mod tests {
         task_context.shutdown().await;
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn candidate_revalidation_detects_root_replacement_identity() {
         let temporary = TempDirectory::new("root-replacement");

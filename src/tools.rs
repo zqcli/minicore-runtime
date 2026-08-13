@@ -5507,7 +5507,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicU64;
 
-    use crate::wire::{CanonicalFileUri, SessionId, WorkspaceRevision};
+    use crate::wire::{CanonicalFileUri, FileUriFamily, SessionId, WorkspaceRevision};
     use crate::workspace::{
         RequestedFilesystemAccess, Workspace, WorkspaceCwdSpec, WorkspaceDefinitionInput,
         WorkspacePathTarget, WorkspaceResolver, WorkspaceRootInput, WorkspaceSourcePolicy,
@@ -5550,6 +5550,45 @@ mod tests {
         std::fs::write(path, bytes).expect("the fixture file is writable");
     }
 
+    /// Converts a native temp-dir path to the canonical file URI matching the
+    /// host platform: Posix on Unix hosts, a forward-slash Drive-decoded path on
+    /// Windows hosts (mirroring the `WorkspacePathTarget::current()` lowering).
+    /// Native paths must never be interpolated into `file://` strings — the wire
+    /// grammar is family-specific, so Windows paths like `C:\...` do not parse.
+    fn native_temp_uri(root: &Path) -> CanonicalFileUri {
+        #[cfg(windows)]
+        {
+            let path = root.to_str().expect("the test temp path is lossless UTF-8");
+            let bytes = path.as_bytes();
+            assert!(
+                bytes.len() >= 3
+                    && bytes[0].is_ascii_alphabetic()
+                    && bytes[1] == b':'
+                    && bytes[2] == b'\\',
+                "the test temp path is an absolute Drive path"
+            );
+            // Drive URIs carry a forward-slash decoded path, and the Drive
+            // grammar requires an uppercase drive letter, so normalize both.
+            let decoded_path = format!(
+                "{}{}/{}",
+                char::from(bytes[0]).to_ascii_uppercase(),
+                &path[1..2],
+                path[3..].replace('\\', "/")
+            );
+            CanonicalFileUri::from_decoded_parts(FileUriFamily::Drive, None, &decoded_path)
+                .expect("the test root is a canonical Drive file URI")
+        }
+        #[cfg(not(windows))]
+        {
+            CanonicalFileUri::from_decoded_parts(
+                FileUriFamily::Posix,
+                None,
+                root.to_str().expect("the test temp path is lossless UTF-8"),
+            )
+            .expect("the test root is a canonical Posix file URI")
+        }
+    }
+
     fn composition_session_id() -> SessionId {
         COMPOSITION_SESSION_ID
             .parse()
@@ -5564,9 +5603,7 @@ mod tests {
         cwd_relative: &str,
         access: RequestedFilesystemAccess,
     ) -> Workspace {
-        let uri: CanonicalFileUri = format!("file://{}", root.display())
-            .parse()
-            .expect("the test root is a canonical native file URI");
+        let uri = native_temp_uri(root);
         let root_input = WorkspaceRootInput::new(
             "primary".parse().expect("the test root key is canonical"),
             uri,
@@ -5587,7 +5624,7 @@ mod tests {
         lower_workspace(
             input,
             WorkspaceRevision::new(NonZeroU64::new(1).expect("the test revision is non-zero")),
-            WorkspacePathTarget::Posix,
+            WorkspacePathTarget::current(),
         )
         .expect("the test workspace lowers")
     }
@@ -6386,9 +6423,7 @@ mod tests {
             WorkspaceDefinitionInput::new(
                 WorkspaceRootInput::new(
                     "primary".parse().unwrap(),
-                    format!("file://{}", temporary.path().display())
-                        .parse()
-                        .unwrap(),
+                    native_temp_uri(temporary.path()),
                     RequestedFilesystemAccess::ReadWrite,
                     WorkspaceSourcePolicy::new(false, false),
                 ),
@@ -6397,7 +6432,7 @@ mod tests {
             )
             .unwrap(),
             WorkspaceRevision::new(NonZeroU64::new(1).expect("the test revision is non-zero")),
-            WorkspacePathTarget::Posix,
+            WorkspacePathTarget::current(),
         )
         .expect("the test workspace lowers");
         let candidate = resolver

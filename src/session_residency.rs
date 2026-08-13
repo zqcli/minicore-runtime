@@ -6930,6 +6930,10 @@ mod tests {
         close_fixture(context, state, registry).await;
     }
 
+    // The exact replacement race (rename of the old root while the candidate holds an
+    // opened capability) is Unix-only: Windows intentionally returns a sharing violation
+    // because the opened directory lacks FILE_SHARE_DELETE, so the rename never succeeds.
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn read_access_load_revalidates_readable_candidate_and_rejects_replaced_root() {
         let store = TempStore::new();
