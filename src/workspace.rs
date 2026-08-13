@@ -2547,10 +2547,6 @@ impl WorkspaceSnapshot {
             },
         }
     }
-
-    pub(crate) fn into_resolved(self: Arc<Self>) -> ResolvedWorkspace {
-        ResolvedWorkspace { snapshot: self }
-    }
 }
 
 impl fmt::Debug for WorkspaceSnapshot {
@@ -2561,34 +2557,6 @@ impl fmt::Debug for WorkspaceSnapshot {
             .field("root_count", &self.roots.len())
             .field("prompt_source_count", &self.prompt_sources.len())
             .field("skill_source_count", &self.skill_sources.len())
-            .finish()
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct ResolvedWorkspace {
-    snapshot: Arc<WorkspaceSnapshot>,
-}
-
-impl ResolvedWorkspace {
-    pub(crate) fn snapshot(&self) -> &Arc<WorkspaceSnapshot> {
-        &self.snapshot
-    }
-
-    pub(crate) fn session_id(&self) -> SessionId {
-        self.snapshot.session_id()
-    }
-
-    pub(crate) fn revision(&self) -> WorkspaceRevision {
-        self.snapshot.revision()
-    }
-}
-
-impl fmt::Debug for ResolvedWorkspace {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ResolvedWorkspace")
-            .field("snapshot", &self.snapshot)
             .finish()
     }
 }
@@ -4061,10 +4029,6 @@ mod tests {
         assert!(!format!("{snapshot:?}").contains(primary.to_str().unwrap()));
         assert!(!format!("{snapshot:?}").contains(&session_id().to_string()));
 
-        let resolved = Arc::clone(&snapshot).into_resolved();
-        assert_eq!(resolved.session_id(), session_id());
-        assert_eq!(resolved.revision(), revision());
-        assert_eq!(resolved.snapshot.roots, snapshot.roots);
         task_context.shutdown().await;
     }
 

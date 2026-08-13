@@ -856,10 +856,6 @@ ToolService通过该context获得（当前实现）：
 WorkspaceSnapshot在Turn内没有可撤销lease。Workspace definition update只在Session Idle时执行，因此active Turn不会与definition update竞争，也不需要`WorkspaceAuthorizationControl`或`WorkspaceCommitAuthorization`。
 
 ```rust
-pub struct ResolvedWorkspace {
-    pub snapshot: Arc<WorkspaceSnapshot>,
-}
-
 pub(crate) struct WorkspaceSnapshotCandidate {
     // resolved roots, cwd, effective access and diagnostics; not yet published
 }
@@ -876,7 +872,7 @@ impl WorkspaceSnapshotCandidate {
 }
 ```
 
-`ResolvedWorkspace`是`SessionWorkspaceState::Ready`保存的published wrapper，不是WorkspaceResolver的直接返回值；只有candidate `finish(...)`完成Prompt/Skill source capture后才能创建。每个candidate内部持有不公开、不持久化且不命名的process-local capability basis；capture context产生的source必须携带同一basis，`finish(...)`在release build中同时验证basis identity与root/kind/path/trust authorization，不允许把旧candidate或另一candidate的captured source拼入当前Snapshot。失败返回redacted `WorkspaceSnapshotFinishError`，不能依赖`debug_assert!`或production panic执行授权检查；该basis不是Workspace identity、fingerprint、revision或public token。
+Workspace没有额外的published wrapper：只有candidate `finish(...)`完成Prompt/Skill source capture后才能产生`Arc<WorkspaceSnapshot>`，loaded Session将该Arc直接安装到其immutable executor snapshot。每个candidate内部持有不公开、不持久化且不命名的process-local capability basis；capture context产生的source必须携带同一basis，`finish(...)`在release build中同时验证basis identity与root/kind/path/trust authorization，不允许把旧candidate或另一candidate的captured source拼入当前Snapshot。失败返回redacted `WorkspaceSnapshotFinishError`，不能依赖`debug_assert!`或production panic执行授权检查；该basis不是Workspace identity、fingerprint、revision或public token。
 
 **final readable-candidate revalidation**：candidate若含任一readable filesystem grant或authorized Prompt/Skill source root（`requires_revalidation()`），installation前必须经`WorkspaceResolver::revalidate_candidate(candidate, workspace)`以current exact definition重新resolve并证明resolution相同（`has_same_resolution_as`比较session_id、revision、roots——含captured safe identity与grant/policy facts——与cwd）；没有任何readable/source root的candidate没有fresh read authority behind it，保持final、无需revalidation。security recovery与reload install前还验证snapshot的`Arc::ptr_eq`与SessionId/revision。该revalidation与`finish`的basis/root/kind/path/trust校验共同防止authority窗口内的root替换或authority事实变化发布stale capability。
 
@@ -914,17 +910,18 @@ pub struct SessionDefinition {
 
 Workspace definition update同时产生新的WorkspaceRevision和SessionDefinitionRevision。loaded Session只在execution state为Idle时接受Workspace patch；active Turn与Workspace definition update不存在并发语义。完整生命周期和线性化规则见[Agent与Session生命周期架构设计](agent-session-lifecycle.md)。
 
-loaded Session execution state 保存当前解析状态：
+loaded Session的immutable `SessionExecutorSnapshot`直接保存当前Workspace解析事实：
 
 ```rust
-pub enum SessionWorkspaceState {
-    Resolving,
-    Ready(ResolvedWorkspace),
-    Unavailable(WorkspaceUnavailable),
+pub(crate) struct SessionExecutorSnapshot {
+    workspace: Option<Arc<WorkspaceSnapshot>>,
+    workspace_unavailable: Option<SessionUnavailableView>,
+    workspace_preparing: bool,
+    // other immutable loaded Session facts
 }
 ```
 
-`SessionWorkspaceState` 是执行状态，不进入 Workspace definition，也不是第二个 durable source of truth。
+Ready时`workspace`必为`Some`；Workspace/Prompt unavailable与security recovery Preparing时该字段可为`None`并由相邻typed facts解释。它们都是process-local执行状态，不进入Workspace definition，也不是第二个durable source of truth。
 
 ### 创建与加载
 
@@ -952,8 +949,8 @@ Create完成lowering或加载已有durable definition后，resolve流程为：
 → SkillService.capture_workspace_sources(candidate.skill_capture_context())
 → candidate.finish(prompt_sources, skill_sources) → Result<Arc<WorkspaceSnapshot>, _>
 → publication 前 CAS SessionLifecycle 仍为 Open且 current revision 未变化
-→ Ready(ResolvedWorkspace { snapshot })
-   或 Unavailable(error)
+→ 将Arc<WorkspaceSnapshot>直接安装到SessionExecutorSnapshot
+   或安装typed Unavailable fact且不安装WorkspaceSnapshot
 
 任一resolve/source capture失败时不发布partial Snapshot。CAS stale时丢弃旧candidate并按新SessionDefinitionRevision重试，不能发布旧Workspace projection或旧source capture。
 ```
@@ -1023,7 +1020,7 @@ Workspace 没有独立 unload lifecycle。
 UnloadSession
 → Session LifecycleControl完成grace/fail-closed drain
 → SessionExecutionState = Idle
-→ 释放 SessionWorkspaceState
+→ 释放installed WorkspaceSnapshot与相邻execution facts
 ```
 
 Session active时由Session层的PrepareForUnload停止admission并等待自然terminal；grace deadline到期后fail-closed cancel。Workspace只在ActiveTurnTask结束、Executor进入Idle后释放resolved state。SessionRecorder没有后台queue或physical flush drain。

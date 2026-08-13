@@ -154,8 +154,6 @@ pub use limits::{
     ProtocolRejectReason, ProtocolVersion, ProtocolWelcome, QueueLimits, RuntimeInfo, TextLimits,
     TransportLimits, WorkspaceWireLimits,
 };
-#[allow(unused_imports, reason = "crate-private M2 Runtime negotiation seam")]
-pub(crate) use limits::{ProtocolNegotiation, negotiate_protocol};
 pub use path::{CanonicalFileUri, FileUriFamily, PathWireError, WorkspaceRelativePath};
 pub use public_protocol::{IncrementalRuntimeProtocolV1, RuntimeRequestKind};
 pub use scalar::{
