@@ -28,10 +28,10 @@ use crate::model_gateway::{
     ModelCallErrorReason, ProviderAttemptError, ProviderRequestDeliveryState,
 };
 
-// The fixed product `User-Agent` and the locked-down client construction moved up to
-// the crate-private shared owner `crate::http_transport` (see
-// `crate::http_transport::USER_AGENT` and `crate::http_transport::build_client`);
-// the adapters install that exact builder unchanged.
+// The fixed product `User-Agent` and the locked-down client construction live in the
+// crate-private shared owner `crate::http_transport` (see
+// `crate::http_transport::USER_AGENT` and `crate::http_transport::client_builder`);
+// the adapters build that exact shared policy unchanged.
 pub(super) fn response_byte_limit() -> usize {
     usize::try_from(
         crate::wire::ProtocolLimits::v1_0()

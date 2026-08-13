@@ -58,7 +58,7 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::http_transport::build_client;
+use crate::http_transport::client_builder;
 use crate::model_gateway::provider_transport::{
     SseParser, cancelled, classify_send_error, invalid_provider_response, invalid_request_not_sent,
     is_event_stream, parse_retry_after, read_bounded_envelope, response_byte_limit,
@@ -125,10 +125,12 @@ impl AnthropicMessagesProviderAdapter {
         validate_opaque_ascii(version, 64)
             .map_err(|_| AnthropicProviderConfigError::InvalidVersion)?;
         // The locked-down client (no redirects, no retries, no ambient proxy, fixed
-        // product UA, explicit no-compression) is the shared production constructor
-        // `crate::http_transport::build_client`; the typed ClientBuild mapping is
-        // preserved.
-        let client = build_client().map_err(|_| AnthropicProviderConfigError::ClientBuild)?;
+        // product UA, explicit no-compression) is built from the shared production
+        // builder `crate::http_transport::client_builder`; the typed ClientBuild
+        // mapping is preserved.
+        let client = client_builder()
+            .build()
+            .map_err(|_| AnthropicProviderConfigError::ClientBuild)?;
         Ok(Self {
             client,
             endpoint,
@@ -2032,7 +2034,8 @@ mod tests {
             header.is_sensitive(),
             "the Anthropic credential header must be explicitly sensitive"
         );
-        let request = build_client()
+        let request = client_builder()
+            .build()
             .expect("the locked-down test client builds")
             .post("https://api.anthropic.com/v1/messages")
             .header("x-api-key", header)
