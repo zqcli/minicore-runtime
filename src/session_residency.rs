@@ -4967,8 +4967,10 @@ mod tests {
         WorkspacePromptSourceAdapter, WorkspacePromptSourceFuture,
     };
     use crate::runtime_task::RuntimeTaskContext;
+    #[cfg(not(windows))]
+    use crate::wire::FileUriFamily;
     use crate::wire::conversation_jsonl::ConversationLineCodec;
-    use crate::wire::{CanonicalFileUri, FileUriFamily, SessionId};
+    use crate::wire::{CanonicalFileUri, SessionId};
     use crate::workspace::{
         RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput, WorkspacePathTarget,
         WorkspaceRootInput, WorkspaceRootKey, WorkspaceSourcePolicy, lower_workspace,

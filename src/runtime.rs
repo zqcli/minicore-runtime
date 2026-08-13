@@ -4517,10 +4517,12 @@ mod tests {
         UserQuestionFieldAnswer,
     };
     use crate::turn_item_interaction::{InteractionResolutionInput, UserMessageSource};
+    #[cfg(not(windows))]
+    use crate::wire::FileUriFamily;
     use crate::wire::conversation_jsonl::ConversationLineCodec;
     use crate::wire::{
-        AgentId, CanonicalFileUri, CommandId, FileUriFamily, InteractionResolutionKey, ItemId,
-        RequestId, SessionId, SessionMetadataRevision, TurnId,
+        AgentId, CanonicalFileUri, CommandId, InteractionResolutionKey, ItemId, RequestId,
+        SessionId, SessionMetadataRevision, TurnId,
     };
     use crate::workspace::{
         RequestedFilesystemAccess, Workspace, WorkspaceAccessError, WorkspaceCwdSpec,

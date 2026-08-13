@@ -3246,19 +3246,21 @@ mod tests {
     use super::{
         AuthorizedWorkspaceReadPath, AuthorizedWorkspaceWritePath, CanonicalWorkspacePath,
         CapturedWorkspacePromptSource, CapturedWorkspaceSkillSource, LocalWorkspacePathAdapter,
-        OpenedWorkspaceRoot, PreparedWorkspaceWriteTarget, PreparedWorkspaceWriteTargetKind,
-        RequestedFilesystemAccess, RestrictedWorkspaceAuthority, Workspace, WorkspaceAccessError,
-        WorkspaceAccessRoot, WorkspaceAccessView, WorkspaceAuthority, WorkspaceAuthorityDecision,
+        OpenedWorkspaceRoot, PreparedWorkspaceWriteTarget, RequestedFilesystemAccess,
+        RestrictedWorkspaceAuthority, Workspace, WorkspaceAccessError, WorkspaceAccessRoot,
+        WorkspaceAccessView, WorkspaceAuthority, WorkspaceAuthorityDecision,
         WorkspaceAuthorityError, WorkspaceAuthorityRequest, WorkspaceAuthorityRootDecision,
         WorkspaceAuthorityRootRequest, WorkspaceConstructionError, WorkspaceCwdSpec,
-        WorkspaceDefinitionInput, WorkspaceFileMutationKey, WorkspaceFilesystemGrant,
-        WorkspaceInputLoweringError, WorkspacePathAdapter, WorkspacePathError, WorkspacePathTarget,
-        WorkspaceResolveError, WorkspaceResolver, WorkspaceRootIdentity, WorkspaceRootInput,
-        WorkspaceRootRole, WorkspaceRootSpec, WorkspaceRootTrust, WorkspaceSnapshotFinishError,
+        WorkspaceDefinitionInput, WorkspaceFilesystemGrant, WorkspaceInputLoweringError,
+        WorkspacePathAdapter, WorkspacePathError, WorkspacePathTarget, WorkspaceResolveError,
+        WorkspaceResolver, WorkspaceRootIdentity, WorkspaceRootInput, WorkspaceRootRole,
+        WorkspaceRootSpec, WorkspaceRootTrust, WorkspaceSnapshotFinishError,
         WorkspaceSourceCaptureError, WorkspaceSourcePolicy, WorkspaceTrustLevel,
         WorkspaceTrustRevision, WorkspaceWriteError, checked_native_uri, lower_workspace,
         test_capability_scratch, uri_from_spec,
     };
+    #[cfg(unix)]
+    use super::{PreparedWorkspaceWriteTargetKind, WorkspaceFileMutationKey};
     use crate::runtime_task::RuntimeTaskContext;
     use crate::wire::{CanonicalFileUri, SessionId, WorkspaceRelativePath, WorkspaceRevision};
 
