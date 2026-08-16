@@ -12,7 +12,7 @@
 //! executor retains its permit (and excludes lifecycle/load changes) for as long as the loaded
 //! executor is live; this constructor does not acquire that permit.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -50,18 +50,21 @@ use crate::live_conversation::{
 };
 use crate::model_gateway::{
     FinalizedAssistantContent, ModelCallError, ModelCallErrorReason, ModelCallPurpose,
-    ModelCallRequest, ModelCallResult, ModelCatalogView, ModelGateway, ModelProgressPublisher,
-    ModelRequestValidationErrorKind, ModelResolutionError, ModelResolutionErrorKind, ModelUsage,
-    ProviderRequestDeliveryState, ResolveTurnModelRequest,
+    ModelCallRequest, ModelCallResult, ModelCatalogView, ModelContentDelta, ModelGateway,
+    ModelProgressEvent, ModelProgressPublisher, ModelRequestValidationErrorKind,
+    ModelResolutionError, ModelResolutionErrorKind, ModelUsage, ProviderRequestDeliveryState,
+    ResolveTurnModelRequest,
 };
 use crate::prompt::{
     PromptError, PromptErrorKind, PromptIntent, PromptResourceView, PromptService,
     SessionPromptSelection,
 };
 use crate::runtime_interface::{
-    CurrentTurnView, InteractionView, ItemContentView, ItemStatusView, ItemView,
-    SessionDiagnosticView, SessionReadinessView, SessionRecordingState, SessionUnavailableView,
-    SessionUsageView, TurnExecutionPhaseView, TurnStatusView,
+    CurrentTurnView, EventRoute, InteractionView, ItemContentView, ItemProgressContentKind,
+    ItemStatusView, ItemView, ModelCallPurpose as PublicModelCallPurpose, ProgressEvent,
+    ProgressEventKind, ProgressUpdate, SessionDiagnosticView, SessionReadinessView,
+    SessionRecordingState, SessionUnavailableView, SessionUsageView, TurnExecutionPhaseView,
+    TurnStatusView,
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, RuntimeTaskError, SystemClock, TrackedTask};
 use crate::session_ingress::{
@@ -78,8 +81,8 @@ use crate::tools::{
     SessionFileMutationTicket, ToolAbandonReason, ToolApprovalDecision, ToolApprovalRequest,
     ToolCall, ToolCancellationHandle, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionPlan,
     ToolExecutionPreparation, ToolExecutionRequest, ToolExecutionResult, ToolExecutionRun,
-    ToolExecutionStart, ToolSet, ToolStartError, ToolStartGate, ToolStartedExecution,
-    TurnToolResources, UserQuestionAnswer, UserQuestionRequest,
+    ToolExecutionStart, ToolResultContentPart, ToolSet, ToolStartError, ToolStartGate,
+    ToolStartedExecution, TurnToolResources, UserQuestionAnswer, UserQuestionRequest,
 };
 use crate::turn_execution_context::{
     TurnContextCapture, TurnContextCaptureError, TurnExecutionContext,
@@ -100,6 +103,7 @@ use crate::workspace::{
 
 const SESSION_EXECUTOR_REQUEST_QUEUE_CAPACITY: usize = 8;
 const SESSION_EVENT_CAPACITY: usize = 32;
+const SESSION_OBSERVATION_EVENT_CAPACITY: usize = 256;
 const AGENT_RUN_MAX_LOGICAL_RETRIES: usize = 3;
 const AGENT_RUN_RETRY_BACKOFFS: [std::time::Duration; AGENT_RUN_MAX_LOGICAL_RETRIES] = [
     std::time::Duration::from_secs(2),
@@ -178,6 +182,54 @@ pub(crate) enum SessionExecutorEvent {
     },
 }
 
+#[derive(Clone)]
+pub(crate) enum SessionExecutorObservationEvent {
+    State(Arc<SessionExecutorEvent>),
+    Progress(ProgressEvent),
+}
+
+pub(crate) enum SessionExecutorSubscriptionEvent {
+    State(Arc<SessionExecutorEvent>),
+    Progress(ProgressEvent),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionExecutorSubscriptionReceiveError {
+    Backpressure,
+    PublisherClosed,
+}
+
+#[derive(Clone)]
+struct SessionEventPublisher {
+    state: broadcast::Sender<Arc<SessionExecutorEvent>>,
+    observations: broadcast::Sender<Arc<SessionExecutorObservationEvent>>,
+}
+
+impl SessionEventPublisher {
+    fn send(
+        &self,
+        event: Arc<SessionExecutorEvent>,
+    ) -> Result<usize, broadcast::error::SendError<Arc<SessionExecutorEvent>>> {
+        let state_result = self.state.send(Arc::clone(&event));
+        let _ = self
+            .observations
+            .send(Arc::new(SessionExecutorObservationEvent::State(event)));
+        state_result
+    }
+
+    fn send_progress(&self, event: ProgressEvent) {
+        let _ = self
+            .observations
+            .send(Arc::new(SessionExecutorObservationEvent::Progress(event)));
+    }
+
+    fn send_observation_state(&self, event: Arc<SessionExecutorEvent>) {
+        let _ = self
+            .observations
+            .send(Arc::new(SessionExecutorObservationEvent::State(event)));
+    }
+}
+
 impl SessionExecutorEvent {
     pub(crate) const fn timestamp(&self) -> Timestamp {
         match self {
@@ -237,7 +289,12 @@ impl SessionExecutorEvent {
 
 pub(crate) struct SessionExecutorSubscription {
     snapshot: Arc<SessionExecutorSnapshot>,
-    receiver: broadcast::Receiver<Arc<SessionExecutorEvent>>,
+    receiver: SessionExecutorSubscriptionReceiver,
+}
+
+enum SessionExecutorSubscriptionReceiver {
+    State(broadcast::Receiver<Arc<SessionExecutorEvent>>),
+    Observations(broadcast::Receiver<Arc<SessionExecutorObservationEvent>>),
 }
 
 impl SessionExecutorSubscription {
@@ -246,7 +303,58 @@ impl SessionExecutorSubscription {
     }
 
     pub(crate) async fn recv(&mut self) -> Option<Arc<SessionExecutorEvent>> {
-        self.receiver.recv().await.ok()
+        loop {
+            match &mut self.receiver {
+                SessionExecutorSubscriptionReceiver::State(receiver) => {
+                    return receiver.recv().await.ok();
+                }
+                SessionExecutorSubscriptionReceiver::Observations(receiver) => {
+                    match receiver.recv().await.ok()?.as_ref() {
+                        SessionExecutorObservationEvent::State(event) => {
+                            return Some(Arc::clone(event));
+                        }
+                        SessionExecutorObservationEvent::Progress(_) => continue,
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn recv_event(
+        &mut self,
+    ) -> Result<SessionExecutorSubscriptionEvent, SessionExecutorSubscriptionReceiveError> {
+        match &mut self.receiver {
+            SessionExecutorSubscriptionReceiver::State(receiver) => receiver
+                .recv()
+                .await
+                .map(SessionExecutorSubscriptionEvent::State)
+                .map_err(map_subscription_receive_error),
+            SessionExecutorSubscriptionReceiver::Observations(receiver) => receiver
+                .recv()
+                .await
+                .map(|event| match event.as_ref() {
+                    SessionExecutorObservationEvent::State(event) => {
+                        SessionExecutorSubscriptionEvent::State(Arc::clone(event))
+                    }
+                    SessionExecutorObservationEvent::Progress(event) => {
+                        SessionExecutorSubscriptionEvent::Progress(event.clone())
+                    }
+                })
+                .map_err(map_subscription_receive_error),
+        }
+    }
+}
+
+fn map_subscription_receive_error(
+    error: broadcast::error::RecvError,
+) -> SessionExecutorSubscriptionReceiveError {
+    match error {
+        broadcast::error::RecvError::Lagged(_) => {
+            SessionExecutorSubscriptionReceiveError::Backpressure
+        }
+        broadcast::error::RecvError::Closed => {
+            SessionExecutorSubscriptionReceiveError::PublisherClosed
+        }
     }
 }
 
@@ -1739,6 +1847,7 @@ pub(crate) struct SessionExecutor {
     published_snapshot: Arc<Mutex<Arc<SessionExecutorSnapshot>>>,
     conversation: Option<Arc<LoadedSessionConversation>>,
     events: broadcast::Sender<Arc<SessionExecutorEvent>>,
+    observations: broadcast::Sender<Arc<SessionExecutorObservationEvent>>,
     emergency: EmergencyControlHandle,
     #[cfg(test)]
     hooks: Arc<SessionExecutorTestHooksInner>,
@@ -1980,6 +2089,7 @@ impl SessionExecutor {
         let (emergency_sender, emergency_receiver) = mpsc::unbounded_channel();
         let (completion_sender, completion_receiver) = mpsc::unbounded_channel();
         let (events, _) = broadcast::channel(SESSION_EVENT_CAPACITY);
+        let (observations, _) = broadcast::channel(SESSION_OBSERVATION_EVENT_CAPACITY);
         let closing = CancellationToken::new();
         let turn_admission_gate = Arc::new(TurnAdmissionGate::new());
         let emergency = EmergencyControlHandle::new();
@@ -2011,7 +2121,10 @@ impl SessionExecutor {
             follow_up: FollowUpQueue::new(),
             steer: SteerQueue::new(),
             turn_admission_gate: Arc::clone(&turn_admission_gate),
-            events: events.clone(),
+            events: SessionEventPublisher {
+                state: events.clone(),
+                observations: observations.clone(),
+            },
             emergency: emergency.clone(),
             pending_availability: None,
             prepare_unload: None,
@@ -2059,6 +2172,7 @@ impl SessionExecutor {
             published_snapshot,
             conversation,
             events,
+            observations,
             emergency,
             #[cfg(test)]
             hooks,
@@ -2859,8 +2973,16 @@ impl SessionExecutor {
     pub(crate) async fn subscribe(
         &self,
     ) -> Result<SessionExecutorSubscription, SessionExecutorSnapshotError> {
+        self.subscribe_with_progress(false).await
+    }
+
+    pub(crate) async fn subscribe_with_progress(
+        &self,
+        include_progress: bool,
+    ) -> Result<SessionExecutorSubscription, SessionExecutorSnapshotError> {
         let (response, waiter) = oneshot::channel();
         let mut request = SessionExecutorRequest::Subscribe(SubscribeRequest {
+            include_progress,
             response: Some(response),
         });
         let permit = tokio::select! {
@@ -3058,7 +3180,7 @@ struct SessionExecutorActor {
     follow_up: FollowUpQueue,
     steer: SteerQueue,
     turn_admission_gate: Arc<TurnAdmissionGate>,
-    events: broadcast::Sender<Arc<SessionExecutorEvent>>,
+    events: SessionEventPublisher,
     emergency: EmergencyControlHandle,
     pending_availability: Option<PendingAvailability>,
     prepare_unload: Option<PrepareUnloadState>,
@@ -3600,9 +3722,16 @@ impl SessionExecutorActor {
                 self.publish_metadata(request)?;
             }
             SessionExecutorRequest::Subscribe(request) => {
+                let receiver = if request.include_progress {
+                    SessionExecutorSubscriptionReceiver::Observations(
+                        self.events.observations.subscribe(),
+                    )
+                } else {
+                    SessionExecutorSubscriptionReceiver::State(self.events.state.subscribe())
+                };
                 request.settle(Ok(SessionExecutorSubscription {
                     snapshot: Arc::clone(&self.current),
-                    receiver: self.events.subscribe(),
+                    receiver,
                 }));
             }
             #[cfg(test)]
@@ -5845,6 +5974,7 @@ impl SessionExecutorActor {
                 steer_command_ids,
             );
         self.publish_current(Arc::new(current));
+        self.publish_observation_changed(SystemClock.now());
         // The current pending-interaction projection was published synchronously; the
         // test-only probe wakes after it, so one snapshot read observes this exact
         // publication (a request presentation and a resolution/cancellation removal both
@@ -5893,7 +6023,7 @@ impl SessionExecutorActor {
             self.durable_state.request_closing();
         }
         self.execution_state = SessionExecutionState::Idle;
-        self.publish_execution_state(
+        self.update_execution_state_snapshot(
             SessionExecutionState::Idle,
             None,
             Some((active.turn_id, completion.terminal)),
@@ -6336,6 +6466,7 @@ impl SessionExecutorActor {
             ExecutorCompletion::InteractionRequested(completion) => {
                 self.handle_interaction_requested(completion).await
             }
+            ExecutorCompletion::Progress(completion) => self.handle_progress_completion(completion),
             ExecutorCompletion::SteerSafePoint(completion) => {
                 self.handle_steer_safe_point(completion).await
             }
@@ -6353,6 +6484,39 @@ impl SessionExecutorActor {
         }
     }
 
+    fn handle_progress_completion(
+        &mut self,
+        completion: ProgressCompletion,
+    ) -> Result<(), ActorFatality> {
+        let Some(active_turn) = self.active_turn.as_ref() else {
+            return Err(ActorFatality::Internal);
+        };
+        let session_id = self.current.definition().session_id();
+        let route_matches = match completion.event.route() {
+            EventRoute::Turn {
+                session_id: event_session_id,
+                turn_id,
+            }
+            | EventRoute::Item {
+                session_id: event_session_id,
+                turn_id,
+                ..
+            } => event_session_id == session_id && turn_id == completion.turn_id,
+            EventRoute::Runtime
+            | EventRoute::Agent { .. }
+            | EventRoute::Session { .. }
+            | EventRoute::Interaction { .. } => false,
+        };
+        if active_turn.turn_id != completion.turn_id || !route_matches {
+            return Err(ActorFatality::Internal);
+        }
+        self.events.send_progress(completion.event);
+        if let Some(published) = completion.published {
+            let _ = published.send(());
+        }
+        Ok(())
+    }
+
     fn handle_turn_phase_completion(
         &mut self,
         completion: TurnPhaseCompletion,
@@ -6365,6 +6529,7 @@ impl SessionExecutorActor {
         }
         active_turn.phase = completion.phase;
         self.publish_queue_projection();
+        self.publish_observation_changed(SystemClock.now());
         let _ = completion.response.send(());
         Ok(())
     }
@@ -6950,6 +7115,22 @@ impl SessionExecutorActor {
         last_terminal: Option<(TurnId, SessionTurnTerminal)>,
     ) {
         let previous_execution_state = self.current.execution_state();
+        self.update_execution_state_snapshot(execution_state, current_turn, last_terminal);
+        if previous_execution_state != execution_state {
+            if execution_state == SessionExecutionState::Finishing {
+                self.publish_execution_changed(SystemClock.now());
+            } else {
+                self.publish_observation_changed(SystemClock.now());
+            }
+        }
+    }
+
+    fn update_execution_state_snapshot(
+        &mut self,
+        execution_state: SessionExecutionState,
+        current_turn: Option<TurnId>,
+        last_terminal: Option<(TurnId, SessionTurnTerminal)>,
+    ) {
         // The queue projection must be derived from the transition candidate's own readiness,
         // never from the pre-transition snapshot: a terminal transition back to Idle surfaces
         // the definition-time facts installed during the active Turn (the Running snapshot
@@ -6967,16 +7148,23 @@ impl SessionExecutorActor {
             steer_command_ids,
         ));
         self.publish_current(current);
-        if execution_state == SessionExecutionState::Finishing
-            && previous_execution_state != SessionExecutionState::Finishing
-        {
-            let _ = self
-                .events
-                .send(Arc::new(SessionExecutorEvent::ExecutionChanged {
-                    timestamp: SystemClock.now(),
-                    snapshot: Arc::clone(&self.current),
-                }));
-        }
+    }
+
+    fn publish_execution_changed(&self, timestamp: Timestamp) {
+        let _ = self
+            .events
+            .send(Arc::new(SessionExecutorEvent::ExecutionChanged {
+                timestamp,
+                snapshot: Arc::clone(&self.current),
+            }));
+    }
+
+    fn publish_observation_changed(&self, timestamp: Timestamp) {
+        self.events
+            .send_observation_state(Arc::new(SessionExecutorEvent::ExecutionChanged {
+                timestamp,
+                snapshot: Arc::clone(&self.current),
+            }));
     }
 
     /// Projects the public queue under an explicit candidate readiness: while non-Ready every
@@ -7146,10 +7334,12 @@ impl SessionExecutorActor {
                 StoredEntryBody::AssistantMessage(message) => {
                     for content in message.content() {
                         let (item_id, item_content) = match content {
-                            StoredAssistantContent::Reasoning {
-                                item_id,
-                                content: _,
-                            } => (*item_id, ItemContentView::reasoning("reasoning redacted")),
+                            StoredAssistantContent::Reasoning { item_id, content } => (
+                                *item_id,
+                                ItemContentView::reasoning(
+                                    content.summary().unwrap_or("reasoning redacted"),
+                                ),
+                            ),
                             StoredAssistantContent::Text { item_id, text } => {
                                 (*item_id, ItemContentView::agent_message(text.as_ref()))
                             }
@@ -7613,11 +7803,18 @@ enum ExecutorCompletion {
     Publication(PublicationCompletion),
     Admission(AdmissionCompletion),
     InteractionRequested(InteractionRequestedCompletion),
+    Progress(ProgressCompletion),
     SteerSafePoint(SteerSafePointCompletion),
     TurnPhase(TurnPhaseCompletion),
     Turn(TurnCompletion),
     SecurityRecovery(SecurityRecoveryCompletion),
     RuntimeDependencyProbe(RuntimeDependencyProbeCompletion),
+}
+
+struct ProgressCompletion {
+    turn_id: TurnId,
+    event: ProgressEvent,
+    published: Option<oneshot::Sender<()>>,
 }
 
 struct InteractionRequestedCompletion {
@@ -9292,6 +9489,189 @@ async fn execute_gated_tool_round(
     results.into_iter().map(|(_, outcome)| outcome).collect()
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ActiveModelProgressKind {
+    AssistantText,
+    Reasoning,
+}
+
+impl ActiveModelProgressKind {
+    const fn public(self) -> ItemProgressContentKind {
+        match self {
+            Self::AssistantText => ItemProgressContentKind::AssistantText,
+            Self::Reasoning => ItemProgressContentKind::Reasoning,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ActiveModelProgressState {
+    item_ids: BTreeMap<(u32, ActiveModelProgressKind), ItemId>,
+    started: BTreeSet<(u32, ActiveModelProgressKind)>,
+    deltas: BTreeSet<(u32, ActiveModelProgressKind)>,
+}
+
+#[derive(Clone)]
+struct ActiveModelProgress {
+    session_id: SessionId,
+    turn_id: TurnId,
+    completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    state: Arc<Mutex<ActiveModelProgressState>>,
+}
+
+impl ActiveModelProgress {
+    fn new(
+        session_id: SessionId,
+        turn_id: TurnId,
+        completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    ) -> Self {
+        Self {
+            session_id,
+            turn_id,
+            completion_sender,
+            state: Arc::new(Mutex::new(ActiveModelProgressState::default())),
+        }
+    }
+
+    fn publisher(&self) -> ModelProgressPublisher {
+        let progress = self.clone();
+        ModelProgressPublisher::new(move |event| progress.publish_provider_event(event))
+    }
+
+    fn publish_provider_event(&self, event: ModelProgressEvent) {
+        let ModelProgressEvent::ContentDelta {
+            content_index,
+            delta,
+        } = event;
+        let (kind, delta) = match delta {
+            ModelContentDelta::Text(delta) => (ActiveModelProgressKind::AssistantText, delta),
+            ModelContentDelta::ReasoningSummary(delta) => {
+                (ActiveModelProgressKind::Reasoning, delta)
+            }
+        };
+        self.publish_delta(content_index, kind, delta.as_ref());
+    }
+
+    fn publish_delta(&self, content_index: u32, kind: ActiveModelProgressKind, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let key = (content_index, kind);
+        let (item_id, publish_started) = {
+            let mut state = lock(&self.state);
+            let item_id = match state.item_ids.get(&key).copied() {
+                Some(item_id) => item_id,
+                None => {
+                    let Ok(item_id) = ItemId::generate() else {
+                        return;
+                    };
+                    state.item_ids.insert(key, item_id);
+                    item_id
+                }
+            };
+            let publish_started = state.started.insert(key);
+            state.deltas.insert(key);
+            (item_id, publish_started)
+        };
+        let route = EventRoute::Item {
+            session_id: self.session_id,
+            turn_id: self.turn_id,
+            item_id,
+        };
+        if publish_started {
+            if let Ok(event) = ProgressEvent::new(
+                SystemClock.now(),
+                route,
+                ProgressEventKind::Model,
+                ProgressUpdate::item_started(item_id, content_index, kind.public()),
+            ) {
+                self.send(event, None);
+            }
+        }
+        let Ok(update) = ProgressUpdate::item_delta(item_id, content_index, kind.public(), delta)
+        else {
+            return;
+        };
+        if let Ok(event) =
+            ProgressEvent::new(SystemClock.now(), route, ProgressEventKind::Model, update)
+        {
+            self.send(event, None);
+        }
+    }
+
+    fn final_item_id(
+        &self,
+        content_index: u32,
+        kind: ActiveModelProgressKind,
+    ) -> Result<ItemId, SessionTurnFailure> {
+        let mut state = lock(&self.state);
+        let key = (content_index, kind);
+        if let Some(item_id) = state.item_ids.get(&key) {
+            return Ok(*item_id);
+        }
+        let item_id = ItemId::generate().map_err(|_| SessionTurnFailure::Internal)?;
+        state.item_ids.insert(key, item_id);
+        Ok(item_id)
+    }
+
+    fn publish_final_summary_if_missing(&self, content_index: u32, item_id: ItemId, summary: &str) {
+        let key = (content_index, ActiveModelProgressKind::Reasoning);
+        let missing = {
+            let mut state = lock(&self.state);
+            state.item_ids.insert(key, item_id);
+            !state.deltas.contains(&key)
+        };
+        if missing {
+            self.publish_delta(content_index, ActiveModelProgressKind::Reasoning, summary);
+        }
+    }
+
+    fn retry_scheduled(&self, retry_count: u8, delay: std::time::Duration) {
+        {
+            let mut state = lock(&self.state);
+            state.started.clear();
+            state.deltas.clear();
+        }
+        let Ok(milliseconds) = i64::try_from(delay.as_millis()) else {
+            return;
+        };
+        let Some(ready_at) = SystemClock
+            .now()
+            .as_datetime()
+            .checked_add(time::Duration::milliseconds(milliseconds))
+            .and_then(|value| Timestamp::from_utc(value).ok())
+        else {
+            return;
+        };
+        let Ok(event) = ProgressEvent::new(
+            SystemClock.now(),
+            EventRoute::Turn {
+                session_id: self.session_id,
+                turn_id: self.turn_id,
+            },
+            ProgressEventKind::Retry,
+            ProgressUpdate::model_retry_scheduled(
+                PublicModelCallPurpose::AgentRun,
+                retry_count,
+                ready_at,
+            ),
+        ) else {
+            return;
+        };
+        self.send(event, None);
+    }
+
+    fn send(&self, event: ProgressEvent, published: Option<oneshot::Sender<()>>) {
+        let _ = self
+            .completion_sender
+            .send(ExecutorCompletion::Progress(ProgressCompletion {
+                turn_id: self.turn_id,
+                event,
+                published,
+            }));
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "one ActiveTurn binds its immutable context, model, channels, and cancellation basis"
@@ -9326,7 +9706,7 @@ async fn run_active_turn(
         executor_closing.clone(),
         closing,
         interaction_completion_sender,
-        steer_completion_sender,
+        steer_completion_sender.clone(),
         #[cfg(test)]
         hooks,
     )
@@ -9334,6 +9714,16 @@ async fn run_active_turn(
     match result {
         Ok(entry) => {
             let _ = conversation.recorder.record(entry).await;
+            // Refresh the public snapshot after the final assistant fact is live and its
+            // inline record attempt has settled, but before the TurnCompletion guard queues
+            // terminal. The actor lane therefore publishes the completed assistant Item after
+            // every accepted model progress event and before the terminal StateEvent.
+            let _ = publish_turn_phase(
+                &steer_completion_sender,
+                turn_id,
+                TurnExecutionPhaseView::Sampling,
+            )
+            .await;
             SessionTurnTerminal::Completed
         }
         Err(SessionTurnFailure::EmergencyControl(signal)) => {
@@ -9480,6 +9870,11 @@ async fn run_active_turn_inner(
         .map_err(map_model_request_error)?;
         #[cfg(test)]
         hooks.before_agent_run_attempt().await;
+        let model_progress = ActiveModelProgress::new(
+            context.session_id(),
+            turn_id,
+            steer_completion_sender.clone(),
+        );
         let call_result = call_agent_run_with_logical_retry(
             &model_gateway,
             Arc::clone(&request),
@@ -9491,6 +9886,7 @@ async fn run_active_turn_inner(
             cancellation.clone(),
             executor_closing.clone(),
             closing.clone(),
+            &model_progress,
         )
         .await;
         let (result, logical_retry_count) = match call_result {
@@ -9531,16 +9927,28 @@ async fn run_active_turn_inner(
         let response = result.response();
         let mut content = Vec::with_capacity(response.content().len());
         let mut calls = Vec::new();
-        for block in response.content() {
-            let item_id = ItemId::generate().map_err(|_| SessionTurnFailure::Internal)?;
+        for (content_index, block) in response.content().iter().enumerate() {
+            let content_index =
+                u32::try_from(content_index).map_err(|_| SessionTurnFailure::Internal)?;
             match block {
                 FinalizedAssistantContent::Reasoning(reasoning) => {
+                    let item_id = model_progress
+                        .final_item_id(content_index, ActiveModelProgressKind::Reasoning)?;
+                    if let Some(summary) = reasoning.summary() {
+                        model_progress.publish_final_summary_if_missing(
+                            content_index,
+                            item_id,
+                            summary,
+                        );
+                    }
                     content.push(StoredAssistantContent::Reasoning {
                         item_id,
                         content: reasoning.clone(),
                     });
                 }
                 FinalizedAssistantContent::Text { text } => {
+                    let item_id = model_progress
+                        .final_item_id(content_index, ActiveModelProgressKind::AssistantText)?;
                     content.push(StoredAssistantContent::Text {
                         item_id,
                         text: Arc::clone(text),
@@ -9551,6 +9959,7 @@ async fn run_active_turn_inner(
                     name,
                     arguments,
                 } => {
+                    let item_id = ItemId::generate().map_err(|_| SessionTurnFailure::Internal)?;
                     let call_index =
                         u32::try_from(calls.len()).map_err(|_| SessionTurnFailure::Internal)?;
                     content.push(StoredAssistantContent::ToolCall {
@@ -9630,6 +10039,12 @@ async fn run_active_turn_inner(
                 .recorder
                 .record(Arc::clone(assistant_fact.entry()))
                 .await;
+            publish_turn_phase(
+                &steer_completion_sender,
+                turn_id,
+                TurnExecutionPhaseView::Sampling,
+            )
+            .await?;
             if let Some(steer) = resolve_one_steer(
                 Arc::clone(&context),
                 Arc::clone(&conversation),
@@ -9657,6 +10072,12 @@ async fn run_active_turn_inner(
                     .recorder
                     .record(Arc::clone(steer_fact.entry()))
                     .await;
+                publish_turn_phase(
+                    &steer_completion_sender,
+                    turn_id,
+                    TurnExecutionPhaseView::Sampling,
+                )
+                .await?;
             }
             continue;
         }
@@ -9693,6 +10114,12 @@ async fn run_active_turn_inner(
             })
             .collect::<Vec<_>>();
         let _ = conversation.recorder.record(entry).await;
+        publish_turn_phase(
+            &steer_completion_sender,
+            turn_id,
+            TurnExecutionPhaseView::ExecutingTools,
+        )
+        .await?;
         #[cfg(test)]
         hooks.before_tool_round_start().await;
         let mut round = PlannedToolRound::plan(
@@ -9711,8 +10138,14 @@ async fn run_active_turn_inner(
         // before the Turn interrupts.  An abandoned question settles the exchange and starts
         // no remaining side effect, exactly like the ordinary abandoned terminal semantics.
         while let Some((_call_index, outcome)) = round.next_question().await {
-            let (item_id, tool_call_id, stored) = stored_tool_outcome(outcome)?;
-            if matches!(&stored, StoredToolOutcome::Abandoned { .. }) {
+            if apply_tool_outcome_and_publish(
+                &conversation,
+                turn_id,
+                outcome,
+                &steer_completion_sender,
+            )
+            .await?
+            {
                 // The abandoned question outcome is applied + recorded first, then every
                 // not-yet-driven question and ordinary operation settles without executing
                 // any binding/factory/side effect (every `Some(plan)` Prepared slot moves
@@ -9720,52 +10153,31 @@ async fn run_active_turn_inner(
                 // slots keep their exact outcome).  The matching outcomes are applied +
                 // inline-recorded in stable call_index order before the exchange is
                 // abandoned, so no Prepared slot or plan is ever dropped silently.
-                let fact = lock(&conversation.live_state)
-                    .apply_tool_message(
-                        StoredToolMessage::reconstruct(item_id, tool_call_id, stored),
-                        turn_id,
-                        SystemClock.now(),
-                    )
-                    .map_err(|_| SessionTurnFailure::Internal)?;
-                let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
                 for (_call_index, outcome) in round.settle_remaining_without_start() {
-                    let (item_id, tool_call_id, stored) = stored_tool_outcome(outcome)?;
-                    let fact = lock(&conversation.live_state)
-                        .apply_tool_message(
-                            StoredToolMessage::reconstruct(item_id, tool_call_id, stored),
-                            turn_id,
-                            SystemClock.now(),
-                        )
-                        .map_err(|_| SessionTurnFailure::Internal)?;
-                    let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
+                    let _ = apply_tool_outcome_and_publish(
+                        &conversation,
+                        turn_id,
+                        outcome,
+                        &steer_completion_sender,
+                    )
+                    .await?;
                 }
                 lock(&conversation.live_state)
                     .abandon_current_tool_exchange(turn_id)
                     .map_err(|_| SessionTurnFailure::Internal)?;
                 return Err(SessionTurnFailure::Model);
             }
-            let fact = lock(&conversation.live_state)
-                .apply_tool_message(
-                    StoredToolMessage::reconstruct(item_id, tool_call_id, stored),
-                    turn_id,
-                    SystemClock.now(),
-                )
-                .map_err(|_| SessionTurnFailure::Internal)?;
-            let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
         }
         let tool_results = round.execute_remaining().await;
         let mut abandoned = false;
         for (_call_index, outcome) in tool_results {
-            let (item_id, tool_call_id, stored) = stored_tool_outcome(outcome)?;
-            abandoned |= matches!(&stored, StoredToolOutcome::Abandoned { .. });
-            let fact = lock(&conversation.live_state)
-                .apply_tool_message(
-                    StoredToolMessage::reconstruct(item_id, tool_call_id, stored),
-                    turn_id,
-                    SystemClock.now(),
-                )
-                .map_err(|_| SessionTurnFailure::Internal)?;
-            let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
+            abandoned |= apply_tool_outcome_and_publish(
+                &conversation,
+                turn_id,
+                outcome,
+                &steer_completion_sender,
+            )
+            .await?;
         }
         if abandoned {
             lock(&conversation.live_state)
@@ -9776,6 +10188,12 @@ async fn run_active_turn_inner(
         if cancellation.is_cancelled() {
             return Err(SessionTurnFailure::Model);
         }
+        publish_turn_phase(
+            &steer_completion_sender,
+            turn_id,
+            TurnExecutionPhaseView::Sampling,
+        )
+        .await?;
         let steer = arbitrate_one_steer(
             Arc::clone(&conversation),
             turn_id,
@@ -9833,6 +10251,22 @@ struct ActiveTurnCompaction {
     completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     #[cfg(test)]
     hooks: Arc<SessionExecutorTestHooksInner>,
+}
+
+async fn publish_turn_phase(
+    completion_sender: &mpsc::UnboundedSender<ExecutorCompletion>,
+    turn_id: TurnId,
+    phase: TurnExecutionPhaseView,
+) -> Result<(), SessionTurnFailure> {
+    let (response, waiter) = oneshot::channel();
+    completion_sender
+        .send(ExecutorCompletion::TurnPhase(TurnPhaseCompletion {
+            turn_id,
+            phase,
+            response,
+        }))
+        .map_err(|_| SessionTurnFailure::Internal)?;
+    waiter.await.map_err(|_| SessionTurnFailure::Internal)
 }
 
 struct ActiveCompactionOperation {
@@ -10075,15 +10509,7 @@ impl ActiveTurnCompaction {
     }
 
     async fn publish_phase(&self, phase: TurnExecutionPhaseView) -> Result<(), SessionTurnFailure> {
-        let (response, waiter) = oneshot::channel();
-        self.completion_sender
-            .send(ExecutorCompletion::TurnPhase(TurnPhaseCompletion {
-                turn_id: self.turn_id,
-                phase,
-                response,
-            }))
-            .map_err(|_| SessionTurnFailure::Internal)?;
-        waiter.await.map_err(|_| SessionTurnFailure::Internal)
+        publish_turn_phase(&self.completion_sender, self.turn_id, phase).await
     }
 }
 
@@ -10102,6 +10528,7 @@ async fn call_agent_run_with_logical_retry(
     cancellation: CancellationToken,
     executor_closing: CancellationToken,
     closing: CancellationToken,
+    progress: &ActiveModelProgress,
 ) -> Result<(ModelCallResult, u8), ModelCallError> {
     let mut logical_retries = 0_u8;
     loop {
@@ -10121,7 +10548,7 @@ async fn call_agent_run_with_logical_retry(
         let result = model_gateway
             .generate_model_turn(
                 Arc::clone(&request),
-                ModelProgressPublisher::discard(),
+                progress.publisher(),
                 cancellation.clone(),
             )
             .await;
@@ -10158,6 +10585,7 @@ async fn call_agent_run_with_logical_retry(
             return Err(error);
         }
         logical_retries += 1;
+        progress.retry_scheduled(logical_retries, delay);
         tokio::select! {
             biased;
             _ = executor_closing.cancelled() => {
@@ -10435,6 +10863,65 @@ fn stored_tool_outcome(
             StoredToolOutcome::Abandoned { reason },
         )),
     }
+}
+
+async fn apply_tool_outcome_and_publish(
+    conversation: &LoadedSessionConversation,
+    turn_id: TurnId,
+    outcome: ToolExecutionOutcome,
+    completion_sender: &mpsc::UnboundedSender<ExecutorCompletion>,
+) -> Result<bool, SessionTurnFailure> {
+    let (item_id, tool_call_id, stored) = stored_tool_outcome(outcome)?;
+    let abandoned = matches!(&stored, StoredToolOutcome::Abandoned { .. });
+    let public_content = match &stored {
+        StoredToolOutcome::Completed { content, .. } => Some(content.clone()),
+        StoredToolOutcome::Abandoned { .. } => None,
+    };
+    let fact = lock(&conversation.live_state)
+        .apply_tool_message(
+            StoredToolMessage::reconstruct(item_id, tool_call_id.clone(), stored),
+            turn_id,
+            SystemClock.now(),
+        )
+        .map_err(|_| SessionTurnFailure::Internal)?;
+    let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
+    if let Some(content) = public_content {
+        for part in content.parts() {
+            let ToolResultContentPart::Text(text) = part;
+            if text.as_str().is_empty() {
+                continue;
+            }
+            let Ok(update) =
+                ProgressUpdate::tool_output_delta(item_id, tool_call_id.clone(), text.as_str())
+            else {
+                continue;
+            };
+            let Ok(event) = ProgressEvent::new(
+                SystemClock.now(),
+                EventRoute::Item {
+                    session_id: fact.entry().session_id(),
+                    turn_id,
+                    item_id,
+                },
+                ProgressEventKind::Tool,
+                update,
+            ) else {
+                continue;
+            };
+            let (published, waiter) = oneshot::channel();
+            if completion_sender
+                .send(ExecutorCompletion::Progress(ProgressCompletion {
+                    turn_id,
+                    event,
+                    published: Some(published),
+                }))
+                .is_ok()
+            {
+                let _ = waiter.await;
+            }
+        }
+    }
+    Ok(abandoned)
 }
 
 fn map_agent_definition_read_error(error: DurableAgentDefinitionReadError) -> SessionSubmitError {
@@ -11432,6 +11919,7 @@ impl Drop for ResolveInteractionRequest {
 }
 
 struct SubscribeRequest {
+    include_progress: bool,
     response:
         Option<oneshot::Sender<Result<SessionExecutorSubscription, SessionExecutorSnapshotError>>>,
 }
@@ -14102,10 +14590,10 @@ mod tests {
             wait_for_terminal(&executor, turn_id).await,
             SessionTurnTerminal::Completed
         );
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), subscription.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let event = wait_for_event(&mut subscription, |event| {
+            matches!(event, SessionExecutorEvent::TurnTerminal { .. })
+        })
+        .await;
         assert_eq!(event.command_id(), Some(command_id));
         assert_eq!(event.turn_id(), Some(turn_id));
         assert_eq!(event.terminal(), Some(SessionTurnTerminal::Completed));

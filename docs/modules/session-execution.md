@@ -7,6 +7,8 @@ v0.1前端恢复补充（[ADR 0148](../adr/0148-v0-1-session-transcript-is-a-lib
 
 M9 当前补充：Session Snapshot 已公开投影 current Turn、active Items 与 Pending Interaction 的最小安全摘要，并与 Running/approval Wire V1 fixtures 对齐。
 
+Observer闭环补充：SessionExecutor保留既有state-only broadcast，并新增只供`include_progress=true`订阅的actor-owned State+Progress有序broadcast；ActiveTurnTask与provider callback不能直接发布public frame，只能把typed progress completion送回actor。模型delta、ToolInvocation snapshot refresh、ToolOutputDelta、下一次模型delta与Turn terminal因此共享同一owner lane；ToolOutput在live apply和inline record attempt后发送，并等待actor接受后才进入下一次Model。final assistant在terminal前触发一次opt-in observation refresh，确保最终Item identity可校正provisional progress。subscriber lag关闭该stream为Backpressure；Unload/owner replacement为PublisherRestarted；Runtime shutdown为RuntimeClosing。
+
 ## 目的
 
 本文定义loaded Session的control actor、ActiveTurnTask、async run loop、SessionIngress、Steer/FollowUp、Cancel、Interaction routing、logical retry和restart行为。

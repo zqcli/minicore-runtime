@@ -177,6 +177,8 @@ pub(crate) enum StreamingItem {
 - live mutation后完成inline record attempt，再发布ItemCompleted StateEvent；
 - retry、Cancel或provider error丢弃provisional buffer。
 
+当前实现以一次logical AgentRun中的`content_index + AssistantText|Reasoning`作为最小绑定key：首个公开delta分配ItemId，后续delta与final `StoredAssistantContent`复用该ID；retry保留identity但发布`model_retry_scheduled`，host据此清理上一attempt的provisional正文。OpenAI reasoning summary可以作为Reasoning progress；没有summary delta但final response含真实safe summary时，在terminal前原样发布一次。raw reasoning/thinking、encrypted payload与signature永不进入Progress或public Item正文；final Snapshot中的Reasoning也只读取summary，否则使用固定redacted placeholder。
+
 Host可能先看到streaming，随后进程crash且没有任何recorded final Item。
 
 ## ToolCall Identity

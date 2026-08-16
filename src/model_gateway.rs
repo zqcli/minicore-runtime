@@ -1445,14 +1445,18 @@ fn is_canonical_integer_literal(literal: &str) -> bool {
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) enum ModelContentDelta {
     Text(Arc<str>),
+    ReasoningSummary(Arc<str>),
 }
 
 impl fmt::Debug for ModelContentDelta {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self::Text(value) = self;
+        let (kind, value) = match self {
+            Self::Text(value) => ("text", value),
+            Self::ReasoningSummary(value) => ("reasoning_summary", value),
+        };
         formatter
             .debug_struct("ModelContentDelta")
-            .field("kind", &"text")
+            .field("kind", &kind)
             .field("bytes", &value.len())
             .finish()
     }
@@ -1776,6 +1780,179 @@ pub(crate) struct ScriptedModelFixture {
 impl ScriptedModelFixture {
     pub(crate) fn new(responses: Vec<&str>) -> Self {
         Self::with_context_window_tokens(responses, 128_000)
+    }
+
+    pub(crate) fn with_text_deltas_progress(deltas: &[&str], response: &str) -> Self {
+        Self::from_scripts(
+            vec![ScriptedProviderScript::success(
+                deltas
+                    .iter()
+                    .map(|delta| ModelProgressEvent::ContentDelta {
+                        content_index: 0,
+                        delta: ModelContentDelta::Text(Arc::from(*delta)),
+                    })
+                    .collect(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::Text(Arc::from(response))]),
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            )],
+            128_000,
+        )
+    }
+
+    pub(crate) fn with_reasoning_summary_progress(
+        delta: Option<&str>,
+        summary: &str,
+        response: &str,
+    ) -> Self {
+        let progress = delta
+            .into_iter()
+            .map(|delta| ModelProgressEvent::ContentDelta {
+                content_index: 0,
+                delta: ModelContentDelta::ReasoningSummary(Arc::from(delta)),
+            })
+            .collect();
+        Self::from_scripts(
+            vec![ScriptedProviderScript::success(
+                progress,
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([
+                        ProviderAttemptContent::Reasoning(
+                            ReasoningContent::new(None, Some(summary.to_owned()), None, None, None)
+                                .expect("the scripted reasoning summary is valid"),
+                        ),
+                        ProviderAttemptContent::Text(Arc::from(response)),
+                    ]),
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            )],
+            128_000,
+        )
+    }
+
+    pub(crate) fn with_tool_round_and_final_progress(
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &str,
+        final_deltas: &[&str],
+        final_text: &str,
+    ) -> Self {
+        let scripts = vec![
+            Self::scripted_success(
+                ProviderAttemptContent::ToolCall {
+                    tool_call_id: tool_call_id.parse().unwrap(),
+                    name: tool_name.parse().unwrap(),
+                    arguments: arguments.parse().unwrap(),
+                },
+                ModelFinishReason::ToolCalls,
+            ),
+            ScriptedProviderScript::success(
+                final_deltas
+                    .iter()
+                    .map(|delta| ModelProgressEvent::ContentDelta {
+                        content_index: 0,
+                        delta: ModelContentDelta::Text(Arc::from(*delta)),
+                    })
+                    .collect(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::Text(Arc::from(final_text))]),
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+        ];
+        Self::from_scripts(scripts, 128_000)
+    }
+
+    pub(crate) fn with_retrying_text_progress(
+        first_delta: &str,
+        retry_delta: &str,
+        final_text: &str,
+    ) -> Self {
+        let scripts = vec![
+            ScriptedProviderScript::failure_with_progress(
+                vec![ModelProgressEvent::ContentDelta {
+                    content_index: 0,
+                    delta: ModelContentDelta::Text(Arc::from(first_delta)),
+                }],
+                ProviderAttemptError::new(ModelCallErrorReason::Timeout),
+            ),
+            ScriptedProviderScript::success(
+                vec![ModelProgressEvent::ContentDelta {
+                    content_index: 0,
+                    delta: ModelContentDelta::Text(Arc::from(retry_delta)),
+                }],
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::Text(Arc::from(final_text))]),
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+        ];
+        Self::from_scripts(scripts, 128_000)
+    }
+
+    pub(crate) fn with_progress_then_cancellation_and_follow_up(
+        delta: &str,
+        follow_up_text: &str,
+    ) -> Self {
+        let scripts = vec![
+            ScriptedProviderScript {
+                progress: vec![ModelProgressEvent::ContentDelta {
+                    content_index: 0,
+                    delta: ModelContentDelta::Text(Arc::from(delta)),
+                }],
+                terminal: ScriptedProviderTerminal::WaitForCancellation,
+            },
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::Text(Arc::from(follow_up_text))]),
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+        ];
+        Self::from_scripts(scripts, 128_000)
+    }
+
+    pub(crate) fn with_progress_then_failure_and_follow_up(
+        delta: &str,
+        follow_up_text: &str,
+    ) -> Self {
+        let scripts = vec![
+            ScriptedProviderScript::failure_with_progress(
+                vec![ModelProgressEvent::ContentDelta {
+                    content_index: 0,
+                    delta: ModelContentDelta::Text(Arc::from(delta)),
+                }],
+                ProviderAttemptError::new(ModelCallErrorReason::InvalidRequest),
+            ),
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::Text(Arc::from(follow_up_text))]),
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+        ];
+        Self::from_scripts(scripts, 128_000)
     }
 
     pub(crate) fn with_context_window_tokens(
@@ -2110,6 +2287,16 @@ impl ScriptedProviderScript {
     fn failure(error: ProviderAttemptError) -> Self {
         Self {
             progress: Vec::new(),
+            terminal: ScriptedProviderTerminal::Failure(error),
+        }
+    }
+
+    fn failure_with_progress(
+        progress: Vec<ModelProgressEvent>,
+        error: ProviderAttemptError,
+    ) -> Self {
+        Self {
+            progress,
             terminal: ScriptedProviderTerminal::Failure(error),
         }
     }

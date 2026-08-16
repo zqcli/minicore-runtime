@@ -6,6 +6,8 @@
 
 > v0.1前端闭环细化：`c99ccf7`已增加[ADR 0148](../adr/0148-v0-1-session-transcript-is-a-library-only-read-seam.md)冻结的library-only `MiniCoreRuntime::session_transcript`。它从loaded Session的canonical selected history分页恢复基础User/Assistant文本，并明确把`GetHistoryTree/ListTurns/GetTurn/ListItems`、unloaded direct history read与Wire transcript route冻结为post-MVP。Public Wire V1 manifest仍为144 active / 0 pending，Store V1与Conversation JSONL V1均未变化。
 
+同进程Session progress闭环补充：`SubscriptionRequest { scope = Session, include_progress = true }`现使用Session actor单点写入的State+Progress有序流；首帧仍是原子捕获的Session Snapshot，随后才交付模型文本、公开reasoning summary、ToolInvocation observation、真实ToolResult Text与terminal StateEvent。`include_progress = false`继续使用原state-only publisher，既有State/Snapshot事件集合和背压不受高频progress影响。每次AgentRun以`content_index + public content kind`绑定stable ItemId，并在final `StoredAssistantContent`复用；logical retry发布`model_retry_scheduled`并重置attempt-local provisional状态。OpenAI只发布`response.reasoning_summary_text.delta`，raw `response.reasoning_text.delta`、Anthropic `thinking_delta`、encrypted/signature及function-call argument delta继续不公开。该实现复用现有Progress/Wire V1 shape，不新增public variant。
+
 ## 目的
 
 本文定义 MiniCore 的公开 Runtime interface，回答：
