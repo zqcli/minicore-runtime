@@ -41,13 +41,15 @@ use crate::runtime_interface::{
     SessionReadinessView, SessionRecordingView, SessionSnapshot, SessionSummary,
     SessionUnavailableView, SessionWorkspaceInvalidationError, SnapshotError, SnapshotErrorCode,
     SnapshotRequest, SnapshotResponse, StateEvent, SubmitAdmissionStateView, SubmitAdmissionView,
-    SubscriptionError, SubscriptionErrorCode, SubscriptionRequest, SubscriptionScope, TurnCommand,
-    TurnFailureView, TurnInterruptionView,
+    SubscriptionClosed, SubscriptionError, SubscriptionErrorCode, SubscriptionRequest,
+    SubscriptionScope, TurnCommand, TurnFailureView, TurnInterruptionView,
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, SystemClock};
 use crate::session_execution::{
     SessionCancelTarget, SessionExecutionState, SessionExecutorEvent, SessionExecutorSnapshot,
-    SessionExecutorSubscription, SessionTurnFailure, SessionTurnInterruption, SessionTurnTerminal,
+    SessionExecutorSubscription, SessionExecutorSubscriptionEvent,
+    SessionExecutorSubscriptionReceiveError, SessionTurnFailure, SessionTurnInterruption,
+    SessionTurnTerminal,
 };
 use crate::session_residency::{
     SessionResidencyAgentAvailabilityError, SessionResidencyAgentUpgradeError,
@@ -641,6 +643,7 @@ pub struct EventStream {
     runtime: Arc<RuntimeInner>,
     initial: Option<EventFrame>,
     subscription: EventSubscription,
+    closed: bool,
 }
 
 enum EventSubscription {
@@ -650,21 +653,53 @@ enum EventSubscription {
 
 impl EventStream {
     pub async fn recv(&mut self) -> Option<EventFrame> {
+        if self.closed {
+            return None;
+        }
         if let Some(initial) = self.initial.take() {
             return Some(initial);
         }
         match &mut self.subscription {
-            EventSubscription::Runtime(receiver) => receiver
-                .recv()
-                .await
-                .ok()
-                .map(|event| EventFrame::State(event.as_ref().clone())),
+            EventSubscription::Runtime(receiver) => match receiver.recv().await {
+                Ok(event) => Some(EventFrame::State(event.as_ref().clone())),
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    self.closed = true;
+                    Some(EventFrame::Closed(SubscriptionClosed::Backpressure))
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    self.closed = true;
+                    Some(EventFrame::Closed(
+                        self.runtime.subscription_closed_reason(),
+                    ))
+                }
+            },
             EventSubscription::Session(subscription) => {
-                let event = subscription.recv().await?;
-                let snapshot = self
+                let event = match subscription.recv_event().await {
+                    Ok(event) => event,
+                    Err(SessionExecutorSubscriptionReceiveError::Backpressure) => {
+                        self.closed = true;
+                        return Some(EventFrame::Closed(SubscriptionClosed::Backpressure));
+                    }
+                    Err(SessionExecutorSubscriptionReceiveError::PublisherClosed) => {
+                        self.closed = true;
+                        return Some(EventFrame::Closed(
+                            self.runtime.subscription_closed_reason(),
+                        ));
+                    }
+                };
+                let event = match event {
+                    SessionExecutorSubscriptionEvent::State(event) => event,
+                    SessionExecutorSubscriptionEvent::Progress(event) => {
+                        return Some(EventFrame::Progress(event));
+                    }
+                };
+                let Ok(snapshot) = self
                     .runtime
                     .public_session_snapshot(Arc::clone(event.snapshot()))
-                    .ok()?;
+                else {
+                    self.closed = true;
+                    return Some(EventFrame::Closed(SubscriptionClosed::PublisherRestarted));
+                };
                 let state = match event.as_ref() {
                     SessionExecutorEvent::ExecutionChanged { timestamp, .. } => {
                         StateEvent::session_execution_changed(*timestamp, None, snapshot)
@@ -1852,6 +1887,7 @@ impl RuntimeInner {
                 runtime: Arc::clone(self),
                 initial: Some(EventFrame::Snapshot(SnapshotResponse::Runtime(snapshot))),
                 subscription: EventSubscription::Runtime(receiver),
+                closed: false,
             });
         }
 
@@ -1862,7 +1898,7 @@ impl RuntimeInner {
             return Err(subscription_closing());
         };
         let subscription = residency
-            .subscribe(session_id)
+            .subscribe(session_id, request.include_progress())
             .await
             .map_err(|error| map_subscription_error(session_id, error))?;
         let initial = self
@@ -1881,7 +1917,16 @@ impl RuntimeInner {
                 initial,
             )))),
             subscription: EventSubscription::Session(subscription),
+            closed: false,
         })
+    }
+
+    fn subscription_closed_reason(&self) -> SubscriptionClosed {
+        if matches!(*lock(&self.lifecycle), RuntimeLifecycle::Open) {
+            SubscriptionClosed::PublisherRestarted
+        } else {
+            SubscriptionClosed::RuntimeClosing
+        }
     }
 
     fn public_runtime_snapshot(&self) -> Result<RuntimeSnapshot, SnapshotError> {
@@ -4495,15 +4540,16 @@ mod tests {
     use crate::runtime_interface::{
         AgentCommand, CommandCompletion, CommandErrorCode, CommandOutcome, CommandRequest,
         CommandResponse, EventFrame, EventRoute, InteractionCommand, ItemContentView,
-        NewSessionDefinition, NewSessionMetadata, PageRequest, PublicCancelTarget, PublicSubject,
-        QueryErrorCode, QueryResult, RetryAdvice, RuntimeCapability, RuntimeCommand,
-        RuntimeDispatchError, RuntimeEventDetail, RuntimeLifecycleCommand, RuntimeQuery,
-        RuntimeQueryResult, RuntimeReadQuery, RuntimeStateEventKind, SessionCommand,
-        SessionEventDetail, SessionExecutionView, SessionLifecycleView, SessionReadinessView,
-        SessionRecordingState, SessionStateEventKind, SessionUnavailableView,
-        SessionWorkspaceInvalidationError, SnapshotRequest, SnapshotResponse, StateEventMsg,
-        SubscriptionRequest, SubscriptionScope, TurnCommand, TurnExecutionPhaseView,
-        TurnFailureView, TurnTerminalView,
+        ItemProgressContentKind, ItemStatusView, ModelCallPurpose as ProgressModelCallPurpose,
+        NewSessionDefinition, NewSessionMetadata, PageRequest, ProgressEventKind, ProgressUpdate,
+        PublicCancelTarget, PublicSubject, QueryErrorCode, QueryResult, RetryAdvice,
+        RuntimeCapability, RuntimeCommand, RuntimeDispatchError, RuntimeEventDetail,
+        RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery,
+        RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionExecutionView,
+        SessionLifecycleView, SessionReadinessView, SessionRecordingState, SessionStateEventKind,
+        SessionUnavailableView, SessionWorkspaceInvalidationError, SnapshotRequest,
+        SnapshotResponse, StateEventMsg, SubscriptionClosed, SubscriptionRequest,
+        SubscriptionScope, TurnCommand, TurnExecutionPhaseView, TurnFailureView, TurnTerminalView,
     };
     use crate::runtime_task::RuntimeTaskError;
     use crate::session_execution::SessionExecutionState;
@@ -4979,8 +5025,9 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
                 .await
                 .expect("Runtime closing settles the event stream"),
-            None
+            Some(EventFrame::Closed(SubscriptionClosed::RuntimeClosing))
         );
+        assert_eq!(events.recv().await, None);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -10857,6 +10904,990 @@ mod tests {
             Some(SessionStateEventKind::TurnCompleted)
         );
 
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn opted_in_session_subscription_receives_real_model_progress() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::with_text_deltas_progress(&["par", "tial"], "complete");
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the progress test Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                true,
+            ))
+            .await
+            .expect("the Session progress subscription opens");
+
+        let response = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("hello").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("the progress test Turn starts");
+        let turn_id = started_turn(&response);
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+
+        let (progress_item_id, deltas) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut item_id = None;
+                let mut deltas = Vec::new();
+                loop {
+                    match events.recv().await {
+                        Some(EventFrame::Progress(event))
+                            if event.kind() == ProgressEventKind::Model =>
+                        {
+                            if let ProgressUpdate::ItemDelta { delta, .. } = event.update() {
+                                let EventRoute::Item {
+                                    turn_id: event_turn_id,
+                                    item_id: event_item_id,
+                                    ..
+                                } = event.route()
+                                else {
+                                    panic!("model progress uses an Item route");
+                                };
+                                assert_eq!(event_turn_id, turn_id);
+                                assert!(item_id.is_none_or(|item_id| item_id == event_item_id));
+                                item_id = Some(event_item_id);
+                                deltas.push(delta.to_string());
+                                if deltas.len() == 2 {
+                                    return (event_item_id, deltas);
+                                }
+                            }
+                        }
+                        Some(EventFrame::State(_)) | Some(EventFrame::Progress(_)) => continue,
+                        other => panic!("unexpected frame before model progress: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("the real model deltas reach the Session subscription");
+        assert_eq!(deltas, ["par", "tial"]);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break;
+                    }
+                    Some(EventFrame::State(_)) | Some(EventFrame::Progress(_)) => continue,
+                    other => panic!("unexpected frame before Turn completion: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the progress test Turn completes");
+
+        let transcript = runtime
+            .session_transcript(
+                session_id,
+                PageRequest::new(None, NonZeroU32::new(10).unwrap()),
+            )
+            .await
+            .expect("the completed transcript is readable");
+        let assistant = transcript
+            .items()
+            .iter()
+            .find(|item| item.role() == SessionTranscriptItemRole::Assistant)
+            .expect("the transcript contains the assistant item");
+        assert_eq!(assistant.item_id(), progress_item_id);
+        assert_eq!(assistant.turn_id(), turn_id);
+        assert_eq!(assistant.body(), "complete");
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_subscription_without_progress_receives_only_state() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let deltas = vec!["x"; 300];
+        let model = ScriptedModelFixture::with_text_deltas_progress(&deltas, "complete");
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the opt-out test Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the state-only Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+
+        let _turn_id = started_turn(
+            &runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("hello").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the opt-out test Turn starts"),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    Some(EventFrame::Progress(_)) => {
+                        panic!("include_progress=false must suppress Progress frames")
+                    }
+                    other => panic!("unexpected state-only frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the state-only Turn reaches terminal state");
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reasoning_summary_progress_is_public_and_reuses_the_final_item_id() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::with_reasoning_summary_progress(
+            Some("summary "),
+            "summary complete",
+            "answer",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the reasoning progress Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                true,
+            ))
+            .await
+            .expect("the reasoning progress subscription opens");
+        assert!(matches!(events.recv().await, Some(EventFrame::Snapshot(_))));
+        let turn_id = started_turn(
+            &runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("reason").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the reasoning Turn starts"),
+        );
+
+        let mut progress_item_id = None;
+        let mut final_item_id = None;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::Progress(event)) => {
+                        if let ProgressUpdate::ItemDelta {
+                            item_id,
+                            content_kind: ItemProgressContentKind::Reasoning,
+                            delta,
+                            ..
+                        } = event.update()
+                        {
+                            assert_eq!(delta.as_ref(), "summary ");
+                            progress_item_id = Some(*item_id);
+                        }
+                    }
+                    Some(EventFrame::State(event)) => {
+                        if let Some(snapshot) = event.msg().session_snapshot() {
+                            for item in snapshot.active_items() {
+                                if let ItemContentView::Reasoning { body } = item.content() {
+                                    assert_eq!(body.as_ref(), "summary complete");
+                                    assert_eq!(item.turn_id(), turn_id);
+                                    final_item_id = Some(item.item_id());
+                                }
+                            }
+                        }
+                        if event.msg().session_kind() == Some(SessionStateEventKind::TurnCompleted)
+                        {
+                            break;
+                        }
+                    }
+                    other => panic!("unexpected reasoning progress frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("reasoning progress and terminal state arrive");
+        assert_eq!(progress_item_id, final_item_id);
+        assert!(progress_item_id.is_some());
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn final_reasoning_summary_without_stream_delta_is_published_once() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::with_reasoning_summary_progress(
+            None,
+            "terminal summary",
+            "answer",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the terminal summary Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                true,
+            ))
+            .await
+            .expect("the terminal summary subscription opens");
+        assert!(matches!(events.recv().await, Some(EventFrame::Snapshot(_))));
+        let _turn_id = started_turn(
+            &runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("reason").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the terminal summary Turn starts"),
+        );
+        let mut summaries = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::Progress(event)) => {
+                        if let ProgressUpdate::ItemDelta {
+                            content_kind: ItemProgressContentKind::Reasoning,
+                            delta,
+                            ..
+                        } = event.update()
+                        {
+                            summaries.push(delta.to_string());
+                        }
+                    }
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => panic!("unexpected terminal summary frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the terminal summary and terminal state arrive");
+        assert_eq!(summaries, ["terminal summary"]);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_file_progress_orders_invocation_output_final_model_and_terminal() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        fs::write(workspace.path().join("src").join("note.txt"), "file body")
+            .expect("the read_file fixture is written");
+        let model = ScriptedModelFixture::with_tool_round_and_final_progress(
+            "call_read",
+            "read_file",
+            r#"{"path":"note.txt"}"#,
+            &["final"],
+            "final answer",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_read_file_tool(),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the read_file progress Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                true,
+            ))
+            .await
+            .expect("the read_file progress subscription opens");
+        assert!(matches!(events.recv().await, Some(EventFrame::Snapshot(_))));
+        let turn_id = started_turn(
+            &runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("read it").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the read_file Turn starts"),
+        );
+
+        let mut order = Vec::new();
+        let mut invocation_item_id = None;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event)) => {
+                        if invocation_item_id.is_none() {
+                            if let Some(snapshot) = event.msg().session_snapshot() {
+                                if let Some(item) = snapshot.active_items().iter().find(|item| {
+                                    matches!(
+                                        item.content(),
+                                        ItemContentView::ToolInvocation { tool_call_id, .. }
+                                            if tool_call_id.as_ref() == "call_read"
+                                    )
+                                }) {
+                                    assert_eq!(item.turn_id(), turn_id);
+                                    assert_eq!(item.status(), ItemStatusView::Started);
+                                    invocation_item_id = Some(item.item_id());
+                                    order.push("invocation");
+                                }
+                            }
+                        }
+                        if event.msg().session_kind() == Some(SessionStateEventKind::TurnCompleted)
+                        {
+                            assert!(order.contains(&"assistant"));
+                            order.push("terminal");
+                            break;
+                        }
+                    }
+                    Some(EventFrame::Progress(event)) => match event.update() {
+                        ProgressUpdate::ToolOutputDelta {
+                            item_id,
+                            tool_call_id,
+                            delta,
+                        } => {
+                            assert_eq!(invocation_item_id, Some(*item_id));
+                            assert_eq!(tool_call_id.as_str(), "call_read");
+                            assert_eq!(delta.as_ref(), "file body");
+                            order.push("output");
+                        }
+                        ProgressUpdate::ItemDelta {
+                            content_kind: ItemProgressContentKind::AssistantText,
+                            delta,
+                            ..
+                        } if delta.as_ref() == "final" => {
+                            assert!(order.contains(&"output"));
+                            order.push("assistant");
+                        }
+                        _ => {}
+                    },
+                    other => panic!("unexpected read_file progress frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the read_file progress chain reaches terminal state");
+        assert_eq!(order, ["invocation", "output", "assistant", "terminal"]);
+        let invocation_item_id = invocation_item_id.expect("the ToolInvocation was observed");
+        let recording = fs::read_to_string(
+            root.path()
+                .join("sessions")
+                .join(session_id.to_string())
+                .join("conversation.jsonl"),
+        )
+        .expect("the read_file conversation recording is readable");
+        assert!(
+            recording.matches(&invocation_item_id.to_string()).count() >= 2,
+            "the same ToolInvocation ItemId is stored on the call and result facts"
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_directory_result_reaches_the_session_progress_stream() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        fs::write(workspace.path().join("src").join("note.txt"), "file body")
+            .expect("the list_directory fixture is written");
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_list",
+            "list_directory",
+            r#"{"path":""}"#,
+            "listed",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_list_directory_tool(),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the list_directory progress Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                true,
+            ))
+            .await
+            .expect("the list_directory progress subscription opens");
+        assert!(matches!(events.recv().await, Some(EventFrame::Snapshot(_))));
+        let _turn_id = started_turn(
+            &runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("list it").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the list_directory Turn starts"),
+        );
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::Progress(event)) => {
+                        if let ProgressUpdate::ToolOutputDelta {
+                            tool_call_id,
+                            delta,
+                            ..
+                        } = event.update()
+                        {
+                            if tool_call_id.as_str() == "call_list" {
+                                return delta.to_string();
+                            }
+                        }
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => panic!("unexpected list_directory progress frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the list_directory result reaches the subscriber");
+        assert!(output.contains(r#""name":"note.txt""#));
+        assert!(output.contains(r#""type":"file""#));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn progress_backpressure_closes_only_the_opted_in_stream() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let deltas = vec!["x"; 300];
+        let model = ScriptedModelFixture::with_text_deltas_progress(&deltas, "complete");
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the backpressure test Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                true,
+            ))
+            .await
+            .expect("the backpressure test progress subscription opens");
+        let mut state_events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the backpressure test state subscription opens");
+        assert!(matches!(
+            state_events.recv().await,
+            Some(EventFrame::Snapshot(_))
+        ));
+        let _turn_id = started_turn(
+            &runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("overflow progress").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the backpressure test Turn starts"),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match state_events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => panic!("unexpected state-only backpressure frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the unaffected state-only stream reaches Turn completion");
+
+        assert!(matches!(events.recv().await, Some(EventFrame::Snapshot(_))));
+        assert_eq!(
+            events.recv().await,
+            Some(EventFrame::Closed(SubscriptionClosed::Backpressure))
+        );
+        assert_eq!(events.recv().await, None);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unloaded_session_subscription_reports_publisher_restart() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let runtime = MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+        )
+        .await
+        .expect("the publisher-close Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                true,
+            ))
+            .await
+            .expect("the publisher-close Session subscription opens");
+        assert!(matches!(events.recv().await, Some(EventFrame::Snapshot(_))));
+        runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Unload { session_id }),
+            ))
+            .await
+            .expect("the subscribed Session unloads");
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("the unloaded Session publisher closes"),
+            Some(EventFrame::Closed(SubscriptionClosed::PublisherRestarted))
+        );
+        assert_eq!(events.recv().await, None);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn logical_retry_is_ordered_between_attempt_progress_and_terminal() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::with_retrying_text_progress(
+            "first attempt",
+            "retry attempt",
+            "complete",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the retry progress Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                true,
+            ))
+            .await
+            .expect("the retry progress subscription opens");
+        assert!(matches!(events.recv().await, Some(EventFrame::Snapshot(_))));
+        let turn_id = started_turn(
+            &runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("retry").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the retry progress Turn starts"),
+        );
+        let mut order = Vec::new();
+        let mut item_id = None;
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::Progress(event)) => match event.update() {
+                        ProgressUpdate::ItemDelta {
+                            item_id: event_item_id,
+                            delta,
+                            ..
+                        } if delta.as_ref() == "first attempt"
+                            || delta.as_ref() == "retry attempt" =>
+                        {
+                            assert_eq!(
+                                event.route(),
+                                EventRoute::Item {
+                                    session_id,
+                                    turn_id,
+                                    item_id: *event_item_id,
+                                }
+                            );
+                            assert!(item_id.is_none_or(|item_id| item_id == *event_item_id));
+                            item_id = Some(*event_item_id);
+                            order.push(if delta.as_ref() == "first attempt" {
+                                "first"
+                            } else {
+                                "retry_attempt"
+                            });
+                        }
+                        ProgressUpdate::ModelRetryScheduled {
+                            purpose,
+                            retry_count,
+                            ..
+                        } => {
+                            assert_eq!(*purpose, ProgressModelCallPurpose::AgentRun);
+                            assert_eq!(*retry_count, 1);
+                            order.push("retry_scheduled");
+                        }
+                        _ => {}
+                    },
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        order.push("terminal");
+                        break;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => panic!("unexpected retry progress frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the retry progress chain reaches terminal state");
+        assert_eq!(
+            order,
+            ["first", "retry_scheduled", "retry_attempt", "terminal"]
+        );
+        assert!(item_id.is_some());
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_turn_cannot_publish_progress_after_its_terminal_event() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::with_progress_then_cancellation_and_follow_up(
+            "before cancel",
+            "follow-up complete",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the cancellation progress Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                true,
+            ))
+            .await
+            .expect("the cancellation progress subscription opens");
+        assert!(matches!(events.recv().await, Some(EventFrame::Snapshot(_))));
+        let first_turn = started_turn(
+            &runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("cancel me").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the cancellable Turn starts"),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::Progress(event))
+                        if matches!(
+                            event.update(),
+                            ProgressUpdate::ItemDelta { delta, .. }
+                                if delta.as_ref() == "before cancel"
+                        ) =>
+                    {
+                        break;
+                    }
+                    Some(EventFrame::State(_)) | Some(EventFrame::Progress(_)) => continue,
+                    other => panic!("unexpected pre-cancel frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the pre-cancel progress arrives");
+        let _ = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Cancel {
+                    session_id,
+                    target: PublicCancelTarget::Turn(first_turn),
+                }),
+            ))
+            .await
+            .expect("the active Turn cancellation is accepted");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnInterrupted) =>
+                    {
+                        break;
+                    }
+                    Some(EventFrame::Progress(event)) => {
+                        assert_ne!(
+                            event.route(),
+                            EventRoute::Turn {
+                                session_id,
+                                turn_id: first_turn,
+                            },
+                            "the cancelled Turn emitted progress after cancellation"
+                        );
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => panic!("unexpected cancellation terminal frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the cancelled Turn reaches terminal state");
+
+        let second_turn = started_turn(
+            &runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("continue").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the follow-up verification Turn starts"),
+        );
+        assert_ne!(first_turn, second_turn);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::Progress(event)) => match event.route() {
+                        EventRoute::Turn { turn_id, .. } | EventRoute::Item { turn_id, .. } => {
+                            assert_ne!(turn_id, first_turn, "late progress crossed terminal")
+                        }
+                        _ => {}
+                    },
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => panic!("unexpected post-terminal verification frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the follow-up verification Turn completes");
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_turn_cannot_publish_progress_after_its_terminal_event() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::with_progress_then_failure_and_follow_up(
+            "before failure",
+            "follow-up complete",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the failure progress Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                true,
+            ))
+            .await
+            .expect("the failure progress subscription opens");
+        assert!(matches!(events.recv().await, Some(EventFrame::Snapshot(_))));
+        let failed_turn = started_turn(
+            &runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("fail").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the failing Turn starts"),
+        );
+        let mut saw_progress = false;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::Progress(event)) => {
+                        if matches!(
+                            event.update(),
+                            ProgressUpdate::ItemDelta { delta, .. }
+                                if delta.as_ref() == "before failure"
+                        ) {
+                            saw_progress = true;
+                        }
+                    }
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnFailed) =>
+                    {
+                        assert!(saw_progress, "the scripted progress precedes failure");
+                        break;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => panic!("unexpected failure terminal frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the failing Turn reaches terminal state");
+
+        let verification_turn = started_turn(
+            &runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("continue").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the failure verification Turn starts"),
+        );
+        assert_ne!(failed_turn, verification_turn);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::Progress(event)) => match event.route() {
+                        EventRoute::Turn { turn_id, .. } | EventRoute::Item { turn_id, .. } => {
+                            assert_ne!(turn_id, failed_turn, "late progress crossed failure")
+                        }
+                        _ => {}
+                    },
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        break;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => panic!("unexpected failure verification frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the failure verification Turn completes");
         runtime.shutdown().await;
     }
 }

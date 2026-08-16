@@ -3138,6 +3138,7 @@ impl SessionResidencyRegistry {
     pub(crate) async fn subscribe(
         &self,
         session_id: SessionId,
+        include_progress: bool,
     ) -> Result<SessionExecutorSubscription, SessionResidencySubscriptionError> {
         if self.closing.is_cancelled() {
             return Err(SessionResidencySubscriptionError::Closing);
@@ -3146,12 +3147,15 @@ impl SessionResidencyRegistry {
             .shared
             .executor(session_id)
             .ok_or(SessionResidencySubscriptionError::SessionNotLoaded)?;
-        executor.subscribe().await.map_err(|error| match error {
-            SessionExecutorSnapshotError::Closing => SessionResidencySubscriptionError::Closing,
-            SessionExecutorSnapshotError::InternalDispatchUnavailable => {
-                SessionResidencySubscriptionError::PublisherUnavailable
-            }
-        })
+        executor
+            .subscribe_with_progress(include_progress)
+            .await
+            .map_err(|error| match error {
+                SessionExecutorSnapshotError::Closing => SessionResidencySubscriptionError::Closing,
+                SessionExecutorSnapshotError::InternalDispatchUnavailable => {
+                    SessionResidencySubscriptionError::PublisherUnavailable
+                }
+            })
     }
 
     /// Routes a complete loaded Session definition replacement to the installed executor.  The

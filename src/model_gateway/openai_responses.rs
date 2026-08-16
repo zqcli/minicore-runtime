@@ -205,9 +205,11 @@ impl OpenAiResponsesProviderAdapter {
         }
 
         let mut delivery = ProviderRequestDeliveryState::AcceptedNoOutput;
-        // Every non-empty streamed text delta's validated output index, correlated
-        // with the terminal output array when response.completed arrives.
+        // Every non-empty streamed public delta's validated output index, correlated
+        // with the terminal output array when response.completed arrives. Raw reasoning
+        // text remains private and is never added to either collection.
         let mut streamed_text_indexes = Vec::new();
+        let mut streamed_reasoning_summary_indexes = Vec::new();
         let mut parser = SseParser::new(response_byte_limit());
         let expected_model = request.call().model.api_model_name();
         let mut stream = response.bytes_stream();
@@ -238,6 +240,7 @@ impl OpenAiResponsesProviderAdapter {
                             &request_id,
                             &mut delivery,
                             &mut streamed_text_indexes,
+                            &mut streamed_reasoning_summary_indexes,
                             expected_model,
                         )? {
                             Dispatch::Continue => {}
@@ -601,6 +604,7 @@ fn dispatch(
     request_id: &Option<ProviderRequestId>,
     delivery: &mut ProviderRequestDeliveryState,
     streamed_text_indexes: &mut Vec<u32>,
+    streamed_reasoning_summary_indexes: &mut Vec<u32>,
     expected_model: &ApiModelName,
 ) -> Result<Dispatch, ProviderAttemptError> {
     let value: Value =
@@ -629,11 +633,27 @@ fn dispatch(
             }
             Ok(Dispatch::Continue)
         }
-        // Semantic deltas the current progress enum cannot carry: they are validated
-        // structurally (required fields present), advance delivery truth, and are never
-        // published — hidden raw reasoning text must not leak.
-        "response.reasoning_summary_text.delta"
-        | "response.reasoning_text.delta"
+        "response.reasoning_summary_text.delta" => {
+            let output_index = required_u64(&value, "output_index")
+                .map_err(|_| invalid_provider_response(*delivery))?;
+            let delta =
+                required_str(&value, "delta").map_err(|_| invalid_provider_response(*delivery))?;
+            let content_index =
+                u32::try_from(output_index).map_err(|_| invalid_provider_response(*delivery))?;
+            if !delta.is_empty() {
+                streamed_reasoning_summary_indexes.push(content_index);
+                mark_semantic(delivery);
+                progress.publish(ModelProgressEvent::ContentDelta {
+                    content_index,
+                    delta: ModelContentDelta::ReasoningSummary(Arc::from(delta)),
+                });
+            }
+            Ok(Dispatch::Continue)
+        }
+        // Semantic deltas that are intentionally not public: validate their required
+        // fields and delivery truth, but never publish raw chain-of-thought, refusal text,
+        // or function-call argument fragments.
+        "response.reasoning_text.delta"
         | "response.refusal.delta"
         | "response.function_call_arguments.delta" => {
             let _ = required_u64(&value, "output_index")
@@ -737,8 +757,13 @@ fn dispatch(
                 // A completed-typed terminal that is not completed is contradictory.
                 return Err(invalid_provider_response(*delivery));
             }
-            let result =
-                normalize_terminal(response, request_id, *delivery, streamed_text_indexes)?;
+            let result = normalize_terminal(
+                response,
+                request_id,
+                *delivery,
+                streamed_text_indexes,
+                streamed_reasoning_summary_indexes,
+            )?;
             Ok(Dispatch::Success(Box::new(result)))
         }
         "response.failed" => {
@@ -848,6 +873,7 @@ fn normalize_terminal(
     request_id: &Option<ProviderRequestId>,
     delivery: ProviderRequestDeliveryState,
     streamed_text_indexes: &[u32],
+    streamed_reasoning_summary_indexes: &[u32],
 ) -> Result<ProviderAttemptResult, ProviderAttemptError> {
     let response_id: ProviderResponseId = response
         .get("id")
@@ -863,6 +889,7 @@ fn normalize_terminal(
     // Terminal output positions of message items with non-empty output_text, paired
     // with the normalized content index of their (single) text block.
     let mut text_block_content_indexes: Vec<(usize, usize)> = Vec::new();
+    let mut reasoning_summary_content_indexes: Vec<(usize, usize)> = Vec::new();
     let mut has_refusal = false;
     let mut has_non_refusal_visible = false;
     let mut has_tool_call = false;
@@ -898,6 +925,8 @@ fn normalize_terminal(
             }
             if item_type == "message" && message_has_non_empty_output_text(item) {
                 text_block_content_indexes.push((position, blocks_before));
+            } else if item_type == "reasoning" && reasoning_has_non_empty_summary(item) {
+                reasoning_summary_content_indexes.push((position, blocks_before));
             }
         } else {
             empty_tail_started = true;
@@ -909,6 +938,15 @@ fn normalize_terminal(
     for &streamed in streamed_text_indexes {
         let streamed = usize::try_from(streamed).expect("u32 always fits usize");
         if !text_block_content_indexes
+            .iter()
+            .any(|&(position, content_index)| position == streamed && content_index == streamed)
+        {
+            return Err(invalid_provider_response(delivery));
+        }
+    }
+    for &streamed in streamed_reasoning_summary_indexes {
+        let streamed = usize::try_from(streamed).expect("u32 always fits usize");
+        if !reasoning_summary_content_indexes
             .iter()
             .any(|&(position, content_index)| position == streamed && content_index == streamed)
         {
@@ -1030,6 +1068,20 @@ fn message_has_non_empty_output_text(item: &Value) -> bool {
             parts.iter().any(|part| {
                 part.get("type").and_then(Value::as_str) == Some("output_text")
                     && part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+            })
+        })
+}
+
+fn reasoning_has_non_empty_summary(item: &Value) -> bool {
+    item.get("summary")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.get("type").and_then(Value::as_str) == Some("summary_text")
+                    && entry
                         .get("text")
                         .and_then(Value::as_str)
                         .is_some_and(|text| !text.is_empty())
@@ -2217,10 +2269,15 @@ mod tests {
             ])
         );
 
-        // --- Progress: only the representable text deltas, normalized content_index. ---
+        // --- Progress: public reasoning summary plus assistant text, in provider order.
+        // Raw reasoning_text remains private even though it is present in the terminal. ---
         assert_eq!(
             drain(&mut progress_rx),
             [
+                ModelProgressEvent::ContentDelta {
+                    content_index: 1,
+                    delta: ModelContentDelta::ReasoningSummary(Arc::from("Let me think")),
+                },
                 ModelProgressEvent::ContentDelta {
                     content_index: 0,
                     delta: ModelContentDelta::Text(Arc::from("The weather")),
