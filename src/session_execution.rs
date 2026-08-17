@@ -112,6 +112,13 @@ const AGENT_RUN_RETRY_BACKOFFS: [std::time::Duration; AGENT_RUN_MAX_LOGICAL_RETR
 ];
 const COMPACTION_SUMMARY_MAX_LOGICAL_RETRIES: u8 = 1;
 
+/// Raw UTF-8 bytes per public ToolOutputDelta. Safe ToolResult text can expand by at most 2x
+/// under canonical JSON escaping (`"`, `\\`, tab, and LF); 32,000 bytes leaves room for the
+/// selected V1 ProgressEvent envelope with maximum-length IDs. The focused Wire test derives
+/// that envelope through the canonical encoder and proves the complete frame stays within
+/// `max_progress_event_bytes`.
+const MAX_TOOL_OUTPUT_DELTA_CHUNK_BYTES: usize = 32_000;
+
 /// The only execution states represented by a loaded Session executor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionExecutionState {
@@ -10868,6 +10875,22 @@ fn stored_tool_outcome(
     }
 }
 
+fn tool_output_delta_chunks(text: &str) -> impl Iterator<Item = &str> {
+    let mut remaining = text;
+    std::iter::from_fn(move || {
+        if remaining.is_empty() {
+            return None;
+        }
+        let mut end = remaining.len().min(MAX_TOOL_OUTPUT_DELTA_CHUNK_BYTES);
+        while !remaining.is_char_boundary(end) {
+            end -= 1;
+        }
+        let (chunk, rest) = remaining.split_at(end);
+        remaining = rest;
+        Some(chunk)
+    })
+}
+
 async fn apply_tool_outcome_and_publish(
     conversation: &LoadedSessionConversation,
     turn_id: TurnId,
@@ -10891,36 +10914,35 @@ async fn apply_tool_outcome_and_publish(
     if let Some(content) = public_content {
         for part in content.parts() {
             let ToolResultContentPart::Text(text) = part;
-            if text.as_str().is_empty() {
-                continue;
-            }
-            let Ok(update) =
-                ProgressUpdate::tool_output_delta(item_id, tool_call_id.clone(), text.as_str())
-            else {
-                continue;
-            };
-            let Ok(event) = ProgressEvent::new(
-                SystemClock.now(),
-                EventRoute::Item {
-                    session_id: fact.entry().session_id(),
-                    turn_id,
-                    item_id,
-                },
-                ProgressEventKind::Tool,
-                update,
-            ) else {
-                continue;
-            };
-            let (published, waiter) = oneshot::channel();
-            if completion_sender
-                .send(ExecutorCompletion::Progress(ProgressCompletion {
-                    turn_id,
-                    event,
-                    published: Some(published),
-                }))
-                .is_ok()
-            {
-                let _ = waiter.await;
+            for chunk in tool_output_delta_chunks(text.as_str()) {
+                let Ok(update) =
+                    ProgressUpdate::tool_output_delta(item_id, tool_call_id.clone(), chunk)
+                else {
+                    continue;
+                };
+                let Ok(event) = ProgressEvent::new(
+                    SystemClock.now(),
+                    EventRoute::Item {
+                        session_id: fact.entry().session_id(),
+                        turn_id,
+                        item_id,
+                    },
+                    ProgressEventKind::Tool,
+                    update,
+                ) else {
+                    continue;
+                };
+                let (published, waiter) = oneshot::channel();
+                if completion_sender
+                    .send(ExecutorCompletion::Progress(ProgressCompletion {
+                        turn_id,
+                        event,
+                        published: Some(published),
+                    }))
+                    .is_ok()
+                {
+                    let _ = waiter.await;
+                }
             }
         }
     }
@@ -13207,9 +13229,11 @@ mod tests {
     use crate::prompt::{PromptBodyIntent, TextIntent};
     use crate::runtime_task::RuntimeTaskContext;
     use crate::tools::{
-        PreparedToolExecution, SessionFileMutationQueue, ToolCapabilityClass, ToolExecutionFuture,
-        ToolExecutionPreparation, ToolOutcomeSource, ToolPermissionSet, ToolSandboxContract,
+        PreparedToolExecution, SessionFileMutationQueue, ToolCallId, ToolCapabilityClass,
+        ToolExecutionFuture, ToolExecutionPreparation, ToolOutcomeSource, ToolPermissionSet,
+        ToolResultContent, ToolSandboxContract,
     };
+    use crate::wire::IncrementalRuntimeProtocolV1;
     use crate::workspace::{
         RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput,
         WorkspaceFileMutationKey, WorkspacePathTarget, WorkspaceRootInput, WorkspaceRootKey,
@@ -13222,6 +13246,88 @@ mod tests {
     const G2: &str = "00000000000000000002";
 
     static NEXT_TEST_ROOT: AtomicUsize = AtomicUsize::new(1);
+
+    fn encoded_tool_output_delta(delta: &str) -> Vec<u8> {
+        let session_id: SessionId = "ses_ffffffffffffffffffffffffffffffff".parse().unwrap();
+        let turn_id: TurnId = "trn_ffffffffffffffffffffffffffffffff".parse().unwrap();
+        let item_id: ItemId = "itm_ffffffffffffffffffffffffffffffff".parse().unwrap();
+        let tool_call_id: ToolCallId = "x".repeat(256).parse().unwrap();
+        let event = ProgressEvent::new(
+            "9999-12-31T23:59:59.999Z".parse().unwrap(),
+            EventRoute::Item {
+                session_id,
+                turn_id,
+                item_id,
+            },
+            ProgressEventKind::Tool,
+            ProgressUpdate::tool_output_delta(item_id, tool_call_id, delta).unwrap(),
+        )
+        .unwrap();
+        IncrementalRuntimeProtocolV1::v1_0()
+            .encode_event_frame(&crate::runtime_interface::EventFrame::Progress(event))
+            .unwrap()
+    }
+
+    #[test]
+    fn tool_output_chunks_fit_the_canonical_progress_frame_limit() {
+        let maximum = ProtocolLimits::v1_0().transport.max_progress_event_bytes as usize;
+        let one_escaped_byte = encoded_tool_output_delta("\\");
+        let fixed_envelope_bytes = one_escaped_byte.len() - 2;
+        assert!(
+            fixed_envelope_bytes + 2 * MAX_TOOL_OUTPUT_DELTA_CHUNK_BYTES <= maximum,
+            "the fixed chunk cap must fit the maximum-ID envelope at the worst 2x JSON escape expansion"
+        );
+
+        for text in ["a".repeat(65_536), "\\".repeat(65_536)] {
+            let chunks = tool_output_delta_chunks(&text).collect::<Vec<_>>();
+            assert!(chunks.len() > 1);
+            assert_eq!(chunks.concat(), text);
+            for chunk in chunks {
+                assert!(!chunk.is_empty());
+                assert!(chunk.len() <= MAX_TOOL_OUTPUT_DELTA_CHUNK_BYTES);
+                assert!(encoded_tool_output_delta(chunk).len() <= maximum);
+            }
+        }
+    }
+
+    #[test]
+    fn tool_output_chunks_preserve_utf8_part_order_and_small_outputs() {
+        let multibyte = format!("{}\n{}", "界🙂".repeat(4_500), "界🙂".repeat(4_500));
+        let chunks = tool_output_delta_chunks(&multibyte).collect::<Vec<_>>();
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.concat(), multibyte);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.len() <= MAX_TOOL_OUTPUT_DELTA_CHUNK_BYTES)
+        );
+
+        assert_eq!(
+            tool_output_delta_chunks("small").collect::<Vec<_>>(),
+            ["small"]
+        );
+
+        let long = "x".repeat(MAX_TOOL_OUTPUT_DELTA_CHUNK_BYTES + 1);
+        let content = ToolResultContent::from_text_parts(vec![
+            "first".to_owned(),
+            String::new(),
+            long,
+            "last🙂".to_owned(),
+        ])
+        .unwrap();
+        let mut emitted = Vec::new();
+        for part in content.parts() {
+            emitted.extend(tool_output_delta_chunks(part.as_text()));
+        }
+        assert_eq!(emitted.len(), 4);
+        assert_eq!(
+            emitted.concat(),
+            format!(
+                "first{}last🙂",
+                "x".repeat(MAX_TOOL_OUTPUT_DELTA_CHUNK_BYTES + 1)
+            )
+        );
+    }
 
     #[test]
     fn public_usage_projection_aggregates_tokens_costs_and_overflow_diagnostics() {

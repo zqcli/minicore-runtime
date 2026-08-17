@@ -743,7 +743,7 @@ matching Tool message live apply：
 ToolInvocation Item → Completed(result)
 ```
 
-同进程progress订阅中，assistant ToolCall完成live apply与inline record attempt后，Session actor先发布携带Started ToolInvocation的`session_execution_changed` snapshot；任何Tool start都发生在该observation之后。exact `ToolExecutionOutcome::Completed`随后先apply/record，再按原有`ToolResultContent.parts()`顺序把每个non-empty真实Text part发布为`ToolOutputDelta`（builtin不支持流式输出时就是完整结果part，不伪造中间状态）；Abandoned没有synthetic output delta。ActiveTurnTask等待actor接受这些delta后，才允许下一次Model，因此ToolInvocation → ToolOutputDelta → next assistant progress → terminal保持同一Session owner顺序。
+同进程progress订阅中，assistant ToolCall完成live apply与inline record attempt后，Session actor先发布携带Started ToolInvocation的`session_execution_changed` snapshot；任何Tool start都发生在该observation之后。exact `ToolExecutionOutcome::Completed`随后先apply/record，再按原有`ToolResultContent.parts()`顺序把每个non-empty真实Text part切成至多32,000 raw UTF-8 bytes的char-boundary chunks并逐个发布为`ToolOutputDelta`；empty part不发布，part/chunk之间不插入separator，subscriber按顺序拼接可恢复exact原文。32,000-byte cap按safe Text最大2x JSON escaping expansion与maximum-ID canonical V1 envelope留足`max_progress_event_bytes`空间；它不截断、normalize或改写stored/model-visible ToolResult。Abandoned没有synthetic output delta。ActiveTurnTask逐chunk等待actor接受后，才允许下一次Model，因此ToolInvocation → ToolOutputDelta chunk1..N → next assistant progress → terminal保持同一Session owner顺序。
 
 ToolAbandoned：
 

@@ -11571,6 +11571,119 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn large_read_file_progress_chunks_stay_ordered_before_final_model_and_terminal() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let expected = "x".repeat(65_536);
+        fs::write(workspace.path().join("src").join("large.txt"), &expected)
+            .expect("the large read_file fixture is written");
+        let model = ScriptedModelFixture::with_tool_round_and_final_progress(
+            "call_large_read",
+            "read_file",
+            r#"{"path":"large.txt"}"#,
+            &["final"],
+            "final answer",
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_read_file_tool(),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the large read_file progress Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                true,
+            ))
+            .await
+            .expect("the large read_file progress subscription opens");
+        assert!(matches!(events.recv().await, Some(EventFrame::Snapshot(_))));
+        let turn_id = started_turn(
+            &runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("read the large file").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the large read_file Turn starts"),
+        );
+
+        let mut invocation_item_id = None;
+        let mut deltas = Vec::new();
+        let mut final_assistant_observed = false;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event)) => {
+                        if invocation_item_id.is_none() {
+                            if let Some(snapshot) = event.msg().session_snapshot() {
+                                invocation_item_id =
+                                    snapshot.active_items().iter().find_map(|item| {
+                                        matches!(
+                                            item.content(),
+                                            ItemContentView::ToolInvocation { tool_call_id, .. }
+                                                if tool_call_id.as_ref() == "call_large_read"
+                                        )
+                                        .then_some(item.item_id())
+                                    });
+                            }
+                        }
+                        if event.msg().session_kind() == Some(SessionStateEventKind::TurnCompleted)
+                        {
+                            assert!(final_assistant_observed);
+                            break;
+                        }
+                    }
+                    Some(EventFrame::Progress(event)) => match event.update() {
+                        ProgressUpdate::ToolOutputDelta {
+                            item_id,
+                            tool_call_id,
+                            delta,
+                        } if tool_call_id.as_str() == "call_large_read" => {
+                            assert!(!final_assistant_observed);
+                            assert_eq!(
+                                event.route(),
+                                EventRoute::Item {
+                                    session_id,
+                                    turn_id,
+                                    item_id: *item_id,
+                                }
+                            );
+                            assert_eq!(invocation_item_id, Some(*item_id));
+                            deltas.push(delta.to_string());
+                        }
+                        ProgressUpdate::ItemDelta {
+                            content_kind: ItemProgressContentKind::AssistantText,
+                            delta,
+                            ..
+                        } if delta.as_ref() == "final" => {
+                            assert!(deltas.len() > 1);
+                            assert_eq!(deltas.concat(), expected);
+                            final_assistant_observed = true;
+                        }
+                        _ => {}
+                    },
+                    other => panic!("unexpected large read_file progress frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the chunked read_file progress chain reaches terminal state");
+        assert!(deltas.len() > 1);
+        assert_eq!(deltas.concat(), expected);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn list_directory_result_reaches_the_session_progress_stream() {
         let root = TempRoot::new();
         let workspace = TempWorkspace::new();
