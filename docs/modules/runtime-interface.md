@@ -6,7 +6,7 @@
 
 > v0.1前端闭环细化：`c99ccf7`已增加[ADR 0148](../adr/0148-v0-1-session-transcript-is-a-library-only-read-seam.md)冻结的library-only `MiniCoreRuntime::session_transcript`。它从loaded Session的canonical selected history分页恢复基础User/Assistant文本，并明确把`GetHistoryTree/ListTurns/GetTurn/ListItems`、unloaded direct history read与Wire transcript route冻结为post-MVP。Public Wire V1 manifest仍为144 active / 0 pending，Store V1与Conversation JSONL V1均未变化。
 
-同进程Session progress闭环补充：`SubscriptionRequest { scope = Session, include_progress = true }`现使用Session actor单点写入的State+Progress有序流；首帧仍是原子捕获的Session Snapshot，随后才交付模型文本、选定的reasoning progress、ToolInvocation observation、真实ToolResult Text与terminal StateEvent。`include_progress = false`继续使用原state-only publisher，既有State/Snapshot事件集合和背压不受高频progress影响。每次AgentRun以`content_index + public content kind`绑定stable ItemId，并在final `StoredAssistantContent`复用；logical retry发布`model_retry_scheduled`并重置attempt-local provisional状态。OpenAI provider installation默认只发布`response.reasoning_summary_text.delta`；trusted host可通过显式`OpenAiReasoningProgress::RawText`改为只发布non-empty `response.reasoning_text.delta`，同一installation绝不同时发布或拼接summary/raw。`include_progress`只选择是否订阅progress，不构成raw disclosure授权。Anthropic `thinking_delta`、encrypted/signature、refusal与function-call argument delta继续不公开；final Snapshot/Item正文仍只读取summary或固定redacted placeholder。该实现复用现有Progress/Wire V1 shape，不新增public variant。
+同进程Session progress闭环补充：`SubscriptionRequest { scope = Session, include_progress = true }`现使用Session actor单点写入的State+Progress有序流；首帧仍是原子捕获的Session Snapshot，随后才交付模型文本、选定的reasoning progress、ToolInvocation observation、真实ToolResult Text与terminal StateEvent。ToolResult每个non-empty Text part按part顺序切成至多32,000 raw UTF-8 bytes的char-boundary chunks；每个chunk继续使用同一`ToolOutputDelta` V1 shape与Item/ToolCall/Turn identity，canonical encoded frame在maximum IDs与worst safe-Text JSON escaping下仍不超过`max_progress_event_bytes`，顺序拼接恢复exact原文。`include_progress = false`继续使用原state-only publisher，既有State/Snapshot事件集合和背压不受高频progress影响。每次AgentRun以`content_index + public content kind`绑定stable ItemId，并在final `StoredAssistantContent`复用；logical retry发布`model_retry_scheduled`并重置attempt-local provisional状态。OpenAI provider installation默认只发布`response.reasoning_summary_text.delta`；trusted host可通过显式`OpenAiReasoningProgress::RawText`改为只发布non-empty `response.reasoning_text.delta`，同一installation绝不同时发布或拼接summary/raw。`include_progress`只选择是否订阅progress，不构成raw disclosure授权。Anthropic `thinking_delta`、encrypted/signature、refusal与function-call argument delta继续不公开；final Snapshot/Item正文仍只读取summary或固定redacted placeholder。该实现复用现有Progress/Wire V1 shape，不新增public variant。
 
 ## 目的
 
@@ -2152,6 +2152,7 @@ model_retry_scheduled
 - message/reasoning started属于AgentRun ProgressEvent，不创建final live Item；CompactionSummary不创建StreamingItem或ItemId；
 - Host漏掉started时可以用首个delta创建临时Item view；漏掉全部progress或provider为non-streaming时直接使用final `item_completed`；
 - 可以按SessionId/TurnId/ItemId合并连续delta；
+- `ToolOutputDelta`对每个non-empty ToolResult Text part按原part顺序发布UTF-8-safe chunks；单chunk最多32,000 raw bytes，empty part无event，chunk间无separator，拼接必须得到exact原文；
 - queue满时可以丢弃中间progress；
 - progress缺失不影响StateEvent或Snapshot正确性；
 - `item_completed`只在final candidate成功apply到live state并完成inline record attempt后发布，携带完整final Item view；recording failure不阻止发布；
