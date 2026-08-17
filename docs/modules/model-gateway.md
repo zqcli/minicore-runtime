@@ -934,12 +934,12 @@ pub enum ModelContentDelta {
 
 规则：
 
-- scoped publisher是process-local；AgentRun adapter必须先无损更新`StreamingItem`和ItemId映射，之后的Host ProgressEvent enqueue才是bounded、可合并/丢弃的observer路径；CompactionSummary adapter不创建ItemId；
-- publisher由ActiveTurnTask scope到SessionId/TurnId；task创建的AgentRun adapter使用`content_index`维护`StreamingItem`并分配MiniCore ItemId；
-- ModelGateway只发布provider-neutral content index和delta，不创建ItemId，也不接收SessionId或TurnId；logical retry由ActiveTurnTask发布`model_retry_scheduled`；
-- 连续text/reasoning delta可以合并；
-- Host progress queue满可以丢弃中间delta，但不能跳过operation-local累积；
-- Host progress sink关闭不取消provider调用或operation-local累积；
+- scoped publisher是process-local且callback同步nonblocking：每个AgentRun attempt publisher捕获private monotonic generation，callback先验证generation，再持短mutex更新bounded ItemId/delta-seen facts并对Turn mailbox执行bounded append + capacity-1 `try_send` wake；旧attempt retained callback在任何identity/fallback/mailbox mutation前drop；callback绝不await或向unbounded owner completion lane逐delta发送；CompactionSummary adapter不创建ItemId；
+- publisher由ActiveTurnTask scope到SessionId/TurnId；AgentRun最多跟踪64个`content_index + public kind` key，overflow key不发布provisional payload但terminal仍分配final ItemId；raw reasoning overflow仍conservative阻止summary fallback；
+- ModelGateway只发布provider-neutral content index和delta，不创建ItemId，也不接收SessionId或TurnId；logical retry由ActiveTurnTask在marker前先递增attempt generation并清空started/delta/fallback attempt-local facts（保留logical ItemId map），再经capacity-1 reliable actor fence发布并等待`model_retry_scheduled` acknowledgement；
+- observer mailbox最多8 events/65,536 raw text bytes；32,000-byte UTF-8 segment在未受压时保留provider segmentation，受压时只合并same-item newest suffix，满后丢newest；
+- zero progress-demand subscriber时不构造observer payload、不wake actor，但operation-local ItemId/delta-seen/fallback事实仍更新；
+- Host progress sink关闭或subscriber lag不取消provider调用；final provider normalization与Session Snapshot/terminal不依赖progress delivery；
 - cancellation由CancellationToken决定；
 - partial reasoning/text/tool arguments不是durable Item；
 - reasoning progress默认只发布provider summary；OpenAI Responses只有trusted host通过`ModelProviderConfig::openai_responses_with_reasoning_progress(..., OpenAiReasoningProgress::RawText, ...)`显式安装时才发布non-empty `response.reasoning_text.delta`，并在该installation内抑制summary delta。summary/raw是互斥单通道，不拼接；Anthropic thinking仍不公开；
@@ -1501,7 +1501,7 @@ ModelGateway不提供Runtime global、per-provider route、per-model或per-auth-
 - request前auth refresh只对同一credential执行singleflight，不阻塞无关credential的调用；
 - 不存在route/principal cooldown cache或preflight cooldown fast-fail；`RateLimited`、`QuotaExceeded`和typed `Retry-After`继续规范化为terminal result，由ActiveTurnTask裁决logical retry；
 - Provider SDK/HTTP connection pool的transport资源管理是private implementation detail，不成为MiniCore admission policy；
-- progress publisher阻塞不能占用provider stream读取。
+- progress publisher不能阻塞provider stream读取：production callback无await、无blocking channel send，只有short mutex、bounded copy和capacity-1 `try_send`。
 
 ## Complete Call Flow
 

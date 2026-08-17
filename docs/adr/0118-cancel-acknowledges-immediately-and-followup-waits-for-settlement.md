@@ -3,6 +3,8 @@
 状态：Partially Superseded by ADRs 0124, 0126, 0127 and 0133
 日期：2026-07-27
 
+> 2026-08-12 current implementation refinement：exact active Turn的EmergencyControl owner mutex同时承载private terminal/control commit gate。Final Assistant在`complete_with_assistant_message`前先claim terminal reservation；Cancel/SecurityRevoked/PrepareForUnload/close在接受或signal前经同一mutex claim control。control先赢则final不apply/record并truthful Interrupted；terminal先赢则Turn Cancel返回既有terminal rejection，Security/Unload只继续future Session/Workspace lifecycle且不得重标该Turn。worker已计算Failed但尚未由actor settle时仍由同一gate first-wins，accepted control映射Interrupted；不再通过final live commit后的terminal label rewrite伪造一致性。该实现闭合正文第10条，不改变public contract。
+>
 > 2026-08-11 current refinement：signal-first all-unstarted settlement已落地——Cancel/SecurityRevoked/Unload signal先赢时跳过UserQuestion binding与一切start factory，全部未启动calls（含pending question）settle matching PreExecution Cancelled；Interaction host resolution与UserQuestion binding分别经`InteractionResolutionPermit`/`UserQuestionBindingPermit`在apply/bind前与signal first-wins（permit先赢则signal随后仍授权该精确步骤并truthful settle）。历史正文不变。
 
 > [ADR 0133](0133-runtime-public-payload-is-snapshot-recoverable.md)冻结Starting Submit两条public completion：Input apply前user Cancel先赢为`Completed(SubmitCancelled)`且无Turn；Input apply先赢为`Completed(TurnStarted)`，随后观察同一Turn Interrupted。
