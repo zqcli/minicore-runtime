@@ -1591,7 +1591,9 @@ pub enum SnapshotResponse {
 }
 ```
 
-`Box<SessionSnapshot>`只控制enum尺寸，不改变semantic ownership或Wire V1 shape。当前 incremental codec materialize `Open + Loaded + Ready` 的 Idle baseline，以及 M9.18 已激活的 Starting/Running/Finishing queue projection；M9.20 已补齐 running/approval 快照中的 current Turn、active Items 与 Pending Interaction 最小安全投影（不暴露原始工具参数、工具结果或隐含推理）；Session usage、Degraded recording与bounded diagnostic projection已由Session Executor真实状态驱动，并在Wire V1中作为accepted/canonical snapshot状态处理。
+`Box<SessionSnapshot>`只控制enum尺寸，不改变semantic ownership或Wire V1 shape。当前 incremental codec materialize `Open + Loaded + Ready` 的 Idle baseline，以及 M9.18 已激活的 Starting/Running/Finishing queue projection；M9.20 已补齐 running/approval 快照中的 current Turn、active Items 与 Pending Interaction 最小安全投影（不暴露raw Tool arguments JSON、工具结果或隐含推理）；Session usage、Degraded recording与bounded diagnostic projection已由Session Executor真实状态驱动，并在Wire V1中作为accepted/canonical snapshot状态处理。
+
+active `ItemContentView::ToolInvocation.arguments_summary`保持既有Wire V1 String字段，但其value由Tools owner的closed safe projector产生：当前仅`read_file`与`list_directory`可从各自strict typed arguments投影cwd-relative `path: <relative>`，其中list cwd显示`path: .`；read root、unknown/custom Tool、malformed/unknown-field及absolute/dot/backslash path都固定为`arguments redacted`。Session Execution只调用该projector，不读取generic JSON。`result`继续为`None`，Tool结果只沿既有`ToolOutputDelta` live progress发布；本变化不新增Wire variant、storage字段、Conversation format或transcript item。
 
 ### RuntimeSnapshot
 

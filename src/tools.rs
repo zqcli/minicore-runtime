@@ -220,6 +220,23 @@ pub(crate) struct ToolCall {
     call_index: u32,
 }
 
+const REDACTED_TOOL_ARGUMENTS_SUMMARY: &str = "arguments redacted";
+
+/// The closed, tool-owned safe projection of model-supplied arguments for public Item views.
+/// Only builtins with an explicit strict projector may disclose a summary; unknown tools and
+/// every malformed or unsupported argument shape fail closed to the fixed redacted text.
+pub(crate) fn public_tool_call_arguments_summary(
+    name: &ToolName,
+    arguments: &BoundedJsonObject,
+) -> Box<str> {
+    let summary = match name.as_str() {
+        read_file::READ_FILE_NAME => read_file::public_arguments_summary(arguments),
+        list_directory::LIST_DIRECTORY_NAME => list_directory::public_arguments_summary(arguments),
+        _ => None,
+    };
+    summary.unwrap_or_else(|| REDACTED_TOOL_ARGUMENTS_SUMMARY.into())
+}
+
 impl ToolCall {
     pub(crate) const fn new(
         tool_call_id: ToolCallId,
@@ -3397,6 +3414,20 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn public_tool_call_arguments_summary_redacts_unknown_tools() {
+        let name: ToolName = "custom_tool".parse().unwrap();
+        let arguments: BoundedJsonObject =
+            r#"{"path":"src/lib.rs","credential":"do-not-disclose"}"#
+                .parse()
+                .unwrap();
+
+        assert_eq!(
+            public_tool_call_arguments_summary(&name, &arguments).as_ref(),
+            "arguments redacted"
+        );
+    }
 
     async fn run_planned_execution(
         set: Arc<ToolSet>,

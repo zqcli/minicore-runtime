@@ -244,6 +244,17 @@ fn parse_arguments(arguments: &BoundedJsonObject) -> Result<ReadFileArguments, (
     serde_json::from_str(arguments.canonical_json()).map_err(|_| ())
 }
 
+/// Projects only the strict builtin path argument into a bounded public summary. The root
+/// path is not a valid read target, and every parse or semantic failure stays redacted by
+/// the parent dispatcher.
+pub(super) fn public_arguments_summary(arguments: &BoundedJsonObject) -> Option<Box<str>> {
+    let arguments = parse_arguments(arguments).ok()?;
+    if arguments.path.is_root() {
+        return None;
+    }
+    Some(format!("path: {}", arguments.path.as_str()).into_boxed_str())
+}
+
 /// The cooperative-cancellation executor for one started read.
 ///
 /// Once start has happened (this executor exists), a cancellation that already won (or
@@ -741,6 +752,31 @@ mod tests {
             set.plan(&request)
                 .is_some_and(|plan| matches!(plan, ToolExecutionPlan::Execute { .. }))
         );
+    }
+
+    #[test]
+    fn public_arguments_summary_discloses_only_valid_non_root_relative_paths() {
+        let valid: BoundedJsonObject = r#"{"path":"src/lib.rs"}"#.parse().unwrap();
+        assert_eq!(
+            public_arguments_summary(&valid).as_deref(),
+            Some("path: src/lib.rs")
+        );
+
+        for arguments in [
+            r#"{"path":""}"#,
+            r#"{"path":"/etc/passwd"}"#,
+            r#"{"path":"../secret"}"#,
+            r#"{"path":"./secret"}"#,
+            r#"{"path":"a\\b"}"#,
+            r#"{"path":"secret.txt","credential":"do-not-disclose"}"#,
+        ] {
+            let arguments: BoundedJsonObject = arguments.parse().unwrap();
+            assert_eq!(
+                public_arguments_summary(&arguments),
+                None,
+                "arguments must fail closed: {arguments:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

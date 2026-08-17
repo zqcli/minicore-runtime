@@ -7347,7 +7347,7 @@ impl SessionExecutorActor {
                                 item_id,
                                 tool_call_id,
                                 name,
-                                ..
+                                arguments,
                             } => {
                                 has_started_tool |= !completed_tools.contains(item_id);
                                 (
@@ -7355,7 +7355,9 @@ impl SessionExecutorActor {
                                     ItemContentView::tool_invocation(
                                         tool_call_id.as_str(),
                                         name.as_str(),
-                                        "arguments redacted",
+                                        crate::tools::public_tool_call_arguments_summary(
+                                            name, arguments,
+                                        ),
                                         Option::<&str>::None,
                                     ),
                                 )

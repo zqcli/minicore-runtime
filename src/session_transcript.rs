@@ -287,7 +287,9 @@ mod tests {
     use std::num::NonZeroU32;
 
     use super::*;
-    use crate::conversation_storage::{StoredAssistantMessage, StoredUserMessage};
+    use crate::conversation_storage::{
+        StoredAssistantMessage, StoredToolMessage, StoredToolOutcome, StoredUserMessage,
+    };
     use crate::model_gateway::{
         ModelFinishReason, ModelId, ModelReasoningSummary, ModelResponseSummary, ModelServiceClass,
         ProviderId, ProviderResponseMetadata, ReasoningContent,
@@ -296,6 +298,7 @@ mod tests {
         CanonicalUserMessage, MessageContent, MessageRecord, PromptContributionOrigin,
         PromptContributionStamp,
     };
+    use crate::tools::{ToolCallId, ToolOutcomeSource, ToolResultContent, ToolResultDisposition};
     use crate::turn_item_interaction::AssistantDisposition;
 
     fn item(number: u8) -> ItemId {
@@ -452,5 +455,80 @@ mod tests {
         let debug = format!("{capture:?}");
         assert!(!debug.contains("secret reasoning"));
         assert!(!debug.contains("secret text"));
+    }
+
+    #[test]
+    fn transcript_continues_to_exclude_tool_calls_and_results() {
+        let session_id = "ses_11111111111111111111111111111111"
+            .parse()
+            .expect("test session IDs are valid");
+        let turn_id = turn(1);
+        let call_entry_id = "ent_11111111111111111111111111111111"
+            .parse()
+            .expect("test entry IDs are valid");
+        let tool_call_id: ToolCallId = "call_read".parse().expect("test ToolCallId is valid");
+        let assistant = StoredAssistantMessage::reconstruct(
+            AssistantDisposition::Intermediate,
+            vec![StoredAssistantContent::ToolCall {
+                item_id: item(1),
+                tool_call_id: tool_call_id.clone(),
+                name: "read_file".parse().expect("test ToolName is valid"),
+                arguments: r#"{"path":"secret.txt"}"#
+                    .parse()
+                    .expect("test arguments are valid bounded JSON"),
+            }],
+            ModelResponseSummary::reconstruct(
+                "fixture".parse::<ProviderId>().unwrap(),
+                "scripted".parse::<ModelId>().unwrap(),
+                ModelReasoningSummary::Disabled,
+                ModelServiceClass::Standard,
+            ),
+            None,
+            ModelFinishReason::ToolCalls,
+            NonZeroU32::new(1).unwrap(),
+            None,
+            0,
+            ProviderResponseMetadata::reconstruct(None, None, None),
+        )
+        .unwrap();
+        let tool = StoredToolMessage::reconstruct(
+            item(1),
+            tool_call_id,
+            StoredToolOutcome::completed(
+                ToolOutcomeSource::Executed,
+                ToolResultDisposition::Succeeded,
+                ToolResultContent::from_text_parts(vec!["secret result".to_owned()]).unwrap(),
+            )
+            .unwrap(),
+        );
+        let capture = SessionTranscriptCapture {
+            entries: Arc::from([
+                Arc::new(StoredSessionEntry::reconstruct(
+                    call_entry_id,
+                    None,
+                    session_id,
+                    turn_id,
+                    timestamp(),
+                    StoredEntryBody::AssistantMessage(assistant),
+                )),
+                Arc::new(StoredSessionEntry::reconstruct(
+                    "ent_22222222222222222222222222222222"
+                        .parse()
+                        .expect("test entry IDs are valid"),
+                    Some(call_entry_id),
+                    session_id,
+                    turn_id,
+                    timestamp(),
+                    StoredEntryBody::ToolMessage(tool),
+                )),
+            ]),
+        };
+
+        let (items, next) = capture.page(0, 10).unwrap().into_parts();
+        assert!(items.is_empty());
+        assert!(next.is_none());
+        let debug = format!("{capture:?}");
+        assert!(!debug.contains("secret.txt"));
+        assert!(!debug.contains("secret result"));
     }
 }

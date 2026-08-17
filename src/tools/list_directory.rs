@@ -262,6 +262,19 @@ fn parse_arguments(arguments: &BoundedJsonObject) -> Result<ListDirectoryArgumen
     serde_json::from_str(arguments.canonical_json()).map_err(|_| ())
 }
 
+/// Projects only the strict builtin path argument into a bounded public summary. The empty
+/// relative path is the captured workspace cwd and is rendered as `.`; every parse or
+/// semantic failure stays redacted by the parent dispatcher.
+pub(super) fn public_arguments_summary(arguments: &BoundedJsonObject) -> Option<Box<str>> {
+    let arguments = parse_arguments(arguments).ok()?;
+    let path = if arguments.path.is_root() {
+        "."
+    } else {
+        arguments.path.as_str()
+    };
+    Some(format!("path: {path}").into_boxed_str())
+}
+
 /// The cooperative-cancellation executor for one started listing.
 ///
 /// Once start has happened (this executor exists), a cancellation that already won (or
@@ -864,6 +877,35 @@ mod tests {
             set.plan(&request)
                 .is_some_and(|plan| matches!(plan, ToolExecutionPlan::Execute { .. }))
         );
+    }
+
+    #[test]
+    fn public_arguments_summary_uses_dot_for_cwd_and_rejects_invalid_paths() {
+        for (arguments, expected) in [
+            (r#"{"path":"src"}"#, "path: src"),
+            (r#"{"path":""}"#, "path: ."),
+        ] {
+            let arguments: BoundedJsonObject = arguments.parse().unwrap();
+            assert_eq!(
+                public_arguments_summary(&arguments).as_deref(),
+                Some(expected)
+            );
+        }
+
+        for arguments in [
+            r#"{"path":"/etc"}"#,
+            r#"{"path":"../secret"}"#,
+            r#"{"path":"./secret"}"#,
+            r#"{"path":"a\\b"}"#,
+            r#"{"path":"secret","credential":"do-not-disclose"}"#,
+        ] {
+            let arguments: BoundedJsonObject = arguments.parse().unwrap();
+            assert_eq!(
+                public_arguments_summary(&arguments),
+                None,
+                "arguments must fail closed: {arguments:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
