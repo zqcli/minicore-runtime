@@ -388,6 +388,16 @@ pub enum ProviderEndpointPolicy {
     AllowLoopbackHttp,
 }
 
+/// Selects the single process-local reasoning progress channel published by one
+/// OpenAI Responses provider installation. The existing installation constructor
+/// remains closed by default and selects [`Self::SummaryOnly`]; raw reasoning text
+/// requires the explicitly named constructor and [`Self::RawText`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenAiReasoningProgress {
+    SummaryOnly,
+    RawText,
+}
+
 /// Typed, payload-free installation configuration failure. Rejected endpoints,
 /// versions, and descriptor details are never stored, so Debug/Display can never
 /// leak them. This is the closed public config-validation taxonomy of the pure
@@ -429,6 +439,7 @@ pub(crate) enum ProviderSourceBuildError {
 pub(crate) enum ProviderRoute {
     OpenAiResponses {
         endpoint: Box<str>,
+        reasoning_progress: OpenAiReasoningProgress,
     },
     AnthropicMessages {
         endpoint: Box<str>,
@@ -479,12 +490,32 @@ impl ModelProviderConfig {
         credential_source: Arc<dyn CredentialSource>,
         models: Vec<ModelProviderDescriptor>,
     ) -> Result<Self, ModelProviderConfigError> {
+        Self::openai_responses_with_reasoning_progress(
+            endpoint,
+            endpoint_policy,
+            OpenAiReasoningProgress::SummaryOnly,
+            credential_source,
+            models,
+        )
+    }
+
+    /// OpenAI Responses installation with an explicit process-local reasoning
+    /// progress disclosure policy. `RawText` is an explicit trusted-host opt-in;
+    /// the ordinary [`Self::openai_responses`] constructor remains summary-only.
+    pub fn openai_responses_with_reasoning_progress(
+        endpoint: &str,
+        endpoint_policy: ProviderEndpointPolicy,
+        reasoning_progress: OpenAiReasoningProgress,
+        credential_source: Arc<dyn CredentialSource>,
+        models: Vec<ModelProviderDescriptor>,
+    ) -> Result<Self, ModelProviderConfigError> {
         validate_model_list(&models)?;
         validate_endpoint(endpoint, endpoint_policy)?;
         validate_descriptors(&models)?;
         Ok(Self {
             route: ProviderRoute::OpenAiResponses {
                 endpoint: endpoint.into(),
+                reasoning_progress,
             },
             credential_source,
             descriptors: models,
@@ -528,8 +559,15 @@ impl ModelProviderConfig {
         &self,
     ) -> Result<Arc<dyn ModelSourceAdapter>, ProviderSourceBuildError> {
         let adapter: Arc<dyn crate::model_gateway::ProviderAdapter> = match &self.route {
-            ProviderRoute::OpenAiResponses { endpoint } => Arc::new(
-                OpenAiResponsesProviderAdapter::new(endpoint).map_err(|error| match error {
+            ProviderRoute::OpenAiResponses {
+                endpoint,
+                reasoning_progress,
+            } => Arc::new(
+                OpenAiResponsesProviderAdapter::new_with_reasoning_progress(
+                    endpoint,
+                    *reasoning_progress,
+                )
+                .map_err(|error| match error {
                     // Unreachable: the constructor ran the identical validation.
                     OpenAiProviderConfigError::InvalidEndpoint => {
                         ProviderSourceBuildError::InvalidDefinition
@@ -832,6 +870,42 @@ mod tests {
             fixed_credential_source("sk-test"),
             vec![descriptor()],
         )
+    }
+
+    #[test]
+    fn openai_reasoning_progress_is_summary_only_by_default_and_raw_only_when_explicit() {
+        fn reasoning_progress(config: &ModelProviderConfig) -> OpenAiReasoningProgress {
+            match &config.route {
+                ProviderRoute::OpenAiResponses {
+                    reasoning_progress, ..
+                } => *reasoning_progress,
+                ProviderRoute::AnthropicMessages { .. } => {
+                    panic!("the test config must use OpenAI Responses")
+                }
+            }
+        }
+
+        let default = ModelProviderConfig::openai_responses(
+            "https://api.openai.com/v1/responses",
+            ProviderEndpointPolicy::HttpsOnly,
+            fixed_credential_source("sk-test"),
+            vec![descriptor()],
+        )
+        .expect("the default OpenAI installation validates");
+        let raw = ModelProviderConfig::openai_responses_with_reasoning_progress(
+            "https://api.openai.com/v1/responses",
+            ProviderEndpointPolicy::HttpsOnly,
+            OpenAiReasoningProgress::RawText,
+            fixed_credential_source("sk-test"),
+            vec![descriptor()],
+        )
+        .expect("the explicit raw-reasoning installation validates");
+
+        assert_eq!(
+            reasoning_progress(&default),
+            OpenAiReasoningProgress::SummaryOnly
+        );
+        assert_eq!(reasoning_progress(&raw), OpenAiReasoningProgress::RawText);
     }
 
     #[test]

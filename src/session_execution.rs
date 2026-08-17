@@ -9548,6 +9548,7 @@ impl ActiveModelProgress {
             ModelContentDelta::ReasoningSummary(delta) => {
                 (ActiveModelProgressKind::Reasoning, delta)
             }
+            ModelContentDelta::ReasoningText(delta) => (ActiveModelProgressKind::Reasoning, delta),
         };
         self.publish_delta(content_index, kind, delta.as_ref());
     }

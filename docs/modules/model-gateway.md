@@ -942,7 +942,7 @@ pub enum ModelContentDelta {
 - Host progress sink关闭不取消provider调用或operation-local累积；
 - cancellation由CancellationToken决定；
 - partial reasoning/text/tool arguments不是durable Item；
-- hidden chain-of-thought不可发布；
+- reasoning progress默认只发布provider summary；OpenAI Responses只有trusted host通过`ModelProviderConfig::openai_responses_with_reasoning_progress(..., OpenAiReasoningProgress::RawText, ...)`显式安装时才发布non-empty `response.reasoning_text.delta`，并在该installation内抑制summary delta。summary/raw是互斥单通道，不拼接；Anthropic thinking仍不公开；
 - provider未暴露的reasoning不可推断；
 - terminal success必须返回完整FinalizedAssistantResponse；
 - terminal error必须返回typed ModelCallError；
@@ -1436,7 +1436,7 @@ pub struct CustomProviderDefinition {
 }
 ```
 
-当前实现不公开generic protocol enum或raw custom-provider DTO；host使用`ModelProviderConfig::openai_responses(...)`或`ModelProviderConfig::anthropic_messages(...)`显式选择protocol，并提供共享credential source与一个或多个`ModelProviderDescriptor`。constructor只做纯validation；`MiniCoreRuntime::open`为每个installation构建exact一个direct adapter/client与static source，后续shared reload复用该source，不重建client。
+当前实现不公开generic protocol enum或raw custom-provider DTO；host使用`ModelProviderConfig::openai_responses(...)`或`ModelProviderConfig::anthropic_messages(...)`显式选择protocol，并提供共享credential source与一个或多个`ModelProviderDescriptor`。OpenAI普通constructor固定`OpenAiReasoningProgress::SummaryOnly`；只有显式`openai_responses_with_reasoning_progress(..., RawText, ...)`授权该installation向所有progress-enabled Session subscribers发布raw reasoning delta。该值不是model capability/reasoning effort，也不由`include_progress`推断。constructor只做纯validation；`MiniCoreRuntime::open`为每个installation构建exact一个direct adapter/client与static source，后续shared reload复用该source，不重建client。
 
 规则：
 
