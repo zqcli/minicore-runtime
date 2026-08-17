@@ -11505,6 +11505,16 @@ mod tests {
                                 }) {
                                     assert_eq!(item.turn_id(), turn_id);
                                     assert_eq!(item.status(), ItemStatusView::Started);
+                                    let ItemContentView::ToolInvocation {
+                                        arguments_summary,
+                                        result,
+                                        ..
+                                    } = item.content()
+                                    else {
+                                        unreachable!("the selected item is a ToolInvocation");
+                                    };
+                                    assert_eq!(arguments_summary.as_ref(), "path: note.txt");
+                                    assert_eq!(result.as_deref(), None);
                                     invocation_item_id = Some(item.item_id());
                                     order.push("invocation");
                                 }
@@ -11605,8 +11615,37 @@ mod tests {
                 .expect("the list_directory Turn starts"),
         );
         let output = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut invocation_observed = false;
             loop {
                 match events.recv().await {
+                    Some(EventFrame::State(event)) => {
+                        if invocation_observed {
+                            continue;
+                        }
+                        let Some(snapshot) = event.msg().session_snapshot() else {
+                            continue;
+                        };
+                        let Some(item) = snapshot.active_items().iter().find(|item| {
+                            matches!(
+                                item.content(),
+                                ItemContentView::ToolInvocation { tool_call_id, .. }
+                                    if tool_call_id.as_ref() == "call_list"
+                            )
+                        }) else {
+                            continue;
+                        };
+                        let ItemContentView::ToolInvocation {
+                            arguments_summary,
+                            result,
+                            ..
+                        } = item.content()
+                        else {
+                            unreachable!("the selected item is a ToolInvocation");
+                        };
+                        assert_eq!(arguments_summary.as_ref(), "path: .");
+                        assert_eq!(result.as_deref(), None);
+                        invocation_observed = true;
+                    }
                     Some(EventFrame::Progress(event)) => {
                         if let ProgressUpdate::ToolOutputDelta {
                             tool_call_id,
@@ -11615,11 +11654,11 @@ mod tests {
                         } = event.update()
                         {
                             if tool_call_id.as_str() == "call_list" {
+                                assert!(invocation_observed);
                                 return delta.to_string();
                             }
                         }
                     }
-                    Some(EventFrame::State(_)) => continue,
                     other => panic!("unexpected list_directory progress frame: {other:?}"),
                 }
             }

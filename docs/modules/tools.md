@@ -267,6 +267,8 @@ pub enum ToolAbandonReason {
 
 `ToolResultContent`是唯一model-visible/stored result body；MVP只支持1..32个safe Text parts，每part<=65,536 bytes、aggregate<=262,144 bytes。它是external Tool text carrier，payload中的CR/CRLF不做silent normalization；owner只能fail closed，或在构造前显式替换为U+FFFD并记录bounded diagnostic。structured executor payload必须由Tool owner确定性render为Text；raw JSON可在bounded `details`中供current-process trusted debug projection使用，但不自动进入模型，且[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md#tool-message)明确不记录details。
 
+current active `ToolInvocation.arguments_summary`由Tools owner的closed dispatcher产生，不由Session Execution解析generic JSON。当前只允许`read_file`与`list_directory`各自复用private strict arguments parser投影cwd-relative path：前者仅对non-root valid path返回`path: <relative>`；后者对valid path返回同一形状，并把empty cwd path渲染为`path: .`。unknown/custom Tool、malformed object、unknown field、absolute/dot/backslash path及任何projector failure一律返回固定`arguments redacted`。该summary不包含raw arguments JSON、Workspace physical root、result、credential字段或内部error；`ToolCall`、`ToolExecutionRequest`与Conversation JSONL继续保存既有形状，不新增summary storage事实。
+
 `Succeeded`要求Tool owner产生exact successful business result：ordinary Tool来自executor exact success；ask-user等built-in control Tool可以在不启动side effect/executor的情况下由合法Interaction resolution产生truthful success。`Failed`表示有truthful Tool/preflight error（例如unknown Tool、invalid arguments、Hook或exact executor failure）；`Denied`表示policy、approval、Workspace authority或Sandbox capability的pre-execution fail-closed拒绝；`Cancelled`只在能证明side effect未开始或executor返回exact cancellation result时使用。outcome unknown不能伪造成上述任一disposition，必须使用`ToolExecutionOutcome::Abandoned`，其reason只能是`OutcomeUnknown`或`RuntimeFailure`。raw internal error不能进入reason。
 
 source/disposition valid matrix：
