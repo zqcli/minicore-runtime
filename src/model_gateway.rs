@@ -23,11 +23,14 @@ mod openai_responses;
 mod provider_installation;
 mod provider_transport;
 
+#[cfg(test)]
+pub(crate) use provider_transport::loopback as provider_loopback;
+
 pub(crate) use provider_installation::ProviderSourceBuildError;
 pub use provider_installation::{
     CredentialSource, CredentialSourceFuture, ModelProviderConfig, ModelProviderConfigError,
     ModelProviderDescriptor, ModelProviderDescriptorError, ModelReasoningSupport,
-    ProviderCredential, ProviderCredentialError, ProviderEndpointPolicy,
+    OpenAiReasoningProgress, ProviderCredential, ProviderCredentialError, ProviderEndpointPolicy,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -1446,6 +1449,7 @@ fn is_canonical_integer_literal(literal: &str) -> bool {
 pub(crate) enum ModelContentDelta {
     Text(Arc<str>),
     ReasoningSummary(Arc<str>),
+    ReasoningText(Arc<str>),
 }
 
 impl fmt::Debug for ModelContentDelta {
@@ -1453,6 +1457,7 @@ impl fmt::Debug for ModelContentDelta {
         let (kind, value) = match self {
             Self::Text(value) => ("text", value),
             Self::ReasoningSummary(value) => ("reasoning_summary", value),
+            Self::ReasoningText(value) => ("reasoning_text", value),
         };
         formatter
             .debug_struct("ModelContentDelta")

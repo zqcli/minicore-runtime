@@ -4524,14 +4524,16 @@ mod tests {
         SessionMetadataPatch, SessionModelConfig,
     };
     use crate::conversation_storage::{RecordOutcome, RecorderWriteBarrier, SessionHeader};
+    use crate::model_gateway::provider_loopback::{LoopbackServer, ScriptedResponse};
     use crate::model_gateway::{
         CredentialSource, CredentialSourceFuture, EffectiveModelLimits, ModelCallErrorReason,
         ModelCapabilities, ModelCatalogView, ModelDefinition, ModelDefinitionVersion, ModelGateway,
         ModelGenerationDefaults, ModelProgressPublisher, ModelProviderConfig,
         ModelProviderDescriptor, ModelReasoningSummary, ModelSelection, ModelServiceClass,
-        ModelSourceAdapter, ModelSourceFuture, ProviderAdapter, ProviderAttemptFuture,
-        ProviderAttemptRequest, ProviderEndpointPolicy, ReasoningCapabilities, ReasoningPreference,
-        ScriptedModelFixture, TokenEstimateRate, fixed_credential_source,
+        ModelSourceAdapter, ModelSourceFuture, OpenAiReasoningProgress, ProviderAdapter,
+        ProviderAttemptFuture, ProviderAttemptRequest, ProviderEndpointPolicy,
+        ReasoningCapabilities, ReasoningPreference, ScriptedModelFixture, TokenEstimateRate,
+        fixed_credential_source,
     };
     use crate::prompt::{
         AgentPromptSelection, ModelMessageRef, PromptBodyIntent, PromptIntent,
@@ -11167,6 +11169,205 @@ mod tests {
         assert_eq!(progress_item_id, final_item_id);
         assert!(progress_item_id.is_some());
         runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn openai_raw_reasoning_progress_opt_in_reaches_session_stream_without_summary_duplication()
+     {
+        fn sse(events: &[serde_json::Value]) -> String {
+            let mut body = String::new();
+            for event in events {
+                body.push_str("data: ");
+                body.push_str(&event.to_string());
+                body.push_str("\n\n");
+            }
+            body
+        }
+
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: Vec::new(),
+            body: sse(&[
+                serde_json::json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "reasoning_1",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "sequence_number": 1,
+                    "delta": "SAFE-SUMMARY-DELTA"
+                }),
+                serde_json::json!({
+                    "type": "response.reasoning_text.delta",
+                    "item_id": "reasoning_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "sequence_number": 2,
+                    "delta": "RAW-THINKING-DELTA"
+                }),
+                serde_json::json!({
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": 0,
+                    "sequence_number": 3,
+                    "delta": "{\"secret\":true}"
+                }),
+                serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "item_id": "message_1",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "sequence_number": 4,
+                    "delta": "answer"
+                }),
+                serde_json::json!({
+                    "type": "response.completed",
+                    "sequence_number": 5,
+                    "response": {
+                        "id": "response_1",
+                        "object": "response",
+                        "created_at": 1752000000,
+                        "status": "completed",
+                        "model": "gpt-5",
+                        "output": [
+                            {
+                                "type": "reasoning",
+                                "id": "reasoning_1",
+                                "status": "completed",
+                                "summary": [{
+                                    "type": "summary_text",
+                                    "text": "SAFE-SUMMARY-TERMINAL"
+                                }],
+                                "content": [{
+                                    "type": "reasoning_text",
+                                    "text": "RAW-THINKING-TERMINAL"
+                                }],
+                                "encrypted_content": "ENCRYPTED-CANARY"
+                            },
+                            {
+                                "type": "message",
+                                "id": "message_1",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [{"type": "output_text", "text": "answer"}]
+                            }
+                        ]
+                    }
+                }),
+            ]),
+            gate: 0,
+        }]);
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let provider = ModelProviderConfig::openai_responses_with_reasoning_progress(
+            &server.responses_endpoint(),
+            ProviderEndpointPolicy::AllowLoopbackHttp,
+            OpenAiReasoningProgress::RawText,
+            fixed_credential_source("sk-test"),
+            vec![
+                ModelProviderDescriptor::new(
+                    ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+                    NonZeroU64::new(1).unwrap(),
+                    "gpt-5",
+                    NonZeroU32::new(4_096).unwrap(),
+                    NonZeroU32::new(3).unwrap(),
+                )
+                .unwrap(),
+            ],
+        )
+        .expect("the explicit raw-reasoning provider installation validates");
+        let runtime = MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_model_provider(provider),
+            Handle::current(),
+        )
+        .await
+        .expect("the raw-reasoning loopback Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                true,
+            ))
+            .await
+            .expect("the raw-reasoning progress subscription opens");
+        assert!(matches!(events.recv().await, Some(EventFrame::Snapshot(_))));
+        let turn_id = started_turn(
+            &runtime
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Turn(TurnCommand::Submit {
+                        session_id,
+                        intent: PromptIntent::new(
+                            PromptBodyIntent::Text(TextIntent::new("reason in detail").unwrap()),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    }),
+                ))
+                .await
+                .expect("the raw-reasoning Turn starts"),
+        );
+
+        let mut reasoning_deltas = Vec::new();
+        let mut progress_item_ids = Vec::new();
+        let mut final_reasoning = None;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::Progress(event)) => {
+                        if let ProgressUpdate::ItemDelta {
+                            item_id,
+                            content_kind: ItemProgressContentKind::Reasoning,
+                            delta,
+                            ..
+                        } = event.update()
+                        {
+                            reasoning_deltas.push(delta.to_string());
+                            progress_item_ids.push(*item_id);
+                        }
+                    }
+                    Some(EventFrame::State(event)) => {
+                        if let Some(snapshot) = event.msg().session_snapshot() {
+                            for item in snapshot.active_items() {
+                                if let ItemContentView::Reasoning { body } = item.content() {
+                                    assert_eq!(item.turn_id(), turn_id);
+                                    final_reasoning = Some((item.item_id(), body.to_string()));
+                                }
+                            }
+                        }
+                        if event.msg().session_kind() == Some(SessionStateEventKind::TurnCompleted)
+                        {
+                            break;
+                        }
+                    }
+                    other => panic!("unexpected raw-reasoning progress frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("raw reasoning progress and terminal state arrive");
+
+        runtime.shutdown().await;
+        let requests = server.join();
+        assert_eq!(requests.len(), 1, "the Runtime path makes exactly one POST");
+        assert_eq!(
+            reasoning_deltas,
+            ["RAW-THINKING-DELTA"],
+            "RawText mode must publish raw reasoning only, never concatenate or publish the summary for the same reasoning item"
+        );
+        let progress_item_id = progress_item_ids
+            .first()
+            .copied()
+            .expect("raw reasoning progress has an ItemId");
+        assert!(
+            progress_item_ids
+                .iter()
+                .all(|item_id| *item_id == progress_item_id),
+            "all raw reasoning deltas reuse one stable ItemId"
+        );
+        let (final_item_id, final_body) =
+            final_reasoning.expect("the final safe reasoning Item is published");
+        assert_eq!(progress_item_id, final_item_id);
+        assert_eq!(final_body, "SAFE-SUMMARY-TERMINAL");
     }
 
     #[tokio::test(flavor = "current_thread")]

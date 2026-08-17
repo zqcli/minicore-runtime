@@ -25,6 +25,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0146](0146-production-write-file-binds-capability-targets-to-session-fifo.md) | Production `write_file`是closed、default-off、Workspace-bound mutation builtin：ReadWrite authority仍受requested access约束，existing/create target使用capability-opened physical identity，same-Session ticket按`call_index` FIFO，mutation permit由`ToolOperationSlot`持有through `Settling`，16,384-byte safe UTF-8 full replacement且不mkdir/append/atomic rename |
 | [0147](0147-production-fetch-url-pins-exact-https-origins-to-host-addresses.md) | Production `fetch_url`冻结为closed/default-off exact-origin HTTPS GET builtin：host安装DNS hostname与1..=8个fixed SocketAddr的交集authority，per-origin reject-all DNS client关闭redirect/retry/proxy/compression，2xx-only bounded safe UTF-8 text，30秒request timeout与owner-contained cancellation cleanup |
 | [0148](0148-v0-1-session-transcript-is-a-library-only-read-seam.md) | v0.1以library-only `MiniCoreRuntime::session_transcript`恢复loaded Session的基础User/Assistant selected history；首次capture由Session actor拥有，分页cursor绑定immutable capture，不修改Wire V1或Store V1，完整history Query生态后置 |
+| [0149](0149-openai-raw-reasoning-progress-requires-host-opt-in.md) | OpenAI raw reasoning progress是provider-installation级trusted-host显式opt-in；默认SummaryOnly，summary/raw单通道互斥，复用现有Reasoning Progress/ItemId且不修改Wire、storage或final Item正文 |
 
 ## Current With Later Refinements
 
@@ -46,7 +47,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0117](0117-async-synchronization-uses-single-owner-and-typed-permits.md) | ADR 0124、0125、0126、0127、0136、0137 |
 | [0118](0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md) | ADR 0124、0126、0127、0133 |
 | [0119](0119-model-calls-use-session-logical-retries.md) | ADR 0126、0139、0141 |
-| [0120](0120-failures-stay-with-owning-modules.md) | ADR 0126 |
+| [0120](0120-failures-stay-with-owning-modules.md) | ADR 0126、0149 |
 | [0121](0121-workspace-updates-require-idle.md) | ADR 0124、0126、0127、0140、0143、0144、0146 |
 | [0123](0123-identity-uses-refs-and-explicit-reload.md) | ADR 0124、0126、0127、0129、0132、0141 |
 | [0124](0124-session-replay-is-tolerant-and-links-are-minimal.md) | ADR 0126、0127、0131、0132、0134、0136、0137 |

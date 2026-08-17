@@ -147,7 +147,7 @@ rules：
 - Item read model的UserMessageSource/AssistantDisposition/ToolResultDisposition closed variants与live/storage projection一致；
 - User body只返回用户显式body；Skill/Workspace contribution返回safe origin，不返回注入正文、absolute path或authorization；
 - AgentMessage只返回user-visible finalized Text；opaque/hidden reasoning不混入；
-- Reasoning只返回provider允许display的summary，不返回encrypted/signature/hidden chain-of-thought；
+- final Reasoning Item只返回provider允许display的summary，不返回raw reasoning、encrypted或signature；OpenAI RawText opt-in只影响process-local provisional ProgressEvent，不改变final Item/Snapshot正文；
 - Tool arguments/result由Tool-owned redaction policy产生bounded summary，不返回prepared args、raw details、credential或sandbox internals；
 - public summary construction失败时使用typed redacted placeholder，不fallback raw payload；
 - string/count/aggregate limits和serde shape由[Wire Schema](wire-schema.md#protocollimits-v10)拥有；
@@ -177,7 +177,7 @@ pub(crate) enum StreamingItem {
 - live mutation后完成inline record attempt，再发布ItemCompleted StateEvent；
 - retry、Cancel或provider error丢弃provisional buffer。
 
-当前实现以一次logical AgentRun中的`content_index + AssistantText|Reasoning`作为最小绑定key：首个公开delta分配ItemId，后续delta与final `StoredAssistantContent`复用该ID；retry保留identity但发布`model_retry_scheduled`，host据此清理上一attempt的provisional正文。OpenAI reasoning summary可以作为Reasoning progress；没有summary delta但final response含真实safe summary时，在terminal前原样发布一次。raw reasoning/thinking、encrypted payload与signature永不进入Progress或public Item正文；final Snapshot中的Reasoning也只读取summary，否则使用固定redacted placeholder。
+当前实现以一次logical AgentRun中的`content_index + AssistantText|Reasoning`作为最小绑定key：首个公开delta分配ItemId，后续delta与final `StoredAssistantContent`复用该ID；retry保留identity但发布`model_retry_scheduled`，host据此清理上一attempt的provisional正文。OpenAI installation默认把reasoning summary作为Reasoning progress；trusted host显式选择RawText时改为只发布raw reasoning delta并抑制summary，同一item绝不拼接两个channel。raw delta与summary delta使用同一Reasoning identity，因此raw已发布时不会再触发terminal summary fallback；若没有选定raw delta而final response含真实safe summary，现有fallback仍可在terminal前原样发布一次。Anthropic thinking、encrypted payload、signature、refusal与function-call arguments永不进入Progress；final Snapshot中的Reasoning仍只读取summary，否则使用固定redacted placeholder。
 
 Host可能先看到streaming，随后进程crash且没有任何recorded final Item。
 

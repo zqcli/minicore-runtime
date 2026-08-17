@@ -46,6 +46,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::http_transport::client_builder;
+use crate::model_gateway::provider_installation::OpenAiReasoningProgress;
 use crate::model_gateway::provider_transport::{
     SseParser, cancelled, classify_send_error, invalid_provider_response, invalid_request_not_sent,
     is_event_stream, parse_retry_after, read_bounded_envelope, response_byte_limit,
@@ -84,6 +85,7 @@ pub(crate) enum OpenAiProviderConfigError {
 pub(crate) struct OpenAiResponsesProviderAdapter {
     client: reqwest::Client,
     endpoint: reqwest::Url,
+    reasoning_progress: OpenAiReasoningProgress,
 }
 
 impl OpenAiResponsesProviderAdapter {
@@ -108,7 +110,20 @@ impl OpenAiResponsesProviderAdapter {
         let client = client_builder()
             .build()
             .map_err(|_| OpenAiProviderConfigError::ClientBuild)?;
-        Ok(Self { client, endpoint })
+        Ok(Self {
+            client,
+            endpoint,
+            reasoning_progress: OpenAiReasoningProgress::SummaryOnly,
+        })
+    }
+
+    pub(crate) fn new_with_reasoning_progress(
+        endpoint: &str,
+        reasoning_progress: OpenAiReasoningProgress,
+    ) -> Result<Self, OpenAiProviderConfigError> {
+        let mut adapter = Self::new(endpoint)?;
+        adapter.reasoning_progress = reasoning_progress;
+        Ok(adapter)
     }
 }
 
@@ -119,6 +134,7 @@ impl fmt::Debug for OpenAiResponsesProviderAdapter {
         formatter
             .debug_struct("OpenAiResponsesProviderAdapter")
             .field("endpoint", &"<redacted>")
+            .field("reasoning_progress", &self.reasoning_progress)
             .finish()
     }
 }
@@ -206,10 +222,13 @@ impl OpenAiResponsesProviderAdapter {
 
         let mut delivery = ProviderRequestDeliveryState::AcceptedNoOutput;
         // Every non-empty streamed public delta's validated output index, correlated
-        // with the terminal output array when response.completed arrives. Raw reasoning
-        // text remains private and is never added to either collection.
+        // with the terminal output array when response.completed arrives. Exactly one
+        // reasoning channel is selected by the installation: summary or raw text.
         let mut streamed_text_indexes = Vec::new();
-        let mut streamed_reasoning_summary_indexes = Vec::new();
+        let mut reasoning_progress = StreamedReasoningProgress {
+            mode: self.reasoning_progress,
+            indexes: Vec::new(),
+        };
         let mut parser = SseParser::new(response_byte_limit());
         let expected_model = request.call().model.api_model_name();
         let mut stream = response.bytes_stream();
@@ -240,7 +259,7 @@ impl OpenAiResponsesProviderAdapter {
                             &request_id,
                             &mut delivery,
                             &mut streamed_text_indexes,
-                            &mut streamed_reasoning_summary_indexes,
+                            &mut reasoning_progress,
                             expected_model,
                         )? {
                             Dispatch::Continue => {}
@@ -589,22 +608,29 @@ enum Dispatch {
     Failure(ProviderAttemptError),
 }
 
+struct StreamedReasoningProgress {
+    mode: OpenAiReasoningProgress,
+    indexes: Vec<u32>,
+}
+
 /// Dispatches one completed SSE frame. Event identity comes from the JSON `type`
 /// field (OpenAI Responses events carry their type in the payload). Unknown valid
 /// event types are ignored; a malformed JSON event or a malformed required event
 /// field fails closed as `InvalidProviderResponse` with the current delivery.
 /// Non-empty text deltas record their validated output index in
 /// `streamed_text_indexes` so the terminal can verify the published `content_index`
-/// contract. The pinned private API model name of the request's definition is
-/// threaded through every terminal: a successful `response.completed` must echo it
-/// exactly.
+/// contract. Non-empty deltas of the installation-selected reasoning channel are
+/// recorded in the attempt-local reasoning progress state and checked against the
+/// corresponding terminal summary/raw artifact. The pinned private API model name
+/// of the request's definition is threaded through every terminal: a successful
+/// `response.completed` must echo it exactly.
 fn dispatch(
     data: &str,
     progress: &ModelProgressPublisher,
     request_id: &Option<ProviderRequestId>,
     delivery: &mut ProviderRequestDeliveryState,
     streamed_text_indexes: &mut Vec<u32>,
-    streamed_reasoning_summary_indexes: &mut Vec<u32>,
+    reasoning_progress: &mut StreamedReasoningProgress,
     expected_model: &ApiModelName,
 ) -> Result<Dispatch, ProviderAttemptError> {
     let value: Value =
@@ -641,21 +667,40 @@ fn dispatch(
             let content_index =
                 u32::try_from(output_index).map_err(|_| invalid_provider_response(*delivery))?;
             if !delta.is_empty() {
-                streamed_reasoning_summary_indexes.push(content_index);
                 mark_semantic(delivery);
-                progress.publish(ModelProgressEvent::ContentDelta {
-                    content_index,
-                    delta: ModelContentDelta::ReasoningSummary(Arc::from(delta)),
-                });
+                if reasoning_progress.mode == OpenAiReasoningProgress::SummaryOnly {
+                    reasoning_progress.indexes.push(content_index);
+                    progress.publish(ModelProgressEvent::ContentDelta {
+                        content_index,
+                        delta: ModelContentDelta::ReasoningSummary(Arc::from(delta)),
+                    });
+                }
             }
             Ok(Dispatch::Continue)
         }
-        // Semantic deltas that are intentionally not public: validate their required
-        // fields and delivery truth, but never publish raw chain-of-thought, refusal text,
-        // or function-call argument fragments.
-        "response.reasoning_text.delta"
-        | "response.refusal.delta"
-        | "response.function_call_arguments.delta" => {
+        "response.reasoning_text.delta" => {
+            let output_index = required_u64(&value, "output_index")
+                .map_err(|_| invalid_provider_response(*delivery))?;
+            let delta =
+                required_str(&value, "delta").map_err(|_| invalid_provider_response(*delivery))?;
+            let content_index =
+                u32::try_from(output_index).map_err(|_| invalid_provider_response(*delivery))?;
+            if !delta.is_empty() {
+                mark_semantic(delivery);
+                if reasoning_progress.mode == OpenAiReasoningProgress::RawText {
+                    reasoning_progress.indexes.push(content_index);
+                    progress.publish(ModelProgressEvent::ContentDelta {
+                        content_index,
+                        delta: ModelContentDelta::ReasoningText(Arc::from(delta)),
+                    });
+                }
+            }
+            Ok(Dispatch::Continue)
+        }
+        // Semantic deltas that are intentionally never public: validate their
+        // required fields and delivery truth, but suppress refusal text and
+        // function-call argument fragments under every installation policy.
+        "response.refusal.delta" | "response.function_call_arguments.delta" => {
             let _ = required_u64(&value, "output_index")
                 .map_err(|_| invalid_provider_response(*delivery))?;
             let delta =
@@ -762,7 +807,8 @@ fn dispatch(
                 request_id,
                 *delivery,
                 streamed_text_indexes,
-                streamed_reasoning_summary_indexes,
+                &reasoning_progress.indexes,
+                reasoning_progress.mode,
             )?;
             Ok(Dispatch::Success(Box::new(result)))
         }
@@ -863,17 +909,20 @@ fn classify_response_failed(
 ///
 /// The progress `content_index` contract is verified here: every non-empty streamed
 /// text `output_index` must name a terminal message item with non-empty `output_text`
-/// whose block lands at exactly that normalized content index. Because empty
-/// message/reasoning items normalize to zero blocks, such empty items are accepted
-/// only as a trailing suffix (e.g. the M12 trailing empty reasoning echo); an empty
-/// item before any representable item would silently diverge provider `output_index`
-/// from `content[]` and fails closed.
+/// whose block lands at exactly that normalized content index. Every selected
+/// reasoning index must likewise name a reasoning item with a non-empty summary in
+/// SummaryOnly mode or non-empty `reasoning_text` content in RawText mode. Because
+/// empty message/reasoning items normalize to zero blocks, such empty items are
+/// accepted only as a trailing suffix (e.g. the M12 trailing empty reasoning echo);
+/// an empty item before any representable item would silently diverge provider
+/// `output_index` from `content[]` and fails closed.
 fn normalize_terminal(
     response: &Map<String, Value>,
     request_id: &Option<ProviderRequestId>,
     delivery: ProviderRequestDeliveryState,
     streamed_text_indexes: &[u32],
-    streamed_reasoning_summary_indexes: &[u32],
+    streamed_reasoning_indexes: &[u32],
+    reasoning_progress: OpenAiReasoningProgress,
 ) -> Result<ProviderAttemptResult, ProviderAttemptError> {
     let response_id: ProviderResponseId = response
         .get("id")
@@ -889,7 +938,7 @@ fn normalize_terminal(
     // Terminal output positions of message items with non-empty output_text, paired
     // with the normalized content index of their (single) text block.
     let mut text_block_content_indexes: Vec<(usize, usize)> = Vec::new();
-    let mut reasoning_summary_content_indexes: Vec<(usize, usize)> = Vec::new();
+    let mut reasoning_content_indexes: Vec<(usize, usize)> = Vec::new();
     let mut has_refusal = false;
     let mut has_non_refusal_visible = false;
     let mut has_tool_call = false;
@@ -925,8 +974,10 @@ fn normalize_terminal(
             }
             if item_type == "message" && message_has_non_empty_output_text(item) {
                 text_block_content_indexes.push((position, blocks_before));
-            } else if item_type == "reasoning" && reasoning_has_non_empty_summary(item) {
-                reasoning_summary_content_indexes.push((position, blocks_before));
+            } else if item_type == "reasoning"
+                && reasoning_has_selected_progress_artifact(item, reasoning_progress)
+            {
+                reasoning_content_indexes.push((position, blocks_before));
             }
         } else {
             empty_tail_started = true;
@@ -944,9 +995,9 @@ fn normalize_terminal(
             return Err(invalid_provider_response(delivery));
         }
     }
-    for &streamed in streamed_reasoning_summary_indexes {
+    for &streamed in streamed_reasoning_indexes {
         let streamed = usize::try_from(streamed).expect("u32 always fits usize");
-        if !reasoning_summary_content_indexes
+        if !reasoning_content_indexes
             .iter()
             .any(|&(position, content_index)| position == streamed && content_index == streamed)
         {
@@ -1087,6 +1138,30 @@ fn reasoning_has_non_empty_summary(item: &Value) -> bool {
                         .is_some_and(|text| !text.is_empty())
             })
         })
+}
+
+fn reasoning_has_non_empty_text(item: &Value) -> bool {
+    item.get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.get("type").and_then(Value::as_str) == Some("reasoning_text")
+                    && entry
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+            })
+        })
+}
+
+fn reasoning_has_selected_progress_artifact(
+    item: &Value,
+    reasoning_progress: OpenAiReasoningProgress,
+) -> bool {
+    match reasoning_progress {
+        OpenAiReasoningProgress::SummaryOnly => reasoning_has_non_empty_summary(item),
+        OpenAiReasoningProgress::RawText => reasoning_has_non_empty_text(item),
+    }
 }
 
 fn normalize_reasoning_item(
@@ -2169,6 +2244,9 @@ mod tests {
                 json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1",
                        "output_index": 1, "summary_index": 0, "sequence_number": 1,
                        "delta": "Let me think"}),
+                json!({"type": "response.reasoning_text.delta", "item_id": "rs_1",
+                       "output_index": 1, "content_index": 0, "sequence_number": 2,
+                       "delta": "RAW-REASONING-CANARY"}),
                 output_text_delta(0, "The weather"),
                 output_text_delta(0, " in Paris is 22°C."),
                 json!({"type": "response.output_item.done", "item_id": "msg_456", "output_index": 0,
@@ -2270,7 +2348,8 @@ mod tests {
         );
 
         // --- Progress: public reasoning summary plus assistant text, in provider order.
-        // Raw reasoning_text remains private even though it is present in the terminal. ---
+        // Raw reasoning_text remains private even when an actual streamed delta and the
+        // terminal artifact both carry it. ---
         assert_eq!(
             drain(&mut progress_rx),
             [
@@ -3659,6 +3738,67 @@ mod tests {
             error.delivery(),
             ProviderRequestDeliveryState::OutputStarted,
             "the failing terminal keeps the already-advanced delivery truth"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loopback_raw_reasoning_delta_requires_terminal_reasoning_text() {
+        // RawText mode publishes a reasoning_text delta at output/content index 0.
+        // A terminal reasoning block at that index with only a summary is not a
+        // matching raw artifact, even though the block itself is representable.
+        let server = LoopbackServer::spawn(vec![ScriptedResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: vec![],
+            body: sse(&[
+                json!({"type": "response.reasoning_text.delta", "item_id": "rs_0",
+                       "output_index": 0, "content_index": 0, "sequence_number": 1,
+                       "delta": "raw thought"}),
+                json!({"type": "response.completed", "sequence_number": 2,
+                "response": {
+                    "id": "resp_raw_missing", "object": "response",
+                    "created_at": 1752000000, "status": "completed", "model": "gpt-5",
+                    "output": [
+                        {"type": "reasoning", "id": "rs_0", "status": "completed",
+                         "summary": [{"type": "summary_text", "text": "safe summary"}]},
+                        {"type": "message", "id": "msg_1", "role": "assistant",
+                         "status": "completed",
+                         "content": [{"type": "output_text", "text": "answer"}]},
+                    ],
+                }}),
+            ]),
+            gate: 0,
+        }]);
+        let adapter = Arc::new(
+            OpenAiResponsesProviderAdapter::new_with_reasoning_progress(
+                &server.responses_endpoint(),
+                OpenAiReasoningProgress::RawText,
+            )
+            .unwrap(),
+        );
+        let provider: Arc<dyn ProviderAdapter> = adapter;
+        let (gateway, model) = gateway_and_model(text_definition(1, 4_096, provider)).await;
+        let request = request_for_model(model).await;
+
+        let error = gateway
+            .generate_model_turn(
+                request,
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        let requests = server.join();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            error.reason(),
+            ModelCallErrorReason::InvalidProviderResponse,
+            "a streamed raw reasoning index requires non-empty terminal reasoning_text"
+        );
+        assert_eq!(
+            error.delivery(),
+            ProviderRequestDeliveryState::OutputStarted
         );
     }
 
