@@ -1521,6 +1521,11 @@ impl ModelProgressPublisher {
     fn publish(&self, event: ModelProgressEvent) {
         (self.publish)(event);
     }
+
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, event: ModelProgressEvent) {
+        self.publish(event);
+    }
 }
 
 impl fmt::Debug for ModelProgressPublisher {
@@ -1782,6 +1787,24 @@ pub(crate) struct ScriptedModelFixture {
 }
 
 #[cfg(test)]
+#[derive(Default)]
+pub(crate) struct LateModelProgressProbe {
+    publisher: std::sync::Mutex<Option<ModelProgressPublisher>>,
+}
+
+#[cfg(test)]
+impl LateModelProgressProbe {
+    pub(crate) fn publish_text(&self, content_index: u32, delta: &str) {
+        if let Some(publisher) = self.publisher.lock().unwrap().as_ref() {
+            publisher.publish(ModelProgressEvent::ContentDelta {
+                content_index,
+                delta: ModelContentDelta::Text(Arc::from(delta)),
+            });
+        }
+    }
+}
+
+#[cfg(test)]
 impl ScriptedModelFixture {
     pub(crate) fn new(responses: Vec<&str>) -> Self {
         Self::with_context_window_tokens(responses, 128_000)
@@ -1807,6 +1830,27 @@ impl ScriptedModelFixture {
             )],
             128_000,
         )
+    }
+
+    pub(crate) fn with_yielding_text_deltas_progress(deltas: &[&str], response: &str) -> Self {
+        let mut script = ScriptedProviderScript::success(
+            deltas
+                .iter()
+                .map(|delta| ModelProgressEvent::ContentDelta {
+                    content_index: 0,
+                    delta: ModelContentDelta::Text(Arc::from(*delta)),
+                })
+                .collect(),
+            ProviderAttemptResult {
+                response_id: None,
+                content: Arc::from([ProviderAttemptContent::Text(Arc::from(response))]),
+                finish_reason: ModelFinishReason::Stop,
+                usage: None,
+                metadata: ProviderResponseMetadata::new(None, None, None),
+            },
+        );
+        script.yield_after_each_progress = true;
+        Self::from_scripts(vec![script], 128_000)
     }
 
     pub(crate) fn with_reasoning_summary_progress(
@@ -1919,6 +1963,7 @@ impl ScriptedModelFixture {
                     delta: ModelContentDelta::Text(Arc::from(delta)),
                 }],
                 terminal: ScriptedProviderTerminal::WaitForCancellation,
+                yield_after_each_progress: false,
             },
             ScriptedProviderScript::success(
                 Vec::new(),
@@ -1932,6 +1977,112 @@ impl ScriptedModelFixture {
             ),
         ];
         Self::from_scripts(scripts, 128_000)
+    }
+
+    pub(crate) fn with_progress_flood_then_cancellation(
+        delta_count: usize,
+    ) -> (Self, Arc<tokio::sync::Notify>) {
+        let flooded = Arc::new(tokio::sync::Notify::new());
+        let progress = (0..delta_count)
+            .map(|_| ModelProgressEvent::ContentDelta {
+                content_index: 0,
+                delta: ModelContentDelta::Text(Arc::from("x")),
+            })
+            .collect();
+        let model = Self::from_scripts(
+            vec![ScriptedProviderScript {
+                progress,
+                terminal: ScriptedProviderTerminal::WaitForCancellationAfterProgress(Arc::clone(
+                    &flooded,
+                )),
+                yield_after_each_progress: false,
+            }],
+            128_000,
+        );
+        (model, flooded)
+    }
+
+    pub(crate) fn with_retained_first_wake_and_paused_second_progress(
+        first_delta: &str,
+        first_text: &str,
+        second_delta: &str,
+        second_text: &str,
+    ) -> (Self, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let second_progressed = Arc::new(tokio::sync::Notify::new());
+        let release_second = Arc::new(tokio::sync::Notify::new());
+        let scripts = vec![
+            ScriptedProviderScript::success(
+                vec![ModelProgressEvent::ContentDelta {
+                    content_index: 0,
+                    delta: ModelContentDelta::Text(Arc::from(first_delta)),
+                }],
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::Text(Arc::from(first_text))]),
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+            ScriptedProviderScript {
+                progress: vec![ModelProgressEvent::ContentDelta {
+                    content_index: 0,
+                    delta: ModelContentDelta::Text(Arc::from(second_delta)),
+                }],
+                terminal: ScriptedProviderTerminal::WaitAfterProgress {
+                    result: ProviderAttemptResult {
+                        response_id: None,
+                        content: Arc::from([ProviderAttemptContent::Text(Arc::from(second_text))]),
+                        finish_reason: ModelFinishReason::Stop,
+                        usage: None,
+                        metadata: ProviderResponseMetadata::new(None, None, None),
+                    },
+                    progressed: Arc::clone(&second_progressed),
+                    release: Arc::clone(&release_second),
+                },
+                yield_after_each_progress: false,
+            },
+        ];
+        (
+            Self::from_scripts(scripts, 128_000),
+            second_progressed,
+            release_second,
+        )
+    }
+
+    pub(crate) fn with_late_progress_after_success(
+        first_text: &str,
+        second_text: &str,
+    ) -> (Self, Arc<LateModelProgressProbe>) {
+        let late = Arc::new(LateModelProgressProbe::default());
+        let first = ProviderAttemptResult {
+            response_id: None,
+            content: Arc::from([ProviderAttemptContent::Text(Arc::from(first_text))]),
+            finish_reason: ModelFinishReason::Stop,
+            usage: None,
+            metadata: ProviderResponseMetadata::new(None, None, None),
+        };
+        let scripts = vec![
+            ScriptedProviderScript {
+                progress: Vec::new(),
+                terminal: ScriptedProviderTerminal::SuccessAndRetainProgress(
+                    first,
+                    Arc::clone(&late),
+                ),
+                yield_after_each_progress: false,
+            },
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::Text(Arc::from(second_text))]),
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+        ];
+        (Self::from_scripts(scripts, 128_000), late)
     }
 
     pub(crate) fn with_progress_then_failure_and_follow_up(
@@ -2240,6 +2391,9 @@ impl ProviderAdapter for ScriptedProviderAdapter {
                     return Err(ProviderAttemptError::new(ModelCallErrorReason::Cancelled));
                 }
                 progress.publish(event);
+                if script.yield_after_each_progress {
+                    tokio::task::yield_now().await;
+                }
             }
             match script.terminal {
                 ScriptedProviderTerminal::Success(result) if !cancel.is_cancelled() => Ok(result),
@@ -2248,11 +2402,37 @@ impl ProviderAdapter for ScriptedProviderAdapter {
                     cancel.cancel();
                     Ok(result)
                 }
+                ScriptedProviderTerminal::SuccessAndRetainProgress(result, late)
+                    if !cancel.is_cancelled() =>
+                {
+                    *late.publisher.lock().unwrap() = Some(progress);
+                    Ok(result)
+                }
                 ScriptedProviderTerminal::WaitForCancellation => {
                     cancel.cancelled().await;
                     Err(ProviderAttemptError::new(ModelCallErrorReason::Cancelled))
                 }
-                ScriptedProviderTerminal::Success(_) | ScriptedProviderTerminal::Failure(_) => {
+                ScriptedProviderTerminal::WaitForCancellationAfterProgress(flooded) => {
+                    flooded.notify_one();
+                    cancel.cancelled().await;
+                    Err(ProviderAttemptError::new(ModelCallErrorReason::Cancelled))
+                }
+                ScriptedProviderTerminal::WaitAfterProgress {
+                    result,
+                    progressed,
+                    release,
+                } => {
+                    progressed.notify_one();
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            Err(ProviderAttemptError::new(ModelCallErrorReason::Cancelled))
+                        }
+                        _ = release.notified() => Ok(result),
+                    }
+                }
+                ScriptedProviderTerminal::Success(_)
+                | ScriptedProviderTerminal::Failure(_)
+                | ScriptedProviderTerminal::SuccessAndRetainProgress(_, _) => {
                     Err(ProviderAttemptError::new(ModelCallErrorReason::Cancelled))
                 }
             }
@@ -2264,6 +2444,7 @@ impl ProviderAdapter for ScriptedProviderAdapter {
 struct ScriptedProviderScript {
     progress: Vec<ModelProgressEvent>,
     terminal: ScriptedProviderTerminal,
+    yield_after_each_progress: bool,
 }
 
 #[cfg(test)]
@@ -2272,6 +2453,7 @@ impl ScriptedProviderScript {
         Self {
             progress,
             terminal: ScriptedProviderTerminal::Success(result),
+            yield_after_each_progress: false,
         }
     }
 
@@ -2279,6 +2461,7 @@ impl ScriptedProviderScript {
         Self {
             progress: Vec::new(),
             terminal: ScriptedProviderTerminal::WaitForCancellation,
+            yield_after_each_progress: false,
         }
     }
 
@@ -2286,6 +2469,7 @@ impl ScriptedProviderScript {
         Self {
             progress: Vec::new(),
             terminal: ScriptedProviderTerminal::SuccessThenCancel(result),
+            yield_after_each_progress: false,
         }
     }
 
@@ -2293,6 +2477,7 @@ impl ScriptedProviderScript {
         Self {
             progress: Vec::new(),
             terminal: ScriptedProviderTerminal::Failure(error),
+            yield_after_each_progress: false,
         }
     }
 
@@ -2303,6 +2488,7 @@ impl ScriptedProviderScript {
         Self {
             progress,
             terminal: ScriptedProviderTerminal::Failure(error),
+            yield_after_each_progress: false,
         }
     }
 }
@@ -2313,6 +2499,13 @@ enum ScriptedProviderTerminal {
     Failure(ProviderAttemptError),
     SuccessThenCancel(ProviderAttemptResult),
     WaitForCancellation,
+    WaitForCancellationAfterProgress(Arc<tokio::sync::Notify>),
+    WaitAfterProgress {
+        result: ProviderAttemptResult,
+        progressed: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    },
+    SuccessAndRetainProgress(ProviderAttemptResult, Arc<LateModelProgressProbe>),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

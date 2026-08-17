@@ -102,16 +102,29 @@ pub(crate) enum EmergencyControlSignalOutcome {
         epoch: u64,
         signal: EmergencyControlSignal,
     },
+    TerminalReserved {
+        epoch: u64,
+    },
     StaleTarget,
 }
 
 impl EmergencyControlSignalOutcome {
     pub(crate) const fn epoch(self) -> Option<u64> {
         match self {
-            Self::Accepted { epoch } | Self::AlreadySignaled { epoch, .. } => Some(epoch),
+            Self::Accepted { epoch }
+            | Self::AlreadySignaled { epoch, .. }
+            | Self::TerminalReserved { epoch } => Some(epoch),
             Self::StaleTarget => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TurnTerminalClaimOutcome {
+    Accepted,
+    AlreadyReserved,
+    ControlWon { signal: EmergencyControlSignal },
+    StaleTarget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,6 +142,7 @@ struct EmergencyControlState {
     target: Option<EmergencyControlTarget>,
     epoch: u64,
     signal: Option<EmergencyControlSignal>,
+    terminal_reserved: bool,
     cancellation: CancellationToken,
 }
 
@@ -138,9 +152,11 @@ struct EmergencyControlState {
 /// binds/observes carries a clone of that exact owner, and every method that consumes or
 /// validates an observation requires `Arc::ptr_eq` with this handle's owner in normal
 /// release code — a foreign handle bound to the same target at the same epoch is rejected,
-/// never `debug_assert`-only.  Binding a new target retires any prior signal.  A signal is
-/// first-wins for the bound target; stale targets cannot affect the current target or its
-/// cancellation wakeup.
+/// never `debug_assert`-only. Binding a new target retires any prior signal. For an exact Turn,
+/// signal and terminal reservation share this same mutex as a private commit gate: either
+/// control wins and cancels the basis, or terminal wins and every later signal reports
+/// `TerminalReserved`. Stale targets cannot affect the current target or its cancellation
+/// wakeup.
 #[derive(Clone)]
 pub(crate) struct EmergencyControlHandle {
     owner: Arc<EmergencyControlOwner>,
@@ -161,6 +177,7 @@ impl EmergencyControlHandle {
                 target: None,
                 epoch: 0,
                 signal: None,
+                terminal_reserved: false,
                 cancellation: CancellationToken::new(),
             })),
         }
@@ -206,6 +223,7 @@ impl EmergencyControlHandle {
         state.cancellation.cancel();
         state.target = Some(target);
         state.signal = None;
+        state.terminal_reserved = false;
         state.cancellation = CancellationToken::new();
         Ok(EmergencyControlObservation {
             owner: Arc::clone(&self.owner),
@@ -232,9 +250,10 @@ impl EmergencyControlHandle {
     }
 
     /// The locked first-wins signal application shared by `signal` and `signal_current`: a
-    /// stale target reports `StaleTarget`, an already-won signal keeps its exact epoch and
-    /// signal (`AlreadySignaled` never overwrites it), and a fresh signal is set with the
-    /// emergency cancellation token cancelled and reports `Accepted`.  The caller holds the
+    /// stale target reports `StaleTarget`, an already-won terminal reports
+    /// `TerminalReserved`, an already-won signal keeps its exact epoch and signal
+    /// (`AlreadySignaled` never overwrites it), and a fresh signal is set with the emergency
+    /// cancellation token cancelled and reports `Accepted`. The caller holds the
     /// owner mutex; the section runs no callback, no await, and locks no nested guard, so a
     /// caller that must hand the signal off synchronously can never be stalled by this
     /// application.
@@ -246,6 +265,9 @@ impl EmergencyControlHandle {
         if state.target != Some(target) {
             return EmergencyControlSignalOutcome::StaleTarget;
         }
+        if state.terminal_reserved {
+            return EmergencyControlSignalOutcome::TerminalReserved { epoch: state.epoch };
+        }
         if let Some(existing) = state.signal {
             return EmergencyControlSignalOutcome::AlreadySignaled {
                 epoch: state.epoch,
@@ -255,6 +277,37 @@ impl EmergencyControlHandle {
         state.signal = Some(signal);
         state.cancellation.cancel();
         EmergencyControlSignalOutcome::Accepted { epoch: state.epoch }
+    }
+
+    /// Atomically reserves terminal settlement for one exact active Turn.  This is the
+    /// private terminal/control commit gate: final Assistant live commit and actor-owned
+    /// failure/terminal completion call this method, while every Cancel/Security/Unload
+    /// producer calls `signal`/`signal_current` under the same mutex.  Exactly one side can
+    /// transition an open Turn basis; no callback, await, or nested lock runs here.
+    pub(crate) fn claim_turn_terminal(
+        &self,
+        observation: &EmergencyControlObservation,
+    ) -> TurnTerminalClaimOutcome {
+        if !self.owner_is(observation)
+            || !matches!(observation.target, EmergencyControlTarget::Turn(_))
+        {
+            return TurnTerminalClaimOutcome::StaleTarget;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .expect("emergency control state is not poisoned");
+        if state.target != Some(observation.target) || state.epoch != observation.epoch {
+            return TurnTerminalClaimOutcome::StaleTarget;
+        }
+        if let Some(signal) = state.signal {
+            return TurnTerminalClaimOutcome::ControlWon { signal };
+        }
+        if state.terminal_reserved {
+            return TurnTerminalClaimOutcome::AlreadyReserved;
+        }
+        state.terminal_reserved = true;
+        TurnTerminalClaimOutcome::Accepted
     }
 
     pub(crate) fn signal(
@@ -271,9 +324,10 @@ impl EmergencyControlHandle {
 
     /// The synchronous close handoff: signals the current bound target (if any) with the
     /// exact same fixed nonblocking first-wins semantics as `signal`, under the same owner
-    /// mutex.  `None` means no target is bound; an already-won signal returns its exact
-    /// `AlreadySignaled` epoch and signal (never overwritten); a fresh signal is set and the
-    /// emergency cancellation token cancelled, returning `Accepted`.  No callback, no await,
+    /// mutex. `None` means no target is bound; an already-won terminal returns
+    /// `TerminalReserved`; an already-won signal returns its exact `AlreadySignaled` epoch and
+    /// signal (never overwritten); a fresh signal is set and the emergency cancellation token
+    /// cancelled, returning `Accepted`. No callback, no await,
     /// no nested lock: a Session unload caller makes the sticky unload signal observable on
     /// any active Submit/Turn basis before it wakes the actor or workers, without any
     /// scheduling or poll guess.
@@ -323,6 +377,7 @@ impl EmergencyControlHandle {
         state.cancellation.cancel();
         state.target = None;
         state.signal = None;
+        state.terminal_reserved = false;
         state.cancellation = CancellationToken::new();
         Some(signal)
     }
@@ -344,6 +399,7 @@ impl EmergencyControlHandle {
         state.cancellation.cancel();
         state.target = None;
         state.signal = None;
+        state.terminal_reserved = false;
         state.cancellation = CancellationToken::new();
         true
     }
@@ -395,6 +451,7 @@ impl EmergencyControlHandle {
         state.cancellation.cancel();
         state.target = Some(new_target);
         state.epoch = epoch;
+        state.terminal_reserved = false;
         let cancellation = CancellationToken::new();
         if signal.is_some() {
             cancellation.cancel();

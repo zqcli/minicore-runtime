@@ -71,7 +71,7 @@ use crate::session_ingress::{
     EmergencyControlHandle, EmergencyControlMigrationError, EmergencyControlObservation,
     EmergencyControlSignal, EmergencyControlSignalOutcome, EmergencyControlTarget, FollowUpQueue,
     FollowUpQueueError, InteractionPresentationPermit, InteractionResolutionPermit, QueuedSteer,
-    SteerQueue, SteerQueueError, UserQuestionBindingPermit,
+    SteerQueue, SteerQueueError, TurnTerminalClaimOutcome, UserQuestionBindingPermit,
 };
 use crate::session_transcript::SessionTranscriptCapture;
 #[cfg(test)]
@@ -104,6 +104,13 @@ use crate::workspace::{
 const SESSION_EXECUTOR_REQUEST_QUEUE_CAPACITY: usize = 8;
 const SESSION_EVENT_CAPACITY: usize = 32;
 const SESSION_OBSERVATION_EVENT_CAPACITY: usize = 256;
+const MODEL_PROGRESS_WAKE_CHANNEL_CAPACITY: usize = 1;
+const RELIABLE_PROGRESS_CHANNEL_CAPACITY: usize = 1;
+const MODEL_PROGRESS_PENDING_EVENT_CAPACITY: usize = 8;
+const MODEL_PROGRESS_PENDING_TEXT_CAPACITY: usize = 65_536;
+const MODEL_PROGRESS_DELTA_CHUNK_BYTES: usize = 32_000;
+const MODEL_PROGRESS_KEY_CAPACITY: usize =
+    ProtocolLimits::v1_0().observation.max_active_items as usize;
 const AGENT_RUN_MAX_LOGICAL_RETRIES: usize = 3;
 const AGENT_RUN_RETRY_BACKOFFS: [std::time::Duration; AGENT_RUN_MAX_LOGICAL_RETRIES] = [
     std::time::Duration::from_secs(2),
@@ -301,7 +308,10 @@ pub(crate) struct SessionExecutorSubscription {
 
 enum SessionExecutorSubscriptionReceiver {
     State(broadcast::Receiver<Arc<SessionExecutorEvent>>),
-    Observations(broadcast::Receiver<Arc<SessionExecutorObservationEvent>>),
+    Observations {
+        receiver: broadcast::Receiver<Arc<SessionExecutorObservationEvent>>,
+        demand: Option<ProgressDemandLease>,
+    },
 }
 
 impl SessionExecutorSubscription {
@@ -315,15 +325,28 @@ impl SessionExecutorSubscription {
                 SessionExecutorSubscriptionReceiver::State(receiver) => {
                     return receiver.recv().await.ok();
                 }
-                SessionExecutorSubscriptionReceiver::Observations(receiver) => {
-                    match receiver.recv().await.ok()?.as_ref() {
-                        SessionExecutorObservationEvent::State(event) => {
-                            return Some(Arc::clone(event));
+                SessionExecutorSubscriptionReceiver::Observations { receiver, demand } => {
+                    match receiver.recv().await {
+                        Ok(event) => match event.as_ref() {
+                            SessionExecutorObservationEvent::State(event) => {
+                                return Some(Arc::clone(event));
+                            }
+                            SessionExecutorObservationEvent::Progress(_) => continue,
+                        },
+                        Err(_) => {
+                            demand.take();
+                            return None;
                         }
-                        SessionExecutorObservationEvent::Progress(_) => continue,
                     }
                 }
             }
+        }
+    }
+
+    pub(crate) fn release_progress_demand(&mut self) {
+        if let SessionExecutorSubscriptionReceiver::Observations { demand, .. } = &mut self.receiver
+        {
+            demand.take();
         }
     }
 
@@ -336,18 +359,22 @@ impl SessionExecutorSubscription {
                 .await
                 .map(SessionExecutorSubscriptionEvent::State)
                 .map_err(map_subscription_receive_error),
-            SessionExecutorSubscriptionReceiver::Observations(receiver) => receiver
-                .recv()
-                .await
-                .map(|event| match event.as_ref() {
-                    SessionExecutorObservationEvent::State(event) => {
-                        SessionExecutorSubscriptionEvent::State(Arc::clone(event))
+            SessionExecutorSubscriptionReceiver::Observations { receiver, demand } => {
+                match receiver.recv().await {
+                    Ok(event) => Ok(match event.as_ref() {
+                        SessionExecutorObservationEvent::State(event) => {
+                            SessionExecutorSubscriptionEvent::State(Arc::clone(event))
+                        }
+                        SessionExecutorObservationEvent::Progress(event) => {
+                            SessionExecutorSubscriptionEvent::Progress(event.clone())
+                        }
+                    }),
+                    Err(error) => {
+                        demand.take();
+                        Err(map_subscription_receive_error(error))
                     }
-                    SessionExecutorObservationEvent::Progress(event) => {
-                        SessionExecutorSubscriptionEvent::Progress(event.clone())
-                    }
-                })
-                .map_err(map_subscription_receive_error),
+                }
+            }
         }
     }
 }
@@ -1857,6 +1884,8 @@ pub(crate) struct SessionExecutor {
     observations: broadcast::Sender<Arc<SessionExecutorObservationEvent>>,
     emergency: EmergencyControlHandle,
     #[cfg(test)]
+    progress_demand: Arc<ProgressDemand>,
+    #[cfg(test)]
     hooks: Arc<SessionExecutorTestHooksInner>,
 }
 
@@ -2095,8 +2124,13 @@ impl SessionExecutor {
         let (sender, receiver) = mpsc::channel(SESSION_EXECUTOR_REQUEST_QUEUE_CAPACITY);
         let (emergency_sender, emergency_receiver) = mpsc::unbounded_channel();
         let (completion_sender, completion_receiver) = mpsc::unbounded_channel();
+        let (model_progress_wake_sender, model_progress_wake_receiver) =
+            mpsc::channel(MODEL_PROGRESS_WAKE_CHANNEL_CAPACITY);
+        let (reliable_progress_sender, reliable_progress_receiver) =
+            mpsc::channel(RELIABLE_PROGRESS_CHANNEL_CAPACITY);
         let (events, _) = broadcast::channel(SESSION_EVENT_CAPACITY);
         let (observations, _) = broadcast::channel(SESSION_OBSERVATION_EVENT_CAPACITY);
+        let progress_demand = Arc::new(ProgressDemand::default());
         let closing = CancellationToken::new();
         let turn_admission_gate = Arc::new(TurnAdmissionGate::new());
         let emergency = EmergencyControlHandle::new();
@@ -2108,6 +2142,11 @@ impl SessionExecutor {
             emergency_receiver,
             completions: completion_receiver,
             completion_sender,
+            model_progress_wakes: model_progress_wake_receiver,
+            model_progress_wake_sender,
+            reliable_progress: reliable_progress_receiver,
+            reliable_progress_sender,
+            progress_demand: Arc::clone(&progress_demand),
             closing: closing.clone(),
             lifecycle_closing,
             task_context: task_context.clone(),
@@ -2182,6 +2221,8 @@ impl SessionExecutor {
             observations,
             emergency,
             #[cfg(test)]
+            progress_demand,
+            #[cfg(test)]
             hooks,
         })
     }
@@ -2189,25 +2230,21 @@ impl SessionExecutor {
     /// Requests the actor to reject future requests.  An admitted publication may abandon
     /// cancellable candidate capture, but work that has reached durable publication still drains.
     ///
-    /// The synchronous close signal handoff happens here, in this fixed order: the admission
-    /// gate is closed first, then the current exact emergency basis — an active Submit
-    /// admission or an active Turn — is signaled `PrepareForUnload` first-wins under the
-    /// emergency owner mutex (`signal_current`, no callback/await/nested lock), and only then
-    /// is the closing token cancelled.  Every owner that observes the basis — an
-    /// already-reserved interaction presentation or answer binding, a not-yet-reserved start
-    /// gate, an active worker — therefore settles the truthful unload reason (or keeps an
-    /// earlier Cancel/SecurityRevoked first-wins signal and reason) before the closing token
-    /// ever wakes the actor or workers, so no active Submit/Turn exact basis can advance to
-    /// the next Model after a close request.  The signal is sticky: `close_and_drain` later
-    /// re-attempts the exact Turn signal and on this path normally records
-    /// `AlreadySignaled { signal: PrepareForUnload }`; an earlier Cancel/SecurityRevoked
-    /// remains exact.
+    /// The synchronous close handoff happens here, in this fixed order: the admission gate is
+    /// closed first, then `signal_current(PrepareForUnload)` competes under the exact emergency
+    /// owner mutex with any active Turn terminal reservation, and only then is the closing token
+    /// cancelled.  An open Submit/Turn basis records the sticky unload signal (or keeps an
+    /// earlier Cancel/SecurityRevoked); a Turn whose final/terminal reservation already won
+    /// returns `TerminalReserved`, receives no unload signal, and must drain to its committed
+    /// Completed/Failed terminal without a fabricated Finishing/Interrupted relabel.  Thus every
+    /// interaction/start owner observes the truthful winning control while a committed final is
+    /// never revoked after its live mutation boundary.
     pub(crate) fn request_closing(&self) {
         self.turn_admission_gate.close();
-        // The synchronous unload handoff: any active Submit/Turn exact basis carries the
-        // sticky PrepareForUnload before closing wakes the actor/workers.  `None` means no
-        // basis is bound (an already-Idle executor); the outcome is deliberately not read
-        // here — the drain re-attempts and records the exact outcome for close tests.
+        // The synchronous unload handoff: an open active basis carries sticky
+        // PrepareForUnload before closing wakes the actor/workers; a terminal-reserved Turn
+        // rejects that control claim and drains naturally. `None` means no basis is bound.
+        // The drain repeats the same atomic attempt and records its exact outcome for tests.
         let _ = self
             .emergency
             .signal_current(EmergencyControlSignal::PrepareForUnload);
@@ -3020,6 +3057,13 @@ impl SessionExecutor {
     }
 
     #[cfg(test)]
+    pub(crate) fn progress_demand_count_for_test(&self) -> usize {
+        self.progress_demand
+            .subscribers
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     pub(crate) fn emergency_control_for_test(&self) -> EmergencyControlHandle {
         self.emergency.clone()
     }
@@ -3162,6 +3206,11 @@ struct SessionExecutorActor {
     emergency_receiver: mpsc::UnboundedReceiver<SessionExecutorRequest>,
     completions: mpsc::UnboundedReceiver<ExecutorCompletion>,
     completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    model_progress_wakes: mpsc::Receiver<TurnId>,
+    model_progress_wake_sender: mpsc::Sender<TurnId>,
+    reliable_progress: mpsc::Receiver<ReliableProgressCommand>,
+    reliable_progress_sender: mpsc::Sender<ReliableProgressCommand>,
+    progress_demand: Arc<ProgressDemand>,
     closing: CancellationToken,
     lifecycle_closing: CancellationToken,
     task_context: RuntimeTaskContext,
@@ -3304,6 +3353,7 @@ struct ActiveTurn {
     task: Option<TrackedTask>,
     steer_admission_open: bool,
     phase: TurnExecutionPhaseView,
+    progress_mailbox: Arc<TurnProgressMailbox>,
 }
 
 struct ActiveInteraction {
@@ -3406,6 +3456,8 @@ enum ActorWakeup {
     Closing,
     PrepareDeadline,
     Completion(ExecutorCompletion),
+    ReliableProgress(ReliableProgressCommand),
+    ModelProgress(TurnId),
     Request(SessionExecutorRequest),
 }
 
@@ -3448,8 +3500,16 @@ impl SessionExecutorActor {
                     Some(request) => ActorWakeup::Request(request),
                     None => return self.close_and_drain().await,
                 },
+                progress = self.reliable_progress.recv() => match progress {
+                    Some(progress) => ActorWakeup::ReliableProgress(progress),
+                    None => return self.close_and_drain().await,
+                },
                 request = self.receiver.recv() => match request {
                     Some(request) => ActorWakeup::Request(request),
+                    None => return self.close_and_drain().await,
+                },
+                turn_id = self.model_progress_wakes.recv() => match turn_id {
+                    Some(turn_id) => ActorWakeup::ModelProgress(turn_id),
                     None => return self.close_and_drain().await,
                 },
             };
@@ -3466,6 +3526,12 @@ impl SessionExecutorActor {
                         self.close_for_fatal(fatality);
                         return self.close_and_drain().await;
                     }
+                }
+                ActorWakeup::ReliableProgress(progress) => {
+                    self.handle_reliable_progress(progress);
+                }
+                ActorWakeup::ModelProgress(turn_id) => {
+                    self.handle_model_progress_wakeup(turn_id);
                 }
                 ActorWakeup::Request(mut request) => {
                     if self.closing.is_cancelled() {
@@ -3484,6 +3550,41 @@ impl SessionExecutorActor {
     async fn close_and_drain(&mut self) -> bool {
         self.receiver.close();
         self.emergency_receiver.close();
+        self.model_progress_wakes.close();
+        let mut normal_exit = true;
+        let close_turn_outcome = self.active_turn.as_ref().map(|active_turn| {
+            self.emergency.signal(
+                active_turn.emergency.target(),
+                EmergencyControlSignal::PrepareForUnload,
+            )
+        });
+        let turn_control_won = match close_turn_outcome {
+            Some(
+                _outcome @ (EmergencyControlSignalOutcome::Accepted { .. }
+                | EmergencyControlSignalOutcome::AlreadySignaled { .. }),
+            ) => {
+                #[cfg(test)]
+                self.hooks.record_close_drain_signal(_outcome);
+                true
+            }
+            Some(_outcome @ EmergencyControlSignalOutcome::TerminalReserved { .. }) => {
+                #[cfg(test)]
+                self.hooks.record_close_drain_signal(_outcome);
+                false
+            }
+            Some(_outcome @ EmergencyControlSignalOutcome::StaleTarget) => {
+                #[cfg(test)]
+                self.hooks.record_close_drain_signal(_outcome);
+                normal_exit = false;
+                false
+            }
+            None => false,
+        };
+        if turn_control_won {
+            if let Some(turn_id) = self.active_turn.as_ref().map(|active| active.turn_id) {
+                self.discard_model_progress(turn_id);
+            }
+        }
         self.follow_up.clear();
         self.steer.clear();
         if let Some(state) = self.prepare_unload.take() {
@@ -3517,9 +3618,10 @@ impl SessionExecutorActor {
                 }
             }
         }
-        // Only an executor that still has an active admission or Turn projects Finishing.  An
-        // already-Idle prepared executor must not fabricate a Finishing ExecutionChanged event.
-        if self.active_admission.is_some() || self.active_turn.is_some() {
+        // An active admission or a Turn whose close control claim won projects Finishing. A
+        // terminal-reserved Turn drains its already-won terminal without a fabricated Finishing
+        // projection; an already-Idle prepared executor likewise publishes none.
+        if self.active_admission.is_some() || turn_control_won {
             self.execution_state = SessionExecutionState::Finishing;
             self.install_current_state(SessionExecutionState::Finishing);
         }
@@ -3530,41 +3632,16 @@ impl SessionExecutorActor {
             .collect::<Vec<_>>();
         let mut requests_drained = false;
         let mut emergency_requests_drained = false;
-        let mut normal_exit = true;
-        // Close is a Session unload: whenever a Turn is still active, publish the exact
-        // unload signal first-wins on its emergency basis *before* the Turn token is
-        // cancelled, and only then cancel the token, so every owner that observes the basis
-        // — an already-reserved but not-yet-registered UserQuestion included — settles the
-        // truthful PrepareForUnload reason instead of continuing to the next Model, and the
-        // Turn token is never cancelled before the signal exists (the signal is never
-        // generic-first).  `request_closing` already performed the synchronous handoff
-        // (`signal_current(PrepareForUnload)`) before cancelling the closing token, so on
-        // that path this attempt normally records `AlreadySignaled { signal:
-        // PrepareForUnload }`; the drain remains the authoritative actor cleanup and
-        // re-attempts the exact Turn signal so a close that never passed through
-        // `request_closing` (fatal/worker exits) still signals the basis.  An earlier
-        // Cancel/SecurityRevoked keeps its first-wins signal and reason (AlreadySignaled
-        // never overwrites it); both Accepted and AlreadySignaled leave the emergency basis
-        // cancelled, so no worker can start a new side effect.  A stale target is an
-        // integrity failure: the drain then reports an abnormal exit.
-        if let Some(active_turn) = self.active_turn.as_ref() {
-            // The exact first-wins outcome is captured: the drain records it (Accepted /
-            // AlreadySignaled / Stale) and notifies the close-drain signal probe immediately
-            // after the attempt settles, so an integrated close test can prove the drain's
-            // signal did not overwrite a previously won Cancel without polling.
-            let outcome = self.emergency.signal(
-                active_turn.emergency.target(),
-                EmergencyControlSignal::PrepareForUnload,
-            );
-            match outcome {
-                EmergencyControlSignalOutcome::Accepted { .. }
-                | EmergencyControlSignalOutcome::AlreadySignaled { .. } => {}
-                EmergencyControlSignalOutcome::StaleTarget => {
-                    normal_exit = false;
-                }
-            }
-            #[cfg(test)]
-            self.hooks.record_close_drain_signal(outcome);
+        // Close uses the exact terminal/control gate outcome captured above. Accepted or
+        // AlreadySignaled means control owns the Turn: cancel its token only after the sticky
+        // winning signal exists. TerminalReserved means final/failure settlement owns the Turn:
+        // do not cancel, discard final progress, project Finishing, or relabel its terminal.
+        // A stale target is an integrity failure and makes the drain abnormal.
+        if turn_control_won {
+            let active_turn = self
+                .active_turn
+                .as_ref()
+                .expect("a won close Turn control claim retains the active Turn");
             active_turn.cancellation.cancel();
         }
         for (request_id, turn_id) in pending_interactions {
@@ -3588,6 +3665,9 @@ impl SessionExecutorActor {
         }
 
         loop {
+            while let Ok(progress) = self.reliable_progress.try_recv() {
+                self.handle_reliable_progress(progress);
+            }
             if !requests_drained {
                 loop {
                     match self.receiver.try_recv() {
@@ -3629,6 +3709,12 @@ impl SessionExecutorActor {
 
             tokio::select! {
                 biased;
+                progress = self.reliable_progress.recv(), if self.active_turn.is_some() => match progress {
+                    Some(progress) => self.handle_reliable_progress(progress),
+                    None => {
+                        normal_exit = false;
+                    }
+                },
                 completion = self.completions.recv(), if self.active_publication.is_some() || self.active_admission.is_some() || self.active_turn.is_some() || self.security_recovery_is_active() || self.runtime_dependency_probe_is_active() => match completion {
                     Some(completion) => {
                         if let Err(fatality) = self.handle_completion(completion).await {
@@ -3730,9 +3816,10 @@ impl SessionExecutorActor {
             }
             SessionExecutorRequest::Subscribe(request) => {
                 let receiver = if request.include_progress {
-                    SessionExecutorSubscriptionReceiver::Observations(
-                        self.events.observations.subscribe(),
-                    )
+                    SessionExecutorSubscriptionReceiver::Observations {
+                        receiver: self.events.observations.subscribe(),
+                        demand: Some(self.progress_demand.acquire()),
+                    }
                 } else {
                     SessionExecutorSubscriptionReceiver::State(self.events.state.subscribe())
                 };
@@ -3760,6 +3847,8 @@ impl SessionExecutorActor {
             }
             SessionExecutorRequest::Submit(request) => {
                 self.start_admission(request)?;
+                #[cfg(test)]
+                self.hooks.after_submit_admission_started().await;
             }
             SessionExecutorRequest::FollowUp(request) => {
                 self.enqueue_follow_up(request)?;
@@ -3875,13 +3964,16 @@ impl SessionExecutorActor {
                     .map(|active| active.emergency.target())
             });
         if let Some(target) = target {
-            let prepared_won = match self
+            let signal_outcome = self
                 .emergency
-                .signal(target, EmergencyControlSignal::PrepareForUnload)
-            {
+                .signal(target, EmergencyControlSignal::PrepareForUnload);
+            #[cfg(test)]
+            self.hooks.record_prepare_deadline_signal(signal_outcome);
+            let prepared_won = match signal_outcome {
                 EmergencyControlSignalOutcome::Accepted { .. } => true,
                 // An earlier Cancel or SecurityRevoked keeps its original signal and reason.
-                EmergencyControlSignalOutcome::AlreadySignaled { .. } => false,
+                EmergencyControlSignalOutcome::AlreadySignaled { .. }
+                | EmergencyControlSignalOutcome::TerminalReserved { .. } => false,
                 EmergencyControlSignalOutcome::StaleTarget => return Err(ActorFatality::Integrity),
             };
             if prepared_won {
@@ -3890,6 +3982,9 @@ impl SessionExecutorActor {
                 }
                 if let Some(active) = self.active_turn.as_ref() {
                     active.cancellation.cancel();
+                }
+                if let Some(turn_id) = self.active_turn.as_ref().map(|active| active.turn_id) {
+                    self.discard_model_progress(turn_id);
                 }
                 // Only an active Turn projects Finishing.  An admission-only deadline (the
                 // Input is still being captured) keeps Starting and its Starting submit queue
@@ -4608,6 +4703,15 @@ impl SessionExecutorActor {
             Some(active.turn_id),
             self.current.last_terminal(),
         );
+        let progress_mailbox = Arc::new(TurnProgressMailbox::new(
+            self.current.definition().session_id(),
+            active.turn_id,
+            Arc::clone(&self.progress_demand),
+            self.model_progress_wake_sender.clone(),
+        ));
+        if finishing {
+            progress_mailbox.close_and_discard();
+        }
         self.active_turn = Some(ActiveTurn {
             command_id: active.command_id,
             turn_id: active.turn_id,
@@ -4618,6 +4722,7 @@ impl SessionExecutorActor {
             task: None,
             steer_admission_open: true,
             phase: TurnExecutionPhaseView::Sampling,
+            progress_mailbox: Arc::clone(&progress_mailbox),
         });
 
         let turn_id = active.turn_id;
@@ -4644,6 +4749,7 @@ impl SessionExecutorActor {
             let guard = TurnCompletionGuard::new(completion_sender, turn_id);
             let interaction_completion_sender = self.completion_sender.clone();
             let steer_completion_sender = self.completion_sender.clone();
+            let reliable_progress_sender = self.reliable_progress_sender.clone();
             #[cfg(test)]
             let hooks = Arc::clone(&self.hooks);
             let worker = async move {
@@ -4661,11 +4767,17 @@ impl SessionExecutorActor {
                     lifecycle_closing,
                     interaction_completion_sender,
                     steer_completion_sender,
+                    progress_mailbox,
+                    reliable_progress_sender,
                     #[cfg(test)]
-                    hooks,
+                    Arc::clone(&hooks),
                 )
                 .await;
+                #[cfg(test)]
+                hooks.before_turn_completion_queued().await;
                 guard.complete(terminal);
+                #[cfg(test)]
+                hooks.turn_completion_queued.notify();
             };
             match self.task_context.spawn_tracked(worker) {
                 Ok(task) => {
@@ -4681,6 +4793,8 @@ impl SessionExecutorActor {
                 }
             }
         }
+        #[cfg(test)]
+        self.hooks.after_turn_worker_spawned().await;
         active.settle(Ok(active.turn_id));
         self.settle_prepare_unload_if_idle();
         Ok(())
@@ -5019,6 +5133,10 @@ impl SessionExecutorActor {
                         request.settle(Err(SessionCancelError::TurnCancelling));
                         return Ok(());
                     }
+                    EmergencyControlSignalOutcome::TerminalReserved { .. } => {
+                        request.settle(Err(SessionCancelError::SubmitNotCancellable));
+                        return Ok(());
+                    }
                     EmergencyControlSignalOutcome::StaleTarget => {
                         return Err(ActorFatality::Integrity);
                     }
@@ -5063,6 +5181,10 @@ impl SessionExecutorActor {
                         EmergencyControlSignalOutcome::Accepted { epoch } => epoch,
                         EmergencyControlSignalOutcome::AlreadySignaled { .. } => {
                             request.settle(Err(SessionCancelError::TurnCancelling));
+                            return Ok(());
+                        }
+                        EmergencyControlSignalOutcome::TerminalReserved { .. } => {
+                            request.settle(Err(SessionCancelError::TurnTerminal));
                             return Ok(());
                         }
                         EmergencyControlSignalOutcome::StaleTarget => {
@@ -5124,6 +5246,10 @@ impl SessionExecutorActor {
                         request.settle(Err(SessionCancelError::TurnCancelling));
                         return Ok(());
                     }
+                    EmergencyControlSignalOutcome::TerminalReserved { .. } => {
+                        request.settle(Err(SessionCancelError::TurnTerminal));
+                        return Ok(());
+                    }
                     EmergencyControlSignalOutcome::StaleTarget => {
                         return Err(ActorFatality::Integrity);
                     }
@@ -5138,6 +5264,7 @@ impl SessionExecutorActor {
                     .cancel_accepted = Some(accepted);
                 if matches!(signal, EmergencyControlSignalOutcome::Accepted { .. }) {
                     cancellation.cancel();
+                    self.discard_model_progress(turn_id);
                     self.execution_state = SessionExecutionState::Finishing;
                     self.steer.clear_for_turn(turn_id);
                     self.publish_execution_state(
@@ -5247,6 +5374,10 @@ impl SessionExecutorActor {
                 request.settle(Err(SessionSecurityRevokedError::AlreadyCancelling));
                 false
             }
+            EmergencyControlSignalOutcome::TerminalReserved { .. } => {
+                request.settle(Err(SessionSecurityRevokedError::NotRunning));
+                false
+            }
             EmergencyControlSignalOutcome::StaleTarget => return Err(ActorFatality::Integrity),
         };
         if accepted {
@@ -5262,6 +5393,7 @@ impl SessionExecutorActor {
                 }
             };
             let pending = if let Some(turn_id) = finishing_turn {
+                self.discard_model_progress(turn_id);
                 self.execution_state = SessionExecutionState::Finishing;
                 self.publish_execution_state(
                     SessionExecutionState::Finishing,
@@ -5380,6 +5512,7 @@ impl SessionExecutorActor {
                 }
             };
             if let Some(turn_id) = finishing_turn {
+                self.discard_model_progress(turn_id);
                 if self.execution_state != SessionExecutionState::Finishing {
                     self.execution_state = SessionExecutionState::Finishing;
                     self.publish_execution_state(
@@ -5405,6 +5538,8 @@ impl SessionExecutorActor {
                 }
             }
         }
+        #[cfg(test)]
+        self.hooks.security_invalidation_admitted.notify();
         Ok(())
     }
 
@@ -5420,7 +5555,8 @@ impl SessionExecutorActor {
             .signal(target, EmergencyControlSignal::SecurityRevoked)
         {
             EmergencyControlSignalOutcome::Accepted { .. } => Ok(true),
-            EmergencyControlSignalOutcome::AlreadySignaled { .. } => Ok(false),
+            EmergencyControlSignalOutcome::AlreadySignaled { .. }
+            | EmergencyControlSignalOutcome::TerminalReserved { .. } => Ok(false),
             EmergencyControlSignalOutcome::StaleTarget => Err(ActorFatality::Integrity),
         }
     }
@@ -5907,7 +6043,8 @@ impl SessionExecutorActor {
     ) -> Result<(), ActorFatality> {
         match self.emergency.signal(target, signal) {
             EmergencyControlSignalOutcome::Accepted { .. }
-            | EmergencyControlSignalOutcome::AlreadySignaled { .. } => Ok(()),
+            | EmergencyControlSignalOutcome::AlreadySignaled { .. }
+            | EmergencyControlSignalOutcome::TerminalReserved { .. } => Ok(()),
             EmergencyControlSignalOutcome::StaleTarget => Err(ActorFatality::Integrity),
         }
     }
@@ -5921,7 +6058,8 @@ impl SessionExecutorActor {
             .signal(target, EmergencyControlSignal::Cancel)
         {
             outcome @ EmergencyControlSignalOutcome::Accepted { .. }
-            | outcome @ EmergencyControlSignalOutcome::AlreadySignaled { .. } => Ok(outcome),
+            | outcome @ EmergencyControlSignalOutcome::AlreadySignaled { .. }
+            | outcome @ EmergencyControlSignalOutcome::TerminalReserved { .. } => Ok(outcome),
             EmergencyControlSignalOutcome::StaleTarget => Err(ActorFatality::Integrity),
         }
     }
@@ -5995,6 +6133,33 @@ impl SessionExecutorActor {
         &mut self,
         completion: TurnCompletion,
     ) -> Result<(), ActorFatality> {
+        let active = self
+            .active_turn
+            .as_ref()
+            .filter(|active| active.turn_id == completion.turn_id)
+            .ok_or(ActorFatality::Internal)?;
+        let terminal = match self.emergency.claim_turn_terminal(&active.emergency) {
+            TurnTerminalClaimOutcome::Accepted | TurnTerminalClaimOutcome::AlreadyReserved => {
+                completion.terminal
+            }
+            TurnTerminalClaimOutcome::ControlWon { signal } => {
+                SessionTurnTerminal::Interrupted(session_turn_interruption(signal))
+            }
+            // A deliberately retired/stale emergency basis cannot accept any later control.
+            // Failure settlement therefore keeps the worker's proposed terminal instead of
+            // fatal-closing the Session; final live commit still fails closed earlier when its
+            // worker-side exact claim observes stale.
+            TurnTerminalClaimOutcome::StaleTarget => completion.terminal,
+        };
+        match terminal {
+            SessionTurnTerminal::Completed => {
+                self.drain_model_progress(completion.turn_id);
+                self.discard_model_progress(completion.turn_id);
+            }
+            SessionTurnTerminal::Interrupted(_) | SessionTurnTerminal::Failed(_) => {
+                self.discard_model_progress(completion.turn_id);
+            }
+        }
         let Some(mut active) = self.active_turn.take() else {
             return Err(ActorFatality::Internal);
         };
@@ -6033,7 +6198,7 @@ impl SessionExecutorActor {
         self.update_execution_state_snapshot(
             SessionExecutionState::Idle,
             None,
-            Some((active.turn_id, completion.terminal)),
+            Some((active.turn_id, terminal)),
         );
         // The Session is Idle again: apply the latest intended availability composite before
         // the FollowUp decision, so a Disable at terminal leaves the queue intact for a later
@@ -6069,9 +6234,11 @@ impl SessionExecutorActor {
                 timestamp: SystemClock.now(),
                 command_id: active.command_id,
                 turn_id: active.turn_id,
-                terminal: completion.terminal,
+                terminal,
                 snapshot: Arc::clone(&self.current),
             }));
+        #[cfg(test)]
+        self.hooks.after_turn_terminal_published().await;
         // The Turn terminal is published first (TurnInterrupted with SecurityRevoked or the
         // earlier winner), then the security recovery enters Preparing and publishes
         // ReadinessChanged(command_id: None) before any FollowUp handoff.
@@ -6473,12 +6640,11 @@ impl SessionExecutorActor {
             ExecutorCompletion::InteractionRequested(completion) => {
                 self.handle_interaction_requested(completion).await
             }
-            ExecutorCompletion::Progress(completion) => self.handle_progress_completion(completion),
             ExecutorCompletion::SteerSafePoint(completion) => {
                 self.handle_steer_safe_point(completion).await
             }
             ExecutorCompletion::TurnPhase(completion) => {
-                self.handle_turn_phase_completion(completion)
+                self.handle_turn_phase_completion(completion).await
             }
             ExecutorCompletion::Turn(completion) => self.handle_turn_completion(completion).await,
             ExecutorCompletion::SecurityRecovery(completion) => {
@@ -6491,15 +6657,69 @@ impl SessionExecutorActor {
         }
     }
 
-    fn handle_progress_completion(
-        &mut self,
-        completion: ProgressCompletion,
-    ) -> Result<(), ActorFatality> {
-        let Some(active_turn) = self.active_turn.as_ref() else {
-            return Err(ActorFatality::Internal);
+    fn publish_progress(&self, event: ProgressEvent) {
+        #[cfg(test)]
+        if event.kind() == ProgressEventKind::Model {
+            self.hooks
+                .model_progress_publications
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        self.events.send_progress(event);
+    }
+
+    fn drain_model_progress(&self, turn_id: TurnId) {
+        let Some(active_turn) = self
+            .active_turn
+            .as_ref()
+            .filter(|active| active.turn_id == turn_id)
+        else {
+            return;
         };
+        for event in active_turn.progress_mailbox.drain() {
+            self.publish_progress(event);
+        }
+    }
+
+    fn discard_model_progress(&self, turn_id: TurnId) {
+        if let Some(active_turn) = self
+            .active_turn
+            .as_ref()
+            .filter(|active| active.turn_id == turn_id)
+        {
+            active_turn.progress_mailbox.close_and_discard();
+        }
+    }
+
+    fn handle_model_progress_wakeup(&self, _turn_id: TurnId) {
+        let Some(active_turn_id) = self.active_turn.as_ref().map(|active| active.turn_id) else {
+            return;
+        };
+        // The capacity-1 wake channel is shared across successive Turns. A stale Turn A wake
+        // can occupy its only slot while active Turn B accepts mailbox data and observes
+        // `try_send(Full)`, leaving B's `wake_pending` bit without a second channel message.
+        // Consuming any wake therefore recovers the shared credit by inspecting the current
+        // active mailbox. Draining an empty mailbox is harmless; draining B clears its
+        // `wake_pending` bit and publishes the retained prefix before a later phase fence.
+        self.drain_model_progress(active_turn_id);
+    }
+
+    fn handle_reliable_progress(&self, progress: ReliableProgressCommand) {
+        let Some(active_turn) = self
+            .active_turn
+            .as_ref()
+            .filter(|active| active.turn_id == progress.turn_id)
+        else {
+            let _ = progress.acknowledged.send(false);
+            return;
+        };
+        if matches!(progress.kind, ReliableProgressKind::Retry)
+            && active_turn.cancellation.is_cancelled()
+        {
+            let _ = progress.acknowledged.send(false);
+            return;
+        }
         let session_id = self.current.definition().session_id();
-        let route_matches = match completion.event.route() {
+        let route_matches = match progress.event.route() {
             EventRoute::Turn {
                 session_id: event_session_id,
                 turn_id,
@@ -6508,26 +6728,26 @@ impl SessionExecutorActor {
                 session_id: event_session_id,
                 turn_id,
                 ..
-            } => event_session_id == session_id && turn_id == completion.turn_id,
+            } => event_session_id == session_id && turn_id == progress.turn_id,
             EventRoute::Runtime
             | EventRoute::Agent { .. }
             | EventRoute::Session { .. }
             | EventRoute::Interaction { .. } => false,
         };
-        if active_turn.turn_id != completion.turn_id || !route_matches {
-            return Err(ActorFatality::Internal);
+        if !route_matches {
+            let _ = progress.acknowledged.send(false);
+            return;
         }
-        self.events.send_progress(completion.event);
-        if let Some(published) = completion.published {
-            let _ = published.send(());
-        }
-        Ok(())
+        self.drain_model_progress(progress.turn_id);
+        self.publish_progress(progress.event);
+        let _ = progress.acknowledged.send(true);
     }
 
-    fn handle_turn_phase_completion(
+    async fn handle_turn_phase_completion(
         &mut self,
         completion: TurnPhaseCompletion,
     ) -> Result<(), ActorFatality> {
+        self.drain_model_progress(completion.turn_id);
         let Some(active_turn) = self.active_turn.as_mut() else {
             return Err(ActorFatality::Internal);
         };
@@ -6538,6 +6758,8 @@ impl SessionExecutorActor {
         self.publish_queue_projection();
         self.publish_observation_changed(SystemClock.now());
         let _ = completion.response.send(());
+        #[cfg(test)]
+        self.hooks.after_turn_phase_acknowledged().await;
         Ok(())
     }
 
@@ -6545,6 +6767,7 @@ impl SessionExecutorActor {
         &mut self,
         completion: SteerSafePointCompletion,
     ) -> Result<(), ActorFatality> {
+        self.drain_model_progress(completion.turn_id);
         let Some(active_turn) = self.active_turn.as_ref() else {
             return Err(ActorFatality::Internal);
         };
@@ -6563,6 +6786,8 @@ impl SessionExecutorActor {
         #[cfg(test)]
         self.hooks.after_steer_arbitration().await;
         let _ = completion.response.send(steer);
+        #[cfg(test)]
+        self.hooks.after_steer_safe_point_acknowledged().await;
         Ok(())
     }
 
@@ -7812,7 +8037,6 @@ enum ExecutorCompletion {
     Publication(PublicationCompletion),
     Admission(AdmissionCompletion),
     InteractionRequested(InteractionRequestedCompletion),
-    Progress(ProgressCompletion),
     SteerSafePoint(SteerSafePointCompletion),
     TurnPhase(TurnPhaseCompletion),
     Turn(TurnCompletion),
@@ -7820,10 +8044,16 @@ enum ExecutorCompletion {
     RuntimeDependencyProbe(RuntimeDependencyProbeCompletion),
 }
 
-struct ProgressCompletion {
+enum ReliableProgressKind {
+    ToolOutput,
+    Retry,
+}
+
+struct ReliableProgressCommand {
     turn_id: TurnId,
     event: ProgressEvent,
-    published: Option<oneshot::Sender<()>>,
+    kind: ReliableProgressKind,
+    acknowledged: oneshot::Sender<bool>,
 }
 
 struct InteractionRequestedCompletion {
@@ -9504,6 +9734,316 @@ enum ActiveModelProgressKind {
     Reasoning,
 }
 
+#[derive(Default)]
+struct ProgressDemand {
+    subscribers: std::sync::atomic::AtomicUsize,
+}
+
+impl ProgressDemand {
+    fn acquire(self: &Arc<Self>) -> ProgressDemandLease {
+        self.subscribers
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |current| current.checked_add(1),
+            )
+            .expect("the process cannot retain usize::MAX progress subscriptions");
+        ProgressDemandLease {
+            demand: Arc::clone(self),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.subscribers.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+}
+
+struct ProgressDemandLease {
+    demand: Arc<ProgressDemand>,
+}
+
+impl Drop for ProgressDemandLease {
+    fn drop(&mut self) {
+        let previous = self
+            .demand
+            .subscribers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
+
+enum PendingModelProgress {
+    Started {
+        timestamp: Timestamp,
+        item_id: ItemId,
+        content_index: u32,
+        content_kind: ItemProgressContentKind,
+    },
+    Delta {
+        timestamp: Timestamp,
+        item_id: ItemId,
+        content_index: u32,
+        content_kind: ItemProgressContentKind,
+        text: String,
+    },
+}
+
+impl PendingModelProgress {
+    fn into_event(self, session_id: SessionId, turn_id: TurnId) -> Option<ProgressEvent> {
+        let (timestamp, item_id, update) = match self {
+            Self::Started {
+                timestamp,
+                item_id,
+                content_index,
+                content_kind,
+            } => (
+                timestamp,
+                item_id,
+                ProgressUpdate::item_started(item_id, content_index, content_kind),
+            ),
+            Self::Delta {
+                timestamp,
+                item_id,
+                content_index,
+                content_kind,
+                text,
+            } => (
+                timestamp,
+                item_id,
+                ProgressUpdate::item_delta(item_id, content_index, content_kind, text).ok()?,
+            ),
+        };
+        ProgressEvent::new(
+            timestamp,
+            EventRoute::Item {
+                session_id,
+                turn_id,
+                item_id,
+            },
+            ProgressEventKind::Model,
+            update,
+        )
+        .ok()
+    }
+}
+
+#[derive(Default)]
+struct TurnProgressMailboxState {
+    closed: bool,
+    wake_pending: bool,
+    pending: VecDeque<PendingModelProgress>,
+    pending_text_bytes: usize,
+    #[cfg(test)]
+    high_water: ModelProgressHighWater,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct ModelProgressHighWater {
+    events: usize,
+    text_bytes: usize,
+    keys: usize,
+}
+
+struct TurnProgressMailbox {
+    session_id: SessionId,
+    turn_id: TurnId,
+    demand: Arc<ProgressDemand>,
+    wake_sender: mpsc::Sender<TurnId>,
+    state: Mutex<TurnProgressMailboxState>,
+}
+
+impl TurnProgressMailbox {
+    fn new(
+        session_id: SessionId,
+        turn_id: TurnId,
+        demand: Arc<ProgressDemand>,
+        wake_sender: mpsc::Sender<TurnId>,
+    ) -> Self {
+        Self {
+            session_id,
+            turn_id,
+            demand,
+            wake_sender,
+            state: Mutex::new(TurnProgressMailboxState::default()),
+        }
+    }
+
+    fn record_key_count(&self, keys: usize) {
+        #[cfg(test)]
+        {
+            let mut state = lock(&self.state);
+            state.high_water.keys = state.high_water.keys.max(keys);
+        }
+        #[cfg(not(test))]
+        let _ = keys;
+    }
+
+    fn enqueue_delta(
+        &self,
+        timestamp: Timestamp,
+        item_id: ItemId,
+        content_index: u32,
+        content_kind: ItemProgressContentKind,
+        started_needed: bool,
+        delta: &str,
+    ) -> bool {
+        if !self.demand.is_active() || delta.is_empty() {
+            return false;
+        }
+        if lock(&self.state).closed {
+            return false;
+        }
+        let Ok(validated) = ProgressUpdate::item_delta(item_id, content_index, content_kind, delta)
+        else {
+            return false;
+        };
+        let ProgressUpdate::ItemDelta { delta, .. } = validated else {
+            unreachable!("the item-delta constructor returns its exact variant")
+        };
+
+        let mut state = lock(&self.state);
+        if state.closed {
+            return false;
+        }
+        if state.pending_text_bytes >= MODEL_PROGRESS_PENDING_TEXT_CAPACITY
+            || (started_needed
+                && state.pending.len().saturating_add(2) > MODEL_PROGRESS_PENDING_EVENT_CAPACITY)
+        {
+            return false;
+        }
+
+        let mut remaining = delta.as_ref();
+        let mut accepted = 0_usize;
+        if !started_needed && state.pending.len() >= MODEL_PROGRESS_PENDING_EVENT_CAPACITY {
+            let pending_text_capacity =
+                MODEL_PROGRESS_PENDING_TEXT_CAPACITY.saturating_sub(state.pending_text_bytes);
+            if let Some(PendingModelProgress::Delta {
+                item_id: pending_item_id,
+                content_index: pending_content_index,
+                content_kind: pending_content_kind,
+                text,
+                ..
+            }) = state.pending.back_mut()
+            {
+                if *pending_item_id == item_id
+                    && *pending_content_index == content_index
+                    && *pending_content_kind == content_kind
+                    && text.len() < MODEL_PROGRESS_DELTA_CHUNK_BYTES
+                {
+                    let capacity = MODEL_PROGRESS_DELTA_CHUNK_BYTES
+                        .saturating_sub(text.len())
+                        .min(pending_text_capacity);
+                    let end = utf8_prefix_len(remaining, capacity);
+                    if end != 0 {
+                        text.push_str(&remaining[..end]);
+                        remaining = &remaining[end..];
+                        accepted += end;
+                    }
+                }
+            }
+        }
+
+        let mut additions = VecDeque::new();
+        while !remaining.is_empty()
+            && state
+                .pending
+                .len()
+                .saturating_add(additions.len())
+                .saturating_add(usize::from(started_needed))
+                < MODEL_PROGRESS_PENDING_EVENT_CAPACITY
+        {
+            let capacity = MODEL_PROGRESS_DELTA_CHUNK_BYTES.min(
+                MODEL_PROGRESS_PENDING_TEXT_CAPACITY
+                    .saturating_sub(state.pending_text_bytes)
+                    .saturating_sub(accepted),
+            );
+            let end = utf8_prefix_len(remaining, capacity);
+            if end == 0 {
+                break;
+            }
+            additions.push_back(PendingModelProgress::Delta {
+                timestamp,
+                item_id,
+                content_index,
+                content_kind,
+                text: remaining[..end].to_owned(),
+            });
+            remaining = &remaining[end..];
+            accepted += end;
+        }
+        if accepted == 0 {
+            return false;
+        }
+        if started_needed {
+            state.pending.push_back(PendingModelProgress::Started {
+                timestamp,
+                item_id,
+                content_index,
+                content_kind,
+            });
+        }
+        state.pending.extend(additions);
+        state.pending_text_bytes += accepted;
+        #[cfg(test)]
+        {
+            state.high_water.events = state.high_water.events.max(state.pending.len());
+            state.high_water.text_bytes = state.high_water.text_bytes.max(state.pending_text_bytes);
+        }
+        let notify = !state.wake_pending;
+        if notify {
+            state.wake_pending = true;
+        }
+        drop(state);
+        if notify {
+            match self.wake_sender.try_send(self.turn_id) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => self.close_and_discard(),
+            }
+        }
+        true
+    }
+
+    fn drain(&self) -> Vec<ProgressEvent> {
+        let pending = {
+            let mut state = lock(&self.state);
+            state.wake_pending = false;
+            state.pending_text_bytes = 0;
+            std::mem::take(&mut state.pending)
+        };
+        pending
+            .into_iter()
+            .filter_map(|event| event.into_event(self.session_id, self.turn_id))
+            .collect()
+    }
+
+    fn close_and_discard(&self) {
+        let mut state = lock(&self.state);
+        state.closed = true;
+        state.wake_pending = false;
+        state.pending.clear();
+        state.pending_text_bytes = 0;
+    }
+
+    #[cfg(test)]
+    fn high_water_for_test(&self) -> ModelProgressHighWater {
+        lock(&self.state).high_water
+    }
+
+    #[cfg(test)]
+    fn drain_for_test(&self) -> Vec<ProgressEvent> {
+        self.drain()
+    }
+}
+
+fn utf8_prefix_len(text: &str, maximum: usize) -> usize {
+    let mut end = text.len().min(maximum);
+    while end != 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 impl ActiveModelProgressKind {
     const fn public(self) -> ItemProgressContentKind {
         match self {
@@ -9515,16 +10055,19 @@ impl ActiveModelProgressKind {
 
 #[derive(Default)]
 struct ActiveModelProgressState {
+    attempt_generation: u64,
     item_ids: BTreeMap<(u32, ActiveModelProgressKind), ItemId>,
     started: BTreeSet<(u32, ActiveModelProgressKind)>,
     deltas: BTreeSet<(u32, ActiveModelProgressKind)>,
+    untracked_reasoning_delta: bool,
 }
 
 #[derive(Clone)]
 struct ActiveModelProgress {
     session_id: SessionId,
     turn_id: TurnId,
-    completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    mailbox: Arc<TurnProgressMailbox>,
+    reliable_progress_sender: mpsc::Sender<ReliableProgressCommand>,
     state: Arc<Mutex<ActiveModelProgressState>>,
 }
 
@@ -9532,22 +10075,46 @@ impl ActiveModelProgress {
     fn new(
         session_id: SessionId,
         turn_id: TurnId,
-        completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+        mailbox: Arc<TurnProgressMailbox>,
+        reliable_progress_sender: mpsc::Sender<ReliableProgressCommand>,
     ) -> Self {
         Self {
             session_id,
             turn_id,
-            completion_sender,
+            mailbox,
+            reliable_progress_sender,
             state: Arc::new(Mutex::new(ActiveModelProgressState::default())),
         }
     }
 
+    #[cfg(test)]
+    fn new_with_mailbox(
+        session_id: SessionId,
+        turn_id: TurnId,
+        mailbox: Arc<TurnProgressMailbox>,
+    ) -> Self {
+        let (reliable_progress_sender, _) = mpsc::channel(RELIABLE_PROGRESS_CHANNEL_CAPACITY);
+        Self::new(session_id, turn_id, mailbox, reliable_progress_sender)
+    }
+
     fn publisher(&self) -> ModelProgressPublisher {
+        let attempt_generation = lock(&self.state).attempt_generation;
         let progress = self.clone();
-        ModelProgressPublisher::new(move |event| progress.publish_provider_event(event))
+        ModelProgressPublisher::new(move |event| {
+            progress.publish_provider_event_for_attempt(attempt_generation, event);
+        })
     }
 
     fn publish_provider_event(&self, event: ModelProgressEvent) {
+        let attempt_generation = lock(&self.state).attempt_generation;
+        self.publish_provider_event_for_attempt(attempt_generation, event);
+    }
+
+    fn publish_provider_event_for_attempt(
+        &self,
+        attempt_generation: u64,
+        event: ModelProgressEvent,
+    ) {
         let ModelProgressEvent::ContentDelta {
             content_index,
             delta,
@@ -9559,53 +10126,53 @@ impl ActiveModelProgress {
             }
             ModelContentDelta::ReasoningText(delta) => (ActiveModelProgressKind::Reasoning, delta),
         };
-        self.publish_delta(content_index, kind, delta.as_ref());
+        self.publish_delta(attempt_generation, content_index, kind, delta.as_ref());
     }
 
-    fn publish_delta(&self, content_index: u32, kind: ActiveModelProgressKind, delta: &str) {
+    fn publish_delta(
+        &self,
+        attempt_generation: u64,
+        content_index: u32,
+        kind: ActiveModelProgressKind,
+        delta: &str,
+    ) {
         if delta.is_empty() {
             return;
         }
         let key = (content_index, kind);
-        let (item_id, publish_started) = {
-            let mut state = lock(&self.state);
-            let item_id = match state.item_ids.get(&key).copied() {
-                Some(item_id) => item_id,
-                None => {
-                    let Ok(item_id) = ItemId::generate() else {
-                        return;
-                    };
-                    state.item_ids.insert(key, item_id);
-                    item_id
-                }
-            };
-            let publish_started = state.started.insert(key);
-            state.deltas.insert(key);
-            (item_id, publish_started)
-        };
-        let route = EventRoute::Item {
-            session_id: self.session_id,
-            turn_id: self.turn_id,
-            item_id,
-        };
-        if publish_started {
-            if let Ok(event) = ProgressEvent::new(
-                SystemClock.now(),
-                route,
-                ProgressEventKind::Model,
-                ProgressUpdate::item_started(item_id, content_index, kind.public()),
-            ) {
-                self.send(event, None);
-            }
-        }
-        let Ok(update) = ProgressUpdate::item_delta(item_id, content_index, kind.public(), delta)
-        else {
+        let mut state = lock(&self.state);
+        if state.attempt_generation != attempt_generation {
             return;
+        }
+        let item_id = match state.item_ids.get(&key).copied() {
+            Some(item_id) => item_id,
+            None => {
+                if state.item_ids.len() >= MODEL_PROGRESS_KEY_CAPACITY {
+                    if kind == ActiveModelProgressKind::Reasoning {
+                        state.untracked_reasoning_delta = true;
+                    }
+                    return;
+                }
+                let Ok(item_id) = ItemId::generate() else {
+                    return;
+                };
+                state.item_ids.insert(key, item_id);
+                item_id
+            }
         };
-        if let Ok(event) =
-            ProgressEvent::new(SystemClock.now(), route, ProgressEventKind::Model, update)
+        let publish_started = !state.started.contains(&key);
+        state.deltas.insert(key);
+        self.mailbox.record_key_count(state.item_ids.len());
+        if self.mailbox.enqueue_delta(
+            SystemClock.now(),
+            item_id,
+            content_index,
+            kind.public(),
+            publish_started,
+            delta,
+        ) && publish_started
         {
-            self.send(event, None);
+            state.started.insert(key);
         }
     }
 
@@ -9620,30 +10187,49 @@ impl ActiveModelProgress {
             return Ok(*item_id);
         }
         let item_id = ItemId::generate().map_err(|_| SessionTurnFailure::Internal)?;
-        state.item_ids.insert(key, item_id);
+        if state.item_ids.len() < MODEL_PROGRESS_KEY_CAPACITY {
+            state.item_ids.insert(key, item_id);
+        }
         Ok(item_id)
     }
 
     fn publish_final_summary_if_missing(&self, content_index: u32, item_id: ItemId, summary: &str) {
         let key = (content_index, ActiveModelProgressKind::Reasoning);
-        let missing = {
+        let (missing, attempt_generation) = {
             let mut state = lock(&self.state);
-            state.item_ids.insert(key, item_id);
-            !state.deltas.contains(&key)
+            if state.item_ids.len() < MODEL_PROGRESS_KEY_CAPACITY
+                || state.item_ids.contains_key(&key)
+            {
+                state.item_ids.insert(key, item_id);
+            }
+            (
+                !state.untracked_reasoning_delta && !state.deltas.contains(&key),
+                state.attempt_generation,
+            )
         };
         if missing {
-            self.publish_delta(content_index, ActiveModelProgressKind::Reasoning, summary);
+            self.publish_delta(
+                attempt_generation,
+                content_index,
+                ActiveModelProgressKind::Reasoning,
+                summary,
+            );
         }
     }
 
-    fn retry_scheduled(&self, retry_count: u8, delay: std::time::Duration) {
+    async fn retry_scheduled(&self, retry_count: u8, delay: std::time::Duration) -> bool {
         {
             let mut state = lock(&self.state);
+            let Some(next_generation) = state.attempt_generation.checked_add(1) else {
+                return false;
+            };
+            state.attempt_generation = next_generation;
             state.started.clear();
             state.deltas.clear();
+            state.untracked_reasoning_delta = false;
         }
         let Ok(milliseconds) = i64::try_from(delay.as_millis()) else {
-            return;
+            return true;
         };
         let Some(ready_at) = SystemClock
             .now()
@@ -9651,7 +10237,7 @@ impl ActiveModelProgress {
             .checked_add(time::Duration::milliseconds(milliseconds))
             .and_then(|value| Timestamp::from_utc(value).ok())
         else {
-            return;
+            return true;
         };
         let Ok(event) = ProgressEvent::new(
             SystemClock.now(),
@@ -9666,19 +10252,23 @@ impl ActiveModelProgress {
                 ready_at,
             ),
         ) else {
-            return;
+            return true;
         };
-        self.send(event, None);
-    }
-
-    fn send(&self, event: ProgressEvent, published: Option<oneshot::Sender<()>>) {
-        let _ = self
-            .completion_sender
-            .send(ExecutorCompletion::Progress(ProgressCompletion {
+        let (acknowledged, waiter) = oneshot::channel();
+        if self
+            .reliable_progress_sender
+            .send(ReliableProgressCommand {
                 turn_id: self.turn_id,
                 event,
-                published,
-            }));
+                kind: ReliableProgressKind::Retry,
+                acknowledged,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        waiter.await.unwrap_or(false)
     }
 }
 
@@ -9699,6 +10289,8 @@ async fn run_active_turn(
     closing: CancellationToken,
     interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     steer_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    progress_mailbox: Arc<TurnProgressMailbox>,
+    reliable_progress_sender: mpsc::Sender<ReliableProgressCommand>,
     #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
 ) -> SessionTurnTerminal {
     if context.turn_id() != turn_id {
@@ -9717,23 +10309,45 @@ async fn run_active_turn(
         closing,
         interaction_completion_sender,
         steer_completion_sender.clone(),
+        Arc::clone(&progress_mailbox),
+        reliable_progress_sender,
         #[cfg(test)]
-        hooks,
+        Arc::clone(&hooks),
     )
     .await;
     match result {
         Ok(entry) => {
+            #[cfg(test)]
+            hooks.after_final_live_apply_before_completion().await;
             let _ = conversation.recorder.record(entry).await;
             // Refresh the public snapshot after the final assistant fact is live and its
             // inline record attempt has settled, but before the TurnCompletion guard queues
             // terminal. The actor lane therefore publishes the completed assistant Item after
             // every accepted model progress event and before the terminal StateEvent.
-            let _ = publish_turn_phase(
+            #[cfg(test)]
+            let phase_result = {
+                let (response, waiter) = oneshot::channel();
+                let sent = steer_completion_sender.send(ExecutorCompletion::TurnPhase(
+                    TurnPhaseCompletion {
+                        turn_id,
+                        phase: TurnExecutionPhaseView::Sampling,
+                        response,
+                    },
+                ));
+                hooks.final_phase_queued.notify();
+                match sent {
+                    Ok(()) => waiter.await.map_err(|_| SessionTurnFailure::Internal),
+                    Err(_) => Err(SessionTurnFailure::Internal),
+                }
+            };
+            #[cfg(not(test))]
+            let phase_result = publish_turn_phase(
                 &steer_completion_sender,
                 turn_id,
                 TurnExecutionPhaseView::Sampling,
             )
             .await;
+            let _ = phase_result;
             SessionTurnTerminal::Completed
         }
         Err(SessionTurnFailure::EmergencyControl(signal)) => {
@@ -9810,6 +10424,8 @@ async fn run_active_turn_inner(
     closing: CancellationToken,
     interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     steer_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    progress_mailbox: Arc<TurnProgressMailbox>,
+    reliable_progress_sender: mpsc::Sender<ReliableProgressCommand>,
     #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
 ) -> Result<Arc<crate::conversation_storage::StoredSessionEntry>, SessionTurnFailure> {
     let mut compactions_started = 0_u8;
@@ -9883,7 +10499,8 @@ async fn run_active_turn_inner(
         let model_progress = ActiveModelProgress::new(
             context.session_id(),
             turn_id,
-            steer_completion_sender.clone(),
+            Arc::clone(&progress_mailbox),
+            reliable_progress_sender.clone(),
         );
         let call_result = call_agent_run_with_logical_retry(
             &model_gateway,
@@ -10094,6 +10711,22 @@ async fn run_active_turn_inner(
         if !emergency_control_is_unsignaled_current(&emergency_control, &emergency_observation) {
             return Err(SessionTurnFailure::Model);
         }
+        #[cfg(test)]
+        if !is_tool_round {
+            hooks.before_final_commit().await;
+        }
+        if !is_tool_round {
+            match emergency_control.claim_turn_terminal(&emergency_observation) {
+                TurnTerminalClaimOutcome::Accepted => {}
+                TurnTerminalClaimOutcome::ControlWon { signal } => {
+                    return Err(SessionTurnFailure::EmergencyControl(signal));
+                }
+                TurnTerminalClaimOutcome::AlreadyReserved
+                | TurnTerminalClaimOutcome::StaleTarget => {
+                    return Err(SessionTurnFailure::Internal);
+                }
+            }
+        }
         let fact = {
             let mut live_state = lock(&conversation.live_state);
             if is_tool_round {
@@ -10152,7 +10785,9 @@ async fn run_active_turn_inner(
                 &conversation,
                 turn_id,
                 outcome,
-                &steer_completion_sender,
+                &reliable_progress_sender,
+                #[cfg(test)]
+                Arc::clone(&hooks),
             )
             .await?
             {
@@ -10168,7 +10803,9 @@ async fn run_active_turn_inner(
                         &conversation,
                         turn_id,
                         outcome,
-                        &steer_completion_sender,
+                        &reliable_progress_sender,
+                        #[cfg(test)]
+                        Arc::clone(&hooks),
                     )
                     .await?;
                 }
@@ -10185,7 +10822,9 @@ async fn run_active_turn_inner(
                 &conversation,
                 turn_id,
                 outcome,
-                &steer_completion_sender,
+                &reliable_progress_sender,
+                #[cfg(test)]
+                Arc::clone(&hooks),
             )
             .await?;
         }
@@ -10595,7 +11234,9 @@ async fn call_agent_run_with_logical_retry(
             return Err(error);
         }
         logical_retries += 1;
-        progress.retry_scheduled(logical_retries, delay);
+        if !progress.retry_scheduled(logical_retries, delay).await {
+            return Err(ModelCallError::cancelled());
+        }
         tokio::select! {
             biased;
             _ = executor_closing.cancelled() => {
@@ -10895,7 +11536,8 @@ async fn apply_tool_outcome_and_publish(
     conversation: &LoadedSessionConversation,
     turn_id: TurnId,
     outcome: ToolExecutionOutcome,
-    completion_sender: &mpsc::UnboundedSender<ExecutorCompletion>,
+    reliable_progress_sender: &mpsc::Sender<ReliableProgressCommand>,
+    #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
 ) -> Result<bool, SessionTurnFailure> {
     let (item_id, tool_call_id, stored) = stored_tool_outcome(outcome)?;
     let abandoned = matches!(&stored, StoredToolOutcome::Abandoned { .. });
@@ -10932,16 +11574,20 @@ async fn apply_tool_outcome_and_publish(
                 ) else {
                     continue;
                 };
-                let (published, waiter) = oneshot::channel();
-                if completion_sender
-                    .send(ExecutorCompletion::Progress(ProgressCompletion {
+                let (acknowledged, waiter) = oneshot::channel();
+                reliable_progress_sender
+                    .send(ReliableProgressCommand {
                         turn_id,
                         event,
-                        published: Some(published),
-                    }))
-                    .is_ok()
-                {
-                    let _ = waiter.await;
+                        kind: ReliableProgressKind::ToolOutput,
+                        acknowledged,
+                    })
+                    .await
+                    .map_err(|_| SessionTurnFailure::Model)?;
+                #[cfg(test)]
+                hooks.reliable_progress_waiting.notify();
+                if !waiter.await.unwrap_or(false) {
+                    return Err(SessionTurnFailure::Model);
                 }
             }
         }
@@ -12683,6 +13329,14 @@ impl SessionExecutorTestHooks {
         *lock(&self.inner.close_drain_signal_outcome)
     }
 
+    pub(crate) async fn await_prepare_deadline_signal_processed(&self) {
+        self.inner.prepare_deadline_signal_processed.wait().await;
+    }
+
+    pub(crate) fn prepare_deadline_signal_outcome(&self) -> Option<EmergencyControlSignalOutcome> {
+        *lock(&self.inner.prepare_deadline_signal_outcome)
+    }
+
     pub(crate) fn arm_before_emergency_submit_to_turn_migration(&self) {
         self.inner.before_emergency_submit_to_turn_migration.arm();
     }
@@ -12727,6 +13381,118 @@ impl SessionExecutorTestHooks {
         self.inner.before_compaction_apply.release();
     }
 
+    pub(crate) fn arm_before_final_commit(&self) {
+        self.inner.before_final_commit.arm();
+    }
+
+    pub(crate) async fn wait_before_final_commit(&self) {
+        self.inner.before_final_commit.wait_until_entered().await;
+    }
+
+    pub(crate) fn release_before_final_commit(&self) {
+        self.inner.before_final_commit.release();
+    }
+
+    pub(crate) fn arm_after_final_live_apply_before_completion(&self) {
+        self.inner.after_final_live_apply_before_completion.arm();
+    }
+
+    pub(crate) async fn wait_after_final_live_apply_before_completion(&self) {
+        self.inner
+            .after_final_live_apply_before_completion
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_after_final_live_apply_before_completion(&self) {
+        self.inner
+            .after_final_live_apply_before_completion
+            .release();
+    }
+
+    pub(crate) fn arm_after_submit_admission_started(&self) {
+        self.inner.after_submit_admission_started.arm();
+    }
+
+    pub(crate) async fn wait_after_submit_admission_started(&self) {
+        self.inner
+            .after_submit_admission_started
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_after_submit_admission_started(&self) {
+        self.inner.after_submit_admission_started.release();
+    }
+
+    pub(crate) fn arm_after_turn_worker_spawned(&self) {
+        self.inner.after_turn_worker_spawned.arm();
+    }
+
+    pub(crate) async fn wait_after_turn_worker_spawned(&self) {
+        self.inner
+            .after_turn_worker_spawned
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_after_turn_worker_spawned(&self) {
+        self.inner.after_turn_worker_spawned.release();
+    }
+
+    pub(crate) fn arm_after_turn_phase_acknowledged(&self) {
+        self.inner.after_turn_phase_acknowledged.arm();
+    }
+
+    pub(crate) async fn wait_after_turn_phase_acknowledged(&self) {
+        self.inner
+            .after_turn_phase_acknowledged
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_after_turn_phase_acknowledged(&self) {
+        self.inner.after_turn_phase_acknowledged.release();
+    }
+
+    pub(crate) async fn wait_turn_completion_queued(&self) {
+        self.inner.turn_completion_queued.wait().await;
+    }
+
+    pub(crate) async fn wait_final_phase_queued(&self) {
+        self.inner.final_phase_queued.wait().await;
+    }
+
+    pub(crate) fn arm_before_turn_completion_queued(&self) {
+        self.inner.before_turn_completion_queued.arm();
+    }
+
+    pub(crate) async fn wait_before_turn_completion_queued(&self) {
+        self.inner
+            .before_turn_completion_queued
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_before_turn_completion_queued(&self) {
+        self.inner.before_turn_completion_queued.release();
+    }
+
+    pub(crate) fn arm_after_turn_terminal_published(&self) {
+        self.inner.after_turn_terminal_published.arm();
+    }
+
+    pub(crate) async fn wait_after_turn_terminal_published(&self) {
+        self.inner
+            .after_turn_terminal_published
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_after_turn_terminal_published(&self) {
+        self.inner.after_turn_terminal_published.release();
+    }
+
     pub(crate) async fn wait_before_steer_safe_point(&self) {
         self.inner
             .before_steer_safe_point
@@ -12763,6 +13529,21 @@ impl SessionExecutorTestHooks {
 
     pub(crate) fn release_after_steer_arbitration(&self) {
         self.inner.after_steer_arbitration.release();
+    }
+
+    pub(crate) fn arm_after_steer_safe_point_acknowledged(&self) {
+        self.inner.after_steer_safe_point_acknowledged.arm();
+    }
+
+    pub(crate) async fn wait_after_steer_safe_point_acknowledged(&self) {
+        self.inner
+            .after_steer_safe_point_acknowledged
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_after_steer_safe_point_acknowledged(&self) {
+        self.inner.after_steer_safe_point_acknowledged.release();
     }
 
     pub(crate) fn arm_after_candidate_snapshot_finish_before_durable(&self) {
@@ -12845,6 +13626,20 @@ impl SessionExecutorTestHooks {
             .fail_next_install_after_commit
             .store(true, std::sync::atomic::Ordering::Release);
     }
+
+    pub(crate) fn model_progress_publications(&self) -> usize {
+        self.inner
+            .model_progress_publications
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_reliable_progress_waiting(&self) {
+        self.inner.reliable_progress_waiting.wait().await;
+    }
+
+    pub(crate) async fn wait_security_invalidation_admitted(&self) {
+        self.inner.security_invalidation_admitted.wait().await;
+    }
 }
 
 #[cfg(test)]
@@ -12854,6 +13649,13 @@ struct SessionExecutorTestHooksInner {
     after_input_before_completion: Arc<NamedAsyncBarrier>,
     before_agent_run_attempt: Arc<NamedAsyncBarrier>,
     before_compaction_apply: Arc<NamedAsyncBarrier>,
+    before_final_commit: Arc<NamedAsyncBarrier>,
+    after_final_live_apply_before_completion: Arc<NamedAsyncBarrier>,
+    after_submit_admission_started: Arc<NamedAsyncBarrier>,
+    after_turn_worker_spawned: Arc<NamedAsyncBarrier>,
+    after_turn_phase_acknowledged: Arc<NamedAsyncBarrier>,
+    before_turn_completion_queued: Arc<NamedAsyncBarrier>,
+    after_turn_terminal_published: Arc<NamedAsyncBarrier>,
     before_steer_safe_point: Arc<NamedAsyncBarrier>,
     before_tool_round_start: Arc<NamedAsyncBarrier>,
     after_interaction_presentation_reserved: Arc<NamedAsyncBarrier>,
@@ -12864,12 +13666,15 @@ struct SessionExecutorTestHooksInner {
     before_user_question_binding: Arc<NamedAsyncBarrier>,
     after_steer_resolution: Arc<NamedAsyncBarrier>,
     after_steer_arbitration: Arc<NamedAsyncBarrier>,
+    after_steer_safe_point_acknowledged: Arc<NamedAsyncBarrier>,
     after_snapshot_finish: Arc<NamedAsyncBarrier>,
     after_commit_before_install: Arc<NamedAsyncBarrier>,
     settled: Arc<SettlementNotification>,
     pending_interaction_published: Arc<SettlementNotification>,
     close_drain_signal_processed: Arc<SettlementNotification>,
     close_drain_signal_outcome: Arc<Mutex<Option<EmergencyControlSignalOutcome>>>,
+    prepare_deadline_signal_processed: Arc<SettlementNotification>,
+    prepare_deadline_signal_outcome: Arc<Mutex<Option<EmergencyControlSignalOutcome>>>,
     fail_next_install_after_commit: std::sync::atomic::AtomicBool,
     runtime_dependency_probe_settlements: std::sync::atomic::AtomicUsize,
     runtime_dependency_probe_settled: tokio::sync::Notify,
@@ -12879,6 +13684,11 @@ struct SessionExecutorTestHooksInner {
     runtime_dependency_probe_active: std::sync::atomic::AtomicBool,
     /// Wakes `await_runtime_dependency_probe_idle` when the probe-active flag clears.
     runtime_dependency_probe_idle: tokio::sync::Notify,
+    model_progress_publications: std::sync::atomic::AtomicUsize,
+    reliable_progress_waiting: Arc<SettlementNotification>,
+    security_invalidation_admitted: Arc<SettlementNotification>,
+    final_phase_queued: Arc<SettlementNotification>,
+    turn_completion_queued: Arc<SettlementNotification>,
 }
 
 #[cfg(test)]
@@ -12890,6 +13700,13 @@ impl SessionExecutorTestHooksInner {
             after_input_before_completion: Arc::new(NamedAsyncBarrier::new()),
             before_agent_run_attempt: Arc::new(NamedAsyncBarrier::new()),
             before_compaction_apply: Arc::new(NamedAsyncBarrier::new()),
+            before_final_commit: Arc::new(NamedAsyncBarrier::new()),
+            after_final_live_apply_before_completion: Arc::new(NamedAsyncBarrier::new()),
+            after_submit_admission_started: Arc::new(NamedAsyncBarrier::new()),
+            after_turn_worker_spawned: Arc::new(NamedAsyncBarrier::new()),
+            after_turn_phase_acknowledged: Arc::new(NamedAsyncBarrier::new()),
+            before_turn_completion_queued: Arc::new(NamedAsyncBarrier::new()),
+            after_turn_terminal_published: Arc::new(NamedAsyncBarrier::new()),
             before_steer_safe_point: Arc::new(NamedAsyncBarrier::new()),
             before_tool_round_start: Arc::new(NamedAsyncBarrier::new()),
             after_interaction_presentation_reserved: Arc::new(NamedAsyncBarrier::new()),
@@ -12900,17 +13717,25 @@ impl SessionExecutorTestHooksInner {
             before_user_question_binding: Arc::new(NamedAsyncBarrier::new()),
             after_steer_resolution: Arc::new(NamedAsyncBarrier::new()),
             after_steer_arbitration: Arc::new(NamedAsyncBarrier::new()),
+            after_steer_safe_point_acknowledged: Arc::new(NamedAsyncBarrier::new()),
             after_snapshot_finish: Arc::new(NamedAsyncBarrier::new()),
             after_commit_before_install: Arc::new(NamedAsyncBarrier::new()),
             settled: Arc::new(SettlementNotification::new()),
             pending_interaction_published: Arc::new(SettlementNotification::new()),
             close_drain_signal_processed: Arc::new(SettlementNotification::new()),
             close_drain_signal_outcome: Arc::new(Mutex::new(None)),
+            prepare_deadline_signal_processed: Arc::new(SettlementNotification::new()),
+            prepare_deadline_signal_outcome: Arc::new(Mutex::new(None)),
             fail_next_install_after_commit: std::sync::atomic::AtomicBool::new(false),
             runtime_dependency_probe_settlements: std::sync::atomic::AtomicUsize::new(0),
             runtime_dependency_probe_settled: tokio::sync::Notify::new(),
             runtime_dependency_probe_active: std::sync::atomic::AtomicBool::new(false),
             runtime_dependency_probe_idle: tokio::sync::Notify::new(),
+            model_progress_publications: std::sync::atomic::AtomicUsize::new(0),
+            reliable_progress_waiting: Arc::new(SettlementNotification::new()),
+            security_invalidation_admitted: Arc::new(SettlementNotification::new()),
+            final_phase_queued: Arc::new(SettlementNotification::new()),
+            turn_completion_queued: Arc::new(SettlementNotification::new()),
         }
     }
 
@@ -12934,6 +13759,36 @@ impl SessionExecutorTestHooksInner {
 
     async fn before_compaction_apply(&self) {
         self.before_compaction_apply.wait_if_armed().await;
+    }
+
+    async fn before_final_commit(&self) {
+        self.before_final_commit.wait_if_armed().await;
+    }
+
+    async fn after_final_live_apply_before_completion(&self) {
+        self.after_final_live_apply_before_completion
+            .wait_if_armed()
+            .await;
+    }
+
+    async fn after_submit_admission_started(&self) {
+        self.after_submit_admission_started.wait_if_armed().await;
+    }
+
+    async fn after_turn_worker_spawned(&self) {
+        self.after_turn_worker_spawned.wait_if_armed().await;
+    }
+
+    async fn after_turn_phase_acknowledged(&self) {
+        self.after_turn_phase_acknowledged.wait_if_armed().await;
+    }
+
+    async fn before_turn_completion_queued(&self) {
+        self.before_turn_completion_queued.wait_if_armed().await;
+    }
+
+    async fn after_turn_terminal_published(&self) {
+        self.after_turn_terminal_published.wait_if_armed().await;
     }
 
     async fn before_steer_safe_point(&self) {
@@ -12982,6 +13837,11 @@ impl SessionExecutorTestHooksInner {
         self.close_drain_signal_processed.notify();
     }
 
+    fn record_prepare_deadline_signal(&self, outcome: EmergencyControlSignalOutcome) {
+        *lock(&self.prepare_deadline_signal_outcome) = Some(outcome);
+        self.prepare_deadline_signal_processed.notify();
+    }
+
     /// Parks the actor right before the atomic Submit→Turn emergency migration in the
     /// admission success handler: a test can prove the synchronous close handoff
     /// (`request_closing`'s sticky `signal_current`) that lands on the Submit basis is
@@ -13007,6 +13867,12 @@ impl SessionExecutorTestHooksInner {
 
     async fn after_steer_arbitration(&self) {
         self.after_steer_arbitration.wait_if_armed().await;
+    }
+
+    async fn after_steer_safe_point_acknowledged(&self) {
+        self.after_steer_safe_point_acknowledged
+            .wait_if_armed()
+            .await;
     }
 
     async fn after_candidate_snapshot_finish_before_durable(&self) {
@@ -13327,6 +14193,275 @@ mod tests {
                 "x".repeat(MAX_TOOL_OUTPUT_DELTA_CHUNK_BYTES + 1)
             )
         );
+    }
+
+    #[test]
+    fn model_progress_mailbox_bounds_one_hundred_thousand_tiny_deltas() {
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let turn_id: TurnId = "trn_33333333333333333333333333333333".parse().unwrap();
+        let demand = Arc::new(ProgressDemand::default());
+        let _lease = demand.acquire();
+        let (wake_sender, mut wake_receiver) = mpsc::channel(MODEL_PROGRESS_WAKE_CHANNEL_CAPACITY);
+        let mailbox = Arc::new(TurnProgressMailbox::new(
+            session_id,
+            turn_id,
+            Arc::clone(&demand),
+            wake_sender,
+        ));
+        let progress =
+            ActiveModelProgress::new_with_mailbox(session_id, turn_id, Arc::clone(&mailbox));
+
+        for _ in 0..100_000 {
+            progress.publish_provider_event(ModelProgressEvent::ContentDelta {
+                content_index: 0,
+                delta: ModelContentDelta::Text(Arc::from("x")),
+            });
+        }
+
+        assert_eq!(wake_receiver.try_recv(), Ok(turn_id));
+        assert!(wake_receiver.try_recv().is_err());
+        let high_water = mailbox.high_water_for_test();
+        assert_eq!(high_water.events, MODEL_PROGRESS_PENDING_EVENT_CAPACITY);
+        assert!(high_water.text_bytes <= MODEL_PROGRESS_PENDING_TEXT_CAPACITY);
+        assert_eq!(high_water.keys, 1);
+
+        let retained = mailbox.drain_for_test();
+        assert!(matches!(
+            retained.first().map(ProgressEvent::update),
+            Some(ProgressUpdate::ItemStarted { .. })
+        ));
+        let text = retained
+            .iter()
+            .filter_map(|event| match event.update() {
+                ProgressUpdate::ItemDelta { delta, .. } => Some(delta.as_ref()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(!text.is_empty());
+        assert!(text.bytes().all(|byte| byte == b'x'));
+        assert!(retained.iter().all(|event| match event.update() {
+            ProgressUpdate::ItemDelta { delta, .. } => {
+                delta.len() <= MODEL_PROGRESS_DELTA_CHUNK_BYTES
+            }
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn model_progress_mailbox_skips_no_demand_payloads_and_bounds_keys() {
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let turn_id: TurnId = "trn_44444444444444444444444444444444".parse().unwrap();
+        let demand = Arc::new(ProgressDemand::default());
+        let (wake_sender, mut wake_receiver) = mpsc::channel(MODEL_PROGRESS_WAKE_CHANNEL_CAPACITY);
+        let mailbox = Arc::new(TurnProgressMailbox::new(
+            session_id,
+            turn_id,
+            Arc::clone(&demand),
+            wake_sender,
+        ));
+        let progress =
+            ActiveModelProgress::new_with_mailbox(session_id, turn_id, Arc::clone(&mailbox));
+
+        for _ in 0..100_000 {
+            progress.publish_provider_event(ModelProgressEvent::ContentDelta {
+                content_index: 0,
+                delta: ModelContentDelta::Text(Arc::from("x")),
+            });
+        }
+        assert!(wake_receiver.try_recv().is_err());
+        let without_demand = mailbox.high_water_for_test();
+        assert_eq!(without_demand.events, 0);
+        assert_eq!(without_demand.text_bytes, 0);
+
+        let _lease = demand.acquire();
+        for content_index in 1..=100 {
+            progress.publish_provider_event(ModelProgressEvent::ContentDelta {
+                content_index,
+                delta: ModelContentDelta::Text(Arc::from("y")),
+            });
+        }
+        assert_eq!(
+            mailbox.high_water_for_test().keys,
+            MODEL_PROGRESS_KEY_CAPACITY
+        );
+    }
+
+    #[test]
+    fn model_progress_mailbox_preserves_utf8_prefix_and_reasoning_fallback_bookkeeping() {
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let turn_id: TurnId = "trn_55555555555555555555555555555555".parse().unwrap();
+        let demand = Arc::new(ProgressDemand::default());
+        let (wake_sender, _wake_receiver) = mpsc::channel(MODEL_PROGRESS_WAKE_CHANNEL_CAPACITY);
+        let mailbox = Arc::new(TurnProgressMailbox::new(
+            session_id,
+            turn_id,
+            Arc::clone(&demand),
+            wake_sender,
+        ));
+        let progress =
+            ActiveModelProgress::new_with_mailbox(session_id, turn_id, Arc::clone(&mailbox));
+        let unit = "界🙂";
+        let expected = unit.repeat(10_000);
+        let _lease = demand.acquire();
+        for _ in 0..10_000 {
+            progress.publish_provider_event(ModelProgressEvent::ContentDelta {
+                content_index: 0,
+                delta: ModelContentDelta::Text(Arc::from(unit)),
+            });
+        }
+        let retained = mailbox.drain_for_test();
+        assert!(matches!(
+            retained.first().map(ProgressEvent::update),
+            Some(ProgressUpdate::ItemStarted { .. })
+        ));
+        let text = retained
+            .iter()
+            .filter_map(|event| match event.update() {
+                ProgressUpdate::ItemDelta { delta, .. } => Some(delta.as_ref()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(!text.is_empty());
+        assert!(expected.starts_with(&text));
+        assert!(text.is_char_boundary(text.len()));
+
+        drop(_lease);
+        progress.publish_provider_event(ModelProgressEvent::ContentDelta {
+            content_index: 1,
+            delta: ModelContentDelta::ReasoningText(Arc::from("raw hidden by no demand")),
+        });
+        let reasoning_item = progress
+            .final_item_id(1, ActiveModelProgressKind::Reasoning)
+            .unwrap();
+        let _lease = demand.acquire();
+        progress.publish_final_summary_if_missing(1, reasoning_item, "must not be published");
+        assert!(mailbox.drain_for_test().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retained_first_attempt_publisher_is_inert_after_retry_acknowledgement() {
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let turn_id: TurnId = "trn_66666666666666666666666666666666".parse().unwrap();
+        let demand = Arc::new(ProgressDemand::default());
+        let _lease = demand.acquire();
+        let (wake_sender, _wake_receiver) = mpsc::channel(MODEL_PROGRESS_WAKE_CHANNEL_CAPACITY);
+        let mailbox = Arc::new(TurnProgressMailbox::new(
+            session_id,
+            turn_id,
+            Arc::clone(&demand),
+            wake_sender,
+        ));
+        let (reliable_sender, mut reliable_receiver) =
+            mpsc::channel(RELIABLE_PROGRESS_CHANNEL_CAPACITY);
+        let progress =
+            ActiveModelProgress::new(session_id, turn_id, Arc::clone(&mailbox), reliable_sender);
+        let first_attempt = progress.publisher();
+        first_attempt.publish_for_test(ModelProgressEvent::ContentDelta {
+            content_index: 0,
+            delta: ModelContentDelta::Text(Arc::from("first text")),
+        });
+        first_attempt.publish_for_test(ModelProgressEvent::ContentDelta {
+            content_index: 1,
+            delta: ModelContentDelta::ReasoningText(Arc::from("first reasoning")),
+        });
+        let first_events = mailbox.drain_for_test();
+        let first_text_item = first_events
+            .iter()
+            .find_map(|event| match event.update() {
+                ProgressUpdate::ItemStarted {
+                    content_kind: ItemProgressContentKind::AssistantText,
+                    ..
+                } => match event.route() {
+                    EventRoute::Item { item_id, .. } => Some(item_id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the first attempt starts its text item");
+        let first_reasoning_item = first_events
+            .iter()
+            .find_map(|event| match event.update() {
+                ProgressUpdate::ItemStarted {
+                    content_kind: ItemProgressContentKind::Reasoning,
+                    ..
+                } => match event.route() {
+                    EventRoute::Item { item_id, .. } => Some(item_id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the first attempt starts its reasoning item");
+
+        let mut retry = Box::pin(progress.retry_scheduled(1, std::time::Duration::from_millis(1)));
+        assert!(poll_once_pending(retry.as_mut()).await);
+        let marker = reliable_receiver
+            .recv()
+            .await
+            .expect("the retry marker reaches the reliable lane");
+        assert_eq!(marker.turn_id, turn_id);
+        assert!(matches!(&marker.kind, ReliableProgressKind::Retry));
+        marker
+            .acknowledged
+            .send(true)
+            .expect("the retry acknowledgement receiver remains live");
+        assert!(retry.await);
+
+        first_attempt.publish_for_test(ModelProgressEvent::ContentDelta {
+            content_index: 0,
+            delta: ModelContentDelta::Text(Arc::from("stale text")),
+        });
+        first_attempt.publish_for_test(ModelProgressEvent::ContentDelta {
+            content_index: 1,
+            delta: ModelContentDelta::ReasoningText(Arc::from("stale reasoning")),
+        });
+        assert!(
+            mailbox.drain_for_test().is_empty(),
+            "the retained first-attempt callback must be inert after retry acknowledgement"
+        );
+
+        let second_attempt = progress.publisher();
+        second_attempt.publish_for_test(ModelProgressEvent::ContentDelta {
+            content_index: 0,
+            delta: ModelContentDelta::Text(Arc::from("second text")),
+        });
+        let reasoning_item = progress
+            .final_item_id(1, ActiveModelProgressKind::Reasoning)
+            .unwrap();
+        assert_eq!(reasoning_item, first_reasoning_item);
+        progress.publish_final_summary_if_missing(1, reasoning_item, "final summary");
+        let second_events = mailbox.drain_for_test();
+        assert!(second_events.iter().any(|event| {
+            matches!(
+                (event.route(), event.update()),
+                (
+                    EventRoute::Item { item_id, .. },
+                    ProgressUpdate::ItemStarted {
+                        content_kind: ItemProgressContentKind::AssistantText,
+                        ..
+                    }
+                ) if item_id == first_text_item
+            )
+        }));
+        assert!(second_events.iter().any(|event| {
+            matches!(
+                (event.route(), event.update()),
+                (
+                    EventRoute::Item { item_id, .. },
+                    ProgressUpdate::ItemStarted {
+                        content_kind: ItemProgressContentKind::Reasoning,
+                        ..
+                    }
+                ) if item_id == first_reasoning_item
+            )
+        }));
+        let deltas = second_events
+            .iter()
+            .filter_map(|event| match event.update() {
+                ProgressUpdate::ItemDelta { delta, .. } => Some(delta.as_ref()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, ["second text", "final summary"]);
     }
 
     #[test]
@@ -15409,7 +16544,7 @@ mod tests {
 
         assert_eq!(
             wait_for_terminal(&loaded.executor, turn_id).await,
-            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+            SessionTurnTerminal::Interrupted(SessionTurnInterruption::SecurityRevoked)
         );
         assert_eq!(model.request_count(), 1);
         let live_state = loaded.executor.live_state_for_test().unwrap();
@@ -15477,7 +16612,7 @@ mod tests {
 
         assert_eq!(
             wait_for_terminal(&loaded.executor, turn_id).await,
-            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+            SessionTurnTerminal::Interrupted(SessionTurnInterruption::SecurityRevoked)
         );
         assert_eq!(model.request_count(), 1);
         let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
