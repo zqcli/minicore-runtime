@@ -16,6 +16,8 @@ pub(crate) mod model_v2;
 pub(crate) mod session_v2;
 #[path = "tools/mod.rs"]
 pub(crate) mod tools_v2;
+#[path = "workspace_v2/mod.rs"]
+pub(crate) mod workspace_v2;
 pub use compaction::CompactionSettings;
 pub(crate) mod conversation_storage;
 pub(crate) mod durable_state;
@@ -54,6 +56,10 @@ pub use session_v2::{
 pub use tools_v2::{
     ToolCallSummary, ToolName, ToolNameError, ToolOutput, ToolResultStatus, ToolResultSummary,
     ToolSpec, ToolValueError, UserAnswer, UserQuestion,
+};
+pub use workspace_v2::{
+    DirectoryEntry, DirectoryEntryKind, RelativePath, RelativePathError, Workspace,
+    WorkspaceAccess, WorkspaceError,
 };
 pub mod skills;
 #[path = "tools.rs"]
