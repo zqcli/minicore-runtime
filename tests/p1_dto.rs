@@ -3,9 +3,9 @@ use std::str::FromStr;
 
 use minicore_runtime::{
     AssistantPart, InteractionId, ModelEvent, ModelFinishReason, ModelId, ModelLimits,
-    ModelMessage, ModelRequest, ModelResponse, ModelSelection, ProviderId, ReasoningPreference,
-    SessionEvent, SessionEventKind, SessionId, SessionSnapshot, SessionStatus, SnapshotHistory,
-    ToolCall, ToolCallId, ToolCallSummary, ToolName, ToolOutput, ToolResultStatus,
+    ModelMessage, ModelRequest, ModelResponse, ModelSelection, ProviderId, ReasoningContent,
+    ReasoningPreference, SessionEvent, SessionEventKind, SessionId, SessionSnapshot, SessionStatus,
+    SnapshotHistory, ToolCall, ToolCallId, ToolCallSummary, ToolName, ToolOutput, ToolResultStatus,
     ToolResultSummary, ToolSpec, TurnId, TurnSummary, Usage, UserAnswer, UserQuestion,
 };
 
@@ -113,6 +113,40 @@ fn model_and_tool_dtos_round_trip_through_checked_ordinary_json() {
     assert_json_round_trip(&request);
     assert_json_round_trip(&response);
     assert_json_round_trip(&events);
+}
+
+#[test]
+fn usage_preserves_unknown_counts_and_only_sums_complete_reported_values() {
+    const OPTIONAL: Usage = Usage::from_optional(Some(12), Some(3), None);
+
+    let default = Usage::default();
+    assert_eq!(default.input_tokens(), None);
+    assert_eq!(default.output_tokens(), None);
+    assert_eq!(default.reasoning_tokens(), None);
+    assert_eq!(default.total_tokens(), None);
+    assert_eq!(
+        serde_json::to_value(default).unwrap(),
+        serde_json::json!({})
+    );
+    assert_eq!(
+        serde_json::from_value::<Usage>(serde_json::json!({})).unwrap(),
+        default
+    );
+
+    let complete = Usage::new(12, 3, 2);
+    assert_eq!(complete.input_tokens(), Some(12));
+    assert_eq!(complete.output_tokens(), Some(3));
+    assert_eq!(complete.reasoning_tokens(), Some(2));
+    assert_eq!(complete.total_tokens(), Some(17));
+
+    assert_eq!(OPTIONAL.input_tokens(), Some(12));
+    assert_eq!(OPTIONAL.output_tokens(), Some(3));
+    assert_eq!(OPTIONAL.reasoning_tokens(), None);
+    assert_eq!(OPTIONAL.total_tokens(), None);
+    assert_eq!(
+        Usage::from_optional(Some(u64::MAX), Some(1), Some(0)).total_tokens(),
+        None
+    );
 }
 
 #[test]
@@ -271,7 +305,17 @@ fn model_request_scopes_call_indices_and_ids_to_each_assistant_round() {
         selection,
         vec![
             ModelMessage::assistant(vec![AssistantPart::ToolCall(call("round_1!", 0))]).unwrap(),
+            ModelMessage::tool(
+                "round_1!".parse().unwrap(),
+                ToolOutput::success("round one").unwrap(),
+            )
+            .unwrap(),
             ModelMessage::assistant(vec![AssistantPart::ToolCall(call("round_2!", 0))]).unwrap(),
+            ModelMessage::tool(
+                "round_2!".parse().unwrap(),
+                ToolOutput::success("round two").unwrap(),
+            )
+            .unwrap(),
         ],
         Vec::new(),
         ModelLimits::default(),
@@ -577,9 +621,134 @@ fn session_snapshot_deserialize_is_checked_and_event_json_is_canonical_and_safe(
 }
 
 #[test]
+fn model_request_requires_complete_ordered_tool_exchanges() {
+    let selection = ModelSelection::new("openai".parse().unwrap(), "model".parse().unwrap());
+    let limits = ModelLimits::new(None, Some(32)).unwrap();
+    let assistant =
+        ModelMessage::assistant(vec![AssistantPart::ToolCall(call("call_1", 0))]).unwrap();
+    let result = ModelMessage::tool(
+        "call_1".parse().unwrap(),
+        ToolOutput::success("ok").unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        ModelRequest::new(
+            selection.clone(),
+            vec![result.clone(), ModelMessage::user("orphan").unwrap()],
+            Vec::new(),
+            limits,
+            ReasoningPreference::Auto,
+        )
+        .is_err()
+    );
+    assert!(
+        ModelRequest::new(
+            selection.clone(),
+            vec![assistant.clone(), ModelMessage::user("too early").unwrap()],
+            Vec::new(),
+            limits,
+            ReasoningPreference::Auto,
+        )
+        .is_err()
+    );
+    assert!(
+        ModelRequest::new(
+            selection.clone(),
+            vec![assistant.clone()],
+            Vec::new(),
+            limits,
+            ReasoningPreference::Auto,
+        )
+        .is_err()
+    );
+    assert!(
+        ModelRequest::new(
+            selection.clone(),
+            vec![assistant.clone(), result.clone(), result.clone()],
+            Vec::new(),
+            limits,
+            ReasoningPreference::Auto,
+        )
+        .is_err()
+    );
+    assert!(
+        ModelRequest::new(
+            selection,
+            vec![assistant, result, ModelMessage::user("next").unwrap()],
+            Vec::new(),
+            limits,
+            ReasoningPreference::Auto,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn tool_schemas_and_arguments_share_bounded_json_shape_limits() {
+    fn nested(depth: usize) -> serde_json::Value {
+        let mut value = serde_json::json!({});
+        for _ in 0..depth {
+            value = serde_json::json!({"nested": value});
+        }
+        value
+    }
+
+    let name = ToolName::from_str("read_file").unwrap();
+    assert!(ToolSpec::new(name.clone(), "bounded", nested(32)).is_ok());
+    assert!(ToolSpec::new(name.clone(), "too deep", nested(33)).is_err());
+    let nodes_within = serde_json::json!({
+        "items": (0..4_094).map(|_| serde_json::Value::Null).collect::<Vec<_>>()
+    });
+    let nodes_over = serde_json::json!({
+        "items": (0..4_095).map(|_| serde_json::Value::Null).collect::<Vec<_>>()
+    });
+    assert!(ToolSpec::new(name.clone(), "node bound", nodes_within).is_ok());
+    assert!(ToolSpec::new(name.clone(), "too many nodes", nodes_over).is_err());
+    let oversized_schema = serde_json::json!({"text": "x".repeat(66_000)});
+    assert!(ToolSpec::new(name.clone(), "too large", oversized_schema.clone()).is_err());
+    assert!(
+        serde_json::from_value::<ToolSpec>(serde_json::json!({
+            "name": "read_file",
+            "description": "too large",
+            "input_schema": oversized_schema,
+        }))
+        .is_err()
+    );
+
+    assert!(
+        ToolCall::new(
+            ToolCallId::from_str("call_json").unwrap(),
+            name.clone(),
+            nested(32),
+            0,
+        )
+        .is_ok()
+    );
+    assert!(
+        ToolCall::new(
+            ToolCallId::from_str("call_json").unwrap(),
+            name.clone(),
+            nested(33),
+            0,
+        )
+        .is_err()
+    );
+    assert!(
+        ToolCall::new(
+            ToolCallId::from_str("call_json").unwrap(),
+            name,
+            serde_json::json!({"text": "x".repeat(66_000)}),
+            0,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn model_message_and_assistant_parts_expose_minimal_validation() {
     assert!(AssistantPart::Text(String::new()).validate().is_err());
-    assert!(AssistantPart::Reasoning(String::new()).validate().is_err());
+    assert!(ReasoningContent::new(None, None, None, None, None).is_err());
     assert!(ModelMessage::User(String::new()).validate().is_err());
     assert!(ModelMessage::Assistant(Vec::new()).validate().is_err());
 }
