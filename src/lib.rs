@@ -4,6 +4,18 @@ pub mod agent_session_lifecycle;
     reason = "M4/M5 foundations and M10 planning are consumed by adjacent summary/orchestration slices"
 )]
 pub(crate) mod compaction;
+#[path = "error.rs"]
+pub(crate) mod error_v2;
+#[path = "event.rs"]
+pub(crate) mod event_v2;
+#[path = "ids.rs"]
+pub(crate) mod ids_v2;
+#[path = "model/mod.rs"]
+pub(crate) mod model_v2;
+#[path = "session/mod.rs"]
+pub(crate) mod session_v2;
+#[path = "tools/mod.rs"]
+pub(crate) mod tools_v2;
 pub use compaction::CompactionSettings;
 pub(crate) mod conversation_storage;
 pub(crate) mod durable_state;
@@ -23,8 +35,28 @@ pub(crate) mod session_ingress;
 pub(crate) mod session_residency;
 pub mod session_transcript;
 pub(crate) mod turn_execution_context;
+pub use error_v2::{PublicErrorCode, PublicErrorSummary, RuntimeError, SessionError};
+pub use event_v2::SessionEventKind;
+pub use ids_v2::{
+    IdError, IdGenerationError, InteractionId, RuntimeIdError, SessionId, ToolCallId,
+    ToolCallIdError, TurnId,
+};
+pub use model_v2::{
+    AssistantPart, DeliveryState, ModelError, ModelEvent, ModelFinishReason, ModelId,
+    ModelIdentityError, ModelLimits, ModelLimitsError, ModelMessage, ModelRequest, ModelResponse,
+    ModelSelection, ModelValueError, ProviderId, ReasoningPreference, ToolCall, Usage,
+};
 pub use runtime::{MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError};
+pub use session_v2::{
+    SessionEvent, SessionSnapshot, SessionStatus, SnapshotHistory, SnapshotShapeError,
+    TerminalOutcome, TurnOutcome, TurnSummary, TurnTerminal, TurnTerminalSummary,
+};
+pub use tools_v2::{
+    ToolCallSummary, ToolName, ToolNameError, ToolOutput, ToolResultStatus, ToolResultSummary,
+    ToolSpec, ToolValueError, UserAnswer, UserQuestion,
+};
 pub mod skills;
+#[path = "tools.rs"]
 pub mod tools;
 pub mod turn_item_interaction;
 pub mod wire;
