@@ -104,9 +104,7 @@ impl ModelErrorDetails {
             ModelErrorKind::Unavailable | ModelErrorKind::AuthMissing => {
                 delivery == DeliveryState::NotSent
             }
-            ModelErrorKind::Cancelled => {
-                matches!(delivery, DeliveryState::NotSent | DeliveryState::Unknown)
-            }
+            ModelErrorKind::Cancelled => true,
             _ => true,
         };
         if !delivery_allowed {
