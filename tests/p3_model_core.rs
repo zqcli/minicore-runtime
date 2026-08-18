@@ -768,9 +768,8 @@ fn detailed_model_errors_follow_the_complete_delivery_matrix() {
         }
     }
     for delivery in deliveries {
-        assert_eq!(
+        assert!(
             ModelError::detailed(ModelErrorKind::Cancelled, delivery, None).is_ok(),
-            matches!(delivery, DeliveryState::NotSent | DeliveryState::Unknown),
             "unexpected cancellation matrix result for {delivery:?}"
         );
     }

@@ -1,6 +1,7 @@
 mod gateway;
 mod provider;
 mod registry;
+pub(crate) mod transport;
 mod types;
 
 pub use gateway::ModelGateway;

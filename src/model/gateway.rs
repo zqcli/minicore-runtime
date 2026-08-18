@@ -16,6 +16,7 @@ pub struct ModelGateway {
 
 impl ModelGateway {
     pub fn new(registry: ProviderRegistry) -> Self {
+        super::transport::ensure_linked();
         Self { registry }
     }
 
