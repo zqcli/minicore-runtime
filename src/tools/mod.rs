@@ -1,6 +1,14 @@
+mod context;
+mod policy;
+mod registry;
 mod types;
 
+pub use context::{InteractionClient, InteractionReceiver, InteractionRequest, ToolContext};
+pub use policy::{
+    AllowConfiguredTools, ToolContextView, ToolDecision, ToolPolicy, ToolPolicyError, ToolRequest,
+};
+pub use registry::{Tool, ToolFuture, ToolRegistry, ToolRegistryBuilder};
 pub use types::{
-    ToolCallSummary, ToolName, ToolNameError, ToolOutput, ToolResultStatus, ToolResultSummary,
-    ToolSpec, ToolValueError, UserAnswer, UserQuestion,
+    ToolCallSummary, ToolError, ToolName, ToolNameError, ToolOutput, ToolResultStatus,
+    ToolResultSummary, ToolSpec, ToolValueError, UserAnswer, UserQuestion,
 };
