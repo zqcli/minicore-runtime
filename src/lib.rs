@@ -44,9 +44,11 @@ pub use ids_v2::{
     ToolCallIdError, TurnId,
 };
 pub use model_v2::{
-    AssistantPart, DeliveryState, ModelError, ModelEvent, ModelFinishReason, ModelId,
-    ModelIdentityError, ModelLimits, ModelLimitsError, ModelMessage, ModelRequest, ModelResponse,
-    ModelSelection, ModelValueError, ProviderId, ReasoningPreference, ToolCall, Usage,
+    AssistantPart, DeliveryState, ModelCallContext, ModelDescriptor, ModelError, ModelErrorDetails,
+    ModelErrorKind, ModelEvent, ModelEventSink, ModelFinishReason, ModelFuture, ModelGateway,
+    ModelId, ModelIdentityError, ModelLimits, ModelLimitsError, ModelMessage, ModelProvider,
+    ModelRequest, ModelResponse, ModelSelection, ModelValueError, ProviderId, ProviderRegistry,
+    ProviderRegistryBuilder, ReasoningPreference, ResolvedModel, ToolCall, Usage,
 };
 pub use runtime::{MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError};
 pub use session_v2::{

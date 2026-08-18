@@ -2,10 +2,10 @@ use std::fmt::Debug;
 use std::str::FromStr;
 
 use minicore_runtime::{
-    AssistantPart, DeliveryState, InteractionId, ModelEvent, ModelFinishReason, ModelId,
-    ModelLimits, ModelMessage, ModelRequest, ModelResponse, ModelSelection, ProviderId,
-    ReasoningPreference, SessionEvent, SessionEventKind, SessionId, SessionSnapshot, SessionStatus,
-    SnapshotHistory, ToolCall, ToolCallId, ToolCallSummary, ToolName, ToolOutput, ToolResultStatus,
+    AssistantPart, InteractionId, ModelEvent, ModelFinishReason, ModelId, ModelLimits,
+    ModelMessage, ModelRequest, ModelResponse, ModelSelection, ProviderId, ReasoningPreference,
+    SessionEvent, SessionEventKind, SessionId, SessionSnapshot, SessionStatus, SnapshotHistory,
+    ToolCall, ToolCallId, ToolCallSummary, ToolName, ToolOutput, ToolResultStatus,
     ToolResultSummary, ToolSpec, TurnId, TurnSummary, Usage, UserAnswer, UserQuestion,
 };
 
@@ -92,7 +92,6 @@ fn model_and_tool_dtos_round_trip_through_checked_ordinary_json() {
         vec![AssistantPart::Text("done".into())],
         ModelFinishReason::Stop,
         Usage::new(12, 3, 0),
-        DeliveryState::Delivered,
     )
     .unwrap();
     let events = vec![
@@ -196,7 +195,6 @@ fn constrained_dto_deserializers_reject_malformed_json_and_nested_invalid_values
         vec![AssistantPart::Text("done".into())],
         ModelFinishReason::Stop,
         Usage::default(),
-        DeliveryState::Delivered,
     )
     .unwrap();
     let mut invalid_response = serde_json::to_value(valid_response).unwrap();
@@ -205,8 +203,7 @@ fn constrained_dto_deserializers_reject_malformed_json_and_nested_invalid_values
     let nested_invalid_response = serde_json::json!({
         "parts": [{"type": "text", "data": ""}],
         "finish_reason": "stop",
-        "usage": {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0},
-        "delivery_state": "delivered"
+        "usage": {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
     });
     assert_invalid::<ModelResponse>(nested_invalid_response);
 }
@@ -246,7 +243,6 @@ fn tool_calls_are_ordered_and_duplicate_ids_or_indices_are_rejected() {
             ],
             ModelFinishReason::ToolCalls,
             Usage::default(),
-            DeliveryState::Delivered,
         )
         .is_err()
     );
