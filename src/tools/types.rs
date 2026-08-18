@@ -9,6 +9,26 @@ use thiserror::Error;
 use crate::ids_v2::{InteractionId, ToolCallId};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ToolError {
+    #[error("tool is unknown")]
+    UnknownTool,
+    #[error("tool name is already registered")]
+    DuplicateTool,
+    #[error("tool execution was cancelled")]
+    Cancelled,
+    #[error("tool interaction channel is closed")]
+    InteractionClosed,
+    #[error("tool interaction is already pending")]
+    InteractionBusy,
+    #[error("tool interaction is invalid")]
+    InvalidInteraction,
+    #[error("tool operation panicked")]
+    Panicked,
+    #[error("tool operation failed internally")]
+    Internal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolNameError {
     #[error("tool name must be 1..=64 bytes")]
     InvalidLength,

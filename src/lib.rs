@@ -54,8 +54,11 @@ pub use session_v2::{
     TerminalOutcome, TurnOutcome, TurnSummary, TurnTerminal, TurnTerminalSummary,
 };
 pub use tools_v2::{
-    ToolCallSummary, ToolName, ToolNameError, ToolOutput, ToolResultStatus, ToolResultSummary,
-    ToolSpec, ToolValueError, UserAnswer, UserQuestion,
+    AllowConfiguredTools, InteractionClient, InteractionReceiver, InteractionRequest, Tool,
+    ToolCallSummary, ToolContext, ToolContextView, ToolDecision, ToolError, ToolFuture, ToolName,
+    ToolNameError, ToolOutput, ToolPolicy, ToolPolicyError, ToolRegistry, ToolRegistryBuilder,
+    ToolRequest, ToolResultStatus, ToolResultSummary, ToolSpec, ToolValueError, UserAnswer,
+    UserQuestion,
 };
 pub use workspace_v2::{
     DirectoryEntry, DirectoryEntryKind, RelativePath, RelativePathError, Workspace,
