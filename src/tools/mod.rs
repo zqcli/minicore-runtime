@@ -1,7 +1,10 @@
+mod builtins;
 mod context;
 mod policy;
 mod registry;
 mod types;
+
+pub use builtins::{AskUserTool, ListDirectoryTool, ReadFileTool, WriteFileTool};
 
 pub use context::{InteractionClient, InteractionReceiver, InteractionRequest, ToolContext};
 pub use policy::{
