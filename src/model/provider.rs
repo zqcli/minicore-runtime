@@ -1,7 +1,10 @@
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -11,6 +14,81 @@ use super::types::{
 
 const MAX_EVENT_CAPACITY: usize = 1_024;
 const MAX_EVENT_DELTA_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ProviderCredentialError {
+    #[error("provider credential must be non-empty safe opaque ASCII within 256 bytes")]
+    Invalid,
+}
+
+#[derive(Clone)]
+pub struct ProviderCredential(Box<str>);
+
+impl ProviderCredential {
+    pub fn new(value: impl AsRef<str>) -> Result<Self, ProviderCredentialError> {
+        value.as_ref().parse()
+    }
+
+    pub(crate) fn header(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for ProviderCredential {
+    type Err = ProviderCredentialError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty()
+            || value.len() > 256
+            || value
+                .bytes()
+                .any(|byte| !(0x21..=0x7e).contains(&byte) || matches!(byte, b'"' | b'\\'))
+        {
+            return Err(ProviderCredentialError::Invalid);
+        }
+        Ok(Self(value.into()))
+    }
+}
+
+impl fmt::Debug for ProviderCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProviderCredential(<redacted>)")
+    }
+}
+
+pub type CredentialSourceFuture<'a> =
+    Pin<Box<dyn Future<Output = Option<ProviderCredential>> + Send + 'a>>;
+
+pub trait CredentialSource: Send + Sync {
+    fn resolve(&self) -> CredentialSourceFuture<'_>;
+}
+
+struct FixedCredentialSource(ProviderCredential);
+
+impl CredentialSource for FixedCredentialSource {
+    fn resolve(&self) -> CredentialSourceFuture<'_> {
+        let credential = self.0.clone();
+        Box::pin(async move { Some(credential) })
+    }
+}
+
+pub fn fixed_credential_source(
+    value: &str,
+) -> Result<Arc<dyn CredentialSource>, ProviderCredentialError> {
+    Ok(Arc::new(FixedCredentialSource(value.parse()?)))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderEndpointPolicy {
+    HttpsOnly,
+    AllowLoopbackHttp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenAiReasoningProgress {
+    SummaryOnly,
+    RawText,
+}
 
 fn valid_event(event: &ModelEvent) -> bool {
     let delta = match event {

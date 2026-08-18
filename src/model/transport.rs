@@ -31,7 +31,7 @@ pub(crate) fn cancelled(delivery: DeliveryState) -> ModelError {
 }
 
 pub(crate) fn invalid_provider_response(delivery: DeliveryState) -> ModelError {
-    checked_error(ModelErrorKind::InvalidResponse, delivery)
+    checked_error(ModelErrorKind::InvalidProviderResponse, delivery)
 }
 
 pub(crate) fn invalid_request_not_sent() -> ModelError {
@@ -665,7 +665,7 @@ mod tests {
         }
         assert_eq!(
             invalid_provider_response(DeliveryState::OutputStarted).kind(),
-            ModelErrorKind::InvalidResponse
+            ModelErrorKind::InvalidProviderResponse
         );
         assert_eq!(
             invalid_request_not_sent().delivery(),
