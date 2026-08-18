@@ -21,25 +21,30 @@ use crate::wire::{BoundedJsonObject, BoundedJsonSchema, ItemId, ProtocolLimits};
 use crate::workspace::{WorkspaceFileMutationKey, WorkspaceToolContext};
 
 /// The M14 production `ask_user` builtin: one closed, default-off, Runtime-owned Tool.
+#[path = "tools/ask_user.rs"]
 mod ask_user;
 
 /// The production `read_file` builtin: one closed, default-off, Runtime-owned Tool that
 /// reads one UTF-8 text file relative to the Workspace cwd.
+#[path = "tools/read_file.rs"]
 mod read_file;
 
 /// The production `list_directory` builtin: one closed, default-off, Runtime-owned Tool
 /// that lists the direct entries of one directory relative to the Workspace cwd.
+#[path = "tools/list_directory.rs"]
 mod list_directory;
 
 /// The production `write_file` builtin: one closed, default-off, Runtime-owned Tool that
 /// writes UTF-8 text to one file relative to the Workspace cwd, replacing its full
 /// contents or creating the file when its parent directory exists.
+#[path = "tools/write_file.rs"]
 mod write_file;
 
 /// The `fetch_url` builtin (ADR 0147): the public redacted exact-origin config type and
 /// its payload-free validation error, plus the crate-private pinned client
 /// materialization, same-origin authorization seam, and the closed Tool definition,
 /// planner, and owner-tracked executor.
+#[path = "tools/fetch_url.rs"]
 mod fetch_url;
 
 /// Public re-export of the minimal `fetch_url` host config surface: the validated exact
