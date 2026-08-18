@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -44,7 +45,288 @@ pub enum ModelValueError {
     InvalidToolCallOrder,
 }
 
-pub type ModelError = ModelValueError;
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelErrorKind {
+    InvalidRequest,
+    Unavailable,
+    ProviderUnavailable,
+    AuthMissing,
+    AuthRejected,
+    RateLimited,
+    QuotaExceeded,
+    ContextOverflow,
+    Timeout,
+    TransportUnavailable,
+    Cancelled,
+    InvalidResponse,
+    IncompleteResponse,
+    StreamInterrupted,
+    RequestOutcomeUnknown,
+    UnexpectedToolCall,
+    Internal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ModelErrorDetails {
+    kind: ModelErrorKind,
+    delivery: DeliveryState,
+    retry_after_ms: Option<u64>,
+}
+
+impl ModelErrorDetails {
+    fn new(
+        kind: ModelErrorKind,
+        delivery: DeliveryState,
+        retry_after_ms: Option<u64>,
+    ) -> Result<Self, ModelError> {
+        if retry_after_ms.is_some()
+            && !(kind == ModelErrorKind::RateLimited
+                && delivery == DeliveryState::RejectedBeforeExecution)
+        {
+            return Err(ModelError::InvalidRequest);
+        }
+        let delivery_allowed = match kind {
+            ModelErrorKind::ProviderUnavailable
+            | ModelErrorKind::RateLimited
+            | ModelErrorKind::Timeout
+            | ModelErrorKind::TransportUnavailable => matches!(
+                delivery,
+                DeliveryState::NotSent | DeliveryState::RejectedBeforeExecution
+            ),
+            ModelErrorKind::QuotaExceeded | ModelErrorKind::AuthRejected => {
+                delivery == DeliveryState::RejectedBeforeExecution
+            }
+            ModelErrorKind::InvalidRequest | ModelErrorKind::ContextOverflow => matches!(
+                delivery,
+                DeliveryState::NotSent | DeliveryState::RejectedBeforeExecution
+            ),
+            ModelErrorKind::Unavailable | ModelErrorKind::AuthMissing => {
+                delivery == DeliveryState::NotSent
+            }
+            ModelErrorKind::Cancelled => {
+                matches!(delivery, DeliveryState::NotSent | DeliveryState::Unknown)
+            }
+            _ => true,
+        };
+        if !delivery_allowed {
+            return Err(ModelError::InvalidRequest);
+        }
+        if kind == ModelErrorKind::StreamInterrupted && delivery != DeliveryState::OutputStarted {
+            return Err(ModelError::InvalidRequest);
+        }
+        if kind == ModelErrorKind::RequestOutcomeUnknown && delivery != DeliveryState::Unknown {
+            return Err(ModelError::InvalidRequest);
+        }
+        Ok(Self {
+            kind,
+            delivery,
+            retry_after_ms,
+        })
+    }
+
+    pub const fn kind(&self) -> ModelErrorKind {
+        self.kind
+    }
+
+    pub const fn delivery(&self) -> DeliveryState {
+        self.delivery
+    }
+
+    pub const fn retry_after(&self) -> Option<Duration> {
+        match self.retry_after_ms {
+            Some(milliseconds) => Some(Duration::from_millis(milliseconds)),
+            None => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum ModelError {
+    #[error("model request is invalid")]
+    InvalidRequest,
+    #[error("model is unavailable")]
+    Unavailable,
+    #[error("model provider is unavailable")]
+    ProviderUnavailable,
+    #[error("model credentials are missing")]
+    AuthMissing,
+    #[error("model credentials were rejected")]
+    AuthRejected,
+    #[error("model provider rate limited the request")]
+    RateLimited,
+    #[error("model quota was exceeded")]
+    QuotaExceeded,
+    #[error("model request exceeds context limits")]
+    ContextOverflow,
+    #[error("model request timed out")]
+    Timeout,
+    #[error("model transport is unavailable")]
+    TransportUnavailable,
+    #[error("model request was cancelled")]
+    Cancelled,
+    #[error("model response is invalid")]
+    InvalidResponse,
+    #[error("model response is incomplete")]
+    IncompleteResponse,
+    #[error("model stream was interrupted")]
+    StreamInterrupted,
+    #[error("model request outcome is unknown")]
+    RequestOutcomeUnknown,
+    #[error("model returned an unexpected tool call")]
+    UnexpectedToolCall,
+    #[error("model operation failed internally")]
+    Internal,
+    #[error("model operation failed")]
+    Detailed(ModelErrorDetails),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum ModelErrorWire {
+    InvalidRequest,
+    Unavailable,
+    ProviderUnavailable,
+    AuthMissing,
+    AuthRejected,
+    RateLimited,
+    QuotaExceeded,
+    ContextOverflow,
+    Timeout,
+    TransportUnavailable,
+    Cancelled,
+    InvalidResponse,
+    IncompleteResponse,
+    StreamInterrupted,
+    RequestOutcomeUnknown,
+    UnexpectedToolCall,
+    Internal,
+    Detailed {
+        kind: ModelErrorKind,
+        delivery: DeliveryState,
+        retry_after_ms: Option<u64>,
+    },
+}
+
+impl ModelError {
+    pub fn detailed(
+        kind: ModelErrorKind,
+        delivery: DeliveryState,
+        retry_after: Option<Duration>,
+    ) -> Result<Self, Self> {
+        let retry_after_ms = retry_after
+            .map(|value| value.as_millis().try_into())
+            .transpose()
+            .map_err(|_| Self::InvalidRequest)?;
+        Ok(Self::Detailed(ModelErrorDetails::new(
+            kind,
+            delivery,
+            retry_after_ms,
+        )?))
+    }
+
+    pub fn with_delivery(
+        kind: ModelErrorKind,
+        delivery: DeliveryState,
+        retry_after: Option<Duration>,
+    ) -> Result<Self, Self> {
+        Self::detailed(kind, delivery, retry_after)
+    }
+
+    pub const fn kind(self) -> ModelErrorKind {
+        match self {
+            Self::InvalidRequest => ModelErrorKind::InvalidRequest,
+            Self::Unavailable => ModelErrorKind::Unavailable,
+            Self::ProviderUnavailable => ModelErrorKind::ProviderUnavailable,
+            Self::AuthMissing => ModelErrorKind::AuthMissing,
+            Self::AuthRejected => ModelErrorKind::AuthRejected,
+            Self::RateLimited => ModelErrorKind::RateLimited,
+            Self::QuotaExceeded => ModelErrorKind::QuotaExceeded,
+            Self::ContextOverflow => ModelErrorKind::ContextOverflow,
+            Self::Timeout => ModelErrorKind::Timeout,
+            Self::TransportUnavailable => ModelErrorKind::TransportUnavailable,
+            Self::Cancelled => ModelErrorKind::Cancelled,
+            Self::InvalidResponse => ModelErrorKind::InvalidResponse,
+            Self::IncompleteResponse => ModelErrorKind::IncompleteResponse,
+            Self::StreamInterrupted => ModelErrorKind::StreamInterrupted,
+            Self::RequestOutcomeUnknown => ModelErrorKind::RequestOutcomeUnknown,
+            Self::UnexpectedToolCall => ModelErrorKind::UnexpectedToolCall,
+            Self::Internal => ModelErrorKind::Internal,
+            Self::Detailed(details) => details.kind(),
+        }
+    }
+
+    pub const fn delivery(&self) -> DeliveryState {
+        match self {
+            Self::Detailed(details) => details.delivery(),
+            Self::InvalidRequest
+            | Self::Unavailable
+            | Self::AuthMissing
+            | Self::ContextOverflow
+            | Self::Cancelled => DeliveryState::NotSent,
+            Self::AuthRejected | Self::QuotaExceeded | Self::RateLimited => {
+                DeliveryState::RejectedBeforeExecution
+            }
+            Self::StreamInterrupted => DeliveryState::OutputStarted,
+            Self::RequestOutcomeUnknown => DeliveryState::Unknown,
+            Self::ProviderUnavailable
+            | Self::Timeout
+            | Self::TransportUnavailable
+            | Self::InvalidResponse
+            | Self::IncompleteResponse
+            | Self::UnexpectedToolCall
+            | Self::Internal => DeliveryState::Unknown,
+        }
+    }
+
+    pub const fn delivery_state(&self) -> DeliveryState {
+        self.delivery()
+    }
+
+    pub const fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Detailed(details) => details.retry_after(),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = match ModelErrorWire::deserialize(deserializer)? {
+            ModelErrorWire::InvalidRequest => Self::InvalidRequest,
+            ModelErrorWire::Unavailable => Self::Unavailable,
+            ModelErrorWire::ProviderUnavailable => Self::ProviderUnavailable,
+            ModelErrorWire::AuthMissing => Self::AuthMissing,
+            ModelErrorWire::AuthRejected => Self::AuthRejected,
+            ModelErrorWire::RateLimited => Self::RateLimited,
+            ModelErrorWire::QuotaExceeded => Self::QuotaExceeded,
+            ModelErrorWire::ContextOverflow => Self::ContextOverflow,
+            ModelErrorWire::Timeout => Self::Timeout,
+            ModelErrorWire::TransportUnavailable => Self::TransportUnavailable,
+            ModelErrorWire::Cancelled => Self::Cancelled,
+            ModelErrorWire::InvalidResponse => Self::InvalidResponse,
+            ModelErrorWire::IncompleteResponse => Self::IncompleteResponse,
+            ModelErrorWire::StreamInterrupted => Self::StreamInterrupted,
+            ModelErrorWire::RequestOutcomeUnknown => Self::RequestOutcomeUnknown,
+            ModelErrorWire::UnexpectedToolCall => Self::UnexpectedToolCall,
+            ModelErrorWire::Internal => Self::Internal,
+            ModelErrorWire::Detailed {
+                kind,
+                delivery,
+                retry_after_ms,
+            } => Self::Detailed(
+                ModelErrorDetails::new(kind, delivery, retry_after_ms)
+                    .map_err(serde::de::Error::custom)?,
+            ),
+        };
+        Ok(value)
+    }
+}
 
 fn deserialize_from_str<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
@@ -129,7 +411,7 @@ macro_rules! model_identity {
 model_identity!(ProviderId, false);
 model_identity!(ModelId, true);
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ModelSelection {
     provider_id: ProviderId,
     model_id: ModelId,
@@ -152,7 +434,9 @@ impl ModelSelection {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningPreference {
     #[default]
@@ -206,6 +490,71 @@ impl<'de> Deserialize<'de> for ModelLimits {
         let value = ModelLimitsWire::deserialize(deserializer)?;
         Self::new(value.context_window_tokens, value.max_output_tokens)
             .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ModelDescriptor {
+    selection: ModelSelection,
+    api_model_name: Box<str>,
+    limits: ModelLimits,
+    supported_reasoning: BTreeSet<ReasoningPreference>,
+}
+
+impl ModelDescriptor {
+    pub fn new(
+        selection: ModelSelection,
+        api_model_name: impl Into<String>,
+        limits: ModelLimits,
+        supported_reasoning: BTreeSet<ReasoningPreference>,
+    ) -> Result<Self, ModelError> {
+        let api_model_name = api_model_name.into();
+        if api_model_name.is_empty()
+            || api_model_name.len() > 256
+            || api_model_name
+                .bytes()
+                .any(|byte| !(0x21..=0x7e).contains(&byte) || matches!(byte, b'"' | b'\\'))
+            || supported_reasoning.is_empty()
+        {
+            return Err(ModelError::InvalidRequest);
+        }
+        Ok(Self {
+            selection,
+            api_model_name: api_model_name.into_boxed_str(),
+            limits,
+            supported_reasoning,
+        })
+    }
+
+    pub const fn selection(&self) -> &ModelSelection {
+        &self.selection
+    }
+
+    pub const fn limits(&self) -> &ModelLimits {
+        &self.limits
+    }
+
+    pub(crate) fn api_model_name(&self) -> &str {
+        &self.api_model_name
+    }
+
+    pub fn supported_reasoning(&self) -> &BTreeSet<ReasoningPreference> {
+        &self.supported_reasoning
+    }
+
+    pub fn supports_reasoning(&self, preference: ReasoningPreference) -> bool {
+        self.supported_reasoning.contains(&preference)
+    }
+}
+
+impl fmt::Debug for ModelDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelDescriptor")
+            .field("selection", &self.selection)
+            .field("limits", &self.limits)
+            .field("supported_reasoning", &self.supported_reasoning)
+            .finish()
     }
 }
 
@@ -562,8 +911,9 @@ impl Usage {
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryState {
     NotSent,
-    Sent,
-    Delivered,
+    RejectedBeforeExecution,
+    AcceptedNoOutput,
+    OutputStarted,
     Unknown,
 }
 
@@ -572,7 +922,6 @@ pub struct ModelResponse {
     parts: Vec<AssistantPart>,
     finish_reason: ModelFinishReason,
     usage: Usage,
-    delivery_state: DeliveryState,
 }
 
 #[derive(Deserialize)]
@@ -580,7 +929,6 @@ struct ModelResponseWire {
     parts: Vec<AssistantPart>,
     finish_reason: ModelFinishReason,
     usage: Usage,
-    delivery_state: DeliveryState,
 }
 
 impl ModelResponse {
@@ -588,7 +936,6 @@ impl ModelResponse {
         parts: Vec<AssistantPart>,
         finish_reason: ModelFinishReason,
         usage: Usage,
-        delivery_state: DeliveryState,
     ) -> Result<Self, ModelValueError> {
         if parts.is_empty() {
             return Err(ModelValueError::EmptyResponseParts);
@@ -598,7 +945,6 @@ impl ModelResponse {
             parts,
             finish_reason,
             usage,
-            delivery_state,
         })
     }
 
@@ -613,10 +959,6 @@ impl ModelResponse {
     pub const fn usage(&self) -> &Usage {
         &self.usage
     }
-
-    pub const fn delivery_state(&self) -> DeliveryState {
-        self.delivery_state
-    }
 }
 
 impl<'de> Deserialize<'de> for ModelResponse {
@@ -625,13 +967,7 @@ impl<'de> Deserialize<'de> for ModelResponse {
         D: Deserializer<'de>,
     {
         let value = ModelResponseWire::deserialize(deserializer)?;
-        Self::new(
-            value.parts,
-            value.finish_reason,
-            value.usage,
-            value.delivery_state,
-        )
-        .map_err(serde::de::Error::custom)
+        Self::new(value.parts, value.finish_reason, value.usage).map_err(serde::de::Error::custom)
     }
 }
 
