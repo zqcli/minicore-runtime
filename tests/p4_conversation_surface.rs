@@ -14,6 +14,7 @@ fn conversation_surface_is_crate_private_and_not_root_exported() {
         "TranscriptPage",
         "PromptConversationView",
         "ConversationSnapshot",
+        "CompactionConversationView",
     ] {
         assert!(
             !public_exports.contains(symbol),
@@ -22,8 +23,12 @@ fn conversation_surface_is_crate_private_and_not_root_exported() {
     }
     let session = include_str!("../src/session/mod.rs");
     assert!(session.contains("pub(crate) mod conversation;"));
+    assert!(session.contains("mod compaction_visibility;"));
     assert!(!session.contains("pub use conversation"));
     let conversation = include_str!("../src/session/conversation.rs");
+    let visibility = include_str!("../src/session/compaction_visibility.rs");
+    assert!(conversation.contains("pub(crate) use compaction::CompactionConversationView;"));
+    assert!(visibility.contains("CompactionConversationView"));
     for removed in [
         "ConversationResolution",
         "PendingInteraction",
@@ -44,6 +49,7 @@ fn conversation_surface_is_crate_private_and_not_root_exported() {
         "pub(crate) struct ConversationLog",
         "pub(crate) struct ConversationSnapshot",
         "pub(crate) struct TranscriptPage",
+        "pub(crate) struct ConversationSummary",
         "pub(crate) struct PromptConversationView",
     ] {
         assert!(
@@ -58,6 +64,8 @@ fn conversation_owns_strict_jsonl_and_worker_boundaries_without_legacy_coupling(
     for source in [
         include_str!("../src/session/conversation.rs"),
         include_str!("../src/session/conversation_codec.rs"),
+        include_str!("../src/session/conversation_compaction.rs"),
+        include_str!("../src/session/compaction_visibility.rs"),
         include_str!("../src/session/store.rs"),
         include_str!("../src/session/mod.rs"),
     ] {
@@ -85,7 +93,8 @@ fn conversation_owns_strict_jsonl_and_worker_boundaries_without_legacy_coupling(
     }
     let conversation = include_str!("../src/session/conversation.rs");
     let codec = include_str!("../src/session/conversation_codec.rs");
-    let combined = [conversation, codec].join("\n");
+    let compaction = include_str!("../src/session/conversation_compaction.rs");
+    let combined = [conversation, codec, compaction].join("\n");
     for required in [
         "serde(tag = \"type\", rename_all = \"snake_case\", deny_unknown_fields)",
         "deny_unknown_fields",
@@ -110,6 +119,14 @@ fn conversation_owns_strict_jsonl_and_worker_boundaries_without_legacy_coupling(
         "Notify",
         "SessionRegistration",
         "run_io",
+        "CompactionConversationView",
+        "compaction_view",
+        "append_summary",
+        "latest_terminal_seq",
+        "IncompleteToolExchange",
+        "Stale",
+        "pub(crate) use compaction::CompactionConversationView",
+        "NewConversationEntry::Summary",
     ] {
         assert!(
             combined.contains(required),
@@ -118,16 +135,17 @@ fn conversation_owns_strict_jsonl_and_worker_boundaries_without_legacy_coupling(
     }
     assert!(!combined.contains("read_to_end"));
     assert!(!combined.contains("with_capacity(MAX_FILE_BYTES"));
+    assert!(!combined.contains("prompt_v2"));
     let store = include_str!("../src/session/store.rs");
     assert!(store.contains("pub(crate) fn run_io"));
     assert!(store.contains("pub(crate) fn conversation_path"));
     assert!(store.contains("pub(crate) async fn open_registration"));
     assert!(store.contains("ConversationCorrupt"));
     let prepare = conversation
-        .split_once("fn prepare_append(")
-        .and_then(|(_, rest)| rest.split_once("fn request_close("))
+        .split_once("fn reserve_append_slot(")
+        .and_then(|(_, rest)| rest.split_once("fn encode_candidate("))
         .map(|(body, _)| body)
-        .expect("prepare_append must remain a distinct lock-order seam");
+        .expect("reserve_append_slot must remain a distinct lock-order seam");
     let health = prepare
         .find("read_lock(&inner.state).health")
         .expect("prepare_append must check health");
