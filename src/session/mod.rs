@@ -1,6 +1,8 @@
 mod event;
 mod snapshot;
 mod state;
+pub(crate) mod store;
+pub(crate) mod time;
 
 pub use event::SessionEvent;
 pub use snapshot::{
