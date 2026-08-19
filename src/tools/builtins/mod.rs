@@ -2,11 +2,13 @@ mod ask_user;
 mod list_directory;
 mod path_args;
 mod read_file;
+mod run_command;
 mod write_file;
 
 pub use ask_user::AskUserTool;
 pub use list_directory::ListDirectoryTool;
 pub use read_file::ReadFileTool;
+pub use run_command::RunCommandTool;
 pub use write_file::WriteFileTool;
 
 use super::{ToolError, ToolOutput};

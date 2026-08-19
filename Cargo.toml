@@ -27,7 +27,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.140", features = ["arbitrary_precision"] }
 thiserror = "2.0.12"
 time = { version = "0.3.41", features = ["parsing"] }
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time", "process", "io-util"] }
 tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
 file-id = "=0.2.3"
 fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }

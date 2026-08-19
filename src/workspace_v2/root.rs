@@ -93,6 +93,7 @@ type BlockingJob = Box<dyn FnOnce(&Dir) + Send + 'static>;
 
 struct WorkspaceInner {
     blocking: Arc<BlockingOwner>,
+    root_path: PathBuf,
 }
 
 struct BlockingState {
@@ -157,7 +158,10 @@ impl Workspace {
         let root_dir = Arc::new(root_dir);
         let blocking = Arc::new(BlockingOwner::new(Arc::clone(&root_dir))?);
         Ok(Self {
-            inner: Arc::new(WorkspaceInner { blocking }),
+            inner: Arc::new(WorkspaceInner {
+                blocking,
+                root_path: root.to_owned(),
+            }),
             access,
         })
     }
@@ -174,6 +178,34 @@ impl Workspace {
     /// block the dropping thread; production Session ownership must call it.
     pub async fn shutdown(&self) -> Result<(), WorkspaceError> {
         self.inner.blocking.shutdown().await
+    }
+
+    /// Validates an optional model-relative directory through the captured
+    /// capability before returning the corresponding host path for a child
+    /// process. This is pre-spawn validation on a trusted, non-adversarial host
+    /// filesystem. `Command::current_dir(Path)` cannot receive the captured
+    /// `Dir` identity: this method does not claim protection against a later
+    /// host-filesystem replacement and does not provide a process sandbox.
+    /// File operations remain capability-safe; this path is only a process
+    /// working-directory hint.
+    pub async fn command_cwd(
+        &self,
+        path: Option<&RelativePath>,
+    ) -> Result<PathBuf, WorkspaceError> {
+        if self.inner.blocking.is_closing() {
+            return Err(WorkspaceError::Closing);
+        }
+        let relative = path.cloned().unwrap_or_default();
+        let root_path = self.inner.root_path.clone();
+        self.run_blocking(move |root_dir| {
+            validate_command_directory(root_dir, &relative)?;
+            Ok(if relative.is_empty() {
+                root_path
+            } else {
+                root_path.join(relative.as_str())
+            })
+        })
+        .await
     }
 
     /// Reads one bounded UTF-8 regular file through the captured capability.
@@ -401,6 +433,45 @@ fn worker_loop(
     }
 }
 
+fn validate_command_directory(
+    root_dir: &Dir,
+    relative: &RelativePath,
+) -> Result<(), WorkspaceError> {
+    let mut directory = root_dir.try_clone().map_err(|_| WorkspaceError::Io)?;
+    for component in relative
+        .as_str()
+        .split('/')
+        .filter(|component| !component.is_empty())
+    {
+        let component_path = Path::new(component);
+        let metadata = directory
+            .symlink_metadata(component_path)
+            .map_err(map_command_cwd_error)?;
+        if metadata.file_type().is_symlink() {
+            return Err(WorkspaceError::IsSymlink);
+        }
+        if !metadata.is_dir() {
+            return Err(WorkspaceError::NotRegularFile);
+        }
+
+        let parent_file = directory
+            .try_clone()
+            .map_err(|_| WorkspaceError::Io)?
+            .into_std_file();
+        let child_file = cap_primitives::fs::open_dir_nofollow(&parent_file, component_path)
+            .map_err(|error| {
+                if let Ok(metadata) = directory.symlink_metadata(component_path) {
+                    if metadata.file_type().is_symlink() {
+                        return WorkspaceError::IsSymlink;
+                    }
+                }
+                map_command_cwd_error(error)
+            })?;
+        directory = Dir::from_std_file(child_file);
+    }
+    Ok(())
+}
+
 impl fmt::Debug for Workspace {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -605,6 +676,14 @@ fn map_parent_error(error: std::io::Error) -> WorkspaceError {
 fn map_operation_error(error: std::io::Error) -> WorkspaceError {
     match error.kind() {
         std::io::ErrorKind::NotFound => WorkspaceError::NotFound,
+        _ => WorkspaceError::Io,
+    }
+}
+
+fn map_command_cwd_error(error: std::io::Error) -> WorkspaceError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => WorkspaceError::NotFound,
+        std::io::ErrorKind::NotADirectory => WorkspaceError::NotRegularFile,
         _ => WorkspaceError::Io,
     }
 }
