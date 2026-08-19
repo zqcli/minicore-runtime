@@ -33,6 +33,7 @@ const _: () = {
     let _ = Compactor::new;
     let _ = Compactor::config;
     let _ = Compactor::plan;
+    let _ = Compactor::plan_after_context_overflow;
     let _ = CompactionPlan::request;
     let _ = CompactionPlan::clone_request;
     let _ = CompactionPlan::through_seq;

@@ -87,6 +87,28 @@ impl Compactor {
         tools: &[ToolSpec],
         options: PromptBuildOptions,
     ) -> Result<Option<CompactionPlan>, CompactionError> {
+        self.plan_internal(builder, view, tools, options, false)
+    }
+
+    pub(crate) fn plan_after_context_overflow(
+        &self,
+        builder: &PromptBuilder,
+        view: &CompactionConversationView,
+        tools: &[ToolSpec],
+        options: PromptBuildOptions,
+    ) -> Result<CompactionPlan, CompactionError> {
+        self.plan_internal(builder, view, tools, options, true)?
+            .ok_or(CompactionError::NotReady)
+    }
+
+    fn plan_internal(
+        &self,
+        builder: &PromptBuilder,
+        view: &CompactionConversationView,
+        tools: &[ToolSpec],
+        options: PromptBuildOptions,
+        forced: bool,
+    ) -> Result<Option<CompactionPlan>, CompactionError> {
         let mut ordinary_messages = Vec::with_capacity(
             view.completed_messages()
                 .len()
@@ -101,7 +123,7 @@ impl Compactor {
                 tools,
             )
             .map_err(CompactionError::Prompt)?;
-        if ordinary_estimate <= self.config.trigger_tokens {
+        if !forced && ordinary_estimate <= self.config.trigger_tokens {
             return Ok(None);
         }
         let Some(through_seq) = view.through_seq() else {

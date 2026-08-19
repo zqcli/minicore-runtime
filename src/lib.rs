@@ -1,4 +1,6 @@
 pub mod agent_session_lifecycle;
+#[path = "agent_v2/mod.rs"]
+pub(crate) mod agent_v2;
 #[allow(
     dead_code,
     reason = "M4/M5 foundations and M10 planning are consumed by adjacent summary/orchestration slices"
