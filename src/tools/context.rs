@@ -61,6 +61,38 @@ struct RequestState {
     reply: Mutex<Option<oneshot::Sender<Result<UserAnswer, ToolError>>>>,
 }
 
+pub(crate) struct InteractionResponse {
+    reply: Option<oneshot::Sender<Result<UserAnswer, ToolError>>>,
+}
+
+impl InteractionResponse {
+    pub(crate) fn respond(mut self, answer: UserAnswer) -> Result<(), ToolError> {
+        let Some(reply) = self.reply.take() else {
+            return Err(ToolError::InteractionClosed);
+        };
+        reply
+            .send(Ok(answer))
+            .map_err(|_| ToolError::InteractionClosed)
+    }
+
+    pub(crate) fn reject(mut self, error: ToolError) -> Result<(), ToolError> {
+        let Some(reply) = self.reply.take() else {
+            return Err(ToolError::InteractionClosed);
+        };
+        reply
+            .send(Err(error))
+            .map_err(|_| ToolError::InteractionClosed)
+    }
+}
+
+impl Drop for InteractionResponse {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(Err(ToolError::InteractionClosed));
+        }
+    }
+}
+
 impl RequestState {
     fn new(
         channel: &Arc<InteractionChannelInner>,
@@ -124,7 +156,7 @@ impl RequestState {
         }
     }
 
-    fn finish(self: &Arc<Self>, result: Result<UserAnswer, ToolError>) -> Result<(), ToolError> {
+    fn claim(self: &Arc<Self>) -> Result<InteractionResponse, ToolError> {
         if !self.active.swap(false, Ordering::AcqRel) {
             return Err(ToolError::InteractionClosed);
         }
@@ -132,7 +164,15 @@ impl RequestState {
         let Some(reply) = self.take_reply() else {
             return Err(ToolError::InteractionClosed);
         };
-        reply.send(result).map_err(|_| ToolError::InteractionClosed)
+        Ok(InteractionResponse { reply: Some(reply) })
+    }
+
+    fn finish(self: &Arc<Self>, result: Result<UserAnswer, ToolError>) -> Result<(), ToolError> {
+        let response = self.claim()?;
+        match result {
+            Ok(answer) => response.respond(answer),
+            Err(error) => response.reject(error),
+        }
     }
 }
 
@@ -351,12 +391,16 @@ impl InteractionRequest {
         .map_err(|_| ToolError::InvalidInteraction)
     }
 
+    pub(crate) fn claim_response(self) -> Result<InteractionResponse, ToolError> {
+        self.inner.state.claim()
+    }
+
     pub fn respond(self, answer: UserAnswer) -> Result<(), ToolError> {
-        self.inner.state.finish(Ok(answer))
+        self.claim_response()?.respond(answer)
     }
 
     pub fn reject(self, error: ToolError) -> Result<(), ToolError> {
-        self.inner.state.finish(Err(error))
+        self.claim_response()?.reject(error)
     }
 }
 
@@ -419,5 +463,93 @@ impl<'a> ToolContext<'a> {
         self.interactions
             .ask_user(self.turn_id, question, choices, self.cancellation.clone())
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InteractionClient, InteractionId, ToolError, TurnId, UserAnswer};
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claimed_response_owns_sender_and_responds_without_request_finish() {
+        let (client, mut receiver) = InteractionClient::channel();
+        let task_client = client.clone();
+        let task = tokio::runtime::Handle::current().spawn(async move {
+            task_client
+                .ask_user(
+                    TurnId::new().unwrap(),
+                    "question",
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        let request = receiver.recv().await.unwrap();
+        let response = request.claim_response().unwrap();
+        response
+            .respond(UserAnswer::new("answer").unwrap())
+            .unwrap();
+        assert_eq!(task.await.unwrap().unwrap().text(), "answer");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claimed_response_wins_after_runner_cancellation_attempt() {
+        let (client, mut receiver) = InteractionClient::channel();
+        let cancellation = CancellationToken::new();
+        let task_client = client.clone();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::runtime::Handle::current().spawn(async move {
+            task_client
+                .ask_user(TurnId::new().unwrap(), "question", None, task_cancellation)
+                .await
+        });
+        let request = receiver.recv().await.unwrap();
+        let response = request.claim_response().unwrap();
+        cancellation.cancel();
+        response
+            .respond(UserAnswer::new("accepted").unwrap())
+            .unwrap();
+        assert_eq!(task.await.unwrap().unwrap().text(), "accepted");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dequeued_cancelled_request_preserves_interaction_closed_error() {
+        let (client, mut receiver) = InteractionClient::channel();
+        let cancellation = CancellationToken::new();
+        let task_client = client.clone();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::runtime::Handle::current().spawn(async move {
+            task_client
+                .ask_user(TurnId::new().unwrap(), "question", None, task_cancellation)
+                .await
+        });
+        let request = receiver.recv().await.unwrap();
+        cancellation.cancel();
+        assert_eq!(task.await.unwrap(), Err(ToolError::Cancelled));
+        assert_eq!(
+            request.user_question(InteractionId::new().unwrap()),
+            Err(ToolError::InteractionClosed)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_claimed_response_settles_waiter_as_closed() {
+        let (client, mut receiver) = InteractionClient::channel();
+        let task_client = client.clone();
+        let task = tokio::runtime::Handle::current().spawn(async move {
+            task_client
+                .ask_user(
+                    TurnId::new().unwrap(),
+                    "question",
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        let request = receiver.recv().await.unwrap();
+        let response = request.claim_response().unwrap();
+        drop(response);
+        assert_eq!(task.await.unwrap(), Err(ToolError::InteractionClosed));
     }
 }

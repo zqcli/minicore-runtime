@@ -17,6 +17,9 @@ use crate::model_v2::{
 };
 use crate::tools_v2::{ToolOutput, UserAnswer, UserQuestion};
 
+#[path = "conversation_actor.rs"]
+mod actor_support;
+pub(crate) use actor_support::validate_user_text;
 #[path = "conversation_codec.rs"]
 mod codec;
 #[path = "conversation_compaction.rs"]
@@ -82,6 +85,7 @@ const _: () = {
     let _ = CompactionConversationView::through_seq;
     let _ = CompactionConversationView::snapshot_seq;
     let _ = ConversationLog::close;
+    let _ = ConversationLog::wait_idle;
     let _ = ConversationSnapshot::entries;
     let _ = ConversationSnapshot::max_seq;
     let _ = ConversationSnapshot::health;
@@ -916,8 +920,12 @@ impl ConversationState {
                     outstanding_tools = Some(exchange);
                 }
             }
-            ConversationEntry::Interaction { .. } => {
-                if outstanding_tools.is_some() || pending_restart_terminal.is_some() {
+            ConversationEntry::Interaction { turn_id, .. } => {
+                if pending_restart_terminal.is_some()
+                    || outstanding_tools
+                        .as_ref()
+                        .is_some_and(|exchange| exchange.turn_id != *turn_id)
+                {
                     return Err(ConversationError::Corrupt);
                 }
             }
@@ -1072,24 +1080,6 @@ pub(crate) struct ConversationSnapshot {
     partial_tail: bool,
 }
 
-impl ConversationSnapshot {
-    pub(crate) fn entries(&self) -> &[Arc<ConversationEntry>] {
-        &self.entries
-    }
-
-    pub(crate) const fn max_seq(&self) -> u64 {
-        self.max_seq
-    }
-
-    pub(crate) const fn health(&self) -> ConversationHealth {
-        self.health
-    }
-
-    pub(crate) const fn partial_tail(&self) -> bool {
-        self.partial_tail
-    }
-}
-
 pub(crate) struct TranscriptPage {
     entries: Arc<[Arc<ConversationEntry>]>,
     next_after_seq: Option<u64>,
@@ -1142,6 +1132,7 @@ impl PromptConversationView {
 }
 
 struct ConversationInner {
+    id: SessionId,
     store: SessionStore,
     path: PathBuf,
     state: RwLock<ConversationState>,
@@ -1175,6 +1166,7 @@ impl ConversationLog {
             .map_err(ConversationError::from)?;
         Ok(Self {
             inner: Arc::new(ConversationInner {
+                id,
                 store: store.clone(),
                 path: store.conversation_path(id),
                 state: RwLock::new(state),
@@ -1225,16 +1217,20 @@ impl ConversationLog {
         read_lock(&self.inner.state).prompt_view()
     }
 
-    pub(crate) async fn close(&self) -> Result<(), ConversationError> {
-        request_close(&self.inner);
+    pub(crate) async fn wait_idle(&self) {
         loop {
             let notified = self.inner.notify.notified();
             let busy = lock_mutex(&self.inner.lifecycle).busy;
             if !busy {
-                break;
+                return;
             }
             notified.await;
         }
+    }
+
+    pub(crate) async fn close(&self) -> Result<(), ConversationError> {
+        request_close(&self.inner);
+        self.wait_idle().await;
         release_registration(&self.inner);
         Ok(())
     }
@@ -1499,6 +1495,9 @@ fn open_sync(
 }
 
 #[cfg(test)]
+pub(crate) use tests::wait_until_busy_for_test;
+
+#[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
     use std::future::Future;
@@ -1548,6 +1547,15 @@ mod tests {
             execution,
         )
         .unwrap()
+    }
+
+    pub(crate) async fn wait_until_busy_for_test(log: &ConversationLog) {
+        loop {
+            if lock_mutex(&log.inner.lifecycle).busy {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     async fn opened() -> (SessionStore, ConversationLog, PathBuf, SessionId) {
@@ -2532,6 +2540,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn restart_repairs_tool_exchange_after_interaction_and_keeps_interaction_non_model_visible()
+     {
+        let (store, log, root, id) = opened().await;
+        let turn_id = TurnId::new().unwrap();
+        let interaction_id = InteractionId::new().unwrap();
+        let question = UserQuestion::new(interaction_id, "Allow tool?", None).unwrap();
+        log.append(user(turn_id, "question")).await.unwrap();
+        log.append(assistant(
+            turn_id,
+            response(vec![AssistantPart::ToolCall(call(0, "call-restart"))], None),
+        ))
+        .await
+        .unwrap();
+        log.append(NewConversationEntry::Interaction {
+            turn_id,
+            timestamp: timestamp(),
+            interaction_id,
+            question,
+            answer: UserAnswer::new("no").unwrap(),
+        })
+        .await
+        .unwrap();
+        log.close().await.unwrap();
+        store.shutdown().await.unwrap();
+        let reopened_store = SessionStore::open(root.clone()).await.unwrap();
+        let reopened = ConversationLog::open(&reopened_store, id).await.unwrap();
+        let snapshot = reopened.snapshot().await;
+        assert_eq!(snapshot.entries().len(), 5);
+        assert!(snapshot.entries().iter().any(|entry| {
+            matches!(entry.as_ref(), ConversationEntry::Interaction { interaction_id: current, .. } if *current == interaction_id)
+        }));
+        assert!(snapshot.entries().iter().any(|entry| {
+            matches!(entry.as_ref(), ConversationEntry::ToolResult { result, .. } if result.text() == RESTART_CANCELLED_TEXT)
+        }));
+        assert!(snapshot.entries().iter().any(|entry| {
+            matches!(
+                entry.as_ref(),
+                ConversationEntry::TurnTerminal {
+                    outcome: StoredTurnOutcome::CancelledByRestart,
+                    ..
+                }
+            )
+        }));
+        let prompt = reopened.prompt_view().await.unwrap();
+        assert_eq!(prompt.messages().len(), 3);
+        assert!(matches!(prompt.messages()[0], ModelMessage::User(_)));
+        assert!(matches!(prompt.messages()[1], ModelMessage::Assistant(_)));
+        assert!(matches!(prompt.messages()[2], ModelMessage::Tool { .. }));
+        cleanup(&reopened_store, &reopened, root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn replay_reports_physical_line_and_offset_for_complete_corruption() {
         let first = encoded(&ConversationEntry::User {
             seq: 1,
@@ -2788,11 +2848,13 @@ mod tests {
             .with_cache_write_tokens(Some(55))
             .with_provider_total_tokens(Some(66));
         assert_eq!(log.usage().await, expected);
+        assert_eq!(log.snapshot().await.usage(), expected);
         log.close().await.unwrap();
         store.shutdown().await.unwrap();
         let reopened_store = SessionStore::open(root.clone()).await.unwrap();
         let reopened = ConversationLog::open(&reopened_store, id).await.unwrap();
         assert_eq!(reopened.usage().await, expected);
+        assert_eq!(reopened.snapshot().await.usage(), expected);
         cleanup(&reopened_store, &reopened, root).await;
     }
 
@@ -2859,6 +2921,42 @@ mod tests {
         assert_eq!(aggregate.input_tokens(), None);
         assert_eq!(aggregate.output_tokens(), Some(6));
         assert_eq!(aggregate.reasoning_tokens(), Some(8));
+        cleanup(&store, &log, root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_idle_drains_admitted_append_without_setting_closing() {
+        let (store, log, root, _id) = opened().await;
+        let (started_sender, started_receiver) = channel();
+        let (release_sender, release_receiver) = channel();
+        let blocker = store.run_io(move || {
+            started_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            Ok::<_, crate::session_v2::store::StoreError>(())
+        });
+        started_receiver.recv().unwrap();
+        let turn_id = TurnId::new().unwrap();
+        let mut append = Box::pin(log.append(user(turn_id, "pending")));
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(append.as_mut().poll(&mut context), Poll::Pending));
+        let mut idle = Box::pin(log.wait_idle());
+        assert!(matches!(idle.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(
+            log.append(user(TurnId::new().unwrap(), "rejected while busy"))
+                .await,
+            Err(ConversationError::Busy)
+        );
+        release_sender.send(()).unwrap();
+        SessionStore::await_io(blocker).await.unwrap();
+        assert_eq!(append.await.unwrap(), 1);
+        idle.await;
+        assert_eq!(
+            log.append(user(TurnId::new().unwrap(), "after"))
+                .await
+                .unwrap(),
+            2
+        );
         cleanup(&store, &log, root).await;
     }
 

@@ -86,15 +86,18 @@ impl UsageAccumulator {
     }
 }
 
+pub(crate) fn usage_from_entries(entries: &[std::sync::Arc<ConversationEntry>]) -> Usage {
+    let mut aggregate = UsageAccumulator::default();
+    for entry in entries {
+        if let ConversationEntry::Assistant { usage, .. } = entry.as_ref() {
+            aggregate.add(usage.as_ref());
+        }
+    }
+    aggregate.finish()
+}
+
 impl ConversationLog {
     pub(crate) async fn usage(&self) -> Usage {
-        let state = read_lock(&self.inner.state);
-        let mut aggregate = UsageAccumulator::default();
-        for entry in &state.entries {
-            if let ConversationEntry::Assistant { usage, .. } = entry.as_ref() {
-                aggregate.add(usage.as_ref());
-            }
-        }
-        aggregate.finish()
+        self.snapshot().await.usage()
     }
 }
