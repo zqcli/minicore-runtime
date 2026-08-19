@@ -11,7 +11,9 @@ pub use provider::{
     ProviderCredentialError, ProviderEndpointPolicy, fixed_credential_source,
 };
 pub use provider::{ModelCallContext, ModelEventSink, ModelFuture, ModelProvider};
-pub use providers::{OpenAiProviderError, OpenAiResponsesProvider};
+pub use providers::{
+    AnthropicMessagesProvider, AnthropicProviderError, OpenAiProviderError, OpenAiResponsesProvider,
+};
 pub use registry::{ProviderRegistry, ProviderRegistryBuilder, ResolvedModel};
 pub use types::{
     AssistantPart, DeliveryState, ModelDescriptor, ModelError, ModelErrorDetails, ModelErrorKind,
