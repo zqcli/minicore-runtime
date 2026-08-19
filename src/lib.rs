@@ -44,14 +44,15 @@ pub use ids_v2::{
     ToolCallIdError, TurnId,
 };
 pub use model_v2::{
-    AssistantPart, CredentialSource, CredentialSourceFuture, DeliveryState, ModelCallContext,
-    ModelDescriptor, ModelError, ModelErrorDetails, ModelErrorKind, ModelEvent, ModelEventSink,
-    ModelFinishReason, ModelFuture, ModelGateway, ModelId, ModelIdentityError, ModelLimits,
-    ModelLimitsError, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelSelection,
-    ModelValueError, OpenAiProviderError, OpenAiReasoningProgress, OpenAiResponsesProvider,
-    ProviderCredential, ProviderCredentialError, ProviderEndpointPolicy, ProviderId,
-    ProviderItemId, ProviderItemIdError, ProviderRegistry, ProviderRegistryBuilder,
-    ReasoningContent, ReasoningPreference, ResolvedModel, ToolCall, Usage, fixed_credential_source,
+    AnthropicMessagesProvider, AnthropicProviderError, AssistantPart, CredentialSource,
+    CredentialSourceFuture, DeliveryState, ModelCallContext, ModelDescriptor, ModelError,
+    ModelErrorDetails, ModelErrorKind, ModelEvent, ModelEventSink, ModelFinishReason, ModelFuture,
+    ModelGateway, ModelId, ModelIdentityError, ModelLimits, ModelLimitsError, ModelMessage,
+    ModelProvider, ModelRequest, ModelResponse, ModelSelection, ModelValueError,
+    OpenAiProviderError, OpenAiReasoningProgress, OpenAiResponsesProvider, ProviderCredential,
+    ProviderCredentialError, ProviderEndpointPolicy, ProviderId, ProviderItemId,
+    ProviderItemIdError, ProviderRegistry, ProviderRegistryBuilder, ReasoningContent,
+    ReasoningPreference, ResolvedModel, ToolCall, Usage, fixed_credential_source,
 };
 pub use runtime::{MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError};
 pub use session_v2::{
