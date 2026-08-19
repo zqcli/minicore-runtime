@@ -1,3 +1,4 @@
+pub(crate) mod conversation;
 mod event;
 mod snapshot;
 mod state;

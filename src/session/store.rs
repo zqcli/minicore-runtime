@@ -2,11 +2,14 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
+use std::future::Future;
 use std::io::{self, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
 use fs4::fs_std::FileExt;
@@ -83,6 +86,8 @@ pub(crate) enum StoreError {
     InvalidConfig,
     #[error("session store data is corrupt")]
     Corrupt,
+    #[error("session conversation data is corrupt")]
+    ConversationCorrupt { line: u64, offset: u64 },
     #[error("session store data is too large")]
     TooLarge,
     #[error("session store cleanup failed")]
@@ -491,10 +496,58 @@ impl SessionStore {
             })
             .await
     }
+
+    pub(crate) fn conversation_path(&self, id: SessionId) -> PathBuf {
+        self.inner
+            .sessions
+            .join(id.to_string())
+            .join("conversation.jsonl")
+    }
+
+    pub(crate) fn run_io<T, F>(&self, operation: F) -> StoreIo<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, StoreError> + Send + 'static,
+    {
+        StoreIo {
+            receiver: self.inner.worker.submit(operation),
+        }
+    }
+
+    pub(crate) async fn await_io<T>(job: StoreIo<T>) -> Result<T, StoreError> {
+        job.await
+    }
 }
 
 type BlockingJob = Box<dyn FnOnce() + Send + 'static>;
+type StoreJob<T> = oneshot::Receiver<Result<T, StoreError>>;
 type WorkerReadiness = oneshot::Receiver<Result<PathBuf, StoreError>>;
+
+pub(crate) struct StoreIo<T> {
+    receiver: Result<StoreJob<T>, StoreError>,
+}
+
+impl<T> StoreIo<T> {
+    pub(crate) const fn is_admitted(&self) -> bool {
+        self.receiver.is_ok()
+    }
+}
+
+impl<T> Future for StoreIo<T> {
+    type Output = Result<T, StoreError>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match &mut this.receiver {
+            Ok(receiver) => match Pin::new(receiver).poll(context) {
+                Poll::Ready(Ok(result)) => Poll::Ready(result),
+                Poll::Ready(Err(_)) => Poll::Ready(Err(StoreError::WorkerFailed)),
+                Poll::Pending => Poll::Pending,
+            },
+            Err(error) => Poll::Ready(Err(*error)),
+        }
+    }
+}
 
 struct WorkerState {
     sender: Option<SyncSender<BlockingJob>>,
@@ -569,6 +622,15 @@ impl WorkerOwner {
         T: Send + 'static,
         F: FnOnce() -> Result<T, StoreError> + Send + 'static,
     {
+        let receiver = self.submit(operation)?;
+        receiver.await.map_err(|_| StoreError::WorkerFailed)?
+    }
+
+    fn submit<T, F>(&self, operation: F) -> Result<StoreJob<T>, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, StoreError> + Send + 'static,
+    {
         let (sender, receiver) = oneshot::channel();
         self.admit(Box::new(move || {
             let result = match catch_unwind(AssertUnwindSafe(operation)) {
@@ -577,7 +639,7 @@ impl WorkerOwner {
             };
             let _ = sender.send(result);
         }))?;
-        receiver.await.map_err(|_| StoreError::WorkerFailed)?
+        Ok(receiver)
     }
 
     #[allow(
@@ -1148,6 +1210,7 @@ mod tests {
             StoreError::Busy,
             StoreError::InvalidConfig,
             StoreError::Corrupt,
+            StoreError::ConversationCorrupt { line: 2, offset: 7 },
             StoreError::TooLarge,
             StoreError::Io,
             StoreError::CleanupFailed,
@@ -1156,6 +1219,10 @@ mod tests {
         ] {
             assert!(!format!("{error:?}").contains(&root.to_string_lossy().to_string()));
         }
+        let located = StoreError::ConversationCorrupt { line: 2, offset: 7 };
+        assert_eq!(located.to_string(), "session conversation data is corrupt");
+        assert!(!located.to_string().contains("2"));
+        assert!(!located.to_string().contains("7"));
         store.shutdown().await.unwrap();
         fs::remove_dir_all(root).unwrap();
     }
@@ -1315,6 +1382,32 @@ mod tests {
         }
         run_release_sender.send(()).unwrap();
         owner.shutdown().await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_io_keeps_admitted_work_after_receiver_drop_and_uses_exact_path() {
+        let root = unique_root();
+        let store = SessionStore::open(root.clone()).await.unwrap();
+        let id = SessionId::new().unwrap();
+        store
+            .create(&sample_config(id, Path::new("/tmp/workspace")))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.conversation_path(id),
+            root.join("sessions")
+                .join(id.to_string())
+                .join("conversation.jsonl")
+        );
+        let (done_sender, done_receiver) = channel();
+        let job = store.run_io(move || {
+            done_sender.send(()).unwrap();
+            Ok::<_, StoreError>(())
+        });
+        drop(job);
+        done_receiver.recv().unwrap();
+        store.shutdown().await.unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
