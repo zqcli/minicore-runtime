@@ -19,6 +19,9 @@ use crate::tools_v2::{ToolOutput, UserAnswer, UserQuestion};
 
 #[path = "conversation_codec.rs"]
 mod codec;
+#[path = "conversation_compaction.rs"]
+mod compaction;
+pub(crate) use compaction::CompactionConversationView;
 
 const MAX_TEXT_BYTES: usize = 262_144;
 const MAX_SUMMARY_BYTES: usize = 65_536;
@@ -47,6 +50,7 @@ const _: () = {
     let _ = std::mem::size_of::<TranscriptPage>();
     let _ = std::mem::size_of::<ConversationSummary>();
     let _ = std::mem::size_of::<PromptConversationView>();
+    let _ = std::mem::size_of::<CompactionConversationView>();
     let _ = std::mem::size_of::<ConversationInner>();
     let _ = std::mem::size_of::<ConversationLifecycle>();
     let _ = std::mem::size_of::<ConversationLog>();
@@ -67,6 +71,13 @@ const _: () = {
     let _ = ConversationLog::snapshot;
     let _ = ConversationLog::page;
     let _ = ConversationLog::prompt_view;
+    let _ = ConversationLog::compaction_view;
+    let _ = ConversationLog::append_summary;
+    let _ = CompactionConversationView::latest_summary;
+    let _ = CompactionConversationView::completed_messages;
+    let _ = CompactionConversationView::current_turn_messages;
+    let _ = CompactionConversationView::through_seq;
+    let _ = CompactionConversationView::snapshot_seq;
     let _ = ConversationLog::close;
     let _ = ConversationSnapshot::entries;
     let _ = ConversationSnapshot::max_seq;
@@ -105,6 +116,10 @@ pub(crate) enum ConversationError {
     InvalidPage,
     #[error("conversation is degraded")]
     Degraded,
+    #[error("conversation compaction state is incomplete")]
+    IncompleteToolExchange,
+    #[error("conversation snapshot is stale")]
+    Stale,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -767,6 +782,7 @@ struct SummaryBoundary {
 struct ConversationState {
     entries: Vec<Arc<ConversationEntry>>,
     max_seq: u64,
+    latest_terminal_seq: Option<u64>,
     complete_entries: usize,
     outstanding_tools: Option<OutstandingTools>,
     pending_restart_terminal: Option<PendingRestartTerminal>,
@@ -782,6 +798,7 @@ impl ConversationState {
         Self {
             entries: Vec::new(),
             max_seq: 0,
+            latest_terminal_seq: None,
             complete_entries: 0,
             outstanding_tools: None,
             pending_restart_terminal: None,
@@ -808,6 +825,7 @@ impl ConversationState {
         let mut pending_restart_terminal = self.pending_restart_terminal.clone();
         let mut terminal_turns = self.terminal_turns.clone();
         let mut latest_summary = self.latest_summary.clone();
+        let mut latest_terminal_seq = self.latest_terminal_seq;
         if let Some(pending) = pending_restart_terminal.as_ref() {
             match entry.as_ref() {
                 ConversationEntry::ToolResult {
@@ -935,10 +953,12 @@ impl ConversationState {
                 if !terminal_turns.insert(*turn_id) {
                     return Err(ConversationError::Corrupt);
                 }
+                latest_terminal_seq = Some(entry.seq());
             }
         }
 
         self.max_seq = entry.seq();
+        self.latest_terminal_seq = latest_terminal_seq;
         self.complete_entries += 1;
         self.entries.push(entry);
         self.outstanding_tools = outstanding_tools;
@@ -1170,33 +1190,7 @@ impl ConversationLog {
         entry: NewConversationEntry,
     ) -> Result<u64, ConversationError> {
         let (reservation, candidate, line, projected) = prepare_append(&self.inner, entry)?;
-        let job_state = Arc::new(AppendJobState {
-            started: AtomicBool::new(false),
-            admitted: AtomicBool::new(false),
-            finished: AtomicBool::new(false),
-        });
-        let settlement = AppendSettlement {
-            inner: Arc::clone(&self.inner),
-            projected,
-            seq: candidate.seq(),
-            job_state: Arc::clone(&job_state),
-        };
-        let path = self.inner.path.clone();
-        let job_state_for_worker = Arc::clone(&job_state);
-        let receiver = self.inner.store.run_io(move || {
-            job_state_for_worker.started.store(true, Ordering::Release);
-            let write_result = codec::append_line_sync(&path, &line);
-            settlement.settle(write_result)
-        });
-        if !receiver.is_admitted() {
-            return match receiver.await {
-                Ok(_) => Err(ConversationError::WorkerFailed),
-                Err(error) => Err(error.into()),
-            };
-        }
-        job_state.admitted.store(true, Ordering::Release);
-        reservation.disarm();
-        receiver.await.map_err(ConversationError::from)
+        compaction::submit_append(&self.inner, reservation, candidate, line, projected).await
     }
 
     pub(crate) async fn snapshot(&self) -> ConversationSnapshot {
@@ -1326,6 +1320,27 @@ fn prepare_append(
     ),
     ConversationError,
 > {
+    if matches!(&entry, NewConversationEntry::Summary { .. }) {
+        return Err(ConversationError::InvalidEntry);
+    }
+    let (reservation, state) = reserve_append_slot(inner)?;
+    let candidate = Arc::new(
+        entry.into_entry(
+            state
+                .max_seq
+                .checked_add(1)
+                .ok_or(ConversationError::Corrupt)?,
+        )?,
+    );
+    let mut projected = state.clone();
+    projected.apply(Arc::clone(&candidate))?;
+    let line = encode_candidate(&candidate)?;
+    Ok((reservation, candidate, line, projected))
+}
+
+fn reserve_append_slot(
+    inner: &Arc<ConversationInner>,
+) -> Result<(BusyReservation, ConversationState), ConversationError> {
     if read_lock(&inner.state).health == ConversationHealth::Degraded {
         return Err(ConversationError::Degraded);
     }
@@ -1347,24 +1362,18 @@ fn prepare_append(
     if state.health == ConversationHealth::Degraded {
         return Err(ConversationError::Degraded);
     }
-    let candidate = Arc::new(
-        entry.into_entry(
-            state
-                .max_seq
-                .checked_add(1)
-                .ok_or(ConversationError::Corrupt)?,
-        )?,
-    );
-    let mut projected = state.clone();
-    projected.apply(Arc::clone(&candidate))?;
+    let snapshot = state.clone();
     drop(state);
-    let mut line =
-        serde_json::to_vec(candidate.as_ref()).map_err(|_| ConversationError::InvalidEntry)?;
+    Ok((reservation, snapshot))
+}
+
+fn encode_candidate(candidate: &ConversationEntry) -> Result<Vec<u8>, ConversationError> {
+    let mut line = serde_json::to_vec(candidate).map_err(|_| ConversationError::InvalidEntry)?;
     line.push(b'\n');
     if line.len() > MAX_LINE_BYTES {
         return Err(ConversationError::TooLarge);
     }
-    Ok((reservation, candidate, line, projected))
+    Ok(line)
 }
 
 fn request_close(inner: &Arc<ConversationInner>) {
@@ -1846,6 +1855,256 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn compaction_view_without_terminal_keeps_all_messages_current() {
+        let (store, log, root, _id) = opened().await;
+        let turn_id = TurnId::new().unwrap();
+        log.append(user(turn_id, "hello")).await.unwrap();
+        log.append(assistant(
+            turn_id,
+            response(vec![AssistantPart::Text("answer".to_owned())], None),
+        ))
+        .await
+        .unwrap();
+        let view = log.compaction_view().await.unwrap();
+        assert!(view.latest_summary().is_none());
+        assert!(view.completed_messages().is_empty());
+        assert_eq!(view.through_seq(), None);
+        assert_eq!(view.snapshot_seq(), 2);
+        assert_eq!(
+            view.current_turn_messages(),
+            &[
+                ModelMessage::user("hello").unwrap(),
+                ModelMessage::assistant(vec![AssistantPart::Text("answer".to_owned())]).unwrap(),
+            ]
+        );
+        cleanup(&store, &log, root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compaction_view_splits_terminal_history_and_respects_existing_summary() {
+        let (store, log, root, _id) = opened().await;
+        let first_turn = TurnId::new().unwrap();
+        log.append(user(first_turn, "first")).await.unwrap();
+        log.append(assistant(
+            first_turn,
+            response(vec![AssistantPart::Text("done".to_owned())], None),
+        ))
+        .await
+        .unwrap();
+        log.append(terminal(first_turn, StoredTurnOutcome::Completed))
+            .await
+            .unwrap();
+        let first_view = log.compaction_view().await.unwrap();
+        assert_eq!(first_view.through_seq(), Some(3));
+        assert_eq!(first_view.completed_messages().len(), 2);
+        assert!(first_view.current_turn_messages().is_empty());
+
+        log.append_summary(3, 3, timestamp(), "old summary".to_owned())
+            .await
+            .unwrap();
+        let second_turn = TurnId::new().unwrap();
+        log.append(user(second_turn, "second")).await.unwrap();
+        log.append(assistant(
+            second_turn,
+            response(vec![AssistantPart::Text("later".to_owned())], None),
+        ))
+        .await
+        .unwrap();
+        log.append(terminal(second_turn, StoredTurnOutcome::Failed))
+            .await
+            .unwrap();
+        let view = log.compaction_view().await.unwrap();
+        assert_eq!(view.latest_summary().unwrap().text(), "old summary");
+        assert_eq!(view.latest_summary().unwrap().through_seq(), 3);
+        assert_eq!(view.through_seq(), Some(7));
+        assert_eq!(view.snapshot_seq(), 7);
+        assert_eq!(view.completed_messages().len(), 2);
+        assert!(view.current_turn_messages().is_empty());
+        assert_eq!(
+            view.completed_messages(),
+            &[
+                ModelMessage::user("second").unwrap(),
+                ModelMessage::assistant(vec![AssistantPart::Text("later".to_owned())]).unwrap(),
+            ]
+        );
+        let current_turn = TurnId::new().unwrap();
+        log.append(user(current_turn, "current")).await.unwrap();
+        log.append(assistant(
+            current_turn,
+            response(vec![AssistantPart::Text("still running".to_owned())], None),
+        ))
+        .await
+        .unwrap();
+        let split_view = log.compaction_view().await.unwrap();
+        assert_eq!(split_view.through_seq(), Some(7));
+        assert_eq!(split_view.snapshot_seq(), 9);
+        assert_eq!(split_view.completed_messages().len(), 2);
+        assert_eq!(
+            split_view.current_turn_messages(),
+            &[
+                ModelMessage::user("current").unwrap(),
+                ModelMessage::assistant(vec![AssistantPart::Text("still running".to_owned())])
+                    .unwrap(),
+            ]
+        );
+        cleanup(&store, &log, root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compaction_view_refuses_incomplete_tool_exchange() {
+        let (store, log, root, _id) = opened().await;
+        let turn_id = TurnId::new().unwrap();
+        log.append(assistant(
+            turn_id,
+            response(vec![AssistantPart::ToolCall(call(0, "pending"))], None),
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            log.compaction_view().await,
+            Err(ConversationError::IncompleteToolExchange)
+        ));
+        cleanup(&store, &log, root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generic_summary_append_is_rejected_without_changing_current_turn() {
+        let (store, log, root, id) = opened().await;
+        let turn_id = TurnId::new().unwrap();
+        log.append(user(turn_id, "current input")).await.unwrap();
+        let file = root
+            .join("sessions")
+            .join(id.to_string())
+            .join("conversation.jsonl");
+        let before_bytes = fs::read(&file).unwrap();
+        let before = log.snapshot().await;
+        assert_eq!(
+            log.append(NewConversationEntry::Summary {
+                timestamp: timestamp(),
+                through_seq: 0,
+                text: "not through append_summary".to_owned(),
+            })
+            .await,
+            Err(ConversationError::InvalidEntry)
+        );
+        assert_eq!(fs::read(&file).unwrap(), before_bytes);
+        let after = log.snapshot().await;
+        assert_eq!(after.max_seq(), before.max_seq());
+        assert_eq!(after.entries(), before.entries());
+        assert_eq!(after.health(), ConversationHealth::Healthy);
+        let view = log.compaction_view().await.unwrap();
+        assert!(view.completed_messages().is_empty());
+        assert_eq!(view.through_seq(), None);
+        assert_eq!(view.snapshot_seq(), 1);
+        assert_eq!(
+            view.current_turn_messages(),
+            &[ModelMessage::user("current input").unwrap()]
+        );
+        cleanup(&store, &log, root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compaction_view_orders_tool_results_by_call_index() {
+        let (store, log, root, _id) = opened().await;
+        let turn_id = TurnId::new().unwrap();
+        let first = call(0, "first");
+        let second = call(1, "second");
+        log.append(assistant(
+            turn_id,
+            response(
+                vec![
+                    AssistantPart::ToolCall(first.clone()),
+                    AssistantPart::ToolCall(second.clone()),
+                ],
+                None,
+            ),
+        ))
+        .await
+        .unwrap();
+        log.append(NewConversationEntry::ToolResult {
+            turn_id,
+            timestamp: timestamp(),
+            call_id: second.tool_call_id().clone(),
+            result: ToolOutput::success("second").unwrap(),
+        })
+        .await
+        .unwrap();
+        log.append(NewConversationEntry::ToolResult {
+            turn_id,
+            timestamp: timestamp(),
+            call_id: first.tool_call_id().clone(),
+            result: ToolOutput::success("first").unwrap(),
+        })
+        .await
+        .unwrap();
+        log.append(terminal(turn_id, StoredTurnOutcome::Completed))
+            .await
+            .unwrap();
+        let messages = log
+            .compaction_view()
+            .await
+            .unwrap()
+            .completed_messages()
+            .to_vec();
+        assert!(matches!(
+            &messages[1],
+            ModelMessage::Tool { tool_call_id, .. } if tool_call_id == first.tool_call_id()
+        ));
+        assert!(matches!(
+            &messages[2],
+            ModelMessage::Tool { tool_call_id, .. } if tool_call_id == second.tool_call_id()
+        ));
+        cleanup(&store, &log, root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn summary_append_is_stale_safe_and_append_only() {
+        let (store, log, root, id) = opened().await;
+        let turn_id = TurnId::new().unwrap();
+        log.append(user(turn_id, "input")).await.unwrap();
+        log.append(assistant(
+            turn_id,
+            response(vec![AssistantPart::Text("output".to_owned())], None),
+        ))
+        .await
+        .unwrap();
+        log.append(terminal(turn_id, StoredTurnOutcome::Completed))
+            .await
+            .unwrap();
+        let file = root
+            .join("sessions")
+            .join(id.to_string())
+            .join("conversation.jsonl");
+        let before = fs::read(&file).unwrap();
+        assert_eq!(
+            log.append_summary(2, 3, timestamp(), "summary".to_owned())
+                .await,
+            Err(ConversationError::Stale)
+        );
+        assert_eq!(fs::read(&file).unwrap(), before);
+        assert_eq!(log.snapshot().await.health(), ConversationHealth::Healthy);
+        assert_eq!(
+            log.append_summary(3, 2, timestamp(), "summary".to_owned())
+                .await,
+            Err(ConversationError::Stale)
+        );
+        assert_eq!(fs::read(&file).unwrap(), before);
+        assert_eq!(
+            log.append_summary(3, 3, timestamp(), "summary".to_owned())
+                .await,
+            Ok(4)
+        );
+        let after = fs::read(&file).unwrap();
+        assert!(after.starts_with(&before));
+        assert!(after.len() > before.len());
+        assert_eq!(log.page(None, 10).await.unwrap().entries().len(), 4);
+        let prompt = log.prompt_view().await.unwrap();
+        assert_eq!(prompt.latest_summary().unwrap().text(), "summary");
+        assert!(prompt.messages().is_empty());
+        cleanup(&store, &log, root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn tool_results_are_ordered_and_restart_repairs_are_durable() {
         let (store, log, root, id) = opened().await;
         let turn_id = TurnId::new().unwrap();
@@ -2159,21 +2418,13 @@ mod tests {
                 .is_err()
         );
 
-        log.append(NewConversationEntry::Summary {
-            timestamp: timestamp(),
-            through_seq: 4,
-            text: "summary".to_owned(),
-        })
-        .await
-        .unwrap();
-        assert!(
-            log.append(NewConversationEntry::Summary {
-                timestamp: timestamp(),
-                through_seq: 4,
-                text: "duplicate boundary".to_owned(),
-            })
+        log.append_summary(4, 4, timestamp(), "summary".to_owned())
             .await
-            .is_err()
+            .unwrap();
+        assert!(
+            log.append_summary(5, 4, timestamp(), "duplicate boundary".to_owned())
+                .await
+                .is_err()
         );
         let turn_two = TurnId::new().unwrap();
         log.append(user(turn_two, "after")).await.unwrap();
@@ -2549,6 +2800,50 @@ mod tests {
         assert!(close.await.is_ok());
         store.shutdown().await.unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_summary_future_is_settled_by_the_worker() {
+        let (store, log, root, _id) = opened().await;
+        let turn_id = TurnId::new().unwrap();
+        log.append(user(turn_id, "input")).await.unwrap();
+        log.append(assistant(
+            turn_id,
+            response(vec![AssistantPart::Text("output".to_owned())], None),
+        ))
+        .await
+        .unwrap();
+        log.append(terminal(turn_id, StoredTurnOutcome::Completed))
+            .await
+            .unwrap();
+        let (started_sender, started_receiver) = channel();
+        let (release_sender, release_receiver) = channel();
+        let blocker = store.run_io(move || {
+            started_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            Ok::<_, crate::session_v2::store::StoreError>(())
+        });
+        started_receiver.recv().unwrap();
+        let mut summary = Box::pin(log.append_summary(3, 3, timestamp(), "summary".to_owned()));
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(summary.as_mut().poll(&mut context), Poll::Pending));
+        drop(summary);
+        let barrier = store.run_io(|| Ok::<_, crate::session_v2::store::StoreError>(()));
+        release_sender.send(()).unwrap();
+        SessionStore::await_io(blocker).await.unwrap();
+        SessionStore::await_io(barrier).await.unwrap();
+        assert_eq!(log.snapshot().await.max_seq(), 4);
+        assert_eq!(
+            log.prompt_view()
+                .await
+                .unwrap()
+                .latest_summary()
+                .unwrap()
+                .text(),
+            "summary"
+        );
+        cleanup(&store, &log, root).await;
     }
 
     #[test]

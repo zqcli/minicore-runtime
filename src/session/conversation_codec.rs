@@ -43,7 +43,9 @@ impl ConversationError {
             | Self::WorkerFailed
             | Self::NotFound
             | Self::InvalidPage
-            | Self::Degraded => None,
+            | Self::Degraded
+            | Self::IncompleteToolExchange
+            | Self::Stale => None,
         }
     }
 

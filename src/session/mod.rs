@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod compaction_visibility;
 pub(crate) mod conversation;
 mod event;
 mod snapshot;
