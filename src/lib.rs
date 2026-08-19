@@ -12,6 +12,8 @@ pub(crate) mod event_v2;
 pub(crate) mod ids_v2;
 #[path = "model/mod.rs"]
 pub(crate) mod model_v2;
+#[path = "prompt_v2/mod.rs"]
+pub(crate) mod prompt_v2;
 #[path = "session/mod.rs"]
 pub(crate) mod session_v2;
 #[path = "tools/mod.rs"]
