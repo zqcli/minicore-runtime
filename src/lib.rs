@@ -58,8 +58,9 @@ pub use model_v2::{
 };
 pub use runtime::{MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError};
 pub use session_v2::{
-    SessionEvent, SessionSnapshot, SessionStatus, SnapshotHistory, SnapshotShapeError,
-    TerminalOutcome, TurnOutcome, TurnSummary, TurnTerminal, TurnTerminalSummary,
+    SessionEvent, SessionEventStream, SessionSnapshot, SessionStatus, SnapshotHistory,
+    SnapshotShapeError, TerminalOutcome, TurnOutcome, TurnSummary, TurnTerminal,
+    TurnTerminalSummary,
 };
 pub use tools_v2::{
     AllowConfiguredTools, AskUserTool, InteractionClient, InteractionReceiver, InteractionRequest,

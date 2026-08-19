@@ -65,6 +65,7 @@ fn conversation_owns_strict_jsonl_and_worker_boundaries_without_legacy_coupling(
         include_str!("../src/session/conversation.rs"),
         include_str!("../src/session/conversation_codec.rs"),
         include_str!("../src/session/conversation_compaction.rs"),
+        include_str!("../src/session/conversation_usage.rs"),
         include_str!("../src/session/compaction_visibility.rs"),
         include_str!("../src/session/store.rs"),
         include_str!("../src/session/mod.rs"),
@@ -94,7 +95,8 @@ fn conversation_owns_strict_jsonl_and_worker_boundaries_without_legacy_coupling(
     let conversation = include_str!("../src/session/conversation.rs");
     let codec = include_str!("../src/session/conversation_codec.rs");
     let compaction = include_str!("../src/session/conversation_compaction.rs");
-    let combined = [conversation, codec, compaction].join("\n");
+    let usage = include_str!("../src/session/conversation_usage.rs");
+    let combined = [conversation, codec, compaction, usage].join("\n");
     for required in [
         "serde(tag = \"type\", rename_all = \"snake_case\", deny_unknown_fields)",
         "deny_unknown_fields",

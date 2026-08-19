@@ -21,6 +21,8 @@ use crate::tools_v2::{ToolOutput, UserAnswer, UserQuestion};
 mod codec;
 #[path = "conversation_compaction.rs"]
 mod compaction;
+#[path = "conversation_usage.rs"]
+mod usage;
 pub(crate) use compaction::CompactionConversationView;
 
 const MAX_TEXT_BYTES: usize = 262_144;
@@ -69,6 +71,7 @@ const _: () = {
     let _ = ConversationLog::open;
     let _ = ConversationLog::append;
     let _ = ConversationLog::snapshot;
+    let _ = ConversationLog::usage;
     let _ = ConversationLog::page;
     let _ = ConversationLog::prompt_view;
     let _ = ConversationLog::compaction_view;
@@ -2747,6 +2750,116 @@ mod tests {
             } if actual == "answer" && tool_calls.is_empty()
         ));
         cleanup(&reopened_store, &reopened, root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn usage_aggregates_all_fields_and_survives_reload() {
+        let (store, log, root, id) = opened().await;
+        let first = Usage::from_optional(Some(1), Some(2), Some(3))
+            .with_cache_read_tokens(Some(4))
+            .with_cache_write_tokens(Some(5))
+            .with_provider_total_tokens(Some(6));
+        let second = Usage::from_optional(Some(10), Some(20), Some(30))
+            .with_cache_read_tokens(Some(40))
+            .with_cache_write_tokens(Some(50))
+            .with_provider_total_tokens(Some(60));
+        let first_turn = TurnId::new().unwrap();
+        log.append(assistant(
+            first_turn,
+            response(vec![AssistantPart::Text("one".to_owned())], Some(first)),
+        ))
+        .await
+        .unwrap();
+        log.append(terminal(first_turn, StoredTurnOutcome::Completed))
+            .await
+            .unwrap();
+        let second_turn = TurnId::new().unwrap();
+        log.append(assistant(
+            second_turn,
+            response(vec![AssistantPart::Text("two".to_owned())], Some(second)),
+        ))
+        .await
+        .unwrap();
+        log.append(terminal(second_turn, StoredTurnOutcome::Completed))
+            .await
+            .unwrap();
+        let expected = Usage::from_optional(Some(11), Some(22), Some(33))
+            .with_cache_read_tokens(Some(44))
+            .with_cache_write_tokens(Some(55))
+            .with_provider_total_tokens(Some(66));
+        assert_eq!(log.usage().await, expected);
+        log.close().await.unwrap();
+        store.shutdown().await.unwrap();
+        let reopened_store = SessionStore::open(root.clone()).await.unwrap();
+        let reopened = ConversationLog::open(&reopened_store, id).await.unwrap();
+        assert_eq!(reopened.usage().await, expected);
+        cleanup(&reopened_store, &reopened, root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn usage_is_conservative_for_missing_fields_and_whole_usage() {
+        let (store, log, root, _id) = opened().await;
+        let partial = Usage::from_optional(Some(1), None, Some(3)).with_cache_read_tokens(Some(4));
+        let partial_turn = TurnId::new().unwrap();
+        log.append(assistant(
+            partial_turn,
+            response(
+                vec![AssistantPart::Text("partial".to_owned())],
+                Some(partial),
+            ),
+        ))
+        .await
+        .unwrap();
+        log.append(terminal(partial_turn, StoredTurnOutcome::Completed))
+            .await
+            .unwrap();
+        let aggregate = log.usage().await;
+        assert_eq!(aggregate.input_tokens(), Some(1));
+        assert_eq!(aggregate.output_tokens(), None);
+        assert_eq!(aggregate.reasoning_tokens(), Some(3));
+        assert_eq!(aggregate.cache_read_tokens(), Some(4));
+        assert_eq!(aggregate.cache_write_tokens(), None);
+        assert_eq!(aggregate.provider_total_tokens(), None);
+
+        let missing_turn = TurnId::new().unwrap();
+        log.append(assistant(
+            missing_turn,
+            response(vec![AssistantPart::Text("missing".to_owned())], None),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(log.usage().await, Usage::default());
+        cleanup(&store, &log, root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn usage_field_overflow_is_conservative_per_field() {
+        let (store, log, root, _id) = opened().await;
+        let first_turn = TurnId::new().unwrap();
+        log.append(assistant(
+            first_turn,
+            response(
+                vec![AssistantPart::Text("overflow".to_owned())],
+                Some(Usage::from_optional(Some(u64::MAX), Some(2), Some(3))),
+            ),
+        ))
+        .await
+        .unwrap();
+        let second_turn = TurnId::new().unwrap();
+        log.append(assistant(
+            second_turn,
+            response(
+                vec![AssistantPart::Text("second".to_owned())],
+                Some(Usage::from_optional(Some(1), Some(4), Some(5))),
+            ),
+        ))
+        .await
+        .unwrap();
+        let aggregate = log.usage().await;
+        assert_eq!(aggregate.input_tokens(), None);
+        assert_eq!(aggregate.output_tokens(), Some(6));
+        assert_eq!(aggregate.reasoning_tokens(), Some(8));
+        cleanup(&store, &log, root).await;
     }
 
     #[tokio::test(flavor = "current_thread")]

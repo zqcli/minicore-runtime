@@ -1,4 +1,5 @@
 use std::fmt;
+use std::fmt::Write as _;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -10,6 +11,7 @@ use time::format_description::well_known::Rfc3339;
 const _: () = {
     let _ = std::mem::size_of::<Timestamp>();
     let _: fn(&str) -> Result<Timestamp, TimestampError> = Timestamp::new;
+    let _: fn() -> Result<Timestamp, TimestampError> = Timestamp::now_utc;
     let _: fn(&Timestamp) -> &str = Timestamp::as_str;
 };
 
@@ -23,6 +25,24 @@ pub(crate) enum TimestampError {
 pub(crate) struct Timestamp(Box<str>);
 
 impl Timestamp {
+    pub(crate) fn now_utc() -> Result<Self, TimestampError> {
+        let now = OffsetDateTime::now_utc();
+        let mut value = String::with_capacity(24);
+        write!(
+            &mut value,
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            now.year(),
+            u8::from(now.month()),
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second(),
+            now.nanosecond() / 1_000_000,
+        )
+        .map_err(|_| TimestampError::Invalid)?;
+        Self::new(&value)
+    }
+
     pub(crate) fn new(value: &str) -> Result<Self, TimestampError> {
         value.parse()
     }
@@ -126,5 +146,30 @@ mod tests {
         ] {
             assert!(invalid.parse::<Timestamp>().is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn now_utc_uses_the_canonical_millisecond_shape() {
+        let timestamp = Timestamp::now_utc().unwrap();
+        let value = timestamp.as_str();
+        assert_eq!(value.len(), 24);
+        assert_eq!(&value[4..5], "-");
+        assert_eq!(&value[7..8], "-");
+        assert_eq!(&value[10..11], "T");
+        assert_eq!(&value[13..14], ":");
+        assert_eq!(&value[16..17], ":");
+        assert_eq!(&value[19..20], ".");
+        assert_eq!(&value[23..24], "Z");
+        assert!(
+            value[..4]
+                .chars()
+                .all(|character| character.is_ascii_digit())
+        );
+        assert!(
+            value[20..23]
+                .chars()
+                .all(|character| character.is_ascii_digit())
+        );
+        assert_eq!(value.parse::<Timestamp>().unwrap(), timestamp);
     }
 }
