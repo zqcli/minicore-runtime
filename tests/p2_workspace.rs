@@ -247,16 +247,47 @@ async fn opened_workspace_capability_remains_bound_across_root_replacement() {
     fs::write(root.join("target.txt"), b"old").unwrap();
 
     let workspace = Workspace::open(&root, WorkspaceAccess::ReadWrite).unwrap();
-    fs::rename(&root, &displaced).unwrap();
-    fs::create_dir(&root).unwrap();
-    fs::write(root.join("target.txt"), b"replacement").unwrap();
 
-    workspace
-        .write_text(&relative("target.txt"), "bound")
-        .await
-        .unwrap();
-    assert_eq!(fs::read(displaced.join("target.txt")).unwrap(), b"bound");
-    assert_eq!(fs::read(root.join("target.txt")).unwrap(), b"replacement");
+    #[cfg(unix)]
+    {
+        fs::rename(&root, &displaced).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("target.txt"), b"replacement").unwrap();
+
+        workspace
+            .write_text(&relative("target.txt"), "bound")
+            .await
+            .unwrap();
+        assert_eq!(fs::read(displaced.join("target.txt")).unwrap(), b"bound");
+        assert_eq!(fs::read(root.join("target.txt")).unwrap(), b"replacement");
+        workspace.shutdown().await.unwrap();
+        drop(workspace);
+    }
+
+    #[cfg(windows)]
+    {
+        let error = fs::rename(&root, &displaced).unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(32),
+            "live workspace capability must refuse root replacement: {error}"
+        );
+        assert!(!displaced.exists());
+
+        workspace
+            .write_text(&relative("target.txt"), "bound")
+            .await
+            .unwrap();
+        assert_eq!(fs::read(root.join("target.txt")).unwrap(), b"bound");
+
+        workspace.shutdown().await.unwrap();
+        drop(workspace);
+        fs::rename(&root, &displaced).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("target.txt"), b"replacement").unwrap();
+        assert_eq!(fs::read(displaced.join("target.txt")).unwrap(), b"bound");
+        assert_eq!(fs::read(root.join("target.txt")).unwrap(), b"replacement");
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
