@@ -348,6 +348,56 @@ async fn runtime_create_submit_transcript_close_reload_delete_and_reopen() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_unpolled_shutdown_starts_runtime_cleanup() {
+    let (root, _workspace) = paths("unpolled-shutdown");
+    let runtime = Runtime::open(runtime_config(&root), Handle::current())
+        .await
+        .unwrap();
+    let shutdown = runtime.shutdown();
+    drop(shutdown);
+    drop(runtime);
+
+    let mut reopened = None;
+    for _ in 0..1_000 {
+        match Runtime::open(runtime_config(&root), Handle::current()).await {
+            Ok(value) => {
+                reopened = Some(value);
+                break;
+            }
+            Err(minicore_runtime::RuntimeError::InvalidConfiguration) => {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => panic!("unexpected runtime reopen error: {error:?}"),
+        }
+    }
+    let reopened = reopened.expect("unpolled shutdown did not release the root lock");
+    reopened.shutdown().await.unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_runtime_shutdown_is_an_immediate_reopen_barrier() {
+    for index in 0..20 {
+        let (root, workspace) = paths(&format!("shutdown-barrier-{index}"));
+        let runtime = Runtime::open(runtime_config(&root), Handle::current())
+            .await
+            .unwrap();
+        runtime
+            .create_session(session_config(&workspace))
+            .await
+            .unwrap();
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+
+        let reopened = Runtime::open(runtime_config(&root), Handle::current())
+            .await
+            .unwrap();
+        reopened.shutdown().await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_non_last_runtime_clone_does_not_request_shutdown() {
     let (root, workspace) = paths("clone");
     let runtime = Runtime::open(runtime_config(&root), Handle::current())

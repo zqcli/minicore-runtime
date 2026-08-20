@@ -982,6 +982,8 @@ async fn at_01_model_only_turn() {
         entry,
         minicore_runtime::TranscriptEntry::Assistant { text: Some(text), .. } if text == "done"
     )));
+    drop(stream);
+    drop(page);
     runtime.shutdown().await.unwrap();
     drop(runtime);
     let reopened = Runtime::open(reopen_config, Handle::current())
@@ -1553,6 +1555,8 @@ async fn at_09_runtime_restart() {
             | minicore_runtime::TranscriptEntry::Interaction { seq, .. } => *seq,
         })
     );
+    drop(stream);
+    drop(original_page);
     runtime.shutdown().await.unwrap();
     drop(runtime);
 
@@ -1587,6 +1591,7 @@ async fn at_09_runtime_restart() {
     assert!(reopened_page.entries().iter().any(|entry| {
         matches!(entry, minicore_runtime::TranscriptEntry::Summary { text, .. } if text == "COMPACT SUMMARY")
     }));
+    drop(reopened_page);
     reopened.shutdown().await.unwrap();
     fs::remove_dir_all(root).unwrap();
 }
@@ -1618,6 +1623,8 @@ async fn at_10_partial_jsonl() {
     assert_eq!(finished(&mut stream).await, TurnOutcome::Completed);
     let original_page = runtime.transcript(id, None, 200).await.unwrap();
     let original_entries = original_page.entries().to_vec();
+    drop(stream);
+    drop(original_page);
     runtime.shutdown().await.unwrap();
     drop(runtime);
     let conversation = root_path
@@ -1683,6 +1690,7 @@ async fn at_10_partial_jsonl() {
         .await
         .unwrap();
     assert_eq!(finished(&mut stream).await, TurnOutcome::Completed);
+    drop(stream);
     runtime_two.shutdown().await.unwrap();
     drop(runtime_two);
     let corrupt_file = root_two

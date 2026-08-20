@@ -45,7 +45,7 @@ fn p7_public_runtime_surface_is_typed_and_redacted() {
     assert!(source.contains("self.inner.runtime.spawn(actor.run())"));
     assert!(source.contains("JoinOnce<Result<(), RuntimeError>>"));
     assert!(source.contains("RetainedRuntimeOwners"));
-    assert!(source.contains("process teardown"));
+    assert!(source.contains("starts the same asynchronous shutdown path"));
     assert!(source.contains("begin_shutdown"));
     assert!(source.contains("join_all"));
     assert!(!source.contains("shutdown_started"));
