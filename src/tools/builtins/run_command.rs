@@ -577,13 +577,7 @@ async fn kill_and_wait_until(
         // A kill error is acceptable only because this wait status proves the
         // direct child had already exited.
         (Err(_), Ok(Ok(status))) => Ok(status.code()),
-        (_, Ok(Err(_))) => Err(ToolError::Internal),
-        // A cleanup deadline can win before the async reaper is polled again;
-        // accept it only when a nonblocking wait proves direct-child exit.
-        (_, Err(_)) => match child.try_wait() {
-            Ok(Some(status)) => Ok(status.code()),
-            Ok(None) | Err(_) => Err(ToolError::Internal),
-        },
+        (_, Ok(Err(_))) | (_, Err(_)) => Err(ToolError::Internal),
     }
 }
 
@@ -933,6 +927,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn direct_child_exit_with_inherited_pipes_is_bounded_by_user_timeout() {
         const PRODUCT_TIMEOUT: Duration = Duration::from_secs(15);
+        const CLEANUP_SCHEDULING_MARGIN: Duration = Duration::from_millis(250);
         const FIXTURE_START_LIMIT: Duration = Duration::from_secs(60);
 
         let sequence = NEXT_PROCESS_ROOT.fetch_add(1, Ordering::Relaxed);
@@ -1009,14 +1004,12 @@ mod tests {
             "fixture startup must not consume product Tokio time"
         );
         tokio::time::advance(PRODUCT_TIMEOUT).await;
-        let output = tokio::select! {
-            biased;
-            result = &mut operation => result.expect("run_command must settle after the user deadline"),
-            _ = tokio::task::yield_now() => {
-                tokio::time::advance(CLEANUP_TIMEOUT).await;
-                operation.await.expect("run_command cleanup must settle")
-            }
-        };
+        tokio::time::resume();
+        let output =
+            tokio::time::timeout(CLEANUP_TIMEOUT + CLEANUP_SCHEDULING_MARGIN, &mut operation)
+                .await
+                .expect("run_command cleanup must settle within the cleanup bound")
+                .expect("run_command cleanup must settle");
         let value: Value = serde_json::from_str(output.text()).unwrap();
         assert_eq!(value["timed_out"], true, "unexpected output: {value}");
         assert_eq!(
