@@ -212,6 +212,7 @@ def current_authority_files() -> list[Path]:
         ROOT / "docs/architecture.md",
         ROOT / "docs/development-plan.md",
         ROOT / "docs/migration-v0.1-v0.2.md",
+        ROOT / "docs/release-v0.2-core-reset.md",
         ROOT / "docs/modules/README.md",
         ROOT / "docs/adr/README.md",
         *sorted((ROOT / "docs/formats").glob("*.md")),
