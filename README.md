@@ -138,7 +138,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 | `tools` | Tool traits, registry, policies, interaction types, process policy, and builtins |
 | `workspace` | Relative paths, root capability access, directory entries, and workspace errors |
 
-The `agent` and `prompt` modules are implementation-private. Storage, actor, provider transport, and compaction internals are not additional public extension points.
+The `agent`, `prompt`, and `storage` modules are implementation-private. Storage, actor, provider transport, and compaction internals are not additional public extension points.
 
 ## Builtins
 

@@ -1,14 +1,9 @@
 pub(crate) mod actor;
 pub(crate) mod command;
-#[cfg(test)]
-mod compaction_visibility;
-pub(crate) mod conversation;
 mod event;
 pub(crate) mod event_stream;
 mod snapshot;
 mod state;
-pub(crate) mod store;
-pub(crate) mod time;
 pub(crate) mod transcript;
 
 pub(crate) use actor::{SessionActor, SessionActorDependencies};

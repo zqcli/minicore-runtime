@@ -55,12 +55,12 @@ mod tests {
         ModelResponse, ModelSelection, ProviderId, ProviderRegistry, ReasoningPreference, Usage,
     };
     use crate::prompt::CompactionConfig;
-    use crate::session::conversation::{ConversationLog, NewConversationEntry};
-    use crate::session::store::{
+    use crate::storage::conversation::{ConversationLog, NewConversationEntry};
+    use crate::storage::store::{
         SessionStore, StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig,
         StoredSessionConfig,
     };
-    use crate::session::time::{Timestamp, TimestampError};
+    use crate::storage::time::{Timestamp, TimestampError};
     use crate::tools::{
         AllowConfiguredTools, InteractionClient, InteractionReceiver, Tool, ToolContext,
         ToolDecision, ToolError, ToolFuture, ToolName, ToolOutput, ToolPolicy, ToolRegistry,
@@ -1317,7 +1317,7 @@ mod tests {
         log.append(NewConversationEntry::TurnTerminal {
             turn_id,
             timestamp: timestamp(),
-            outcome: crate::session::conversation::StoredTurnOutcome::Completed,
+            outcome: crate::storage::conversation::StoredTurnOutcome::Completed,
         })
         .await
         .unwrap();

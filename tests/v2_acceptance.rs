@@ -2990,6 +2990,7 @@ fn at_20_no_legacy_coupling() {
         "pub mod ids;",
         "pub mod model;",
         "mod prompt;",
+        "mod storage;",
         "pub mod runtime;",
         "pub mod session;",
         "pub mod tools;",

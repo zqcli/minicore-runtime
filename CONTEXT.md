@@ -15,15 +15,16 @@ The crate is Rust 2024 with Rust 1.85 as its MSRV. The default build is offline.
 - `workspace`: one capability-backed root, relative-path validation, bounded file operations, directory enumeration, and workspace shutdown.
 - `prompt`: private prompt assembly and compaction planning.
 - `agent`: private turn runner, model/tool ordering, retries, cancellation, and compaction integration.
-- `session`: actor, mailbox, observation, conversation log, store, snapshots, events, and transcript projection.
+- `storage`: private durable session configuration, timestamps, root lock, store worker, conversation log, replay, repair, and transcript source.
+- `session`: actor, mailbox, observation, terminal/lifecycle orchestration, snapshots, events, and public transcript projection.
 - `runtime`: public orchestration and session residency manager.
 
-The public root exposes canonical `config`, `error`, `event`, `ids`, `model`, `runtime`, `session`, `tools`, and `workspace` modules. `agent` and `prompt` remain private. Storage workers, provider transport, actor commands, and prompt internals are not public extension seams.
+The public root exposes canonical `config`, `error`, `event`, `ids`, `model`, `runtime`, `session`, `tools`, and `workspace` modules. `agent`, `prompt`, and `storage` remain private. Storage workers, provider transport, actor commands, and prompt internals are not public extension seams.
 
 ## Core Invariants
 
-- One `Runtime` owns one `SessionStore`, its root lock, its provider registry, and its tool registry.
-- One loaded session owns one actor, one bounded command mailbox, one conversation log, one workspace, and one active turn at most.
+- One `Runtime` owns one storage `SessionStore`, its root lock, its provider registry, and its tool registry.
+- One loaded session coordinates one storage-owned conversation log, one actor, one bounded command mailbox, one workspace, and one active turn at most.
 - Session states are exactly `Idle`, `Running`, `WaitingForInput`, and `Closing`.
 - Submit and answer use the same bounded mailbox. Cancellation is an out-of-band request and never waits behind normal work.
 - A response to an interaction has one first-winner claim. The actor persists the interaction before resuming model work.
@@ -103,7 +104,7 @@ The two provider live-smoke cases remain ignored and require explicit opt-in env
 - Public surface: `src/lib.rs`, `src/config.rs`, `src/error.rs`, `src/runtime/runtime_impl.rs`.
 - Model contract: `src/model/registry.rs`, `src/model/provider.rs`, and the two direct provider modules.
 - Tool contract: `src/tools/registry.rs`, `src/tools/policy.rs`, `src/tools/context.rs`, and `src/tools/builtins/`.
-- Storage contract: `src/session/store.rs`, `src/session/conversation.rs`, `src/session/conversation/codec.rs`, and `src/session/transcript.rs`.
+- Storage contract: `src/storage/store.rs`, `src/storage/conversation.rs`, `src/storage/conversation/codec.rs`, and `src/session/transcript.rs`.
 - Lifecycle contract: `src/session/actor.rs`, `src/session/command.rs`, and `src/runtime/session_manager.rs`.
 - Acceptance contract: `tests/v2_acceptance.rs`; provider protocol evidence remains in the P3 suites.
 - Documentation validation: `scripts/check_docs.py` checks current authority plus selected non-pre-reset evidence.

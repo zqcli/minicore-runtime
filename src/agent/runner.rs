@@ -14,7 +14,7 @@ use crate::model::{
     ModelResponse, ToolCall, Usage,
 };
 use crate::prompt::{PromptError, append_validated_summary};
-use crate::session::conversation::{ConversationError, NewConversationEntry};
+use crate::storage::conversation::{ConversationError, NewConversationEntry};
 use crate::tools::{
     ToolCallSummary, ToolContext, ToolContextView, ToolDecision, ToolError, ToolOutput,
     ToolRequest, ToolResultStatus, ToolResultSummary,
@@ -373,7 +373,7 @@ async fn build_ordinary_request(ctx: &TurnContext) -> CallFlow<crate::model::Mod
         };
         match append_validated_summary(ctx.conversation(), &plan, timestamp, &summary).await {
             Ok(_) => return build_fresh_prompt(ctx).await,
-            Err(crate::session::conversation::ConversationError::Stale) if !stale_replan => {
+            Err(crate::storage::conversation::ConversationError::Stale) if !stale_replan => {
                 stale_replan = true;
             }
             Err(_) => return CallFlow::Failed(TurnFailure::Compaction),

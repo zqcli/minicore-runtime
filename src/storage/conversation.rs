@@ -1442,7 +1442,7 @@ mod tests {
 
     use super::*;
     use crate::model::{ModelFinishReason, ModelMessage, ModelSelection, ReasoningContent, Usage};
-    use crate::session::store::{
+    use crate::storage::store::{
         StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig, StoredSessionConfig,
     };
     use crate::tools::ToolName;
@@ -2861,7 +2861,7 @@ mod tests {
         let blocker = store.run_io(move || {
             started_sender.send(()).unwrap();
             release_receiver.recv().unwrap();
-            Ok::<_, crate::session::store::StoreError>(())
+            Ok::<_, crate::storage::store::StoreError>(())
         });
         started_receiver.recv().unwrap();
         let turn_id = TurnId::new().unwrap();
@@ -2897,7 +2897,7 @@ mod tests {
         let blocker = store.run_io(move || {
             started_sender.send(()).unwrap();
             release_receiver.recv().unwrap();
-            Ok::<_, crate::session::store::StoreError>(())
+            Ok::<_, crate::storage::store::StoreError>(())
         });
         started_receiver.recv().unwrap();
         let turn_id = TurnId::new().unwrap();
@@ -2906,7 +2906,7 @@ mod tests {
         let mut context = Context::from_waker(&waker);
         assert!(matches!(append.as_mut().poll(&mut context), Poll::Pending));
         drop(append);
-        let barrier = store.run_io(|| Ok::<_, crate::session::store::StoreError>(()));
+        let barrier = store.run_io(|| Ok::<_, crate::storage::store::StoreError>(()));
         release_sender.send(()).unwrap();
         SessionStore::await_io(blocker).await.unwrap();
         SessionStore::await_io(barrier).await.unwrap();
@@ -2917,7 +2917,7 @@ mod tests {
         let blocker = store.run_io(move || {
             started_sender.send(()).unwrap();
             release_receiver.recv().unwrap();
-            Ok::<_, crate::session::store::StoreError>(())
+            Ok::<_, crate::storage::store::StoreError>(())
         });
         started_receiver.recv().unwrap();
         let append = log.append(user(TurnId::new().unwrap(), "drain"));
@@ -2961,7 +2961,7 @@ mod tests {
         let blocker = store.run_io(move || {
             started_sender.send(()).unwrap();
             release_receiver.recv().unwrap();
-            Ok::<_, crate::session::store::StoreError>(())
+            Ok::<_, crate::storage::store::StoreError>(())
         });
         started_receiver.recv().unwrap();
         let mut summary = Box::pin(log.append_summary(3, 3, timestamp(), "summary".to_owned()));
@@ -2969,7 +2969,7 @@ mod tests {
         let mut context = Context::from_waker(&waker);
         assert!(matches!(summary.as_mut().poll(&mut context), Poll::Pending));
         drop(summary);
-        let barrier = store.run_io(|| Ok::<_, crate::session::store::StoreError>(()));
+        let barrier = store.run_io(|| Ok::<_, crate::storage::store::StoreError>(()));
         release_sender.send(()).unwrap();
         SessionStore::await_io(blocker).await.unwrap();
         SessionStore::await_io(barrier).await.unwrap();

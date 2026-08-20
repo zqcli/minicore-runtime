@@ -1,6 +1,6 @@
 # Session JSON v2
 
-This document is the current durable session configuration contract implemented by [`src/session/store.rs`](../../src/session/store.rs). The store writes one `session.json` per session directory and rejects unknown fields, duplicate enabled tools, unsupported format versions, invalid paths, invalid text, and values outside the bounds below.
+This document is the current durable session configuration contract implemented by [`src/storage/store.rs`](../../src/storage/store.rs). The store writes one `session.json` per session directory and rejects unknown fields, duplicate enabled tools, unsupported format versions, invalid paths, invalid text, and values outside the bounds below.
 
 ## Layout
 

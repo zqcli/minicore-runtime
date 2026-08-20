@@ -9,7 +9,7 @@ use serde::{Serialize, Serializer};
 use super::{
     ConversationEntry, ConversationError, ConversationState, MAX_FILE_BYTES, MAX_LINE_BYTES,
 };
-use crate::session::store::StoreError;
+use crate::storage::store::StoreError;
 
 impl From<StoreError> for ConversationError {
     fn from(error: StoreError) -> Self {

@@ -46,14 +46,14 @@ mod tests {
         AssistantPart, ModelFinishReason, ModelLimits, ModelMessage, ModelResponse, ModelSelection,
         ReasoningContent, ReasoningPreference,
     };
-    use crate::session::conversation::{
+    use crate::storage::conversation::{
         ConversationError, ConversationLog, NewConversationEntry, StoredTurnOutcome,
     };
-    use crate::session::store::{
+    use crate::storage::store::{
         SessionStore, StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig,
         StoredSessionConfig,
     };
-    use crate::session::time::Timestamp;
+    use crate::storage::time::Timestamp;
     use crate::tools::{ToolName, ToolSpec};
 
     fn timestamp() -> Timestamp {
@@ -155,7 +155,7 @@ mod tests {
         ConversationLog,
         PathBuf,
         SessionId,
-        crate::session::conversation::CompactionConversationView,
+        crate::storage::conversation::CompactionConversationView,
     ) {
         let (store, log, root, id) = opened().await;
         let completed_turn = TurnId::new().unwrap();

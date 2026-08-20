@@ -6,10 +6,10 @@ use crate::model::{
     AssistantPart, ModelFinishReason, ModelMessage, ModelRequest, ModelResponse,
     ReasoningPreference,
 };
-use crate::session::conversation::{
+use crate::storage::conversation::{
     CompactionConversationView, ConversationError, ConversationLog,
 };
-use crate::session::time::Timestamp;
+use crate::storage::time::Timestamp;
 use crate::tools::ToolSpec;
 
 use super::builder::{MAX_SUMMARY_TEXT_BYTES, PromptBuildOptions, PromptBuilder, PromptError};

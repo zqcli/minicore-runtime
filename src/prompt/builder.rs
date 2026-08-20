@@ -5,7 +5,7 @@ use serde_json::to_vec;
 use thiserror::Error;
 
 use crate::model::{ModelLimits, ModelMessage, ModelRequest, ModelSelection, ReasoningPreference};
-use crate::session::conversation::PromptConversationView;
+use crate::storage::conversation::PromptConversationView;
 use crate::tools::{ToolName, ToolSpec};
 
 pub(crate) const MAX_PROMPT_TEXT_BYTES: usize = 262_144;

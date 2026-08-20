@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use crate::error::SessionError;
 use crate::ids::SessionId;
 use crate::session::command::SessionHandle;
-use crate::session::conversation::ConversationLog;
+use crate::storage::conversation::ConversationLog;
 
 pub(crate) struct ManagedSession {
     pub(crate) handle: SessionHandle,

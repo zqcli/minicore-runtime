@@ -12,9 +12,9 @@ fn p6_observation_surface_is_precise_and_keeps_owners_private() {
     let session = include_str!("../src/session/mod.rs");
     assert!(session.contains("pub(crate) mod event_stream;"));
     assert!(session.contains("pub use event_stream::SessionEventStream;"));
-    let time = include_str!("../src/session/time.rs");
-    let conversation = include_str!("../src/session/conversation.rs");
-    let usage = include_str!("../src/session/conversation/usage.rs");
+    let time = include_str!("../src/storage/time.rs");
+    let conversation = include_str!("../src/storage/conversation.rs");
+    let usage = include_str!("../src/storage/conversation/usage.rs");
     let stream = include_str!("../src/session/event_stream.rs");
     for required in [
         "now_utc",

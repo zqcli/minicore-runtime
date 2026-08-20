@@ -4,10 +4,10 @@ use crate::error::{PublicErrorCode, PublicErrorSummary};
 use crate::ids::{InteractionId, ToolCallId, TurnId};
 use crate::tools::ToolName;
 
-use super::conversation::{
+use super::snapshot::TurnOutcome;
+use crate::storage::conversation::{
     ConversationEntry, ConversationError, ConversationLog, ConversationSnapshot, StoredTurnOutcome,
 };
-use super::snapshot::TurnOutcome;
 
 const MAX_PAGE_SIZE: usize = 200;
 

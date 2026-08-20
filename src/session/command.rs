@@ -4,11 +4,11 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::conversation::validate_user_text;
 use super::event_stream::{SessionEventStream, SessionObservation};
 use super::snapshot::SessionSnapshot;
 use crate::error::SessionError;
 use crate::ids::{InteractionId, TurnId};
+use crate::storage::conversation::validate_user_text;
 use crate::tools::UserAnswer;
 
 pub(crate) const MAX_COMMAND_CAPACITY: usize = 4_096;

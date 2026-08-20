@@ -7,11 +7,11 @@ MiniCore Runtime is a typed, embeddable core for a durable coding session. The a
 ```text
 host configuration
     -> Runtime
-        -> SessionManager / SessionStore
+        -> SessionManager / Storage
             -> zero or more loaded SessionActors
                 -> one Turn runner per active Session
                     -> PromptBuilder -> ModelGateway -> ToolRegistry/Workspace
-                        -> ConversationLog -> Snapshot/Event/Transcript
+                        -> Storage ConversationLog -> Snapshot/Event/Transcript
 ```
 
 The source of truth for this map is [`src/lib.rs`](../src/lib.rs), the [canonical module map](modules/README.md), and the current [format documents](formats/session-json-v2.md). Historical pre-reset material is not an implementation dependency.
@@ -26,10 +26,11 @@ The crate has one public facade and a small number of owner boundaries:
 4. `workspace` owns one capability-backed root and all filesystem operations relative to that root.
 5. `prompt` owns prompt assembly and compaction planning. It is private.
 6. `agent` owns one turn's model/tool loop. It is private and returns work to the session owner.
-7. `session` owns durable conversation state, the actor mailbox, terminal settlement, observation, and per-session resources.
-8. `runtime` owns public lifecycle admission, loaded-session residency, and runtime cleanup.
+7. `session` owns the actor mailbox, terminal settlement, observation, and per-session orchestration.
+8. `storage` owns durable session configuration, timestamps, the root lock, and conversation JSONL. It is private and lower-level than session, agent, and prompt.
+9. `runtime` owns public lifecycle admission, loaded-session residency, and runtime cleanup.
 
-The model registry does not reach into sessions. Tools receive a `ToolContext` rather than a Runtime handle. Workspace does not know about providers or conversation state. Prompt assembly consumes already-owned values. The session actor is the integration owner; it does not create peer actors for each subsystem.
+The model registry does not reach into sessions. Tools receive a `ToolContext` rather than a Runtime handle. Workspace does not know about providers or conversation state. Prompt assembly consumes storage-owned conversation projections. The session actor is the integration owner for a loaded session; it does not create peer actors for each subsystem. Storage is lower-level and never imports session ownership.
 
 ## Runtime Ownership
 
@@ -151,7 +152,7 @@ Model deltas, tool execution, interaction waiting, terminal results, and closure
 
 ## Persistence and Recovery
 
-The store owns `runtime.lock` and the sessions namespace. Conversation append is serialized through the store worker, flushed/synchronized, and reflected in the in-memory state only after the durable barrier. `ConversationLog` owns the semantic append and replay contract; `SessionActor` owns when a user, assistant, tool, interaction, summary, or terminal entry is allowed to exist.
+The private `storage` module owns `runtime.lock`, the sessions namespace, and the conversation log. Conversation append is serialized through the store worker, flushed/synchronized, and reflected in the in-memory state only after the durable barrier. `ConversationLog` owns the semantic append and replay contract; `SessionActor` owns when a user, assistant, tool, interaction, summary, or terminal entry is allowed to exist.
 
 Replay validates line size, file size, UTF-8, JSON shape, positive sequence order, tool relations, interaction identity, terminal boundaries, and summary boundaries. A final partial line is repaired by truncation to the last complete newline. A complete middle failure returns located corruption. Store health can degrade on local recording failure; a terminal append failure makes the live session unavailable rather than claiming completion.
 
@@ -170,7 +171,7 @@ No layer turns an unknown remote outcome into a safe retry, a failed durable app
 
 ## Deliberate Limits
 
-The core has no default provider, no shell language, no process-tree sandbox claim, no automatic historical storage migration, and no server or CLI. It has one actor per loaded session, one bounded mailbox, one conversation log, one workspace owner, and one Runtime shutdown owner. Future host features must preserve these ownership boundaries or introduce a separate documented owner and evidence contract.
+The core has no default provider, no shell language, no process-tree sandbox claim, no automatic historical storage migration, and no server or CLI. It has one actor per loaded session, one bounded mailbox, one storage-owned conversation log, one workspace owner, and one Runtime shutdown owner. Future host features must preserve these ownership boundaries or introduce a separate documented owner and evidence contract.
 
 ## Startup and Shutdown Timeline
 

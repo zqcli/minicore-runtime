@@ -14,11 +14,11 @@ This page maps the current source graph. It is intentionally narrower than the h
 | `ids` | Checked identifiers |
 | `model` | Provider and model contracts |
 | `runtime` | Runtime orchestration and session summaries |
-| `session` | Session observation, outcomes, transcript DTOs, actor, store, and conversation |
+| `session` | Session observation, outcomes, transcript DTOs, actor, and lifecycle orchestration |
 | `tools` | Tool contracts, policy, interaction, process policy, and builtins |
 | `workspace` | Capability-backed root and relative filesystem operations |
 
-The root also reexports stable DTOs and operations. `agent` and `prompt` are private modules. There are no path-based compatibility declarations.
+The root also reexports stable DTOs and operations. `agent`, `prompt`, and `storage` are private modules. There are no path-based compatibility declarations.
 
 ## Ownership and Dependencies
 
@@ -26,7 +26,7 @@ The root also reexports stable DTOs and operations. `agent` and `prompt` are pri
 
 - Source: [`src/config.rs`](../../src/config.rs)
 - Owns `RuntimeConfig`, `RuntimeConfigBuilder`, `SessionConfig`, and checked bounds.
-- Depends on model selection/registry, tool names/registry, stored session constructors, and session timestamps.
+- Depends on model selection/registry, tool names/registry, and storage-owned checked session constructors/timestamps.
 - Does not open files, providers, actors, or processes.
 
 ### `model`
@@ -58,7 +58,7 @@ The root also reexports stable DTOs and operations. `agent` and `prompt` are pri
 
 - Sources: [`src/prompt/mod.rs`](../../src/prompt/mod.rs), [`builder.rs`](../../src/prompt/builder.rs), and [`compaction.rs`](../../src/prompt/compaction.rs).
 - Private owner of prompt message assembly, coding instructions, serialized-byte estimation, compaction planning, and validated summaries.
-- Consumes model/tool values and conversation projections. It does not write the conversation file or publish session events.
+- Consumes model/tool values and storage-owned conversation projections. It does not write the conversation file or publish session events.
 
 ### `agent`
 
@@ -66,14 +66,19 @@ The root also reexports stable DTOs and operations. `agent` and `prompt` are pri
 - Private owner of one model/tool turn, tool-round ordering, interaction requests, delivery-aware logical retry, cancellation, and compaction requests.
 - It returns turn work/results to the session actor; it does not own terminal persistence.
 
+### `storage`
+
+- Sources: [`src/storage/mod.rs`](../../src/storage/mod.rs), [`store.rs`](../../src/storage/store.rs), [`conversation.rs`](../../src/storage/conversation.rs), [`conversation/`](../../src/storage/conversation/), [`time.rs`](../../src/storage/time.rs), and test-only `compaction_visibility.rs`.
+- Private owner of checked session configuration, timestamps, the root lock, session namespace, append-only conversation records, replay/repair, prompt projections, compaction boundaries, usage aggregation, and transcript source entries.
+- Depends on model, tools, identifiers, cap-std, and the filesystem worker; it does not depend on session, agent, prompt, or Runtime owners.
+
 ### `session`
 
-- Sources: [`src/session/mod.rs`](../../src/session/mod.rs), [`actor.rs`](../../src/session/actor.rs), [`command.rs`](../../src/session/command.rs), [`event.rs`](../../src/session/event.rs), [`event_stream.rs`](../../src/session/event_stream.rs), [`snapshot.rs`](../../src/session/snapshot.rs), [`state.rs`](../../src/session/state.rs), [`store.rs`](../../src/session/store.rs), [`conversation.rs`](../../src/session/conversation.rs), [`conversation/actor_support.rs`](../../src/session/conversation/actor_support.rs), [`conversation/codec.rs`](../../src/session/conversation/codec.rs), [`conversation/compaction.rs`](../../src/session/conversation/compaction.rs), [`conversation/usage.rs`](../../src/session/conversation/usage.rs), [`transcript.rs`](../../src/session/transcript.rs), and [`time.rs`](../../src/session/time.rs).
+- Sources: [`src/session/mod.rs`](../../src/session/mod.rs), [`actor.rs`](../../src/session/actor.rs), [`command.rs`](../../src/session/command.rs), [`event.rs`](../../src/session/event.rs), [`event_stream.rs`](../../src/session/event_stream.rs), [`snapshot.rs`](../../src/session/snapshot.rs), [`state.rs`](../../src/session/state.rs), and [`transcript.rs`](../../src/session/transcript.rs).
 - The actor owns admission, mailbox ordering, terminal settlement, interaction persistence, snapshot publication, and close completion.
-- The conversation log owns append ordering, replay, repair, prompt projection, compaction boundaries, usage aggregation, and transcript projection.
-- The store worker owns the root lock, session namespace, atomic create, bounded CRUD, readiness, and shutdown result.
-- Snapshot and event modules expose observation; the durable and actor modules remain crate-private.
-- Session depends on model, tools, workspace, prompt, and agent internals. Those dependencies point inward to the session owner rather than creating peer actors.
+- Session coordinates the storage-owned conversation log and publishes its public observation/transcript projections; it does not own storage workers or durable formats.
+- Snapshot and event modules expose observation; the actor and storage modules remain crate-private.
+- Session depends on model, tools, workspace, prompt, agent, and storage internals without creating peer actors.
 
 ### `runtime`
 
@@ -105,14 +110,15 @@ src/
 │   └── providers/{anthropic.rs,mod.rs,openai.rs}
 ├── prompt/{builder.rs,compaction.rs,mod.rs}
 ├── runtime/{mod.rs,runtime_impl.rs,session_manager.rs}
-├── session/{actor.rs,command.rs,event.rs,event_stream.rs,mod.rs,snapshot.rs,state.rs,store.rs,time.rs,transcript.rs,conversation.rs}
+├── session/{actor.rs,command.rs,event.rs,event_stream.rs,mod.rs,snapshot.rs,state.rs,transcript.rs}
+├── storage/{compaction_visibility.rs,conversation.rs,mod.rs,store.rs,time.rs}
 │   └── conversation/{actor_support.rs,codec.rs,compaction.rs,usage.rs}
 ├── tools/{context.rs,mod.rs,policy.rs,process.rs,registry.rs,types.rs}
 │   └── builtins/{ask_user.rs,list_directory.rs,path_args.rs,read_file.rs,run_command.rs,write_file.rs}
 └── workspace/{mod.rs,path.rs,root.rs}
 ```
 
-The graph above names the current owners, not an archival compatibility layout. The `src/session` conversation files are private submodules of the session module. The `src/model/transport.rs` module is crate-private even though model provider types are public. The `src/prompt` and `src/agent` directories are private implementation modules declared from the crate root.
+The graph above names the current owners, not an archival compatibility layout. The `src/storage` files are private lower modules declared from the crate root; session, agent, and prompt consume their interfaces without creating a reverse storage-to-session edge. The `src/model/transport.rs` module is crate-private even though model provider types are public. The `src/prompt`, `src/agent`, and `src/storage` directories are private implementation modules declared from the crate root.
 
 ## Boundary Rules
 
