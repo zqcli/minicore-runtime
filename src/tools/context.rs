@@ -40,11 +40,26 @@ struct InteractionChannelInner {
     notify: Notify,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InteractionSlotId(u64);
+
 struct InteractionChannelState {
     receiver_open: bool,
     client_count: usize,
     queued: Option<Arc<InteractionRequestInner>>,
     pending: Option<Arc<RequestState>>,
+    next_slot_id: u64,
+}
+
+impl InteractionChannelState {
+    fn allocate_slot_id(&mut self) -> Result<InteractionSlotId, ToolError> {
+        let value = self
+            .next_slot_id
+            .checked_add(1)
+            .ok_or(ToolError::Internal)?;
+        self.next_slot_id = value;
+        Ok(InteractionSlotId(value))
+    }
 }
 
 impl InteractionChannelInner {
@@ -57,6 +72,7 @@ impl InteractionChannelInner {
 
 struct RequestState {
     channel: Weak<InteractionChannelInner>,
+    slot_id: InteractionSlotId,
     active: AtomicBool,
     reply: Mutex<Option<oneshot::Sender<Result<UserAnswer, ToolError>>>>,
 }
@@ -96,10 +112,12 @@ impl Drop for InteractionResponse {
 impl RequestState {
     fn new(
         channel: &Arc<InteractionChannelInner>,
+        slot_id: InteractionSlotId,
         reply: oneshot::Sender<Result<UserAnswer, ToolError>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             channel: Arc::downgrade(channel),
+            slot_id,
             active: AtomicBool::new(true),
             reply: Mutex::new(Some(reply)),
         })
@@ -126,7 +144,7 @@ impl RequestState {
             if state
                 .pending
                 .as_ref()
-                .is_some_and(|pending| Arc::ptr_eq(pending, self))
+                .is_some_and(|pending| pending.slot_id == self.slot_id)
             {
                 state.pending = None;
                 changed = true;
@@ -134,7 +152,7 @@ impl RequestState {
             if state
                 .queued
                 .as_ref()
-                .is_some_and(|queued| Arc::ptr_eq(&queued.state, self))
+                .is_some_and(|queued| queued.state.slot_id == self.slot_id)
             {
                 state.queued = None;
                 changed = true;
@@ -218,6 +236,7 @@ impl InteractionClient {
                 client_count: 1,
                 queued: None,
                 pending: None,
+                next_slot_id: 0,
             }),
             notify: Notify::new(),
         });
@@ -255,7 +274,8 @@ impl InteractionClient {
             }
 
             let (reply, response) = oneshot::channel();
-            let request_state = RequestState::new(&self.inner, reply);
+            let slot_id = channel_state.allocate_slot_id()?;
+            let request_state = RequestState::new(&self.inner, slot_id, reply);
             let request = Arc::new(InteractionRequestInner {
                 state: Arc::clone(&request_state),
                 turn_id,
@@ -330,7 +350,7 @@ impl InteractionReceiver {
                             && state
                                 .pending
                                 .as_ref()
-                                .is_some_and(|pending| Arc::ptr_eq(pending, &request.state))
+                                .is_some_and(|pending| pending.slot_id == request.state.slot_id)
                         {
                             return Some(InteractionRequest { inner: request });
                         }
@@ -468,7 +488,9 @@ impl<'a> ToolContext<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InteractionClient, InteractionId, ToolError, TurnId, UserAnswer};
+    use super::{
+        InteractionChannelState, InteractionClient, InteractionId, ToolError, TurnId, UserAnswer,
+    };
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test(flavor = "current_thread")]
@@ -551,5 +573,78 @@ mod tests {
         let response = request.claim_response().unwrap();
         drop(response);
         assert_eq!(task.await.unwrap(), Err(ToolError::InteractionClosed));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_request_drop_does_not_clear_a_new_slot() {
+        let (client, mut receiver) = InteractionClient::channel();
+        let first_client = client.clone();
+        let first = tokio::runtime::Handle::current().spawn(async move {
+            first_client
+                .ask_user(
+                    TurnId::new().unwrap(),
+                    "old request",
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        let old_request = receiver.recv().await.unwrap();
+        {
+            let mut state = client.inner.lock_state();
+            assert!(state.pending.take().is_some());
+        }
+
+        let second_client = client.clone();
+        let second = tokio::runtime::Handle::current().spawn(async move {
+            second_client
+                .ask_user(
+                    TurnId::new().unwrap(),
+                    "new request",
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        let new_request = receiver.recv().await.unwrap();
+        let new_slot_id = new_request.inner.state.slot_id;
+        drop(old_request);
+
+        assert_eq!(first.await.unwrap(), Err(ToolError::InteractionClosed));
+        assert_eq!(
+            client
+                .inner
+                .lock_state()
+                .pending
+                .as_ref()
+                .map(|pending| pending.slot_id),
+            Some(new_slot_id)
+        );
+        new_request
+            .respond(UserAnswer::new("accepted").unwrap())
+            .unwrap();
+        assert_eq!(second.await.unwrap().unwrap().text(), "accepted");
+    }
+
+    #[test]
+    fn interaction_slot_ids_are_monotonic_and_checked() {
+        let mut state = InteractionChannelState {
+            receiver_open: true,
+            client_count: 1,
+            queued: None,
+            pending: None,
+            next_slot_id: 0,
+        };
+        assert_eq!(
+            state.allocate_slot_id().unwrap(),
+            super::InteractionSlotId(1)
+        );
+        assert_eq!(
+            state.allocate_slot_id().unwrap(),
+            super::InteractionSlotId(2)
+        );
+        state.next_slot_id = u64::MAX;
+        assert_eq!(state.allocate_slot_id(), Err(ToolError::Internal));
+        assert_eq!(state.next_slot_id, u64::MAX);
     }
 }

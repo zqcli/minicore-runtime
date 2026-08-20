@@ -159,6 +159,7 @@ FORBIDDEN_SOURCE_TOKENS = (
     "Archive",
     "Steer",
     "FollowUp",
+    "Arc::ptr_eq",
 )
 
 EXPECTED_ACCEPTANCE_CASES = (
