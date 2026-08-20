@@ -7,20 +7,20 @@ use futures_util::future::join_all;
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent_v2::{RetryPolicy, system_timestamp_source};
+use crate::agent::{RetryPolicy, system_timestamp_source};
 use crate::config::{RuntimeConfig, SessionConfig};
-use crate::error_v2::{RuntimeError, SessionError};
-use crate::ids_v2::{InteractionId, SessionId, TurnId};
-use crate::model_v2::{ModelGateway, ModelSelection, ReasoningPreference};
-use crate::session_v2::SessionSnapshot;
-use crate::session_v2::actor::{SessionActor, SessionActorDependencies};
-use crate::session_v2::conversation::{ConversationError, ConversationLog};
-use crate::session_v2::event_stream::SessionEventStream;
-use crate::session_v2::store::{SessionStore, StoreError, StoredSessionConfig};
-use crate::session_v2::time::Timestamp;
-use crate::session_v2::transcript::TranscriptPage;
-use crate::tools_v2::{AllowConfiguredTools, ToolName, ToolPolicy, ToolRegistry, UserAnswer};
-use crate::workspace_v2::{Workspace, WorkspaceAccess, WorkspaceError};
+use crate::error::{RuntimeError, SessionError};
+use crate::ids::{InteractionId, SessionId, TurnId};
+use crate::model::{ModelGateway, ModelSelection, ReasoningPreference};
+use crate::session::SessionSnapshot;
+use crate::session::actor::{SessionActor, SessionActorDependencies};
+use crate::session::conversation::{ConversationError, ConversationLog};
+use crate::session::event_stream::SessionEventStream;
+use crate::session::store::{SessionStore, StoreError, StoredSessionConfig};
+use crate::session::time::Timestamp;
+use crate::session::transcript::TranscriptPage;
+use crate::tools::{AllowConfiguredTools, ToolName, ToolPolicy, ToolRegistry, UserAnswer};
+use crate::workspace::{Workspace, WorkspaceAccess, WorkspaceError};
 
 use super::session_manager::{JoinOnce, ManagedSession, SessionManager};
 

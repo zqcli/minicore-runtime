@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use tokio::sync::{Notify, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::ids_v2::{InteractionId, SessionId, TurnId};
-use crate::workspace_v2::Workspace;
+use crate::ids::{InteractionId, SessionId, TurnId};
+use crate::workspace::Workspace;
 
 use super::types::{ToolError, UserAnswer, UserQuestion};
 

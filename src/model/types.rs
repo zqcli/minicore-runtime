@@ -8,9 +8,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::ids_v2::ToolCallId;
-pub(crate) use crate::tools_v2::ToolSpec;
-use crate::tools_v2::{ToolName, ToolOutput, validate_json_shape};
+use crate::ids::ToolCallId;
+pub(crate) use crate::tools::ToolSpec;
+use crate::tools::{ToolName, ToolOutput, validate_json_shape};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ModelIdentityError {

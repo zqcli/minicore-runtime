@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
@@ -111,7 +112,7 @@ impl ModelProvider for ScriptedProvider {
         std::slice::from_ref(&self.descriptor)
     }
 
-    fn generate<'a>(&'a self, request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'a> {
+    fn generate(&self, request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'_> {
         self.state
             .requests
             .lock()
@@ -630,10 +631,11 @@ fn anthropic_sse(text: &str) -> String {
             "usage": {"output_tokens": 2}
         }),
     ];
-    events
-        .into_iter()
-        .map(|event| format!("data: {event}\n\n"))
-        .collect()
+    let mut output = String::new();
+    for event in events {
+        write!(&mut output, "data: {event}\n\n").unwrap();
+    }
+    output
 }
 
 fn anthropic_tool_sse() -> String {
@@ -668,10 +670,11 @@ fn anthropic_tool_sse() -> String {
             "usage": {"output_tokens": 2}
         }),
     ];
-    events
-        .into_iter()
-        .map(|event| format!("data: {event}\n\n"))
-        .collect()
+    let mut output = String::new();
+    for event in events {
+        write!(&mut output, "data: {event}\n\n").unwrap();
+    }
+    output
 }
 
 #[derive(Clone)]

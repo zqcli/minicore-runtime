@@ -11,11 +11,9 @@ use tokio::sync::Notify;
 
 use super::store::{SessionRegistration, SessionStore, StoreError};
 use super::time::Timestamp;
-use crate::ids_v2::{InteractionId, SessionId, ToolCallId, TurnId};
-use crate::model_v2::{
-    AssistantPart, ModelMessage, ModelResponse, ReasoningContent, ToolCall, Usage,
-};
-use crate::tools_v2::{ToolOutput, UserAnswer, UserQuestion};
+use crate::ids::{InteractionId, SessionId, ToolCallId, TurnId};
+use crate::model::{AssistantPart, ModelMessage, ModelResponse, ReasoningContent, ToolCall, Usage};
+use crate::tools::{ToolOutput, UserAnswer, UserQuestion};
 
 #[path = "conversation_actor.rs"]
 mod actor_support;
@@ -33,7 +31,6 @@ const MAX_SUMMARY_BYTES: usize = 65_536;
 const MAX_LINE_BYTES: usize = 1_048_576;
 const MAX_FILE_BYTES: usize = 1_073_741_824;
 const MAX_COMPLETE_ENTRIES: usize = 1_000_000;
-const MAX_PAGE_SIZE: usize = 200;
 const RESTART_CANCELLED_TEXT: &str = "cancelled by restart";
 
 // Keep this crate-private foundation type-checked before the SessionActor slice consumes it.
@@ -43,7 +40,6 @@ const _: () = {
     let _ = MAX_LINE_BYTES;
     let _ = MAX_FILE_BYTES;
     let _ = MAX_COMPLETE_ENTRIES;
-    let _ = MAX_PAGE_SIZE;
     let _ = RESTART_CANCELLED_TEXT;
     let _ = std::mem::size_of::<ConversationError>();
     let _ = std::mem::size_of::<ConversationHealth>();
@@ -52,7 +48,6 @@ const _: () = {
     let _ = std::mem::size_of::<ConversationEntry>();
     let _ = std::mem::size_of::<ConversationState>();
     let _ = std::mem::size_of::<ConversationSnapshot>();
-    let _ = std::mem::size_of::<TranscriptPage>();
     let _ = std::mem::size_of::<ConversationSummary>();
     let _ = std::mem::size_of::<PromptConversationView>();
     let _ = std::mem::size_of::<CompactionConversationView>();
@@ -63,9 +58,6 @@ const _: () = {
     let _ = ConversationState::apply;
     let _ = ConversationState::snapshot;
     let _ = ConversationState::prompt_view;
-    let _ = ConversationError::location;
-    let _ = ConversationError::line;
-    let _ = ConversationError::offset;
     let _ = NewConversationEntry::assistant_from_response;
     let _ = NewConversationEntry::validate;
     let _ = NewConversationEntry::into_entry;
@@ -75,7 +67,6 @@ const _: () = {
     let _ = ConversationLog::append;
     let _ = ConversationLog::snapshot;
     let _ = ConversationLog::usage;
-    let _ = ConversationLog::page;
     let _ = ConversationLog::prompt_view;
     let _ = ConversationLog::compaction_view;
     let _ = ConversationLog::append_summary;
@@ -89,14 +80,9 @@ const _: () = {
     let _ = ConversationSnapshot::entries;
     let _ = ConversationSnapshot::max_seq;
     let _ = ConversationSnapshot::health;
-    let _ = ConversationSnapshot::partial_tail;
-    let _ = TranscriptPage::entries;
-    let _ = TranscriptPage::next_after_seq;
-    let _ = ConversationSummary::through_seq;
     let _ = ConversationSummary::text;
     let _ = PromptConversationView::messages;
     let _ = PromptConversationView::latest_summary;
-    let _ = PromptConversationView::snapshot_seq;
 };
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -987,7 +973,6 @@ impl ConversationState {
             entries: Arc::from(self.entries.clone().into_boxed_slice()),
             max_seq: self.max_seq,
             health: self.health,
-            partial_tail: self.partial_tail,
         }
     }
 
@@ -1067,7 +1052,6 @@ impl ConversationState {
                     through_seq: summary.through_seq,
                     text: summary.text.clone(),
                 }),
-            snapshot_seq: self.max_seq,
         })
     }
 }
@@ -1077,22 +1061,6 @@ pub(crate) struct ConversationSnapshot {
     entries: Arc<[Arc<ConversationEntry>]>,
     max_seq: u64,
     health: ConversationHealth,
-    partial_tail: bool,
-}
-
-pub(crate) struct TranscriptPage {
-    entries: Arc<[Arc<ConversationEntry>]>,
-    next_after_seq: Option<u64>,
-}
-
-impl TranscriptPage {
-    pub(crate) fn entries(&self) -> &[Arc<ConversationEntry>] {
-        &self.entries
-    }
-
-    pub(crate) const fn next_after_seq(&self) -> Option<u64> {
-        self.next_after_seq
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1102,10 +1070,6 @@ pub(crate) struct ConversationSummary {
 }
 
 impl ConversationSummary {
-    pub(crate) const fn through_seq(&self) -> u64 {
-        self.through_seq
-    }
-
     pub(crate) fn text(&self) -> &str {
         &self.text
     }
@@ -1114,7 +1078,6 @@ impl ConversationSummary {
 pub(crate) struct PromptConversationView {
     messages: Arc<[ModelMessage]>,
     latest_summary: Option<ConversationSummary>,
-    snapshot_seq: u64,
 }
 
 impl PromptConversationView {
@@ -1124,10 +1087,6 @@ impl PromptConversationView {
 
     pub(crate) fn latest_summary(&self) -> Option<&ConversationSummary> {
         self.latest_summary.as_ref()
-    }
-
-    pub(crate) const fn snapshot_seq(&self) -> u64 {
-        self.snapshot_seq
     }
 }
 
@@ -1190,27 +1149,6 @@ impl ConversationLog {
 
     pub(crate) async fn snapshot(&self) -> ConversationSnapshot {
         read_lock(&self.inner.state).snapshot()
-    }
-
-    pub(crate) async fn page(
-        &self,
-        after_seq: Option<u64>,
-        limit: usize,
-    ) -> Result<TranscriptPage, ConversationError> {
-        if !(1..=MAX_PAGE_SIZE).contains(&limit) {
-            return Err(ConversationError::InvalidPage);
-        }
-        let state = read_lock(&self.inner.state);
-        let start = after_seq.map_or(0, |after| {
-            state.entries.partition_point(|entry| entry.seq() <= after)
-        });
-        let end = start.saturating_add(limit).min(state.entries.len());
-        let entries = Arc::from(state.entries[start..end].to_vec().into_boxed_slice());
-        let next_after_seq = (end < state.entries.len()).then(|| state.entries[end - 1].seq());
-        Ok(TranscriptPage {
-            entries,
-            next_after_seq,
-        })
     }
 
     pub(crate) async fn prompt_view(&self) -> Result<PromptConversationView, ConversationError> {
@@ -1507,13 +1445,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::model_v2::{
-        ModelFinishReason, ModelMessage, ModelSelection, ReasoningContent, Usage,
-    };
-    use crate::session_v2::store::{
+    use crate::model::{ModelFinishReason, ModelMessage, ModelSelection, ReasoningContent, Usage};
+    use crate::session::store::{
         StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig, StoredSessionConfig,
     };
-    use crate::tools_v2::ToolName;
+    use crate::tools::ToolName;
 
     fn root() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1828,21 +1764,20 @@ mod tests {
             3
         );
         assert!(matches!(
-            log.page(None, 0).await,
+            log.transcript(None, 0).await,
             Err(ConversationError::InvalidPage)
         ));
         assert!(matches!(
-            log.page(None, 201).await,
+            log.transcript(None, 201).await,
             Err(ConversationError::InvalidPage)
         ));
-        let page = log.page(None, 2).await.unwrap();
+        let page = log.transcript(None, 2).await.unwrap();
         assert_eq!(page.entries().len(), 2);
         assert_eq!(page.next_after_seq(), Some(2));
-        let next = log.page(page.next_after_seq(), 2).await.unwrap();
+        let next = log.transcript(page.next_after_seq(), 2).await.unwrap();
         assert_eq!(next.entries().len(), 1);
         assert_eq!(next.next_after_seq(), None);
         let prompt = log.prompt_view().await.unwrap();
-        assert_eq!(prompt.snapshot_seq(), 3);
         assert!(prompt.latest_summary().is_none());
         assert_eq!(
             prompt.messages(),
@@ -1926,7 +1861,7 @@ mod tests {
             .unwrap();
         let view = log.compaction_view().await.unwrap();
         assert_eq!(view.latest_summary().unwrap().text(), "old summary");
-        assert_eq!(view.latest_summary().unwrap().through_seq(), 3);
+        assert_eq!(view.latest_summary().unwrap().through_seq, 3);
         assert_eq!(view.through_seq(), Some(7));
         assert_eq!(view.snapshot_seq(), 7);
         assert_eq!(view.completed_messages().len(), 2);
@@ -2108,7 +2043,7 @@ mod tests {
         let after = fs::read(&file).unwrap();
         assert!(after.starts_with(&before));
         assert!(after.len() > before.len());
-        assert_eq!(log.page(None, 10).await.unwrap().entries().len(), 4);
+        assert_eq!(log.transcript(None, 10).await.unwrap().entries().len(), 4);
         let prompt = log.prompt_view().await.unwrap();
         assert_eq!(prompt.latest_summary().unwrap().text(), "summary");
         assert!(prompt.messages().is_empty());
@@ -2256,7 +2191,6 @@ mod tests {
         let reopened_store = SessionStore::open(root.clone()).await.unwrap();
         let repaired = ConversationLog::open(&reopened_store, id).await.unwrap();
         let snapshot = repaired.snapshot().await;
-        assert!(snapshot.partial_tail());
         assert_eq!(snapshot.max_seq(), 4);
         assert_eq!(
             snapshot
@@ -2441,7 +2375,7 @@ mod tests {
         log.append(user(turn_two, "after")).await.unwrap();
         let prompt = log.prompt_view().await.unwrap();
         assert_eq!(prompt.latest_summary().unwrap().text(), "summary");
-        assert_eq!(prompt.latest_summary().unwrap().through_seq(), 4);
+        assert_eq!(prompt.latest_summary().unwrap().through_seq, 4);
         assert_eq!(prompt.messages(), &[ModelMessage::user("after").unwrap()]);
         log.close().await.unwrap();
         store.shutdown().await.unwrap();
@@ -2479,7 +2413,6 @@ mod tests {
         .unwrap();
         let reopened_store = SessionStore::open(root.clone()).await.unwrap();
         let reopened = ConversationLog::open(&reopened_store, id).await.unwrap();
-        assert!(reopened.snapshot().await.partial_tail());
         assert_eq!(fs::read(&file).unwrap(), line);
         cleanup(&reopened_store, &reopened, root).await;
 
@@ -2932,7 +2865,7 @@ mod tests {
         let blocker = store.run_io(move || {
             started_sender.send(()).unwrap();
             release_receiver.recv().unwrap();
-            Ok::<_, crate::session_v2::store::StoreError>(())
+            Ok::<_, crate::session::store::StoreError>(())
         });
         started_receiver.recv().unwrap();
         let turn_id = TurnId::new().unwrap();
@@ -2968,7 +2901,7 @@ mod tests {
         let blocker = store.run_io(move || {
             started_sender.send(()).unwrap();
             release_receiver.recv().unwrap();
-            Ok::<_, crate::session_v2::store::StoreError>(())
+            Ok::<_, crate::session::store::StoreError>(())
         });
         started_receiver.recv().unwrap();
         let turn_id = TurnId::new().unwrap();
@@ -2977,7 +2910,7 @@ mod tests {
         let mut context = Context::from_waker(&waker);
         assert!(matches!(append.as_mut().poll(&mut context), Poll::Pending));
         drop(append);
-        let barrier = store.run_io(|| Ok::<_, crate::session_v2::store::StoreError>(()));
+        let barrier = store.run_io(|| Ok::<_, crate::session::store::StoreError>(()));
         release_sender.send(()).unwrap();
         SessionStore::await_io(blocker).await.unwrap();
         SessionStore::await_io(barrier).await.unwrap();
@@ -2988,7 +2921,7 @@ mod tests {
         let blocker = store.run_io(move || {
             started_sender.send(()).unwrap();
             release_receiver.recv().unwrap();
-            Ok::<_, crate::session_v2::store::StoreError>(())
+            Ok::<_, crate::session::store::StoreError>(())
         });
         started_receiver.recv().unwrap();
         let append = log.append(user(TurnId::new().unwrap(), "drain"));
@@ -3032,7 +2965,7 @@ mod tests {
         let blocker = store.run_io(move || {
             started_sender.send(()).unwrap();
             release_receiver.recv().unwrap();
-            Ok::<_, crate::session_v2::store::StoreError>(())
+            Ok::<_, crate::session::store::StoreError>(())
         });
         started_receiver.recv().unwrap();
         let mut summary = Box::pin(log.append_summary(3, 3, timestamp(), "summary".to_owned()));
@@ -3040,7 +2973,7 @@ mod tests {
         let mut context = Context::from_waker(&waker);
         assert!(matches!(summary.as_mut().poll(&mut context), Poll::Pending));
         drop(summary);
-        let barrier = store.run_io(|| Ok::<_, crate::session_v2::store::StoreError>(()));
+        let barrier = store.run_io(|| Ok::<_, crate::session::store::StoreError>(()));
         release_sender.send(()).unwrap();
         SessionStore::await_io(blocker).await.unwrap();
         SessionStore::await_io(barrier).await.unwrap();
@@ -3065,9 +2998,13 @@ mod tests {
             line: 2,
             offset: 10,
         };
-        assert_eq!(located.location(), Some((2, 10)));
-        assert_eq!(located.line(), Some(2));
-        assert_eq!(located.offset(), Some(10));
+        assert!(matches!(
+            located,
+            ConversationError::CorruptAt {
+                line: 2,
+                offset: 10
+            }
+        ));
         assert_eq!(located.to_string(), "conversation data is corrupt");
         assert!(!located.to_string().contains("10"));
         let secret = NewConversationEntry::User {

@@ -8,7 +8,6 @@ fn p3_transport_is_private_and_stays_outside_legacy_owner_boundaries() {
         "crate::prompt",
         "crate::session",
         "crate::runtime",
-        "crate::tools::",
         "allow(dead_code",
         "tokio::spawn",
         "thread::sleep",
@@ -26,5 +25,5 @@ fn p3_transport_is_private_and_stays_outside_legacy_owner_boundaries() {
     assert!(!model_mod.contains("pub use transport"));
 
     let lib = include_str!("../src/lib.rs");
-    assert!(!lib.contains("pub use model_v2::transport"));
+    assert!(!lib.contains("pub use model::transport"));
 }

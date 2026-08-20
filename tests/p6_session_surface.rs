@@ -93,7 +93,6 @@ fn p6_session_actor_surface_is_private_and_owner_proof_free() {
             "crate::runtime",
             "crate::runtime_task",
             "crate::wire",
-            "crate::prompt::",
             "crate::compaction::",
             "crate::model_gateway",
             "crate::turn_execution_context",

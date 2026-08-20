@@ -3,7 +3,7 @@ mod compaction;
 
 pub(crate) use builder::{PromptBuildOptions, PromptBuilder, PromptError};
 pub(crate) use compaction::{
-    CompactionConfig, CompactionError, CompactionPlan, Compactor, Plan, ValidatedSummary,
+    CompactionConfig, CompactionError, CompactionPlan, Compactor, ValidatedSummary,
     append_validated_summary,
 };
 
@@ -15,33 +15,20 @@ const _: () = {
     let _ = std::mem::size_of::<CompactionConfig>();
     let _ = std::mem::size_of::<Compactor>();
     let _ = std::mem::size_of::<CompactionPlan>();
-    let _ = std::mem::size_of::<Plan>();
     let _ = std::mem::size_of::<ValidatedSummary>();
     let _: fn(&str, &str) -> Result<PromptBuilder, PromptError> =
         |system, coding| PromptBuilder::new(system, coding);
-    let _ = PromptBuilder::system_prompt;
-    let _ = PromptBuilder::coding_instructions;
     let _ = PromptBuilder::build;
-    let _ = PromptBuilder::estimate_tokens;
     let _ = PromptBuildOptions::new;
     let _ = PromptBuildOptions::selection;
     let _ = PromptBuildOptions::limits;
     let _ = PromptBuildOptions::reasoning;
     let _ = CompactionConfig::new;
-    let _ = CompactionConfig::trigger_tokens;
-    let _ = CompactionConfig::target_tokens;
     let _ = Compactor::new;
-    let _ = Compactor::config;
     let _ = Compactor::plan;
     let _ = Compactor::plan_after_context_overflow;
-    let _ = CompactionPlan::request;
     let _ = CompactionPlan::clone_request;
-    let _ = CompactionPlan::through_seq;
-    let _ = CompactionPlan::snapshot_seq;
-    let _ = CompactionPlan::current_turn_messages;
     let _ = CompactionPlan::validate_summary;
-    let _ = ValidatedSummary::text;
-    let _ = ValidatedSummary::into_text;
     let _ = append_validated_summary;
 };
 
@@ -54,20 +41,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::ids_v2::{SessionId, TurnId};
-    use crate::model_v2::{
+    use crate::ids::{SessionId, TurnId};
+    use crate::model::{
         AssistantPart, ModelFinishReason, ModelLimits, ModelMessage, ModelResponse, ModelSelection,
         ReasoningContent, ReasoningPreference,
     };
-    use crate::session_v2::conversation::{
+    use crate::session::conversation::{
         ConversationError, ConversationLog, NewConversationEntry, StoredTurnOutcome,
     };
-    use crate::session_v2::store::{
+    use crate::session::store::{
         SessionStore, StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig,
         StoredSessionConfig,
     };
-    use crate::session_v2::time::Timestamp;
-    use crate::tools_v2::{ToolName, ToolSpec};
+    use crate::session::time::Timestamp;
+    use crate::tools::{ToolName, ToolSpec};
 
     fn timestamp() -> Timestamp {
         "2026-08-19T12:34:56.789Z".parse().unwrap()
@@ -168,7 +155,7 @@ mod tests {
         ConversationLog,
         PathBuf,
         SessionId,
-        crate::session_v2::conversation::CompactionConversationView,
+        crate::session::conversation::CompactionConversationView,
     ) {
         let (store, log, root, id) = opened().await;
         let completed_turn = TurnId::new().unwrap();
@@ -247,12 +234,7 @@ mod tests {
             PromptBuilder::new("x".repeat(262_145), "coding"),
             Err(PromptError::InvalidText)
         ));
-        assert!(
-            PromptBuilder::new("", "coding")
-                .unwrap()
-                .system_prompt()
-                .is_none()
-        );
+        assert!(PromptBuilder::new("", "coding").is_ok());
         let builder = builder();
         let (store, log, root, _) = opened().await;
         let view = log.prompt_view().await.unwrap();
@@ -274,7 +256,13 @@ mod tests {
         let view = log.prompt_view().await.unwrap();
         let builder = builder();
         let tools = [tool("alpha")];
-        let input_tokens = builder.estimate_tokens(&view, &tools).unwrap();
+        let input_tokens = builder
+            .estimate_parts(
+                view.latest_summary().map(|summary| summary.text()),
+                view.messages(),
+                &tools,
+            )
+            .unwrap();
         let equality =
             ModelLimits::new(Some(u32::try_from(input_tokens + 7).unwrap()), Some(7)).unwrap();
         assert!(
@@ -312,13 +300,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(plan.through_seq(), 3);
-        assert_eq!(plan.snapshot_seq(), 4);
-        assert_eq!(
-            plan.current_turn_messages(),
-            &[ModelMessage::user("current question").unwrap()]
-        );
-        let request = plan.request();
+        let request = plan.clone_request();
         assert_eq!(request.reasoning(), ReasoningPreference::Disabled);
         assert!(request.tools().is_empty());
         assert_eq!(request.selection().provider_id().as_str(), "openai");
@@ -406,10 +388,9 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(plan.through_seq(), 7);
-        assert_eq!(plan.snapshot_seq(), 8);
+        let request = plan.clone_request();
         assert_eq!(
-            plan.request().messages(),
+            request.messages(),
             &[
                 ModelMessage::system("system").unwrap(),
                 ModelMessage::system("coding instructions").unwrap(),
@@ -423,7 +404,7 @@ mod tests {
                 .unwrap(),
             ]
         );
-        assert_eq!(plan.request().limits(), &ModelLimits::default());
+        assert_eq!(request.limits(), &ModelLimits::default());
         cleanup(&store, &log, root).await;
     }
 

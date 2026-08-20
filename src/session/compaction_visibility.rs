@@ -1,7 +1,7 @@
 use super::conversation::{
     CompactionConversationView, ConversationLog, ConversationSummary, PromptConversationView,
 };
-use crate::model_v2::ModelMessage;
+use crate::model::ModelMessage;
 
 const _: for<'a> fn(&'a CompactionConversationView) -> Option<&'a ConversationSummary> =
     CompactionConversationView::latest_summary;

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::ids_v2::{InteractionId, TurnId};
+use crate::ids::{InteractionId, TurnId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]

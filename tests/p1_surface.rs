@@ -21,11 +21,6 @@ fn p1_sources_have_no_legacy_imports_or_new_dead_code_suppression() {
         assert!(!source.contains("crate::model_gateway"));
         assert!(!source.contains("crate::session_execution"));
         assert!(!source.contains("crate::session_residency"));
-        assert!(!source.contains("crate::tools::"));
-        assert!(!source.contains("crate::ids::"));
-        assert!(!source.contains("crate::error::"));
-        assert!(!source.contains("crate::model::"));
-        assert!(!source.contains("crate::session::"));
         assert!(!source.contains("allow(dead_code"));
         assert!(!source.contains("allow(\n    dead_code"));
         assert!(!source.contains("::*"));
@@ -33,42 +28,36 @@ fn p1_sources_have_no_legacy_imports_or_new_dead_code_suppression() {
 }
 
 #[test]
-fn every_new_module_is_a_private_alias_with_explicit_root_exports() {
+fn canonical_modules_have_explicit_root_exports() {
     let lib = include_str!("../src/lib.rs");
-    for (alias, path) in [
-        ("ids_v2", "ids.rs"),
-        ("error_v2", "error.rs"),
-        ("event_v2", "event.rs"),
-        ("model_v2", "model/mod.rs"),
-        ("session_v2", "session/mod.rs"),
-        ("tools_v2", "tools/mod.rs"),
-    ] {
-        let declaration = format!("#[path = \"{path}\"]\npub(crate) mod {alias};");
-        assert!(lib.contains(&declaration), "missing private alias {alias}");
-    }
-    for public_module in [
+    for declaration in [
         "pub mod ids;",
         "pub mod error;",
         "pub mod event;",
         "pub mod model;",
         "pub mod session;",
+        "pub mod tools;",
+        "pub mod workspace;",
     ] {
         assert!(
-            !lib.contains(public_module),
-            "public P1 module leaked: {public_module}"
+            lib.contains(declaration),
+            "missing canonical module: {declaration}"
         );
     }
-    assert!(lib.contains("#[path = \"tools.rs\"]\npub mod tools;"));
-    assert!(lib.contains("pub use event_v2::SessionEventKind;"));
+    assert!(lib.contains("mod agent;"));
+    assert!(lib.contains("mod prompt;"));
+    assert!(!lib.contains("#[path ="));
+    assert!(!lib.contains("_v2"));
+    assert!(!lib.contains("pub use ids::*"));
+    assert!(!lib.contains("pub use error::*"));
+    assert!(!lib.contains("pub use event::*"));
+    assert!(!lib.contains("pub use model::*"));
+    assert!(!lib.contains("pub use session::*"));
+    assert!(!lib.contains("pub use tools::*"));
+    assert!(lib.contains("pub use event::SessionEventKind;"));
     assert!(!include_str!("../src/model/mod.rs").contains("pub mod types"));
     assert!(!include_str!("../src/session/mod.rs").contains("pub mod snapshot"));
     assert!(!include_str!("../src/tools/mod.rs").contains("pub mod types"));
-    assert!(!lib.contains("pub use ids_v2::*"));
-    assert!(!lib.contains("pub use error_v2::*"));
-    assert!(!lib.contains("pub use event_v2::*"));
-    assert!(!lib.contains("pub use model_v2::*"));
-    assert!(!lib.contains("pub use session_v2::*"));
-    assert!(!lib.contains("pub use tools_v2::*"));
 }
 
 #[test]

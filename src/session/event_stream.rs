@@ -6,7 +6,7 @@ use tokio::sync::{broadcast, watch};
 use super::event::SessionEvent;
 use super::snapshot::SessionSnapshot;
 use super::state::SessionStatus;
-use crate::error_v2::SessionError;
+use crate::error::SessionError;
 
 pub(crate) const MAX_EVENT_CAPACITY: usize = 4_096;
 
@@ -251,10 +251,10 @@ impl fmt::Debug for SessionEventStream {
 mod tests {
     use super::*;
 
-    use crate::ids_v2::{SessionId, TurnId};
-    use crate::model_v2::Usage;
-    use crate::session_v2::snapshot::{SessionSnapshot, SnapshotHistory, TurnSummary};
-    use crate::session_v2::state::SessionStatus;
+    use crate::ids::{SessionId, TurnId};
+    use crate::model::Usage;
+    use crate::session::snapshot::{SessionSnapshot, SnapshotHistory, TurnSummary};
+    use crate::session::state::SessionStatus;
 
     fn snapshot(session_id: SessionId, sequence: u64, status: SessionStatus) -> SessionSnapshot {
         SessionSnapshot::new(

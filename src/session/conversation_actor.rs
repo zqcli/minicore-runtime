@@ -1,6 +1,6 @@
 use super::{ConversationEntry, ConversationLog, ConversationSnapshot, StoredTurnOutcome};
-use crate::ids_v2::SessionId;
-use crate::model_v2::Usage;
+use crate::ids::SessionId;
+use crate::model::Usage;
 
 pub(crate) const MAX_USER_TEXT_BYTES: usize = super::MAX_TEXT_BYTES;
 
@@ -27,15 +27,11 @@ impl ConversationSnapshot {
         self.health
     }
 
-    pub(crate) const fn partial_tail(&self) -> bool {
-        self.partial_tail
-    }
-
     pub(crate) fn usage(&self) -> Usage {
         super::usage::usage_from_entries(&self.entries)
     }
 
-    pub(crate) fn latest_terminal(&self) -> Option<(crate::ids_v2::TurnId, StoredTurnOutcome)> {
+    pub(crate) fn latest_terminal(&self) -> Option<(crate::ids::TurnId, StoredTurnOutcome)> {
         self.entries
             .iter()
             .rev()

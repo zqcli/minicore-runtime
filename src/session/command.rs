@@ -7,11 +7,10 @@ use tokio_util::sync::CancellationToken;
 use super::conversation::validate_user_text;
 use super::event_stream::{SessionEventStream, SessionObservation};
 use super::snapshot::SessionSnapshot;
-use crate::error_v2::SessionError;
-use crate::ids_v2::{InteractionId, TurnId};
-use crate::tools_v2::UserAnswer;
+use crate::error::SessionError;
+use crate::ids::{InteractionId, TurnId};
+use crate::tools::UserAnswer;
 
-pub(crate) const DEFAULT_COMMAND_CAPACITY: usize = 64;
 pub(crate) const MAX_COMMAND_CAPACITY: usize = 4_096;
 
 pub(super) struct CloseCompletion {
@@ -210,7 +209,6 @@ impl SessionHandle {
 }
 
 const _: () = {
-    let _ = DEFAULT_COMMAND_CAPACITY;
     let _ = MAX_COMMAND_CAPACITY;
     let _ = std::mem::size_of::<SessionCommand>();
     let _ = std::mem::size_of::<CancelSlot>();

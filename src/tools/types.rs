@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::ids_v2::{InteractionId, ToolCallId};
+use crate::ids::{InteractionId, ToolCallId};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolError {

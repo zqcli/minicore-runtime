@@ -6,13 +6,13 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::ids_v2::{SessionId, TurnId};
-use crate::model_v2::{ModelGateway, ModelLimits, ReasoningPreference};
-use crate::prompt_v2::{Compactor, PromptBuildOptions, PromptBuilder};
-use crate::session_v2::conversation::ConversationLog;
-use crate::session_v2::time::{Timestamp, TimestampError};
-use crate::tools_v2::{InteractionClient, ToolName, ToolPolicy, ToolRegistry, ToolSpec};
-use crate::workspace_v2::Workspace;
+use crate::ids::{SessionId, TurnId};
+use crate::model::{ModelGateway, ModelLimits, ReasoningPreference};
+use crate::prompt::{Compactor, PromptBuildOptions, PromptBuilder};
+use crate::session::conversation::ConversationLog;
+use crate::session::time::{Timestamp, TimestampError};
+use crate::tools::{InteractionClient, ToolName, ToolPolicy, ToolRegistry, ToolSpec};
+use crate::workspace::Workspace;
 
 use super::runner::RunnerEventSink;
 

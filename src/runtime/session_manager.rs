@@ -8,10 +8,10 @@ use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::error_v2::SessionError;
-use crate::ids_v2::SessionId;
-use crate::session_v2::command::SessionHandle;
-use crate::session_v2::conversation::ConversationLog;
+use crate::error::SessionError;
+use crate::ids::SessionId;
+use crate::session::command::SessionHandle;
+use crate::session::conversation::ConversationLog;
 
 pub(crate) struct ManagedSession {
     pub(crate) handle: SessionHandle,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::model_v2::Usage;
+use crate::model::Usage;
 
 struct UsageField {
     sum: Option<u64>,

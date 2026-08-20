@@ -1,8 +1,8 @@
 use serde::Serialize;
 
-use crate::error_v2::{PublicErrorCode, PublicErrorSummary};
-use crate::ids_v2::{InteractionId, ToolCallId, TurnId};
-use crate::tools_v2::ToolName;
+use crate::error::{PublicErrorCode, PublicErrorSummary};
+use crate::ids::{InteractionId, ToolCallId, TurnId};
+use crate::tools::ToolName;
 
 use super::conversation::{
     ConversationEntry, ConversationError, ConversationLog, ConversationSnapshot, StoredTurnOutcome,

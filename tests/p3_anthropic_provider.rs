@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, VecDeque};
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::str::FromStr;
@@ -306,10 +307,11 @@ fn make_gateway(provider: AnthropicMessagesProvider) -> ModelGateway {
 }
 
 fn sse(events: &[Value]) -> String {
-    events
-        .iter()
-        .map(|event| format!("data: {}\n\n", event))
-        .collect()
+    let mut output = String::new();
+    for event in events {
+        write!(&mut output, "data: {}\n\n", event).unwrap();
+    }
+    output
 }
 
 fn message_start(usage: Option<Value>) -> Value {
@@ -1532,7 +1534,6 @@ fn new_anthropic_provider_stays_model_owned_and_bounded() {
         "crate::session",
         "crate::runtime",
         "crate::wire",
-        "crate::tools::",
         "crate::http_transport",
         "crate::model_gateway",
         "tokio::spawn",

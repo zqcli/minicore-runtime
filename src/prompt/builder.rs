@@ -4,11 +4,9 @@ use std::sync::Arc;
 use serde_json::to_vec;
 use thiserror::Error;
 
-use crate::model_v2::{
-    ModelLimits, ModelMessage, ModelRequest, ModelSelection, ReasoningPreference,
-};
-use crate::session_v2::conversation::PromptConversationView;
-use crate::tools_v2::{ToolName, ToolSpec};
+use crate::model::{ModelLimits, ModelMessage, ModelRequest, ModelSelection, ReasoningPreference};
+use crate::session::conversation::PromptConversationView;
+use crate::tools::{ToolName, ToolSpec};
 
 pub(crate) const MAX_PROMPT_TEXT_BYTES: usize = 262_144;
 pub(crate) const MAX_SUMMARY_TEXT_BYTES: usize = 65_536;
@@ -61,14 +59,6 @@ impl PromptBuilder {
         })
     }
 
-    pub(crate) fn system_prompt(&self) -> Option<&str> {
-        (!self.system_prompt.is_empty()).then_some(&self.system_prompt)
-    }
-
-    pub(crate) fn coding_instructions(&self) -> &str {
-        &self.coding_instructions
-    }
-
     pub(crate) fn build(
         &self,
         conversation: &PromptConversationView,
@@ -80,18 +70,6 @@ impl PromptBuilder {
             conversation.messages(),
             tools,
             &options,
-        )
-    }
-
-    pub(crate) fn estimate_tokens(
-        &self,
-        conversation: &PromptConversationView,
-        tools: &[ToolSpec],
-    ) -> Result<u64, PromptError> {
-        self.estimate_parts(
-            conversation.latest_summary().map(|summary| summary.text()),
-            conversation.messages(),
-            tools,
         )
     }
 

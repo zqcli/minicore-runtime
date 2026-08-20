@@ -75,7 +75,7 @@ impl ModelProvider for EchoProvider {
         std::slice::from_ref(&self.descriptor)
     }
 
-    fn generate<'a>(&'a self, _request: ModelRequest, _ctx: ModelCallContext) -> ModelFuture<'a> {
+    fn generate(&self, _request: ModelRequest, _ctx: ModelCallContext) -> ModelFuture<'_> {
         let response = self
             .responses
             .lock()

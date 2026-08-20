@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::ids_v2::{SessionId, ToolCallId, TurnId};
+use crate::ids::{SessionId, ToolCallId, TurnId};
 
 use super::types::ToolName;
 

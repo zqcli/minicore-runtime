@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::workspace_v2::RelativePath;
+use crate::workspace::RelativePath;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

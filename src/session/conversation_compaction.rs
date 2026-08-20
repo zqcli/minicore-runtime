@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
-use crate::model_v2::{AssistantPart, ModelMessage};
+use crate::model::{AssistantPart, ModelMessage};
 
 pub(crate) struct CompactionConversationView {
     latest_summary: Option<ConversationSummary>,

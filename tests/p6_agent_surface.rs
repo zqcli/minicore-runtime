@@ -1,20 +1,20 @@
 #[test]
 fn p6_agent_runner_surface_is_private_and_legacy_isolated() {
     let lib = include_str!("../src/lib.rs");
-    assert_eq!(lib.matches("#[path = \"agent_v2/mod.rs\"]").count(), 1);
-    assert!(lib.contains("#[path = \"agent_v2/mod.rs\"]\npub(crate) mod agent_v2;"));
-    assert!(!lib.contains("pub mod agent_v2"));
-    assert!(!lib.contains("pub use agent_v2"));
-    assert!(!lib.contains("pub use agent_v2::"));
+    assert!(lib.contains("mod agent;"));
+    assert!(!lib.contains("#[path ="));
+    assert!(!lib.contains("pub mod agent"));
+    assert!(!lib.contains("pub use agent"));
+    assert!(!lib.contains("pub use agent::"));
 
-    let module = include_str!("../src/agent_v2/mod.rs");
-    let context = include_str!("../src/agent_v2/context.rs");
+    let module = include_str!("../src/agent/mod.rs");
+    let context = include_str!("../src/agent/context.rs");
     assert!(context.contains("type TimestampSource = fn()"));
     assert!(!context.contains("dyn Fn"));
     assert!(context.contains("!(1..=64).contains"));
     assert!(module.contains("pub(crate) use context::{"));
     assert!(module.contains("pub(crate) use runner::{"));
-    let runner = include_str!("../src/agent_v2/runner.rs");
+    let runner = include_str!("../src/agent/runner.rs");
     for required in [
         "TimestampSource",
         "RetryPolicy",
@@ -48,12 +48,10 @@ fn p6_agent_runner_surface_is_private_and_legacy_isolated() {
             "crate::runtime",
             "crate::runtime_task",
             "crate::wire",
-            "crate::prompt::",
             "crate::compaction::",
             "crate::model_gateway",
             "crate::runtime_interface",
             "crate::turn_execution_context",
-            "crate::workspace::",
             "crate::tools::ToolSet",
             "Agent",
             "Fork",

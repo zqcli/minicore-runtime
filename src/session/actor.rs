@@ -16,23 +16,22 @@ use super::event_stream::SessionObservation;
 use super::snapshot::{SessionSnapshot, SnapshotHistory, TurnOutcome, TurnSummary, TurnTerminal};
 use super::state::SessionStatus;
 use super::store::StoredSessionConfig;
-use crate::agent_v2::{
+use crate::agent::{
     RetryPolicy, RunnerEvent, RunnerEventSink, TimestampSource, TurnContext,
     TurnContextDependencies, TurnFailure, TurnTaskResult, run_turn,
 };
-use crate::error_v2::{PublicErrorCode, PublicErrorSummary, SessionError};
-use crate::ids_v2::{InteractionId, TurnId};
-use crate::model_v2::{
+use crate::error::{PublicErrorCode, PublicErrorSummary, SessionError};
+use crate::ids::{InteractionId, TurnId};
+use crate::model::{
     ModelDescriptor, ModelEvent, ModelGateway, ModelSelection, ReasoningPreference, Usage,
 };
-use crate::prompt_v2::{CompactionConfig, Compactor, PromptBuildOptions, PromptBuilder};
-use crate::tools_v2::{
+use crate::prompt::{CompactionConfig, Compactor, PromptBuildOptions, PromptBuilder};
+use crate::tools::{
     InteractionClient, InteractionReceiver, InteractionRequest, ToolError, ToolPolicy,
     ToolRegistry, UserAnswer, UserQuestion,
 };
-use crate::workspace_v2::Workspace;
+use crate::workspace::Workspace;
 
-pub(crate) const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CLOSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(crate) struct SessionActorDependencies {
@@ -53,7 +52,7 @@ struct SessionResources {
     prompt_builder: PromptBuilder,
     prompt_options: PromptBuildOptions,
     compactor: Compactor,
-    enabled_tools: BTreeSet<crate::tools_v2::ToolName>,
+    enabled_tools: BTreeSet<crate::tools::ToolName>,
     max_tool_rounds: u8,
 }
 
@@ -112,8 +111,7 @@ impl SessionActorDependencies {
         }
         if !(1..=super::command::MAX_COMMAND_CAPACITY).contains(&self.command_capacity)
             || !(1..=super::event_stream::MAX_EVENT_CAPACITY).contains(&self.event_capacity)
-            || !(1..=crate::agent_v2::MAX_RUNNER_EVENT_CAPACITY)
-                .contains(&self.runner_event_capacity)
+            || !(1..=crate::agent::MAX_RUNNER_EVENT_CAPACITY).contains(&self.runner_event_capacity)
         {
             return Err(SessionError::InvalidInput);
         }
@@ -430,10 +428,10 @@ impl SessionActor {
             },
         )
         .map_err(|error| match error {
-            crate::agent_v2::TurnContextError::ModelUnavailable => SessionError::Unavailable,
-            crate::agent_v2::TurnContextError::InvalidModelConfiguration
-            | crate::agent_v2::TurnContextError::UnknownTool
-            | crate::agent_v2::TurnContextError::InvalidToolRounds => SessionError::InvalidInput,
+            crate::agent::TurnContextError::ModelUnavailable => SessionError::Unavailable,
+            crate::agent::TurnContextError::InvalidModelConfiguration
+            | crate::agent::TurnContextError::UnknownTool
+            | crate::agent::TurnContextError::InvalidToolRounds => SessionError::InvalidInput,
         })
     }
 
@@ -1024,7 +1022,6 @@ fn map_conversation_failure(error: ConversationError) -> TurnFailure {
 }
 
 const _: () = {
-    let _ = DEFAULT_CLOSE_TIMEOUT;
     let _ = std::mem::size_of::<SessionActorDependencies>();
     let _ = std::mem::size_of::<SessionActor>();
     let _ = SessionActor::new;
@@ -1043,24 +1040,24 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::agent_v2::RetryPolicy;
-    use crate::ids_v2::{SessionId, TurnId};
-    use crate::model_v2::{
+    use crate::agent::RetryPolicy;
+    use crate::ids::{SessionId, TurnId};
+    use crate::model::{
         AssistantPart, ModelCallContext, ModelDescriptor, ModelError, ModelEvent,
         ModelFinishReason, ModelFuture, ModelGateway, ModelLimits, ModelProvider, ModelRequest,
         ModelResponse, ModelSelection, ProviderId, ProviderRegistry, ReasoningPreference, Usage,
     };
-    use crate::session_v2::conversation::{
+    use crate::session::conversation::{
         ConversationEntry, ConversationLog, NewConversationEntry, StoredTurnOutcome,
     };
-    use crate::session_v2::store::{
+    use crate::session::store::{
         SessionStore, StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig,
         StoredSessionConfig,
     };
-    use crate::session_v2::time::{Timestamp, TimestampError};
-    use crate::tools_v2::{AllowConfiguredTools, ToolRegistry};
-    use crate::tools_v2::{Tool, ToolContext, ToolFuture, ToolName, ToolOutput, ToolSpec};
-    use crate::workspace_v2::{Workspace, WorkspaceAccess};
+    use crate::session::time::{Timestamp, TimestampError};
+    use crate::tools::{AllowConfiguredTools, ToolRegistry};
+    use crate::tools::{Tool, ToolContext, ToolFuture, ToolName, ToolOutput, ToolSpec};
+    use crate::workspace::{Workspace, WorkspaceAccess};
     use serde_json::json;
 
     fn timestamp() -> Timestamp {
@@ -1158,13 +1155,13 @@ mod tests {
 
     struct AskPolicy;
 
-    impl crate::tools_v2::ToolPolicy for AskPolicy {
+    impl crate::tools::ToolPolicy for AskPolicy {
         fn decide(
             &self,
-            _request: &crate::tools_v2::ToolRequest<'_>,
-            _ctx: &crate::tools_v2::ToolContextView<'_>,
-        ) -> crate::tools_v2::ToolDecision {
-            crate::tools_v2::ToolDecision::ask("allow alpha?", None).unwrap()
+            _request: &crate::tools::ToolRequest<'_>,
+            _ctx: &crate::tools::ToolContextView<'_>,
+        ) -> crate::tools::ToolDecision {
+            crate::tools::ToolDecision::ask("allow alpha?", None).unwrap()
         }
     }
 
@@ -1183,7 +1180,7 @@ mod tests {
             _args: serde_json::Value,
         ) -> ToolFuture<'a> {
             Box::pin(async {
-                std::future::pending::<Result<ToolOutput, crate::tools_v2::ToolError>>().await
+                std::future::pending::<Result<ToolOutput, crate::tools::ToolError>>().await
             })
         }
     }
@@ -1205,7 +1202,7 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push(name);
-                ToolOutput::success("ok").map_err(|_| crate::tools_v2::ToolError::Internal)
+                ToolOutput::success("ok").map_err(|_| crate::tools::ToolError::Internal)
             })
         }
     }
@@ -1225,11 +1222,7 @@ mod tests {
             std::slice::from_ref(&self.descriptor)
         }
 
-        fn generate<'a>(
-            &'a self,
-            _request: ModelRequest,
-            ctx: ModelCallContext,
-        ) -> ModelFuture<'a> {
+        fn generate(&self, _request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'_> {
             let step = self
                 .steps
                 .lock()
@@ -1261,11 +1254,7 @@ mod tests {
             std::slice::from_ref(&self.descriptor)
         }
 
-        fn generate<'a>(
-            &'a self,
-            _request: ModelRequest,
-            _ctx: ModelCallContext,
-        ) -> ModelFuture<'a> {
+        fn generate(&self, _request: ModelRequest, _ctx: ModelCallContext) -> ModelFuture<'_> {
             let future: Pin<Box<dyn Future<Output = Result<ModelResponse, ModelError>> + Send>> =
                 Box::pin(async { Err(ModelError::Internal) });
             future
@@ -1281,8 +1270,8 @@ mod tests {
             retry_policy: RetryPolicy::new(1, Duration::ZERO).unwrap(),
             timestamp_source,
             runtime: tokio::runtime::Handle::current(),
-            close_timeout: DEFAULT_CLOSE_TIMEOUT,
-            command_capacity: super::super::command::DEFAULT_COMMAND_CAPACITY,
+            close_timeout: Duration::from_secs(30),
+            command_capacity: crate::config::DEFAULT_COMMAND_CAPACITY,
             event_capacity: 8,
             runner_event_capacity: 8,
         }
@@ -1395,8 +1384,8 @@ mod tests {
             .enumerate()
             .map(|(index, name)| {
                 AssistantPart::ToolCall(
-                    crate::model_v2::ToolCall::new(
-                        crate::ids_v2::ToolCallId::new(format!("call-{index}")).unwrap(),
+                    crate::model::ToolCall::new(
+                        crate::ids::ToolCallId::new(format!("call-{index}")).unwrap(),
                         (*name).parse().unwrap(),
                         json!({}),
                         index as u32,
@@ -1411,7 +1400,7 @@ mod tests {
     fn dependencies_with(
         gateway: ModelGateway,
         tool_registry: ToolRegistry,
-        tool_policy: Arc<dyn crate::tools_v2::ToolPolicy>,
+        tool_policy: Arc<dyn crate::tools::ToolPolicy>,
     ) -> SessionActorDependencies {
         SessionActorDependencies {
             model_gateway: gateway,
@@ -1421,8 +1410,8 @@ mod tests {
             retry_policy: RetryPolicy::new(1, Duration::ZERO).unwrap(),
             timestamp_source,
             runtime: tokio::runtime::Handle::current(),
-            close_timeout: DEFAULT_CLOSE_TIMEOUT,
-            command_capacity: super::super::command::DEFAULT_COMMAND_CAPACITY,
+            close_timeout: Duration::from_secs(30),
+            command_capacity: crate::config::DEFAULT_COMMAND_CAPACITY,
             event_capacity: 8,
             runner_event_capacity: 8,
         }
@@ -1467,14 +1456,14 @@ mod tests {
         let snapshot = handle.snapshot();
         assert_eq!(
             snapshot.status(),
-            crate::session_v2::state::SessionStatus::Idle
+            crate::session::state::SessionStatus::Idle
         );
         assert_eq!(snapshot.conversation_seq(), 3);
         assert_eq!(snapshot.usage(), &Usage::new(1, 2, 3));
         assert_eq!(snapshot.last_terminal().unwrap().turn_id, turn_id);
         assert_eq!(
             snapshot.last_terminal().unwrap().outcome,
-            crate::session_v2::snapshot::TurnOutcome::Completed
+            crate::session::snapshot::TurnOutcome::Completed
         );
         drop(actor);
         log.close().await.unwrap();
@@ -1498,7 +1487,7 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            Err(crate::error_v2::SessionError::InvalidInput)
+            Err(crate::error::SessionError::InvalidInput)
         ));
         log.close().await.unwrap();
         workspace.shutdown().await.unwrap();
@@ -1709,11 +1698,11 @@ mod tests {
                 interaction_id: waiting_interaction,
             } if waiting_turn == turn_id && waiting_interaction == interaction_id
         ));
-        let wrong = crate::ids_v2::InteractionId::new().unwrap();
-        let wrong_answer = crate::tools_v2::UserAnswer::new("allow").unwrap();
+        let wrong = crate::ids::InteractionId::new().unwrap();
+        let wrong_answer = crate::tools::UserAnswer::new("allow").unwrap();
         assert_eq!(
             handle.answer(wrong, wrong_answer).await,
-            Err(crate::error_v2::SessionError::InteractionMismatch)
+            Err(crate::error::SessionError::InteractionMismatch)
         );
         assert!(matches!(
             handle.snapshot().status(),
@@ -1722,7 +1711,7 @@ mod tests {
         handle
             .answer(
                 interaction_id,
-                crate::tools_v2::UserAnswer::new("allow").unwrap(),
+                crate::tools::UserAnswer::new("allow").unwrap(),
             )
             .await
             .unwrap();
@@ -1803,10 +1792,10 @@ mod tests {
             handle
                 .answer(
                     interaction_id,
-                    crate::tools_v2::UserAnswer::new("allow").unwrap(),
+                    crate::tools::UserAnswer::new("allow").unwrap(),
                 )
                 .await,
-            Err(crate::error_v2::SessionError::InteractionMismatch)
+            Err(crate::error::SessionError::InteractionMismatch)
         );
         assert!(matches!(
             handle.snapshot().status(),
@@ -1875,10 +1864,10 @@ mod tests {
             handle
                 .answer(
                     interaction_id,
-                    crate::tools_v2::UserAnswer::new("allow").unwrap(),
+                    crate::tools::UserAnswer::new("allow").unwrap(),
                 )
                 .await,
-            Err(crate::error_v2::SessionError::Closing)
+            Err(crate::error::SessionError::Closing)
         );
         close.await.unwrap();
         assert!(
@@ -1948,7 +1937,7 @@ mod tests {
         handle
             .answer(
                 interaction_id,
-                crate::tools_v2::UserAnswer::new("allow").unwrap(),
+                crate::tools::UserAnswer::new("allow").unwrap(),
             )
             .await
             .unwrap();
@@ -2036,7 +2025,7 @@ mod tests {
         let blocker = store.run_io(move || {
             started_sender.send(()).unwrap();
             release_receiver.recv().unwrap();
-            Ok::<_, crate::session_v2::store::StoreError>(())
+            Ok::<_, crate::session::store::StoreError>(())
         });
         started_receiver.recv().unwrap();
         let answer_task = tokio::runtime::Handle::current().spawn({
@@ -2045,12 +2034,12 @@ mod tests {
                 handle
                     .answer(
                         interaction_id,
-                        crate::tools_v2::UserAnswer::new("allow").unwrap(),
+                        crate::tools::UserAnswer::new("allow").unwrap(),
                     )
                     .await
             }
         });
-        crate::session_v2::conversation::wait_until_busy_for_test(&log).await;
+        crate::session::conversation::wait_until_busy_for_test(&log).await;
         assert_eq!(handle.cancel(), Ok(()));
         release_sender.send(()).unwrap();
         SessionStore::await_io(blocker).await.unwrap();
@@ -2134,7 +2123,7 @@ mod tests {
         let blocker = store.run_io(move || {
             started_sender.send(()).unwrap();
             release_receiver.recv().unwrap();
-            Ok::<_, crate::session_v2::store::StoreError>(())
+            Ok::<_, crate::session::store::StoreError>(())
         });
         started_receiver.recv().unwrap();
         let answer_task = tokio::runtime::Handle::current().spawn({
@@ -2143,12 +2132,12 @@ mod tests {
                 handle
                     .answer(
                         interaction_id,
-                        crate::tools_v2::UserAnswer::new("allow").unwrap(),
+                        crate::tools::UserAnswer::new("allow").unwrap(),
                     )
                     .await
             }
         });
-        crate::session_v2::conversation::wait_until_busy_for_test(&log).await;
+        crate::session::conversation::wait_until_busy_for_test(&log).await;
         let close_task = tokio::runtime::Handle::current().spawn({
             let handle = handle.clone();
             async move { handle.close().await }
@@ -2229,10 +2218,10 @@ mod tests {
             handle
                 .answer(
                     interaction_id,
-                    crate::tools_v2::UserAnswer::new("allow").unwrap(),
+                    crate::tools::UserAnswer::new("allow").unwrap(),
                 )
                 .await,
-            Err(crate::error_v2::SessionError::Internal)
+            Err(crate::error::SessionError::Internal)
         );
         assert!(matches!(
             stream.recv().await,
@@ -2308,7 +2297,7 @@ mod tests {
             answer_handle
                 .answer(
                     interaction_id,
-                    crate::tools_v2::UserAnswer::new("allow").unwrap(),
+                    crate::tools::UserAnswer::new("allow").unwrap(),
                 )
                 .await
         });
@@ -2444,7 +2433,7 @@ mod tests {
         for invalid in [String::new(), "bad\u{0001}".to_owned(), "x".repeat(262_145)] {
             assert_eq!(
                 handle.submit(invalid).await,
-                Err(crate::error_v2::SessionError::InvalidInput)
+                Err(crate::error::SessionError::InvalidInput)
             );
         }
         drop(queued);
@@ -2452,7 +2441,7 @@ mod tests {
         let mut accepted = Box::pin(handle.submit(exact));
         assert!(matches!(
             accepted.as_mut().poll(&mut context),
-            Poll::Ready(Err(crate::error_v2::SessionError::Busy))
+            Poll::Ready(Err(crate::error::SessionError::Busy))
         ));
         drop(accepted);
         drop(actor);
@@ -2576,10 +2565,7 @@ mod tests {
         ));
         loop {
             if let SessionEvent::ToolFinished { result, .. } = stream.recv().await.unwrap() {
-                assert_eq!(
-                    result.status(),
-                    crate::tools_v2::ToolResultStatus::Cancelled
-                );
+                assert_eq!(result.status(), crate::tools::ToolResultStatus::Cancelled);
                 break;
             }
         }
@@ -2619,7 +2605,7 @@ mod tests {
         let _turn_id = handle.submit("first".to_owned()).await.unwrap();
         assert_eq!(
             handle.submit("second".to_owned()).await,
-            Err(crate::error_v2::SessionError::Busy)
+            Err(crate::error::SessionError::Busy)
         );
         handle.cancel().unwrap();
         let _ = stream.recv().await;
@@ -2656,7 +2642,7 @@ mod tests {
         assert!(matches!(first.as_mut().poll(&mut context), Poll::Pending));
         assert_eq!(
             handle.submit("second".to_owned()).await,
-            Err(crate::error_v2::SessionError::Busy)
+            Err(crate::error::SessionError::Busy)
         );
         drop(first);
         let mut stream = handle.subscribe().unwrap();
@@ -2697,16 +2683,16 @@ mod tests {
         assert_eq!(handle.snapshot().status(), SessionStatus::Closing);
         assert_eq!(
             handle.submit("after close".to_owned()).await,
-            Err(crate::error_v2::SessionError::Closing)
+            Err(crate::error::SessionError::Closing)
         );
         assert_eq!(
             handle
                 .answer(
-                    crate::ids_v2::InteractionId::new().unwrap(),
-                    crate::tools_v2::UserAnswer::new("late").unwrap(),
+                    crate::ids::InteractionId::new().unwrap(),
+                    crate::tools::UserAnswer::new("late").unwrap(),
                 )
                 .await,
-            Err(crate::error_v2::SessionError::Closing)
+            Err(crate::error::SessionError::Closing)
         );
         assert_eq!(stream.recv().await, Some(SessionEvent::Closed));
         assert_eq!(stream.recv().await, None);
@@ -2785,11 +2771,11 @@ mod tests {
         let first = handle.clone();
         let second = handle.clone();
         let (first_result, second_result) = tokio::join!(first.close(), second.close());
-        assert_eq!(first_result, Err(crate::error_v2::SessionError::Internal));
-        assert_eq!(second_result, Err(crate::error_v2::SessionError::Internal));
+        assert_eq!(first_result, Err(crate::error::SessionError::Internal));
+        assert_eq!(second_result, Err(crate::error::SessionError::Internal));
         assert_eq!(
             actor_task.await.unwrap(),
-            Err(crate::error_v2::SessionError::Internal)
+            Err(crate::error::SessionError::Internal)
         );
         store.shutdown().await.unwrap();
         workspace.shutdown().await.unwrap();
@@ -2910,7 +2896,7 @@ mod tests {
         let first_blocker = store.run_io(move || {
             first_started_sender.send(()).unwrap();
             first_release_receiver.recv().unwrap();
-            Ok::<_, crate::session_v2::store::StoreError>(())
+            Ok::<_, crate::session::store::StoreError>(())
         });
         first_started_receiver.recv().unwrap();
 
@@ -2918,19 +2904,19 @@ mod tests {
         let mut context = Context::from_waker(&waker);
         let mut submit = Box::pin(handle.submit("question".to_owned()));
         assert!(matches!(submit.as_mut().poll(&mut context), Poll::Pending));
-        crate::session_v2::conversation::wait_until_busy_for_test(&log).await;
+        crate::session::conversation::wait_until_busy_for_test(&log).await;
 
         let (second_started_sender, second_started_receiver) = std::sync::mpsc::channel();
         let (second_release_sender, second_release_receiver) = std::sync::mpsc::channel();
         let second_blocker = store.run_io(move || {
             second_started_sender.send(()).unwrap();
             second_release_receiver.recv().unwrap();
-            Ok::<_, crate::session_v2::store::StoreError>(())
+            Ok::<_, crate::session::store::StoreError>(())
         });
         first_release_sender.send(()).unwrap();
         SessionStore::await_io(first_blocker).await.unwrap();
         second_started_receiver.recv().unwrap();
-        crate::session_v2::conversation::wait_until_busy_for_test(&log).await;
+        crate::session::conversation::wait_until_busy_for_test(&log).await;
         let turn_id = submit.await.unwrap();
 
         let close_task = tokio::runtime::Handle::current().spawn({
