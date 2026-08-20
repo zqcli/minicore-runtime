@@ -17,8 +17,7 @@ cap-std = { version = "=4.0.2", default-features = false }
 cap-primitives = { version = "=4.0.2", default-features = false }
 getrandom = "0.3.3"
 serde = { version = "1.0.219", features = ["derive"] }
-# Keep `arbitrary_precision` to preserve current Tool/Provider `Value` behavior.
-serde_json = { version = "1.0.140", features = ["arbitrary_precision"] }
+serde_json = "1.0.140"
 thiserror = "2.0.12"
 time = { version = "0.3.41", features = ["parsing"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time", "process", "io-util"] }
