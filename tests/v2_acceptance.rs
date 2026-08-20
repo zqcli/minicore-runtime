@@ -478,6 +478,20 @@ async fn finished(stream: &mut SessionEventStream) -> TurnOutcome {
     finished_event(stream).await.1
 }
 
+async fn finished_with_timeout(stream: &mut SessionEventStream, timeout: Duration) -> TurnOutcome {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let SessionEvent::TurnFinished { outcome, .. } =
+                stream.recv().await.expect("session stream closed early")
+            {
+                return outcome;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for session completion")
+}
+
 async fn finished_event(
     stream: &mut SessionEventStream,
 ) -> (minicore_runtime::TurnId, TurnOutcome) {
@@ -1257,14 +1271,24 @@ async fn at_04_run_tests() {
         .unwrap();
     let mut stream = stream_for(&runtime, id).await;
     runtime.submit(id, "run tests".to_owned()).await.unwrap();
-    assert_eq!(finished(&mut stream).await, TurnOutcome::Completed);
+    let outcome = finished_with_timeout(&mut stream, Duration::from_secs(60)).await;
     let page = runtime.transcript(id, None, 200).await.unwrap();
-    let output = tool_result(page.entries())
+    let output_text = tool_result(page.entries())
         .into_iter()
         .find(|text| text.contains("exit_code"))
         .expect("run_command output");
-    let output: Value = serde_json::from_str(output).unwrap();
-    assert_eq!(output["exit_code"], 0);
+    let output: Value = serde_json::from_str(output_text).unwrap_or_else(|error| {
+        panic!("AT-04 invalid run_command output: {error}; raw output: {output_text:?}")
+    });
+    assert_eq!(
+        outcome,
+        TurnOutcome::Completed,
+        "AT-04 turn failed; complete run_command output including stderr: {output}"
+    );
+    assert_eq!(
+        output["exit_code"], 0,
+        "AT-04 cargo test failed; complete run_command output including stderr: {output}"
+    );
     assert_eq!(output["timed_out"], false);
     assert!(output["stdout"].is_string());
     assert!(output["stderr"].is_string());

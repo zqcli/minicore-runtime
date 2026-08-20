@@ -191,6 +191,9 @@ impl ProcessPolicy {
             allowed_env.insert("SYSTEMROOT".to_owned());
             allowed_env.insert("TEMP".to_owned());
             allowed_env.insert("TMP".to_owned());
+            allowed_env.insert("USERPROFILE".to_owned());
+            allowed_env.insert("CARGO_HOME".to_owned());
+            allowed_env.insert("RUSTUP_HOME".to_owned());
         }
 
         #[cfg(not(windows))]
@@ -330,6 +333,17 @@ mod tests {
         #[cfg(windows)]
         for program in ["cargo.exe", "rustc.exe", "rustfmt.exe", "rg.exe"] {
             assert!(policy.allowed_programs().allows(program));
+        }
+        #[cfg(windows)]
+        for key in [
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+        ] {
+            assert!(policy.allowed_env().contains(key));
         }
         assert!(!format!("{policy:?}").contains("cargo"));
         assert!(!format!("{policy:?}").contains("PATH"));
