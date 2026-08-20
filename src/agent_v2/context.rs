@@ -25,7 +25,7 @@ pub(crate) const fn system_timestamp_source() -> TimestampSource {
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub(crate) enum RetryPolicyError {
+pub enum RetryPolicyError {
     #[error("retry attempt count is outside its bound")]
     InvalidAttempts,
     #[error("retry delay exceeds its bound")]
@@ -33,13 +33,13 @@ pub(crate) enum RetryPolicyError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RetryPolicy {
+pub struct RetryPolicy {
     max_attempts: u8,
     base_delay: Duration,
 }
 
 impl RetryPolicy {
-    pub(crate) fn new(max_attempts: u8, base_delay: Duration) -> Result<Self, RetryPolicyError> {
+    pub fn new(max_attempts: u8, base_delay: Duration) -> Result<Self, RetryPolicyError> {
         if !(1..=4).contains(&max_attempts) {
             return Err(RetryPolicyError::InvalidAttempts);
         }
@@ -52,15 +52,15 @@ impl RetryPolicy {
         })
     }
 
-    pub(crate) const fn max_attempts(&self) -> u8 {
+    pub const fn max_attempts(&self) -> u8 {
         self.max_attempts
     }
 
-    pub(crate) const fn base_delay(&self) -> Duration {
+    pub const fn base_delay(&self) -> Duration {
         self.base_delay
     }
 
-    pub(crate) fn delay_for_retry(
+    pub fn delay_for_retry(
         &self,
         retry_index: u8,
         retry_after: Option<Duration>,

@@ -6,6 +6,7 @@ pub(crate) mod agent_v2;
     reason = "M4/M5 foundations and M10 planning are consumed by adjacent summary/orchestration slices"
 )]
 pub(crate) mod compaction;
+pub mod config;
 #[path = "error.rs"]
 pub(crate) mod error_v2;
 #[path = "event.rs"]
@@ -16,6 +17,8 @@ pub(crate) mod ids_v2;
 pub(crate) mod model_v2;
 #[path = "prompt_v2/mod.rs"]
 pub(crate) mod prompt_v2;
+#[path = "runtime_v2/mod.rs"]
+pub(crate) mod runtime_v2;
 #[path = "session/mod.rs"]
 pub(crate) mod session_v2;
 #[path = "tools/mod.rs"]
@@ -41,6 +44,9 @@ pub(crate) mod session_ingress;
 pub(crate) mod session_residency;
 pub mod session_transcript;
 pub(crate) mod turn_execution_context;
+pub use config::{
+    ConfigError, RetryPolicy, RetryPolicyError, RuntimeConfig, RuntimeConfigBuilder, SessionConfig,
+};
 pub use error_v2::{PublicErrorCode, PublicErrorSummary, RuntimeError, SessionError};
 pub use event_v2::SessionEventKind;
 pub use ids_v2::{
@@ -59,6 +65,9 @@ pub use model_v2::{
     ReasoningPreference, ResolvedModel, ToolCall, Usage, fixed_credential_source,
 };
 pub use runtime::{MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError};
+pub use runtime_v2::{
+    Runtime, SessionSummary, TranscriptEntry, TranscriptPage, TranscriptToolCall,
+};
 pub use session_v2::{
     SessionEvent, SessionEventStream, SessionSnapshot, SessionStatus, SnapshotHistory,
     SnapshotShapeError, TerminalOutcome, TurnOutcome, TurnSummary, TurnTerminal,
