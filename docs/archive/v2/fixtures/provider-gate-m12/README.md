@@ -6,9 +6,9 @@
 
 ## Authority
 
-- canonical behavior：[Model Gateway](../../../../modules/model-gateway.md)；
-- protocol decision：[ADR 0138](../../../../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)；
-- Rust 1.85 implementation decision：[ADR 0139](../../../../adr/0139-rig-is-evidence-only-under-rust-1-85.md)；
+- canonical behavior：[Model Gateway](../../pre-reset/modules/model-gateway.md)；
+- protocol decision：[ADR 0138](../../pre-reset/adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)；
+- Rust 1.85 implementation decision：[ADR 0139](../../pre-reset/adr/0139-rig-is-evidence-only-under-rust-1-85.md)；
 - current production ownership：P3 provider suites与AT-13；本文件是archived fixture evidence；
 - real Rig HTTP evidence：`provider-gate/tests/m12_rig_*.rs`。
 

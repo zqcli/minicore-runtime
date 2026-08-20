@@ -1,66 +1,153 @@
-# 模块总览（V2 当前架构）
+# Canonical Module Map
 
-本目录是MiniCore V2当前权威module设计。ADR 0126–0148冻结async conversation/public wire、DurableState/Store V1/root lease、Tokio owner-tracked foundations、Rust 1.85 provider dependency边界、Tool Sandbox pre-start fail-closed admission、M14 stateless full-request wire policy与closed production Tool builtins（`ask_user`/`read_file`/`list_directory`/`write_file`/`fetch_url`）。M0–M8 foundations/behavior与ToolStartGate first-wins start gate、M9当前control/observation范围、M10完整Compaction vertical slice及M11 Session Fork command/storage、durable catalog/Fork provenance query、Runtime Session membership/lifecycle StateEvent、public Agent lifecycle/definition/metadata、public Session metadata、ordinary Session definition CAS、Agent revision upgrade、Ready-state `ReloadWorkspace` command/event、Workspace/Prompt Unavailable loaded readiness及ReloadWorkspace恢复与Agent readiness fan-out与ModelUnavailable及selected PromptUnavailable load/definition projection及shared-resource reload recovery/fanout与complete shared-root publication及active-Turn graceful Unload（default 30s/≤5min grace config、PrepareForUnload deadline signal与truthful settlement、shutdown broadcast）vertical slices及host security Workspace authority invalidation（`MiniCoreRuntime::invalidate_session_workspace_authority` host-only非wire seam、`SessionExecutorSnapshot.workspace_preparing`→`Preparing`最高readiness优先级、owner-tracked Workspace re-resolve recovery worker、start/finish各发布一次`session_readiness_changed`(command_id None)、close/fatal/reap exactly-once waiter settlement）及RuntimeDependencyUnavailable loaded readiness与probe recovery（唯一producer为loaded Turn admission读pinned historical AgentRevisionRef时的transient StorageUnavailable、owner-tracked无TurnId probe与Submit re-arm恢复）已实现；full recovery scenario/fixture closure已实现并通过统一质量门禁；完整cross-platform native matrix acceptance已通过（全部七个`platform_m5_0`坐标均有对应的production行为与测试覆盖；GitHub Actions run 31433810296四个job全部通过：Ubuntu Rust stable、Ubuntu Rust 1.85.0、cargo test macos-latest、cargo test windows-latest）；crate-private Structured output foundation已实现（`OutputContract::Structured` exact-model contract、schema v1 subset、terminal本地schema validation与ScriptedProviderAdapter conformance），crate-private `ToolOperationSlot`完整生命周期亦已实现（Prepared→Running→Settling→Terminal：per-slot first-wins start gate、typed started proof与PreExecution/Executed/Abandoned truthful settlement、Running cancellation pair与truthful settle），crate-private scripted approval/UserQuestion控制seam亦已完成（typed `ToolExecutionPlan::{Approval, UserQuestion}`拆分、concrete Session-owned `ToolExecutionControl`、move-only `UserQuestionAnswerBinding`、hoisted exclusive question调度与signal-first settlement）。M12/V4-P1-3已由ADR 0138/0139、OpenAI Responses/Anthropic Messages真实Rig standalone loopback evidence、terminal/metadata seam、26-case delivery/error fixture与真实Rust 1.85冷编译关闭；Rig被拒绝进入production baseline。M13/V4-C0-1已由ADR 0140、class-level Sandbox admission、approval revalidation与adapter-independent Session round conformance关闭；M14 OpenAI Responses/Anthropic Messages direct provider adapters、provider-native Structured strict mapping、host-only dynamic credential/catalog installation与explicit ignored live smoke harness已实现，stateless full-request wire policy已由[ADR 0141](../adr/0141-provider-calls-are-stateless-full-request.md)冻结为有意omission（不是pending实现）；2026-08-12两个real-credential public Runtime release smoke均通过，固定产品User-Agent与Anthropic wire refinements由[ADR 0145](../adr/0145-live-provider-evidence-refines-direct-adapter-wire-truth.md)记录；production Tool/Sandbox adapters中`read_file`、`list_directory`、`write_file`与`fetch_url`已实现（ADR 0143/0144/0146/0147：closed/default-off、五个independent opt-ins的32种fixed selection、per-admission Workspace-bound filesystem materialization、filesystem authority/requested-access intersection与per-Session permanent revocation、capability-relative reads/writes、same-Session mutation FIFO与permit-through-Settling，以及exact-origin/pinned-address network authority与bounded response lifecycle），process及其他未实现adapter明确冻结为post-MVP；current `fetch_url` milestone已通过stable/真实Rust 1.85主crate library `1031 passed / 3 ignored`与integration `159 passed / 3 ignored`，stable provider-gate `25/25`及Clippy/format/docs/Wire/Store fixtures；production `ask_user` builtin（ToolName/schema与answer→model-visible ToolResult text/render格式已由ADR 0142冻结并实现：closed/default-off/`with_ask_user_tool()` opt-in、零permission、仅UserQuestion/frozen PreExecution plans、deterministic compact JSON answer）已实现；public structured activation、具体Skill composition/source、完整Tool policy/approval enforcement、schema/hooks/完整generic policy、其余production ToolService/executor/adapters（返回前须提供有界、可确认cleanup）与public Tool DTO均属post-MVP。
+This page maps the current source graph. It is intentionally narrower than the historical design archive: every listed owner is compiled by the public crate, and every unlisted implementation file is private or removed.
 
-权威顺序：[`docs/architecture.md`](../architecture.md)与本目录 → current/refined ADR → formats + fixtures → development plan → migration + research → archive。
+## Root Surface
 
-## 领域关系
+`src/lib.rs` declares these public modules:
+
+| Module | Surface |
+| --- | --- |
+| `config` | Checked runtime/session configuration and retry policy |
+| `error` | Runtime/session errors and public error summaries |
+| `event` | Session event-kind catalog |
+| `ids` | Checked identifiers |
+| `model` | Provider and model contracts |
+| `runtime` | Runtime orchestration and session summaries |
+| `session` | Session observation, outcomes, transcript DTOs, actor, store, and conversation |
+| `tools` | Tool contracts, policy, interaction, process policy, and builtins |
+| `workspace` | Capability-backed root and relative filesystem operations |
+
+The root also reexports stable DTOs and operations. `agent` and `prompt` are private modules. There are no path-based compatibility declarations.
+
+## Ownership and Dependencies
+
+### `config`
+
+- Source: [`src/config.rs`](../../src/config.rs)
+- Owns `RuntimeConfig`, `RuntimeConfigBuilder`, `SessionConfig`, and checked bounds.
+- Depends on model selection/registry, tool names/registry, stored session constructors, and session timestamps.
+- Does not open files, providers, actors, or processes.
+
+### `model`
+
+- Sources: [`src/model/mod.rs`](../../src/model/mod.rs), [`gateway.rs`](../../src/model/gateway.rs), [`provider.rs`](../../src/model/provider.rs), [`registry.rs`](../../src/model/registry.rs), [`types.rs`](../../src/model/types.rs), [`transport.rs`](../../src/model/transport.rs), and [`providers/`](../../src/model/providers/).
+- Owns `ModelGateway`, `ModelProvider`, `ProviderRegistry`, descriptors, selections, request/response values, opaque credentials, event sinks, delivery state, and provider errors.
+- The registry freezes provider descriptors and resolves a selection only from its own immutable maps.
+- Providers own protocol encoding, SSE parsing, terminal proof, usage normalization, endpoint policy, and provider-native error mapping.
+- Transport owns bounded response drains, no-redirect/no-retry client policy, cancellation-aware reads, and retry-after parsing.
+- Depends on `serde_json`, `reqwest`, `futures-util`, and Tokio cancellation primitives; it does not depend on session actors or storage.
+
+### `tools`
+
+- Sources: [`src/tools/mod.rs`](../../src/tools/mod.rs), [`registry.rs`](../../src/tools/registry.rs), [`types.rs`](../../src/tools/types.rs), [`policy.rs`](../../src/tools/policy.rs), [`context.rs`](../../src/tools/context.rs), [`process.rs`](../../src/tools/process.rs), and [`builtins/`](../../src/tools/builtins/).
+- Owns the immutable tool registry, tool descriptions, tool result values, user-question values, interaction client, policy decisions, and process policy.
+- Builtins own their schemas, argument validation, execution mapping, bounded output, and fixed result text.
+- `ToolContext` supplies the current workspace, cancellation token, and interaction bridge. Tools do not own session state or provider selection.
+- The registry is frozen before a runtime opens. Session configuration only selects names already present in that registry.
+
+### `workspace`
+
+- Sources: [`src/workspace/mod.rs`](../../src/workspace/mod.rs), [`path.rs`](../../src/workspace/path.rs), and [`root.rs`](../../src/workspace/root.rs).
+- Owns one configured root capability, access mode, relative paths, directory-entry projection, bounded I/O, final-component checks, and owner-tracked shutdown.
+- `Workspace::open` captures the single root capability. File and directory operations resolve relative to that capability; they do not re-open ambient paths.
+- The workspace worker joins admitted blocking operations before shutdown completes. Production `SessionActor` ownership awaits `Workspace::shutdown()` during close; the `Workspace` Drop fallback may block synchronously and is not preferred. Explicit Runtime shutdown waits for all session actors and observes their workspace shutdowns.
+- Depends on cap-std/cap-primitives for capability and no-follow operations, not on Runtime or session residency.
+
+### `prompt`
+
+- Sources: [`src/prompt/mod.rs`](../../src/prompt/mod.rs), [`builder.rs`](../../src/prompt/builder.rs), and [`compaction.rs`](../../src/prompt/compaction.rs).
+- Private owner of prompt message assembly, coding instructions, serialized-byte estimation, compaction planning, and validated summaries.
+- Consumes model/tool values and conversation projections. It does not write the conversation file or publish session events.
+
+### `agent`
+
+- Sources: [`src/agent/mod.rs`](../../src/agent/mod.rs), [`context.rs`](../../src/agent/context.rs), and [`runner.rs`](../../src/agent/runner.rs).
+- Private owner of one model/tool turn, tool-round ordering, interaction requests, delivery-aware logical retry, cancellation, and compaction requests.
+- It returns turn work/results to the session actor; it does not own terminal persistence.
+
+### `session`
+
+- Sources: [`src/session/mod.rs`](../../src/session/mod.rs), [`actor.rs`](../../src/session/actor.rs), [`command.rs`](../../src/session/command.rs), [`event.rs`](../../src/session/event.rs), [`event_stream.rs`](../../src/session/event_stream.rs), [`snapshot.rs`](../../src/session/snapshot.rs), [`state.rs`](../../src/session/state.rs), [`store.rs`](../../src/session/store.rs), [`conversation.rs`](../../src/session/conversation.rs), [`conversation_actor.rs`](../../src/session/conversation_actor.rs), [`conversation_codec.rs`](../../src/session/conversation_codec.rs), [`conversation_compaction.rs`](../../src/session/conversation_compaction.rs), [`conversation_usage.rs`](../../src/session/conversation_usage.rs), [`transcript.rs`](../../src/session/transcript.rs), and [`time.rs`](../../src/session/time.rs).
+- The actor owns admission, mailbox ordering, terminal settlement, interaction persistence, snapshot publication, and close completion.
+- The conversation log owns append ordering, replay, repair, prompt projection, compaction boundaries, usage aggregation, and transcript projection.
+- The store worker owns the root lock, session namespace, atomic create, bounded CRUD, readiness, and shutdown result.
+- Snapshot and event modules expose observation; the durable and actor modules remain crate-private.
+- Session depends on model, tools, workspace, prompt, and agent internals. Those dependencies point inward to the session owner rather than creating peer actors.
+
+### `runtime`
+
+- Sources: [`src/runtime/mod.rs`](../../src/runtime/mod.rs), [`runtime_impl.rs`](../../src/runtime/runtime_impl.rs), and [`session_manager.rs`](../../src/runtime/session_manager.rs).
+- Owns public lifecycle admission, loaded-session residency, create/load/close/delete/list orchestration, public method error mapping, and runtime shutdown ownership.
+- It contains one manager state boundary for loaded, loading, and closing sessions. It does not duplicate the session actor mailbox.
+- Runtime opens the session store and carries a model/tool/workspace configuration into prepared sessions; session actors own per-session work after admission.
+
+## Public and Private Boundary
+
+Public values are checked at construction and are safe to serialize or display. Provider credentials, model endpoint details, workspace roots in debug output, and internal actor/store details are redacted or private.
+
+The public transcript contains `User`, `Assistant`, `ToolResult`, `Interaction`, `Summary`, and `Terminal` projections. The interaction entry is durable transcript evidence but is intentionally absent from model prompt messages.
+
+The canonical graph has no public transport protocol module, no second runtime owner, no compatibility aliases, and no alternate source tree. New functionality should deepen an existing owner before adding a module.
+
+## File Inventory
+
+The compiled current graph is intentionally small:
 
 ```text
-MiniCoreRuntime
-└─ Agent*
-   └─ Session*
-      └─ Turn*
-         └─ Item*
-            └─ Interaction*
+src/
+├── agent/{context.rs,mod.rs,runner.rs}
+├── config.rs
+├── error.rs
+├── event.rs
+├── ids.rs
+├── model/{gateway.rs,mod.rs,provider.rs,registry.rs,transport.rs,types.rs}
+│   └── providers/{anthropic.rs,mod.rs,openai.rs}
+├── prompt/{builder.rs,compaction.rs,mod.rs}
+├── runtime/{mod.rs,runtime_impl.rs,session_manager.rs}
+├── session/{actor.rs,command.rs,event.rs,event_stream.rs,mod.rs,snapshot.rs,state.rs,store.rs,time.rs,transcript.rs}
+│   └── conversation{,_actor.rs,_codec.rs,_compaction.rs,_usage.rs}
+├── tools/{context.rs,mod.rs,policy.rs,process.rs,registry.rs,types.rs}
+│   └── builtins/{ask_user.rs,list_directory.rs,path_args.rs,read_file.rs,run_command.rs,write_file.rs}
+└── workspace/{mod.rs,path.rs,root.rs}
 ```
 
-目标Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`四个共享深module。后续行为slice中，每个loaded Session将由`SessionExecutor` control actor管理，并最多运行一个`ActiveTurnTask`。M4的`LiveSessionState` reducer提供current-process conversation truth；`SessionRecorder`与可恢复前缀属于M5。
+The graph above names the current owners, not an archival compatibility layout. The `src/session` conversation files are private submodules of the session module. The `src/model/transport.rs` module is crate-private even though model provider types are public. The `src/prompt` and `src/agent` directories are private implementation modules declared from the crate root.
 
-## 模块索引
+## Boundary Rules
 
-- [Wire Schema与Bounded Decode](wire-schema.md)：public JSON v1、shared scalar carriers、ProtocolLimits、bounded JSON和JSONL scanner floor。
-- [Archived Wire V1 Conformance Fixtures](../archive/v2/fixtures/wire-v1/README.md)：历史public manifest、byte-exact JSON/JSONL、corruption expectations、all-limit recipes与structural verifier。
-- [Runtime公开协议](runtime-interface.md)：`dispatch / query / snapshot / subscribe` Wire-compatible families、library-only paged Session transcript、公开identity和live observer语义。
-- [Agent与Session生命周期](agent-session-lifecycle.md)：definition/revision、create/load/unload/archive/fork与readiness。
-- [Workspace](workspace.md)：Session-owned Workspace、trust、authorization和immutable snapshot。
-- [Prompt](prompt.md)：PromptIntent、CanonicalUserMessage、safe part-level contribution provenance、Prompt-owned opaque `ModelMessage` read refs和crate-private AssembledModelContext。
-- [Skills](skills.md)：SkillService、shared SkillResourceView、Turn-pinned SkillView和reload。
-- [Tools](tools.md)：ToolSet、policy、approval、sandbox、executor和Session-local file mutation queue。
-- [Turn执行上下文](turn-execution-context.md)：immutable capture、ConversationRevision和ModelCallRequest basis。
-- [Turn / Item / Interaction](turn-item-interaction.md)：live lifecycle、complete Tool exchange、Interaction和Tool start gate。
-- [Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md)：exact Stored DTO envelope、field order、limits与corruption vectors。
-- [Durable Store V1](../formats/durable-store-v1.md)：exact local entity layout、head/definition bytes、markers与strict recovery。
-- [Archived Durable Store V1 Fixtures](../archive/v2/fixtures/durable-store-v1/README.md)：历史golden documents、crash taxonomy与structural verifier。
-- [DurableState](durable-state.md)：private actor、reservation/root lease/CAS/generation/publication/recovery/fault seam。
-- [Conversation Recording与Replay](conversation-storage.md)：LiveSessionState reducer transaction/capture、SessionRecorder、best-effort JSONL prefix、RecordingHealth、tolerant replay和fork semantic seed。
-- [Session执行](session-execution.md)：SessionExecutor actor、ActiveTurnTask、async run loop、Steer/FollowUp/Cancel。
-- [ModelGateway](model-gateway.md)：TurnModelSnapshot、single provider attempt、stream、usage和typed errors。
-- [Archived M12 Production Provider Gate Fixtures](../archive/v2/fixtures/provider-gate-m12/README.md)：历史OpenAI Responses/Anthropic Messages Rig standalone evidence、SDK rejection与26-case delivery/error mapping。
-- [Compaction](compaction.md)：revision-bound stable units、Runtime settings、source+cut marker、summary budget与best-effort recording。
+- A public DTO must have a checked constructor or a checked deserializer before it reaches Runtime or a worker.
+- A registry is mutable only during its builder phase; the value passed into Runtime is immutable.
+- An owner may expose a narrow typed operation, but it must not expose its internal queue, worker handle, raw path, credential, or actor channel.
+- A blocking operation must have a named owner and a join/settlement path. Dropping a caller cannot detach it.
+- A public error must preserve the authoritative owner and must not leak secret or host-specific diagnostic material.
+- A new event must be derived from a published snapshot fact and must remain bounded.
+- A persistence change must specify field order, byte limits, replay behavior, repair behavior, and migration behavior before source changes.
 
-## 权威归属
+## Test Seams
 
-| 概念 | Canonical Owner |
-| --- | --- |
-| public/storage JSON representation、shared scalar carriers、ProtocolLimits与bounded decode | [Wire Schema与Bounded Decode](wire-schema.md) |
-| 公开command/query/event/snapshot payload与library-only Session transcript DTO/paging contract | [Runtime公开协议](runtime-interface.md) |
-| Agent/Session lifecycle与revision | [Agent与Session生命周期](agent-session-lifecycle.md) |
-| Workspace与authority | [Workspace](workspace.md) |
-| PromptIntent、CanonicalUserMessage、contribution provenance、opaque ModelMessage与model context assembly | [Prompt](prompt.md) |
-| Skill discovery/load/reload | [Skills](skills.md) |
-| Tool policy/approval/sandbox/execution | [Tools](tools.md) |
-| immutable Turn capture与live execution basis | [Turn执行上下文](turn-execution-context.md) |
-| Turn/Item/Interaction与Tool exchange | [Turn / Item / Interaction](turn-item-interaction.md) |
-| exact conversation JSONL v1 envelope与Stored DTO projection | [Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md) |
-| local entity physical layout、root lease、reservation/generation/marker publication、catalog recovery | [DurableState](durable-state.md) / [Durable Store V1](../formats/durable-store-v1.md) |
-| Live reducer、canonical selected history、JSONL semantic recording、RecordingHealth与cold replay | [Conversation Recording与Replay](conversation-storage.md) |
-| control actor、ActiveTurnTask与async loop | [Session执行](session-execution.md) |
-| provider attempt与response validation | [ModelGateway](model-gateway.md) |
-| compaction planning与summary validation | [Compaction](compaction.md) |
+- `tests/p1_*` cover checked IDs, public DTOs, and root/module surface.
+- `tests/p2_*` cover registry/policy behavior and capability-relative builtin/workspace behavior.
+- `tests/p3_*` cover model gateway, provider protocol mapping, SSE, transport, delivery, and retry behavior.
+- `tests/p4_*` cover conversation and store bytes, replay, repair, lock ownership, and degradation.
+- `tests/p5_*` cover prompt/compaction boundaries and deterministic estimation.
+- `tests/p6_*` cover turn runner and session actor ownership/cancellation.
+- `tests/p7_*` cover Runtime lifecycle, restart, close, shutdown, process policy, and public surface.
+- `tests/v2_acceptance.rs` covers the active end-to-end matrix and the source graph audit.
+- `provider-gate/` is a separate stable-only evidence package for provider SDK behavior; it is not a production dependency.
 
-## 当前实现顺序
+A test that needs a private owner should use an existing crate-private seam or a focused module test. It should not resurrect a public transport or lifecycle type solely to reach an assertion.
 
-完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0–M13已实现并通过统一review/check；M11关闭Session Fork command/storage、durable Agent/Session catalog/Fork provenance query、Runtime Session membership StateEvent、public Agent mutation、public Session metadata、ordinary Session definition CAS、Agent revision upgrade、Ready-state `ReloadWorkspace`、Workspace/Prompt/Agent/Model/selected Prompt/RuntimeDependency loaded readiness与恢复、shared-resource reload recovery/fanout、active-Turn graceful Unload、host security Workspace authority invalidation及full recovery scenario/fixture closure。Structured output foundation已实现，provider-native schema strict mapping亦已实现而public activation仍pending；crate-private `ToolOperationSlot`完整生命周期已实现（Prepared→Running→Settling→Terminal：per-slot first-wins gate、typed started proof、Running cancellation pair与truthful settle）；crate-private scripted approval/UserQuestion控制seam已实现（typed `ToolExecutionPlan::{Approval, UserQuestion}`、private concrete Session-owned `ToolExecutionControl`复用既有Interaction owner、Tools-owned move-only/redacted `UserQuestionAnswerBinding`、hoisted exclusive question调度与signal-first settlement）；M14五个closed production builtins均已实现：`ask_user`（ADR 0142）、`read_file`（ADR 0143）、`list_directory`（ADR 0144）、`write_file`（[ADR 0146](../adr/0146-production-write-file-binds-capability-targets-to-session-fifo.md)；ReadWrite ceiling/requested-access intersection、capability target、Session-local FIFO与permit-through-Settling）与`fetch_url`（[ADR 0147](../adr/0147-production-fetch-url-pins-exact-https-origins-to-host-addresses.md)；exact HTTPS origin、host-pinned addresses、bounded UTF-8 response与owner-contained cancellation）；完整cross-platform native matrix实现已交付（统一native matrix acceptance已通过：GitHub Actions run 31433810296四job全绿）。V4-P1-3 provider gate已关闭并拒绝Rig进入production baseline；V4-C0-1 Tool/Sandbox gate也已由ADR 0140关闭。两个direct production Provider adapters与stateless full-request wire policy（ADR 0141）已实现；2026-08-12两个real-credential public Runtime release smoke均通过，固定产品User-Agent与Anthropic wire refinements由[ADR 0145](../adr/0145-live-provider-evidence-refines-direct-adapter-wire-truth.md)记录；process及其他未实现production adapters、generic ToolService/policy与public Tool DTO仍属post-MVP范围。
+## Change Checklist
 
-跨模块高风险规则见[架构总览的不变量索引](../architecture.md#跨模块不变量索引)。
+When adding a module, record its owner and its dependency direction.
+
+When adding a public type, add a checked constructor, a redacted Debug form where needed, and a surface test.
+
+When adding a worker, record who starts it, who cancels it, who joins it, and which result is authoritative.
+
+When adding a durable field, update both the source serializer and the current format document.
+
+When adding a tool, specify its input schema, access boundary, cancellation result, output bound, and registry name.
+
+When adding a provider behavior, keep endpoint, credential, protocol, delivery, and retry evidence in the model owner.

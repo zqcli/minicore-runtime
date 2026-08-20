@@ -30,7 +30,13 @@ def markdown_files() -> list[Path]:
         if SKIP_PARTS.intersection(parts) or "archive" in parts:
             continue
         current.append(path)
-    archived_v2 = list((ROOT / "docs/archive/v2").rglob("*.md"))
+    # The pre-reset tree is intentionally stale. Existing v2 ADR/review prose is
+    # also historical and remains unchanged; fixture Markdown remains checked.
+    archived_v2 = [
+        path
+        for path in (ROOT / "docs/archive/v2").rglob("*.md")
+        if "pre-reset" not in relative_parts(path)
+    ]
     return sorted({*current, *archived_v2})
 
 
@@ -88,24 +94,34 @@ def check_markdown(path: Path) -> list[str]:
         if count % 2:
             errors.append(f"{relative}: unbalanced {marker * 3} fenced code blocks")
 
-    for raw_target in link_targets(text):
-        if not raw_target or raw_target.startswith(("#", "http://", "https://", "mailto:")):
-            if raw_target.startswith("#") and raw_target[1:] not in anchors(path):
-                errors.append(f"{relative}: missing local anchor {raw_target}")
-            continue
+    parts = relative_parts(path)
+    skip_historical_links = (
+        "pre-reset" in parts
+        or (
+            len(parts) >= 4
+            and parts[:3] == ("docs", "archive", "v2")
+            and parts[3] in {"adr", "review"}
+        )
+    )
+    if not skip_historical_links:
+        for raw_target in link_targets(text):
+            if not raw_target or raw_target.startswith(("#", "http://", "https://", "mailto:")):
+                if raw_target.startswith("#") and raw_target[1:] not in anchors(path):
+                    errors.append(f"{relative}: missing local anchor {raw_target}")
+                continue
 
-        file_part, fragment = split_target(raw_target)
-        resolved = (path.parent / file_part).resolve() if file_part else path.resolve()
-        try:
-            resolved.relative_to(ROOT)
-        except ValueError:
-            errors.append(f"{relative}: link escapes repository {raw_target}")
-            continue
-        if not resolved.exists():
-            errors.append(f"{relative}: missing link target {raw_target}")
-            continue
-        if fragment and resolved.suffix.lower() == ".md" and fragment not in anchors(resolved):
-            errors.append(f"{relative}: missing anchor {raw_target}")
+            file_part, fragment = split_target(raw_target)
+            resolved = (path.parent / file_part).resolve() if file_part else path.resolve()
+            try:
+                resolved.relative_to(ROOT)
+            except ValueError:
+                errors.append(f"{relative}: link escapes repository {raw_target}")
+                continue
+            if not resolved.exists():
+                errors.append(f"{relative}: missing link target {raw_target}")
+                continue
+            if fragment and resolved.suffix.lower() == ".md" and fragment not in anchors(resolved):
+                errors.append(f"{relative}: missing anchor {raw_target}")
 
     return errors
 
@@ -188,29 +204,107 @@ def check_adr_index() -> list[str]:
     return errors
 
 
-def check_current_status() -> list[str]:
-    paths = [
+def current_authority_files() -> list[Path]:
+    return [
         ROOT / "README.md",
         ROOT / "CONTEXT.md",
         ROOT / "docs/README.md",
         ROOT / "docs/architecture.md",
         ROOT / "docs/development-plan.md",
-        ROOT / "docs/migration/v1-to-v2.md",
-        ROOT / "docs/review/v2-design-review-4.md",
-        *sorted((ROOT / "docs/modules").glob("*.md")),
+        ROOT / "docs/migration-v0.1-v0.2.md",
+        ROOT / "docs/modules/README.md",
+        ROOT / "docs/adr/README.md",
+        *sorted((ROOT / "docs/formats").glob("*.md")),
+        *sorted((ROOT / "docs/adr").glob("020[0-3]-*.md")),
     ]
+
+
+def check_migration_status() -> list[str]:
+    path = ROOT / "docs/migration-v0.1-v0.2.md"
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    folded = text.casefold()
+    required = (
+        "this is the final breaking migration guide",
+        "the typed `runtime` replaces",
+        "no compatibility wrappers",
+        "does not automatically read or transform the historical store v1 layout",
+        "p8 reset closure is complete",
+        "p9 documentation status:",
+    )
+    errors: list[str] = []
+    for phrase in required:
+        if phrase not in folded:
+            errors.append(
+                f"{path.relative_to(ROOT)}: missing final migration status phrase {phrase}"
+            )
+    for phrase in ("p8 public switch pending", "p8 switch/deletion remains deferred"):
+        if phrase in folded:
+            errors.append(
+                f"{path.relative_to(ROOT)}: stale migration status {phrase}"
+            )
+    return errors
+
+
+def check_current_status() -> list[str]:
     forbidden = (
+        "MiniCoreRuntime",
+        "RuntimeQuery",
+        "CommandRequest",
+        "Wire V1",
+        "AgentRevisionRef",
+        "ToolExecutionPlan",
+        "ToolStartGate",
+        "SessionFileMutationQueue",
+        "WorkspaceAuthority",
+        "PrepareUnload",
+        "SecurityInvalidation",
+        "RuntimeDependencyProbe",
+        "Steer",
+        "FollowUp",
+        "Fork",
+        "Archive",
+        "src/agent_session_lifecycle.rs",
+        "src/compaction.rs",
+        "src/conversation_storage.rs",
+        "src/durable_state.rs",
+        "src/http_transport.rs",
+        "src/live_conversation.rs",
+        "src/model_gateway.rs",
+        "src/runtime_interface.rs",
+        "src/runtime_task.rs",
+        "src/session_execution.rs",
+        "src/session_ingress.rs",
+        "src/session_residency.rs",
+        "src/session_transcript.rs",
+        "src/skills.rs",
+        "src/tools.rs",
+        "src/turn_execution_context.rs",
+        "src/turn_item_interaction.rs",
+        "P8 public switch pending",
+        "P8 switch/deletion remains deferred",
+        "v0.1 baseline",
+        "current v0.1",
+        "v0.1 MVP",
         "仓库仍无`Cargo.toml`",
         "下一实现入口：创建Rust crate",
         "当前入口是创建Rust crate",
         "生产实现仍待启动",
     )
     errors: list[str] = []
-    for path in paths:
+    for path in current_authority_files():
+        if not path.exists():
+            errors.append(f"missing current authority file: {path.relative_to(ROOT)}")
+            continue
         text = path.read_text(encoding="utf-8")
+        if path == ROOT / "docs/migration-v0.1-v0.2.md":
+            continue
         for phrase in forbidden:
             if phrase in text:
-                errors.append(f"{path.relative_to(ROOT)}: stale status phrase {phrase}")
+                errors.append(
+                    f"{path.relative_to(ROOT)}: forbidden current-authority text {phrase}"
+                )
     return errors
 
 
@@ -219,6 +313,7 @@ def main() -> int:
     for path in markdown_files():
         errors.extend(check_markdown(path))
     errors.extend(check_adr_index())
+    errors.extend(check_migration_status())
     errors.extend(check_current_status())
 
     if errors:
