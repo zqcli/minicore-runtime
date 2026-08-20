@@ -22,8 +22,8 @@ use super::super::types::{
     ModelFinishReason, ModelMessage, ModelRequest, ModelResponse, ProviderItemId, ReasoningContent,
     ToolCall, ToolSpec, Usage,
 };
-use crate::ids_v2::ToolCallId;
-use crate::tools_v2::ToolName;
+use crate::ids::ToolCallId;
+use crate::tools::ToolName;
 
 const MAX_REQUEST_BYTES: usize = 1_048_576;
 const MAX_JSON_BYTES: usize = 65_536;
@@ -260,7 +260,7 @@ impl ModelProvider for AnthropicMessagesProvider {
         &self.models
     }
 
-    fn generate<'a>(&'a self, request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'a> {
+    fn generate(&self, request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'_> {
         Box::pin(self.run(request, ctx))
     }
 }

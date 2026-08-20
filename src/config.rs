@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-pub use crate::agent_v2::{RetryPolicy, RetryPolicyError};
-use crate::ids_v2::SessionId;
-use crate::model_v2::{ModelSelection, ProviderRegistry};
-use crate::session_v2::store::{
+pub use crate::agent::{RetryPolicy, RetryPolicyError};
+use crate::ids::SessionId;
+use crate::model::{ModelSelection, ProviderRegistry};
+use crate::session::store::{
     StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig, StoredSessionConfig,
 };
-use crate::session_v2::time::Timestamp;
-use crate::tools_v2::{ToolName, ToolRegistry};
+use crate::session::time::Timestamp;
+use crate::tools::{ToolName, ToolRegistry};
 
 pub const DEFAULT_EVENT_CAPACITY: usize = 64;
 pub const DEFAULT_COMMAND_CAPACITY: usize = 64;

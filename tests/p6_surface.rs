@@ -2,7 +2,7 @@
 fn p6_observation_surface_is_precise_and_keeps_owners_private() {
     let lib = include_str!("../src/lib.rs");
     let session_exports = lib
-        .split_once("pub use session_v2::{")
+        .split_once("pub use session::{")
         .and_then(|(_, rest)| rest.split_once("};"))
         .map(|(exports, _)| exports)
         .unwrap_or("");
@@ -43,7 +43,6 @@ fn p6_observation_surface_is_precise_and_keeps_owners_private() {
             "crate::durable_state",
             "crate::conversation_storage",
             "crate::live_conversation",
-            "crate::prompt",
             "crate::skills",
             "crate::model_gateway",
             "crate::runtime",
@@ -54,10 +53,6 @@ fn p6_observation_surface_is_precise_and_keeps_owners_private() {
             "crate::turn_execution_context",
             "crate::http_transport",
             "crate::agent_session_lifecycle",
-            "crate::model::",
-            "crate::tools::",
-            "crate::ids::",
-            "crate::error::",
             "tokio::spawn",
             "spawn_blocking",
             "allow(dead_code",

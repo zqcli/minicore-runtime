@@ -19,14 +19,13 @@ async fn list_signature(runtime: &Runtime) -> Result<Vec<SessionSummary>, Sessio
 
 #[test]
 fn p7_public_runtime_surface_is_typed_and_redacted() {
-    let source = include_str!("../src/runtime_v2/runtime.rs");
-    let manager = include_str!("../src/runtime_v2/session_manager.rs");
+    let source = include_str!("../src/runtime/runtime_impl.rs");
+    let manager = include_str!("../src/runtime/session_manager.rs");
     let config = include_str!("../src/config.rs");
     let lib = include_str!("../src/lib.rs");
     let tools = include_str!("../src/tools/mod.rs");
     for text in [source, manager, config] {
         for forbidden in [
-            "crate::runtime::",
             "crate::wire",
             "crate::durable_state",
             "crate::conversation_storage",

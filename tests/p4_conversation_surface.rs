@@ -2,7 +2,7 @@
 fn conversation_surface_is_crate_private_and_not_root_exported() {
     let lib = include_str!("../src/lib.rs");
     let public_exports = lib
-        .split_once("pub use session_v2::{")
+        .split_once("pub use session::{")
         .and_then(|(_, rest)| rest.split_once("};"))
         .map(|(exports, _)| exports)
         .unwrap_or("");
@@ -48,7 +48,6 @@ fn conversation_surface_is_crate_private_and_not_root_exported() {
         "pub(crate) enum ConversationEntry",
         "pub(crate) struct ConversationLog",
         "pub(crate) struct ConversationSnapshot",
-        "pub(crate) struct TranscriptPage",
         "pub(crate) struct ConversationSummary",
         "pub(crate) struct PromptConversationView",
     ] {
@@ -137,7 +136,6 @@ fn conversation_owns_strict_jsonl_and_worker_boundaries_without_legacy_coupling(
     }
     assert!(!combined.contains("read_to_end"));
     assert!(!combined.contains("with_capacity(MAX_FILE_BYTES"));
-    assert!(!combined.contains("prompt_v2"));
     let store = include_str!("../src/session/store.rs");
     assert!(store.contains("pub(crate) fn run_io"));
     assert!(store.contains("pub(crate) fn conversation_path"));

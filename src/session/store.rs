@@ -20,9 +20,9 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 
 use super::time::Timestamp;
-use crate::ids_v2::SessionId;
-use crate::model_v2::{ModelId, ModelSelection, ProviderId};
-use crate::tools_v2::ToolName;
+use crate::ids::SessionId;
+use crate::model::{ModelId, ModelSelection, ProviderId};
+use crate::tools::ToolName;
 
 const FORMAT_VERSION: u8 = 2;
 const MAX_SESSION_JSON_BYTES: usize = 1_048_576;
@@ -32,16 +32,6 @@ const MAX_TOOL_ROUNDS: u8 = 64;
 const WORKER_QUEUE_CAPACITY: usize = 64;
 const TEMP_PREFIX: &str = ".session-tmp-";
 const TEMP_NAME_ATTEMPTS: usize = 32;
-type StoredConfigConstructor = fn(
-    SessionId,
-    Timestamp,
-    Timestamp,
-    PathBuf,
-    StoredModelConfig,
-    String,
-    StoredExecutionConfig,
-) -> Result<StoredSessionConfig, StoreError>;
-
 // Keep this crate-private foundation type-checked before the SessionActor slice consumes it.
 const _: () = {
     let _ = FORMAT_VERSION;
@@ -62,7 +52,6 @@ const _: () = {
     let _ = StoredModelConfig::new;
     let _ = StoredCompactionConfig::new;
     let _ = StoredExecutionConfig::new;
-    let _: StoredConfigConstructor = StoredSessionConfig::new;
     let _ = SessionStore::open;
     let _ = SessionStore::create;
     let _ = SessionStore::load_config;
@@ -1153,7 +1142,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn store_create_load_list_delete_has_exact_v2_layout() {
+    async fn store_create_load_list_delete_has_exact_layout() {
         let root = unique_root();
         let store = SessionStore::open(root.clone()).await.unwrap();
         let id = SessionId::new().unwrap();

@@ -2,15 +2,15 @@ use std::fmt;
 
 use thiserror::Error;
 
-use crate::model_v2::{
+use crate::model::{
     AssistantPart, ModelFinishReason, ModelMessage, ModelRequest, ModelResponse,
     ReasoningPreference,
 };
-use crate::session_v2::conversation::{
+use crate::session::conversation::{
     CompactionConversationView, ConversationError, ConversationLog,
 };
-use crate::session_v2::time::Timestamp;
-use crate::tools_v2::ToolSpec;
+use crate::session::time::Timestamp;
+use crate::tools::ToolSpec;
 
 use super::builder::{MAX_SUMMARY_TEXT_BYTES, PromptBuildOptions, PromptBuilder, PromptError};
 
@@ -56,14 +56,6 @@ impl CompactionConfig {
             target_tokens,
         })
     }
-
-    pub(crate) const fn trigger_tokens(&self) -> u64 {
-        self.trigger_tokens
-    }
-
-    pub(crate) const fn target_tokens(&self) -> u64 {
-        self.target_tokens
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,10 +66,6 @@ pub(crate) struct Compactor {
 impl Compactor {
     pub(crate) const fn new(config: CompactionConfig) -> Self {
         Self { config }
-    }
-
-    pub(crate) const fn config(&self) -> CompactionConfig {
-        self.config
     }
 
     pub(crate) fn plan(
@@ -194,27 +182,9 @@ pub(crate) struct CompactionPlan {
     target_tokens: u64,
 }
 
-pub(crate) type Plan = CompactionPlan;
-
 impl CompactionPlan {
-    pub(crate) fn request(&self) -> &ModelRequest {
-        &self.request
-    }
-
     pub(crate) fn clone_request(&self) -> ModelRequest {
         self.request.clone()
-    }
-
-    pub(crate) const fn through_seq(&self) -> u64 {
-        self.through_seq
-    }
-
-    pub(crate) const fn snapshot_seq(&self) -> u64 {
-        self.snapshot_seq
-    }
-
-    pub(crate) fn current_turn_messages(&self) -> &[ModelMessage] {
-        &self.current_turn_messages
     }
 
     pub(crate) fn validate_summary(
@@ -264,16 +234,6 @@ impl fmt::Debug for ValidatedSummary {
             .debug_struct("ValidatedSummary")
             .field("text_bytes", &self.text.len())
             .finish()
-    }
-}
-
-impl ValidatedSummary {
-    pub(crate) fn text(&self) -> &str {
-        &self.text
-    }
-
-    pub(crate) fn into_text(self) -> String {
-        self.text
     }
 }
 

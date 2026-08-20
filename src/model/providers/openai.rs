@@ -264,7 +264,7 @@ impl ModelProvider for OpenAiResponsesProvider {
         &self.models
     }
 
-    fn generate<'a>(&'a self, request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'a> {
+    fn generate(&self, request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'_> {
         Box::pin(self.run(request, ctx))
     }
 }

@@ -11,7 +11,7 @@ use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
-use crate::workspace_v2::RelativePath;
+use crate::workspace::RelativePath;
 
 use super::super::process::{
     MAX_ARGUMENT_BYTES, MAX_ARGUMENTS, MAX_CWD_BYTES, MAX_ENV_VALUE_BYTES, MAX_ENV_VARS,
@@ -638,7 +638,7 @@ mod tests {
         InteractionClient, ProcessPolicy, ProgramPolicy, ToolContext, ToolError, ToolOutput,
     };
     use super::*;
-    use crate::workspace_v2::{Workspace, WorkspaceAccess};
+    use crate::workspace::{Workspace, WorkspaceAccess};
 
     static NEXT_PROCESS_ROOT: AtomicU64 = AtomicU64::new(0);
     const FIXTURE_WALL_LIMIT: Duration = Duration::from_secs(60);
@@ -738,8 +738,8 @@ mod tests {
         interactions: &'a InteractionClient,
     ) -> ToolContext<'a> {
         ToolContext::new(
-            crate::ids_v2::SessionId::new().unwrap(),
-            crate::ids_v2::TurnId::new().unwrap(),
+            crate::ids::SessionId::new().unwrap(),
+            crate::ids::TurnId::new().unwrap(),
             workspace,
             cancellation,
             interactions,
@@ -752,7 +752,7 @@ mod tests {
             "program": helper_program(),
             "args": [
                 "--exact",
-                "tools_v2::builtins::run_command::tests::helper_process_mode_is_a_test_only_child_entrypoint",
+                "tools::builtins::run_command::tests::helper_process_mode_is_a_test_only_child_entrypoint",
                 "--nocapture"
             ],
             "env": {"MINICORE_P7_HELPER_MODE": mode}
@@ -771,7 +771,7 @@ mod tests {
             "program": helper_program(),
             "args": [
                 "--exact",
-                "tools_v2::builtins::run_command::tests::helper_process_mode_is_a_test_only_child_entrypoint",
+                "tools::builtins::run_command::tests::helper_process_mode_is_a_test_only_child_entrypoint",
                 "--nocapture"
             ],
             "env": {
@@ -827,7 +827,7 @@ mod tests {
         let mut child = Command::new(helper_program())
             .args([
                 "--exact",
-                "tools_v2::builtins::run_command::tests::helper_process_mode_is_a_test_only_child_entrypoint",
+                "tools::builtins::run_command::tests::helper_process_mode_is_a_test_only_child_entrypoint",
                 "--nocapture",
             ])
             .env("MINICORE_P7_HELPER_MODE", "echo")
@@ -1336,7 +1336,7 @@ mod tests {
                 descendant
                     .args([
                         "--exact",
-                        "tools_v2::builtins::run_command::tests::helper_process_mode_is_a_test_only_child_entrypoint",
+                        "tools::builtins::run_command::tests::helper_process_mode_is_a_test_only_child_entrypoint",
                         "--nocapture",
                     ])
                     .env("MINICORE_P7_HELPER_MODE", "hold_pipe")

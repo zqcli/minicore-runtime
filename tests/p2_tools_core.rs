@@ -625,8 +625,6 @@ fn p2_tool_sources_have_no_p2_plus_or_legacy_owner_coupling() {
     ] {
         for forbidden in [
             "crate::wire",
-            "crate::tools::",
-            "crate::workspace::",
             "crate::model_gateway",
             "crate::runtime",
             "crate::session_",
@@ -646,10 +644,10 @@ fn p2_tool_sources_have_no_p2_plus_or_legacy_owner_coupling() {
 
     let lib = include_str!("../src/lib.rs");
     let tests = include_str!("../tests/p2_tools_core.rs");
-    assert!(lib.contains("#[path = \"tools/mod.rs\"]\npub(crate) mod tools_v2;"));
-    assert!(lib.contains("pub use tools_v2::{"));
+    assert!(lib.contains("pub mod tools;"));
+    assert!(lib.contains("pub use tools::{"));
     assert!(lib.contains("InteractionReceiver"));
-    assert!(!lib.contains("pub use tools_v2::*"));
+    assert!(!lib.contains("pub use tools::*"));
     assert!(!lib.contains("pub mod registry;"));
     assert!(!lib.contains("pub mod policy;"));
     assert!(!lib.contains("pub mod context;"));

@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::error_v2::PublicErrorSummary;
-use crate::ids_v2::{SessionId, TurnId};
-use crate::model_v2::Usage;
-use crate::tools_v2::UserQuestion;
+use crate::error::PublicErrorSummary;
+use crate::ids::{SessionId, TurnId};
+use crate::model::Usage;
+use crate::tools::UserQuestion;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum SnapshotShapeError {

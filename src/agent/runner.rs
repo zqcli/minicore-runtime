@@ -9,13 +9,13 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::context::TurnContext;
-use crate::model_v2::{
+use crate::model::{
     DeliveryState, ModelCallContext, ModelError, ModelErrorKind, ModelEvent, ModelFinishReason,
     ModelResponse, ToolCall, Usage,
 };
-use crate::prompt_v2::{PromptError, append_validated_summary};
-use crate::session_v2::conversation::{ConversationError, NewConversationEntry};
-use crate::tools_v2::{
+use crate::prompt::{PromptError, append_validated_summary};
+use crate::session::conversation::{ConversationError, NewConversationEntry};
+use crate::tools::{
     ToolCallSummary, ToolContext, ToolContextView, ToolDecision, ToolError, ToolOutput,
     ToolRequest, ToolResultStatus, ToolResultSummary,
 };
@@ -97,19 +97,6 @@ impl RunnerEventSink {
         }
     }
 
-    pub(crate) fn close(&self) {
-        let sender = {
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.active = false;
-            state.sender.take()
-        };
-        drop(sender);
-    }
-
     fn try_send(&self, event: RunnerEvent) -> Result<(), RunnerEventSendError> {
         let mut state = self
             .inner
@@ -183,31 +170,6 @@ impl fmt::Debug for TurnTaskResult {
                 .field(failure)
                 .finish(),
         }
-    }
-}
-
-impl TurnTaskResult {
-    pub(crate) const fn usage(&self) -> Usage {
-        match self {
-            Self::Completed { usage } | Self::Cancelled { usage } | Self::Failed { usage, .. } => {
-                *usage
-            }
-        }
-    }
-
-    pub(crate) const fn failure(&self) -> Option<TurnFailure> {
-        match self {
-            Self::Failed { failure, .. } => Some(*failure),
-            Self::Completed { .. } | Self::Cancelled { .. } => None,
-        }
-    }
-
-    pub(crate) const fn is_completed(&self) -> bool {
-        matches!(self, Self::Completed { .. })
-    }
-
-    pub(crate) const fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Cancelled { .. })
     }
 }
 
@@ -367,7 +329,7 @@ async fn run_turn_inner(ctx: &TurnContext) -> Flow {
     }
 }
 
-async fn build_ordinary_request(ctx: &TurnContext) -> CallFlow<crate::model_v2::ModelRequest> {
+async fn build_ordinary_request(ctx: &TurnContext) -> CallFlow<crate::model::ModelRequest> {
     let mut stale_replan = false;
     loop {
         if ctx.cancellation().is_cancelled() {
@@ -411,7 +373,7 @@ async fn build_ordinary_request(ctx: &TurnContext) -> CallFlow<crate::model_v2::
         };
         match append_validated_summary(ctx.conversation(), &plan, timestamp, &summary).await {
             Ok(_) => return build_fresh_prompt(ctx).await,
-            Err(crate::session_v2::conversation::ConversationError::Stale) if !stale_replan => {
+            Err(crate::session::conversation::ConversationError::Stale) if !stale_replan => {
                 stale_replan = true;
             }
             Err(_) => return CallFlow::Failed(TurnFailure::Compaction),
@@ -466,7 +428,7 @@ async fn force_compaction(ctx: &TurnContext) -> CallFlow<()> {
     }
 }
 
-async fn build_fresh_prompt(ctx: &TurnContext) -> CallFlow<crate::model_v2::ModelRequest> {
+async fn build_fresh_prompt(ctx: &TurnContext) -> CallFlow<crate::model::ModelRequest> {
     if ctx.cancellation().is_cancelled() {
         return CallFlow::Cancelled;
     }
@@ -490,7 +452,7 @@ async fn build_fresh_prompt(ctx: &TurnContext) -> CallFlow<crate::model_v2::Mode
 
 async fn ordinary_model_call(
     ctx: &TurnContext,
-    request: Arc<crate::model_v2::ModelRequest>,
+    request: Arc<crate::model::ModelRequest>,
 ) -> CallFlow<ModelResponse> {
     let max_attempts = ctx.retry_policy().max_attempts();
     for attempt in 0..max_attempts {
@@ -532,7 +494,7 @@ async fn ordinary_model_call(
 
 async fn summary_model_call(
     ctx: &TurnContext,
-    request: crate::model_v2::ModelRequest,
+    request: crate::model::ModelRequest,
 ) -> CallFlow<ModelResponse> {
     match generate_once(ctx, Arc::new(request), false).await.result {
         Ok(response) => CallFlow::Value(response),
@@ -547,11 +509,11 @@ async fn summary_model_call(
 
 async fn generate_once(
     ctx: &TurnContext,
-    request: Arc<crate::model_v2::ModelRequest>,
+    request: Arc<crate::model::ModelRequest>,
     forward_events: bool,
 ) -> ModelAttempt {
     let (model_events, mut receiver) =
-        match crate::model_v2::ModelEventSink::channel(MODEL_EVENT_CAPACITY) {
+        match crate::model::ModelEventSink::channel(MODEL_EVENT_CAPACITY) {
             Ok(value) => value,
             Err(error) => {
                 return ModelAttempt {
@@ -866,10 +828,5 @@ const _: () = {
     let _ = RunnerEventSink::channel;
     let _ = RunnerEventSink::try_publish_model;
     let _ = RunnerEventSink::try_publish_tool;
-    let _ = RunnerEventSink::close;
     let _ = run_turn;
-    let _ = TurnTaskResult::usage;
-    let _ = TurnTaskResult::failure;
-    let _ = TurnTaskResult::is_completed;
-    let _ = TurnTaskResult::is_cancelled;
 };

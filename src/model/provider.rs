@@ -228,7 +228,7 @@ pub trait ModelProvider: Send + Sync {
 
     fn models(&self) -> &[ModelDescriptor];
 
-    fn generate<'a>(&'a self, request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'a>;
+    fn generate(&self, request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'_>;
 }
 
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
@@ -240,7 +240,7 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
         (**self).models()
     }
 
-    fn generate<'a>(&'a self, request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'a> {
+    fn generate(&self, request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'_> {
         (**self).generate(request, ctx)
     }
 }

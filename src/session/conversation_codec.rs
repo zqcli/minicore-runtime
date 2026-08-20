@@ -9,7 +9,7 @@ use serde::{Serialize, Serializer};
 use super::{
     ConversationEntry, ConversationError, ConversationState, MAX_FILE_BYTES, MAX_LINE_BYTES,
 };
-use crate::session_v2::store::StoreError;
+use crate::session::store::StoreError;
 
 impl From<StoreError> for ConversationError {
     fn from(error: StoreError) -> Self {
@@ -26,40 +26,6 @@ impl From<StoreError> for ConversationError {
             | StoreError::InvalidConfig
             | StoreError::CleanupFailed
             | StoreError::Io => Self::Io,
-        }
-    }
-}
-
-impl ConversationError {
-    pub(crate) const fn location(&self) -> Option<(u64, u64)> {
-        match self {
-            Self::CorruptAt { line, offset } => Some((*line, *offset)),
-            Self::InvalidEntry
-            | Self::Corrupt
-            | Self::TooLarge
-            | Self::Busy
-            | Self::Closing
-            | Self::Io
-            | Self::WorkerFailed
-            | Self::NotFound
-            | Self::InvalidPage
-            | Self::Degraded
-            | Self::IncompleteToolExchange
-            | Self::Stale => None,
-        }
-    }
-
-    pub(crate) const fn line(&self) -> Option<u64> {
-        match self {
-            Self::CorruptAt { line, .. } => Some(*line),
-            _ => None,
-        }
-    }
-
-    pub(crate) const fn offset(&self) -> Option<u64> {
-        match self {
-            Self::CorruptAt { offset, .. } => Some(*offset),
-            _ => None,
         }
     }
 }

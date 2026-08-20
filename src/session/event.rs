@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::event_v2::SessionEventKind;
-use crate::ids_v2::TurnId;
-use crate::tools_v2::{ToolCallSummary, ToolResultSummary, UserQuestion};
+use crate::event::SessionEventKind;
+use crate::ids::TurnId;
+use crate::tools::{ToolCallSummary, ToolResultSummary, UserQuestion};
 
 use super::snapshot::{SessionSnapshot, TurnOutcome};
 

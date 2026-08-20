@@ -807,8 +807,6 @@ fn builtin_sources_have_only_v2_tool_and_workspace_dependencies() {
     ] {
         for forbidden in [
             "crate::wire",
-            "crate::tools::",
-            "crate::workspace::",
             "ToolExecutionPlan",
             "ToolStartGate",
             "ToolSet",

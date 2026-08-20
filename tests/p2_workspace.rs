@@ -719,13 +719,12 @@ async fn workspace_write_rejects_read_only_missing_parents_directories_and_symli
 #[test]
 fn workspace_public_source_has_no_legacy_or_unsafe_path_seams() {
     let sources = [
-        include_str!("../src/workspace_v2/mod.rs"),
-        include_str!("../src/workspace_v2/path.rs"),
-        include_str!("../src/workspace_v2/root.rs"),
+        include_str!("../src/workspace/mod.rs"),
+        include_str!("../src/workspace/path.rs"),
+        include_str!("../src/workspace/root.rs"),
     ];
     for source in sources {
         assert!(!source.contains("crate::wire"));
-        assert!(!source.contains("crate::workspace::"));
         assert!(!source.contains("canonicalize"));
         assert!(!source.contains("allow(dead_code"));
         assert!(!source.contains("tokio::spawn"));
@@ -734,7 +733,7 @@ fn workspace_public_source_has_no_legacy_or_unsafe_path_seams() {
         assert!(!source.contains("tokio::task::JoinHandle"));
     }
 
-    let root_source = include_str!("../src/workspace_v2/root.rs");
+    let root_source = include_str!("../src/workspace/root.rs");
     assert!(root_source.contains("CleanupFailed"));
     assert!(root_source.contains("WorkerFailed"));
     assert!(root_source.contains("Closing"));
@@ -780,15 +779,14 @@ fn workspace_public_source_has_no_legacy_or_unsafe_path_seams() {
         .expect("directory entry impl is present");
     assert!(!root_source[entry_start..entry_end].contains("Deserialize"));
 
-    let path_source = include_str!("../src/workspace_v2/path.rs");
+    let path_source = include_str!("../src/workspace/path.rs");
     assert!(!path_source.contains("Path::components"));
     assert!(!path_source.contains("Component::Prefix"));
     assert!(!path_source.contains("use std::path::{Component"));
 
     let lib = include_str!("../src/lib.rs");
-    assert!(lib.contains("#[path = \"workspace_v2/mod.rs\"]\npub(crate) mod workspace_v2;"));
-    assert!(lib.contains("pub use workspace_v2::"));
-    assert!(!lib.contains("pub mod workspace_v2;"));
+    assert!(lib.contains("pub mod workspace;"));
+    assert!(lib.contains("pub use workspace::"));
 }
 
 #[test]

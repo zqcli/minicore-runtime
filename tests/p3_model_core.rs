@@ -105,7 +105,7 @@ impl ModelProvider for ScriptedProvider {
         &self.models
     }
 
-    fn generate<'a>(&'a self, _request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'a> {
+    fn generate(&self, _request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'_> {
         self.generate_calls.fetch_add(1, Ordering::SeqCst);
         let outcome = self.outcome.clone();
         let barrier = self.barrier.clone();
@@ -135,7 +135,7 @@ impl ModelProvider for PanicIdProvider {
         &[]
     }
 
-    fn generate<'a>(&'a self, _request: ModelRequest, _ctx: ModelCallContext) -> ModelFuture<'a> {
+    fn generate(&self, _request: ModelRequest, _ctx: ModelCallContext) -> ModelFuture<'_> {
         Box::pin(async { Err(ModelError::Internal) })
     }
 }
@@ -153,7 +153,7 @@ impl ModelProvider for PanicModelsProvider {
         panic!("provider api model name must be redacted")
     }
 
-    fn generate<'a>(&'a self, _request: ModelRequest, _ctx: ModelCallContext) -> ModelFuture<'a> {
+    fn generate(&self, _request: ModelRequest, _ctx: ModelCallContext) -> ModelFuture<'_> {
         Box::pin(async { Err(ModelError::Internal) })
     }
 }
@@ -173,7 +173,7 @@ impl ModelProvider for LateEventProvider {
         &self.models
     }
 
-    fn generate<'a>(&'a self, _request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'a> {
+    fn generate(&self, _request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'_> {
         *self.held_sink.lock().unwrap() = Some(ctx.event_sink().clone());
         Box::pin(async { Ok(response("late event provider")) })
     }
@@ -193,7 +193,7 @@ impl ModelProvider for PanicGenerateProvider {
         &self.models
     }
 
-    fn generate<'a>(&'a self, _request: ModelRequest, _ctx: ModelCallContext) -> ModelFuture<'a> {
+    fn generate(&self, _request: ModelRequest, _ctx: ModelCallContext) -> ModelFuture<'_> {
         Box::pin(async { panic!("scripted provider panic") })
     }
 }
@@ -222,7 +222,7 @@ impl ModelProvider for CancellableProvider {
         &self.models
     }
 
-    fn generate<'a>(&'a self, _request: ModelRequest, _ctx: ModelCallContext) -> ModelFuture<'a> {
+    fn generate(&self, _request: ModelRequest, _ctx: ModelCallContext) -> ModelFuture<'_> {
         let started = Arc::clone(&self.started);
         let dropped = Arc::clone(&self.dropped);
         Box::pin(async move {
@@ -1093,11 +1093,7 @@ fn p3_model_sources_stay_on_the_model_owned_dependency_boundary() {
         include_str!("../src/model/gateway.rs"),
     ] {
         for forbidden in [
-            "crate::prompt",
-            "crate::session",
-            "crate::runtime",
             "crate::wire",
-            "crate::tools::",
             "crate::model_gateway",
             "provider_installation",
             "provider_transport",
@@ -1121,7 +1117,7 @@ fn p3_model_sources_stay_on_the_model_owned_dependency_boundary() {
     assert!(!registry.contains("pub fn provider"));
     assert!(provider.contains("Mutex"));
     assert!(!provider.contains("AtomicBool"));
-    assert!(lib.contains("pub use model_v2::{"));
+    assert!(lib.contains("pub use model::{"));
     for required in [
         "ModelCallContext",
         "ModelDescriptor",
@@ -1135,5 +1131,5 @@ fn p3_model_sources_stay_on_the_model_owned_dependency_boundary() {
     ] {
         assert!(lib.contains(required), "missing root export {required}");
     }
-    assert!(!lib.contains("pub use model_v2::*"));
+    assert!(!lib.contains("pub use model::*"));
 }

@@ -2,7 +2,7 @@
 fn p4_store_types_are_crate_private_and_not_root_reexports() {
     let lib = include_str!("../src/lib.rs");
     let public_exports = lib
-        .split_once("pub use session_v2::{")
+        .split_once("pub use session::{")
         .and_then(|(_, rest)| rest.split_once("};"))
         .map(|(exports, _)| exports)
         .unwrap_or("");

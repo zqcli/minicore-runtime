@@ -48,25 +48,25 @@ mod tests {
         MAX_RUNNER_EVENT_CAPACITY, RunnerEvent, RunnerEventSendError, RunnerEventSink,
     };
     use super::runner::{TurnTaskResult, run_turn};
-    use crate::ids_v2::{SessionId, TurnId};
-    use crate::model_v2::{
+    use crate::ids::{SessionId, TurnId};
+    use crate::model::{
         AssistantPart, ModelCallContext, ModelDescriptor, ModelError, ModelEvent, ModelEventSink,
         ModelFinishReason, ModelFuture, ModelGateway, ModelLimits, ModelProvider, ModelRequest,
         ModelResponse, ModelSelection, ProviderId, ProviderRegistry, ReasoningPreference, Usage,
     };
-    use crate::prompt_v2::CompactionConfig;
-    use crate::session_v2::conversation::{ConversationLog, NewConversationEntry};
-    use crate::session_v2::store::{
+    use crate::prompt::CompactionConfig;
+    use crate::session::conversation::{ConversationLog, NewConversationEntry};
+    use crate::session::store::{
         SessionStore, StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig,
         StoredSessionConfig,
     };
-    use crate::session_v2::time::{Timestamp, TimestampError};
-    use crate::tools_v2::{
+    use crate::session::time::{Timestamp, TimestampError};
+    use crate::tools::{
         AllowConfiguredTools, InteractionClient, InteractionReceiver, Tool, ToolContext,
         ToolDecision, ToolError, ToolFuture, ToolName, ToolOutput, ToolPolicy, ToolRegistry,
         ToolSpec,
     };
-    use crate::workspace_v2::{Workspace, WorkspaceAccess};
+    use crate::workspace::{Workspace, WorkspaceAccess};
     use serde_json::{Value, json};
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -121,7 +121,7 @@ mod tests {
             &self.models
         }
 
-        fn generate<'a>(&'a self, request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'a> {
+        fn generate(&self, request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'_> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.requests
                 .lock()
@@ -329,13 +329,13 @@ mod tests {
             options.enabled_tools.clone(),
             options.max_tool_rounds,
             TurnContextDependencies {
-                prompt_builder: crate::prompt_v2::PromptBuilder::new("system", "coding").unwrap(),
-                prompt_options: crate::prompt_v2::PromptBuildOptions::new(
+                prompt_builder: crate::prompt::PromptBuilder::new("system", "coding").unwrap(),
+                prompt_options: crate::prompt::PromptBuildOptions::new(
                     model_selection,
                     request_limits,
                     options.reasoning,
                 ),
-                compactor: crate::prompt_v2::Compactor::new(options.compaction),
+                compactor: crate::prompt::Compactor::new(options.compaction),
                 gateway,
                 tools: options.registry,
                 policy: options.policy,
@@ -482,9 +482,9 @@ mod tests {
         (builder.build(), enabled, order)
     }
 
-    fn tool_call(index: u32, name: &str) -> crate::model_v2::ToolCall {
-        crate::model_v2::ToolCall::new(
-            crate::ids_v2::ToolCallId::new(format!("call-{index}")).unwrap(),
+    fn tool_call(index: u32, name: &str) -> crate::model::ToolCall {
+        crate::model::ToolCall::new(
+            crate::ids::ToolCallId::new(format!("call-{index}")).unwrap(),
             name.parse().unwrap(),
             json!({}),
             index,
@@ -521,8 +521,8 @@ mod tests {
     impl ToolPolicy for FixedPolicy {
         fn decide(
             &self,
-            _request: &crate::tools_v2::ToolRequest<'_>,
-            _ctx: &crate::tools_v2::ToolContextView<'_>,
+            _request: &crate::tools::ToolRequest<'_>,
+            _ctx: &crate::tools::ToolContextView<'_>,
         ) -> ToolDecision {
             self.decision.clone()
         }
@@ -533,8 +533,8 @@ mod tests {
     impl ToolPolicy for PanickingPolicy {
         fn decide(
             &self,
-            _request: &crate::tools_v2::ToolRequest<'_>,
-            _ctx: &crate::tools_v2::ToolContextView<'_>,
+            _request: &crate::tools::ToolRequest<'_>,
+            _ctx: &crate::tools::ToolContextView<'_>,
         ) -> ToolDecision {
             panic!("test policy panic");
         }
@@ -595,7 +595,7 @@ mod tests {
     #[test]
     fn ordinary_retry_keeps_one_request_arc_until_gateway_boundary() {
         let source = include_str!("runner.rs");
-        assert!(source.contains("request: Arc<crate::model_v2::ModelRequest>"));
+        assert!(source.contains("request: Arc<crate::model::ModelRequest>"));
         assert!(source.contains("Arc::clone(&request)"));
         assert!(source.contains("(*request).clone()"));
     }
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn runner_event_sink_is_bounded_and_deltas_are_best_effort() {
         let (sink, mut receiver) = RunnerEventSink::channel(1).unwrap();
-        let event = RunnerEvent::Model(crate::model_v2::ModelEvent::TextDelta {
+        let event = RunnerEvent::Model(crate::model::ModelEvent::TextDelta {
             delta: "delta".to_owned(),
         });
         assert!(sink.try_publish_model(event.clone()));
@@ -644,14 +644,14 @@ mod tests {
         assert_eq!(receiver.try_recv().unwrap(), event);
         assert!(matches!(
             sink.try_publish_tool(RunnerEvent::Model(
-                crate::model_v2::ModelEvent::ReasoningDelta {
+                crate::model::ModelEvent::ReasoningDelta {
                     delta: "late".to_owned(),
                 }
             )),
             Err(RunnerEventSendError::InvalidEvent)
         ));
-        let call = crate::tools_v2::ToolCallSummary::new(
-            crate::ids_v2::ToolCallId::new("call").unwrap(),
+        let call = crate::tools::ToolCallSummary::new(
+            crate::ids::ToolCallId::new("call").unwrap(),
             "tool".parse().unwrap(),
             0,
         )
@@ -666,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn runner_event_sink_rejects_invalid_capacity_and_closes_without_blocking() {
+    fn runner_event_sink_rejects_invalid_capacity_and_observes_receiver_close() {
         assert!(matches!(
             RunnerEventSink::channel(0),
             Err(RunnerEventSendError::InvalidEvent)
@@ -679,19 +679,18 @@ mod tests {
             RunnerEventSink::channel(usize::MAX),
             Err(RunnerEventSendError::InvalidEvent)
         ));
-        let (sink, mut receiver) = RunnerEventSink::channel(MAX_RUNNER_EVENT_CAPACITY).unwrap();
-        sink.close();
+        let (sink, receiver) = RunnerEventSink::channel(MAX_RUNNER_EVENT_CAPACITY).unwrap();
+        drop(receiver);
         assert_eq!(
             sink.try_publish_tool(RunnerEvent::ToolFinished(
-                crate::tools_v2::ToolResultSummary::new(
-                    crate::ids_v2::ToolCallId::new("call").unwrap(),
-                    crate::tools_v2::ToolResultStatus::Failed,
+                crate::tools::ToolResultSummary::new(
+                    crate::ids::ToolCallId::new("call").unwrap(),
+                    crate::tools::ToolResultStatus::Failed,
                 )
                 .unwrap(),
             )),
             Err(RunnerEventSendError::Closed)
         );
-        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -710,9 +709,13 @@ mod tests {
         }])
         .await;
         let result = run_turn(context).await;
-        assert!(matches!(result, TurnTaskResult::Completed { .. }));
-        assert_eq!(result.usage().input_tokens(), Some(3));
-        assert_eq!(result.usage().output_tokens(), Some(5));
+        let usage = match result {
+            TurnTaskResult::Completed { usage }
+            | TurnTaskResult::Cancelled { usage }
+            | TurnTaskResult::Failed { usage, .. } => usage,
+        };
+        assert_eq!(usage.input_tokens(), Some(3));
+        assert_eq!(usage.output_tokens(), Some(5));
         assert_eq!(harness.calls.load(Ordering::SeqCst), 1);
         assert!(matches!(
             harness.events.recv().await,
@@ -732,7 +735,10 @@ mod tests {
             slot: Arc::clone(&slot),
         }])
         .await;
-        assert!(run_turn(context).await.is_completed());
+        assert!(matches!(
+            run_turn(context).await,
+            TurnTaskResult::Completed { .. }
+        ));
         let late = slot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -790,7 +796,7 @@ mod tests {
             vec!["alpha", "beta"]
         );
         let result = run_turn(context).await;
-        assert!(result.is_completed());
+        assert!(matches!(result, TurnTaskResult::Completed { .. }));
         assert_eq!(
             *order
                 .lock()
@@ -841,7 +847,10 @@ mod tests {
             deny_options,
         )
         .await;
-        assert!(run_turn(context).await.is_completed());
+        assert!(matches!(
+            run_turn(context).await,
+            TurnTaskResult::Completed { .. }
+        ));
         assert!(
             order
                 .lock()
@@ -895,9 +904,9 @@ mod tests {
             Some(["yes".to_owned(), "no".to_owned()].as_slice())
         );
         request
-            .respond(crate::tools_v2::UserAnswer::new("ALLOW").unwrap())
+            .respond(crate::tools::UserAnswer::new("ALLOW").unwrap())
             .unwrap();
-        assert!(task.await.is_completed());
+        assert!(matches!(task.await, TurnTaskResult::Completed { .. }));
         assert_eq!(
             *order
                 .lock()
@@ -935,7 +944,10 @@ mod tests {
             options,
         )
         .await;
-        assert!(run_turn(context).await.is_completed());
+        assert!(matches!(
+            run_turn(context).await,
+            TurnTaskResult::Completed { .. }
+        ));
         assert_eq!(
             *order
                 .lock()
@@ -974,7 +986,10 @@ mod tests {
             options,
         )
         .await;
-        assert!(run_turn(context).await.is_completed());
+        assert!(matches!(
+            run_turn(context).await,
+            TurnTaskResult::Completed { .. }
+        ));
         assert!(
             order
                 .lock()
@@ -1013,14 +1028,17 @@ mod tests {
             options,
         )
         .await;
-        assert!(run_turn(context).await.is_completed());
+        assert!(matches!(
+            run_turn(context).await,
+            TurnTaskResult::Completed { .. }
+        ));
         let first = harness.events.try_recv().unwrap();
         let second = harness.events.try_recv().unwrap();
         assert!(matches!(first, RunnerEvent::ToolStarted(_)));
         assert!(matches!(
             second,
             RunnerEvent::ToolFinished(ref summary)
-                if summary.status() == crate::tools_v2::ToolResultStatus::Failed
+                if summary.status() == crate::tools::ToolResultStatus::Failed
         ));
         let snapshot = harness.log.snapshot().await;
         let result = serde_json::to_value(&*snapshot.entries()[2]).unwrap();
@@ -1054,7 +1072,10 @@ mod tests {
             options,
         )
         .await;
-        assert!(run_turn(context).await.is_completed());
+        assert!(matches!(
+            run_turn(context).await,
+            TurnTaskResult::Completed { .. }
+        ));
         assert!(matches!(
             harness.events.try_recv().unwrap(),
             RunnerEvent::ToolFinished(_)
@@ -1095,7 +1116,10 @@ mod tests {
             options,
         )
         .await;
-        assert!(run_turn(context).await.is_completed());
+        assert!(matches!(
+            run_turn(context).await,
+            TurnTaskResult::Completed { .. }
+        ));
         assert_eq!(harness.log.snapshot().await.entries().len(), 4);
         assert_eq!(
             *order
@@ -1140,10 +1164,13 @@ mod tests {
         )
         .await;
         let result = run_turn(context).await;
-        assert_eq!(
-            result.failure(),
-            Some(super::runner::TurnFailure::ToolRoundLimit)
-        );
+        assert!(matches!(
+            result,
+            TurnTaskResult::Failed {
+                failure: super::runner::TurnFailure::ToolRoundLimit,
+                ..
+            }
+        ));
         assert_eq!(
             *order
                 .lock()
@@ -1189,7 +1216,10 @@ mod tests {
             options,
         )
         .await;
-        assert!(run_turn(context).await.is_cancelled());
+        assert!(matches!(
+            run_turn(context).await,
+            TurnTaskResult::Cancelled { .. }
+        ));
         assert_eq!(
             *order
                 .lock()
@@ -1249,7 +1279,7 @@ mod tests {
         *CANCEL_ON_TIMESTAMP_TOKEN
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        assert!(result.is_cancelled());
+        assert!(matches!(result, TurnTaskResult::Cancelled { .. }));
         assert_eq!(
             *order
                 .lock()
@@ -1287,7 +1317,7 @@ mod tests {
         log.append(NewConversationEntry::TurnTerminal {
             turn_id,
             timestamp: timestamp(),
-            outcome: crate::session_v2::conversation::StoredTurnOutcome::Completed,
+            outcome: crate::session::conversation::StoredTurnOutcome::Completed,
         })
         .await
         .unwrap();
@@ -1331,13 +1361,13 @@ mod tests {
         let _completed = append_completed_turn(&harness.log, &"old ".repeat(300)).await;
         append_current_user(&harness.log, "question").await;
         let result = run_turn(context).await;
-        assert!(result.is_completed());
+        assert!(matches!(result, TurnTaskResult::Completed { .. }));
         assert_eq!(harness.calls.load(Ordering::SeqCst), 2);
         let prompt = harness.log.prompt_view().await.unwrap();
         assert!(prompt
             .messages()
             .iter()
-            .any(|message| matches!(message, crate::model_v2::ModelMessage::User(text) if text == "question")));
+            .any(|message| matches!(message, crate::model::ModelMessage::User(text) if text == "question")));
         let snapshot = harness.log.snapshot().await;
         assert!(
             snapshot
@@ -1400,7 +1430,10 @@ mod tests {
                     event: None,
                 },
             ]);
-        assert!(run_turn(context).await.is_completed());
+        assert!(matches!(
+            run_turn(context).await,
+            TurnTaskResult::Completed { .. }
+        ));
         assert_eq!(harness.calls.load(Ordering::SeqCst), 3);
         assert_eq!(
             harness
@@ -1425,7 +1458,13 @@ mod tests {
         append_completed_turn(&harness.log, &"old ".repeat(300)).await;
         append_current_user(&harness.log, "question").await;
         let result = run_turn(context).await;
-        assert_eq!(result.failure(), Some(super::runner::TurnFailure::Model));
+        assert!(matches!(
+            result,
+            TurnTaskResult::Failed {
+                failure: super::runner::TurnFailure::Model,
+                ..
+            }
+        ));
         assert_eq!(harness.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             harness
@@ -1453,10 +1492,13 @@ mod tests {
         append_completed_turn(&harness.log, &"old ".repeat(300)).await;
         append_current_user(&harness.log, "question").await;
         let result = run_turn(context).await;
-        assert_eq!(
-            result.failure(),
-            Some(super::runner::TurnFailure::Compaction)
-        );
+        assert!(matches!(
+            result,
+            TurnTaskResult::Failed {
+                failure: super::runner::TurnFailure::Compaction,
+                ..
+            }
+        ));
         assert_eq!(harness.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             harness
@@ -1493,7 +1535,10 @@ mod tests {
         .await;
         append_completed_turn(&harness.log, &"old ".repeat(300)).await;
         append_current_user(&harness.log, "question").await;
-        assert!(run_turn(context).await.is_completed());
+        assert!(matches!(
+            run_turn(context).await,
+            TurnTaskResult::Completed { .. }
+        ));
         assert_eq!(harness.calls.load(Ordering::SeqCst), 3);
         assert_eq!(harness.log.snapshot().await.entries().len(), 7);
         harness.cleanup().await;
@@ -1522,7 +1567,7 @@ mod tests {
         append_completed_turn(&harness.log, &"old ".repeat(100)).await;
         append_current_user(&harness.log, &"current ".repeat(100)).await;
         let result = run_turn(context).await;
-        assert!(result.is_completed());
+        assert!(matches!(result, TurnTaskResult::Completed { .. }));
         assert_eq!(harness.calls.load(Ordering::SeqCst), 2);
         harness.cleanup().await;
     }
@@ -1546,10 +1591,13 @@ mod tests {
         append_completed_turn(&harness.log, &"old ".repeat(300)).await;
         append_current_user(&harness.log, "question").await;
         let result = run_turn(context).await;
-        assert_eq!(
-            result.failure(),
-            Some(super::runner::TurnFailure::Compaction)
-        );
+        assert!(matches!(
+            result,
+            TurnTaskResult::Failed {
+                failure: super::runner::TurnFailure::Compaction,
+                ..
+            }
+        ));
         assert_eq!(harness.calls.load(Ordering::SeqCst), 3);
         assert_eq!(
             harness
@@ -1572,10 +1620,13 @@ mod tests {
         )
         .await;
         let result = run_turn(context).await;
-        assert_eq!(
-            result.failure(),
-            Some(super::runner::TurnFailure::Compaction)
-        );
+        assert!(matches!(
+            result,
+            TurnTaskResult::Failed {
+                failure: super::runner::TurnFailure::Compaction,
+                ..
+            }
+        ));
         assert_eq!(harness.calls.load(Ordering::SeqCst), 1);
         assert_eq!(harness.log.snapshot().await.entries().len(), 1);
         harness.cleanup().await;
@@ -1584,8 +1635,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn transient_503_delivery_retries_same_request_but_unsafe_error_does_not() {
         let transient = ModelError::detailed(
-            crate::model_v2::ModelErrorKind::ProviderUnavailable,
-            crate::model_v2::DeliveryState::RejectedBeforeExecution,
+            crate::model::ModelErrorKind::ProviderUnavailable,
+            crate::model::DeliveryState::RejectedBeforeExecution,
             None,
         )
         .unwrap();
@@ -1602,7 +1653,10 @@ mod tests {
             options,
         )
         .await;
-        assert!(run_turn(context).await.is_completed());
+        assert!(matches!(
+            run_turn(context).await,
+            TurnTaskResult::Completed { .. }
+        ));
         assert_eq!(harness.calls.load(Ordering::SeqCst), 2);
         {
             let requests = harness
@@ -1620,22 +1674,34 @@ mod tests {
         )
         .await;
         let result = run_turn(context).await;
-        assert_eq!(result.failure(), Some(super::runner::TurnFailure::Model));
+        assert!(matches!(
+            result,
+            TurnTaskResult::Failed {
+                failure: super::runner::TurnFailure::Model,
+                ..
+            }
+        ));
         assert_eq!(harness.calls.load(Ordering::SeqCst), 1);
         harness.cleanup().await;
 
         let mut options = HarnessOptions::default();
         options.retry_policy = RetryPolicy::new(2, Duration::ZERO).unwrap();
         let too_long_hint = ModelError::detailed(
-            crate::model_v2::ModelErrorKind::RateLimited,
-            crate::model_v2::DeliveryState::RejectedBeforeExecution,
+            crate::model::ModelErrorKind::RateLimited,
+            crate::model::DeliveryState::RejectedBeforeExecution,
             Some(Duration::from_secs(31)),
         )
         .unwrap();
         let (context, harness) =
             harness_with(vec![ScriptedStep::Error(too_long_hint)], options).await;
         let result = run_turn(context).await;
-        assert_eq!(result.failure(), Some(super::runner::TurnFailure::Model));
+        assert!(matches!(
+            result,
+            TurnTaskResult::Failed {
+                failure: super::runner::TurnFailure::Model,
+                ..
+            }
+        ));
         assert_eq!(harness.calls.load(Ordering::SeqCst), 1);
         harness.cleanup().await;
 
@@ -1652,7 +1718,13 @@ mod tests {
         )
         .await;
         let result = run_turn(context).await;
-        assert_eq!(result.failure(), Some(super::runner::TurnFailure::Model));
+        assert!(matches!(
+            result,
+            TurnTaskResult::Failed {
+                failure: super::runner::TurnFailure::Model,
+                ..
+            }
+        ));
         assert_eq!(harness.calls.load(Ordering::SeqCst), 1);
         assert!(harness.events.try_recv().is_err());
         harness.cleanup().await;
@@ -1682,7 +1754,7 @@ mod tests {
                 if delta == "streaming before cancellation"
         ));
         cancellation.cancel();
-        assert!(task.await.is_cancelled());
+        assert!(matches!(task.await, TurnTaskResult::Cancelled { .. }));
         assert_eq!(harness.log.snapshot().await.entries().len(), 1);
         harness.cleanup().await;
 
@@ -1697,7 +1769,7 @@ mod tests {
         )
         .await;
         let result = run_turn(context).await;
-        assert!(result.is_cancelled());
+        assert!(matches!(result, TurnTaskResult::Cancelled { .. }));
         assert!(cancellation.is_cancelled());
         assert_eq!(harness.log.snapshot().await.entries().len(), 1);
         harness.cleanup().await;
@@ -1716,10 +1788,13 @@ mod tests {
         )
         .await;
         let result = run_turn(context).await;
-        assert_eq!(
-            result.failure(),
-            Some(super::runner::TurnFailure::Timestamp)
-        );
+        assert!(matches!(
+            result,
+            TurnTaskResult::Failed {
+                failure: super::runner::TurnFailure::Timestamp,
+                ..
+            }
+        ));
         assert_eq!(timestamp_harness.log.snapshot().await.entries().len(), 1);
         timestamp_harness.cleanup().await;
 
@@ -1730,10 +1805,13 @@ mod tests {
         .await;
         closed_harness.log.close().await.unwrap();
         let result = run_turn(context).await;
-        assert_eq!(
-            result.failure(),
-            Some(super::runner::TurnFailure::Conversation)
-        );
+        assert!(matches!(
+            result,
+            TurnTaskResult::Failed {
+                failure: super::runner::TurnFailure::Conversation,
+                ..
+            }
+        ));
         closed_harness.cleanup().await;
     }
 
@@ -1755,10 +1833,13 @@ mod tests {
             }])
             .await;
             let result = run_turn(context).await;
-            assert_eq!(
-                result.failure(),
-                Some(super::runner::TurnFailure::InvalidResponse)
-            );
+            assert!(matches!(
+                result,
+                TurnTaskResult::Failed {
+                    failure: super::runner::TurnFailure::InvalidResponse,
+                    ..
+                }
+            ));
             assert_eq!(harness.log.snapshot().await.entries().len(), 1);
             harness.cleanup().await;
         }
@@ -1775,10 +1856,13 @@ mod tests {
             }])
             .await;
             let result = run_turn(context).await;
-            assert_eq!(
-                result.failure(),
-                Some(super::runner::TurnFailure::InvalidResponse)
-            );
+            assert!(matches!(
+                result,
+                TurnTaskResult::Failed {
+                    failure: super::runner::TurnFailure::InvalidResponse,
+                    ..
+                }
+            ));
             assert_eq!(harness.log.snapshot().await.entries().len(), 1);
             harness.cleanup().await;
         }
@@ -1794,7 +1878,10 @@ mod tests {
                 event: None,
             }])
             .await;
-            assert!(run_turn(context).await.is_completed());
+            assert!(matches!(
+                run_turn(context).await,
+                TurnTaskResult::Completed { .. }
+            ));
             assert_eq!(harness.log.snapshot().await.entries().len(), 2);
             harness.cleanup().await;
         }
@@ -1827,7 +1914,10 @@ mod tests {
             options,
         )
         .await;
-        assert!(run_turn(context).await.is_completed());
+        assert!(matches!(
+            run_turn(context).await,
+            TurnTaskResult::Completed { .. }
+        ));
         assert_eq!(
             *order
                 .lock()

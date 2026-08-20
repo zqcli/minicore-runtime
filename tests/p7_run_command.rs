@@ -102,8 +102,6 @@ fn p7_sources_expose_only_the_requested_process_surface() {
     for source in [process, run_command, builtins, tools] {
         for forbidden in [
             "crate::wire",
-            "crate::tools::",
-            "crate::workspace::",
             "ToolExecutionPlan",
             "ToolStartGate",
             "ToolSet",
@@ -137,7 +135,7 @@ fn command_cwd_and_run_command_document_only_trusted_host_pre_spawn_validation()
             .replace('/', "")
             .to_ascii_lowercase()
     };
-    let workspace = compact(include_str!("../src/workspace_v2/root.rs"));
+    let workspace = compact(include_str!("../src/workspace/root.rs"));
     let run_command = compact(include_str!("../src/tools/builtins/run_command.rs"));
 
     for source in [&workspace, &run_command] {

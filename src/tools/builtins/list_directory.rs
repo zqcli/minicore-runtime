@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use crate::workspace_v2::{RelativePath, Workspace, WorkspaceError};
+use crate::workspace::{RelativePath, Workspace, WorkspaceError};
 
 use super::super::{Tool, ToolContext, ToolError, ToolFuture, ToolSpec};
 use super::path_args::parse_path_args;
