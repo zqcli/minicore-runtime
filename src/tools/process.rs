@@ -194,6 +194,14 @@ impl ProcessPolicy {
             allowed_env.insert("USERPROFILE".to_owned());
             allowed_env.insert("CARGO_HOME".to_owned());
             allowed_env.insert("RUSTUP_HOME".to_owned());
+            allowed_env.insert("VCINSTALLDIR".to_owned());
+            allowed_env.insert("VSINSTALLDIR".to_owned());
+            allowed_env.insert("VSCMD_ARG_TGT_ARCH".to_owned());
+            allowed_env.insert("WindowsSdkDir".to_owned());
+            allowed_env.insert("WindowsSDKVersion".to_owned());
+            allowed_env.insert("LIB".to_owned());
+            allowed_env.insert("LIBPATH".to_owned());
+            allowed_env.insert("INCLUDE".to_owned());
         }
 
         #[cfg(not(windows))]
@@ -342,6 +350,14 @@ mod tests {
             "USERPROFILE",
             "CARGO_HOME",
             "RUSTUP_HOME",
+            "VCINSTALLDIR",
+            "VSINSTALLDIR",
+            "VSCMD_ARG_TGT_ARCH",
+            "WindowsSdkDir",
+            "WindowsSDKVersion",
+            "LIB",
+            "LIBPATH",
+            "INCLUDE",
         ] {
             assert!(policy.allowed_env().contains(key));
         }
