@@ -57,7 +57,7 @@ The nested `model` object emits `provider` then `model`. The nested `compaction`
 | `compaction.target_tokens` | Non-zero and strictly less than `trigger_tokens`. |
 | `max_tool_rounds` | Integer in `1..=64`. |
 
-The `system_prompt` validator accepts a UTF-8 string when `value.len() <= 262,144`, including the empty string, and rejects every control character other than `\n` and `\t`. The complete serialized `session.json` including its final newline is at most 1 MiB. Serialization uses the production `serde_json` configuration with arbitrary-precision numbers preserved, although the checked session fields themselves use typed integers and identifiers.
+The `system_prompt` validator accepts a UTF-8 string when `value.len() <= 262,144`, including the empty string, and rejects every control character other than `\n` and `\t`. The complete serialized `session.json` including its final newline is at most 1 MiB. Serialization uses the production `serde_json` configuration; the checked session fields use typed integers and identifiers.
 
 ## Read and Write Rules
 

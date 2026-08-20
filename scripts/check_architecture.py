@@ -302,6 +302,7 @@ DIRECT_DEP_CONSUMERS = {
 }
 
 REMOVED_DEPENDENCIES = ("base64", "regex-syntax", "same-file", "file-id")
+FORBIDDEN_MANIFEST_TOKENS = ("heavy-tests", "raw_value", "arbitrary_precision")
 
 EXPECTED_MODULE_VISIBILITY = {
     "src/agent/mod.rs": {"context": "private", "runner": "private"},
@@ -750,8 +751,9 @@ def check_dependencies(sources: Dict[str, str]) -> Tuple[List[str], List[str]]:
             errors.append(f"Cargo.toml: removed direct dependency remains: {dependency}")
     if re.search(r"(?m)^\[features\]\s*$", cargo):
         errors.append("Cargo.toml: obsolete [features] table remains")
-    if "heavy-tests" in cargo or "raw_value" in cargo:
-        errors.append("Cargo.toml: obsolete feature/raw_value configuration remains")
+    for token in FORBIDDEN_MANIFEST_TOKENS:
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])", cargo):
+            errors.append(f"Cargo.toml: forbidden manifest token remains: {token}")
 
     reqwest = re.search(r"(?ms)^\s*reqwest\s*=\s*\{(.*?)\}", section)
     if reqwest is None:
@@ -770,11 +772,6 @@ def check_dependencies(sources: Dict[str, str]) -> Tuple[List[str], List[str]]:
         if not re.search(r'version\s*=\s*"=0.13.4"', spec):
             errors.append("Cargo.toml: reqwest version must remain exactly =0.13.4")
 
-    serde_json = re.search(r"(?ms)^\s*serde_json\s*=\s*\{(.*?)\}", section)
-    if serde_json is None or "arbitrary_precision" not in serde_json.group(1):
-        errors.append("Cargo.toml: serde_json arbitrary_precision is required")
-    if "arbitrary_precision" not in cargo or "Tool/Provider `Value` behavior" not in cargo:
-        errors.append("Cargo.toml: arbitrary_precision behavior must remain documented")
     return errors, sorted(names)
 
 
