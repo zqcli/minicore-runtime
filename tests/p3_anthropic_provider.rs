@@ -8,13 +8,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use minicore_runtime::{
+use minicore_runtime::model::{
     AnthropicMessagesProvider, AnthropicProviderError, AssistantPart, CredentialSource,
-    CredentialSourceFuture, DeliveryState, ModelCallContext, ModelDescriptor, ModelErrorKind,
-    ModelEvent, ModelFinishReason, ModelGateway, ModelLimits, ModelMessage, ModelRequest,
-    ModelSelection, ProviderRegistryBuilder, ReasoningContent, ReasoningPreference, ToolCall,
-    ToolName, ToolOutput, ToolSpec, fixed_credential_source,
+    CredentialSourceFuture, DeliveryState, ModelCallContext, ModelDescriptor, ModelError,
+    ModelErrorKind, ModelEvent, ModelEventSink, ModelFinishReason, ModelGateway, ModelLimits,
+    ModelMessage, ModelRequest, ModelResponse, ModelSelection, ProviderRegistryBuilder,
+    ReasoningContent, ReasoningPreference, ToolCall, fixed_credential_source,
 };
+use minicore_runtime::tools::{ToolName, ToolOutput, ToolSpec};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -391,16 +392,13 @@ fn text_terminal(text: &str, usage: Option<Value>) -> String {
     ])
 }
 
-async fn run_success(
-    body: String,
-    request: ModelRequest,
-) -> (minicore_runtime::ModelResponse, Vec<CapturedRequest>) {
+async fn run_success(body: String, request: ModelRequest) -> (ModelResponse, Vec<CapturedRequest>) {
     let server = LoopbackServer::single(200, "text/event-stream", body);
     let gateway = make_gateway(provider(
         &server.endpoint,
         fixed_credential_source("sk-test").unwrap(),
     ));
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(16).unwrap();
+    let (sink, _events) = ModelEventSink::channel(16).unwrap();
     let result = gateway
         .generate(
             request,
@@ -415,13 +413,13 @@ async fn run_error(
     body: String,
     content_type: &str,
     request: ModelRequest,
-) -> (minicore_runtime::ModelError, Vec<CapturedRequest>) {
+) -> (ModelError, Vec<CapturedRequest>) {
     let server = LoopbackServer::single(200, content_type, body);
     let gateway = make_gateway(provider(
         &server.endpoint,
         fixed_credential_source("sk-test").unwrap(),
     ));
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(16).unwrap();
+    let (sink, _events) = ModelEventSink::channel(16).unwrap();
     let error = gateway
         .generate(
             request,
@@ -582,7 +580,7 @@ async fn reasoning_modes_match_old_anthropic_mapping() {
             &server.endpoint,
             fixed_credential_source("sk-test").unwrap(),
         ));
-        let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+        let (sink, _events) = ModelEventSink::channel(8).unwrap();
         gateway
             .generate(
                 request(reasoning),
@@ -672,7 +670,7 @@ async fn request_replay_preserves_ordered_tools_results_and_thinking_rules() {
         &server.endpoint,
         fixed_credential_source("sk-test").unwrap(),
     ));
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     gateway
         .generate(
             request,
@@ -750,7 +748,7 @@ async fn rich_terminal_publishes_reasoning_text_and_normalizes_tool_calls_and_us
         &server.endpoint,
         fixed_credential_source("sk-test").unwrap(),
     ));
-    let (sink, mut events) = minicore_runtime::ModelEventSink::channel(16).unwrap();
+    let (sink, mut events) = ModelEventSink::channel(16).unwrap();
     let result = gateway
         .generate(
             ModelRequest::new(
@@ -1303,7 +1301,7 @@ async fn unexpected_tools_and_http_errors_are_structural_and_non_retrying() {
             &server.endpoint,
             fixed_credential_source("sk-test").unwrap(),
         ));
-        let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+        let (sink, _events) = ModelEventSink::channel(8).unwrap();
         let error = gateway
             .generate(
                 request(ReasoningPreference::Auto),
@@ -1331,7 +1329,7 @@ async fn numeric_retry_after_is_preserved_without_retry() {
     let endpoint = server.endpoint.clone();
     let provider = provider(&endpoint, fixed_credential_source("sk-test").unwrap());
     let gateway = make_gateway(provider);
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     let error = gateway
         .generate(
             request(ReasoningPreference::Auto),
@@ -1371,7 +1369,7 @@ async fn retry_after_is_bounded_and_dynamic_credentials_are_resolved_per_attempt
     ])));
     let source: Arc<dyn CredentialSource> = Arc::new(RotatingCredentialSource(credentials));
     let gateway = make_gateway(provider(&server.endpoint, source));
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     let first = gateway
         .generate(
             request(ReasoningPreference::Auto),
@@ -1381,7 +1379,7 @@ async fn retry_after_is_bounded_and_dynamic_credentials_are_resolved_per_attempt
         .unwrap_err();
     assert_eq!(first.kind(), ModelErrorKind::RateLimited);
     assert_eq!(first.retry_after(), None);
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     gateway
         .generate(
             request(ReasoningPreference::Auto),
@@ -1413,7 +1411,7 @@ async fn cancellation_before_send_and_after_delta_preserves_delivery() {
     ));
     let cancellation = CancellationToken::new();
     cancellation.cancel();
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     let error = gateway
         .generate(
             request(ReasoningPreference::Auto),
@@ -1437,7 +1435,7 @@ async fn cancellation_before_send_and_after_delta_preserves_delivery() {
         &server.endpoint,
         fixed_credential_source("sk-test").unwrap(),
     ));
-    let (sink, mut events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, mut events) = ModelEventSink::channel(8).unwrap();
     let cancellation = CancellationToken::new();
     let task = tokio::spawn({
         let gateway = gateway.clone();
@@ -1480,7 +1478,7 @@ async fn fragmented_stream_and_request_bound_are_safe() {
         &server.endpoint,
         fixed_credential_source("sk-test").unwrap(),
     ));
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     gateway
         .generate(
             request(ReasoningPreference::Auto),
@@ -1513,7 +1511,7 @@ async fn fragmented_stream_and_request_bound_are_safe() {
         ReasoningPreference::Auto,
     )
     .unwrap();
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     let error = gateway
         .generate(
             oversized,

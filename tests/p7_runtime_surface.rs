@@ -1,7 +1,10 @@
+use minicore_runtime::model::{ModelSelection, ProviderRegistry};
+use minicore_runtime::tools::{
+    ProcessPolicy, ProgramPolicy, RunCommandTool, ToolName, ToolRegistry,
+};
 use minicore_runtime::{
-    ModelSelection, ProcessPolicy, ProgramPolicy, ProviderRegistry, RetryPolicy, RunCommandTool,
-    Runtime, RuntimeConfig, SessionConfig, SessionError, SessionId, SessionSummary, ToolName,
-    ToolRegistry, TranscriptEntry, TranscriptPage,
+    RetryPolicy, Runtime, RuntimeConfig, SessionConfig, SessionError, SessionId, SessionSummary,
+    TranscriptEntry, TranscriptPage,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -23,7 +26,9 @@ fn p7_public_runtime_surface_is_typed_and_redacted() {
     let manager = include_str!("../src/runtime/session_manager.rs");
     let config = include_str!("../src/config.rs");
     let lib = include_str!("../src/lib.rs");
-    let tools = include_str!("../src/tools/mod.rs");
+    let model_module = include_str!("../src/model/mod.rs");
+    let tools_module = include_str!("../src/tools/mod.rs");
+    let workspace_module = include_str!("../src/workspace/mod.rs");
     for text in [source, manager, config] {
         for forbidden in [
             "crate::wire",
@@ -67,12 +72,30 @@ fn p7_public_runtime_surface_is_typed_and_redacted() {
     assert!(!manager.contains("SessionExecutor"));
     assert!(!manager.contains("SessionIngress"));
     assert!(!manager.contains("SessionResidency"));
-    assert!(lib.contains("ProcessPolicy"));
-    assert!(lib.contains("ProcessPolicyError"));
-    assert!(lib.contains("ProgramPolicy"));
-    assert!(lib.contains("RunCommandTool"));
-    assert!(tools.contains("mod builtins;"));
-    assert!(!tools.contains("P7_PROCESS_SURFACE"));
+    for declaration in [
+        "pub mod config;",
+        "pub mod error;",
+        "pub mod event;",
+        "pub mod ids;",
+        "pub mod model;",
+        "pub mod runtime;",
+        "pub mod session;",
+        "pub mod tools;",
+        "pub mod workspace;",
+    ] {
+        assert!(
+            lib.contains(declaration),
+            "missing public module: {declaration}"
+        );
+    }
+    assert!(lib.contains("pub use runtime::{Runtime, SessionSummary};"));
+    assert!(!lib.contains("pub use model::{"));
+    assert!(!lib.contains("pub use tools::{"));
+    assert!(!lib.contains("pub use workspace::{"));
+    assert!(model_module.contains("pub use registry::{ProviderRegistry"));
+    assert!(tools_module.contains("pub use process::{ProcessPolicy"));
+    assert!(tools_module.contains("pub use builtins::{"));
+    assert!(workspace_module.contains("pub use root::{"));
 
     let providers = ProviderRegistry::default();
     let tools = ToolRegistry::default();

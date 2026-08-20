@@ -11,7 +11,6 @@ fn conversation_surface_is_crate_private_and_not_root_exported() {
         "ConversationEntry",
         "NewConversationEntry",
         "ConversationError",
-        "TranscriptPage",
         "PromptConversationView",
         "ConversationSnapshot",
         "CompactionConversationView",

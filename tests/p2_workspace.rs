@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::task::Context;
 
-use minicore_runtime::{
+use minicore_runtime::workspace::{
     DirectoryEntryKind, RelativePath, RelativePathError, Workspace, WorkspaceAccess, WorkspaceError,
 };
 
@@ -786,7 +786,8 @@ fn workspace_public_source_has_no_legacy_or_unsafe_path_seams() {
 
     let lib = include_str!("../src/lib.rs");
     assert!(lib.contains("pub mod workspace;"));
-    assert!(lib.contains("pub use workspace::"));
+    assert!(!lib.contains("pub use workspace::{"));
+    assert!(include_str!("../src/workspace/mod.rs").contains("pub use root::{"));
 }
 
 #[test]
