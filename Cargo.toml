@@ -44,11 +44,6 @@ tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-th
 serde_json = { version = "1.0.140", features = ["raw_value"] }
 
 
-[[test]]
-name = "heavy_boundaries"
-path = "tests/heavy_boundaries.rs"
-required-features = ["heavy-tests"]
-
 [lints.rust]
 unsafe_code = "forbid"
 
