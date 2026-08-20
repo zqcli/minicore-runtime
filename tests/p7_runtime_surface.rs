@@ -1,7 +1,7 @@
 use minicore_runtime::{
-    ModelSelection, ProviderRegistry, RetryPolicy, Runtime, RuntimeConfig, SessionConfig,
-    SessionError, SessionId, SessionSummary, ToolName, ToolRegistry, TranscriptEntry,
-    TranscriptPage,
+    ModelSelection, ProcessPolicy, ProgramPolicy, ProviderRegistry, RetryPolicy, RunCommandTool,
+    Runtime, RuntimeConfig, SessionConfig, SessionError, SessionId, SessionSummary, ToolName,
+    ToolRegistry, TranscriptEntry, TranscriptPage,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -22,6 +22,8 @@ fn p7_public_runtime_surface_is_typed_and_redacted() {
     let source = include_str!("../src/runtime_v2/runtime.rs");
     let manager = include_str!("../src/runtime_v2/session_manager.rs");
     let config = include_str!("../src/config.rs");
+    let lib = include_str!("../src/lib.rs");
+    let tools = include_str!("../src/tools/mod.rs");
     for text in [source, manager, config] {
         for forbidden in [
             "crate::runtime::",
@@ -66,6 +68,12 @@ fn p7_public_runtime_surface_is_typed_and_redacted() {
     assert!(!manager.contains("SessionExecutor"));
     assert!(!manager.contains("SessionIngress"));
     assert!(!manager.contains("SessionResidency"));
+    assert!(lib.contains("ProcessPolicy"));
+    assert!(lib.contains("ProcessPolicyError"));
+    assert!(lib.contains("ProgramPolicy"));
+    assert!(lib.contains("RunCommandTool"));
+    assert!(tools.contains("mod builtins;"));
+    assert!(!tools.contains("P7_PROCESS_SURFACE"));
 
     let providers = ProviderRegistry::default();
     let tools = ToolRegistry::default();
@@ -94,6 +102,9 @@ fn p7_public_runtime_surface_is_typed_and_redacted() {
     .unwrap();
     let _ = session;
     let _ = Runtime::open;
+    let _ = ProcessPolicy::coding_agent_local;
+    let _ = ProgramPolicy::any;
+    let _ = RunCommandTool::new;
     let _ = create_signature;
     let _ = list_signature;
     let _ = TranscriptEntry::User {

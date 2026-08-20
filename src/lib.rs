@@ -75,10 +75,11 @@ pub use session_v2::{
 };
 pub use tools_v2::{
     AllowConfiguredTools, AskUserTool, InteractionClient, InteractionReceiver, InteractionRequest,
-    ListDirectoryTool, ReadFileTool, Tool, ToolCallSummary, ToolContext, ToolContextView,
-    ToolDecision, ToolError, ToolFuture, ToolName, ToolNameError, ToolOutput, ToolPolicy,
-    ToolPolicyError, ToolRegistry, ToolRegistryBuilder, ToolRequest, ToolResultStatus,
-    ToolResultSummary, ToolSpec, ToolValueError, UserAnswer, UserQuestion, WriteFileTool,
+    ListDirectoryTool, ProcessPolicy, ProcessPolicyError, ProgramPolicy, ReadFileTool,
+    RunCommandTool, Tool, ToolCallSummary, ToolContext, ToolContextView, ToolDecision, ToolError,
+    ToolFuture, ToolName, ToolNameError, ToolOutput, ToolPolicy, ToolPolicyError, ToolRegistry,
+    ToolRegistryBuilder, ToolRequest, ToolResultStatus, ToolResultSummary, ToolSpec,
+    ToolValueError, UserAnswer, UserQuestion, WriteFileTool,
 };
 pub use workspace_v2::{
     DirectoryEntry, DirectoryEntryKind, RelativePath, RelativePathError, Workspace,

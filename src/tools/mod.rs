@@ -1,4 +1,4 @@
-pub mod builtins;
+mod builtins;
 mod context;
 mod policy;
 mod process;
@@ -17,11 +17,6 @@ pub(crate) use types::validate_json_shape;
 
 use std::sync::Arc;
 
-// Keep this crate-private P7 surface live until the later root-facade integration
-// reexports the process types and builtin to external hosts.
-#[used]
-static P7_PROCESS_SURFACE: fn() = retain_p7_process_surface;
-
 fn retain_p7_process_surface() {
     let policy = Arc::new(ProcessPolicy::disabled());
     let _local_policy = ProcessPolicy::coding_agent_local();
@@ -38,6 +33,8 @@ fn retain_p7_process_surface() {
     let _program_policy: Option<ProgramPolicy> = None;
     let _ = (_execute, _policy_error, _program_policy);
 }
+
+const _: fn() = retain_p7_process_surface;
 pub use types::{
     ToolCallSummary, ToolError, ToolName, ToolNameError, ToolOutput, ToolResultStatus,
     ToolResultSummary, ToolSpec, ToolValueError, UserAnswer, UserQuestion,
