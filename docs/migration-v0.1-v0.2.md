@@ -1,7 +1,9 @@
 # MiniCore Runtime v0.1 → v0.2
 
-**Status:** P0 declaration for `refactor/v0.2-core-reset`  
+**Status:** P7 foundations and public acceptance integration complete; P8 switch/deletion remains deferred
 **Change type:** breaking Core Reset; no v0.1 Wire/API compatibility promise
+
+P1–P7 are implemented beside the v0.1 baseline. The public typed `Runtime` surface, explicit provider/tool registries, capability-relative file tools, structured `run_command`, durable transcript/compaction behavior, cancellation, and AT-01..AT-19 are active in `tests/v2_acceptance.rs`. AT-20 remains the sole ignored acceptance case because legacy owner deletion is intentionally a P8/P9 concern.
 
 ## Branch Authority
 
