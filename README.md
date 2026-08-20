@@ -4,7 +4,7 @@
 >
 > The typed v0.2 core is implemented beside the v0.1 baseline below. It exposes a checked `Runtime`/`SessionConfig` API with one Session actor, one bounded mailbox, one active Turn, snapshot-first events, durable transcript recovery, compaction, cancellation, explicit provider and tool registries, capability-relative file tools, and structured `run_command`. P8 will switch the repository default and P9 will remove or archive the legacy body; until then, the material below remains the v0.1 baseline.
 >
-> `run_command` never receives a shell string: it takes a structured program and argument list. It uses ambient host command authority after bounded pre-spawn validation, so it is not a process sandbox and must be enabled deliberately with an explicit `ProcessPolicy`. File tools remain capability-relative to the configured workspace. Hosts must call `Runtime::shutdown()` explicitly; dropping the last owner only requests cancellation and does not await cleanup.
+> `run_command` never receives a shell string: it takes a structured program and argument list. It uses ambient host command authority after bounded pre-spawn validation, so it is not a process sandbox and must be enabled deliberately with an explicit `ProcessPolicy`. File tools remain capability-relative to the configured workspace. Hosts must call `Runtime::shutdown()` explicitly to observe cleanup completion; dropping the last owner starts the same asynchronous shutdown path but does not await its completion.
 >
 > ```rust
 > use std::collections::BTreeSet;

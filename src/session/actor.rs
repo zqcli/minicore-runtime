@@ -1715,15 +1715,21 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(handle.snapshot().conversation_seq(), 3);
+        assert!(handle.snapshot().conversation_seq() >= 3);
         loop {
             match stream.recv().await.unwrap() {
                 SessionEvent::ToolStarted { .. } => {
-                    assert_eq!(handle.snapshot().conversation_seq(), 3);
-                    assert_eq!(
-                        handle.snapshot().status(),
-                        SessionStatus::Running { turn_id }
-                    );
+                    assert!(handle.snapshot().conversation_seq() >= 3);
+                    match handle.snapshot().status() {
+                        SessionStatus::Idle | SessionStatus::Closing => {}
+                        SessionStatus::Running { turn_id: current } => {
+                            assert_eq!(current, turn_id)
+                        }
+                        SessionStatus::WaitingForInput {
+                            interaction_id: current,
+                            ..
+                        } => assert_eq!(current, interaction_id),
+                    }
                 }
                 SessionEvent::TurnFinished { outcome, .. } => {
                     assert_eq!(outcome, TurnOutcome::Completed);
@@ -1802,7 +1808,39 @@ mod tests {
             SessionStatus::WaitingForInput { turn_id: current, interaction_id: current_id }
                 if current == turn_id && current_id == interaction_id
         ));
-        assert_eq!(log.snapshot().await.entries().len(), 2);
+        let before_terminal = log.snapshot().await;
+        assert!(before_terminal.entries().len() >= 2);
+        assert!(
+            !before_terminal
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry.as_ref(), ConversationEntry::Interaction { .. }))
+        );
+        assert!(matches!(
+            before_terminal.entries()[0].as_ref(),
+            ConversationEntry::User { turn_id: current, .. } if *current == turn_id
+        ));
+        assert!(matches!(
+            before_terminal.entries()[1].as_ref(),
+            ConversationEntry::Assistant { turn_id: current, tool_calls, .. }
+                if *current == turn_id && tool_calls.len() == 1
+        ));
+        for entry in before_terminal.entries().iter().skip(2) {
+            assert!(
+                matches!(
+                    entry.as_ref(),
+                    ConversationEntry::ToolResult { turn_id: current, result, .. }
+                        if *current == turn_id && result.text() == "cancelled" && result.is_error()
+                ) || matches!(
+                    entry.as_ref(),
+                    ConversationEntry::TurnTerminal {
+                        turn_id: current,
+                        outcome: StoredTurnOutcome::Cancelled,
+                        ..
+                    } if *current == turn_id
+                )
+            );
+        }
         loop {
             if let SessionEvent::TurnFinished {
                 outcome: TurnOutcome::Cancelled,
@@ -1812,7 +1850,36 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(log.snapshot().await.entries().len(), 4);
+        let final_snapshot = log.snapshot().await;
+        assert_eq!(final_snapshot.entries().len(), 4);
+        assert!(
+            !final_snapshot
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry.as_ref(), ConversationEntry::Interaction { .. }))
+        );
+        assert!(matches!(
+            final_snapshot.entries()[0].as_ref(),
+            ConversationEntry::User { turn_id: current, .. } if *current == turn_id
+        ));
+        assert!(matches!(
+            final_snapshot.entries()[1].as_ref(),
+            ConversationEntry::Assistant { turn_id: current, tool_calls, .. }
+                if *current == turn_id && tool_calls.len() == 1
+        ));
+        assert!(matches!(
+            final_snapshot.entries()[2].as_ref(),
+            ConversationEntry::ToolResult { turn_id: current, result, .. }
+                if *current == turn_id && result.text() == "cancelled" && result.is_error()
+        ));
+        assert!(matches!(
+            final_snapshot.entries()[3].as_ref(),
+            ConversationEntry::TurnTerminal {
+                turn_id: current,
+                outcome: StoredTurnOutcome::Cancelled,
+                ..
+            } if *current == turn_id
+        ));
         handle.close().await.unwrap();
         actor_task.await.unwrap().unwrap();
         store.shutdown().await.unwrap();

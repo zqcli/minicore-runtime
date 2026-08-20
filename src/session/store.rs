@@ -548,17 +548,25 @@ struct WorkerState {
 struct WorkerOwner {
     state: Mutex<WorkerState>,
     shutdown_gate: AsyncMutex<()>,
-    exit: watch::Receiver<bool>,
+    exit: watch::Receiver<Option<Result<(), StoreError>>>,
 }
 
 struct WorkerExitGuard {
-    sender: watch::Sender<bool>,
+    sender: watch::Sender<Option<Result<(), StoreError>>>,
+    completed: bool,
+}
+
+impl WorkerExitGuard {
+    fn complete(&mut self, result: Result<(), StoreError>) {
+        self.completed = true;
+        let _ = self.sender.send(Some(result));
+    }
 }
 
 impl WorkerOwner {
     fn start(root: PathBuf) -> Result<(Arc<Self>, WorkerReadiness), StoreError> {
         let (sender, receiver) = mpsc::sync_channel(WORKER_QUEUE_CAPACITY);
-        let (exit_sender, exit) = watch::channel(false);
+        let (exit_sender, exit) = watch::channel(None);
         let (ready_sender, ready_receiver) = oneshot::channel();
         let handle = std::thread::Builder::new()
             .name("minicore-session-store-worker".to_owned())
@@ -644,13 +652,14 @@ impl WorkerOwner {
         }
 
         let mut exit = self.exit.clone();
-        let mut exit_failed = false;
-        while !*exit.borrow() {
-            if exit.changed().await.is_err() {
-                exit_failed = true;
-                break;
+        let exit_result = loop {
+            if let Some(result) = *exit.borrow() {
+                break result;
             }
-        }
+            if exit.changed().await.is_err() {
+                break Err(StoreError::WorkerFailed);
+            }
+        };
         loop {
             let finished = self
                 .lock_state()
@@ -663,16 +672,18 @@ impl WorkerOwner {
             tokio::task::yield_now().await;
         }
         let handle = self.lock_state().handle.take();
-        if let Some(handle) = handle {
-            if exit_failed || handle.join().is_err() {
-                self.lock_state().worker_failed = true;
-            }
+        let join_result = handle.map_or(Ok(()), |handle| {
+            handle.join().map_err(|_| StoreError::WorkerFailed)
+        });
+        let result = match (exit_result, join_result) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        };
+        if result.is_err() {
+            self.lock_state().worker_failed = true;
         }
-        if self.lock_state().worker_failed {
-            Err(StoreError::WorkerFailed)
-        } else {
-            Ok(())
-        }
+        result
     }
 }
 
@@ -686,7 +697,9 @@ impl Drop for WorkerOwner {
         state.sender.take();
         let handle = state.handle.take();
         if let Some(handle) = handle {
-            if handle.join().is_err() {
+            if handle.thread().id() == std::thread::current().id() {
+                drop(handle);
+            } else if handle.join().is_err() {
                 state.worker_failed = true;
             }
         }
@@ -697,9 +710,12 @@ fn worker_loop(
     root: PathBuf,
     receiver: Receiver<BlockingJob>,
     ready: oneshot::Sender<Result<PathBuf, StoreError>>,
-    exit: watch::Sender<bool>,
+    exit: watch::Sender<Option<Result<(), StoreError>>>,
 ) {
-    let _exit_guard = WorkerExitGuard { sender: exit };
+    let mut exit_guard = WorkerExitGuard {
+        sender: exit,
+        completed: false,
+    };
     let bootstrap = catch_unwind(AssertUnwindSafe(|| bootstrap_sync(&root)))
         .unwrap_or(Err(StoreError::WorkerFailed));
     let (sessions, lock_file) = match bootstrap {
@@ -710,18 +726,27 @@ fn worker_loop(
         }
     };
     if ready.send(Ok(sessions.clone())).is_err() {
+        exit_guard.complete(release_lock(lock_file));
         return;
     }
     while let Ok(job) = receiver.recv() {
         let _ = catch_unwind(AssertUnwindSafe(job));
     }
-    drop(lock_file);
+    exit_guard.complete(release_lock(lock_file));
 }
 
 impl Drop for WorkerExitGuard {
     fn drop(&mut self) {
-        let _ = self.sender.send(true);
+        if !self.completed {
+            let _ = self.sender.send(Some(Err(StoreError::WorkerFailed)));
+        }
     }
+}
+
+fn release_lock(lock_file: File) -> Result<(), StoreError> {
+    let result = fs4::fs_std::FileExt::unlock(&lock_file).map_err(|_| StoreError::Io);
+    drop(lock_file);
+    result
 }
 
 fn bootstrap_sync(root: &Path) -> Result<(PathBuf, File), StoreError> {
@@ -1230,10 +1255,47 @@ mod tests {
         store.shutdown().await.unwrap();
         store.shutdown().await.unwrap();
         assert_eq!(store.list().await, Err(StoreError::Closing));
-        let reopened = SessionStore::open(root.clone()).await.unwrap();
-        assert_eq!(reopened.list().await.unwrap(), vec![id]);
-        reopened.shutdown().await.unwrap();
+        for _ in 0..20 {
+            let reopened = SessionStore::open(root.clone()).await.unwrap();
+            assert_eq!(reopened.list().await.unwrap(), vec![id]);
+            reopened.shutdown().await.unwrap();
+        }
         retained_clone.shutdown().await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_owner_drop_on_worker_thread_does_not_join_itself() {
+        let (owner, root, _sessions) = start_worker().await;
+        let (before_sender, before_receiver) = channel();
+        let (after_sender, after_receiver) = channel();
+        let owner_in_worker = Arc::clone(&owner);
+        owner
+            .admit(Box::new(move || {
+                before_sender.send(()).unwrap();
+                drop(owner_in_worker);
+                after_sender.send(()).unwrap();
+            }))
+            .unwrap();
+        drop(owner);
+        before_receiver.recv().unwrap();
+        after_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("worker-owner Drop must not self-join");
+
+        let mut reopened = None;
+        for _ in 0..1_000 {
+            match SessionStore::open(root.clone()).await {
+                Ok(store) => {
+                    reopened = Some(store);
+                    break;
+                }
+                Err(StoreError::InUse) => tokio::task::yield_now().await,
+                Err(error) => panic!("unexpected root reopen error: {error:?}"),
+            }
+        }
+        let reopened = reopened.expect("worker-owner Drop did not release the root lock");
+        reopened.shutdown().await.unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

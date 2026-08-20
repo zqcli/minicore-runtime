@@ -33,10 +33,9 @@ pub struct SessionSummary {
 
 /// A typed P7 runtime owner.
 ///
-/// Call [`Runtime::shutdown`] explicitly. Dropping the last clone only requests
-/// cancellation and retains active actor or shutdown owners when needed; it does
-/// not synchronously join actor tasks. Retained owners are released only after
-/// an explicit shutdown join or at process teardown.
+/// Call [`Runtime::shutdown`] explicitly to observe cleanup. Dropping the last
+/// clone starts the same asynchronous shutdown path and retains active actor or
+/// shutdown owners when needed.
 pub struct Runtime {
     inner: Arc<RuntimeInner>,
 }
@@ -241,15 +240,7 @@ impl Runtime {
     }
 
     pub async fn shutdown(&self) -> Result<(), RuntimeError> {
-        self.inner.closing.cancel();
-        for (_, session) in self.inner.manager.begin_shutdown() {
-            session.request_close();
-        }
-        let manager = self.inner.manager.clone();
-        let store = Arc::clone(&self.inner.store);
-        self.inner.shutdown.start(&self.inner.runtime, async move {
-            shutdown_sessions(manager, store).await
-        });
+        self.inner.start_shutdown_sync();
         self.inner.shutdown.join().await
     }
 
@@ -324,7 +315,7 @@ impl Clone for Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         if Arc::strong_count(&self.inner) == 1 {
-            self.inner.request_close_sync();
+            self.inner.start_shutdown_sync();
         }
     }
 }
@@ -336,7 +327,7 @@ struct RetainedRuntimeOwners {
 
 impl Drop for RuntimeInner {
     fn drop(&mut self) {
-        self.request_close_sync();
+        self.start_shutdown_sync();
         let retain_manager = self.manager.has_loaded();
         let retain_shutdown = self.shutdown.needs_retention();
         if retain_manager || retain_shutdown {
@@ -349,11 +340,16 @@ impl Drop for RuntimeInner {
 }
 
 impl RuntimeInner {
-    fn request_close_sync(&self) {
+    fn start_shutdown_sync(&self) {
         self.closing.cancel();
         for (_, session) in self.manager.begin_shutdown() {
             session.request_close();
         }
+        let manager = self.manager.clone();
+        let store = Arc::clone(&self.store);
+        self.shutdown.start(&self.runtime, async move {
+            shutdown_sessions(manager, store).await
+        });
     }
 }
 
