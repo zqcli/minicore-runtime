@@ -196,6 +196,9 @@ impl ProcessPolicy {
             allowed_env.insert("RUSTUP_HOME".to_owned());
             allowed_env.insert("ProgramFiles(x86)".to_owned());
             allowed_env.insert("ProgramFiles".to_owned());
+            allowed_env.insert("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER".to_owned());
+            allowed_env.insert("RUSTFLAGS".to_owned());
+            allowed_env.insert("CARGO_ENCODED_RUSTFLAGS".to_owned());
         }
 
         #[cfg(not(windows))]
@@ -356,6 +359,9 @@ mod tests {
             "RUSTUP_HOME",
             "ProgramFiles(x86)",
             "ProgramFiles",
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
         ] {
             assert!(policy.allowed_env().contains(key));
         }
