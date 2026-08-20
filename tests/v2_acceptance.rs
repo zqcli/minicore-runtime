@@ -1273,21 +1273,24 @@ async fn at_04_run_tests() {
     runtime.submit(id, "run tests".to_owned()).await.unwrap();
     let outcome = finished_with_timeout(&mut stream, Duration::from_secs(60)).await;
     let page = runtime.transcript(id, None, 200).await.unwrap();
+    let windows_diagnostics = windows_linker_diagnostics_for_at04();
     let output_text = tool_result(page.entries())
         .into_iter()
         .find(|text| text.contains("exit_code"))
-        .expect("run_command output");
+        .unwrap_or_else(|| panic!("AT-04 run_command output missing; {windows_diagnostics}"));
     let output: Value = serde_json::from_str(output_text).unwrap_or_else(|error| {
-        panic!("AT-04 invalid run_command output: {error}; raw output: {output_text:?}")
+        panic!(
+            "AT-04 invalid run_command output: {error}; raw output: {output_text:?}; {windows_diagnostics}"
+        )
     });
     assert_eq!(
         outcome,
         TurnOutcome::Completed,
-        "AT-04 turn failed; complete run_command output including stderr: {output}"
+        "AT-04 turn failed; complete run_command output including stderr: {output}; {windows_diagnostics}"
     );
     assert_eq!(
         output["exit_code"], 0,
-        "AT-04 cargo test failed; complete run_command output including stderr: {output}"
+        "AT-04 cargo test failed; complete run_command output including stderr: {output}; {windows_diagnostics}"
     );
     assert_eq!(output["timed_out"], false);
     assert!(output["stdout"].is_string());
@@ -1503,6 +1506,57 @@ fn present_host_environment() -> (&'static str, String) {
                 .map(|value| (key, value))
         })
         .expect("at least one standard host environment variable must be present")
+}
+
+#[cfg(windows)]
+fn windows_linker_diagnostics_for_at04() -> String {
+    let keys = [
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "ProgramFiles(x86)",
+        "ProgramFiles",
+    ];
+    let presence = keys
+        .iter()
+        .map(|key| {
+            format!(
+                "{key}={}",
+                if std::env::var_os(key).is_some() {
+                    "present"
+                } else {
+                    "absent"
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    let linker_candidates = match std::process::Command::new("where.exe")
+        .arg("link.exe")
+        .output()
+    {
+        Ok(output) => {
+            let candidates = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .take(8)
+                .map(|line| line.chars().take(512).collect::<String>())
+                .collect::<Vec<_>>();
+            format!(
+                "status={:?}, candidates={candidates:?}",
+                output.status.code()
+            )
+        }
+        Err(error) => format!("spawn_error_kind={:?}", error.kind()),
+    };
+    format!(
+        "Windows linker diagnostics: env_presence={presence:?}; where.exe link.exe={linker_candidates}"
+    )
+}
+
+#[cfg(not(windows))]
+fn windows_linker_diagnostics_for_at04() -> String {
+    String::new()
 }
 
 #[cfg(unix)]
