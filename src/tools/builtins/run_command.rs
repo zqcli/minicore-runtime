@@ -577,7 +577,13 @@ async fn kill_and_wait_until(
         // A kill error is acceptable only because this wait status proves the
         // direct child had already exited.
         (Err(_), Ok(Ok(status))) => Ok(status.code()),
-        (_, Ok(Err(_))) | (_, Err(_)) => Err(ToolError::Internal),
+        (_, Ok(Err(_))) => Err(ToolError::Internal),
+        // A cleanup deadline can win before the async reaper is polled again;
+        // accept it only when a nonblocking wait proves direct-child exit.
+        (_, Err(_)) => match child.try_wait() {
+            Ok(Some(status)) => Ok(status.code()),
+            Ok(None) | Err(_) => Err(ToolError::Internal),
+        },
     }
 }
 
@@ -625,7 +631,6 @@ mod tests {
     use std as runtime;
     use std::env;
     use std::io::{Read as _, Write as _};
-    use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1330,8 +1335,6 @@ mod tests {
                     std::process::exit(12);
                 }
 
-                let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-                let parent_addr = listener.local_addr().unwrap().to_string();
                 let mut descendant = std::process::Command::new(env::current_exe().unwrap());
                 descendant
                     .args([
@@ -1340,7 +1343,6 @@ mod tests {
                         "--nocapture",
                     ])
                     .env("MINICORE_P7_HELPER_MODE", "hold_pipe")
-                    .env("MINICORE_P7_PARENT_ADDR", parent_addr)
                     .env(
                         "MINICORE_P7_DESCENDANT_READY_MARKER",
                         env::var("MINICORE_P7_DESCENDANT_READY_MARKER").unwrap(),
@@ -1353,9 +1355,9 @@ mod tests {
                         "MINICORE_P7_EXIT_MARKER",
                         env::var("MINICORE_P7_EXIT_MARKER").unwrap(),
                     )
-                    .spawn()
-                    .unwrap();
-                let (_connection, _) = listener.accept().unwrap();
+                    .stdin(Stdio::piped());
+                let mut descendant = descendant.spawn().unwrap();
+                let _parent_pipe = descendant.stdin.take().unwrap();
                 let descendant_ready = env::var("MINICORE_P7_DESCENDANT_READY_MARKER").unwrap();
                 let descendant_ready_deadline = std::time::Instant::now() + FIXTURE_WALL_LIMIT;
                 while !Path::new(&descendant_ready).exists()
@@ -1371,18 +1373,18 @@ mod tests {
                 }
                 println!("direct child exiting");
                 let _ = std::io::stdout().flush();
-                drop(listener);
                 std::process::exit(0);
             }
             "hold_pipe" => {
-                let address = env::var("MINICORE_P7_PARENT_ADDR").unwrap();
-                let mut parent = TcpStream::connect(address).unwrap();
-                parent.write_all(b"descendant ready").unwrap();
                 if let Ok(path) = env::var("MINICORE_P7_DESCENDANT_READY_MARKER") {
                     runtime::fs::write(path, b"descendant started").unwrap();
                 }
+                let mut parent = std::io::stdin();
                 let mut parent_eof = [0_u8; 1];
-                let _ = parent.read(&mut parent_eof);
+                match parent.read(&mut parent_eof) {
+                    Ok(0) => {}
+                    Ok(_) | Err(_) => std::process::exit(14),
+                }
                 if let Ok(path) = env::var("MINICORE_P7_DIRECT_EXIT_MARKER") {
                     runtime::fs::write(path, b"parent exited").unwrap();
                 }
