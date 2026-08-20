@@ -21,11 +21,13 @@ fn conversation_surface_is_crate_private_and_not_root_exported() {
         );
     }
     let session = include_str!("../src/session/mod.rs");
-    assert!(session.contains("pub(crate) mod conversation;"));
-    assert!(session.contains("mod compaction_visibility;"));
-    assert!(!session.contains("pub use conversation"));
-    let conversation = include_str!("../src/session/conversation.rs");
-    let visibility = include_str!("../src/session/compaction_visibility.rs");
+    assert!(!session.contains("pub(crate) mod conversation;"));
+    let storage = include_str!("../src/storage/mod.rs");
+    assert!(storage.contains("pub(crate) mod conversation;"));
+    assert!(storage.contains("mod compaction_visibility;"));
+    assert!(!storage.contains("pub use conversation"));
+    let conversation = include_str!("../src/storage/conversation.rs");
+    let visibility = include_str!("../src/storage/compaction_visibility.rs");
     assert!(conversation.contains("pub(crate) use compaction::CompactionConversationView;"));
     assert!(visibility.contains("CompactionConversationView"));
     for removed in [
@@ -60,13 +62,13 @@ fn conversation_surface_is_crate_private_and_not_root_exported() {
 #[test]
 fn conversation_owns_strict_jsonl_and_worker_boundaries_without_legacy_coupling() {
     for source in [
-        include_str!("../src/session/conversation.rs"),
-        include_str!("../src/session/conversation/codec.rs"),
-        include_str!("../src/session/conversation/compaction.rs"),
-        include_str!("../src/session/conversation/usage.rs"),
-        include_str!("../src/session/compaction_visibility.rs"),
-        include_str!("../src/session/store.rs"),
-        include_str!("../src/session/mod.rs"),
+        include_str!("../src/storage/conversation.rs"),
+        include_str!("../src/storage/conversation/codec.rs"),
+        include_str!("../src/storage/conversation/compaction.rs"),
+        include_str!("../src/storage/conversation/usage.rs"),
+        include_str!("../src/storage/compaction_visibility.rs"),
+        include_str!("../src/storage/store.rs"),
+        include_str!("../src/storage/mod.rs"),
     ] {
         for forbidden in [
             "crate::wire",
@@ -90,10 +92,10 @@ fn conversation_owns_strict_jsonl_and_worker_boundaries_without_legacy_coupling(
             );
         }
     }
-    let conversation = include_str!("../src/session/conversation.rs");
-    let codec = include_str!("../src/session/conversation/codec.rs");
-    let compaction = include_str!("../src/session/conversation/compaction.rs");
-    let usage = include_str!("../src/session/conversation/usage.rs");
+    let conversation = include_str!("../src/storage/conversation.rs");
+    let codec = include_str!("../src/storage/conversation/codec.rs");
+    let compaction = include_str!("../src/storage/conversation/compaction.rs");
+    let usage = include_str!("../src/storage/conversation/usage.rs");
     let combined = [conversation, codec, compaction, usage].join("\n");
     for required in [
         "serde(tag = \"type\", rename_all = \"snake_case\", deny_unknown_fields)",
@@ -135,7 +137,7 @@ fn conversation_owns_strict_jsonl_and_worker_boundaries_without_legacy_coupling(
     }
     assert!(!combined.contains("read_to_end"));
     assert!(!combined.contains("with_capacity(MAX_FILE_BYTES"));
-    let store = include_str!("../src/session/store.rs");
+    let store = include_str!("../src/storage/store.rs");
     assert!(store.contains("pub(crate) fn run_io"));
     assert!(store.contains("pub(crate) fn conversation_path"));
     assert!(store.contains("pub(crate) async fn open_registration"));

@@ -24,12 +24,15 @@ fn p4_store_types_are_crate_private_and_not_root_reexports() {
     }
 
     let session = include_str!("../src/session/mod.rs");
-    assert!(session.contains("pub(crate) mod store;"));
-    assert!(session.contains("pub(crate) mod time;"));
-    assert!(!session.contains("pub use store::{"));
-    assert!(!session.contains("pub use time::{"));
+    assert!(!session.contains("pub(crate) mod store;"));
+    assert!(!session.contains("pub(crate) mod time;"));
+    let storage = include_str!("../src/storage/mod.rs");
+    assert!(storage.contains("pub(crate) mod store;"));
+    assert!(storage.contains("pub(crate) mod time;"));
+    assert!(!storage.contains("pub use store::{"));
+    assert!(!storage.contains("pub use time::{"));
 
-    let store = include_str!("../src/session/store.rs");
+    let store = include_str!("../src/storage/store.rs");
     for declaration in [
         "pub(crate) enum StoreError",
         "pub(crate) struct SessionRegistration",
@@ -44,7 +47,7 @@ fn p4_store_types_are_crate_private_and_not_root_reexports() {
             "missing private declaration: {declaration}"
         );
     }
-    let time = include_str!("../src/session/time.rs");
+    let time = include_str!("../src/storage/time.rs");
     assert!(time.contains("pub(crate) enum TimestampError"));
     assert!(time.contains("pub(crate) struct Timestamp"));
 }
@@ -52,9 +55,9 @@ fn p4_store_types_are_crate_private_and_not_root_reexports() {
 #[test]
 fn p4_store_stays_on_the_new_boundary_and_keeps_bootstrap_guards() {
     for source in [
-        include_str!("../src/session/time.rs"),
-        include_str!("../src/session/store.rs"),
-        include_str!("../src/session/mod.rs"),
+        include_str!("../src/storage/time.rs"),
+        include_str!("../src/storage/store.rs"),
+        include_str!("../src/storage/mod.rs"),
     ] {
         for forbidden in [
             "crate::wire",
@@ -78,7 +81,7 @@ fn p4_store_stays_on_the_new_boundary_and_keeps_bootstrap_guards() {
             );
         }
     }
-    let store = include_str!("../src/session/store.rs");
+    let store = include_str!("../src/storage/store.rs");
     for required in [
         "fn start(",
         "root: PathBuf",

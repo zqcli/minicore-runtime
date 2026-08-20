@@ -7,6 +7,7 @@ pub mod model;
 mod prompt;
 pub mod runtime;
 pub mod session;
+mod storage;
 pub mod tools;
 pub mod workspace;
 

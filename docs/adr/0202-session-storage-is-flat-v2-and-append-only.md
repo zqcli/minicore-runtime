@@ -20,4 +20,4 @@ Replay accepts and repairs only a final partial tail. Complete malformed lines, 
 
 Existing data requires an explicit offline host migration. The Runtime does not guess another storage format or silently translate an ambiguous record. The flat layout makes lock ownership, atomic create, replay, and cleanup directly testable.
 
-See [session format](../formats/session-json-v2.md), [conversation format](../formats/conversation-jsonl-v2.md), and [`src/session/store.rs`](../../src/session/store.rs).
+See [session format](../formats/session-json-v2.md), [conversation format](../formats/conversation-jsonl-v2.md), and [`src/storage/store.rs`](../../src/storage/store.rs).

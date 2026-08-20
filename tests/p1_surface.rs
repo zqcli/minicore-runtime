@@ -65,6 +65,7 @@ fn canonical_modules_have_explicit_root_exports() {
     }
     assert!(lib.contains("mod agent;"));
     assert!(lib.contains("mod prompt;"));
+    assert!(lib.contains("mod storage;"));
     assert!(!lib.contains("#[path ="));
     assert!(!lib.contains("_v2"));
     assert_root_exports(

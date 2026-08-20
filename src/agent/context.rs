@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::ids::{SessionId, TurnId};
 use crate::model::{ModelGateway, ModelLimits, ReasoningPreference};
 use crate::prompt::{Compactor, PromptBuildOptions, PromptBuilder};
-use crate::session::conversation::ConversationLog;
-use crate::session::time::{Timestamp, TimestampError};
+use crate::storage::conversation::ConversationLog;
+use crate::storage::time::{Timestamp, TimestampError};
 use crate::tools::{InteractionClient, ToolName, ToolPolicy, ToolRegistry, ToolSpec};
 use crate::workspace::Workspace;
 

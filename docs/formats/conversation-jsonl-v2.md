@@ -1,6 +1,6 @@
 # Conversation JSONL v2
 
-This is the append-only conversation contract implemented by [`src/session/conversation.rs`](../../src/session/conversation.rs) and [`src/session/conversation/codec.rs`](../../src/session/conversation/codec.rs). Each physical record is one compact JSON object followed by `LF`. The serializer validates the semantic shape before emitting bytes, and the deserializer rejects unknown fields and invalid relations.
+This is the append-only conversation contract implemented by [`src/storage/conversation.rs`](../../src/storage/conversation.rs) and [`src/storage/conversation/codec.rs`](../../src/storage/conversation/codec.rs). Each physical record is one compact JSON object followed by `LF`. The serializer validates the semantic shape before emitting bytes, and the deserializer rejects unknown fields and invalid relations.
 
 ## Record Order
 

@@ -8,14 +8,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::command::{CancelSlot, CloseCompletion, SessionCommand, SessionHandle};
-use super::conversation::{
-    ConversationError, ConversationHealth, ConversationLog, NewConversationEntry, StoredTurnOutcome,
-};
 use super::event::SessionEvent;
 use super::event_stream::SessionObservation;
 use super::snapshot::{SessionSnapshot, SnapshotHistory, TurnOutcome, TurnSummary, TurnTerminal};
 use super::state::SessionStatus;
-use super::store::StoredSessionConfig;
 use crate::agent::{
     RetryPolicy, RunnerEvent, RunnerEventSink, TimestampSource, TurnContext,
     TurnContextDependencies, TurnFailure, TurnTaskResult, run_turn,
@@ -26,6 +22,10 @@ use crate::model::{
     ModelDescriptor, ModelEvent, ModelGateway, ModelSelection, ReasoningPreference, Usage,
 };
 use crate::prompt::{CompactionConfig, Compactor, PromptBuildOptions, PromptBuilder};
+use crate::storage::conversation::{
+    ConversationError, ConversationHealth, ConversationLog, NewConversationEntry, StoredTurnOutcome,
+};
+use crate::storage::store::StoredSessionConfig;
 use crate::tools::{
     InteractionClient, InteractionReceiver, InteractionRequest, ToolError, ToolPolicy,
     ToolRegistry, UserAnswer, UserQuestion,
@@ -1047,14 +1047,14 @@ mod tests {
         ModelFinishReason, ModelFuture, ModelGateway, ModelLimits, ModelProvider, ModelRequest,
         ModelResponse, ModelSelection, ProviderId, ProviderRegistry, ReasoningPreference, Usage,
     };
-    use crate::session::conversation::{
+    use crate::storage::conversation::{
         ConversationEntry, ConversationLog, NewConversationEntry, StoredTurnOutcome,
     };
-    use crate::session::store::{
+    use crate::storage::store::{
         SessionStore, StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig,
         StoredSessionConfig,
     };
-    use crate::session::time::{Timestamp, TimestampError};
+    use crate::storage::time::{Timestamp, TimestampError};
     use crate::tools::{AllowConfiguredTools, ToolRegistry};
     use crate::tools::{Tool, ToolContext, ToolFuture, ToolName, ToolOutput, ToolSpec};
     use crate::workspace::{Workspace, WorkspaceAccess};
@@ -2105,7 +2105,7 @@ mod tests {
         let blocker = store.run_io(move || {
             started_sender.send(()).unwrap();
             release_receiver.recv().unwrap();
-            Ok::<_, crate::session::store::StoreError>(())
+            Ok::<_, crate::storage::store::StoreError>(())
         });
         started_receiver.recv().unwrap();
         let answer_task = tokio::runtime::Handle::current().spawn({
@@ -2119,7 +2119,7 @@ mod tests {
                     .await
             }
         });
-        crate::session::conversation::wait_until_busy_for_test(&log).await;
+        crate::storage::conversation::wait_until_busy_for_test(&log).await;
         assert_eq!(handle.cancel(), Ok(()));
         release_sender.send(()).unwrap();
         SessionStore::await_io(blocker).await.unwrap();
@@ -2203,7 +2203,7 @@ mod tests {
         let blocker = store.run_io(move || {
             started_sender.send(()).unwrap();
             release_receiver.recv().unwrap();
-            Ok::<_, crate::session::store::StoreError>(())
+            Ok::<_, crate::storage::store::StoreError>(())
         });
         started_receiver.recv().unwrap();
         let answer_task = tokio::runtime::Handle::current().spawn({
@@ -2217,7 +2217,7 @@ mod tests {
                     .await
             }
         });
-        crate::session::conversation::wait_until_busy_for_test(&log).await;
+        crate::storage::conversation::wait_until_busy_for_test(&log).await;
         let close_task = tokio::runtime::Handle::current().spawn({
             let handle = handle.clone();
             async move { handle.close().await }
@@ -2976,7 +2976,7 @@ mod tests {
         let first_blocker = store.run_io(move || {
             first_started_sender.send(()).unwrap();
             first_release_receiver.recv().unwrap();
-            Ok::<_, crate::session::store::StoreError>(())
+            Ok::<_, crate::storage::store::StoreError>(())
         });
         first_started_receiver.recv().unwrap();
 
@@ -2984,19 +2984,19 @@ mod tests {
         let mut context = Context::from_waker(&waker);
         let mut submit = Box::pin(handle.submit("question".to_owned()));
         assert!(matches!(submit.as_mut().poll(&mut context), Poll::Pending));
-        crate::session::conversation::wait_until_busy_for_test(&log).await;
+        crate::storage::conversation::wait_until_busy_for_test(&log).await;
 
         let (second_started_sender, second_started_receiver) = std::sync::mpsc::channel();
         let (second_release_sender, second_release_receiver) = std::sync::mpsc::channel();
         let second_blocker = store.run_io(move || {
             second_started_sender.send(()).unwrap();
             second_release_receiver.recv().unwrap();
-            Ok::<_, crate::session::store::StoreError>(())
+            Ok::<_, crate::storage::store::StoreError>(())
         });
         first_release_sender.send(()).unwrap();
         SessionStore::await_io(first_blocker).await.unwrap();
         second_started_receiver.recv().unwrap();
-        crate::session::conversation::wait_until_busy_for_test(&log).await;
+        crate::storage::conversation::wait_until_busy_for_test(&log).await;
         let turn_id = submit.await.unwrap();
 
         let close_task = tokio::runtime::Handle::current().spawn({

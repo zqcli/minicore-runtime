@@ -24,6 +24,7 @@ CANONICAL_TOPS = (
     "prompt",
     "runtime",
     "session",
+    "storage",
     "tools",
     "workspace",
 )
@@ -35,7 +36,8 @@ REQUIRED_DIRS = {
     "src/prompt",
     "src/runtime",
     "src/session",
-    "src/session/conversation",
+    "src/storage",
+    "src/storage/conversation",
     "src/tools",
     "src/tools/builtins",
     "src/workspace",
@@ -67,20 +69,21 @@ REQUIRED_FILES = {
     "src/runtime/session_manager.rs",
     "src/session/actor.rs",
     "src/session/command.rs",
-    "src/session/compaction_visibility.rs",
-    "src/session/conversation.rs",
-    "src/session/conversation/actor_support.rs",
-    "src/session/conversation/codec.rs",
-    "src/session/conversation/compaction.rs",
-    "src/session/conversation/usage.rs",
     "src/session/event.rs",
     "src/session/event_stream.rs",
     "src/session/mod.rs",
     "src/session/snapshot.rs",
     "src/session/state.rs",
-    "src/session/store.rs",
-    "src/session/time.rs",
     "src/session/transcript.rs",
+    "src/storage/compaction_visibility.rs",
+    "src/storage/conversation.rs",
+    "src/storage/conversation/actor_support.rs",
+    "src/storage/conversation/codec.rs",
+    "src/storage/conversation/compaction.rs",
+    "src/storage/conversation/usage.rs",
+    "src/storage/mod.rs",
+    "src/storage/store.rs",
+    "src/storage/time.rs",
     "src/tools/builtins/ask_user.rs",
     "src/tools/builtins/list_directory.rs",
     "src/tools/builtins/mod.rs",
@@ -286,14 +289,14 @@ DIRECT_DEP_CONSUMERS = {
     "serde_json": [("src/model/types.rs", "use serde_json::Value")],
     "thiserror": [("src/config.rs", "use thiserror::Error;")],
     "time": [
-        ("src/session/time.rs", "use time::"),
-        ("src/session/time.rs", "time::OffsetDateTime"),
+        ("src/storage/time.rs", "use time::"),
+        ("src/storage/time.rs", "time::OffsetDateTime"),
     ],
     "tokio": [("src/runtime/runtime_impl.rs", "use tokio::runtime::Handle;")],
     "tokio-util": [
         ("src/agent/context.rs", "use tokio_util::sync::CancellationToken;"),
     ],
-    "fs4": [("src/session/store.rs", "use fs4::fs_std::FileExt;")],
+    "fs4": [("src/storage/store.rs", "use fs4::fs_std::FileExt;")],
     "futures-util": [("src/agent/runner.rs", "use futures_util::FutureExt;")],
     "reqwest": [("src/model/providers/openai.rs", "use reqwest::header")],
 }
@@ -316,17 +319,19 @@ EXPECTED_MODULE_VISIBILITY = {
     "src/session/mod.rs": {
         "actor": "crate",
         "command": "crate",
-        "compaction_visibility": "private",
-        "conversation": "crate",
         "event": "private",
         "event_stream": "crate",
         "snapshot": "private",
         "state": "private",
-        "store": "crate",
-        "time": "crate",
         "transcript": "crate",
     },
-    "src/session/conversation.rs": {
+    "src/storage/mod.rs": {
+        "conversation": "crate",
+        "compaction_visibility": "private",
+        "store": "crate",
+        "time": "crate",
+    },
+    "src/storage/conversation.rs": {
         "actor_support": "private",
         "codec": "private",
         "compaction": "private",
@@ -640,10 +645,10 @@ def check_public_surface(sources: Dict[str, str]) -> List[str]:
             "src/lib.rs: public modules mismatch: "
             f"expected={sorted(EXPECTED_PUBLIC_MODULES)} actual={sorted(public_modules)}"
         )
-    if private_modules != {"agent", "prompt"}:
+    if private_modules != {"agent", "prompt", "storage"}:
         errors.append(
             "src/lib.rs: private modules mismatch: "
-            f"expected=['agent', 'prompt'] actual={sorted(private_modules)}"
+            f"expected=['agent', 'prompt', 'storage'] actual={sorted(private_modules)}"
         )
     if other_visibility:
         errors.append(f"src/lib.rs: unsupported module visibility: {other_visibility}")
@@ -683,20 +688,23 @@ def check_public_surface(sources: Dict[str, str]) -> List[str]:
     errors.extend(check_module_visibility(sources))
     tools_mod = mask_rust(strip_test_items(sources.get("src/tools/mod.rs", "")))
     session_mod = mask_rust(strip_test_items(sources.get("src/session/mod.rs", "")))
+    storage_mod = mask_rust(strip_test_items(sources.get("src/storage/mod.rs", "")))
     tools_declarations = parse_mod_declarations(tools_mod)
     if tools_declarations.get("builtins") != "private":
         errors.append("src/tools/mod.rs: builtins must remain private")
     session_declarations = parse_mod_declarations(session_mod)
-    for name in ("actor", "store"):
-        if session_declarations.get(name) != "crate":
-            errors.append(f"src/session/mod.rs: {name} must be crate-private")
+    if session_declarations.get("actor") != "crate":
+        errors.append("src/session/mod.rs: actor must be crate-private")
+    storage_declarations = parse_mod_declarations(storage_mod)
+    if storage_declarations.get("store") != "crate":
+        errors.append("src/storage/mod.rs: store must be crate-private")
     actor_source = mask_rust(strip_test_items(sources.get("src/session/actor.rs", "")))
-    store_source = mask_rust(strip_test_items(sources.get("src/session/store.rs", "")))
+    store_source = mask_rust(strip_test_items(sources.get("src/storage/store.rs", "")))
     crate_struct = r"(?m)^\s*pub\s*\(\s*crate\s*\)\s+struct\s+{}\b"
     if not re.search(crate_struct.format("SessionActor"), actor_source):
         errors.append("src/session/actor.rs: SessionActor must be crate-private")
     if not re.search(crate_struct.format("SessionStore"), store_source):
-        errors.append("src/session/store.rs: SessionStore must be crate-private")
+        errors.append("src/storage/store.rs: SessionStore must be crate-private")
     return errors
 
 
@@ -1233,10 +1241,7 @@ def tarjan(edges: Dict[str, Set[str]]) -> List[Set[str]]:
 
 
 def expected_sccs() -> Set[frozenset]:
-    return {
-        frozenset({"agent", "prompt", "session"}),
-        *{frozenset({name}) for name in CANONICAL_TOPS if name not in {"agent", "prompt", "session"}},
-    }
+    return {frozenset({name}) for name in CANONICAL_TOPS}
 
 
 def format_sccs(components: Iterable[Set[str]]) -> str:

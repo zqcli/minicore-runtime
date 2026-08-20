@@ -9,10 +9,10 @@ use thiserror::Error;
 pub use crate::agent::{RetryPolicy, RetryPolicyError};
 use crate::ids::SessionId;
 use crate::model::{ModelSelection, ProviderRegistry};
-use crate::session::store::{
+use crate::storage::store::{
     StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig, StoredSessionConfig,
 };
-use crate::session::time::Timestamp;
+use crate::storage::time::Timestamp;
 use crate::tools::{ToolName, ToolRegistry};
 
 pub const DEFAULT_EVENT_CAPACITY: usize = 64;
