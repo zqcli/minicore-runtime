@@ -319,7 +319,7 @@ Family规则：
 - drive：`authority = None`，URI path exact `/[A-Z]:/segment...`，decoded path去掉URI-specific leading slash后为`C:/segment...`；drive letter uppercase，colon literal；drive root exact `file:///C:/`；
 - UNC：`authority = Some(lowercase_host)`；authority是total<=253 bytes的一到多个lowercase ASCII labels；labels以`.`分隔，每label 1..63 bytes，单字符label为`[a-z0-9]`，多字符label首尾为`[a-z0-9]`且中间只允许`[a-z0-9-]`；authority不能是`localhost`；decoded path不含leading slash且至少含non-empty share segment；share/segment case preserve；share root无trailing slash。
 
-Decoder只接受上述canonical spelling，不自动lowercase host/drive、不移除dot segment、不decode platform alias，并在所有host上接受全部canonical family进入`WorkspaceRootInput`。Workspace在typed command application时若family不被current host支持，返回`InvalidArgument + DoNotRetry`，而不是把URI交给ambient `PathBuf` parser重解释。exact cross-platform vectors见[Wire V1 file URI carriers](../fixtures/wire-v1/public/carriers/file-uri.json)。
+Decoder只接受上述canonical spelling，不自动lowercase host/drive、不移除dot segment、不decode platform alias，并在所有host上接受全部canonical family进入`WorkspaceRootInput`。Workspace在typed command application时若family不被current host支持，返回`InvalidArgument + DoNotRetry`，而不是把URI交给ambient `PathBuf` parser重解释。exact historical cross-platform vectors见[Archived Wire V1 file URI carriers](../archive/v2/fixtures/wire-v1/public/carriers/file-uri.json)。
 
 WorkspaceRelativePath使用forward slash：
 
@@ -695,7 +695,7 @@ Storage：
 - diagnostics cap/aggregate；
 - expected accepted EntryIds、sanitized conversation、diagnostics和writable truncation offset。
 
-Oversized fixture使用recipe在test生成，不提交1 MiB/1 GiB blob。Decoder assertions比较semantic result，不比较input member order；canonical encoder golden比较exact bytes。authoritative vectors、public target/expectation manifest、conversation replay expectations和all-limit recipes位于[Wire V1 Fixtures](../fixtures/wire-v1/README.md)；`verify.py`只校验资产结构，首个Rust protocol/storage crate必须执行semantic conformance。
+Oversized fixture使用recipe在test生成，不提交1 MiB/1 GiB blob。Decoder assertions比较semantic result，不比较input member order；canonical encoder golden比较exact bytes。historical authoritative vectors、public target/expectation manifest、conversation replay expectations和all-limit recipes位于[Archived Wire V1 Fixtures](../archive/v2/fixtures/wire-v1/README.md)；`verify.py`只校验资产结构，首个Rust protocol/storage crate必须执行semantic conformance。
 
 ## Test Matrix
 

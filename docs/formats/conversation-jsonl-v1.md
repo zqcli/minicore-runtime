@@ -473,4 +473,4 @@ Writable open只truncatefinal unterminated tail。完整malformed/oversized/unkn
 - Header/entry/file/count/depth/member/string exact independently-reachable boundary（或更窄enclosing cap下的effective boundary）与boundary+1 recipes；
 - diagnostics 100 + aggregate truncation。
 
-Expected fixture metadata至少保存accepted EntryIds、selected path、sanitized ModelMessages、historical Items、diagnostic codes/counts与writable truncation offset。仓库内authoritative vectors与non-blob boundary recipes位于[Wire V1 Fixtures](../fixtures/wire-v1/README.md)。
+Expected fixture metadata至少保存accepted EntryIds、selected path、sanitized ModelMessages、historical Items、diagnostic codes/counts与writable truncation offset。仓库内历史authoritative vectors与non-blob boundary recipes位于[Archived Wire V1 Fixtures](../archive/v2/fixtures/wire-v1/README.md)。

@@ -20,7 +20,7 @@ MiniCoreRuntime
 ## 模块索引
 
 - [Wire Schema与Bounded Decode](wire-schema.md)：public JSON v1、shared scalar carriers、ProtocolLimits、bounded JSON和JSONL scanner floor。
-- [Wire V1 Conformance Fixtures](../fixtures/wire-v1/README.md)：public manifest、byte-exact JSON/JSONL、corruption expectations、all-limit recipes与structural verifier。
+- [Archived Wire V1 Conformance Fixtures](../archive/v2/fixtures/wire-v1/README.md)：历史public manifest、byte-exact JSON/JSONL、corruption expectations、all-limit recipes与structural verifier。
 - [Runtime公开协议](runtime-interface.md)：`dispatch / query / snapshot / subscribe` Wire-compatible families、library-only paged Session transcript、公开identity和live observer语义。
 - [Agent与Session生命周期](agent-session-lifecycle.md)：definition/revision、create/load/unload/archive/fork与readiness。
 - [Workspace](workspace.md)：Session-owned Workspace、trust、authorization和immutable snapshot。
@@ -31,12 +31,12 @@ MiniCoreRuntime
 - [Turn / Item / Interaction](turn-item-interaction.md)：live lifecycle、complete Tool exchange、Interaction和Tool start gate。
 - [Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md)：exact Stored DTO envelope、field order、limits与corruption vectors。
 - [Durable Store V1](../formats/durable-store-v1.md)：exact local entity layout、head/definition bytes、markers与strict recovery。
-- [Durable Store V1 Fixtures](../fixtures/durable-store-v1/README.md)：golden documents、crash taxonomy与structural verifier。
+- [Archived Durable Store V1 Fixtures](../archive/v2/fixtures/durable-store-v1/README.md)：历史golden documents、crash taxonomy与structural verifier。
 - [DurableState](durable-state.md)：private actor、reservation/root lease/CAS/generation/publication/recovery/fault seam。
 - [Conversation Recording与Replay](conversation-storage.md)：LiveSessionState reducer transaction/capture、SessionRecorder、best-effort JSONL prefix、RecordingHealth、tolerant replay和fork semantic seed。
 - [Session执行](session-execution.md)：SessionExecutor actor、ActiveTurnTask、async run loop、Steer/FollowUp/Cancel。
 - [ModelGateway](model-gateway.md)：TurnModelSnapshot、single provider attempt、stream、usage和typed errors。
-- [M12 Production Provider Gate Fixtures](../fixtures/provider-gate-m12/README.md)：OpenAI Responses/Anthropic Messages Rig standalone evidence、SDK rejection与26-case delivery/error mapping。
+- [Archived M12 Production Provider Gate Fixtures](../archive/v2/fixtures/provider-gate-m12/README.md)：历史OpenAI Responses/Anthropic Messages Rig standalone evidence、SDK rejection与26-case delivery/error mapping。
 - [Compaction](compaction.md)：revision-bound stable units、Runtime settings、source+cut marker、summary budget与best-effort recording。
 
 ## 权威归属

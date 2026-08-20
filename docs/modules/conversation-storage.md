@@ -696,7 +696,7 @@ cold file仍可能因手工编辑、旧bug或partial migration包含orphan；rep
 5. selected path是canonical root到chosen leaf的唯一parent chain；`recorded_head = chosen_leaf`，new Recorder append、RecordedHistory Fork与sanitized projection都使用它；非selected branches仍可由history tree query观察；
 6. 无accepted root时selected path与recorded_head均为空。collision guard仍seed全部first-valid accepted EntryId，包括isolated root/orphan/非selected branch，防止future identity reuse。
 
-exact selection vectors见[branch-last-leaf](../fixtures/wire-v1/conversation/corruption/branch-last-leaf.jsonl)与[multiple-root-isolation](../fixtures/wire-v1/conversation/corruption/multiple-root-isolation.jsonl)。
+exact historical selection vectors见[branch-last-leaf](../archive/v2/fixtures/wire-v1/conversation/corruption/branch-last-leaf.jsonl)与[multiple-root-isolation](../archive/v2/fixtures/wire-v1/conversation/corruption/multiple-root-isolation.jsonl)。
 
 ## Tolerant Replay
 
@@ -763,7 +763,7 @@ diagnostics_truncated
 history_too_large
 ```
 
-Unknown additive object fields在structural caps内bounded skip且不产生diagnostic。每个complete line按scanner → bounded schema/variant → Header session match → duplicate identity → parent/domain relation → projection顺序确定primary code；同一失败stage不凭hash-map iteration选择code。一个line最多产生一个primary code，合法User body内独立drop的stamp分别归并为`invalid_contribution_stamp`或`duplicate_contribution_stamp`。Tool/Interaction/Compaction projection可以在entry被accepted为historical node后额外产生owning projection code。read-only ignore与exclusive-writable truncate都使用`partial_tail`，action只存在于typed internal detail；前100条detail之外追加一次`diagnostics_truncated` summary，aggregate counter表示全部observed facts而非仅omitted suffix。exact fixture expectations见[Wire V1 Fixtures](../fixtures/wire-v1/README.md)。
+Unknown additive object fields在structural caps内bounded skip且不产生diagnostic。每个complete line按scanner → bounded schema/variant → Header session match → duplicate identity → parent/domain relation → projection顺序确定primary code；同一失败stage不凭hash-map iteration选择code。一个line最多产生一个primary code，合法User body内独立drop的stamp分别归并为`invalid_contribution_stamp`或`duplicate_contribution_stamp`。Tool/Interaction/Compaction projection可以在entry被accepted为historical node后额外产生owning projection code。read-only ignore与exclusive-writable truncate都使用`partial_tail`，action只存在于typed internal detail；前100条detail之外追加一次`diagnostics_truncated` summary，aggregate counter表示全部observed facts而非仅omitted suffix。exact historical fixture expectations见[Archived Wire V1 Fixtures](../archive/v2/fixtures/wire-v1/README.md)。
 
 Replay不恢复任何process-local执行对象，也不根据stamp重新加载Skill/Workspace正文、重新授权source或重建旧PromptSet。conversation正文是恢复正确性的事实，stamp只承担安全解释作用。
 

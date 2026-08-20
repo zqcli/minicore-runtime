@@ -144,7 +144,7 @@ ADR 0134关闭wire/storage format门禁：Wire Schema冻结JSON casing/tag、typ
 - format-v1 Stored DTO：ModelResponseSummary、StoredToolOutcome、StoredInteraction request/resolution和StoredCompaction；
 - public manifest、JSON/JSONL golden/corruption vectors和all-limit boundary recipes。
 
-当前Rust crate必须继续消费`docs/fixtures/wire-v1/`，不能重新发明第二套serde defaults。
+历史Rust crate曾消费归档的`docs/archive/v2/fixtures/wire-v1/`，不能重新发明第二套serde defaults。
 
 ### 阶段3：Conversation Recording与Replay
 
@@ -242,7 +242,7 @@ V4-P1-2 wire/storage format门禁已经关闭；全部普通P0/P1（含V4-P1-3�
 
 ## Rig 0.40.0 Spike
 
-静态源码审计与真实M12 loopback spike均已完成：Rig适合作为protocol evidence，不适合作为MiniCore Rust 1.85 production dependency或domain/interface来源。协议合同见[ADR 0138](../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)，implementation转向见[ADR 0139](../adr/0139-rig-is-evidence-only-under-rust-1-85.md)，delivery/error contract见[M12 fixture](../fixtures/provider-gate-m12/README.md)。
+静态源码审计与真实M12 loopback spike均已完成：Rig适合作为protocol evidence，不适合作为MiniCore Rust 1.85 production dependency或domain/interface来源。协议合同见[ADR 0138](../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)，implementation转向见[ADR 0139](../adr/0139-rig-is-evidence-only-under-rust-1-85.md)，delivery/error contract见[archived M12 fixture](../archive/v2/fixtures/provider-gate-m12/README.md)。
 
 已验证：
 

@@ -390,7 +390,7 @@ Cancel可在Input apply前关闭pre-Turn Submit。`runtime-interface.md:573`要�
 
 ## V4-P1-2 · 通用wire/storage envelope与限制未冻结
 
-状态：Closed（2026-07-31）。[ADR 0134](../adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md)与[Wire Schema](../modules/wire-schema.md)冻结public/storage JSON v1、typed scalar carriers、ProtocolLimits、bounded JSON和scanner；[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md)冻结Header、六种Stored body、field order、relation/replay与Compaction projection；[Wire V1 Fixtures](../fixtures/wire-v1/README.md)提供public manifest、golden/corruption vectors、all-limit recipes和structural verifier。
+状态：Closed（2026-07-31）。[ADR 0134](../adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md)与[Wire Schema](../modules/wire-schema.md)冻结public/storage JSON v1、typed scalar carriers、ProtocolLimits、bounded JSON和scanner；[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md)冻结Header、六种Stored body、field order、relation/replay与Compaction projection；[Archived Wire V1 Fixtures](../archive/v2/fixtures/wire-v1/README.md)提供历史public manifest、golden/corruption vectors、all-limit recipes和structural verifier。
 
 关闭映射：
 
@@ -435,7 +435,7 @@ Conversation JSONL首行strict Header，后续entry required SessionId/TurnId并
 - [x] writer与tolerant decoder共享同一tag/casing/ID/canonical dynamic JSON representation；
 - [x] 全部Stored* semantic types有唯一module owner；Format V1只声明exact representation projection，non-owner module不复制semantic declaration；
 - [x] Header/entry/file/count、ProtocolLimits、BoundedJson/Schema boundary/+1 recipes已冻结；
-- [x] `python3 docs/fixtures/wire-v1/verify.py`、Markdown link/fence与`git diff --check`通过。
+- [x] 显式运行`python3 docs/archive/v2/fixtures/wire-v1/verify.py`、Markdown link/fence与`git diff --check`通过。
 
 ## V4-P1-3 · Provider首版scope、Rig映射和旧措辞未统一
 
@@ -478,7 +478,7 @@ ModelGateway current文档仍有被ADR 0125/0126取代的现行措辞：
 4. error/delivery只按typed status/type/code、transport stage、semantic-output-started、terminal evidence与bounded retry hint分类，不匹配human message。只有`NotSent | RejectedBeforeExecution`可保留delivery-safe transient reason；unknown/accepted/partial outcome分别fail closed为`RequestOutcomeUnknown | StreamInterrupted`。
 5. Gateway没有local model/route/principal permit wait。queued Steer不改变in-flight revision或retry basis；只在safe point成功apply后使旧basis失效。
 
-协议合同见[ADR 0138](../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)，Rust 1.85 implementation choice见[ADR 0139](../adr/0139-rig-is-evidence-only-under-rust-1-85.md)，closed mapping见[M12 fixture](../fixtures/provider-gate-m12/README.md)。
+协议合同见[ADR 0138](../adr/0138-production-provider-baseline-uses-verified-rig-contracts.md)，Rust 1.85 implementation choice见[ADR 0139](../adr/0139-rig-is-evidence-only-under-rust-1-85.md)，closed mapping见[archived M12 fixture](../archive/v2/fixtures/provider-gate-m12/README.md)。
 
 ### 关闭验证
 

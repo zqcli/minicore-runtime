@@ -128,7 +128,7 @@ SessionRecorder
 9. [ADR 0134](../../../adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md)
 10. [Wire Schema](../../../modules/wire-schema.md)
 11. [Conversation JSONL Format V1](../../../formats/conversation-jsonl-v1.md)
-12. [Wire V1 Fixtures](../../../fixtures/wire-v1/README.md)
+12. [Archived Wire V1 Fixtures](../fixtures/wire-v1/README.md)
 13. [第四轮完整设计评审与实施门禁](../../../review/v2-design-review-4.md)
 14. [架构总览](../../../architecture.md)
 15. [Runtime Interface](../../../modules/runtime-interface.md)
@@ -197,7 +197,7 @@ SessionRecorder
 - MiniCore IDs/revisions、u64、Timestamp、Duration、Money、PageCursor与platform-independent file URI已有exact carriers；
 - Conversation JSONL v1首行strict Header，entry required SessionId/TurnId并只含六种flat conversation bodies；Header/entry/file/count hard caps与tail precedence固定；
 - replay session match先于EntryId reservation，first valid root + physical-last eligible leaf选择recorded head，orphan/multiple root/invalid relation按typed diagnostics隔离；
-- public manifest、golden/corruption expected metadata与boundary recipes位于`docs/fixtures/wire-v1/`，Rust实现必须消费而不能重新定义。
+- public manifest、golden/corruption expected metadata与boundary recipes位于archived `docs/archive/v2/fixtures/wire-v1/`，Rust实现必须消费而不能重新定义。
 
 ## 跨模块不变量
 

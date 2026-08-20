@@ -1,6 +1,6 @@
 ## M12 Provider Gate
 
-`provider-gate/tests/m12_rig_*.rs`在standalone stable-only package中驱动exact `rig-core = 0.40.0`和test-owned `127.0.0.1:0` HTTP servers。这些targets覆盖OpenAI Responses与Anthropic Messages unary/stream contracts、terminal-vs-EOF evidence、cancellation、single-request behavior、typed error envelopes与response metadata allowlists。`tests/m12_provider_error_matrix.rs`留在主crate，消费`docs/fixtures/provider-gate-m12/error-mapping-v1.json`并在Rust 1.85下冻结delivery-safe retry/normalization rules。
+`provider-gate/tests/m12_rig_*.rs`在standalone stable-only package中驱动exact `rig-core = 0.40.0`和test-owned `127.0.0.1:0` HTTP servers。这些targets覆盖OpenAI Responses与Anthropic Messages unary/stream contracts、terminal-vs-EOF evidence、cancellation、single-request behavior、typed error envelopes与response metadata allowlists。历史M12 mapping fixture已归档于`docs/archive/v2/fixtures/provider-gate-m12/error-mapping-v1.json`；当前生产 provider matrix由P3 provider suites与AT-13拥有。
 
 M12 tests必须保持offline和deterministic：不得使用external DNS/network、真实credential、ambient provider config、sleep、timeout-based absence proof、blind yield polling或unjoined server thread。Rig只存在于声明Rust 1.88并拥有独立lockfile的`provider-gate/` evidence package；root dependency/lockfile、production `src/`和public DTO不得出现Rig。`./scripts/check.sh`运行主crate与evidence package；`./scripts/check-msrv.sh`用真实Rust 1.85运行主crate全部targets。
 

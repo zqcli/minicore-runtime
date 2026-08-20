@@ -62,7 +62,7 @@ snapshot-first的关键问题不是“Snapshot字段够多”，而是断线后h
 
 12. MVP `PromptBodyIntent`只允许`Empty | Text(TextIntent)`；Text在boundary normalization后必须non-empty并满足ProtocolLimits。未定义的Template variant从public enum、query和decoder删除。future Prompt template必须一起定义stable TemplateId、argument grammar、materialized render、limits、reload/capture和protocol capability。
 
-13. 本ADR只冻结semantic payload和恢复/操作规则。其acceptance时后置的field casing、enum tagging、base ID/path carrier、Timestamp、Money、ProtocolLimits、unknown variant policy、PageCursor和conversation format基础已由[ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)统一拥有；Stored DTO projection与golden fixtures现由[Format V1](../formats/conversation-jsonl-v1.md)和[Wire V1 Fixtures](../fixtures/wire-v1/README.md)关闭。
+13. 本ADR只冻结semantic payload和恢复/操作规则。其acceptance时后置的field casing、enum tagging、base ID/path carrier、Timestamp、Money、ProtocolLimits、unknown variant policy、PageCursor和conversation format基础已由[ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)统一拥有；Stored DTO projection与golden fixtures现由[Format V1](../formats/conversation-jsonl-v1.md)和[Archived Wire V1 Fixtures](../archive/v2/fixtures/wire-v1/README.md)关闭。
 
 ## 结果
 
