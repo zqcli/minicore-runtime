@@ -9,6 +9,7 @@ mod snapshot;
 mod state;
 pub(crate) mod store;
 pub(crate) mod time;
+pub(crate) mod transcript;
 
 pub(crate) use actor::{SessionActor, SessionActorDependencies};
 pub(crate) use command::SessionHandle;

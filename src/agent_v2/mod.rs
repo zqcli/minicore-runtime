@@ -1,9 +1,10 @@
 mod context;
 mod runner;
 
+pub use context::{RetryPolicy, RetryPolicyError};
 pub(crate) use context::{
-    RetryPolicy, RetryPolicyError, TimestampSource, TurnContext, TurnContextDependencies,
-    TurnContextError, system_timestamp_source,
+    TimestampSource, TurnContext, TurnContextDependencies, TurnContextError,
+    system_timestamp_source,
 };
 pub(crate) use runner::{
     MAX_RUNNER_EVENT_CAPACITY, RunnerEvent, RunnerEventSendError, RunnerEventSink, TurnFailure,

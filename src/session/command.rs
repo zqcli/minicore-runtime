@@ -180,6 +180,10 @@ impl SessionHandle {
         receiver.await.map_err(|_| SessionError::Closing)?
     }
 
+    pub(crate) fn request_close(&self) {
+        self.cancel.request_close(&self.close_requested);
+    }
+
     pub(crate) fn cancel(&self) -> Result<(), SessionError> {
         if self.close_requested.is_cancelled() {
             return Err(SessionError::Closing);
