@@ -61,9 +61,9 @@ fn conversation_surface_is_crate_private_and_not_root_exported() {
 fn conversation_owns_strict_jsonl_and_worker_boundaries_without_legacy_coupling() {
     for source in [
         include_str!("../src/session/conversation.rs"),
-        include_str!("../src/session/conversation_codec.rs"),
-        include_str!("../src/session/conversation_compaction.rs"),
-        include_str!("../src/session/conversation_usage.rs"),
+        include_str!("../src/session/conversation/codec.rs"),
+        include_str!("../src/session/conversation/compaction.rs"),
+        include_str!("../src/session/conversation/usage.rs"),
         include_str!("../src/session/compaction_visibility.rs"),
         include_str!("../src/session/store.rs"),
         include_str!("../src/session/mod.rs"),
@@ -91,9 +91,9 @@ fn conversation_owns_strict_jsonl_and_worker_boundaries_without_legacy_coupling(
         }
     }
     let conversation = include_str!("../src/session/conversation.rs");
-    let codec = include_str!("../src/session/conversation_codec.rs");
-    let compaction = include_str!("../src/session/conversation_compaction.rs");
-    let usage = include_str!("../src/session/conversation_usage.rs");
+    let codec = include_str!("../src/session/conversation/codec.rs");
+    let compaction = include_str!("../src/session/conversation/compaction.rs");
+    let usage = include_str!("../src/session/conversation/usage.rs");
     let combined = [conversation, codec, compaction, usage].join("\n");
     for required in [
         "serde(tag = \"type\", rename_all = \"snake_case\", deny_unknown_fields)",

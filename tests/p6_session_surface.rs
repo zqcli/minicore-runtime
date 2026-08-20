@@ -117,8 +117,8 @@ fn p6_session_actor_surface_is_private_and_owner_proof_free() {
     }
 
     let conversation = include_str!("../src/session/conversation.rs");
-    let support = include_str!("../src/session/conversation_actor.rs");
-    let usage = include_str!("../src/session/conversation_usage.rs");
+    let support = include_str!("../src/session/conversation/actor_support.rs");
+    let usage = include_str!("../src/session/conversation/usage.rs");
     assert!(conversation.contains("validate_user_text"));
     assert!(support.contains("MAX_USER_TEXT_BYTES"));
     assert!(support.contains("pub(crate) fn usage(&self)"));

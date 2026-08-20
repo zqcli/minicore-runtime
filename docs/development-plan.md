@@ -25,7 +25,7 @@ Every change should preserve these gates:
 3. All-target Clippy with warnings denied.
 4. Offline provider-gate contract tests and Clippy.
 5. Current Markdown links, fences, and ADR index checks.
-6. Source architecture scan for removed owners and forbidden coupling.
+6. `python3 scripts/check_architecture.py` for canonical paths, public surface, dependencies, production size, and module graph.
 7. Git diff/show checks and a clean working tree.
 8. No default network access, live credential use, or detached owner-tracked work.
 
@@ -34,9 +34,10 @@ The two live provider smoke cases remain explicit opt-in and ignored. They are e
 ## P9 Scope
 
 - [x] **P9-01 manifest cleanup:** remove empty crate features and unused direct dependencies without hand-editing the lockfile.
-- [ ] **P9-02 documentation authority:** archive pre-reset prose, establish current source-accurate docs, and reduce the checker to current authority plus selected evidence.
-- [ ] **P9-03 dependency convergence:** regenerate and review `Cargo.lock` remotely after manifest cleanup; make no version bump without a separate decision.
-- [ ] **P9-04 optional non-core work:** only an independently specified host adapter, process hardening seam, or provider installation change may enter after a source owner and deterministic evidence exist.
+- [x] **P9-02 documentation authority:** archive pre-reset prose, establish current source-accurate docs, and reduce the checker to current authority plus selected evidence.
+- [x] **P9-03 automated quality gates:** enforce the canonical source graph, public root surface, direct dependency policy, production size/function limits, and the baseline module SCC through `scripts/check_architecture.py`.
+- [ ] **P9-04 dependency convergence:** regenerate and review `Cargo.lock` remotely after manifest cleanup; make no version bump without a separate decision.
+- [ ] **P9-05 optional non-core work:** only an independently specified host adapter, process hardening seam, or provider installation change may enter after a source owner and deterministic evidence exist.
 
 ## Non-Core Limits
 

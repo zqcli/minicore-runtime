@@ -11,6 +11,7 @@ cargo fmt --manifest-path provider-gate/Cargo.toml -- --check
 cargo test --manifest-path provider-gate/Cargo.toml --all-targets --locked
 cargo clippy --manifest-path provider-gate/Cargo.toml --all-targets --locked -- -D warnings
 python3 scripts/check_docs.py
+python3 scripts/check_architecture.py
 
 if ! command -v rg >/dev/null 2>&1; then
   echo "rg is required by the quality gate" >&2
