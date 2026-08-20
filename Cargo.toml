@@ -6,43 +6,32 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Embeddable MiniCore agent runtime"
 
-[features]
-default = []
-heavy-tests = []
-
 [dependencies]
-# Production Workspace capability layer. Pinned exactly; the default feature set is empty
-# (stated explicitly with `default-features = false`). Only the owner-tracked resolver path
-# phase ever uses ambient authority to capture a root `Dir`; Tool paths resolve strictly
-# capability-relative from a captured root and can never escape it.
+# Production Workspace capability layer for the single configured root. Pinned exactly;
+# `default-features = false` keeps the dependency surface explicit. Workspace file
+# operations resolve through the captured root `Dir`. `run_command` receives only a
+# pre-validated host cwd; child processes retain ambient host authority and are not sandboxed.
 cap-std = { version = "=4.0.2", default-features = false }
 # The exact cap-primitives crate behind cap-std, pinned identically, for the typed
 # final-component no-follow option (`FollowSymlinks::No`) of the write target's create open.
 cap-primitives = { version = "=4.0.2", default-features = false }
-base64 = "0.22.1"
 getrandom = "0.3.3"
-regex-syntax = "=0.8.11"
-same-file = "=1.0.6"
 serde = { version = "1.0.219", features = ["derive"] }
+# Keep `arbitrary_precision` to preserve current Tool/Provider `Value` behavior.
 serde_json = { version = "1.0.140", features = ["arbitrary_precision"] }
 thiserror = "2.0.12"
 time = { version = "0.3.41", features = ["parsing"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time", "process", "io-util"] }
 tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
-file-id = "=0.2.3"
 fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
 futures-util = "0.3.33"
 # Production OpenAI Responses adapter transport. Pinned to the exact reqwest version
-# validated in the M14 Rust 1.85 cold-build spike with exactly json/rustls/stream;
-# no default features: no system proxy, no HTTP/2, no compression, no cookies.
-reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
+# validated in the M14 Rust 1.85 cold-build spike with rustls/stream; no default
+# features: no system proxy, no HTTP/2, no compression, no cookies.
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "stream"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "test-util"] }
-# `raw_value` is only exercised by the wire-limit protocol fixtures (tests/wire_limits.rs),
-# so it is enabled on the dev-dependency instead of the production dependency.
-serde_json = { version = "1.0.140", features = ["raw_value"] }
-
 
 [lints.rust]
 unsafe_code = "forbid"
