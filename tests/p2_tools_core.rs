@@ -133,6 +133,33 @@ where
 }
 
 #[test]
+fn tool_name_grammar_is_checked_at_the_current_public_boundary() {
+    for valid in ["read_file", "Write-File2", "_private", "-prefixed"] {
+        assert_eq!(ToolName::from_str(valid).unwrap().as_str(), valid);
+    }
+    for invalid in [
+        "",
+        "has/slash",
+        "has space",
+        "punctuation?",
+        "é",
+        "line\nbreak",
+    ] {
+        assert!(ToolName::from_str(invalid).is_err(), "accepted {invalid:?}");
+    }
+    assert!(ToolName::from_str(&"x".repeat(64)).is_ok());
+    assert!(ToolName::from_str(&"x".repeat(65)).is_err());
+
+    let name = ToolName::from_str("safe_name-1").unwrap();
+    assert_eq!(serde_json::to_string(&name).unwrap(), "\"safe_name-1\"");
+    assert_eq!(
+        serde_json::from_str::<ToolName>(&serde_json::to_string(&name).unwrap()).unwrap(),
+        name
+    );
+    assert!(serde_json::from_str::<ToolName>("\"bad/name\"").is_err());
+}
+
+#[test]
 fn registry_registers_dynamic_tools_freezes_specs_and_returns_sorted_specs() {
     let mutable = MutableSpecTool::new("z_tool");
     let spec_calls = Arc::clone(&mutable.spec_calls);

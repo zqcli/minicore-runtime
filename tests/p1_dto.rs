@@ -3,10 +3,11 @@ use std::str::FromStr;
 
 use minicore_runtime::{
     AssistantPart, InteractionId, ModelEvent, ModelFinishReason, ModelId, ModelLimits,
-    ModelMessage, ModelRequest, ModelResponse, ModelSelection, ProviderId, ReasoningContent,
-    ReasoningPreference, SessionEvent, SessionEventKind, SessionId, SessionSnapshot, SessionStatus,
-    SnapshotHistory, ToolCall, ToolCallId, ToolCallSummary, ToolName, ToolOutput, ToolResultStatus,
-    ToolResultSummary, ToolSpec, TurnId, TurnSummary, Usage, UserAnswer, UserQuestion,
+    ModelMessage, ModelRequest, ModelResponse, ModelSelection, ProviderId, ProviderItemId,
+    ReasoningContent, ReasoningPreference, SessionEvent, SessionEventKind, SessionId,
+    SessionSnapshot, SessionStatus, SnapshotHistory, ToolCall, ToolCallId, ToolCallSummary,
+    ToolName, ToolOutput, ToolResultStatus, ToolResultSummary, ToolSpec, TurnId, TurnSummary,
+    Usage, UserAnswer, UserQuestion,
 };
 
 fn assert_json_round_trip<T>(value: &T)
@@ -36,6 +37,60 @@ fn call(id: &str, index: u32) -> ToolCall {
         index,
     )
     .unwrap()
+}
+
+#[test]
+fn current_model_identity_and_provider_item_grammars_are_checked_and_redacted() {
+    let provider = ProviderId::from_str("OpenAI-Prod_1").unwrap();
+    let model = ModelId::from_str("Vendor/Model:V2").unwrap();
+    assert_eq!(provider.as_str(), "OpenAI-Prod_1");
+    assert_eq!(model.as_str(), "Vendor/Model:V2");
+    assert_eq!(format!("{provider:?}"), "OpenAI-Prod_1");
+    assert_eq!(format!("{model:?}"), "Vendor/Model:V2");
+
+    assert!(ProviderId::from_str("openai").is_ok());
+    assert!(ModelId::from_str("claude/sonnet-4").is_ok());
+    assert!(ProviderId::from_str("open/ai").is_err());
+    assert!(ModelId::from_str("open/ai").is_ok());
+    for invalid in ["", "has space", "has/slash", "has?punctuation", "é"] {
+        assert!(
+            ProviderId::from_str(invalid).is_err(),
+            "accepted {invalid:?}"
+        );
+    }
+    for invalid in ["", "has space", "has?punctuation", "has\\quote", "é"] {
+        assert!(ModelId::from_str(invalid).is_err(), "accepted {invalid:?}");
+    }
+    assert!(ProviderId::from_str(&"x".repeat(128)).is_ok());
+    assert!(ModelId::from_str(&"x".repeat(128)).is_ok());
+    assert!(ProviderId::from_str(&"x".repeat(129)).is_err());
+    assert!(ModelId::from_str(&"x".repeat(129)).is_err());
+
+    let opaque = ProviderItemId::from_str("provider/item:1_opaque").unwrap();
+    assert_eq!(opaque.as_str(), "provider/item:1_opaque");
+    assert_eq!(format!("{opaque:?}"), "ProviderItemId(<redacted>)");
+    assert!(!format!("{opaque:?}").contains(opaque.as_str()));
+    for invalid in [
+        "",
+        "has space",
+        "has\"quote",
+        "has\\slash",
+        "line\nbreak",
+        "nul\0byte",
+        "é",
+    ] {
+        assert!(
+            ProviderItemId::from_str(invalid).is_err(),
+            "accepted {invalid:?}"
+        );
+    }
+    assert!(ProviderItemId::from_str(&"x".repeat(256)).is_ok());
+    assert!(ProviderItemId::from_str(&"x".repeat(257)).is_err());
+    assert_eq!(
+        serde_json::from_value::<ProviderItemId>(serde_json::json!(opaque.as_str())).unwrap(),
+        opaque
+    );
+    assert_invalid::<ProviderItemId>(serde_json::json!("bad\nvalue"));
 }
 
 #[test]
