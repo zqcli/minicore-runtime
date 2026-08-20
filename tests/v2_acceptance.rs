@@ -4,6 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
