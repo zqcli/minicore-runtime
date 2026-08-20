@@ -5,12 +5,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use minicore_runtime::model::{
+    AssistantPart, ModelCallContext, ModelDescriptor, ModelFinishReason, ModelFuture, ModelLimits,
+    ModelProvider, ModelRequest, ModelResponse, ModelSelection, ProviderId, ProviderRegistry,
+    ReasoningPreference, ToolCall,
+};
+use minicore_runtime::tools::{
+    AskUserTool, Tool, ToolContext, ToolError, ToolFuture, ToolName, ToolOutput, ToolRegistry,
+    ToolSpec,
+};
 use minicore_runtime::{
-    AskUserTool, AssistantPart, ModelCallContext, ModelDescriptor, ModelFinishReason, ModelFuture,
-    ModelLimits, ModelProvider, ModelRequest, ModelResponse, ModelSelection, ProviderId,
-    ProviderRegistry, RetryPolicy, Runtime, RuntimeConfig, SessionConfig, SessionEvent,
-    SessionEventStream, SessionId, SessionStatus, Tool, ToolContext, ToolError, ToolFuture,
-    ToolName, ToolOutput, ToolRegistry, TurnOutcome,
+    RetryPolicy, Runtime, RuntimeConfig, SessionConfig, SessionEvent, SessionEventStream,
+    SessionId, SessionStatus, TurnOutcome,
 };
 use tokio::runtime::Handle;
 
@@ -31,8 +37,8 @@ struct UncooperativeTool {
 }
 
 impl Tool for EchoTool {
-    fn spec(&self) -> minicore_runtime::ToolSpec {
-        minicore_runtime::ToolSpec::new(
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
             self.name.clone(),
             "echoes input",
             serde_json::json!({"type": "object"}),
@@ -48,9 +54,8 @@ impl Tool for EchoTool {
 }
 
 impl Tool for UncooperativeTool {
-    fn spec(&self) -> minicore_runtime::ToolSpec {
-        minicore_runtime::ToolSpec::new(self.name.clone(), "uncooperative", serde_json::json!({}))
-            .unwrap()
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(self.name.clone(), "uncooperative", serde_json::json!({})).unwrap()
     }
 
     fn execute<'a>(&'a self, ctx: ToolContext<'a>, _args: serde_json::Value) -> ToolFuture<'a> {
@@ -115,7 +120,7 @@ fn text_response(text: &str) -> ModelResponse {
 }
 
 fn tool_response(name: &str, arguments: serde_json::Value) -> ModelResponse {
-    let call = minicore_runtime::ToolCall::new(
+    let call = ToolCall::new(
         minicore_runtime::ToolCallId::new("call-0").unwrap(),
         name.parse().unwrap(),
         arguments,
@@ -140,10 +145,7 @@ fn provider_registry_with(responses: VecDeque<ModelResponse>) -> ProviderRegistr
         selection,
         "echo-api-model",
         ModelLimits::default(),
-        BTreeSet::from([
-            minicore_runtime::ReasoningPreference::Auto,
-            minicore_runtime::ReasoningPreference::Disabled,
-        ]),
+        BTreeSet::from([ReasoningPreference::Auto, ReasoningPreference::Disabled]),
     )
     .unwrap();
     let provider = EchoProvider {
@@ -646,7 +648,7 @@ async fn runtime_ask_user_wrong_answer_preserves_pending_then_correct_resumes() 
             .answer(
                 id,
                 minicore_runtime::InteractionId::new().unwrap(),
-                minicore_runtime::UserAnswer::new("allow").unwrap(),
+                minicore_runtime::tools::UserAnswer::new("allow").unwrap(),
             )
             .await,
         Err(minicore_runtime::SessionError::InteractionMismatch)
@@ -655,7 +657,7 @@ async fn runtime_ask_user_wrong_answer_preserves_pending_then_correct_resumes() 
         .answer(
             id,
             interaction_id,
-            minicore_runtime::UserAnswer::new("allow").unwrap(),
+            minicore_runtime::tools::UserAnswer::new("allow").unwrap(),
         )
         .await
         .unwrap();

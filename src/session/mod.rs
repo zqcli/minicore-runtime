@@ -28,3 +28,4 @@ pub use snapshot::{
     TurnSummary, TurnTerminal, TurnTerminalSummary,
 };
 pub use state::SessionStatus;
+pub use transcript::{TranscriptEntry, TranscriptPage, TranscriptToolCall};

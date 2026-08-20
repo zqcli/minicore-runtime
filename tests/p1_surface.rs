@@ -14,6 +14,23 @@ const P1_SOURCES: &[&str] = &[
     include_str!("../src/session/event.rs"),
 ];
 
+fn root_use_block<'a>(lib: &'a str, module: &str) -> Option<&'a str> {
+    let marker = format!("pub use {module}::{{");
+    let start = lib.find(&marker)?;
+    let end = lib[start..].find("};")? + start + 2;
+    Some(&lib[start..end])
+}
+
+fn assert_root_exports(lib: &str, module: &str, symbols: &[&str]) {
+    let block = root_use_block(lib, module).expect("stable root export block is present");
+    for &symbol in symbols {
+        assert!(
+            block.contains(symbol),
+            "missing {module} root export: {symbol}"
+        );
+    }
+}
+
 #[test]
 fn p1_sources_have_no_legacy_imports_or_new_dead_code_suppression() {
     for source in P1_SOURCES {
@@ -31,10 +48,12 @@ fn p1_sources_have_no_legacy_imports_or_new_dead_code_suppression() {
 fn canonical_modules_have_explicit_root_exports() {
     let lib = include_str!("../src/lib.rs");
     for declaration in [
-        "pub mod ids;",
+        "pub mod config;",
         "pub mod error;",
         "pub mod event;",
+        "pub mod ids;",
         "pub mod model;",
+        "pub mod runtime;",
         "pub mod session;",
         "pub mod tools;",
         "pub mod workspace;",
@@ -48,12 +67,66 @@ fn canonical_modules_have_explicit_root_exports() {
     assert!(lib.contains("mod prompt;"));
     assert!(!lib.contains("#[path ="));
     assert!(!lib.contains("_v2"));
-    assert!(!lib.contains("pub use ids::*"));
-    assert!(!lib.contains("pub use error::*"));
-    assert!(!lib.contains("pub use event::*"));
-    assert!(!lib.contains("pub use model::*"));
-    assert!(!lib.contains("pub use session::*"));
-    assert!(!lib.contains("pub use tools::*"));
+    assert_root_exports(
+        lib,
+        "config",
+        &[
+            "ConfigError",
+            "RetryPolicy",
+            "RetryPolicyError",
+            "RuntimeConfig",
+            "RuntimeConfigBuilder",
+            "SessionConfig",
+        ],
+    );
+    assert_root_exports(
+        lib,
+        "error",
+        &[
+            "PublicErrorCode",
+            "PublicErrorSummary",
+            "RuntimeError",
+            "SessionError",
+        ],
+    );
+    assert_root_exports(
+        lib,
+        "ids",
+        &[
+            "IdError",
+            "IdGenerationError",
+            "InteractionId",
+            "RuntimeIdError",
+            "SessionId",
+            "ToolCallId",
+            "ToolCallIdError",
+            "TurnId",
+        ],
+    );
+    assert_root_exports(lib, "runtime", &["Runtime", "SessionSummary"]);
+    assert_root_exports(
+        lib,
+        "session",
+        &[
+            "SessionEvent",
+            "SessionEventStream",
+            "SessionSnapshot",
+            "SessionStatus",
+            "SnapshotHistory",
+            "SnapshotShapeError",
+            "TerminalOutcome",
+            "TranscriptEntry",
+            "TranscriptPage",
+            "TranscriptToolCall",
+            "TurnOutcome",
+            "TurnSummary",
+            "TurnTerminal",
+            "TurnTerminalSummary",
+        ],
+    );
+    assert!(root_use_block(lib, "model").is_none());
+    assert!(root_use_block(lib, "tools").is_none());
+    assert!(root_use_block(lib, "workspace").is_none());
     assert!(lib.contains("pub use event::SessionEventKind;"));
     assert!(!include_str!("../src/model/mod.rs").contains("pub mod types"));
     assert!(!include_str!("../src/session/mod.rs").contains("pub mod snapshot"));

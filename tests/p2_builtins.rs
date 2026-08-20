@@ -4,11 +4,13 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use minicore_runtime::{
-    AskUserTool, InteractionClient, InteractionReceiver, ListDirectoryTool, ReadFileTool,
-    RelativePath, Tool, ToolContext, ToolError, ToolName, ToolRegistry, ToolSpec, TurnId,
-    UserAnswer, Workspace, WorkspaceAccess, WriteFileTool,
+use minicore_runtime::TurnId;
+use minicore_runtime::tools::{
+    AskUserTool, InteractionClient, InteractionReceiver, ListDirectoryTool, ReadFileTool, Tool,
+    ToolContext, ToolError, ToolName, ToolOutput, ToolRegistry, ToolSpec, UserAnswer,
+    WriteFileTool,
 };
+use minicore_runtime::workspace::{RelativePath, Workspace, WorkspaceAccess};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -68,17 +70,17 @@ async fn run<T: Tool>(
     interactions: &InteractionClient,
     cancellation: CancellationToken,
     args: Value,
-) -> Result<minicore_runtime::ToolOutput, ToolError> {
+) -> Result<ToolOutput, ToolError> {
     tool.execute(context(workspace, cancellation, interactions), args)
         .await
 }
 
-fn assert_failure(output: &minicore_runtime::ToolOutput, text: &str) {
+fn assert_failure(output: &ToolOutput, text: &str) {
     assert!(output.is_error());
     assert_eq!(output.text(), text);
 }
 
-fn assert_success(output: &minicore_runtime::ToolOutput, text: &str) {
+fn assert_success(output: &ToolOutput, text: &str) {
     assert!(!output.is_error());
     assert_eq!(output.text(), text);
 }

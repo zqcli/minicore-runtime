@@ -11,11 +11,11 @@
 > use std::error::Error;
 > use std::sync::Arc;
 > use std::time::Duration;
-> use minicore_runtime::{
->     AskUserTool, ListDirectoryTool, ModelSelection, ProcessPolicy, ProviderRegistry,
->     ReadFileTool, RetryPolicy, RunCommandTool, Runtime, RuntimeConfig, SessionConfig, ToolName,
->     ToolRegistry,
->     WriteFileTool,
+> use minicore_runtime::{RetryPolicy, Runtime, RuntimeConfig, SessionConfig};
+> use minicore_runtime::model::{ModelSelection, ProviderRegistry};
+> use minicore_runtime::tools::{
+>     AskUserTool, ListDirectoryTool, ProcessPolicy, ReadFileTool, RunCommandTool, ToolName,
+>     ToolRegistry, WriteFileTool,
 > };
 >
 > async fn open_v02_runtime(
@@ -43,12 +43,12 @@
 >         handle,
 >     )
 >     .await?;
->     let enabled_tools = BTreeSet::from([
->         "ask_user".parse::<ToolName>()?,
->         "read_file".parse::<ToolName>()?,
->         "list_directory".parse::<ToolName>()?,
->         "write_file".parse::<ToolName>()?,
->         "run_command".parse::<ToolName>()?,
+>     let enabled_tools: BTreeSet<ToolName> = BTreeSet::from([
+>         "ask_user".parse()?,
+>         "read_file".parse()?,
+>         "list_directory".parse()?,
+>         "write_file".parse()?,
+>         "run_command".parse()?,
 >     ]);
 >     let session = SessionConfig::new(
 >         "/absolute/workspace/root".into(),

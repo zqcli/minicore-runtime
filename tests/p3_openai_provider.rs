@@ -7,14 +7,15 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use minicore_runtime::{
+use minicore_runtime::model::{
     AssistantPart, CredentialSource, CredentialSourceFuture, DeliveryState, ModelCallContext,
-    ModelDescriptor, ModelError, ModelErrorKind, ModelEvent, ModelFinishReason, ModelGateway,
-    ModelLimits, ModelMessage, ModelRequest, ModelResponse, ModelSelection,
+    ModelDescriptor, ModelError, ModelErrorKind, ModelEvent, ModelEventSink, ModelFinishReason,
+    ModelGateway, ModelLimits, ModelMessage, ModelRequest, ModelResponse, ModelSelection,
     OpenAiReasoningProgress, OpenAiResponsesProvider, ProviderCredential, ProviderEndpointPolicy,
-    ProviderRegistryBuilder, ReasoningContent, ReasoningPreference, ToolCall, ToolName, ToolOutput,
-    ToolSpec, fixed_credential_source,
+    ProviderRegistryBuilder, ReasoningContent, ReasoningPreference, ToolCall,
+    fixed_credential_source,
 };
+use minicore_runtime::tools::{ToolName, ToolOutput, ToolSpec};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -349,7 +350,7 @@ async fn openai_provider_replays_reasoning_and_tool_items_without_private_artifa
     let mut registry = ProviderRegistryBuilder::default();
     registry.register(provider).unwrap();
     let gateway = ModelGateway::new(registry.build());
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     gateway
         .generate(
             request,
@@ -437,7 +438,7 @@ async fn reasoning_progress_mode_and_rich_terminal_preserve_provider_order() {
     let mut registry = ProviderRegistryBuilder::default();
     registry.register(provider).unwrap();
     let gateway = ModelGateway::new(registry.build());
-    let (sink, mut events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, mut events) = ModelEventSink::channel(8).unwrap();
     let result = gateway
         .generate(
             request_with_tools(ReasoningPreference::Low, vec![enabled_tool]),
@@ -510,7 +511,7 @@ async fn raw_reasoning_progress_requires_explicit_opt_in() {
     let mut registry = ProviderRegistryBuilder::default();
     registry.register(provider).unwrap();
     let gateway = ModelGateway::new(registry.build());
-    let (sink, mut events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, mut events) = ModelEventSink::channel(8).unwrap();
     gateway
         .generate(
             request(ReasoningPreference::Low),
@@ -540,7 +541,7 @@ async fn fragmented_sse_terminal_is_normalized_without_synthetic_success() {
     let mut registry = ProviderRegistryBuilder::default();
     registry.register(provider).unwrap();
     let gateway = ModelGateway::new(registry.build());
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     let result = gateway
         .generate(
             request(ReasoningPreference::Disabled),
@@ -572,7 +573,7 @@ async fn run_http_error(script: ScriptedResponse) -> ModelError {
     let mut registry = ProviderRegistryBuilder::default();
     registry.register(provider).unwrap();
     let gateway = ModelGateway::new(registry.build());
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     let error = gateway
         .generate(
             request(ReasoningPreference::Auto),
@@ -610,7 +611,7 @@ async fn provider_function_arguments_use_the_same_json_shape_bounds() {
     let gateway = ModelGateway::new(registry.build());
     let enabled_tool =
         ToolSpec::new(ToolName::from_str("read_file").unwrap(), "read", json!({})).unwrap();
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     let error = gateway
         .generate(
             request_with_tools(ReasoningPreference::Auto, vec![enabled_tool]),
@@ -724,7 +725,7 @@ async fn refusal_is_text_with_refused_finish_and_cannot_mix_tool_output() {
     let mut registry = ProviderRegistryBuilder::default();
     registry.register(provider).unwrap();
     let gateway = ModelGateway::new(registry.build());
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     let result = gateway
         .generate(
             request(ReasoningPreference::Auto),
@@ -751,7 +752,7 @@ async fn run_success_stream(body: String) -> ModelResponse {
     let mut registry = ProviderRegistryBuilder::default();
     registry.register(provider).unwrap();
     let gateway = ModelGateway::new(registry.build());
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     let result = gateway
         .generate(
             request(ReasoningPreference::Auto),
@@ -774,7 +775,7 @@ async fn run_stream_error(body: String, content_type: &str) -> ModelError {
     let mut registry = ProviderRegistryBuilder::default();
     registry.register(provider).unwrap();
     let gateway = ModelGateway::new(registry.build());
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     let error = gateway
         .generate(
             request(ReasoningPreference::Auto),
@@ -922,7 +923,7 @@ async fn unknown_or_disabled_function_calls_are_unexpected_tool_calls() {
             ReasoningPreference::Auto,
         )
         .unwrap();
-        let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+        let (sink, _events) = ModelEventSink::channel(8).unwrap();
         let error = gateway
             .generate(
                 request,
@@ -1023,7 +1024,7 @@ async fn credential_source_is_resolved_fresh_for_each_attempt() {
     registry.register(provider).unwrap();
     let gateway = ModelGateway::new(registry.build());
     for _ in 0..2 {
-        let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+        let (sink, _events) = ModelEventSink::channel(8).unwrap();
         gateway
             .generate(
                 request(ReasoningPreference::Auto),
@@ -1067,7 +1068,7 @@ async fn oversized_full_request_is_rejected_before_post() {
         ReasoningPreference::Auto,
     )
     .unwrap();
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     let error = gateway
         .generate(
             oversized,
@@ -1092,7 +1093,7 @@ async fn pre_send_cancellation_makes_no_post_and_is_not_sent() {
     let mut registry = ProviderRegistryBuilder::default();
     registry.register(provider).unwrap();
     let gateway = ModelGateway::new(registry.build());
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     let cancellation = CancellationToken::new();
     cancellation.cancel();
     let error = gateway
@@ -1126,7 +1127,7 @@ async fn post_delta_cancellation_preserves_output_started() {
     let mut registry = ProviderRegistryBuilder::default();
     registry.register(provider).unwrap();
     let gateway = ModelGateway::new(registry.build());
-    let (sink, mut events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, mut events) = ModelEventSink::channel(8).unwrap();
     let cancellation = CancellationToken::new();
     let task = tokio::spawn({
         let gateway = gateway.clone();
@@ -1179,7 +1180,7 @@ async fn in_flight_cancellation_before_semantic_output_is_conservative() {
     let mut registry = ProviderRegistryBuilder::default();
     registry.register(provider).unwrap();
     let gateway = ModelGateway::new(registry.build());
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
     let cancellation = CancellationToken::new();
     let task = tokio::spawn({
         let gateway = gateway.clone();
@@ -1278,7 +1279,7 @@ async fn openai_provider_encodes_full_request_and_normalizes_terminal() {
     let mut registry = ProviderRegistryBuilder::default();
     registry.register(provider).unwrap();
     let gateway = ModelGateway::new(registry.build());
-    let (sink, _events) = minicore_runtime::ModelEventSink::channel(8).unwrap();
+    let (sink, _events) = ModelEventSink::channel(8).unwrap();
 
     let result = gateway
         .generate(

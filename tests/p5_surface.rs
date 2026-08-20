@@ -4,15 +4,8 @@ fn p5_prompt_surface_is_private_and_uses_only_new_foundations() {
     assert!(lib.contains("mod prompt;"));
     assert!(!lib.contains("pub use prompt"));
     assert!(!lib.contains("pub mod prompt"));
-    let public_exports = lib
-        .split_once("pub use model::{")
-        .and_then(|(_, rest)| rest.split_once("};"))
-        .map(|(exports, _)| exports)
-        .unwrap_or("");
-    assert!(!public_exports.contains("PromptBuilder"));
-    assert!(!public_exports.contains("Compactor"));
-    assert!(!public_exports.contains("Plan"));
-    assert!(!public_exports.contains("ValidatedSummary"));
+    assert!(!lib.contains("pub use model::{"));
+    assert!(!lib.contains("pub use prompt::{"));
 
     let sources = [
         include_str!("../src/prompt/mod.rs"),

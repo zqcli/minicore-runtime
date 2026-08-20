@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use minicore_runtime::{RelativePath, Workspace, WorkspaceAccess, WorkspaceError};
+use minicore_runtime::workspace::{RelativePath, Workspace, WorkspaceAccess, WorkspaceError};
 
 static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 

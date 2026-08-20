@@ -3,12 +3,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use minicore_runtime::{
+use minicore_runtime::model::{
     AssistantPart, DeliveryState, ModelCallContext, ModelDescriptor, ModelError, ModelErrorKind,
     ModelEvent, ModelEventSink, ModelFinishReason, ModelFuture, ModelGateway, ModelLimits,
     ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelSelection, ProviderId,
-    ProviderRegistryBuilder, ReasoningPreference, ToolSpec, Usage,
+    ProviderRegistryBuilder, ReasoningPreference, Usage,
 };
+use minicore_runtime::tools::ToolSpec;
 use tokio::sync::{Barrier, Notify};
 use tokio_util::sync::CancellationToken;
 
@@ -1117,7 +1118,8 @@ fn p3_model_sources_stay_on_the_model_owned_dependency_boundary() {
     assert!(!registry.contains("pub fn provider"));
     assert!(provider.contains("Mutex"));
     assert!(!provider.contains("AtomicBool"));
-    assert!(lib.contains("pub use model::{"));
+    assert!(lib.contains("pub mod model;"));
+    assert!(!lib.contains("pub use model::{"));
     for required in [
         "ModelCallContext",
         "ModelDescriptor",
@@ -1129,7 +1131,7 @@ fn p3_model_sources_stay_on_the_model_owned_dependency_boundary() {
         "ProviderRegistryBuilder",
         "ResolvedModel",
     ] {
-        assert!(lib.contains(required), "missing root export {required}");
+        assert!(include_str!("../src/model/mod.rs").contains(required));
     }
     assert!(!lib.contains("pub use model::*"));
 }

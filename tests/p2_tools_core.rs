@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 
-use minicore_runtime::{
-    AllowConfiguredTools, InteractionClient, InteractionId, InteractionReceiver,
-    InteractionRequest, SessionId, Tool, ToolCallId, ToolContext, ToolContextView, ToolDecision,
-    ToolError, ToolFuture, ToolName, ToolOutput, ToolPolicy, ToolRegistry, ToolRegistryBuilder,
-    ToolRequest, ToolSpec, TurnId, UserAnswer, Workspace, WorkspaceAccess,
+use minicore_runtime::tools::{
+    AllowConfiguredTools, InteractionClient, InteractionReceiver, InteractionRequest, Tool,
+    ToolContext, ToolContextView, ToolDecision, ToolError, ToolFuture, ToolName, ToolOutput,
+    ToolPolicy, ToolRegistry, ToolRegistryBuilder, ToolRequest, ToolSpec, UserAnswer,
 };
+use minicore_runtime::workspace::{Workspace, WorkspaceAccess};
+use minicore_runtime::{InteractionId, SessionId, ToolCallId, TurnId};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -645,8 +646,8 @@ fn p2_tool_sources_have_no_p2_plus_or_legacy_owner_coupling() {
     let lib = include_str!("../src/lib.rs");
     let tests = include_str!("../tests/p2_tools_core.rs");
     assert!(lib.contains("pub mod tools;"));
-    assert!(lib.contains("pub use tools::{"));
-    assert!(lib.contains("InteractionReceiver"));
+    assert!(!lib.contains("pub use tools::{"));
+    assert!(include_str!("../src/tools/mod.rs").contains("pub use context::{"));
     assert!(!lib.contains("pub use tools::*"));
     assert!(!lib.contains("pub mod registry;"));
     assert!(!lib.contains("pub mod policy;"));
