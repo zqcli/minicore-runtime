@@ -7,7 +7,8 @@ The current v0.2 documentation follows this order:
 3. [Current formats](formats/session-json-v2.md) and [conversation JSONL v2](formats/conversation-jsonl-v2.md) for durable bytes and limits.
 4. [Current ADR index](adr/README.md) for accepted decisions that explain why the current source has its boundaries.
 5. [Final migration guide](migration-v0.1-v0.2.md) for the breaking public and persistence reset.
-6. [Development plan](development-plan.md) for completed foundations, maintenance gates, and non-core follow-up.
+6. [v0.2 Core Reset release readiness](release-v0.2-core-reset.md) for the final source graph, public surface, persistence, dependency, verification, and deferred-host result.
+7. [Development plan](development-plan.md) for completed foundations, maintenance gates, and non-core follow-up.
 
 The [current implementation context](../CONTEXT.md) is a short checkpoint for maintainers. The [root README](../README.md) is the host-facing introduction and API example.
 

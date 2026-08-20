@@ -4,7 +4,7 @@
 
 This is the final breaking migration guide for the v0.2 core. P8 reset closure is complete: the current crate contains the typed Runtime graph, the historical pre-reset authority is archived, and the acceptance architecture gate is active. The typed `Runtime` replaces the removed platform command/query surface. There are no compatibility wrappers or root aliases for the removed surface.
 
-P9 documentation status: this authority reset is current; remote lockfile regeneration, dependency/version review, and final validation remain pending.
+P9 documentation status: complete. The lockfile was regenerated and reviewed remotely with Rust 1.85 and stable Cargo, the final deterministic gates passed, and the [release-readiness result](release-v0.2-core-reset.md) records the current contract and deferred host work.
 
 ## What Changes
 
