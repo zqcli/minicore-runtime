@@ -248,6 +248,31 @@ def check_migration_status() -> list[str]:
     return errors
 
 
+def check_readme_example() -> list[str]:
+    path = ROOT / "README.md"
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    example = re.search(r"```rust,no_run\n(.*?)\n```", text, re.DOTALL)
+    if example is None:
+        return ["README.md: missing primary rust,no_run typed Runtime example"]
+    source = example.group(1)
+    required = (
+        "ReasoningPreference::Auto",
+        "ReasoningPreference::Disabled",
+        "RunCommandTool::new",
+        "ProcessPolicy::coding_agent_local()",
+        '"read_file".parse()?',
+        '"run_command".parse()?',
+        "runtime.shutdown().await?",
+    )
+    return [
+        f"README.md: primary typed Runtime example is missing {snippet}"
+        for snippet in required
+        if snippet not in source
+    ]
+
+
 def check_current_status() -> list[str]:
     forbidden = (
         "MiniCoreRuntime",
@@ -315,6 +340,7 @@ def main() -> int:
         errors.extend(check_markdown(path))
     errors.extend(check_adr_index())
     errors.extend(check_migration_status())
+    errors.extend(check_readme_example())
     errors.extend(check_current_status())
 
     if errors:

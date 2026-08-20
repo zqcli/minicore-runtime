@@ -53,7 +53,9 @@ use minicore_runtime::model::{
     fixed_credential_source, ModelDescriptor, ModelLimits, ModelSelection,
     OpenAiResponsesProvider, ProviderRegistry, ReasoningPreference,
 };
-use minicore_runtime::tools::{ReadFileTool, ToolRegistry};
+use minicore_runtime::tools::{
+    ProcessPolicy, ReadFileTool, RunCommandTool, ToolRegistry,
+};
 use minicore_runtime::{RetryPolicy, Runtime, RuntimeConfig, SessionConfig};
 use tokio::runtime::Handle;
 
@@ -66,7 +68,10 @@ fn real_provider_registry(
         selection.clone(),
         "coding-model",
         ModelLimits::new(Some(128_000), Some(4_096))?,
-        BTreeSet::from([ReasoningPreference::Auto]),
+        BTreeSet::from([
+            ReasoningPreference::Auto,
+            ReasoningPreference::Disabled,
+        ]),
     )?;
     let provider = OpenAiResponsesProvider::new_https(
         endpoint,
@@ -88,6 +93,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut tools = ToolRegistry::builder();
     tools.register(ReadFileTool::new())?;
+    tools.register(RunCommandTool::new(Arc::new(
+        ProcessPolicy::coding_agent_local(),
+    )))?;
 
     let runtime = Runtime::open(
         RuntimeConfig::new(
@@ -106,7 +114,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             PathBuf::from("/absolute/workspace/root"),
             ModelSelection::new("openai".parse()?, "coding-model".parse()?),
             "Work only inside the configured workspace.",
-            BTreeSet::from(["read_file".parse()?]),
+            BTreeSet::from(["read_file".parse()?, "run_command".parse()?]),
             80_000,
             30_000,
             16,
