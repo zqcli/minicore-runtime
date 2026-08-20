@@ -103,7 +103,7 @@ The two provider live-smoke cases remain ignored and require explicit opt-in env
 - Public surface: `src/lib.rs`, `src/config.rs`, `src/error.rs`, `src/runtime/runtime_impl.rs`.
 - Model contract: `src/model/registry.rs`, `src/model/provider.rs`, and the two direct provider modules.
 - Tool contract: `src/tools/registry.rs`, `src/tools/policy.rs`, `src/tools/context.rs`, and `src/tools/builtins/`.
-- Storage contract: `src/session/store.rs`, `src/session/conversation.rs`, `src/session/conversation_codec.rs`, and `src/session/transcript.rs`.
+- Storage contract: `src/session/store.rs`, `src/session/conversation.rs`, `src/session/conversation/codec.rs`, and `src/session/transcript.rs`.
 - Lifecycle contract: `src/session/actor.rs`, `src/session/command.rs`, and `src/runtime/session_manager.rs`.
 - Acceptance contract: `tests/v2_acceptance.rs`; provider protocol evidence remains in the P3 suites.
 - Documentation validation: `scripts/check_docs.py` checks current authority plus selected non-pre-reset evidence.

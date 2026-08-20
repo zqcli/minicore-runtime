@@ -15,14 +15,10 @@ use crate::ids::{InteractionId, SessionId, ToolCallId, TurnId};
 use crate::model::{AssistantPart, ModelMessage, ModelResponse, ReasoningContent, ToolCall, Usage};
 use crate::tools::{ToolOutput, UserAnswer, UserQuestion};
 
-#[path = "conversation_actor.rs"]
 mod actor_support;
 pub(crate) use actor_support::validate_user_text;
-#[path = "conversation_codec.rs"]
 mod codec;
-#[path = "conversation_compaction.rs"]
 mod compaction;
-#[path = "conversation_usage.rs"]
 mod usage;
 pub(crate) use compaction::CompactionConversationView;
 

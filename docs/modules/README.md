@@ -68,7 +68,7 @@ The root also reexports stable DTOs and operations. `agent` and `prompt` are pri
 
 ### `session`
 
-- Sources: [`src/session/mod.rs`](../../src/session/mod.rs), [`actor.rs`](../../src/session/actor.rs), [`command.rs`](../../src/session/command.rs), [`event.rs`](../../src/session/event.rs), [`event_stream.rs`](../../src/session/event_stream.rs), [`snapshot.rs`](../../src/session/snapshot.rs), [`state.rs`](../../src/session/state.rs), [`store.rs`](../../src/session/store.rs), [`conversation.rs`](../../src/session/conversation.rs), [`conversation_actor.rs`](../../src/session/conversation_actor.rs), [`conversation_codec.rs`](../../src/session/conversation_codec.rs), [`conversation_compaction.rs`](../../src/session/conversation_compaction.rs), [`conversation_usage.rs`](../../src/session/conversation_usage.rs), [`transcript.rs`](../../src/session/transcript.rs), and [`time.rs`](../../src/session/time.rs).
+- Sources: [`src/session/mod.rs`](../../src/session/mod.rs), [`actor.rs`](../../src/session/actor.rs), [`command.rs`](../../src/session/command.rs), [`event.rs`](../../src/session/event.rs), [`event_stream.rs`](../../src/session/event_stream.rs), [`snapshot.rs`](../../src/session/snapshot.rs), [`state.rs`](../../src/session/state.rs), [`store.rs`](../../src/session/store.rs), [`conversation.rs`](../../src/session/conversation.rs), [`conversation/actor_support.rs`](../../src/session/conversation/actor_support.rs), [`conversation/codec.rs`](../../src/session/conversation/codec.rs), [`conversation/compaction.rs`](../../src/session/conversation/compaction.rs), [`conversation/usage.rs`](../../src/session/conversation/usage.rs), [`transcript.rs`](../../src/session/transcript.rs), and [`time.rs`](../../src/session/time.rs).
 - The actor owns admission, mailbox ordering, terminal settlement, interaction persistence, snapshot publication, and close completion.
 - The conversation log owns append ordering, replay, repair, prompt projection, compaction boundaries, usage aggregation, and transcript projection.
 - The store worker owns the root lock, session namespace, atomic create, bounded CRUD, readiness, and shutdown result.
@@ -105,8 +105,8 @@ src/
 │   └── providers/{anthropic.rs,mod.rs,openai.rs}
 ├── prompt/{builder.rs,compaction.rs,mod.rs}
 ├── runtime/{mod.rs,runtime_impl.rs,session_manager.rs}
-├── session/{actor.rs,command.rs,event.rs,event_stream.rs,mod.rs,snapshot.rs,state.rs,store.rs,time.rs,transcript.rs}
-│   └── conversation{,_actor.rs,_codec.rs,_compaction.rs,_usage.rs}
+├── session/{actor.rs,command.rs,event.rs,event_stream.rs,mod.rs,snapshot.rs,state.rs,store.rs,time.rs,transcript.rs,conversation.rs}
+│   └── conversation/{actor_support.rs,codec.rs,compaction.rs,usage.rs}
 ├── tools/{context.rs,mod.rs,policy.rs,process.rs,registry.rs,types.rs}
 │   └── builtins/{ask_user.rs,list_directory.rs,path_args.rs,read_file.rs,run_command.rs,write_file.rs}
 └── workspace/{mod.rs,path.rs,root.rs}
