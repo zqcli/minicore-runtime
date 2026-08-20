@@ -194,14 +194,8 @@ impl ProcessPolicy {
             allowed_env.insert("USERPROFILE".to_owned());
             allowed_env.insert("CARGO_HOME".to_owned());
             allowed_env.insert("RUSTUP_HOME".to_owned());
-            allowed_env.insert("VCINSTALLDIR".to_owned());
-            allowed_env.insert("VSINSTALLDIR".to_owned());
-            allowed_env.insert("VSCMD_ARG_TGT_ARCH".to_owned());
-            allowed_env.insert("WindowsSdkDir".to_owned());
-            allowed_env.insert("WindowsSDKVersion".to_owned());
-            allowed_env.insert("LIB".to_owned());
-            allowed_env.insert("LIBPATH".to_owned());
-            allowed_env.insert("INCLUDE".to_owned());
+            allowed_env.insert("ProgramFiles(x86)".to_owned());
+            allowed_env.insert("ProgramFiles".to_owned());
         }
 
         #[cfg(not(windows))]
@@ -294,9 +288,19 @@ pub(crate) fn valid_argument(argument: &str) -> bool {
 pub(crate) fn valid_environment_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= MAX_ENV_KEY_BYTES
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && key.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'_' || valid_windows_key_punctuation(byte)
+        })
+}
+
+#[cfg(windows)]
+const fn valid_windows_key_punctuation(byte: u8) -> bool {
+    matches!(byte, b'(' | b')')
+}
+
+#[cfg(not(windows))]
+const fn valid_windows_key_punctuation(_: u8) -> bool {
+    false
 }
 
 pub(crate) fn valid_environment_value(value: &str) -> bool {
@@ -350,14 +354,8 @@ mod tests {
             "USERPROFILE",
             "CARGO_HOME",
             "RUSTUP_HOME",
-            "VCINSTALLDIR",
-            "VSINSTALLDIR",
-            "VSCMD_ARG_TGT_ARCH",
-            "WindowsSdkDir",
-            "WindowsSDKVersion",
-            "LIB",
-            "LIBPATH",
-            "INCLUDE",
+            "ProgramFiles(x86)",
+            "ProgramFiles",
         ] {
             assert!(policy.allowed_env().contains(key));
         }
@@ -373,6 +371,20 @@ mod tests {
             .unwrap()
             .with_limits(Duration::from_millis(99), Duration::from_secs(1), 1, 1);
         assert_eq!(bad, Err(ProcessPolicyError::InvalidBounds));
+    }
+
+    #[test]
+    fn environment_keys_keep_platform_grammar_and_bounds() {
+        for key in ["", "A=B", "A\0B", "A\nB", "A\tB", "A;B", "A-B"] {
+            assert!(!valid_environment_key(key), "unexpectedly accepted {key:?}");
+        }
+        assert!(!valid_environment_key(&"A".repeat(MAX_ENV_KEY_BYTES + 1)));
+        assert!(valid_environment_key("PATH"));
+        assert!(valid_environment_key("ProgramFiles"));
+        #[cfg(windows)]
+        assert!(valid_environment_key("ProgramFiles(x86)"));
+        #[cfg(not(windows))]
+        assert!(!valid_environment_key("ProgramFiles(x86)"));
     }
 
     #[test]
