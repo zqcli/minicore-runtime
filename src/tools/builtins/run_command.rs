@@ -31,7 +31,7 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Runs one direct child process with structured arguments and bounded output.
 ///
-/// The model-relative cwd is validated through [`Workspace::command_cwd`] before
+/// The model-relative cwd is validated through `Workspace::command_cwd` before
 /// spawn. `Command::current_dir(Path)` receives only an ambient host path on a
 /// trusted, non-adversarial host filesystem. This validation does not provide a
 /// capability identity or process sandbox, does not claim protection against a
@@ -625,7 +625,7 @@ mod tests {
     use std as runtime;
     use std::env;
     use std::io::Write as _;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -640,6 +640,66 @@ mod tests {
     use crate::workspace_v2::{Workspace, WorkspaceAccess};
 
     static NEXT_PROCESS_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    struct DescendantMarkers {
+        ready: PathBuf,
+        go: PathBuf,
+        direct_exit: PathBuf,
+        descendant_ready: PathBuf,
+        release: PathBuf,
+        descendant_exit: PathBuf,
+    }
+
+    impl DescendantMarkers {
+        fn new(label: &str, sequence: u64) -> Self {
+            let prefix = format!("minicore-p7-{label}-{}-{sequence}", std::process::id());
+            Self {
+                ready: env::temp_dir().join(format!("{prefix}-ready")),
+                go: env::temp_dir().join(format!("{prefix}-go")),
+                direct_exit: env::temp_dir().join(format!("{prefix}-direct-exit")),
+                descendant_ready: env::temp_dir().join(format!("{prefix}-descendant-ready")),
+                release: env::temp_dir().join(format!("{prefix}-release")),
+                descendant_exit: env::temp_dir().join(format!("{prefix}-exit")),
+            }
+        }
+
+        fn paths(&self) -> [&Path; 6] {
+            [
+                &self.ready,
+                &self.go,
+                &self.direct_exit,
+                &self.descendant_ready,
+                &self.release,
+                &self.descendant_exit,
+            ]
+        }
+
+        fn clear(&self) {
+            for path in self.paths() {
+                let _ = runtime::fs::remove_file(path);
+            }
+        }
+
+        fn release(&self) {
+            let _ = runtime::fs::write(&self.go, b"go");
+            let _ = runtime::fs::write(&self.release, b"release");
+        }
+    }
+
+    impl Drop for DescendantMarkers {
+        fn drop(&mut self) {
+            if self.ready.exists() {
+                self.release();
+                for _ in 0..500 {
+                    if self.descendant_exit.exists() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            self.clear();
+        }
+    }
 
     fn helper_program() -> String {
         env::current_exe().unwrap().to_string_lossy().into_owned()
@@ -699,7 +759,14 @@ mod tests {
         })
     }
 
-    fn descendant_args(ready_marker: &Path, exit_marker: &Path) -> Value {
+    fn descendant_args(
+        ready_marker: &Path,
+        go_marker: &Path,
+        direct_exit_marker: &Path,
+        descendant_ready_marker: &Path,
+        release_marker: &Path,
+        descendant_exit_marker: &Path,
+    ) -> Value {
         json!({
             "program": helper_program(),
             "args": [
@@ -710,8 +777,11 @@ mod tests {
             "env": {
                 "MINICORE_P7_HELPER_MODE": "descendant",
                 "MINICORE_P7_READY_MARKER": ready_marker.to_string_lossy(),
-                "MINICORE_P7_EXIT_MARKER": exit_marker.to_string_lossy(),
-                "MINICORE_P7_HOLD_MS": "5000"
+                "MINICORE_P7_GO_MARKER": go_marker.to_string_lossy(),
+                "MINICORE_P7_DIRECT_EXIT_MARKER": direct_exit_marker.to_string_lossy(),
+                "MINICORE_P7_DESCENDANT_READY_MARKER": descendant_ready_marker.to_string_lossy(),
+                "MINICORE_P7_RELEASE_MARKER": release_marker.to_string_lossy(),
+                "MINICORE_P7_EXIT_MARKER": descendant_exit_marker.to_string_lossy(),
             }
         })
     }
@@ -852,40 +922,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn descendant_pipe_handles_remain_bounded_by_the_original_user_timeout() {
+    async fn direct_child_exit_with_inherited_pipes_is_bounded_by_user_timeout() {
         let sequence = NEXT_PROCESS_ROOT.fetch_add(1, Ordering::Relaxed);
-        let ready_marker = env::temp_dir().join(format!(
-            "minicore-p7-descendant-ready-{}-{sequence}",
-            std::process::id()
-        ));
-        let exit_marker = env::temp_dir().join(format!(
-            "minicore-p7-descendant-exit-{}-{sequence}",
-            std::process::id()
-        ));
-        let _ = runtime::fs::remove_file(&ready_marker);
-        let _ = runtime::fs::remove_file(&exit_marker);
+        let markers = DescendantMarkers::new("descendant", sequence);
+        markers.clear();
+        let ready_marker = &markers.ready;
+        let go_marker = &markers.go;
+        let direct_exit_marker = &markers.direct_exit;
+        let descendant_ready_marker = &markers.descendant_ready;
+        let release_marker = &markers.release;
+        let descendant_exit_marker = &markers.descendant_exit;
+
         let policy = helper_policy(
             1024,
             1024,
-            Duration::from_secs(3),
+            Duration::from_secs(15),
             &[
                 "MINICORE_P7_HELPER_MODE",
                 "MINICORE_P7_READY_MARKER",
+                "MINICORE_P7_GO_MARKER",
+                "MINICORE_P7_DIRECT_EXIT_MARKER",
+                "MINICORE_P7_DESCENDANT_READY_MARKER",
+                "MINICORE_P7_RELEASE_MARKER",
                 "MINICORE_P7_EXIT_MARKER",
-                "MINICORE_P7_HOLD_MS",
             ],
         );
-        let output = tokio::time::timeout(
-            Duration::from_secs(8),
+        let mut operation = Box::pin(tokio::time::timeout(
+            Duration::from_secs(20),
             execute(
                 policy,
                 CancellationToken::new(),
-                descendant_args(&ready_marker, &exit_marker),
+                descendant_args(
+                    ready_marker,
+                    go_marker,
+                    direct_exit_marker,
+                    descendant_ready_marker,
+                    release_marker,
+                    descendant_exit_marker,
+                ),
             ),
-        )
-        .await
-        .expect("the user timeout must bound inherited pipe handles")
-        .unwrap();
+        ));
+
+        for _ in 0..1_500 {
+            if ready_marker.exists() {
+                break;
+            }
+            tokio::select! {
+                result = &mut operation => panic!("command completed before helper readiness: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+        assert!(
+            ready_marker.exists(),
+            "the direct child must signal readiness"
+        );
+        runtime::fs::write(go_marker, b"go").unwrap();
+
+        for _ in 0..1_500 {
+            if direct_exit_marker.exists() {
+                break;
+            }
+            tokio::select! {
+                result = &mut operation => panic!("command completed before direct-child exit: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+        assert!(
+            direct_exit_marker.exists(),
+            "the direct child must signal exit before leaving its pipe descendant"
+        );
+
+        let output = operation
+            .await
+            .expect("the outer test bound must exceed user timeout plus cleanup")
+            .unwrap();
         let value: Value = serde_json::from_str(output.text()).unwrap();
         assert_eq!(value["timed_out"], true, "unexpected output: {value}");
         assert_eq!(
@@ -893,30 +1003,31 @@ mod tests {
             "unexpected output: {value}"
         );
         assert_eq!(value["exit_code"], 0, "unexpected output: {value}");
-        assert!(
-            ready_marker.exists(),
-            "the direct child must spawn its descendant"
-        );
 
-        tokio::time::sleep(Duration::from_millis(5_800)).await;
-        assert!(exit_marker.exists(), "the finite test descendant must exit");
-        let _ = runtime::fs::remove_file(ready_marker);
-        let _ = runtime::fs::remove_file(exit_marker);
+        markers.release();
+        for _ in 0..300 {
+            if descendant_exit_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            descendant_exit_marker.exists(),
+            "the finite test descendant must be released and reaped"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancellation_after_direct_child_exit_does_not_wait_for_inherited_pipes() {
         let sequence = NEXT_PROCESS_ROOT.fetch_add(1, Ordering::Relaxed);
-        let ready_marker = env::temp_dir().join(format!(
-            "minicore-p7-cancel-descendant-ready-{}-{sequence}",
-            std::process::id()
-        ));
-        let exit_marker = env::temp_dir().join(format!(
-            "minicore-p7-cancel-descendant-exit-{}-{sequence}",
-            std::process::id()
-        ));
-        let _ = runtime::fs::remove_file(&ready_marker);
-        let _ = runtime::fs::remove_file(&exit_marker);
+        let markers = DescendantMarkers::new("cancel-descendant", sequence);
+        markers.clear();
+        let ready_marker = &markers.ready;
+        let go_marker = &markers.go;
+        let direct_exit_marker = &markers.direct_exit;
+        let descendant_ready_marker = &markers.descendant_ready;
+        let release_marker = &markers.release;
+        let descendant_exit_marker = &markers.descendant_exit;
         let policy = helper_policy(
             1024,
             1024,
@@ -924,40 +1035,64 @@ mod tests {
             &[
                 "MINICORE_P7_HELPER_MODE",
                 "MINICORE_P7_READY_MARKER",
+                "MINICORE_P7_GO_MARKER",
+                "MINICORE_P7_DIRECT_EXIT_MARKER",
+                "MINICORE_P7_DESCENDANT_READY_MARKER",
+                "MINICORE_P7_RELEASE_MARKER",
                 "MINICORE_P7_EXIT_MARKER",
-                "MINICORE_P7_HOLD_MS",
             ],
         );
         let cancellation = CancellationToken::new();
         let mut operation = Box::pin(execute(
             policy,
             cancellation.clone(),
-            descendant_args(&ready_marker, &exit_marker),
+            descendant_args(
+                ready_marker,
+                go_marker,
+                direct_exit_marker,
+                descendant_ready_marker,
+                release_marker,
+                descendant_exit_marker,
+            ),
         ));
-        for _ in 0..1_000 {
+        for _ in 0..1_500 {
             if ready_marker.exists() {
                 break;
             }
             tokio::select! {
-                result = &mut operation => panic!("command completed before the direct child exit marker: {result:?}"),
+                result = &mut operation => panic!("command completed before helper readiness: {result:?}"),
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {}
             }
         }
         assert!(ready_marker.exists());
-        tokio::select! {
-            result = &mut operation => panic!("command completed before cancellation: {result:?}"),
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        runtime::fs::write(go_marker, b"go").unwrap();
+        for _ in 0..1_500 {
+            if direct_exit_marker.exists() {
+                break;
+            }
+            tokio::select! {
+                result = &mut operation => panic!("command completed before direct-child exit: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
         }
+        assert!(direct_exit_marker.exists());
         cancellation.cancel();
         let result = tokio::time::timeout(Duration::from_secs(2), operation)
             .await
             .expect("cancellation must not wait for inherited pipe handles");
         assert_eq!(result, Err(ToolError::Cancelled));
 
-        tokio::time::sleep(Duration::from_millis(5_800)).await;
-        assert!(exit_marker.exists(), "the finite test descendant must exit");
-        let _ = runtime::fs::remove_file(ready_marker);
-        let _ = runtime::fs::remove_file(exit_marker);
+        markers.release();
+        for _ in 0..300 {
+            if descendant_exit_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            descendant_exit_marker.exists(),
+            "the finite test descendant must exit"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1157,6 +1292,20 @@ mod tests {
                 }
             }
             "descendant" => {
+                if let Ok(path) = env::var("MINICORE_P7_READY_MARKER") {
+                    runtime::fs::write(path, b"direct child started").unwrap();
+                }
+                println!("direct child ready");
+                let _ = std::io::stdout().flush();
+                let go = env::var("MINICORE_P7_GO_MARKER").unwrap();
+                let startup_deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while !Path::new(&go).exists() && std::time::Instant::now() < startup_deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if !Path::new(&go).exists() {
+                    std::process::exit(12);
+                }
+
                 let mut descendant = std::process::Command::new(env::current_exe().unwrap());
                 descendant
                     .args([
@@ -1165,22 +1314,49 @@ mod tests {
                         "--nocapture",
                     ])
                     .env("MINICORE_P7_HELPER_MODE", "hold_pipe")
+                    .env(
+                        "MINICORE_P7_DESCENDANT_READY_MARKER",
+                        env::var("MINICORE_P7_DESCENDANT_READY_MARKER").unwrap(),
+                    )
+                    .env(
+                        "MINICORE_P7_RELEASE_MARKER",
+                        env::var("MINICORE_P7_RELEASE_MARKER").unwrap(),
+                    )
+                    .env(
+                        "MINICORE_P7_EXIT_MARKER",
+                        env::var("MINICORE_P7_EXIT_MARKER").unwrap(),
+                    )
                     .spawn()
                     .unwrap();
-                if let Ok(path) = env::var("MINICORE_P7_READY_MARKER") {
-                    let _ = runtime::fs::write(path, b"direct child is exiting");
+                let descendant_ready = env::var("MINICORE_P7_DESCENDANT_READY_MARKER").unwrap();
+                let descendant_ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !Path::new(&descendant_ready).exists()
+                    && std::time::Instant::now() < descendant_ready_deadline
+                {
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                if !Path::new(&descendant_ready).exists() {
+                    std::process::exit(13);
+                }
+                if let Ok(path) = env::var("MINICORE_P7_DIRECT_EXIT_MARKER") {
+                    runtime::fs::write(path, b"direct child exited").unwrap();
+                }
+                println!("direct child exiting");
+                let _ = std::io::stdout().flush();
                 std::process::exit(0);
             }
             "hold_pipe" => {
-                let hold_ms = env::var("MINICORE_P7_HOLD_MS")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(800);
-                std::thread::sleep(Duration::from_millis(hold_ms));
+                if let Ok(path) = env::var("MINICORE_P7_DESCENDANT_READY_MARKER") {
+                    runtime::fs::write(path, b"descendant started").unwrap();
+                }
+                let release = env::var("MINICORE_P7_RELEASE_MARKER").unwrap();
+                let release_deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while !Path::new(&release).exists() && std::time::Instant::now() < release_deadline
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 if let Ok(path) = env::var("MINICORE_P7_EXIT_MARKER") {
-                    let _ = runtime::fs::write(path, b"descendant exited");
+                    runtime::fs::write(path, b"descendant exited").unwrap();
                 }
                 std::process::exit(0);
             }
