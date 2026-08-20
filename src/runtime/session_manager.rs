@@ -13,19 +13,25 @@ use crate::ids::SessionId;
 use crate::session::command::SessionHandle;
 use crate::storage::conversation::ConversationLog;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LoadedSessionId(u64);
+
 pub(crate) struct ManagedSession {
+    loaded_session_id: LoadedSessionId,
     pub(crate) handle: SessionHandle,
     pub(crate) conversation: Arc<ConversationLog>,
     join: Arc<JoinOnce<Result<(), SessionError>>>,
 }
 
 impl ManagedSession {
-    pub(crate) fn new(
+    pub(super) fn new(
+        loaded_session_id: LoadedSessionId,
         handle: SessionHandle,
         conversation: Arc<ConversationLog>,
         actor: JoinHandle<Result<(), SessionError>>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            loaded_session_id,
             handle,
             conversation,
             join: JoinOnce::new(actor, || Err(SessionError::Internal)),
@@ -224,6 +230,18 @@ struct ManagerState {
     loaded: BTreeMap<SessionId, Arc<ManagedSession>>,
     loading: BTreeSet<SessionId>,
     closing: bool,
+    next_loaded_session_id: u64,
+}
+
+impl ManagerState {
+    fn allocate_loaded_session_id(&mut self) -> Result<LoadedSessionId, SessionError> {
+        let value = self
+            .next_loaded_session_id
+            .checked_add(1)
+            .ok_or(SessionError::Internal)?;
+        self.next_loaded_session_id = value;
+        Ok(LoadedSessionId(value))
+    }
 }
 
 impl Clone for SessionManager {
@@ -242,6 +260,7 @@ impl SessionManager {
                     loaded: BTreeMap::new(),
                     loading: BTreeSet::new(),
                     closing: false,
+                    next_loaded_session_id: 0,
                 }),
                 loading_notify: Notify::new(),
             }),
@@ -259,10 +278,12 @@ impl SessionManager {
         if state.loading.contains(&id) {
             return Err(SessionError::Busy);
         }
+        let loaded_session_id = state.allocate_loaded_session_id()?;
         state.loading.insert(id);
         Ok(LoadReservation {
             manager: self.clone(),
             id,
+            loaded_session_id,
             active: true,
         })
     }
@@ -307,7 +328,7 @@ impl SessionManager {
         if state
             .loaded
             .get(&id)
-            .is_some_and(|current| Arc::ptr_eq(current, expected))
+            .is_some_and(|current| current.loaded_session_id == expected.loaded_session_id)
         {
             state.loaded.remove(&id);
             true
@@ -346,7 +367,14 @@ impl SessionManager {
 pub(crate) struct LoadReservation {
     manager: SessionManager,
     id: SessionId,
+    loaded_session_id: LoadedSessionId,
     active: bool,
+}
+
+impl LoadReservation {
+    pub(super) const fn loaded_session_id(&self) -> LoadedSessionId {
+        self.loaded_session_id
+    }
 }
 
 impl Drop for LoadReservation {
@@ -370,3 +398,44 @@ const _: () = {
     let _ = ManagedSession::close;
     let _ = JoinOnce::<Result<(), SessionError>>::pending;
 };
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::{LoadedSessionId, ManagerState};
+    use crate::error::SessionError;
+
+    fn state() -> ManagerState {
+        ManagerState {
+            loaded: BTreeMap::new(),
+            loading: BTreeSet::new(),
+            closing: false,
+            next_loaded_session_id: 0,
+        }
+    }
+
+    #[test]
+    fn loaded_session_ids_are_monotonic_and_checked() {
+        let mut state = state();
+        let first = state.allocate_loaded_session_id().unwrap();
+        let second = state.allocate_loaded_session_id().unwrap();
+        assert_eq!(first, LoadedSessionId(1));
+        assert_eq!(second, LoadedSessionId(2));
+
+        state.next_loaded_session_id = u64::MAX;
+        assert_eq!(
+            state.allocate_loaded_session_id(),
+            Err(SessionError::Internal)
+        );
+        assert_eq!(state.next_loaded_session_id, u64::MAX);
+    }
+
+    #[test]
+    fn stale_loaded_session_ids_do_not_match_new_sessions() {
+        let mut state = state();
+        let old = state.allocate_loaded_session_id().unwrap();
+        let new = state.allocate_loaded_session_id().unwrap();
+        assert_ne!(old, new);
+    }
+}

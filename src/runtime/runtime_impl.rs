@@ -22,7 +22,7 @@ use crate::storage::time::Timestamp;
 use crate::tools::{AllowConfiguredTools, ToolName, ToolPolicy, ToolRegistry, UserAnswer};
 use crate::workspace::{Workspace, WorkspaceAccess, WorkspaceError};
 
-use super::session_manager::{JoinOnce, ManagedSession, SessionManager};
+use super::session_manager::{JoinOnce, LoadedSessionId, ManagedSession, SessionManager};
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct SessionSummary {
@@ -104,7 +104,9 @@ impl Runtime {
             .create(&stored)
             .await
             .map_err(map_store_session_error)?;
-        let managed = self.prepare_session(id).await?;
+        let managed = self
+            .prepare_session(id, reservation.loaded_session_id())
+            .await?;
         if self.inner.manager.finish_load(&mut reservation, managed) {
             return Err(SessionError::Closing);
         }
@@ -113,7 +115,9 @@ impl Runtime {
 
     pub async fn load_session(&self, id: SessionId) -> Result<(), SessionError> {
         let mut reservation = self.inner.manager.begin_load(id)?;
-        let managed = self.prepare_session(id).await?;
+        let managed = self
+            .prepare_session(id, reservation.loaded_session_id())
+            .await?;
         if self.inner.manager.finish_load(&mut reservation, managed) {
             return Err(SessionError::Closing);
         }
@@ -251,7 +255,11 @@ impl Runtime {
         self.inner.manager.get(id).ok_or(SessionError::NotFound)
     }
 
-    async fn prepare_session(&self, id: SessionId) -> Result<Arc<ManagedSession>, SessionError> {
+    async fn prepare_session(
+        &self,
+        id: SessionId,
+        loaded_session_id: LoadedSessionId,
+    ) -> Result<Arc<ManagedSession>, SessionError> {
         let stored = self
             .inner
             .store
@@ -300,7 +308,12 @@ impl Runtime {
             }
         };
         let actor_task = self.inner.runtime.spawn(actor.run());
-        Ok(ManagedSession::new(handle, conversation, actor_task))
+        Ok(ManagedSession::new(
+            loaded_session_id,
+            handle,
+            conversation,
+            actor_task,
+        ))
     }
 }
 
