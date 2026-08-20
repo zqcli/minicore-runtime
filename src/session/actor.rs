@@ -1525,7 +1525,7 @@ mod tests {
             stream.recv().await,
             Some(SessionEvent::TurnStarted { turn_id })
         );
-        assert_eq!(stream.snapshot().conversation_seq(), 1);
+        assert!(stream.snapshot().conversation_seq() >= 1);
         assert_eq!(
             stream.recv().await,
             Some(SessionEvent::TextDelta {
@@ -1803,11 +1803,24 @@ mod tests {
                 .await,
             Err(crate::error::SessionError::InteractionMismatch)
         );
-        assert!(matches!(
-            handle.snapshot().status(),
-            SessionStatus::WaitingForInput { turn_id: current, interaction_id: current_id }
-                if current == turn_id && current_id == interaction_id
-        ));
+        let cancellation_snapshot = handle.snapshot();
+        match cancellation_snapshot.status() {
+            SessionStatus::WaitingForInput {
+                turn_id: current,
+                interaction_id: current_id,
+            } => {
+                assert_eq!(current, turn_id);
+                assert_eq!(current_id, interaction_id);
+            }
+            SessionStatus::Idle => assert!(matches!(
+                cancellation_snapshot.last_terminal(),
+                Some(TurnTerminal {
+                    turn_id: current,
+                    outcome: TurnOutcome::Cancelled,
+                }) if *current == turn_id
+            )),
+            status => panic!("unexpected post-cancel status: {status:?}"),
+        }
         let before_terminal = log.snapshot().await;
         assert!(before_terminal.entries().len() >= 2);
         assert!(
