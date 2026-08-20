@@ -15,8 +15,8 @@ use minicore_runtime::tools::{
     ToolSpec,
 };
 use minicore_runtime::{
-    RetryPolicy, Runtime, RuntimeConfig, SessionConfig, SessionEvent, SessionEventStream,
-    SessionId, SessionStatus, TurnOutcome,
+    ConfigError, RetryPolicy, Runtime, RuntimeConfig, SessionConfig, SessionEvent,
+    SessionEventStream, SessionId, SessionStatus, TurnOutcome,
 };
 use tokio::runtime::Handle;
 
@@ -722,15 +722,13 @@ async fn dropping_shutdown_waiter_does_not_poison_retained_cleanup() {
     first.abort();
     let _ = first.await;
     tokio::time::advance(Duration::from_millis(101)).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::resume();
     let second = tokio::spawn(async move { runtime.shutdown().await });
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
-    assert!(second.is_finished());
-    assert_eq!(second.await.unwrap(), Ok(()));
+    let second_result = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("retained shutdown did not complete within the bounded drain timeout")
+        .unwrap();
+    assert_eq!(second_result, Ok(()));
     let reopened = Runtime::open(runtime_config(&root), Handle::current())
         .await
         .unwrap();
@@ -757,11 +755,12 @@ async fn shutdown_signals_all_sessions_before_any_close_drain() {
     }
     assert_eq!(cancellations.load(Ordering::SeqCst), ids.len());
     tokio::time::advance(Duration::from_millis(101)).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
-    assert!(shutdown.is_finished());
-    assert_eq!(shutdown.await.unwrap(), Ok(()));
+    tokio::time::resume();
+    let shutdown_result = tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("shutdown did not complete within the bounded drain timeout")
+        .unwrap();
+    assert_eq!(shutdown_result, Ok(()));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -886,9 +885,12 @@ async fn concurrent_shutdown_callers_receive_the_same_result() {
 
 #[test]
 fn checked_config_builder_enforces_timeout_and_capacity_bounds() {
-    let root = PathBuf::from("/tmp/minicore-p7-config-bounds");
+    let root = std::env::temp_dir().join(format!(
+        "minicore-p7-config-bounds-{}",
+        SessionId::new().unwrap()
+    ));
     let retry = RetryPolicy::new(1, Duration::ZERO).unwrap();
-    assert!(
+    assert!(matches!(
         RuntimeConfig::builder(
             root.clone(),
             ProviderRegistry::default(),
@@ -897,10 +899,10 @@ fn checked_config_builder_enforces_timeout_and_capacity_bounds() {
             retry,
         )
         .shutdown_timeout(Duration::ZERO)
-        .build()
-        .is_err()
-    );
-    assert!(
+        .build(),
+        Err(ConfigError::InvalidBounds)
+    ));
+    assert!(matches!(
         RuntimeConfig::builder(
             root,
             ProviderRegistry::default(),
@@ -909,21 +911,25 @@ fn checked_config_builder_enforces_timeout_and_capacity_bounds() {
             retry,
         )
         .capacities(0, 64, 64)
-        .build()
-        .is_err()
-    );
-    assert!(
+        .build(),
+        Err(ConfigError::InvalidBounds)
+    ));
+    let workspace_root = std::env::temp_dir().join(format!(
+        "minicore-p7-workspace-bounds-{}",
+        SessionId::new().unwrap()
+    ));
+    assert!(matches!(
         SessionConfig::new(
-            PathBuf::from("/tmp/minicore-p7-workspace-bounds"),
+            workspace_root,
             selection(),
             "system",
             BTreeSet::new(),
             10,
             10,
             4,
-        )
-        .is_err()
-    );
+        ),
+        Err(ConfigError::InvalidBounds)
+    ));
 }
 
 #[test]

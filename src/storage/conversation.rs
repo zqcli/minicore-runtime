@@ -1454,6 +1454,10 @@ mod tests {
         ))
     }
 
+    fn workspace_root(id: SessionId) -> PathBuf {
+        std::env::temp_dir().join(format!("minicore-p4-workspace-{id}"))
+    }
+
     fn timestamp() -> Timestamp {
         "2026-08-19T12:34:56.789Z".parse().unwrap()
     }
@@ -1473,7 +1477,7 @@ mod tests {
             id,
             timestamp(),
             timestamp(),
-            PathBuf::from("/tmp/workspace"),
+            workspace_root(id),
             model,
             "system".to_owned(),
             execution,
