@@ -2,7 +2,7 @@
 
 > Archived V2 evidence. These fixtures are retained for historical/conformance reference and are not run by default.
 
-本目录保存ADR 0134、[Wire Schema](../../../../modules/wire-schema.md)和[Conversation JSONL Format V1](../../../../formats/conversation-jsonl-v1.md)的byte-exact conformance vectors。fixture文件是规范的一部分，不是说明性伪代码。最低结构自检：
+本目录保存ADR 0134、[Wire Schema](../../pre-reset/modules/wire-schema.md)和[Conversation JSONL Format V1](../../pre-reset/formats/conversation-jsonl-v1.md)的byte-exact conformance vectors。fixture文件是规范的一部分，不是说明性伪代码。最低结构自检：
 
 ```bash
 python3 docs/archive/v2/fixtures/wire-v1/verify.py

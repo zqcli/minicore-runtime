@@ -1,282 +1,250 @@
-# MiniCore 架构（V2 当前权威）
+# v0.2 Architecture
 
-本文档是MiniCore原生Agent harness runtime core的架构总入口。详细设计位于[`docs/modules/`](modules/README.md)。
+## Purpose
 
-## 版本状态
-
-| 版本 | 状态 |
-| --- | --- |
-| V1 | 已归档，只保存在[`docs/archive/v1/`](archive/v1/README.md)和Git history中。 |
-| V2 | 当前权威架构。ADR 0126–0148冻结async execution、conversation/wire、DurableState/Store V1/root lease、Tokio owner-tracked foundations、Rust 1.85 provider dependency边界、Tool Sandbox pre-start fail-closed admission、M14 stateless full-request wire policy与closed production Tool builtins（`ask_user`/`read_file`/`list_directory`/`write_file`/`fetch_url`）。M5 durable/replay、M6 Prompt/Model/Residency foundations、M7 ordinary AgentRun、M8 Tool/Interaction/Cancel与crate-private `ToolOperationSlot`完整生命周期（Prepared→Running→Settling→Terminal：per-slot first-wins start gate + typed proof + Running cancellation）、crate-private scripted approval/UserQuestion控制seam（typed `ToolExecutionPlan::{Approval, UserQuestion}`拆分、concrete Session-owned `ToolExecutionControl`、move-only `UserQuestionAnswerBinding`、hoisted exclusive question调度与signal-first settlement）、M9 current control/observation范围、M10完整Compaction，以及M11 Session Fork/catalog/lifecycle、Agent mutation、Session metadata CAS、ordinary Session definition CAS、Agent revision upgrade、Ready-state `ReloadWorkspace`、Workspace/Prompt Unavailable loaded readiness及ReloadWorkspace恢复、Agent readiness fan-out与ModelUnavailable及selected PromptUnavailable load/definition projection和shared-resource reload recovery/fanout与complete shared-root publication及active-Turn graceful Unload（default 30s/≤5min grace、PrepareForUnload deadline signal、truthful settlement、shutdown broadcast）vertical slices已实现。host security Workspace authority invalidation亦已实现：`MiniCoreRuntime::invalidate_session_workspace_authority(session_id)`为public host-only（非wire command）async seam，redacted `SessionWorkspaceInvalidationError{RuntimeClosing,SessionNotLoaded,InternalDispatchUnavailable}`，host已先发布current hard restriction fact，Runtime只驱动loaded executor的signal+Workspace re-resolve，不改durable definition/revision/metadata/conversation、无CommandId；route不经runtime publication semaphore、不等待普通work lane，经residency loaded map直接clone executor调用out-of-band API（先同步close admission gate再经unbounded emergency lane发送，绝不被bounded work阻塞），采样single SystemClock timestamp；missing loaded executor或per-Session Unload/old exact executor race→SessionNotLoaded、仅registry/runtime closing→RuntimeClosing、fatal→Internal；active admission/Turn对exact current emergency target发sticky `SecurityRevoked` first-wins（更早Cancel/PrepareUnload保留原reason，仅形成Turn投影Finishing、pre-Input Starting legal，pending Interaction按SecurityRevoked truthful settlement；即使active publication在飞也立即signal——publication不屏蔽security signal），仅无admission/Turn而publication在飞也立即进入`Preparing`（drop旧WorkspaceSnapshot并mask workspace cause、发布唯一一次`ReadinessChanged(None)`；publication不取消不阻塞）但recovery worker仍等其settlement并以post-publication exact definition启动（settle后幂等re-enter不重复start event、publication产出的snapshot不重新安装），只要Idle且无active admission/Turn即进入`Preparing`（active publication不阻塞Preparing entry、只等Turn/admission settle；`SessionExecutorSnapshot.workspace_preparing`为最高readiness优先级，Preparing必须Idle+workspace None+空public queues/accepting false，enter drop旧WorkspaceSnapshot并mask workspace cause），recovery worker则单独等待publication settle后才spawn（全空Idle立即spawn），owner-tracked且重复invalidation join同一state不重复signal/recovery；recovery worker复用ReloadWorkspace resolve/capture/revalidate/finish（最小shared async helper返回exact WorkspaceSnapshot或neutral classification，普通ReloadWorkspace映射不变），security分类所有非internal resolver失败（含AuthorityDenied）→WorkspaceUnavailable、Workspace Prompt SourceDiscovery/ContentLoad/DuplicateKey→PromptUnavailable、Closing→typed Closing、shape/channel/task mismatch与Skill roots非空→fatal Internal，install前验证Arc ptr_eq与snapshot SessionId/revision，不调用DurableState；start/finish各发布一次`session_readiness_changed`（command_id None），不发WorkspaceReloaded event、No Runtime event；recovery pending禁止FollowUp pop/start，新Submit因gate close失败（Preparing→公开`SessionNotReady`+RetryWithBackoff）；close/fatal/reap settle security waiters exactly once（closing→Closing、fatal/task/channel/shape→Internal），worker owner-tracked并reap；`SessionExecutorEvent::ReadinessChanged.command_id`改`Option<CommandId>`（Agent/shared reload传Some、security传None）。manifest现为144项；wire `Preparing`由并行worker激活，host security Preparing/active Turn duplicate recovery fixtures/tests已补齐（scenario/fixture closure已实现，统一质量门禁已通过）。RuntimeDependencyUnavailable loaded readiness与probe recovery亦已实现：`SessionExecutorSnapshot`新增独立`runtime_dependency_unavailable: bool`事实，唯一真实producer是loaded Turn admission读取pinned historical AgentRevisionRef时`DurableState::read_agent_definition`的transient `StorageUnavailable`（不是host global bool，也不是`ReloadSharedResources`——shared-resource reload不触碰本fact，Tokio `RuntimeDependencyUnavailable`仍只属于open error），readiness只在Idle按固定优先级为workspace_preparing→Preparing、agent_available=false→AgentUnavailable、workspace cause→cause、prompt_available=false→PromptUnavailable、model_available=false→ModelUnavailable、runtime_dependency_unavailable→RuntimeDependencyUnavailable、否则Ready（非Idle执行始终投影Ready；facts是future-only，new Unavailable只在回Idle后显现）；首次失败settle回Idle后安装该fact并发布`ReadinessChanged(command_id None)`，Submit返回`SessionNotReady(RuntimeDependencyUnavailable)`+RetryWithBackoff并立即启动owner-tracked无TurnId probe（复用同一exact read路径），probe仍Unavailable则保持fact并等待next Submit re-arm，probe Recovered清fact、发布`ReadinessChanged(command_id None)`并保留retained FollowUp handoff；AgentNotFound/RevisionUnavailable分类为AgentUnavailable而非本cause，model recapture failure是internal invariant（不伪装为本cause），fatal/closing/corrupt/too-large不进入本cause，普通Unavailable保留last-good Workspace且active Turn不受影响；恢复只由exact DurableState read probe与Submit re-arm拥有，无新public/wire command，manifest现为144项；RuntimeDependencyUnavailable真实historical storage fault+probe/rearm+retained FollowUp fixtures/tests已补齐（scenario/fixture closure已实现，统一质量门禁已通过）。full recovery scenario/fixture closure已实现并通过统一质量门禁；crate-private Structured output foundation已实现（`OutputContract::Structured` exact-model contract、schema v1 subset、terminal本地schema validation），crate-private `ToolOperationSlot`完整生命周期亦已实现（Prepared→Running→Settling→Terminal：exact request identity、per-slot first-wins reservation、typed started proof、Running cancellation pair、signal先赢→PreExecution Cancelled且不调用factory、start先赢→Settling继续await same run后truthful settle、PreExecution/Executed/Abandoned truthful settlement），crate-private scripted approval/UserQuestion控制seam亦已完成：typed `ToolExecutionPlan::{Approval, UserQuestion}`结构拆分（旧generic Interaction plan删除）、private concrete Session-owned `ToolExecutionControl`复用既有Interaction actor/wire/storage owner（无public interface/trait冻结）、Tools-owned move-only/redacted `UserQuestionAnswerBinding`（仅truthful PreExecution+Succeeded接受为answer，malformed/panic fail closed）、opaque-owner Emergency observation与move-only presentation/resolution/binding/unstarted-settlement permits（绑定owner+target/epoch+同一`ToolExecutionRequest`，ToolStartGate独立、Submit→Turn signal迁移原子、signal/close first-wins）、UserQuestion按typed plan shape hoisted到全部ordinary sibling之前（call_index串行、至多一个pending、所在slot仍持有per-slot ToolStartGate但question路径不reserve/start gate且不涉及mutation ticket、每个question outcome先apply+inline record再继续）、signal-first跳过binding并settle全部unstarted calls为matching PreExecution Cancelled；M12/V4-P1-3已由ADR 0138/0139、OpenAI Responses/Anthropic Messages真实Rig 0.40.0 standalone loopback evidence、protocol terminal/metadata seam、26-case delivery/error fixture及真实Rust 1.85冷编译关闭：Rig被拒绝进入production baseline，M14改为两个direct provider adapters；M13/V4-C0-1已由ADR 0140、class-level Sandbox admission、approval revalidation与adapter-independent Session round conformance关闭；M14 OpenAI Responses/Anthropic Messages direct adapters、provider-native Structured strict mapping、host-only dynamic credential/catalog installation与explicit ignored live smoke harness均已实现，stateless full-request wire policy已由[ADR 0141](adr/0141-provider-calls-are-stateless-full-request.md)冻结为有意omission（不是pending实现：每次`generate_model_turn`至多一次`ProviderAdapter::execute`、独立地零或一个POST，若发送POST则携带完整full request，无optimization fallback/continuation）；M14 production `ask_user` builtin已实现（ADR 0142：ToolName/schema与answer→model-visible ToolResult text/render格式已冻结，closed/default-off、`MiniCoreRuntimeConfig::with_ask_user_tool()` idempotent opt-in与`ToolSet::ask_user_builtin()`、零capability permission、仅UserQuestion或frozen PreExecution failure plans、answer为恰一个deterministic compact JSON Text part）；M14 narrow OS-backed production `read_file` builtin亦已实现（ADR 0143：closed/default-off、`MiniCoreRuntimeConfig::with_read_file_tool()` idempotent opt-in且与`with_ask_user_tool()`相互独立可组合、cwd-relative-only单一required `path`（strict `WorkspaceRelativePath`，无absolute/dot segment、≤4,096 bytes）、per-admission对exact captured Workspace materialize ToolSet（默认Runtime ToolSet保持空）、ReadOnly authority ceiling（`ReadOnlyWorkspaceAuthority`，永不`ReadWrite`且Prompt/Skill source ceiling false、trust Restricted）、capability-relative cap-std open（symlink escape在capability open失败，无ambient path/`std::fs::read`/`canonicalize`）、Execute plan恰带`FilesystemRead`且sandbox contract available exactly for `FilesystemRead`（按ADR 0140对同一single class复验admission）、至多65,537字节bounded读取→恰一个≤65,536字节UTF-8 Text part与frozen PreExecution/Completed texts、owner-tracked blocking job一旦scheduled绝不drop/detach；host `invalidate_session_workspace_authority`对任一Workspace read Runtime先经`WorkspaceReadAccessControl::revoke`永久撤销该Session read grant（idempotent、本Runtime lifetime内无unrevoke）再采样timestamp signal与re-resolve，recovery re-resolve只授予filesystem `None`、绝不恢复`ReadOnly`，restriction在residency返回SessionNotLoaded/Closing/internal时仍保持current；bytes/application work有界、special files以nonblocking capability open拒绝且不挂起、ordinary regular file的wall-clock完成依赖OS/filesystem且不宣称timeout）；M14 production `list_directory` builtin亦已实现（ADR 0144：closed/default-off、cwd-relative bounded direct enumeration与owner-tracked settlement）；M14 production `write_file` builtin已由ADR 0146实现（closed/default-off、ReadWrite ceiling仍与requested access取intersection、capability-prepared physical target、same-Session FIFO与permit through Settling、two tracked jobs/full replacement/no mkdir/append/atomic rename）；production `fetch_url`已由ADR 0147实现（closed/default-off、host-installed exact HTTPS origin与pinned addresses、无ambient DNS/redirect/retry/proxy/compression、2xx-only bounded safe UTF-8 response与owner-contained cancellation），五个opt-ins形成32种fixed selection并按`ask_user → read_file → list_directory → write_file → fetch_url`披露；public structured activation、具体Prompt/Skill source adapter、完整generic Tool policy/approval、process及其他未实现production adapters、public Tool DTO与具体Skill composition/source仍待实现，2026-08-12两个real-credential public Runtime release smoke均通过，固定产品User-Agent与Anthropic unsigned thinking/omitted start-stop refinements由[ADR 0145](adr/0145-live-provider-evidence-refines-direct-adapter-wire-truth.md)冻结；process及其他未实现OS-backed Tool/Sandbox adapters仍pending；完整cross-platform native matrix acceptance已通过（全部七个`platform_m5_0`坐标均有对应的production行为与测试覆盖；GitHub Actions run 31433810296四个job全部通过：Ubuntu Rust stable、Ubuntu Rust 1.85.0、cargo test macos-latest、cargo test windows-latest）；当前`fetch_url` milestone已完成本地acceptance：stable/真实Rust 1.85主crate均为library 1031 passed、3 ignored与integration 159 passed、3 ignored；stable另通过provider-gate 25/25、Clippy、format、current/archive docs、Wire V1 144 active/0 pending与Durable Store fixtures；两个live provider smoke仍默认ignored/offline，既有显式release evidence由ADR 0145记录）；后续见[开发计划](development-plan.md)。 |
-
-权威顺序：本文与`docs/modules/` → current/refined ADR → formats + fixtures → development plan → migration + research → archive。
-
-## 设计定位
-
-MiniCore采用Codex式执行结构：每个loaded Session有一个`SessionExecutor` control actor和最多一个`ActiveTurnTask`。ActiveTurnTask使用普通async loop顺序编排Model、Tool、Interaction、logical retry和Compaction；不再实现同步sans-I/O `AgentLoop`、`next_action()`或`RunningOperation` effect协议。
-
-`DurableState`是Agent/Session entity physical truth的private deep module：它以root lease、permanent reservations、immutable Store V1 generations、COMMITTED/PUBLISHED readback和single actor管理catalog；caller永不看到staging/path/generation/marker。新entity Create/Fork publication是complete-or-invisible；existing-head update则在reopen时是完整old generation或完整new generation。`CommandId`不持久化，Create/Fork response loss可能留下host未知但catalog-visible的generated ID，host需重新page/query且blind retry可能duplicate。
-
-Session的当前进程事实由`LiveSessionState`拥有。`SessionRecorder`只做ordered best-effort inline JSONL append；成功不表示flush或fsync，失败不回滚live state或重放外部操作。`ConversationStorage` owns the recorded tree, replay, and Fork semantic seed; `DurableState` owns the physical target, Fork sink, and publication; lifecycle/Runtime orchestrates them. TurnStatus与terminal StateEvent只属于loaded execution。process crash后只恢复实际留下的conversation完整行前缀。
-
-OpenAI Responses与Anthropic Messages的direct private `ProviderAdapter`各自实现单次provider attempt。Model resolution、request validation、credential、response validation和provider-neutral terminal result仍由ModelGateway拥有；logical retry由ActiveTurnTask拥有。Rig 0.40.0只保留在standalone evidence harness，不进入production dependency graph。
-
-下游TUI/GUI将MiniCore嵌入为Rust library：`dispatch/query/snapshot/subscribe`是Wire-compatible transport families；[ADR 0148](adr/0148-v0-1-session-transcript-is-a-library-only-read-seam.md)另提供library-only `session_transcript`恢复completed User/Assistant文本。当前crate不提供CLI、server、daemon或binary target。
-
-## 领域模型
+MiniCore Runtime is a typed, embeddable core for a durable coding session. The architecture favors deep owners over a broad protocol layer:
 
 ```text
-MiniCoreRuntime
-└─ Agent*
-   └─ Session*
-      └─ Turn*
-         └─ Item*
-            └─ Interaction*
+host configuration
+    -> Runtime
+        -> SessionManager / SessionStore
+            -> zero or more loaded SessionActors
+                -> one Turn runner per active Session
+                    -> PromptBuilder -> ModelGateway -> ToolRegistry/Workspace
+                        -> ConversationLog -> Snapshot/Event/Transcript
 ```
 
-核心关系：
+The source of truth for this map is [`src/lib.rs`](../src/lib.rs), the [canonical module map](modules/README.md), and the current [format documents](formats/session-json-v2.md). Historical pre-reset material is not an implementation dependency.
 
-- 一个Agent可被多个Session引用；一个Session固定归属一个Agent；
-- Workspace属于`SessionDefinition`，active Turn捕获immutable `WorkspaceSnapshot`；
-- Prompt、Tool和Skill是独立module；
-- Turn/Item/Interaction是领域对象，Model request、provider stream、Tool future和ActiveTurnTask是process-local执行对象；
-- Session log用于resume、history和诊断，不证明当前进程全部live事实已经durable；
-- restart不恢复旧ActiveTurnTask、provider stream、Tool task、Interaction waiter、retry timer或queue。
+## Dependency Direction
 
-## Runtime-Owned共享模块
+The crate has one public facade and a small number of owner boundaries:
 
-```rust
-pub struct MiniCoreRuntime {
-    prompt_service: Arc<PromptService>,
-    tool_service: Arc<ToolService>,
-    skill_service: Arc<SkillService>,
-    model_gateway: Arc<ModelGateway>,
-    shared_resources: RwLock<SharedResourceRoots>,
-}
-```
+1. `config` validates host input and constructs checked values. It does not perform I/O.
+2. `model` owns provider descriptors, credential resolution, request/response values, transport, and model selection resolution.
+3. `tools` owns tool descriptions, policy decisions, interaction requests, process policy, and builtin execution contracts.
+4. `workspace` owns one capability-backed root and all filesystem operations relative to that root.
+5. `prompt` owns prompt assembly and compaction planning. It is private.
+6. `agent` owns one turn's model/tool loop. It is private and returns work to the session owner.
+7. `session` owns durable conversation state, the actor mailbox, terminal settlement, observation, and per-session resources.
+8. `runtime` owns public lifecycle admission, loaded-session residency, and runtime cleanup.
+
+The model registry does not reach into sessions. Tools receive a `ToolContext` rather than a Runtime handle. Workspace does not know about providers or conversation state. Prompt assembly consumes already-owned values. The session actor is the integration owner; it does not create peer actors for each subsystem.
+
+## Runtime Ownership
+
+`Runtime::open(config, handle)` opens the store before publishing a `Runtime`. The store worker creates the data directory, acquires `runtime.lock`, prepares `sessions/`, removes orphan temporary create directories, and reports a typed readiness result. The Runtime retains the store, a model gateway built from the immutable provider registry, and the session manager.
+
+`RuntimeConfig` contains:
+
+- absolute data directory;
+- immutable `ProviderRegistry`;
+- immutable `ToolRegistry`;
+- non-empty checked coding instructions;
+- shutdown timeout from 1 ms through 300 seconds;
+- bounded event, command, and runner-event capacities;
+- checked `RetryPolicy`.
+
+`SessionConfig` contains:
+
+- one absolute workspace root without lexical dot components;
+- one `ModelSelection`;
+- checked system prompt;
+- a sorted set of enabled tool names;
+- compaction trigger and target tokens;
+- maximum tool rounds.
+
+The host must register a provider descriptor for the selected model before `create_session`. The Runtime does not infer a provider from an endpoint or model string.
+
+## Session Residency
+
+`SessionManager` maintains one admission boundary for loaded, loading, and closing sessions. Create commits a durable session before preparing a loaded actor. Load reserves the session ID, reads and validates stored configuration, opens the workspace and conversation, prepares dependencies, then publishes one managed session. A failed preparation does not erase a durable create.
+
+Close requests the actor's owner-tracked close completion, removes the exact managed session, and retains the durable session for later load. Delete first excludes a loaded session, then removes its validated durable directory. List reads durable summaries and marks which sessions are loaded without opening every session actor.
+
+There is no second mailbox for a subsystem. Runtime admission is short and synchronous around manager state; the actor owns asynchronous session work after the manager publishes it.
+
+## Session State Machine
+
+The public session status is exactly:
 
 ```text
-captured SharedResourceRoots + Session/Agent/Workspace facts
-├─ ModelGateway::resolve_for_turn → Arc<TurnModelSnapshot>
-├─ SkillService::for_turn         → Arc<SkillView>
-├─ ToolService::for_turn          → Arc<ToolSet>
-└─ PromptService::for_turn        → Arc<PromptSet>
+Idle -> Running -> Idle
+Idle -> WaitingForInput -> Running -> Idle
+Idle/Running/WaitingForInput -> Closing
 ```
 
-active Turn始终使用admission时捕获的immutable对象。Prompt source在candidate build期间完全materialize为强`Arc`持有的正文；path/URL/source ID只用于discovery或provenance，PromptSet不执行正文I/O或resolver lookup。显式reload只影响future Turn。
+`Idle` accepts input. `Running` has an active model/tool turn. `WaitingForInput` has one claimed question presentation awaiting an answer. `Closing` rejects new work while accepted work and cleanup settle.
 
-## Loaded Session结构
+A public `SessionSnapshot` contains exactly these fields: `session_id`, `status`, `active_turn`, `pending_question`, `usage`, `last_error`, `last_terminal`, and `conversation_seq`. Its constructor validates the legal combinations of status, active turn, and pending question.
+
+## Submit Flow
+
+1. The host calls `Runtime::submit(session_id, input)`.
+2. Runtime resolves the exact loaded managed session or returns `SessionError`.
+3. The session handle sends one bounded submit command to the actor mailbox.
+4. The actor checks closing, readiness, interaction state, and turn admission.
+5. The actor persists the user entry before the turn is publicly resumed.
+6. The actor publishes the resulting snapshot and starts one owner future for the turn runner.
+7. The runner builds a prompt from the conversation projection and captured turn resources.
+8. Model output is streamed through a bounded model event sink and reduced into one checked response.
+9. Tool calls are validated in round order, admitted through the configured policy, executed with the captured workspace/cancellation context, and appended as durable results.
+10. The runner either requests the next model round, requests an interaction, requests compaction, or returns a truthful terminal result.
+11. The actor owns terminal append, projection refresh, status publication, and follow-on cleanup.
+
+A dropped caller is a dropped waiter, not a cancellation of owner-tracked actor work. A closed mailbox or actor failure maps to a session error rather than an apparent success.
+
+## Model Flow
+
+`ModelGateway` resolves a `ModelSelection` only through its immutable registry. Each provider descriptor carries its API model name, limits, and supported reasoning preferences. The provider receives a complete stateless request: system/user/assistant/tool messages and the current tool specifications are encoded for every attempt.
+
+Credentials are represented by redacted `ProviderCredential` values. A provider resolves its `CredentialSource` inside the attempt future. A missing credential is `AuthMissing` with `NotSent` delivery. Endpoint policy is explicit: production constructors use `HttpsOnly`; loopback constructors are for offline contract tests.
+
+OpenAI Responses and Anthropic Messages own their protocol rules. The transport client disables redirects, automatic retry, proxy discovery, and decompression. Response bodies and event streams are drained through bounds and cancellation. A successful stream requires protocol-specific terminal evidence; early EOF is not manufactured into success.
+
+## Provider Retry
+
+`RetryPolicy::new` accepts 1 through 4 total attempts and a base delay no greater than 30 seconds. Exponential delay is bounded at 30 seconds and may be raised by a provider retry-after value up to that same limit.
+
+A model failure is retry-safe only when the provider reports a pre-execution delivery state (`NotSent` or `RejectedBeforeExecution`) and the error kind is a permitted transient. `AcceptedNoOutput`, `Unknown`, and `OutputStarted` are conservative, non-retryable outcomes because the remote operation may have executed or produced semantic output. A retry-after value above 30 seconds disables the retry rather than being silently clipped into a retry.
+
+The model gateway has no local call permit and no detached retry task. The turn runner owns the retry loop and the session actor owns its cancellation and terminal settlement.
+
+## Tool Flow
+
+The `ToolRegistryBuilder` registers each tool once and freezes sorted immutable `ToolSpec` values. A session enables a set of names; unknown or unavailable names fail configuration or turn admission. The tool policy sees a checked `ToolRequest` and returns an allow, deny, or question decision without owning the tool future.
+
+A tool receives `ToolContext` containing:
+
+- the captured `Workspace`;
+- the current cancellation token;
+- the interaction bridge for question-based tools;
+- the tool's checked request context.
+
+The tool future returns a bounded `ToolOutput` with text and `is_error`. A panic, malformed result, cancellation, policy denial, or owner failure is converted into a truthful durable result. The actor does not treat a failed tool as a model success.
+
+### Filesystem Builtins
+
+`read_file`, `list_directory`, and `write_file` use one captured workspace capability. They accept only checked relative paths. Reads and writes are bounded to 256 KiB. Directory listing is direct-only, sorted, and bounded to 1,000 entries, 4 KiB per name, and 256 KiB total retained name bytes. Write is full replacement, does not create directories, and respects `ReadOnly` access.
+
+### Question Builtin
+
+`ask_user` produces one checked `UserQuestion` with safe UTF-8 question text and optional choices. The public DTO bounds are question/answer text `1..=8192` bytes, optional choices `1..=32`, and each choice `1..=1024` bytes. The DTO text validator permits newline and tab; the interaction context may apply the stricter all-control-character rejection before persistence. The actor publishes `WaitingForInput`. `InteractionRequest::claim_response` is the first-winner linearization point. After the claim, the actor appends the interaction and only then resumes normal Running publication. A late or duplicate answer is rejected without a second durable interaction.
+
+### Process Builtin
+
+`run_command` accepts `program`, `args`, optional relative `cwd`, optional `timeout_ms`, and an `env` object. It requires an explicit enabled `ProcessPolicy` and program/environment allowlists. It clears the child environment, passes only permitted inherited or requested values, captures bounded stdout/stderr, and uses a direct child process. It never parses a shell string. Timeout and cancellation kill/wait the direct child within the cleanup bound, but the runtime does not claim a process-tree sandbox.
+
+## Cancellation and Close
+
+Cancellation is requested through an out-of-band `CancelSlot`, not through the bounded submit/answer mailbox. The slot verifies the current turn while holding its short mutex, extracts pending interaction state, and signals the exact cancellation token. It never holds a mutex across an await.
+
+The actor maps cancellation according to the point at which it wins: before admission, during model delivery, during a tool, while waiting for input, or after durable terminal work. Accepted interaction answers are not retroactively rejected by a later cancellation; persistence-before-resume prevents a misleading host retry.
+
+Close synchronously signals admission cancellation, waits for accepted work, joins owner-tracked task handles, waits for conversation I/O idle, makes one truthful terminal append attempt when needed, closes the conversation and workspace, and publishes a shared close result. Cleanup errors cannot replace an earlier authoritative terminal error.
+
+## Observation
+
+Snapshots are the recovery baseline. `subscribe` returns a bounded stream whose first observable state is a snapshot; event delivery follows publication. The event stream can report lag and require a fresh subscription/resync rather than inventing missing intermediate state. Closure publishes exactly one `Closed` event before EOF.
+
+Model deltas, tool execution, interaction waiting, terminal results, and closure are projected into typed session events. Usage and terminal history are available through the snapshot. Event payloads are bounded and redact secret/host-specific values. A subscriber that drops its receiver does not cancel the owning actor.
+
+## Persistence and Recovery
+
+The store owns `runtime.lock` and the sessions namespace. Conversation append is serialized through the store worker, flushed/synchronized, and reflected in the in-memory state only after the durable barrier. `ConversationLog` owns the semantic append and replay contract; `SessionActor` owns when a user, assistant, tool, interaction, summary, or terminal entry is allowed to exist.
+
+Replay validates line size, file size, UTF-8, JSON shape, positive sequence order, tool relations, interaction identity, terminal boundaries, and summary boundaries. A final partial line is repaired by truncation to the last complete newline. A complete middle failure returns located corruption. Store health can degrade on local recording failure; a terminal append failure makes the live session unavailable rather than claiming completion.
+
+Prompt projection retains source conversation. A summary changes the model-visible prefix through `through_seq`; it does not delete transcript entries. Transcript pages expose durable `Interaction` entries even though those entries are not sent to the model.
+
+## Error Boundaries
+
+- Configuration errors belong to `ConfigError` and occur before Runtime open or session create.
+- Runtime open/shutdown failures belong to `RuntimeError`.
+- Session admission, residency, interaction, observation, and transcript failures belong to `SessionError`.
+- Model protocol and delivery failures remain `ModelError` until the turn runner maps them to a truthful terminal outcome.
+- Tool argument, policy, workspace, process, and cancellation failures remain owned by the tool path until the actor persists a result.
+- Store/conversation corruption, bounds, lock, worker, and cleanup failures remain owned by persistence until Runtime maps availability.
+
+No layer turns an unknown remote outcome into a safe retry, a failed durable append into success, or an unavailable workspace into an ambient path access.
+
+## Deliberate Limits
+
+The core has no default provider, no shell language, no process-tree sandbox claim, no automatic historical storage migration, and no server or CLI. It has one actor per loaded session, one bounded mailbox, one conversation log, one workspace owner, and one Runtime shutdown owner. Future host features must preserve these ownership boundaries or introduce a separate documented owner and evidence contract.
+
+## Startup and Shutdown Timeline
+
+Open starts with checked configuration, then store bootstrap, then model/tool ownership publication. No session actor exists until a durable session is prepared. This ordering makes a failed root lock or invalid provider/tool setup visible before session admission.
+
+Create first commits the durable session description and empty conversation, then prepares a workspace and conversation owner. Load starts from durable configuration and performs the same checked preparation against existing files. The manager publishes a managed session only after preparation succeeds.
+
+Close first blocks new admission, then lets accepted turn and interaction work settle, waits for conversation I/O, performs the final terminal/close sequence, closes workspace ownership, and removes the exact manager entry. Runtime shutdown applies the same sequence to all known sessions and then shuts down the store worker.
+
+The final barriers are deliberately ordered: actor close, conversation idle/terminal attempt, conversation close, workspace close, session manager removal, store worker shutdown, root-lock release, and Runtime shutdown result. A caller that drops a waiter cannot reorder those owner steps.
+
+## Detailed Owner Contracts
+
+### Configuration to admission
+
+`RuntimeConfig::new` checks the data root, coding instructions, capacities, timeout, and retry policy before any worker is started. `SessionConfig::new` checks the workspace root, system prompt, enabled-name count, compaction ordering, and round count before a durable object is created. This keeps invalid host input outside the actor state machine.
+
+The conversion from `SessionConfig` to `StoredSessionConfig` happens once, with a single timestamp used for creation and update. The stored configuration contains no provider credential, endpoint URL, tool implementation, workspace capability handle, or live actor state.
+
+### Actor work ownership
+
+The actor receives a bounded command enum. The command future may wait for a runner, an interaction append, a conversation barrier, or a close completion, but it never delegates ownership to an untracked task. The runner is a future held by the actor's owner-tracked turn state. A provider future is held by the runner; a blocking builtin job is held by its workspace or process owner.
+
+The actor's normal cycle is:
 
 ```text
-MiniCoreRuntime
-└─ LoadedSessionExecutors
-   └─ SessionExecutor
-      ├─ SessionIngress
-      ├─ LiveSessionState
-      ├─ SessionRecorder
-      ├─ SessionSnapshot publisher
-      └─ optional ActiveTurnTask
+admit -> persist user -> publish Running -> run turn
+     -> persist assistant/tool/interaction evidence
+     -> publish waiting or terminal state
+     -> settle close/queue/cancellation boundaries
 ```
 
-`SessionExecutor`拥有Session级control、lifecycle、FollowUp、active-task handle和公开snapshot。`ActiveTurnTask`拥有当前Turn的async control flow、phase、Model/Tool future、retry timer和compaction orchestration。
+A state publication is derived from durable/projection facts, not from a hopeful command receipt. For example, `WaitingForInput` is published only after the question request is represented by the actor's interaction state, and a terminal outcome is published only after its append attempt has a truthful result.
 
-`LiveSessionState`通过private typed methods更新。若使用锁，guard不得跨任何I/O或await。SessionExecutor与ActiveTurnTask不得分别维护可独立修改的conversation副本。v0.1 transcript capture同样由SessionExecutor actor在owner lane内从canonical selected entries短暂捕获immutable `Arc` handles；Runtime只拥有分页cursor与projection，不能绕过actor读取live state。current Turn仍由Snapshot/Event展示并从stable transcript capture排除。
+### Prompt and compaction ownership
 
-## Session Recording
+The prompt builder receives system instructions, the current user input, completed conversation messages, tool specifications, and the current turn messages. It estimates tokens from deterministic serialized bytes, not provider-specific hidden counters. Exact context equality is allowed; overflow is handled as a typed model/compaction path.
 
-recordable conversation mutation顺序：
+Compaction requires a completed boundary and a valid summary plan. It preserves the current turn, appends a summary through a stale-safe conversation operation, and replans if another append advanced the snapshot. The source conversation remains replayable and the transcript remains complete even when the next prompt starts after a summary boundary.
 
-```text
-complete all relation/value validation, Prompt projection and candidate preparation
-→ preflight ConversationRevision.checked_next() when delta is +1
-→ LiveSessionState.EntryIdGenerator.allocate()? and bind parent_id
-→ infallibly construct exact Arc<StoredSessionEntry>
-→ infallibly bind any prepared new-origin stable unit, commit prepared LiveSessionState / LiveConversation delta
-→ append the same Arc to the full selected path and install the preflighted revision
-→ await SessionRecorder.record(the same Arc)
-→ publish final StateEvent / resume waiter / continue loop
-```
+### Workspace capability ownership
 
-所有normal-result fallible validation/projection/preparation（包括`PreparedLiveCompactionUnit`）都在allocation前完成；revision overflow与EntryId allocation failure都在state/head mutation前返回typed failure。allocation后先构造exact entry Arc，才bind prepared unit、commit state、append same Arc和install revision；这些步骤不会返回错误（ordinary allocation panic在Result contract外），所以returned error绝不消耗ID。EntryId使用CSPRNG、success前reserve和32次bounded collision retry，不能panic或从revision/ordinal/time派生。
+`Workspace::open` validates the configured root before opening a capability. The root worker owns all blocking operations and exposes asynchronous methods that retain the worker job until its result or cancellation cleanup is settled. A dropped result receiver does not detach a running filesystem job.
 
-EntryId由`LiveSessionState`私有Session-scoped generator在apply前分配；Recorder不得创建或改写identity。`record().await`顺序encode并执行当前JSONL line的`write_all`，不使用后台queue。成功不表示flush、fsync或power-loss durability。第一次encode/write失败后Recorder进入`Degraded`并停止该loaded Session的后续记录；Turn继续运行。Degraded在同一load内为终态，不retry、不创建segment、不backfill。Interrupted/Failed terminal没有record attempt，Completed通过Final Assistant conversation entry留下内容事实。
+Relative-path parsing rejects empty paths where a file target is required, dot components, absolute forms, NULs, and platform-specific prefixes. Directory listing allows an empty path as the root and returns only direct entries. Write operations use final-component no-follow behavior and never silently widen a read-only workspace.
 
-Cold replay：
+Production session ownership awaits `Workspace::shutdown()` during actor close. The `Workspace` Drop fallback may block synchronously and is not preferred. Explicit `Runtime::shutdown()` waits for all known session actors, so its result observes their workspace shutdowns as well as the store worker and root-lock release.
 
-- 顺序读取完整JSONL行；
-- skip malformed/duplicate并隔离orphan或invalid relation；
-- 重建recorded history和sanitized model conversation；
-- incomplete Tool exchange不进入模型conversation；
-- 不从recorded TurnId重建旧TurnStatus，不追加restart closure；
-- writable Load只截断final unterminated partial tail，再从replayed recorded head初始化新Recorder；
-- Load完成后`current_turn = None`并进入Idle或Unavailable；
-- Unload/Load只恢复recorded conversation prefix，未record的live tail永久丢失；重新Load后library-only transcript可读取该实际恢复prefix。
+### Interaction ownership
 
-## Turn执行
+The tool policy may return a question presentation, but the session actor owns its lifetime. The interaction client exposes a one-shot response claim. Only the first matching answer can transition the request to claimed; receiver closure, cancellation, and actor close are separate outcomes. The actor persists `Interaction` after the claim and before the next model admission.
 
-```text
-Submit admission
-→ capture TurnExecutionContext
-→ apply live Input + await inline record attempt
-→ spawn ActiveTurnTask
-→ async run_turn loop
-   ├─ consume safe-point Steer
-   ├─ PromptSet.assemble(LiveConversationView)
-   ├─ await ModelGateway
-   ├─ await ToolSet / Interaction
-   ├─ logical retry or Compaction
-   └─ final arbitration
-→ return TurnTaskOutcome
-→ SessionExecutor settles lifecycle and FollowUp
-```
+An interaction is intentionally split between three views:
 
-Turn creation在Input live apply时线性化，Agent lifecycle/admission permit在Recorder await前释放；`Starting`持续到Input record attempt和`TurnStarted` publication完成。该窗口内`Cancel(Submit(command_id))`继续有效，Input已apply时绑定同一Turn并阻止task spawn。
+- tool view: the question, choices, answer, and claim state;
+- session view: `WaitingForInput`, pending interaction identity, and close/cancel behavior;
+- transcript view: the durable question/answer entry;
 
-同Session只有一个ActiveTurnTask。多个Session可以同时调用共享ModelGateway；Gateway没有本地模型调用permit。
+Only the appropriate view crosses each boundary. The interaction is not inserted into the model message sequence.
 
-## Conversation与Tool Exchange
+### Store and conversation barriers
 
-模型输入只来自sanitized `LiveConversationView`：
+The store worker has a bootstrap barrier, a bounded job queue, a final worker-exit result, and an explicit root-lock release step. The owner joins the exact worker thread and preserves sticky worker failure. A successful store shutdown therefore proves more than channel closure: the lock is released and the worker result is known.
 
-```text
-Assistant(tool calls A/B/C) applied live
-→ Tool A/B/C may run
-→ results applied in completion order
-→ all expected calls have first truthful ToolResult
-→ reducer exposes ordered Assistant + Result A/B/C exchange
-→ next Model allowed
-```
+Conversation append reserves a sequence under the conversation owner, encodes one candidate, submits one physical append job, and only then applies the candidate to the live projection. `wait_idle` is used by close paths before the final terminal append attempt. A degraded recording path remains visible to the session and prevents a later operation from claiming healthy durability.
 
-complete exchange门禁保留，但owner是live conversation reducer。SessionRecorder或cold projector不再向执行loop签发`CommittedToolExchangeDelta`。accepted Assistant（包括含ToolCalls、仍被gate隐藏者）使`ConversationRevision +1`；所有expected calls的first truthful `Completed` result才使complete exchange promotion再`+1`，partial/abandoned/non-visible settlement为`+0`。
+### Public observation ownership
 
-每个assistant或ToolResult live mutation在启动下一protocol step前完成inline record attempt。crash或Degraded仍可能只留下assistant ToolCall或部分结果；replay sanitizer排除整个不完整exchange。Tool不会因记录缺失自动重跑。
+The snapshot contains current semantic state; events are notifications about a published state transition. The event stream has a bounded broadcast side and a snapshot/watch side. A lagged receiver receives a resynchronization signal rather than a fabricated sequence of missed events. `Closed` is owner-controlled and is followed by EOF exactly once.
 
-## Interaction
+Runtime-level and session-level projections use stable redacted summaries. They do not include workspace absolute paths, credentials, provider endpoint details, raw request bodies, or arbitrary tool arguments beyond bounded model-visible result text.
 
-```text
-apply Pending Interaction live
-→ await inline record request attempt
-→ publish InteractionView
-→ await oneshot resolution
-→ validate and apply resolution live
-→ await inline record resolution attempt
-→ resume waiter / authorize Tool
-```
+### Public error ownership
 
-recording failure不阻止Interaction。request/resolution可能在crash后缺失；restart不恢复waiter。
+An invalid public value is rejected by its constructor and maps to `InvalidInput` or a configuration error before it reaches a worker. A missing loaded session maps to `NotFound`; an admitted concurrent operation maps to `Busy`; lifecycle shutdown maps to `Closing`; an unavailable workspace/model/tool dependency maps to `Unavailable`; cancellation maps to `Cancelled` when it wins the relevant boundary.
 
-`Interaction` fields/raw state只属于`LiveSessionState`；only its request/resolution transition methods construct、resolve或match该state，sibling只能读safe pending/event/storage projection。`InteractionResolutionCandidate::host(...) -> Result<_, InteractionCandidateError>`只接受ToolApproval、UserAnswer或`Cancelled(HostCancelled)`并seal Some key；`owner_cancellation(...) -> Result<_, InteractionCandidateError>`只接受non-Host `Cancelled`并seal None。wrong origin在reducer apply与EntryId allocation前被redacted candidate error拒绝。
-
-同一Interaction的same key + same canonical payload resolution是live reducer idempotent outcome：不分配EntryId、不构造entry、不record或发第二event；same key + different payload保持typed conflict。
-
-## Cancel与Security
-
-- Cancel发布sticky epoch后立即返回`CancelAccepted`；
-- ActiveTurnTask停止新Model、Tool和Compaction；
-- Running Tool执行best-effort cancel并truthful settle；
-- FollowUp等待旧task terminal后再启动；
-- Tool start继续通过`ToolStartGate`与EmergencyControl first-wins（start first-wins与Running best-effort cancellation均已落地：signal先赢→不调用start factory、PreExecution Cancelled；start先赢→slot经Settling继续await same run并truthful settle；production `read_file`/`list_directory`/`write_file` adapters已提供owner-tracked且不detach的filesystem settlement，`fetch_url`在slot-owned future内直接poll/drop exact send/body operation并不创建adapter-owned child task（ADR 0143/0144/0146/0147）；ordinary filesystem wall-clock settlement仍由OS/filesystem决定，process及其他adapter teardown后置）；Cancel/SecurityRevoked/Unload signal-first对全部unstarted calls（含pending UserQuestion binding）跳过并settle matching PreExecution Cancelled；
-- Workspace update仍只在Idle；SecurityRevoked后重新resolve失败仍可进入Unavailable。
-
-## Logical Retry
-
-Logical retry是ActiveTurnTask局部流程：
-
-```text
-retryable terminal ModelCallError
-→ verify Turn/control_generation/conversation_revision
-→ cancellation-aware sleep
-→ reuse same Arc<ModelCallRequest>
-→ invoke ModelGateway again
-```
-
-不再存在`RunningOperation::WaitForModelRetry`或基于durable `ConversationCheckpoint.entry_id`的live校验。
-
-## Compaction
-
-ActiveTurnTask从`LiveSessionState::capture_conversation_views()`在同一revision取得ordinary `LiveConversationView`、额外的`LiveCompactionSourceView`、由state完整immutable selected path末项派生的selected head和private Item/Pending Interaction facts。M4 aggregate只读该head；state保留full `Arc<StoredSessionEntry>` path给future LiveSnapshot/Fork。后者按EntryId-bearing provider-valid stable units表达User、Assistant、complete Tool exchange和leading rolling summary；Tool exchange不可拆，rolling summary origin是对应StoredCompaction outer EntryId。
-
-Compaction使用Turn-captured Runtime settings、同一PromptSet的AgentRun/Summary assembly bases和同一TurnModelSnapshot estimator/limits，从`source + cut index`派生summary prefix、retained suffix和single `first_kept_entry_id`，不按message equality反查。`ModelMessage`/`ModelAssistantContent`和`LiveCompactionUnit`/source view都是immutable `Clone` values/handles；Compaction estimator/reduction只读transcript refs。V1对超过16 KiB的大ToolResult仅在summary source中保留最多4 KiB head与4 KiB tail，并记录format version、original bytes与omitted bytes；live/durable ToolResult保持不变。Compaction owns fallible `PreparedLiveCompactionUnit` construction before an origin exists and source factories return its redacted structural error（empty unit、duplicate origin、misplaced rolling summary）；only `LiveSessionState` maps it to an owner-local live error, so Compaction never depends on `LiveConversationError`. **M4只关闭reducer subset**：apply接收orchestration-supplied `TurnId + Timestamp`，创建fresh current source，以`source.has_same_stable_identity(&fresh_current_source)`验证exact SessionId/revision/unit-count/ordered `(first_entry_id, kind)` basis，连同nonzero cut和opaque `CompactionReplacement` proof验证derived marker。M4 proof only has `#[cfg(test)] for_m4_test(...) -> Result<_, CompactionReplacementError>` and consuming exact `into_parts()`; it has no production `ValidatedCompactionSummary` constructor. Reducer consumes its exact values, may clone the prebuilt summary into leading unit and flattened LiveConversationView, and prepares the summary unit before all validation/projection/candidate preparation and `checked_next()`. Only then it allocates a new rolling-summary origin, constructs the exact entry Arc, binds the prepared unit, clones only the retained unit handles from the fresh current suffix, commits state, appends that same Arc and installs the preflighted revision; it never reconstructs borrowed messages or a caller suffix. M10在其外层完成exact plan/request/control arbitration、至多一次summary logical retry、production sealed replacement、live Replace、same-Arc inline record、`Compacting` phase与post-compaction Snapshot refresh；marker未写入时restart恢复未压缩旧conversation。M5对recorded bad marker只ignore/diagnose。
-
-## 状态与观察
-
-- `SessionExecutionState = Idle | Starting | Running | Finishing`；
-- `TurnExecutionPhase = Sampling | ExecutingTools | WaitingApproval | WaitingForUserInput | RetryBackoff | Compacting`；
-- StateEvent和Snapshot描述live state；recording Degraded或process crash时，它们可能领先可恢复的recorded prefix；Healthy状态没有后台queue lag；
-- ProgressEvent仍可合并或丢弃；
-- `SessionSnapshot.recording.state = healthy | degraded`；每个loaded Session都尝试记录，first `Healthy → Degraded`先由当前domain event发布Degraded Snapshot，再补发一次`session_recording_changed`；Snapshot保留当前脱敏recording diagnostic；
-- StateEvent不是durable acknowledgement。
-
-## 跨模块不变量索引
-
-只有跨至少三个module且影响correctness/security的规则进入本表。
-
-| ID | 不变量摘要 | Canonical Owner |
-| --- | --- | --- |
-| INV-001 | live owner为recordable conversation fact在apply前分配稳定EntryId并绑定parent，apply后完成inline record attempt再publish/推进；TurnStatus只apply/publish live，Recorder不得创建identity或terminal | [Conversation Recording · Live Mutation](modules/conversation-storage.md#live-mutation-and-recording) |
-| INV-002 | cold replay只恢复recorded完整行前缀，局部skip/isolate并返回diagnostics，不恢复process-local对象 | [Conversation Recording · Tolerant Replay](modules/conversation-storage.md#tolerant-replay) |
-| INV-003 | 含ToolCall的assistant只有在全部matching truthful results形成provider-valid complete exchange后才model-visible | [Turn / Item / Interaction · Complete Tool Exchange](modules/turn-item-interaction.md#complete-tool-exchange) |
-| INV-004 | loaded Fork从同一LiveSnapshot解析anchor并 semantic-stream-re-encodes selected path；unloaded Fork使用RecordedHistory lease；child Header is new and only entry SessionId rebinds while historical IDs/body/order persist; source kind进入durable provenance与command outcome | [Conversation Recording · Fork](modules/conversation-storage.md#fork) |
-| INV-005 | Compaction source由live reducer发布EntryId-bearing stable units；`has_same_stable_identity()`比较Session/revision/unit count/ordered unit identity，cut派生marker；M4以opaque CompactionReplacement关闭source/cut/marker/no-I/O reducer subset，M10才关闭exact control/plan/request、summary validation、recording与publication | [Compaction · M10 Live Replace与Recording](modules/compaction.md#m10-live-replace与recording) |
-| INV-006 | DurableState root lease下，新entity Create/Fork publication是complete-or-invisible，caller永不取得staging/path/generation/marker；existing-head update在reopen时只能是完整old或完整new generation。`PUBLISHED`是新entity唯一catalog root，marker ambiguity以exact readback决定Published或poison/Runtime close | [DurableState · CAS, generations and publication](modules/durable-state.md#cas-generations-and-publication) |
-| INV-101 | 每个loaded Session只有一个control actor和最多一个ActiveTurnTask；同Session不得并行运行两个Turn task | [Session Execution · Ownership](modules/session-execution.md#ownership) |
-| INV-102 | Steer只在完整assistant/tool step后、下一次Model前FIFO消费 | [Session Execution · Steer](modules/session-execution.md#steer) |
-| INV-103 | SessionSnapshot完整列出当前process所有public cancelable Submit admission、Steer和FollowUp CommandId；lane内FIFO，不公开queued intent正文，不从event/count重建 | [Runtime Interface · SessionSnapshot](modules/runtime-interface.md#sessionsnapshot) |
-| INV-201 | active Turn只使用admission时captured immutable Workspace/Prompt/Skill/Tool/Model对象；PromptContent在capture前已materialize，Turn执行不解析source locator | [Turn Execution Context · Context Capture](modules/turn-execution-context.md#context-capture) |
-| INV-202 | exact Skill/Workspace authorization在composition前完成；每个contribution形成独立content part，live/JSONL只保留safe part-level provenance，replay不重新加载或授权source | [Prompt · PromptIntent和CanonicalUserMessage](modules/prompt.md#promptintent-和-canonicalusermessage) |
-| INV-301 | Interaction live request在notify前apply并完成inline record attempt；resolution在resume前apply并完成inline record attempt | [Turn / Item / Interaction · Interaction Ordering](modules/turn-item-interaction.md#interaction-ordering) |
-| INV-302 | MVP UserQuestion只有non-secret Text/SingleChoice；request/answer可进入JSONL/event/ToolResult/model，secret input必须走未来独立secure host capability | [Turn / Item / Interaction · UserQuestion](modules/turn-item-interaction.md#userquestion) |
-| INV-401 | Tool side-effect start由ToolStartGate与EmergencyControl first-wins；Running后只能truthful settle（start first-wins与Running best-effort cancellation均已落地：signal先赢→PreExecution Cancelled且不调用factory，start先赢→Settling等待same run后truthful settle；signal-first对全部unstarted calls settle matching PreExecution Cancelled）；UserQuestion/ask-user不预留ToolStartGate或mutation ticket（hoisted exclusive question调度） | [Turn / Item / Interaction · Tool Side-Effect Start](modules/turn-item-interaction.md#tool-side-effect-start) |
-| INV-402 | production Workspace filesystem Tools只经`WorkspaceAccessView::{authorize_read, authorize_read_directory, authorize_write}`对semantic cwd-relative path签发opaque capability carrier，executor不得接收raw model path或重取ambient authority。write preparation绑定exact opened existing file或exact direct parent+final name，Session queue只消费opaque physical key；read-only/write ceilings与requested access取intersection。任一filesystem opt-in的host invalidation先经同一个Runtime-owned filesystem control永久revoke该Session再signal/re-resolve，future reads/writes共同Denied | [Workspace · WorkspaceAccessView](modules/workspace.md#workspaceaccessview) |
-
-## 模块地图
-
-- [Wire Schema与Bounded Decode](modules/wire-schema.md)：public/storage JSON v1、typed scalar carrier、ProtocolLimits、canonical dynamic JSON和bounded scanner。
-- [Archived Wire V1 Conformance Fixtures](archive/v2/fixtures/wire-v1/README.md)：历史public manifest、golden/corruption vectors、boundary recipes与structural verifier。
-- [Runtime公开协议](modules/runtime-interface.md)：dispatch/query/snapshot/subscribe和live observer语义。
-- [Agent与Session生命周期](modules/agent-session-lifecycle.md)：definition、revision、load/unload/archive/fork。
-- [Workspace](modules/workspace.md)：Session-owned Workspace、authority和immutable snapshot。
-- [Prompt](modules/prompt.md)：materialized PromptContent、orthogonal PromptIntent、safe part-level contribution provenance和live model context assembly。
-- [Skills](modules/skills.md)：SkillService、SkillView和reload。
-- [Tools](modules/tools.md)：ToolSet、policy、approval、sandbox和executor。
-- [Turn执行上下文](modules/turn-execution-context.md)：immutable capture和ConversationRevision basis。
-- [Turn / Item / Interaction](modules/turn-item-interaction.md)：live lifecycle、Tool exchange和Interaction。
-- [Conversation JSONL Format V1](formats/conversation-jsonl-v1.md)：exact Stored DTO envelope、field/tag、limits和corruption behavior。
-- [Durable Store V1](formats/durable-store-v1.md)：exact local entity layout、generation/head bytes、markers、scanner/recovery precedence。
-- [Archived Durable Store V1 Fixtures](archive/v2/fixtures/durable-store-v1/README.md)：历史head/definition golden、closed crash taxonomy与structural verifier。
-- [DurableState](modules/durable-state.md)：private store actor、reservation/lease/CAS/publication/recovery/fault seam。
-- [Conversation Recording与Replay](modules/conversation-storage.md)：JSONL recorder、recording health、tolerant replay和fork。
-- [Session执行](modules/session-execution.md)：control actor、ActiveTurnTask、async loop和queues。
-- [ModelGateway](modules/model-gateway.md)：single provider attempt和response taxonomy。
-- [Compaction](modules/compaction.md)：live rolling summary与best-effort marker。
-
-## 相关决策
-
-核心当前决策：
-
-- [ADR 0147：Production `fetch_url`把exact HTTPS origin绑定到host-pinned addresses](adr/0147-production-fetch-url-pins-exact-https-origins-to-host-addresses.md)
-- [ADR 0146：Production `write_file`把capability target绑定到Session-local FIFO](adr/0146-production-write-file-binds-capability-targets-to-session-fifo.md)
-- [ADR 0144：Production `list_directory`使用有界的Workspace capability直接枚举](adr/0144-production-list-directory-uses-bounded-capability-enumeration.md)
-- [ADR 0143：Production `read_file`是closed、default-off、Workspace-bound本地read builtin](adr/0143-production-read-file-uses-workspace-capabilities.md)
-- [ADR 0142：Production `ask_user`是closed、default-off、Runtime-owned builtin](adr/0142-production-ask-user-is-a-closed-opt-in-builtin.md)
-- [ADR 0141：Provider调用是无状态full-request wire policy](adr/0141-provider-calls-are-stateless-full-request.md)
-- [ADR 0140：Tool Sandbox capability admission在start前fail closed](adr/0140-tool-sandbox-admission-fails-closed-before-start.md)
-- [ADR 0137：Tokio owner-tracked async foundation与deterministic persistent seams](adr/0137-tokio-owner-tracked-async-foundation.md)
-- [ADR 0136：DurableState使用operation-owned immutable generations、permanent reservations与root lease](adr/0136-durablestate-operation-owned-generations.md)
-- [ADR 0134：Public Protocol与Conversation Recording使用bounded v1 wire schema](adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md)
-- [ADR 0133：Runtime public payload必须可从Snapshot恢复并安全操作](adr/0133-runtime-public-payload-is-snapshot-recoverable.md)
-- [ADR 0132：Compaction从revision-bound stable units派生marker](adr/0132-compaction-derives-markers-from-live-stable-units.md)
-- [ADR 0131：Conversation Recording不保存Session definition/lifecycle](adr/0131-conversation-recording-excludes-session-definition-and-lifecycle.md)
-- [ADR 0130：用户消息composition异步解析captured Skill](adr/0130-user-message-composition-resolves-skills-asynchronously.md)
-- [ADR 0129：用户消息贡献使用part-level安全provenance](adr/0129-user-message-contributions-use-part-level-safe-provenance.md)
-- [ADR 0128：Prompt content在publication前materialize](adr/0128-prompt-content-is-materialized-before-publication.md)
-- [ADR 0127：Session recording不保存Turn lifecycle](adr/0127-session-recording-omits-turn-lifecycle.md)
-- [ADR 0126：Turn执行使用async loop，Session记录采用inline best-effort append](adr/0126-turn-execution-is-async-and-session-recording-is-best-effort.md)
-- [ADR 0125：ModelGateway不设置本地模型调用Permit](adr/0125-model-gateway-has-no-local-call-permits.md)
-- [ADR 0124：Session replay宽容恢复](adr/0124-session-replay-is-tolerant-and-links-are-minimal.md)，其strict writer/committed-delta条款已被ADR 0126取代
-- [ADR 0123：Exact Ref、immutable capture与explicit reload](adr/0123-identity-uses-refs-and-explicit-reload.md)，其durable checkpoint条款已被ADR 0126取代
-- [ADR 0119：Session logical retry](adr/0119-model-calls-use-session-logical-retries.md)，owner已改为ActiveTurnTask
-- [ADR 0118：Cancel立即确认并等待settlement](adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)
-- [ADR 0116：文件mutation使用Session-local queue](adr/0116-file-mutations-use-session-local-queues.md)
-
-ADR 0104的durable truth/commit barrier、ADR 0105的single mutable Executor owner和ADR 0115的同步AgentLoop已被ADR 0126取代。
+The error code is not a replacement for the owning typed error. The model layer retains delivery and retry information, the tool layer retains policy/workspace/process detail, and the persistence layer retains corruption/worker/cleanup detail until the public boundary intentionally redacts it.

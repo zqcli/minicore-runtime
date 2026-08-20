@@ -1,3 +1,5 @@
 # Archived V2 Reviews
 
-完整历史review位于本目录；原`docs/review/`路径保留redirect stub。Current finding只见[`docs/review/v2-design-review-4.md`](../../../review/v2-design-review-4.md)。
+This directory preserves historical v2 reviews, findings, and handoffs. The files here are historical evidence, not current implementation authority.
+
+For current authority, use the [architecture](../../../architecture.md), [canonical module map](../../../modules/README.md), [final migration guide](../../../migration-v0.1-v0.2.md), and [documentation index](../../../README.md). The former `docs/review/` path is intentionally absent; no stub file is maintained there.

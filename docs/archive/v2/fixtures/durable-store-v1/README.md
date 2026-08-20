@@ -2,7 +2,7 @@
 
 > Archived V2 evidence. These fixtures are retained for historical/conformance reference and are not run by default.
 
-These are authoritative, stdlib-verified conformance assets for [Durable Store V1](../../../../formats/durable-store-v1.md). Their owning M5/M7 implementation slices consume them; they are not illustrative alternatives. `manifest.json` is closed and `verify.py` rejects undeclared or missing assets, noncanonical bytes, duplicate JSON keys, floats/NaN/Infinity, wrong scalar types, wrong nested key order, and any matrix drift.
+These are authoritative, stdlib-verified conformance assets for [Durable Store V1](../../pre-reset/formats/durable-store-v1.md). Their owning M5/M7 implementation slices consume them; they are not illustrative alternatives. `manifest.json` is closed and `verify.py` rejects undeclared or missing assets, noncanonical bytes, duplicate JSON keys, floats/NaN/Infinity, wrong scalar types, wrong nested key order, and any matrix drift.
 
 ## Asset taxonomy
 
