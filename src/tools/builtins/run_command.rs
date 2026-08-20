@@ -624,7 +624,8 @@ struct RunCommandOutput {
 mod tests {
     use std as runtime;
     use std::env;
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -640,6 +641,7 @@ mod tests {
     use crate::workspace_v2::{Workspace, WorkspaceAccess};
 
     static NEXT_PROCESS_ROOT: AtomicU64 = AtomicU64::new(0);
+    const FIXTURE_WALL_LIMIT: Duration = Duration::from_secs(60);
 
     struct DescendantMarkers {
         ready: PathBuf,
@@ -690,10 +692,8 @@ mod tests {
         fn drop(&mut self) {
             if self.ready.exists() {
                 self.release();
-                for _ in 0..500 {
-                    if self.descendant_exit.exists() {
-                        break;
-                    }
+                let deadline = std::time::Instant::now() + FIXTURE_WALL_LIMIT;
+                while !self.descendant_exit.exists() && std::time::Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
@@ -784,6 +784,10 @@ mod tests {
                 "MINICORE_P7_EXIT_MARKER": descendant_exit_marker.to_string_lossy(),
             }
         })
+    }
+
+    fn parent_closed(marker: &Path) -> bool {
+        runtime::fs::read(marker).is_ok_and(|contents| contents == b"parent exited")
     }
 
     async fn execute(
@@ -921,8 +925,11 @@ mod tests {
         assert_eq!(result, Err(ToolError::Cancelled));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn direct_child_exit_with_inherited_pipes_is_bounded_by_user_timeout() {
+        const PRODUCT_TIMEOUT: Duration = Duration::from_secs(15);
+        const FIXTURE_START_LIMIT: Duration = Duration::from_secs(60);
+
         let sequence = NEXT_PROCESS_ROOT.fetch_add(1, Ordering::Relaxed);
         let markers = DescendantMarkers::new("descendant", sequence);
         markers.clear();
@@ -936,7 +943,7 @@ mod tests {
         let policy = helper_policy(
             1024,
             1024,
-            Duration::from_secs(15),
+            PRODUCT_TIMEOUT,
             &[
                 "MINICORE_P7_HELPER_MODE",
                 "MINICORE_P7_READY_MARKER",
@@ -947,29 +954,29 @@ mod tests {
                 "MINICORE_P7_EXIT_MARKER",
             ],
         );
-        let mut operation = Box::pin(tokio::time::timeout(
-            Duration::from_secs(20),
-            execute(
-                policy,
-                CancellationToken::new(),
-                descendant_args(
-                    ready_marker,
-                    go_marker,
-                    direct_exit_marker,
-                    descendant_ready_marker,
-                    release_marker,
-                    descendant_exit_marker,
-                ),
+        let mut operation = Box::pin(execute(
+            policy,
+            CancellationToken::new(),
+            descendant_args(
+                ready_marker,
+                go_marker,
+                direct_exit_marker,
+                descendant_ready_marker,
+                release_marker,
+                descendant_exit_marker,
             ),
         ));
+        let tokio_before_handshake = TokioInstant::now();
+        let fixture_deadline = std::time::Instant::now() + FIXTURE_START_LIMIT;
 
-        for _ in 0..1_500 {
-            if ready_marker.exists() {
-                break;
-            }
+        while !ready_marker.exists() {
+            assert!(
+                std::time::Instant::now() < fixture_deadline,
+                "helper did not signal readiness before the fixture deadline"
+            );
             tokio::select! {
                 result = &mut operation => panic!("command completed before helper readiness: {result:?}"),
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                _ = tokio::task::yield_now() => {}
             }
         }
         assert!(
@@ -978,24 +985,33 @@ mod tests {
         );
         runtime::fs::write(go_marker, b"go").unwrap();
 
-        for _ in 0..1_500 {
-            if direct_exit_marker.exists() {
-                break;
-            }
+        while !(descendant_ready_marker.exists()
+            && direct_exit_marker.exists()
+            && parent_closed(direct_exit_marker))
+        {
+            assert!(
+                std::time::Instant::now() < fixture_deadline,
+                "helper did not signal descendant readiness and parent exit before the fixture deadline"
+            );
             tokio::select! {
-                result = &mut operation => panic!("command completed before direct-child exit: {result:?}"),
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                result = &mut operation => panic!("command completed before descendant readiness and parent exit: {result:?}"),
+                _ = tokio::task::yield_now() => {}
             }
         }
-        assert!(
-            direct_exit_marker.exists(),
-            "the direct child must signal exit before leaving its pipe descendant"
+        assert_eq!(
+            TokioInstant::now(),
+            tokio_before_handshake,
+            "fixture startup must not consume product Tokio time"
         );
-
-        let output = operation
-            .await
-            .expect("the outer test bound must exceed user timeout plus cleanup")
-            .unwrap();
+        tokio::time::advance(PRODUCT_TIMEOUT).await;
+        let output = tokio::select! {
+            biased;
+            result = &mut operation => result.expect("run_command must settle after the user deadline"),
+            _ = tokio::task::yield_now() => {
+                tokio::time::advance(CLEANUP_TIMEOUT).await;
+                operation.await.expect("run_command cleanup must settle")
+            }
+        };
         let value: Value = serde_json::from_str(output.text()).unwrap();
         assert_eq!(value["timed_out"], true, "unexpected output: {value}");
         assert_eq!(
@@ -1005,11 +1021,12 @@ mod tests {
         assert_eq!(value["exit_code"], 0, "unexpected output: {value}");
 
         markers.release();
-        for _ in 0..300 {
-            if descendant_exit_marker.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        while !descendant_exit_marker.exists() {
+            assert!(
+                std::time::Instant::now() < fixture_deadline,
+                "the finite test descendant did not exit before the fixture deadline"
+            );
+            tokio::task::yield_now().await;
         }
         assert!(
             descendant_exit_marker.exists(),
@@ -1019,6 +1036,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancellation_after_direct_child_exit_does_not_wait_for_inherited_pipes() {
+        let fixture_deadline = std::time::Instant::now() + FIXTURE_WALL_LIMIT;
         let sequence = NEXT_PROCESS_ROOT.fetch_add(1, Ordering::Relaxed);
         let markers = DescendantMarkers::new("cancel-descendant", sequence);
         markers.clear();
@@ -1055,39 +1073,45 @@ mod tests {
                 descendant_exit_marker,
             ),
         ));
-        for _ in 0..1_500 {
-            if ready_marker.exists() {
-                break;
-            }
+        while !ready_marker.exists() {
+            assert!(
+                std::time::Instant::now() < fixture_deadline,
+                "helper did not signal readiness before the fixture deadline"
+            );
             tokio::select! {
                 result = &mut operation => panic!("command completed before helper readiness: {result:?}"),
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                _ = tokio::task::yield_now() => {}
             }
         }
         assert!(ready_marker.exists());
         runtime::fs::write(go_marker, b"go").unwrap();
-        for _ in 0..1_500 {
-            if direct_exit_marker.exists() {
-                break;
-            }
+        while !(descendant_ready_marker.exists()
+            && direct_exit_marker.exists()
+            && parent_closed(direct_exit_marker))
+        {
+            assert!(
+                std::time::Instant::now() < fixture_deadline,
+                "helper did not signal descendant readiness and parent exit before the fixture deadline"
+            );
             tokio::select! {
-                result = &mut operation => panic!("command completed before direct-child exit: {result:?}"),
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                result = &mut operation => panic!("command completed before descendant readiness and parent exit: {result:?}"),
+                _ = tokio::task::yield_now() => {}
             }
         }
         assert!(direct_exit_marker.exists());
         cancellation.cancel();
-        let result = tokio::time::timeout(Duration::from_secs(2), operation)
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut operation)
             .await
-            .expect("cancellation must not wait for inherited pipe handles");
+            .expect("cancellation must settle within two real seconds");
         assert_eq!(result, Err(ToolError::Cancelled));
 
         markers.release();
-        for _ in 0..300 {
-            if descendant_exit_marker.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        while !descendant_exit_marker.exists() {
+            assert!(
+                std::time::Instant::now() < fixture_deadline,
+                "the finite test descendant did not exit before the fixture deadline"
+            );
+            tokio::task::yield_now().await;
         }
         assert!(
             descendant_exit_marker.exists(),
@@ -1298,7 +1322,7 @@ mod tests {
                 println!("direct child ready");
                 let _ = std::io::stdout().flush();
                 let go = env::var("MINICORE_P7_GO_MARKER").unwrap();
-                let startup_deadline = std::time::Instant::now() + Duration::from_secs(30);
+                let startup_deadline = std::time::Instant::now() + FIXTURE_WALL_LIMIT;
                 while !Path::new(&go).exists() && std::time::Instant::now() < startup_deadline {
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1306,6 +1330,8 @@ mod tests {
                     std::process::exit(12);
                 }
 
+                let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let parent_addr = listener.local_addr().unwrap().to_string();
                 let mut descendant = std::process::Command::new(env::current_exe().unwrap());
                 descendant
                     .args([
@@ -1314,6 +1340,7 @@ mod tests {
                         "--nocapture",
                     ])
                     .env("MINICORE_P7_HELPER_MODE", "hold_pipe")
+                    .env("MINICORE_P7_PARENT_ADDR", parent_addr)
                     .env(
                         "MINICORE_P7_DESCENDANT_READY_MARKER",
                         env::var("MINICORE_P7_DESCENDANT_READY_MARKER").unwrap(),
@@ -1328,8 +1355,9 @@ mod tests {
                     )
                     .spawn()
                     .unwrap();
+                let (_connection, _) = listener.accept().unwrap();
                 let descendant_ready = env::var("MINICORE_P7_DESCENDANT_READY_MARKER").unwrap();
-                let descendant_ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let descendant_ready_deadline = std::time::Instant::now() + FIXTURE_WALL_LIMIT;
                 while !Path::new(&descendant_ready).exists()
                     && std::time::Instant::now() < descendant_ready_deadline
                 {
@@ -1343,14 +1371,23 @@ mod tests {
                 }
                 println!("direct child exiting");
                 let _ = std::io::stdout().flush();
+                drop(listener);
                 std::process::exit(0);
             }
             "hold_pipe" => {
+                let address = env::var("MINICORE_P7_PARENT_ADDR").unwrap();
+                let mut parent = TcpStream::connect(address).unwrap();
+                parent.write_all(b"descendant ready").unwrap();
                 if let Ok(path) = env::var("MINICORE_P7_DESCENDANT_READY_MARKER") {
                     runtime::fs::write(path, b"descendant started").unwrap();
                 }
+                let mut parent_eof = [0_u8; 1];
+                let _ = parent.read(&mut parent_eof);
+                if let Ok(path) = env::var("MINICORE_P7_DIRECT_EXIT_MARKER") {
+                    runtime::fs::write(path, b"parent exited").unwrap();
+                }
                 let release = env::var("MINICORE_P7_RELEASE_MARKER").unwrap();
-                let release_deadline = std::time::Instant::now() + Duration::from_secs(30);
+                let release_deadline = std::time::Instant::now() + FIXTURE_WALL_LIMIT;
                 while !Path::new(&release).exists() && std::time::Instant::now() < release_deadline
                 {
                     std::thread::sleep(Duration::from_millis(10));
