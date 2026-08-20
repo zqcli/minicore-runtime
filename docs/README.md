@@ -10,8 +10,8 @@
 2. [架构总览](architecture.md)：领域模型、执行结构与跨模块不变量；
 3. [模块总览](modules/README.md)：canonical owner与具体接口合同；
 4. [ADR索引](adr/README.md)：current、refined与historical决策分类；
-5. [Wire Schema](modules/wire-schema.md)、[Conversation JSONL V1](formats/conversation-jsonl-v1.md)、[Wire V1 fixtures](fixtures/wire-v1/README.md)、[Durable Store V1](formats/durable-store-v1.md)及其[Durable Store V1 fixtures](fixtures/durable-store-v1/README.md)：public/storage representation；
-6. [M12 Production Provider Gate Fixtures](fixtures/provider-gate-m12/README.md)：provider protocol reality、Rig SDK rejection与delivery/error conformance；
+5. [Wire Schema](modules/wire-schema.md)、[Conversation JSONL V1](formats/conversation-jsonl-v1.md)、[Archived Wire V1 fixtures](archive/v2/fixtures/wire-v1/README.md)、[Durable Store V1](formats/durable-store-v1.md)及其[Archived Durable Store V1 fixtures](archive/v2/fixtures/durable-store-v1/README.md)：历史public/storage evidence；
+6. [Archived M12 Production Provider Gate Fixtures](archive/v2/fixtures/provider-gate-m12/README.md)：历史provider protocol reality、Rig SDK rejection与delivery/error conformance；
 7. [第四轮设计评审](review/v2-design-review-4.md)：全部finding的关闭记录与production adapter约束。
 
 权威顺序：
@@ -19,10 +19,10 @@
 ```text
 architecture.md + modules/
 → current/refined ADR（以adr/README.md分类为准）
-→ formats/ + fixtures/（representation与conformance）
+→ formats/（当前representation）
 → development-plan.md（实施顺序，不改变领域语义）
 → migration/ + research/
-→ archive/（历史，不具权威性）
+→ archive/（含V1 Wire/Store/provider fixtures的历史证据，不具当前权威性）
 ```
 
 ## 当前状态
@@ -43,7 +43,8 @@ M0–M6 foundations、M7 ordinary AgentRun与M8最小Tool/Interaction/Cancel及c
 
 - `modules/`：当前semantic contract与canonical owner；`DurableState`是local entity-store physical operation owner；
 - `adr/`：决策理由与successor关系，分类见[ADR索引](adr/README.md)；
-- `formats/`、`fixtures/`：exact wire/storage format与测试资产（含Durable Store V1 golden/crash matrix）；
+- `formats/`：保留的格式说明；旧Wire/Store格式不属于v0.2 Runtime热路径；
+- `archive/v2/fixtures/`：归档的Wire V1、Durable Store V1与M12 provider历史证据，不用于当前默认门禁；
 - `review/`：current closed review与finding关闭证据；
 - `research/`：非权威研究证据，见[Research索引](research/README.md)；
 - `migration/`：V1到V2概念迁移说明；

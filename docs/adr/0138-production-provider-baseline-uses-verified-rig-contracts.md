@@ -51,7 +51,7 @@ M12使用exact `rig-core = 0.40.0`、真实`127.0.0.1:0` HTTP/1.1 loopback serve
 
    request ID经过既有长度/字符/redaction validation后可进入`ProviderResponseMetadata`；`retry-after`只进入typed retry hint；processing time只属于internal telemetry。其他header、cookie、authorization、完整header map、raw body和canary字段不可表示。Rig正常response/error解析仍消费原body；wrapper不能改变成功输出或usage。
 
-7. provider-neutral error与delivery分类的唯一M12 fixture是[`error-mapping-v1.json`](../fixtures/provider-gate-m12/error-mapping-v1.json)。分类只读取status、typed error type/code、transport stage、semantic-output-started、terminal evidence和bounded retry hint，不匹配human message。
+7. provider-neutral error与delivery分类的唯一历史M12 fixture是[`error-mapping-v1.json`](../archive/v2/fixtures/provider-gate-m12/error-mapping-v1.json)。分类只读取status、typed error type/code、transport stage、semantic-output-started、terminal evidence和bounded retry hint，不匹配human message。
 
    - 只有`NotSent`或provider明确证明未开始执行的`RejectedBeforeExecution`可保留transient reason供Session logical retry；
    - OpenAI typed 429和Anthropic typed 429属于pre-execution rejection；`Retry-After <= 60s`才允许retry；
@@ -71,7 +71,7 @@ M12使用exact `rig-core = 0.40.0`、真实`127.0.0.1:0` HTTP/1.1 loopback serve
 - `provider-gate/tests/m12_rig_terminal_evidence.rs`：fragmented SSE、terminal/EOF/error/drop可区分的公开`HttpClientExt` seam；
 - `provider-gate/tests/m12_rig_response_metadata.rs`：成功/error路径的header allowlist、body ID/header ID独立性与canary rejection；
 - `provider-gate/tests/m12_rig_error_envelopes.rs`：两协议400/401 typed envelope、malformed 200 fail-closed和single-request；
-- `tests/m12_provider_error_matrix.rs`：26-case closed taxonomy、delivery normalization、retry/Compaction不变量与no-message-classification；
+- 当前P3 provider suites与AT-13：26-case closed taxonomy、delivery normalization、retry/Compaction不变量与no-message-classification；历史mapping fixture保留于`docs/archive/v2/fixtures/provider-gate-m12/`；
 - `session_execution::tests::steer_queued_during_agent_run_retry_backoff_is_consumed_after_success`：queued Steer规则。
 
 ## 后果

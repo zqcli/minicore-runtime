@@ -10,8 +10,8 @@
 //! context-overflow subtype/code** — only human `message` text hints at the
 //! cause, so the M12 gate must classify structurally, never by message prose.
 //!
-//! Classification stays pinned by `docs/fixtures/provider-gate-m12/error-mapping-v1.json`
-//! and `tests/m12_provider_error_matrix.rs`; this file only pins what Rig
+//! Classification stays pinned by the archived `docs/archive/v2/fixtures/provider-gate-m12/error-mapping-v1.json`
+//! and current P3 provider suites plus AT-13; this file only pins what Rig
 //! preserves on the wire, via `support::LoopbackServer`, settled via `join()`.
 
 mod support;

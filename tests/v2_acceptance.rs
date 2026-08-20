@@ -56,6 +56,101 @@ const ACCEPTANCE_CASES: [&str; 20] = [
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
+const LEGACY_SOURCE_PATHS: &[&str] = &[
+    "src/agent_session_lifecycle.rs",
+    "src/agent_v2",
+    "src/compaction.rs",
+    "src/conversation_storage.rs",
+    "src/durable_state.rs",
+    "src/http_transport.rs",
+    "src/live_conversation.rs",
+    "src/model_gateway.rs",
+    "src/model_gateway",
+    "src/prompt.rs",
+    "src/prompt_v2",
+    "src/runtime.rs",
+    "src/runtime_interface.rs",
+    "src/runtime_task.rs",
+    "src/runtime_v2",
+    "src/session_execution.rs",
+    "src/session_ingress.rs",
+    "src/session_residency.rs",
+    "src/session_transcript.rs",
+    "src/skills.rs",
+    "src/tools.rs",
+    "src/tools/ask_user.rs",
+    "src/tools/fetch_url.rs",
+    "src/tools/list_directory.rs",
+    "src/tools/read_file.rs",
+    "src/tools/write_file.rs",
+    "src/turn_execution_context.rs",
+    "src/turn_item_interaction.rs",
+    "src/wire",
+    "src/workspace.rs",
+    "src/workspace_v2",
+];
+
+const FORBIDDEN_SOURCE_TOKENS: &[&str] = &[
+    "crate::wire",
+    "mod wire",
+    "pub mod wire",
+    "MiniCoreRuntime",
+    "CommandRequest",
+    "RuntimeQuery",
+    "DurableState",
+    "SessionResidency",
+    "SessionIngress",
+    "AgentRevisionRef",
+    "ToolExecutionPlan",
+    "ToolStartGate",
+    "SessionFileMutationQueue",
+    "WorkspaceAuthority",
+    "PrepareUnload",
+    "SecurityInvalidation",
+    "RuntimeDependencyProbe",
+    "_v2",
+    "Fork",
+    "Archive",
+    "Steer",
+    "FollowUp",
+];
+
+fn repository_rust_sources() -> Vec<(PathBuf, String)> {
+    fn collect(directory: &Path, paths: &mut Vec<PathBuf>) {
+        let mut entries = fs::read_dir(directory)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", directory.display()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| panic!("failed to enumerate {}: {error}", directory.display()));
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .unwrap_or_else(|error| panic!("failed to inspect {}: {error}", path.display()));
+            if file_type.is_dir() {
+                collect(&path, paths);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                paths.push(path);
+            }
+        }
+    }
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source_root = repository.join("src");
+    let mut paths = Vec::new();
+    collect(&source_root, &mut paths);
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let source = fs::read_to_string(&path).unwrap_or_else(|error| {
+                panic!("failed to read {} as UTF-8: {error}", path.display())
+            });
+            (path, source)
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 struct ProviderState {
     steps: Arc<Mutex<VecDeque<ScriptStep>>>,
@@ -2866,6 +2961,44 @@ async fn at_19_secret_env() {
     fs::remove_dir_all(root).unwrap();
 }
 
-#[tokio::test]
-#[ignore = "P8 static architecture gate: legacy owner deletion is intentionally deferred"]
-async fn at_20_no_legacy_coupling() {}
+#[test]
+fn at_20_no_legacy_coupling() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for &relative in LEGACY_SOURCE_PATHS {
+        assert!(
+            !repository.join(relative).exists(),
+            "legacy source path still exists: {relative}"
+        );
+    }
+
+    for (path, source) in repository_rust_sources() {
+        for &token in FORBIDDEN_SOURCE_TOKENS {
+            assert!(
+                !source.contains(token),
+                "{} contains forbidden legacy token {token:?}",
+                path.display()
+            );
+        }
+    }
+
+    let lib = fs::read_to_string(repository.join("src/lib.rs")).unwrap();
+    for declaration in [
+        "mod agent;",
+        "pub mod config;",
+        "pub mod error;",
+        "pub mod event;",
+        "pub mod ids;",
+        "pub mod model;",
+        "mod prompt;",
+        "pub mod runtime;",
+        "pub mod session;",
+        "pub mod tools;",
+        "pub mod workspace;",
+    ] {
+        assert!(
+            lib.contains(declaration),
+            "missing canonical declaration: {declaration}"
+        );
+    }
+    assert!(!lib.contains("#[path ="));
+}

@@ -1,9 +1,9 @@
 # MiniCore Runtime v0.1 → v0.2
 
-**Status:** P7 foundations and public acceptance integration complete; P8 switch/deletion remains deferred
+**Status:** P8 public switch, legacy production deletion, fixture archival, and AT-20 closure complete; P9 documentation and dependency cleanup pending
 **Change type:** breaking Core Reset; no v0.1 Wire/API compatibility promise
 
-P1–P7 are implemented beside the v0.1 baseline. The public typed `Runtime` surface, explicit provider/tool registries, capability-relative file tools, structured `run_command`, durable transcript/compaction behavior, cancellation, and AT-01..AT-19 are active in `tests/v2_acceptance.rs`. AT-20 remains the sole ignored acceptance case because legacy owner deletion is intentionally a P8/P9 concern.
+P1–P8 are complete in the v0.2 core. The public typed `Runtime` surface, explicit provider/tool registries, capability-relative file tools, structured `run_command`, durable transcript/compaction behavior, cancellation, and AT-01..AT-20 are active in `tests/v2_acceptance.rs`; the acceptance target has no ignored cases. P9 is reserved for documentation and dependency cleanup.
 
 ## Branch Authority
 
@@ -35,8 +35,8 @@ The JSONL contract is append-only, one complete semantic entry per newline, mono
 
 Workspace file access remains root-relative and capability-relative, rejects absolute paths, traversal, NULs, and symlink escape, and keeps final-component no-follow write protection. `run_command` is structured `program + args`, never a default shell string; it is explicit opt-in, clears the environment by default, applies program/env/timeout/output limits, and does not claim to sandbox the child process.
 
-The v0.2 acceptance matrix is AT-01..AT-20. AT-20 is a static architecture gate, not a behavioral test: it verifies that legacy `wire`, `DurableState`, `SessionResidency`, and `AgentRevisionRef` coupling is absent after the reset.
+The v0.2 acceptance matrix is AT-01..AT-20. AT-20 is an active static architecture gate, not a behavioral test: it verifies that the deleted legacy paths and structured legacy tokens are absent after the reset.
 
 ## Migration Policy
 
-P0 records the baseline and installs the acceptance inventory only. P1–P7 may build the new implementation beside the old one. P8 is the public switch and deletion point. No compatibility shim should be added merely to preserve old tests. Old tests are retained only when their scenario protects a v0.2 user-visible guarantee; otherwise the scenario is rewritten against the typed seams.
+P0 records the baseline and installs the acceptance inventory only. P1–P7 built the new implementation beside the old one; P8 completed the public switch, legacy production deletion, fixture archival, and AT-20 closure. No compatibility shim should be added merely to preserve old tests. P9 covers documentation and dependency cleanup. Old tests are retained only when their scenario protects a v0.2 user-visible guarantee; otherwise the scenario is rewritten against the typed seams.

@@ -27,7 +27,7 @@ M12 checkpoint series：
 - 一次Rig completion/stream invocation最多一个HTTP request；Gateway/SDK automatic retry为0，429/5xx/401不在Gateway内重发；
 - Rig synthetic zero-usage `Final`不是terminal proof：OpenAI要求`response.completed`，Anthropic要求non-empty `message_delta.stop_reason`；公开`HttpClientExt` seam可在原样转发bytes时保存terminal、EOF/error/drop与allowlisted metadata；
 - metadata allowlist为OpenAI `x-request-id/retry-after/openai-processing-ms`及Anthropic `request-id/retry-after`；canary/arbitrary headers、cookie、auth和raw body不越过private seam；
-- `docs/fixtures/provider-gate-m12/error-mapping-v1.json`冻结26个case：只有`NotSent | RejectedBeforeExecution`可保留delivery-safe transient reason，HTTP 500/503/504 unknown outcome不盲重试，early EOF/partial stream分别归一化为`RequestOutcomeUnknown | StreamInterrupted`，Anthropic不得从human message猜context overflow；
+- 归档的`docs/archive/v2/fixtures/provider-gate-m12/error-mapping-v1.json`冻结26个case：只有`NotSent | RejectedBeforeExecution`可保留delivery-safe transient reason，HTTP 500/503/504 unknown outcome不盲重试，early EOF/partial stream分别归一化为`RequestOutcomeUnknown | StreamInterrupted`，Anthropic不得从human message猜context overflow；
 - queued Steer在retry backoff只排队、不改变revision；safe point成功apply后才使旧basis失效；Gateway继续无local route/model/principal permits；
 - ADR 0138/0139 Accepted：协议合同继续有效，M14不实现`RigProviderAdapter`，改为`OpenAiResponsesProviderAdapter`与`AnthropicMessagesProviderAdapter`直接拥有各自HTTP/SSE、terminal、metadata与typed error mapping；两个adapter共享exact `reqwest = 0.13.4`的`json + rustls + stream`最小transport/framing primitives并显式关闭retry/redirect/ambient proxy，但request、terminal与typed envelope parser保持独立；ADR 0140 Accepted：Tool Sandbox class-level admission、approval revalidation与pre-start fail-closed合同关闭V4-C0-1；第四轮全部finding Closed。
 
@@ -56,7 +56,7 @@ M13 Production Tool/Sandbox Gate（V4-C0-1）已由ADR 0140关闭：closed四类
 public/storage representation唯一owner。v1固定camelCase fields、snake_case variants、adjacent `type/data`、typed IDs/revisions、Timestamp/Duration/Money/path/cursor、ProtocolLimits、canonical BoundedJson和bounded scanner；不拥有domain business semantics。
 
 **Wire V1 Fixtures**：
-`docs/fixtures/wire-v1/`中的public target manifest、byte-exact JSON/JSONL、corruption expectations、boundary recipes和structural verifier。首个Rust codec/storage crate必须消费这些assets。
+归档的`docs/archive/v2/fixtures/wire-v1/`中的public target manifest、byte-exact JSON/JSONL、corruption expectations、boundary recipes和structural verifier。首个Rust codec/storage crate必须消费这些assets。
 
 **Runtime-owned共享module**：
 `PromptService`、`ToolService`、`SkillService`和`ModelGateway`。四个current immutable resource roots只在initialize或显式reload成功后整体publication。

@@ -220,4 +220,4 @@ A different/missing post-`COMMITTED` payload is `CommittedCorruptPoisoned`, neve
 
 ## Conformance fixtures
 
-[Durable Store V1 Fixtures](../fixtures/durable-store-v1/README.md) provide byte-exact golden documents and a crash table. `python3 docs/fixtures/durable-store-v1/verify.py` verifies their closed structural contract.
+[Archived Durable Store V1 Fixtures](../archive/v2/fixtures/durable-store-v1/README.md) provide historical byte-exact golden documents and a crash table. `python3 docs/archive/v2/fixtures/durable-store-v1/verify.py` verifies their closed structural contract when explicitly run.

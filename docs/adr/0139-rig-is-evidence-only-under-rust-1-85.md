@@ -41,7 +41,7 @@ MiniCore不能通过提升MSRV、`RUSTC_BOOTSTRAP`、跳过主crate all-targets�
 ## 可执行证据
 
 - `provider-gate/tests/m12_rig_*.rs`：exact Rig 0.40.0在current stable上的OpenAI Responses/Anthropic Messages unary、stream、terminal、metadata和error behavior；
-- `tests/m12_provider_error_matrix.rs`：主crate Rust 1.85下执行的26-case provider-neutral delivery/error合同；
+- 历史M12 provider-neutral delivery/error mapping fixture：`docs/archive/v2/fixtures/provider-gate-m12/error-mapping-v1.json`；当前合同由P3 provider suites与AT-13执行；
 - `provider-gate/Cargo.toml`与独立`Cargo.lock`：Rig evidence dependency和更高language floor显式隔离；
 - root `Cargo.toml`与`Cargo.lock`：production package不含Rig；M14 shared transport固定为经真实Rust 1.85验证的exact `reqwest = 0.13.4`最小feature set；
 - `src/model_gateway/provider_transport.rs`：两个direct adapters真正共享的private client construction、bounded drain、SSE framing与默认离线loopback harness；

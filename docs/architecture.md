@@ -232,7 +232,7 @@ Compaction使用Turn-captured Runtime settings、同一PromptSet的AgentRun/Summ
 ## 模块地图
 
 - [Wire Schema与Bounded Decode](modules/wire-schema.md)：public/storage JSON v1、typed scalar carrier、ProtocolLimits、canonical dynamic JSON和bounded scanner。
-- [Wire V1 Conformance Fixtures](fixtures/wire-v1/README.md)：public manifest、golden/corruption vectors、boundary recipes与structural verifier。
+- [Archived Wire V1 Conformance Fixtures](archive/v2/fixtures/wire-v1/README.md)：历史public manifest、golden/corruption vectors、boundary recipes与structural verifier。
 - [Runtime公开协议](modules/runtime-interface.md)：dispatch/query/snapshot/subscribe和live observer语义。
 - [Agent与Session生命周期](modules/agent-session-lifecycle.md)：definition、revision、load/unload/archive/fork。
 - [Workspace](modules/workspace.md)：Session-owned Workspace、authority和immutable snapshot。
@@ -243,7 +243,7 @@ Compaction使用Turn-captured Runtime settings、同一PromptSet的AgentRun/Summ
 - [Turn / Item / Interaction](modules/turn-item-interaction.md)：live lifecycle、Tool exchange和Interaction。
 - [Conversation JSONL Format V1](formats/conversation-jsonl-v1.md)：exact Stored DTO envelope、field/tag、limits和corruption behavior。
 - [Durable Store V1](formats/durable-store-v1.md)：exact local entity layout、generation/head bytes、markers、scanner/recovery precedence。
-- [Durable Store V1 Fixtures](fixtures/durable-store-v1/README.md)：head/definition golden、closed crash taxonomy与structural verifier。
+- [Archived Durable Store V1 Fixtures](archive/v2/fixtures/durable-store-v1/README.md)：历史head/definition golden、closed crash taxonomy与structural verifier。
 - [DurableState](modules/durable-state.md)：private store actor、reservation/lease/CAS/publication/recovery/fault seam。
 - [Conversation Recording与Replay](modules/conversation-storage.md)：JSONL recorder、recording health、tolerant replay和fork。
 - [Session执行](modules/session-execution.md)：control actor、ActiveTurnTask、async loop和queues。
