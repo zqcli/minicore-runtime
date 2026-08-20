@@ -64,6 +64,10 @@ mod tests {
         std::env::temp_dir().join(format!("minicore-p5-prompt-{}", SessionId::new().unwrap()))
     }
 
+    fn workspace_root(id: SessionId) -> PathBuf {
+        std::env::temp_dir().join(format!("minicore-p5-workspace-{id}"))
+    }
+
     fn config(id: SessionId) -> StoredSessionConfig {
         let model = StoredModelConfig::new(ModelSelection::new(
             "anthropic".parse().unwrap(),
@@ -79,7 +83,7 @@ mod tests {
             id,
             timestamp(),
             timestamp(),
-            PathBuf::from("/tmp/workspace"),
+            workspace_root(id),
             model,
             "stored system".to_owned(),
             execution,

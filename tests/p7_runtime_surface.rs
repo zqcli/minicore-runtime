@@ -7,7 +7,6 @@ use minicore_runtime::{
     TranscriptEntry, TranscriptPage,
 };
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 async fn create_signature(
     runtime: &Runtime,
@@ -100,20 +99,20 @@ fn p7_public_runtime_surface_is_typed_and_redacted() {
     let providers = ProviderRegistry::default();
     let tools = ToolRegistry::default();
     let retry = RetryPolicy::new(1, std::time::Duration::ZERO).unwrap();
-    let config = RuntimeConfig::new(
-        PathBuf::from("/tmp/minicore-p7-runtime"),
-        providers,
-        tools,
-        "coding",
-        retry,
-    )
-    .unwrap();
+    let runtime_root =
+        std::env::temp_dir().join(format!("minicore-p7-runtime-{}", SessionId::new().unwrap()));
+    let config =
+        RuntimeConfig::new(runtime_root.clone(), providers, tools, "coding", retry).unwrap();
     let debug = format!("{config:?}");
-    assert!(!debug.contains("/tmp/minicore-p7-runtime"));
+    assert!(!debug.contains(&runtime_root.to_string_lossy().to_string()));
     assert!(!debug.contains("coding\""));
 
+    let workspace_root = std::env::temp_dir().join(format!(
+        "minicore-p7-workspace-{}",
+        SessionId::new().unwrap()
+    ));
     let session = SessionConfig::new(
-        PathBuf::from("/tmp/minicore-p7-workspace"),
+        workspace_root,
         ModelSelection::new("provider".parse().unwrap(), "model".parse().unwrap()),
         "system",
         BTreeSet::<ToolName>::new(),

@@ -1029,6 +1029,10 @@ mod tests {
         std::env::temp_dir().join(format!("minicore-p4-{}", SessionId::new().unwrap()))
     }
 
+    fn workspace_root(id: SessionId) -> PathBuf {
+        std::env::temp_dir().join(format!("minicore-p4-workspace-{id}"))
+    }
+
     fn sample_config(id: SessionId, workspace_root: &Path) -> StoredSessionConfig {
         let model = StoredModelConfig::new(ModelSelection::new(
             "anthropic".parse().unwrap(),
@@ -1062,21 +1066,22 @@ mod tests {
 
     #[test]
     fn stored_config_is_checked_and_has_canonical_field_order() {
-        let workspace = PathBuf::from("/tmp/p4-workspace");
         let id = SessionId::new().unwrap();
+        let workspace = workspace_root(id);
         let config = sample_config(id, &workspace);
         let json_text = serde_json::to_string(&config).unwrap();
         assert_eq!(
             json_text,
             format!(
-                "{{\"format_version\":2,\"session_id\":\"{}\",\"created_at\":\"2026-08-19T12:34:56.789Z\",\"updated_at\":\"2026-08-19T12:34:56.789Z\",\"workspace_root\":\"/tmp/p4-workspace\",\"model\":{{\"provider\":\"anthropic\",\"model\":\"claude-sonnet\"}},\"system_prompt\":\"You are a coding agent\\nUse bounded tools.\",\"enabled_tools\":[\"read_file\",\"write_file\"],\"compaction\":{{\"trigger_tokens\":80000,\"target_tokens\":30000}},\"max_tool_rounds\":16}}",
-                id
+                "{{\"format_version\":2,\"session_id\":\"{}\",\"created_at\":\"2026-08-19T12:34:56.789Z\",\"updated_at\":\"2026-08-19T12:34:56.789Z\",\"workspace_root\":{},\"model\":{{\"provider\":\"anthropic\",\"model\":\"claude-sonnet\"}},\"system_prompt\":\"You are a coding agent\\nUse bounded tools.\",\"enabled_tools\":[\"read_file\",\"write_file\"],\"compaction\":{{\"trigger_tokens\":80000,\"target_tokens\":30000}},\"max_tool_rounds\":16}}",
+                id,
+                serde_json::to_string(&workspace).unwrap()
             )
         );
         assert!(!json_text.contains("credential"));
         assert!(!json_text.contains("descriptor"));
         let debug = format!("{config:?}");
-        assert!(!debug.contains("/tmp/p4-workspace"));
+        assert!(!debug.contains(&workspace.to_string_lossy().to_string()));
         assert!(!debug.contains("You are a coding agent"));
         assert_eq!(
             serde_json::from_str::<StoredSessionConfig>(&json_text).unwrap(),
@@ -1122,10 +1127,11 @@ mod tests {
                 StoredExecutionConfig::new(BTreeSet::new(), compaction.clone(), rounds).is_err()
             );
         }
+        let absolute = std::env::temp_dir();
         for root in [
             PathBuf::from("relative"),
-            PathBuf::from("/tmp/./workspace"),
-            PathBuf::from("/tmp/../workspace"),
+            absolute.join(".").join("workspace"),
+            absolute.join("..").join("workspace"),
         ] {
             assert!(
                 StoredSessionConfig::new(
@@ -1140,24 +1146,26 @@ mod tests {
                 .is_err()
             );
         }
+        let oversized_id = SessionId::new().unwrap();
         assert!(
             StoredSessionConfig::new(
-                SessionId::new().unwrap(),
+                oversized_id,
                 "2026-08-19T12:34:56.789Z".parse().unwrap(),
                 "2026-08-19T12:34:56.789Z".parse().unwrap(),
-                PathBuf::from("/tmp/workspace"),
+                workspace_root(oversized_id),
                 model.clone(),
                 "x".repeat(262_145),
                 StoredExecutionConfig::new(BTreeSet::new(), compaction.clone(), 1).unwrap(),
             )
             .is_err()
         );
+        let invalid_prompt_id = SessionId::new().unwrap();
         assert!(
             StoredSessionConfig::new(
-                SessionId::new().unwrap(),
+                invalid_prompt_id,
                 "2026-08-19T12:34:56.789Z".parse().unwrap(),
                 "2026-08-19T12:34:56.789Z".parse().unwrap(),
-                PathBuf::from("/tmp/workspace"),
+                workspace_root(invalid_prompt_id),
                 model,
                 "bad\u{0001}prompt".to_owned(),
                 StoredExecutionConfig::new(BTreeSet::new(), compaction, 1).unwrap(),
@@ -1171,7 +1179,7 @@ mod tests {
         let root = unique_root();
         let store = SessionStore::open(root.clone()).await.unwrap();
         let id = SessionId::new().unwrap();
-        let config = sample_config(id, Path::new("/tmp/p4-workspace"));
+        let config = sample_config(id, &workspace_root(id));
         store.create(&config).await.unwrap();
         assert!(!format!("{store:?}").contains(&root.to_string_lossy().to_string()));
         assert_eq!(store.load_config(id).await.unwrap(), config);
@@ -1207,11 +1215,11 @@ mod tests {
         let first = SessionId::new().unwrap();
         let second = SessionId::new().unwrap();
         store
-            .create(&sample_config(first, Path::new("/tmp/workspace")))
+            .create(&sample_config(first, &workspace_root(first)))
             .await
             .unwrap();
         store
-            .create(&sample_config(second, Path::new("/tmp/workspace")))
+            .create(&sample_config(second, &workspace_root(second)))
             .await
             .unwrap();
         let mut expected = vec![first, second];
@@ -1248,7 +1256,7 @@ mod tests {
         let second = SessionStore::open(root.clone()).await;
         assert!(matches!(second, Err(StoreError::InUse)));
         let id = SessionId::new().unwrap();
-        let config = sample_config(id, Path::new("/tmp/workspace"));
+        let config = sample_config(id, &workspace_root(id));
         store.create(&config).await.unwrap();
         assert_eq!(store.create(&config).await, Err(StoreError::AlreadyExists));
         let retained_clone = store.clone();
@@ -1325,7 +1333,7 @@ mod tests {
         let store = SessionStore::open(root.clone()).await.unwrap();
         let id = SessionId::new().unwrap();
         store
-            .create(&sample_config(id, Path::new("/tmp/workspace")))
+            .create(&sample_config(id, &workspace_root(id)))
             .await
             .unwrap();
         let session_json = root
@@ -1336,7 +1344,7 @@ mod tests {
         assert_eq!(store.load_config(id).await, Err(StoreError::TooLarge));
         let other_id = SessionId::new().unwrap();
         let other_json =
-            serde_json::to_vec(&sample_config(other_id, Path::new("/tmp/workspace"))).unwrap();
+            serde_json::to_vec(&sample_config(other_id, &workspace_root(other_id))).unwrap();
         fs::write(&session_json, [other_json.as_slice(), b"\n"].concat()).unwrap();
         assert_eq!(store.load_config(id).await, Err(StoreError::Corrupt));
         fs::write(&session_json, b"{\"format_version\":2}\n").unwrap();
@@ -1355,7 +1363,7 @@ mod tests {
             Err(StoreError::NotFound)
         ));
         store
-            .create(&sample_config(id, Path::new("/tmp/workspace")))
+            .create(&sample_config(id, &workspace_root(id)))
             .await
             .unwrap();
         let registration = store.open_registration(id).await.unwrap();
@@ -1368,7 +1376,7 @@ mod tests {
         store.delete(id).await.unwrap();
 
         store
-            .create(&sample_config(id, Path::new("/tmp/workspace")))
+            .create(&sample_config(id, &workspace_root(id)))
             .await
             .unwrap();
         let (started_sender, started_receiver) = channel();
@@ -1442,7 +1450,7 @@ mod tests {
         let store = SessionStore::open(root.clone()).await.unwrap();
         let id = SessionId::new().unwrap();
         store
-            .create(&sample_config(id, Path::new("/tmp/workspace")))
+            .create(&sample_config(id, &workspace_root(id)))
             .await
             .unwrap();
         assert_eq!(
