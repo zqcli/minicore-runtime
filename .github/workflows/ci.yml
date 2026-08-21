@@ -57,25 +57,44 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if ([string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
-            throw 'ProgramFiles(x86) is not set'
+          if ([string]::IsNullOrWhiteSpace(${env:ProgramFiles}) -and [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
+            throw 'Neither ProgramFiles nor ProgramFiles(x86) is set'
           }
           if ([string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
             throw 'GITHUB_ENV is not set'
           }
 
-          $vswhere = Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath 'Microsoft Visual Studio\Installer\vswhere.exe'
-          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
-            throw "Visual Studio locator was not found: $vswhere"
+          $programFilesRoots = @(
+            ${env:ProgramFiles}
+            ${env:ProgramFiles(x86)}
+          ) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\', '/') } |
+            Sort-Object -Unique
+
+          $candidates = @(
+            foreach ($programFilesRoot in $programFilesRoots) {
+              $pattern = Join-Path -Path $programFilesRoot -ChildPath 'Microsoft Visual Studio\*\*\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
+              Get-ChildItem -Path $pattern -File -Force -ErrorAction SilentlyContinue
+            }
+          )
+          $candidates = @($candidates | Sort-Object -Property FullName -Unique)
+          if ($candidates.Count -eq 0) {
+            throw 'No Visual Studio Developer Shell was found under ProgramFiles or ProgramFiles(x86)'
+          }
+          if ($candidates.Count -ne 1) {
+            $candidatePaths = $candidates.FullName -join ', '
+            throw "Ambiguous Visual Studio Developer Shell candidates: $candidatePaths"
           }
 
-          $installationPath = & $vswhere '-latest' '-products' '*' '-property' 'installationPath' 2>$null | Select-Object -First 1
-          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installationPath)) {
-            throw 'vswhere could not locate a Visual Studio installation'
+          $candidateFile = $candidates[0]
+          $toolsPath = Split-Path -Parent $candidateFile.FullName
+          $common7Path = Split-Path -Parent $toolsPath
+          if ((Split-Path -Leaf $toolsPath) -ne 'Tools' -or (Split-Path -Leaf $common7Path) -ne 'Common7') {
+            throw "Visual Studio Developer Shell has an unexpected layout: $($candidateFile.FullName)"
           }
-          $installationPath = ([string]$installationPath).Trim()
-
-          $devShell = Join-Path -Path $installationPath -ChildPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
+          $installationPath = [IO.Path]::GetFullPath((Split-Path -Parent $common7Path))
+          $devShell = [IO.Path]::GetFullPath($candidateFile.FullName)
           if (-not (Test-Path -LiteralPath $devShell -PathType Leaf)) {
             throw "Visual Studio Developer Shell was not found: $devShell"
           }
