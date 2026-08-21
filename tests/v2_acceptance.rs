@@ -1511,9 +1511,15 @@ fn present_host_environment() -> (&'static str, String) {
 #[cfg(windows)]
 fn windows_linker_diagnostics_for_at04() -> String {
     let keys = [
-        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
-        "RUSTFLAGS",
-        "CARGO_ENCODED_RUSTFLAGS",
+        "PATH",
+        "INCLUDE",
+        "LIB",
+        "LIBPATH",
+        "VCINSTALLDIR",
+        "VSINSTALLDIR",
+        "VSCMD_ARG_TGT_ARCH",
+        "WindowsSdkDir",
+        "WindowsSDKVersion",
         "ProgramFiles(x86)",
         "ProgramFiles",
     ];

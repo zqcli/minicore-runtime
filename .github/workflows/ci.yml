@@ -52,5 +52,60 @@ jobs:
         run: rustup toolchain install stable --profile minimal
       - name: Select stable Rust toolchain
         run: rustup override set stable
+      - name: Initialize Windows MSVC Developer Shell
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
+            throw 'ProgramFiles(x86) is not set'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
+            throw 'GITHUB_ENV is not set'
+          }
+
+          $vswhere = Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "Visual Studio locator was not found: $vswhere"
+          }
+
+          $installationPath = & $vswhere '-latest' '-products' '*' '-requires' 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' '-property' 'installationPath' 2>$null | Select-Object -First 1
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installationPath)) {
+            throw 'vswhere could not locate a Visual Studio installation with x64 MSVC tools'
+          }
+          $installationPath = ([string]$installationPath).Trim()
+
+          $devShell = Join-Path -Path $installationPath -ChildPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
+          if (-not (Test-Path -LiteralPath $devShell -PathType Leaf)) {
+            throw "Visual Studio Developer Shell was not found: $devShell"
+          }
+          Import-Module -LiteralPath $devShell -Force -ErrorAction Stop
+          if ($null -eq (Get-Command Enter-VsDevShell -ErrorAction SilentlyContinue)) {
+            throw 'Enter-VsDevShell was not imported from the Visual Studio Developer Shell module'
+          }
+
+          Enter-VsDevShell -VsInstallPath $installationPath -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+
+          $requiredEnvironment = @(
+            'PATH',
+            'INCLUDE',
+            'LIB',
+            'LIBPATH',
+            'VCINSTALLDIR',
+            'VSINSTALLDIR',
+            'VSCMD_ARG_TGT_ARCH',
+            'WindowsSdkDir',
+            'WindowsSDKVersion'
+          )
+          foreach ($name in $requiredEnvironment) {
+            $value = [Environment]::GetEnvironmentVariable($name, 'Process')
+            if ([string]::IsNullOrWhiteSpace($value)) {
+              throw "Visual Studio Developer Shell did not set required variable: $name"
+            }
+            if ($name -eq 'VSCMD_ARG_TGT_ARCH' -and $value -ne 'x64') {
+              throw "Visual Studio Developer Shell selected unexpected target architecture: $value"
+            }
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value (('{0}={1}' -f $name, $value)) -Encoding utf8
+          }
       - run: cargo test --all-targets --locked
       - run: cargo test --manifest-path provider-gate/Cargo.toml --all-targets --locked
