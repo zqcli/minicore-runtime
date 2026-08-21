@@ -196,9 +196,14 @@ impl ProcessPolicy {
             allowed_env.insert("RUSTUP_HOME".to_owned());
             allowed_env.insert("ProgramFiles(x86)".to_owned());
             allowed_env.insert("ProgramFiles".to_owned());
-            allowed_env.insert("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER".to_owned());
-            allowed_env.insert("RUSTFLAGS".to_owned());
-            allowed_env.insert("CARGO_ENCODED_RUSTFLAGS".to_owned());
+            allowed_env.insert("INCLUDE".to_owned());
+            allowed_env.insert("LIB".to_owned());
+            allowed_env.insert("LIBPATH".to_owned());
+            allowed_env.insert("VCINSTALLDIR".to_owned());
+            allowed_env.insert("VSINSTALLDIR".to_owned());
+            allowed_env.insert("VSCMD_ARG_TGT_ARCH".to_owned());
+            allowed_env.insert("WindowsSdkDir".to_owned());
+            allowed_env.insert("WindowsSDKVersion".to_owned());
         }
 
         #[cfg(not(windows))]
@@ -359,9 +364,14 @@ mod tests {
             "RUSTUP_HOME",
             "ProgramFiles(x86)",
             "ProgramFiles",
-            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
-            "RUSTFLAGS",
-            "CARGO_ENCODED_RUSTFLAGS",
+            "INCLUDE",
+            "LIB",
+            "LIBPATH",
+            "VCINSTALLDIR",
+            "VSINSTALLDIR",
+            "VSCMD_ARG_TGT_ARCH",
+            "WindowsSdkDir",
+            "WindowsSDKVersion",
         ] {
             assert!(policy.allowed_env().contains(key));
         }
