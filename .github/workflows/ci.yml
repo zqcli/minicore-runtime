@@ -69,9 +69,9 @@ jobs:
             throw "Visual Studio locator was not found: $vswhere"
           }
 
-          $installationPath = & $vswhere '-latest' '-products' '*' '-requires' 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' '-property' 'installationPath' 2>$null | Select-Object -First 1
+          $installationPath = & $vswhere '-latest' '-products' '*' '-property' 'installationPath' 2>$null | Select-Object -First 1
           if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installationPath)) {
-            throw 'vswhere could not locate a Visual Studio installation with x64 MSVC tools'
+            throw 'vswhere could not locate a Visual Studio installation'
           }
           $installationPath = ([string]$installationPath).Trim()
 
@@ -85,6 +85,19 @@ jobs:
           }
 
           Enter-VsDevShell -VsInstallPath $installationPath -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+
+          $linkerCommand = Get-Command -Name 'link.exe' -CommandType Application -All -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $linkerCommand) {
+            throw 'Visual Studio Developer Shell did not put link.exe on PATH'
+          }
+          $installationRoot = [IO.Path]::GetFullPath($installationPath).TrimEnd('\', '/') + '\'
+          $linkerPath = [IO.Path]::GetFullPath([string]$linkerCommand.Path)
+          if (-not $linkerPath.StartsWith($installationRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "PATH-first link.exe is outside the selected Visual Studio installation: $linkerPath"
+          }
+          if ($linkerPath -match '(?i)(^|\\)Git(\\|$)') {
+            throw "PATH-first link.exe resolves to Git: $linkerPath"
+          }
 
           $requiredEnvironment = @(
             'PATH',
