@@ -6,7 +6,7 @@ The milestone name is v0.2 Core Reset. The crate package metadata remains at ver
 
 ## Source Graph
 
-The production crate contains 56 Rust source files and approximately 16,581 production lines. Its canonical top-level owners are `agent`, `config`, `error`, `event`, `ids`, `model`, `prompt`, `runtime`, `session`, `storage`, `tools`, and `workspace`. `agent`, `prompt`, and `storage` are private. The production module dependency graph is a DAG: every module SCC is a singleton, with no accepted multi-module cycle.
+The production crate contains 56 Rust source files and approximately 16.6k production lines. Its canonical top-level owners are `agent`, `config`, `error`, `event`, `ids`, `model`, `prompt`, `runtime`, `session`, `storage`, `tools`, and `workspace`. `agent`, `prompt`, and `storage` are private. The production module dependency graph is a DAG: every module SCC is a singleton, with no accepted multi-module cycle.
 
 The architecture gate requires the exact canonical file graph, rejects legacy source paths and migration aliases, checks owner-crossing imports, limits production file and function size, and freezes the direct dependency set. The current direct dependencies are `cap-primitives`, `cap-std`, `fs4`, `futures-util`, `getrandom`, `reqwest`, `serde`, `serde_json`, `thiserror`, `time`, `tokio`, and `tokio-util`.
 
@@ -49,6 +49,7 @@ The final deterministic result includes:
 - stable format, locked all-target tests, all-feature Clippy with warnings denied, provider-gate tests and Clippy, current documentation checks, and the architecture gate through `scripts/check.sh`;
 - Rust 1.85 locked check and all-target tests through `scripts/check-msrv.sh`;
 - locked documentation generation and Cargo metadata resolution;
+- [GitHub Actions run 32434427759](https://github.com/zqcli/minicore-runtime/actions/runs/32434427759): Ubuntu Rust 1.85 and stable gates plus native macOS and Windows all-target/provider-gate tests all passed;
 - all 20 acceptance cases plus the acceptance inventory: 21 passed, 0 failed, 0 ignored;
 - 148 library tests on the Rust 1.85 gate;
 - live-provider harness source validation, with the two real-network provider smokes still explicitly ignored by default.

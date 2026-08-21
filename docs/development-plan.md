@@ -83,7 +83,7 @@ Before changing a provider or builtin, confirm:
 
 ## Remote Release Gate
 
-The final P9 gate ran on the approved Rust 1.85 toolchain and stable toolchain without changing source behavior. It included current Markdown/ADR validation, format, locked all-target tests, Clippy, the provider-gate package, MSRV checks, locked documentation generation, Cargo metadata resolution, and the active acceptance matrix. Live provider smokes remain explicit opt-in and are not part of the default release result.
+The final P9 gate ran on the approved Rust 1.85 toolchain and stable toolchain without changing source behavior. It included current Markdown/ADR validation, format, locked all-target tests, Clippy, the provider-gate package, MSRV checks, locked documentation generation, Cargo metadata resolution, and the active acceptance matrix. Native macOS and Windows all-target plus provider-gate jobs also passed in [GitHub Actions run 32434427759](https://github.com/zqcli/minicore-runtime/actions/runs/32434427759). Live provider smokes remain explicit opt-in and are not part of the default release result.
 
 Dependency lockfile regeneration was committed separately after P9-01 manifest cleanup. Rust 1.85 and stable Cargo produced byte-identical lockfiles. Review confirmed a stable 199-package graph with 20 compatible patch-version updates, no package entry added or removed, and green locked gates. The crate package metadata remains at `0.1.0`; a package version or publication change requires a separate decision.
 
