@@ -98,7 +98,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $devShell -PathType Leaf)) {
             throw "Visual Studio Developer Shell was not found: $devShell"
           }
-          Import-Module -LiteralPath $devShell -Force -ErrorAction Stop
+          Import-Module -Name $devShell -Force -ErrorAction Stop
           if ($null -eq (Get-Command Enter-VsDevShell -ErrorAction SilentlyContinue)) {
             throw 'Enter-VsDevShell was not imported from the Visual Studio Developer Shell module'
           }
