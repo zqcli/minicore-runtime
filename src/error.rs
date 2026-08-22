@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::value::BoundedText;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicErrorCode {
@@ -38,6 +40,99 @@ impl PublicErrorSummary {
 
     pub const fn retryable(&self) -> bool {
         self.retryable
+    }
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticCategory {
+    Configuration,
+    Model,
+    Tool,
+    Policy,
+    Context,
+    Compaction,
+    Storage,
+    Cancellation,
+    Internal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticCode {
+    InvalidConfiguration,
+    InvalidSessionManifest,
+    SessionClosed,
+    SessionBusy,
+    SessionDegraded,
+    CommandBackpressure,
+    InteractionNotFound,
+    InteractionKindMismatch,
+    ModelMismatch,
+    ModelTimeout,
+    ModelMalformedResponse,
+    ModelUnavailable,
+    ContextFailed,
+    PolicyDenied,
+    PolicyFailed,
+    ToolNotFound,
+    ToolTimeout,
+    ToolFailed,
+    TurnBudgetExceeded,
+    LogConflict,
+    LogCorrupt,
+    LogUnknownOutcome,
+    RuntimeTerminated,
+    ShutdownTimeout,
+    Internal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DiagnosticSummary {
+    pub code: DiagnosticCode,
+    pub category: DiagnosticCategory,
+    pub message: BoundedText,
+    pub retryable: bool,
+}
+
+impl DiagnosticSummary {
+    pub const fn new(
+        code: DiagnosticCode,
+        category: DiagnosticCategory,
+        message: BoundedText,
+        retryable: bool,
+    ) -> Self {
+        Self {
+            code,
+            category,
+            message,
+            retryable,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiagnosticSummaryWire {
+    code: DiagnosticCode,
+    category: DiagnosticCategory,
+    message: BoundedText,
+    retryable: bool,
+}
+
+impl<'de> Deserialize<'de> for DiagnosticSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = DiagnosticSummaryWire::deserialize(deserializer)?;
+        Ok(Self::new(
+            value.code,
+            value.category,
+            value.message,
+            value.retryable,
+        ))
     }
 }
 

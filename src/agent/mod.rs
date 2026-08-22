@@ -1,7 +1,6 @@
 mod context;
 mod runner;
 
-pub use context::{RetryPolicy, RetryPolicyError};
 pub(crate) use context::{
     TimestampSource, TurnContext, TurnContextDependencies, TurnContextError,
     system_timestamp_source,
@@ -12,8 +11,6 @@ pub(crate) use runner::{
 };
 
 const _: () = {
-    let _ = std::mem::size_of::<RetryPolicy>();
-    let _ = std::mem::size_of::<RetryPolicyError>();
     let _ = std::mem::size_of::<TimestampSource>();
     let _ = std::mem::size_of::<TurnContext>();
     let _ = std::mem::size_of::<TurnContextDependencies>();
@@ -40,14 +37,12 @@ mod tests {
     use std::time::Duration;
 
     use super::context::TurnContext;
-    use super::context::{
-        RetryPolicy, RetryPolicyError, TimestampSource, TurnContextDependencies,
-        system_timestamp_source,
-    };
+    use super::context::{TimestampSource, TurnContextDependencies, system_timestamp_source};
     use super::runner::{
         MAX_RUNNER_EVENT_CAPACITY, RunnerEvent, RunnerEventSendError, RunnerEventSink,
     };
     use super::runner::{TurnTaskResult, run_turn};
+    use crate::config::RetryPolicy;
     use crate::ids::{SessionId, TurnId};
     use crate::model::{
         AssistantPart, ModelCallContext, ModelDescriptor, ModelError, ModelEvent, ModelEventSink,
@@ -549,47 +544,6 @@ mod tests {
         let fixed: TimestampSource = fixed_timestamp_source;
         assert_eq!(fixed().unwrap(), fixed_timestamp);
         assert_eq!(fixed().unwrap(), fixed_timestamp);
-    }
-
-    #[test]
-    fn retry_policy_is_checked_and_exponential_with_a_cap() {
-        assert_eq!(
-            RetryPolicy::new(0, Duration::ZERO),
-            Err(RetryPolicyError::InvalidAttempts)
-        );
-        assert_eq!(
-            RetryPolicy::new(5, Duration::ZERO),
-            Err(RetryPolicyError::InvalidAttempts)
-        );
-        assert_eq!(
-            RetryPolicy::new(1, Duration::from_secs(31)),
-            Err(RetryPolicyError::DelayTooLong)
-        );
-        let policy = RetryPolicy::new(4, Duration::from_secs(10)).unwrap();
-        assert_eq!(
-            policy.delay_for_retry(0, None),
-            Some(Duration::from_secs(10))
-        );
-        assert_eq!(
-            policy.delay_for_retry(1, None),
-            Some(Duration::from_secs(20))
-        );
-        assert_eq!(
-            policy.delay_for_retry(2, None),
-            Some(Duration::from_secs(30))
-        );
-        assert_eq!(
-            policy.delay_for_retry(3, None),
-            Some(Duration::from_secs(30))
-        );
-        assert_eq!(
-            policy.delay_for_retry(0, Some(Duration::from_secs(29))),
-            Some(Duration::from_secs(29))
-        );
-        assert_eq!(
-            policy.delay_for_retry(0, Some(Duration::from_secs(31))),
-            None
-        );
     }
 
     #[test]

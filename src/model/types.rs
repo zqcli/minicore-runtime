@@ -869,7 +869,7 @@ impl<'de> Deserialize<'de> for AssistantPart {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ToolCall {
     tool_call_id: ToolCallId,
     name: ToolName,
@@ -878,11 +878,24 @@ pub struct ToolCall {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ToolCallWire {
     tool_call_id: ToolCallId,
     name: ToolName,
     arguments: Value,
     call_index: u32,
+}
+
+impl fmt::Debug for ToolCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolCall")
+            .field("tool_call_id", &self.tool_call_id)
+            .field("name", &self.name)
+            .field("call_index", &self.call_index)
+            .field("arguments", &"<redacted>")
+            .finish()
+    }
 }
 
 impl ToolCall {
@@ -1129,6 +1142,7 @@ pub enum ModelFinishReason {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Usage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     input_tokens: Option<u64>,

@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::RetryPolicy;
 use crate::ids::{SessionId, TurnId};
 use crate::model::{ModelGateway, ModelLimits, ReasoningPreference};
 use crate::prompt::{Compactor, PromptBuildOptions, PromptBuilder};
@@ -20,76 +20,6 @@ pub(crate) type TimestampSource = fn() -> Result<Timestamp, TimestampError>;
 
 pub(crate) const fn system_timestamp_source() -> TimestampSource {
     Timestamp::now_utc
-}
-
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
-
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum RetryPolicyError {
-    #[error("retry attempt count is outside its bound")]
-    InvalidAttempts,
-    #[error("retry delay exceeds its bound")]
-    DelayTooLong,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RetryPolicy {
-    max_attempts: u8,
-    base_delay: Duration,
-}
-
-impl RetryPolicy {
-    pub fn new(max_attempts: u8, base_delay: Duration) -> Result<Self, RetryPolicyError> {
-        if !(1..=4).contains(&max_attempts) {
-            return Err(RetryPolicyError::InvalidAttempts);
-        }
-        if base_delay > MAX_RETRY_DELAY {
-            return Err(RetryPolicyError::DelayTooLong);
-        }
-        Ok(Self {
-            max_attempts,
-            base_delay,
-        })
-    }
-
-    pub const fn max_attempts(&self) -> u8 {
-        self.max_attempts
-    }
-
-    pub const fn base_delay(&self) -> Duration {
-        self.base_delay
-    }
-
-    pub fn delay_for_retry(
-        &self,
-        retry_index: u8,
-        retry_after: Option<Duration>,
-    ) -> Option<Duration> {
-        let mut exponential = self.base_delay;
-        for _ in 0..retry_index {
-            exponential = exponential
-                .checked_mul(2)
-                .unwrap_or(MAX_RETRY_DELAY)
-                .min(MAX_RETRY_DELAY);
-            if exponential == MAX_RETRY_DELAY {
-                break;
-            }
-        }
-        match retry_after {
-            Some(value) if value > MAX_RETRY_DELAY => None,
-            Some(value) => Some(value.max(exponential)),
-            None => Some(exponential),
-        }
-    }
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 3,
-            base_delay: Duration::from_millis(250),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]

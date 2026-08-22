@@ -390,6 +390,16 @@ pub enum ToolResultStatus {
     Denied,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultOutcome {
+    Success,
+    Failed,
+    Denied,
+    Cancelled,
+    InputProvided,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ToolResultSummary {
     tool_call_id: ToolCallId,

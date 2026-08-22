@@ -4,10 +4,15 @@ const P1_SOURCES: &[&str] = &[
     include_str!("../src/ids.rs"),
     include_str!("../src/error.rs"),
     include_str!("../src/event.rs"),
+    include_str!("../src/config/retry.rs"),
     include_str!("../src/model/mod.rs"),
     include_str!("../src/model/types.rs"),
+    include_str!("../src/conversation/mod.rs"),
+    include_str!("../src/conversation/entry.rs"),
     include_str!("../src/tools/mod.rs"),
     include_str!("../src/tools/types.rs"),
+    include_str!("../src/storage/mod.rs"),
+    include_str!("../src/storage/session_log.rs"),
     include_str!("../src/session/mod.rs"),
     include_str!("../src/session/state.rs"),
     include_str!("../src/session/snapshot.rs"),
@@ -49,6 +54,7 @@ fn canonical_modules_have_explicit_root_exports() {
     let lib = include_str!("../src/lib.rs");
     for declaration in [
         "pub mod config;",
+        "pub mod conversation;",
         "pub mod error;",
         "pub mod event;",
         "pub mod ids;",
@@ -65,7 +71,7 @@ fn canonical_modules_have_explicit_root_exports() {
     }
     assert!(lib.contains("mod agent;"));
     assert!(lib.contains("mod prompt;"));
-    assert!(lib.contains("mod storage;"));
+    assert!(lib.contains("pub mod storage;"));
     assert!(!lib.contains("#[path ="));
     assert!(!lib.contains("_v2"));
     assert_root_exports(
@@ -121,14 +127,50 @@ fn canonical_modules_have_explicit_root_exports() {
             "TranscriptToolCall",
             "TurnOutcome",
             "TurnSummary",
-            "TurnTerminal",
             "TurnTerminalSummary",
         ],
     );
+    assert_root_exports(
+        lib,
+        "conversation",
+        &["ConversationEntry", "ConversationSeq", "TurnTerminal"],
+    );
+    assert_root_exports(
+        lib,
+        "storage",
+        &[
+            "AppendReceipt",
+            "ConversationPage",
+            "SessionLog",
+            "SessionLogError",
+        ],
+    );
+    let conversation_exports = root_use_block(lib, "conversation").unwrap();
+    for symbol in [
+        "AssistantMessageEntry",
+        "SummaryEntry",
+        "ToolResultEntry",
+        "UserMessageEntry",
+    ] {
+        assert!(!conversation_exports.contains(symbol));
+    }
+    let storage_exports = root_use_block(lib, "storage").unwrap();
+    for symbol in ["LogFuture", "SessionLogErrorKind", "SessionStore"] {
+        assert!(!storage_exports.contains(symbol));
+    }
     assert!(root_use_block(lib, "model").is_none());
     assert!(root_use_block(lib, "tools").is_none());
     assert!(root_use_block(lib, "workspace").is_none());
     assert!(lib.contains("pub use event::SessionEventKind;"));
+    let storage = include_str!("../src/storage/mod.rs");
+    assert!(storage.contains("mod session_log;"));
+    assert!(storage.contains("pub(crate) mod store;"));
+    assert!(!storage.contains("pub mod store;"));
+    let config = include_str!("../src/config.rs");
+    assert!(config.contains("mod retry;"));
+    assert!(config.contains("pub use retry::{RetryPolicy, RetryPolicyError};"));
+    let agent = include_str!("../src/agent/mod.rs");
+    assert!(!agent.contains("pub use context::{RetryPolicy"));
     assert!(!include_str!("../src/model/mod.rs").contains("pub mod types"));
     assert!(!include_str!("../src/session/mod.rs").contains("pub mod snapshot"));
     assert!(!include_str!("../src/tools/mod.rs").contains("pub mod types"));
