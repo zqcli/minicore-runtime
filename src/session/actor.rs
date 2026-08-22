@@ -13,9 +13,10 @@ use super::event_stream::SessionObservation;
 use super::snapshot::{SessionSnapshot, SnapshotHistory, TurnOutcome, TurnSummary, TurnTerminal};
 use super::state::SessionStatus;
 use crate::agent::{
-    RetryPolicy, RunnerEvent, RunnerEventSink, TimestampSource, TurnContext,
-    TurnContextDependencies, TurnFailure, TurnTaskResult, run_turn,
+    RunnerEvent, RunnerEventSink, TimestampSource, TurnContext, TurnContextDependencies,
+    TurnFailure, TurnTaskResult, run_turn,
 };
+use crate::config::RetryPolicy;
 use crate::error::{PublicErrorCode, PublicErrorSummary, SessionError};
 use crate::ids::{InteractionId, TurnId};
 use crate::model::{
@@ -1040,7 +1041,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::agent::RetryPolicy;
+    use crate::config::RetryPolicy;
     use crate::ids::{SessionId, TurnId};
     use crate::model::{
         AssistantPart, ModelCallContext, ModelDescriptor, ModelError, ModelEvent,

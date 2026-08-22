@@ -17,6 +17,7 @@ SRC = ROOT / "src"
 CANONICAL_TOPS = (
     "agent",
     "config",
+    "conversation",
     "error",
     "event",
     "ids",
@@ -33,6 +34,7 @@ CANONICAL_TOPS = (
 
 REQUIRED_DIRS = {
     "src/agent",
+    "src/conversation",
     "src/model",
     "src/model/providers",
     "src/prompt",
@@ -51,8 +53,11 @@ REQUIRED_FILES = {
     "src/agent/runner.rs",
     "src/config.rs",
     "src/config/kernel.rs",
+    "src/config/retry.rs",
     "src/config/session.rs",
     "src/config/session_spec.rs",
+    "src/conversation/entry.rs",
+    "src/conversation/mod.rs",
     "src/error.rs",
     "src/event.rs",
     "src/ids.rs",
@@ -87,6 +92,7 @@ REQUIRED_FILES = {
     "src/storage/conversation/compaction.rs",
     "src/storage/conversation/usage.rs",
     "src/storage/mod.rs",
+    "src/storage/session_log.rs",
     "src/storage/store.rs",
     "src/time.rs",
     "src/tools/builtins/ask_user.rs",
@@ -230,6 +236,7 @@ EXPECTED_ROOT_EXPORTS = {
         "TurnOptions",
         "UserInput",
     },
+    "conversation": {"ConversationEntry", "ConversationSeq", "TurnTerminal"},
     "error": {
         "PublicErrorCode",
         "PublicErrorSummary",
@@ -262,20 +269,22 @@ EXPECTED_ROOT_EXPORTS = {
         "TranscriptToolCall",
         "TurnOutcome",
         "TurnSummary",
-        "TurnTerminal",
         "TurnTerminalSummary",
     },
+    "storage": {"AppendReceipt", "ConversationPage", "SessionLog", "SessionLogError"},
     "value": {"BoundedText"},
 }
 
 EXPECTED_PUBLIC_MODULES = {
     "config",
+    "conversation",
     "error",
     "event",
     "ids",
     "model",
     "runtime",
     "session",
+    "storage",
     "tools",
     "value",
     "workspace",
@@ -323,6 +332,7 @@ FORBIDDEN_MANIFEST_TOKENS = ("heavy-tests", "raw_value", "arbitrary_precision")
 
 EXPECTED_MODULE_VISIBILITY = {
     "src/agent/mod.rs": {"context": "private", "runner": "private"},
+    "src/conversation/mod.rs": {"entry": "private"},
     "src/model/mod.rs": {
         "gateway": "private",
         "provider": "private",
@@ -346,6 +356,7 @@ EXPECTED_MODULE_VISIBILITY = {
     "src/storage/mod.rs": {
         "conversation": "crate",
         "compaction_visibility": "private",
+        "session_log": "private",
         "store": "crate",
     },
     "src/storage/conversation.rs": {
@@ -662,10 +673,10 @@ def check_public_surface(sources: Dict[str, str]) -> List[str]:
             "src/lib.rs: public modules mismatch: "
             f"expected={sorted(EXPECTED_PUBLIC_MODULES)} actual={sorted(public_modules)}"
         )
-    if private_modules != {"agent", "prompt", "storage", "time"}:
+    if private_modules != {"agent", "prompt", "time"}:
         errors.append(
             "src/lib.rs: private modules mismatch: "
-            f"expected=['agent', 'prompt', 'storage', 'time'] actual={sorted(private_modules)}"
+            f"expected=['agent', 'prompt', 'time'] actual={sorted(private_modules)}"
         )
     if other_visibility:
         errors.append(f"src/lib.rs: unsupported module visibility: {other_visibility}")

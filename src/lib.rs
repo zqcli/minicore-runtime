@@ -1,5 +1,6 @@
 mod agent;
 pub mod config;
+pub mod conversation;
 pub mod error;
 pub mod event;
 pub mod ids;
@@ -7,7 +8,7 @@ pub mod model;
 mod prompt;
 pub mod runtime;
 pub mod session;
-mod storage;
+pub mod storage;
 mod time;
 pub mod tools;
 pub mod value;
@@ -18,6 +19,7 @@ pub use config::{
     RuntimeConfigBuilder, SemanticLimits, SessionConfig, SessionManifest, SessionSpec, TurnOptions,
     UserInput,
 };
+pub use conversation::{ConversationEntry, ConversationSeq, TurnTerminal};
 pub use error::{PublicErrorCode, PublicErrorSummary, RuntimeError, SessionError};
 pub use event::SessionEventKind;
 pub use ids::{
@@ -28,6 +30,7 @@ pub use runtime::{Runtime, SessionSummary};
 pub use session::{
     SessionEvent, SessionEventStream, SessionSnapshot, SessionStatus, SnapshotHistory,
     SnapshotShapeError, TerminalOutcome, TranscriptEntry, TranscriptPage, TranscriptToolCall,
-    TurnOutcome, TurnSummary, TurnTerminal, TurnTerminalSummary,
+    TurnOutcome, TurnSummary, TurnTerminalSummary,
 };
+pub use storage::{AppendReceipt, ConversationPage, SessionLog, SessionLogError};
 pub use value::BoundedText;

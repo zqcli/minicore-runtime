@@ -7,8 +7,8 @@ use futures_util::future::join_all;
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{RetryPolicy, system_timestamp_source};
-use crate::config::{RuntimeConfig, SessionConfig};
+use crate::agent::system_timestamp_source;
+use crate::config::{RetryPolicy, RuntimeConfig, SessionConfig};
 use crate::error::{RuntimeError, SessionError};
 use crate::ids::{InteractionId, SessionId, TurnId};
 use crate::model::{ModelGateway, ModelSelection, ReasoningPreference};
@@ -94,8 +94,7 @@ impl Runtime {
         }
         let id = SessionId::new().map_err(|_| SessionError::Internal)?;
         let timestamp = Timestamp::now_utc().map_err(|_| SessionError::Internal)?;
-        let stored = config
-            .to_stored(id, timestamp)
+        let stored = StoredSessionConfig::from_session_config(id, timestamp, &config)
             .map_err(|_| SessionError::InvalidInput)?;
         validate_stored(&self.inner.gateway, &self.inner.tools, &stored)?;
         let mut reservation = self.inner.manager.begin_load(id)?;

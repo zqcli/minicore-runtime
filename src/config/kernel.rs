@@ -1,9 +1,8 @@
 use std::time::Duration;
 
-use crate::agent::RetryPolicy;
 use crate::value::{BoundedText, MAX_JSON_BYTES};
 
-use super::ConfigError;
+use super::{ConfigError, RetryPolicy};
 
 const MAX_KERNEL_CAPACITY: usize = 4_096;
 const MAX_KERNEL_PORT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);

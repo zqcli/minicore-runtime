@@ -6,20 +6,17 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-pub use crate::agent::{RetryPolicy, RetryPolicyError};
-use crate::ids::SessionId;
 use crate::model::{ModelSelection, ProviderRegistry};
-use crate::storage::store::{
-    StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig, StoredSessionConfig,
-};
 pub use crate::time::{Timestamp, TimestampError};
 use crate::tools::{ToolName, ToolRegistry};
 
 mod kernel;
+mod retry;
 mod session;
 mod session_spec;
 
 pub use kernel::{KernelConfig, SemanticLimits};
+pub use retry::{RetryPolicy, RetryPolicyError};
 pub use session::{SessionManifest, TurnOptions, UserInput};
 pub use session_spec::{CompactionConfig, SessionSpec};
 
@@ -333,34 +330,6 @@ impl SessionConfig {
 
     pub const fn max_tool_rounds(&self) -> u8 {
         self.max_tool_rounds
-    }
-
-    pub(crate) fn to_stored(
-        &self,
-        session_id: SessionId,
-        timestamp: Timestamp,
-    ) -> Result<StoredSessionConfig, ConfigError> {
-        let compaction = StoredCompactionConfig::new(
-            self.compaction_trigger_tokens,
-            self.compaction_target_tokens,
-        )
-        .map_err(|_| ConfigError::InvalidBounds)?;
-        let execution = StoredExecutionConfig::new(
-            self.enabled_tools.clone(),
-            compaction,
-            self.max_tool_rounds,
-        )
-        .map_err(|_| ConfigError::InvalidBounds)?;
-        StoredSessionConfig::new(
-            session_id,
-            timestamp.clone(),
-            timestamp,
-            self.workspace_root.clone(),
-            StoredModelConfig::new(self.model.clone()),
-            self.system_prompt.clone(),
-            execution,
-        )
-        .map_err(|_| ConfigError::InvalidBounds)
     }
 }
 
