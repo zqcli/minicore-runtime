@@ -213,10 +213,12 @@ EXPECTED_ACCEPTANCE_FUNCTIONS = (
 EXPECTED_ROOT_EXPORTS = {
     "config": {
         "ConfigError",
+        "KernelConfig",
         "RetryPolicy",
         "RetryPolicyError",
         "RuntimeConfig",
         "RuntimeConfigBuilder",
+        "SemanticLimits",
         "SessionConfig",
     },
     "error": {

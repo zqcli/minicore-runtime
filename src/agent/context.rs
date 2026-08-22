@@ -83,6 +83,15 @@ impl RetryPolicy {
     }
 }
 
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(250),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum TurnContextError {
     #[error("turn model selection is unavailable")]
