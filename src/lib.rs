@@ -9,6 +9,7 @@ pub mod runtime;
 pub mod session;
 mod storage;
 pub mod tools;
+pub mod value;
 pub mod workspace;
 
 pub use config::{
@@ -17,8 +18,8 @@ pub use config::{
 pub use error::{PublicErrorCode, PublicErrorSummary, RuntimeError, SessionError};
 pub use event::SessionEventKind;
 pub use ids::{
-    IdError, IdGenerationError, InteractionId, RuntimeIdError, SessionId, ToolCallId,
-    ToolCallIdError, TurnId,
+    IdError, IdGenerationError, InteractionId, RuntimeIdError, SessionId, SessionInstanceId,
+    ToolCallId, ToolCallIdError, TurnId,
 };
 pub use runtime::{Runtime, SessionSummary};
 pub use session::{
@@ -26,3 +27,4 @@ pub use session::{
     SnapshotShapeError, TerminalOutcome, TranscriptEntry, TranscriptPage, TranscriptToolCall,
     TurnOutcome, TurnSummary, TurnTerminal, TurnTerminalSummary,
 };
+pub use value::BoundedText;

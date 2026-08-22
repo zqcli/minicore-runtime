@@ -7,6 +7,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::ids::{InteractionId, ToolCallId};
+use crate::value::{MAX_JSON_BYTES, validate_json_size};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolError {
@@ -67,34 +68,8 @@ fn valid_text_or_empty(value: &str, maximum: usize) -> bool {
             .all(|character| !character.is_control() || matches!(character, '\n' | '\t'))
 }
 
-const MAX_JSON_BYTES: usize = 65_536;
-const MAX_JSON_DEPTH: usize = 32;
-const MAX_JSON_NODES: usize = 4_096;
-
 pub(crate) fn validate_json_shape(value: &Value) -> bool {
-    let Ok(encoded) = serde_json::to_vec(value) else {
-        return false;
-    };
-    if encoded.len() > MAX_JSON_BYTES {
-        return false;
-    }
-
-    fn visit(value: &Value, depth: usize, nodes: &mut usize) -> bool {
-        if depth > MAX_JSON_DEPTH {
-            return false;
-        }
-        *nodes = nodes.saturating_add(1);
-        if *nodes > MAX_JSON_NODES {
-            return false;
-        }
-        match value {
-            Value::Array(values) => values.iter().all(|value| visit(value, depth + 1, nodes)),
-            Value::Object(values) => values.values().all(|value| visit(value, depth + 1, nodes)),
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => true,
-        }
-    }
-
-    visit(value, 0, &mut 0)
+    validate_json_size(value, MAX_JSON_BYTES).is_ok()
 }
 
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
