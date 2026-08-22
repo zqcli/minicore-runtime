@@ -460,7 +460,7 @@ async fn fake_session_log_initial_state_read_corruption_and_close_failure_are_ob
 #[test]
 fn conversation_dtos_are_exact_checked_and_roundtrip() {
     assert_eq!(ConversationSeq::ZERO.get(), 0);
-    assert_eq!(ConversationSeq::ZERO.next(), ConversationSeq::new(1));
+    assert_eq!(ConversationSeq::ZERO.next(), Some(ConversationSeq::new(1)));
     assert_eq!(ConversationSeq::new(42).get(), 42);
 
     let turn_id = TurnId::new().unwrap();

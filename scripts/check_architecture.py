@@ -58,6 +58,8 @@ REQUIRED_FILES = {
     "src/config/session_spec.rs",
     "src/conversation/entry.rs",
     "src/conversation/mod.rs",
+    "src/conversation/validator.rs",
+    "src/conversation/validator/tests.rs",
     "src/error.rs",
     "src/event.rs",
     "src/ids.rs",
@@ -332,7 +334,7 @@ FORBIDDEN_MANIFEST_TOKENS = ("heavy-tests", "raw_value", "arbitrary_precision")
 
 EXPECTED_MODULE_VISIBILITY = {
     "src/agent/mod.rs": {"context": "private", "runner": "private"},
-    "src/conversation/mod.rs": {"entry": "private"},
+    "src/conversation/mod.rs": {"entry": "private", "validator": "private"},
     "src/model/mod.rs": {
         "gateway": "private",
         "provider": "private",

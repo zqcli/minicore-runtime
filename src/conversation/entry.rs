@@ -23,8 +23,11 @@ impl ConversationSeq {
         self.0
     }
 
-    pub const fn next(self) -> Self {
-        Self(self.0 + 1)
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
     }
 }
 
