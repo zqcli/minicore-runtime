@@ -1,4 +1,4 @@
-use minicore_runtime::{InteractionId, SessionEventKind, SessionStatus, TurnId};
+use minicore_runtime::{InteractionId, SessionEventKind, SessionStatus, TranscriptPage, TurnId};
 
 const P1_SOURCES: &[&str] = &[
     include_str!("../src/ids.rs"),
@@ -123,7 +123,6 @@ fn canonical_modules_have_explicit_root_exports() {
             "SnapshotShapeError",
             "TerminalOutcome",
             "TranscriptEntry",
-            "TranscriptPage",
             "TranscriptToolCall",
             "TurnOutcome",
             "TurnSummary",
@@ -133,7 +132,12 @@ fn canonical_modules_have_explicit_root_exports() {
     assert_root_exports(
         lib,
         "conversation",
-        &["ConversationEntry", "ConversationSeq", "TurnTerminal"],
+        &[
+            "ConversationEntry",
+            "ConversationSeq",
+            "TranscriptPage",
+            "TurnTerminal",
+        ],
     );
     assert_root_exports(
         lib,
@@ -146,6 +150,9 @@ fn canonical_modules_have_explicit_root_exports() {
         ],
     );
     let conversation_exports = root_use_block(lib, "conversation").unwrap();
+    let session_exports = root_use_block(lib, "session").unwrap();
+    assert!(!session_exports.contains("TranscriptPage"));
+    let _: Option<TranscriptPage> = None;
     for symbol in [
         "AssistantMessageEntry",
         "SummaryEntry",

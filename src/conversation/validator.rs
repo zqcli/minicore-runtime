@@ -163,6 +163,10 @@ impl ConversationValidator {
         self.last_summary_through
     }
 
+    pub(crate) const fn max_tool_output_bytes(&self) -> usize {
+        self.limits.max_tool_output_bytes
+    }
+
     #[cfg(test)]
     pub(crate) fn set_head_for_test(&mut self, head: ConversationSeq) {
         self.head = head;
