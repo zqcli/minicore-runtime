@@ -629,6 +629,8 @@ fn p2_tool_sources_have_no_p2_plus_or_legacy_owner_coupling() {
             "crate::model_gateway",
             "crate::runtime",
             "crate::session_",
+            "crate::context",
+            "crate::compaction",
             "ToolExecutionPlan",
             "ToolStartGate",
             "ToolSet",
@@ -651,7 +653,8 @@ fn p2_tool_sources_have_no_p2_plus_or_legacy_owner_coupling() {
     assert!(!lib.contains("pub use tools::*"));
     assert!(!lib.contains("pub mod registry;"));
     assert!(!lib.contains("pub mod policy;"));
-    assert!(!lib.contains("pub mod context;"));
+    assert!(lib.contains("pub mod context;"));
+    assert!(lib.contains("pub mod compaction;"));
     assert!(!tests.contains(&["tokio::time", "::timeout"].concat()));
     assert!(!tests.contains(&["tokio::time", "::sleep"].concat()));
 }

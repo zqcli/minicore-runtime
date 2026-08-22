@@ -38,7 +38,8 @@ CANONICAL_PRODUCTION_FILES = {
 MODEL_DRIVER_ROLE_FILES = {"src/model/driver.rs", "src/model/gateway.rs"}
 TOOLSET_ROLE_FILES = {"src/tools/set.rs", "src/tools/registry.rs"}
 ALLOWED_PORT_PATHS = {
-    "src/context/provider.rs", "src/model/model.rs", "src/storage/session_log.rs",
+    "src/compaction/strategy.rs", "src/context/provider.rs", "src/model/model.rs",
+    "src/storage/session_log.rs",
 }
 FORBIDDEN_SYMBOLS = {
     "Runtime", "RuntimeClient", "RuntimeConfig", "RuntimeConfigBuilder", "RuntimeError",
@@ -74,6 +75,7 @@ REQUIRED_FILES = {
     "src/conversation/mod.rs", "src/conversation/entry.rs", "src/conversation/load.rs", "src/conversation/state.rs",
     "src/conversation/validator.rs", "src/conversation/projection.rs", "src/conversation/log.rs",
     "src/conversation/recovery.rs", "src/conversation/transcript.rs", "src/model/mod.rs", "src/model/model.rs", "src/model/types.rs",
+    "src/conversation/view.rs",
     "src/tools/mod.rs", "src/tools/tool.rs", "src/tools/context.rs", "src/tools/policy.rs", "src/tools/types.rs",
     "src/context/mod.rs", "src/context/provider.rs",
     "src/compaction/mod.rs", "src/compaction/strategy.rs", "src/storage/mod.rs",
