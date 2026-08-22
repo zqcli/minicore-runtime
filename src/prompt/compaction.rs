@@ -9,7 +9,7 @@ use crate::model::{
 use crate::storage::conversation::{
     CompactionConversationView, ConversationError, ConversationLog,
 };
-use crate::storage::time::Timestamp;
+use crate::time::Timestamp;
 use crate::tools::ToolSpec;
 
 use super::builder::{MAX_SUMMARY_TEXT_BYTES, PromptBuildOptions, PromptBuilder, PromptError};

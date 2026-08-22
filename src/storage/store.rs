@@ -19,9 +19,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 
-use super::time::Timestamp;
 use crate::ids::SessionId;
 use crate::model::{ModelId, ModelSelection, ProviderId};
+use crate::time::Timestamp;
 use crate::tools::ToolName;
 
 const FORMAT_VERSION: u8 = 2;

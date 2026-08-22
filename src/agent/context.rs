@@ -10,7 +10,7 @@ use crate::ids::{SessionId, TurnId};
 use crate::model::{ModelGateway, ModelLimits, ReasoningPreference};
 use crate::prompt::{Compactor, PromptBuildOptions, PromptBuilder};
 use crate::storage::conversation::ConversationLog;
-use crate::storage::time::{Timestamp, TimestampError};
+use crate::time::{Timestamp, TimestampError};
 use crate::tools::{InteractionClient, ToolName, ToolPolicy, ToolRegistry, ToolSpec};
 use crate::workspace::Workspace;
 

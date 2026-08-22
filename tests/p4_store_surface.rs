@@ -1,3 +1,5 @@
+use minicore_runtime::config::{Timestamp, TimestampError};
+
 #[test]
 fn p4_store_types_are_crate_private_and_not_root_reexports() {
     let lib = include_str!("../src/lib.rs");
@@ -28,9 +30,19 @@ fn p4_store_types_are_crate_private_and_not_root_reexports() {
     assert!(!session.contains("pub(crate) mod time;"));
     let storage = include_str!("../src/storage/mod.rs");
     assert!(storage.contains("pub(crate) mod store;"));
-    assert!(storage.contains("pub(crate) mod time;"));
+    assert!(!storage.contains("pub(crate) mod time;"));
     assert!(!storage.contains("pub use store::{"));
     assert!(!storage.contains("pub use time::{"));
+
+    let config = include_str!("../src/config.rs");
+    assert!(config.contains("pub use crate::time::{Timestamp, TimestampError};"));
+    let _: Result<Timestamp, TimestampError> = "2026-08-19T12:34:56.789Z".parse();
+    let config_exports = lib
+        .split_once("pub use config::{")
+        .and_then(|(_, rest)| rest.split_once("};"))
+        .map(|(exports, _)| exports)
+        .unwrap_or("");
+    assert!(!config_exports.contains("Timestamp"));
 
     let store = include_str!("../src/storage/store.rs");
     for declaration in [
@@ -47,15 +59,15 @@ fn p4_store_types_are_crate_private_and_not_root_reexports() {
             "missing private declaration: {declaration}"
         );
     }
-    let time = include_str!("../src/storage/time.rs");
-    assert!(time.contains("pub(crate) enum TimestampError"));
-    assert!(time.contains("pub(crate) struct Timestamp"));
+    let time = include_str!("../src/time.rs");
+    assert!(time.contains("pub enum TimestampError"));
+    assert!(time.contains("pub struct Timestamp"));
 }
 
 #[test]
 fn p4_store_stays_on_the_new_boundary_and_keeps_bootstrap_guards() {
     for source in [
-        include_str!("../src/storage/time.rs"),
+        include_str!("../src/time.rs"),
         include_str!("../src/storage/store.rs"),
         include_str!("../src/storage/mod.rs"),
     ] {

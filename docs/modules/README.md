@@ -18,7 +18,7 @@ This page maps the current source graph. It is intentionally narrower than the h
 | `tools` | Tool contracts, policy, interaction, process policy, and builtins |
 | `workspace` | Capability-backed root and relative filesystem operations |
 
-The root also reexports stable DTOs and operations. `agent`, `prompt`, and `storage` are private modules. There are no path-based compatibility declarations.
+The root also reexports stable DTOs and operations. `agent`, `prompt`, `storage`, and `time` are private modules. There are no path-based compatibility declarations.
 
 ## Ownership and Dependencies
 
@@ -26,8 +26,14 @@ The root also reexports stable DTOs and operations. `agent`, `prompt`, and `stor
 
 - Source: [`src/config.rs`](../../src/config.rs)
 - Owns `RuntimeConfig`, `RuntimeConfigBuilder`, `SessionConfig`, and checked bounds.
-- Depends on model selection/registry, tool names/registry, and storage-owned checked session constructors/timestamps.
+- Depends on model selection/registry, tool names/registry, checked session constructors, and the private time seam.
 - Does not open files, providers, actors, or processes.
+
+### `time`
+
+- Source: [`src/time.rs`](../../src/time.rs)
+- Private root owner of canonical UTC RFC3339-millisecond `Timestamp` values, validation, errors, and serde behavior.
+- The config module reexports `Timestamp` and `TimestampError` as the public seam; storage consumes the types but does not own timestamp behavior.
 
 ### `model`
 
@@ -68,8 +74,8 @@ The root also reexports stable DTOs and operations. `agent`, `prompt`, and `stor
 
 ### `storage`
 
-- Sources: [`src/storage/mod.rs`](../../src/storage/mod.rs), [`store.rs`](../../src/storage/store.rs), [`conversation.rs`](../../src/storage/conversation.rs), [`conversation/`](../../src/storage/conversation/), [`time.rs`](../../src/storage/time.rs), and test-only `compaction_visibility.rs`.
-- Private owner of checked session configuration, timestamps, the root lock, session namespace, append-only conversation records, replay/repair, prompt projections, compaction boundaries, usage aggregation, and transcript source entries.
+- Sources: [`src/storage/mod.rs`](../../src/storage/mod.rs), [`store.rs`](../../src/storage/store.rs), [`conversation.rs`](../../src/storage/conversation.rs), [`conversation/`](../../src/storage/conversation/), and test-only `compaction_visibility.rs`.
+- Private owner of checked session configuration, the root lock, session namespace, append-only conversation records, replay/repair, prompt projections, compaction boundaries, usage aggregation, and transcript source entries.
 - Depends on model, tools, identifiers, cap-std, and the filesystem worker; it does not depend on session, agent, prompt, or Runtime owners.
 
 ### `session`
@@ -111,8 +117,9 @@ src/
 ├── prompt/{builder.rs,compaction.rs,mod.rs}
 ├── runtime/{mod.rs,runtime_impl.rs,session_manager.rs}
 ├── session/{actor.rs,command.rs,event.rs,event_stream.rs,mod.rs,snapshot.rs,state.rs,transcript.rs}
-├── storage/{compaction_visibility.rs,conversation.rs,mod.rs,store.rs,time.rs}
+├── storage/{compaction_visibility.rs,conversation.rs,mod.rs,store.rs}
 │   └── conversation/{actor_support.rs,codec.rs,compaction.rs,usage.rs}
+├── time.rs
 ├── tools/{context.rs,mod.rs,policy.rs,process.rs,registry.rs,types.rs}
 │   └── builtins/{ask_user.rs,list_directory.rs,path_args.rs,read_file.rs,run_command.rs,write_file.rs}
 └── workspace/{mod.rs,path.rs,root.rs}
