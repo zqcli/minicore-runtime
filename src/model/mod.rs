@@ -18,6 +18,7 @@ pub use registry::{ProviderRegistry, ProviderRegistryBuilder, ResolvedModel};
 pub use types::{
     AssistantPart, DeliveryState, ModelDescriptor, ModelError, ModelErrorDetails, ModelErrorKind,
     ModelEvent, ModelFinishReason, ModelId, ModelIdentityError, ModelLimits, ModelLimitsError,
-    ModelMessage, ModelRequest, ModelResponse, ModelSelection, ModelValueError, ProviderId,
-    ProviderItemId, ProviderItemIdError, ReasoningContent, ReasoningPreference, ToolCall, Usage,
+    ModelMessage, ModelRef, ModelRefError, ModelRequest, ModelResponse, ModelSelection,
+    ModelValueError, ProviderId, ProviderItemId, ProviderItemIdError, ReasoningContent,
+    ReasoningPreference, ToolCall, Usage,
 };

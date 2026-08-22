@@ -13,8 +13,8 @@ pub mod value;
 pub mod workspace;
 
 pub use config::{
-    ConfigError, KernelConfig, RetryPolicy, RetryPolicyError, RuntimeConfig, RuntimeConfigBuilder,
-    SemanticLimits, SessionConfig,
+    CompactionConfig, ConfigError, KernelConfig, RetryPolicy, RetryPolicyError, RuntimeConfig,
+    RuntimeConfigBuilder, SemanticLimits, SessionConfig, SessionSpec,
 };
 pub use error::{PublicErrorCode, PublicErrorSummary, RuntimeError, SessionError};
 pub use event::SessionEventKind;

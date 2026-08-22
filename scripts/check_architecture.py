@@ -49,6 +49,8 @@ REQUIRED_FILES = {
     "src/agent/mod.rs",
     "src/agent/runner.rs",
     "src/config.rs",
+    "src/config/kernel.rs",
+    "src/config/session_spec.rs",
     "src/error.rs",
     "src/event.rs",
     "src/ids.rs",
@@ -213,6 +215,7 @@ EXPECTED_ACCEPTANCE_FUNCTIONS = (
 EXPECTED_ROOT_EXPORTS = {
     "config": {
         "ConfigError",
+        "CompactionConfig",
         "KernelConfig",
         "RetryPolicy",
         "RetryPolicyError",
@@ -220,6 +223,7 @@ EXPECTED_ROOT_EXPORTS = {
         "RuntimeConfigBuilder",
         "SemanticLimits",
         "SessionConfig",
+        "SessionSpec",
     },
     "error": {
         "PublicErrorCode",
