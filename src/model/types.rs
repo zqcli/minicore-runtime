@@ -21,6 +21,69 @@ pub enum ModelIdentityError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ModelRefError {
+    #[error("model reference must be 1..=256 bytes")]
+    InvalidLength,
+    #[error("model reference violates its stable symbolic grammar")]
+    InvalidGrammar,
+}
+
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ModelRef(Box<str>);
+
+impl ModelRef {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for ModelRef {
+    type Err = ModelRefError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty() || value.len() > 256 {
+            return Err(ModelRefError::InvalidLength);
+        }
+        if !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/')
+        }) {
+            return Err(ModelRefError::InvalidGrammar);
+        }
+        Ok(Self(value.into()))
+    }
+}
+
+impl fmt::Display for ModelRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl fmt::Debug for ModelRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl Serialize for ModelRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_from_str(deserializer)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ModelLimitsError {
     #[error("model limit values must be non-zero")]
     Zero,
