@@ -25,6 +25,7 @@ CANONICAL_TOPS = (
     "runtime",
     "session",
     "storage",
+    "time",
     "tools",
     "value",
     "workspace",
@@ -50,6 +51,7 @@ REQUIRED_FILES = {
     "src/agent/runner.rs",
     "src/config.rs",
     "src/config/kernel.rs",
+    "src/config/session.rs",
     "src/config/session_spec.rs",
     "src/error.rs",
     "src/event.rs",
@@ -86,7 +88,7 @@ REQUIRED_FILES = {
     "src/storage/conversation/usage.rs",
     "src/storage/mod.rs",
     "src/storage/store.rs",
-    "src/storage/time.rs",
+    "src/time.rs",
     "src/tools/builtins/ask_user.rs",
     "src/tools/builtins/list_directory.rs",
     "src/tools/builtins/mod.rs",
@@ -223,7 +225,10 @@ EXPECTED_ROOT_EXPORTS = {
         "RuntimeConfigBuilder",
         "SemanticLimits",
         "SessionConfig",
+        "SessionManifest",
         "SessionSpec",
+        "TurnOptions",
+        "UserInput",
     },
     "error": {
         "PublicErrorCode",
@@ -301,8 +306,8 @@ DIRECT_DEP_CONSUMERS = {
     "serde_json": [("src/model/types.rs", "use serde_json::Value")],
     "thiserror": [("src/config.rs", "use thiserror::Error;")],
     "time": [
-        ("src/storage/time.rs", "use time::"),
-        ("src/storage/time.rs", "time::OffsetDateTime"),
+        ("src/time.rs", "use ::time::OffsetDateTime;"),
+        ("src/time.rs", "use ::time::format_description::well_known::Rfc3339;"),
     ],
     "tokio": [("src/runtime/runtime_impl.rs", "use tokio::runtime::Handle;")],
     "tokio-util": [
@@ -342,7 +347,6 @@ EXPECTED_MODULE_VISIBILITY = {
         "conversation": "crate",
         "compaction_visibility": "private",
         "store": "crate",
-        "time": "crate",
     },
     "src/storage/conversation.rs": {
         "actor_support": "private",
@@ -658,10 +662,10 @@ def check_public_surface(sources: Dict[str, str]) -> List[str]:
             "src/lib.rs: public modules mismatch: "
             f"expected={sorted(EXPECTED_PUBLIC_MODULES)} actual={sorted(public_modules)}"
         )
-    if private_modules != {"agent", "prompt", "storage"}:
+    if private_modules != {"agent", "prompt", "storage", "time"}:
         errors.append(
             "src/lib.rs: private modules mismatch: "
-            f"expected=['agent', 'prompt', 'storage'] actual={sorted(private_modules)}"
+            f"expected=['agent', 'prompt', 'storage', 'time'] actual={sorted(private_modules)}"
         )
     if other_visibility:
         errors.append(f"src/lib.rs: unsupported module visibility: {other_visibility}")

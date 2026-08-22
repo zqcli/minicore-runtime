@@ -1054,7 +1054,7 @@ mod tests {
         SessionStore, StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig,
         StoredSessionConfig,
     };
-    use crate::storage::time::{Timestamp, TimestampError};
+    use crate::time::{Timestamp, TimestampError};
     use crate::tools::{AllowConfiguredTools, ToolRegistry};
     use crate::tools::{Tool, ToolContext, ToolFuture, ToolName, ToolOutput, ToolSpec};
     use crate::workspace::{Workspace, WorkspaceAccess};

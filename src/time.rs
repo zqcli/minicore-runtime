@@ -2,12 +2,12 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::str::FromStr;
 
+use ::time::OffsetDateTime;
+use ::time::format_description::well_known::Rfc3339;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
-// Keep this crate-private foundation type-checked before the SessionActor slice consumes it.
+// Keep this foundation type-checked before the SessionActor slice consumes it.
 const _: () = {
     let _ = std::mem::size_of::<Timestamp>();
     let _: fn(&str) -> Result<Timestamp, TimestampError> = Timestamp::new;
@@ -16,16 +16,16 @@ const _: () = {
 };
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub(crate) enum TimestampError {
+pub enum TimestampError {
     #[error("timestamp must be canonical UTC RFC3339 milliseconds")]
     Invalid,
 }
 
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct Timestamp(Box<str>);
+pub struct Timestamp(Box<str>);
 
 impl Timestamp {
-    pub(crate) fn now_utc() -> Result<Self, TimestampError> {
+    pub fn now_utc() -> Result<Self, TimestampError> {
         let now = OffsetDateTime::now_utc();
         let mut value = String::with_capacity(24);
         write!(
@@ -43,11 +43,11 @@ impl Timestamp {
         Self::new(&value)
     }
 
-    pub(crate) fn new(value: &str) -> Result<Self, TimestampError> {
+    pub fn new(value: &str) -> Result<Self, TimestampError> {
         value.parse()
     }
 
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 }

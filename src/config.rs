@@ -12,13 +12,15 @@ use crate::model::{ModelSelection, ProviderRegistry};
 use crate::storage::store::{
     StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig, StoredSessionConfig,
 };
-use crate::storage::time::Timestamp;
+pub use crate::time::{Timestamp, TimestampError};
 use crate::tools::{ToolName, ToolRegistry};
 
 mod kernel;
+mod session;
 mod session_spec;
 
 pub use kernel::{KernelConfig, SemanticLimits};
+pub use session::{SessionManifest, TurnOptions, UserInput};
 pub use session_spec::{CompactionConfig, SessionSpec};
 
 pub const DEFAULT_EVENT_CAPACITY: usize = 64;

@@ -53,7 +53,7 @@ mod tests {
         SessionStore, StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig,
         StoredSessionConfig,
     };
-    use crate::storage::time::Timestamp;
+    use crate::time::Timestamp;
     use crate::tools::{ToolName, ToolSpec};
 
     fn timestamp() -> Timestamp {

@@ -18,7 +18,7 @@ use crate::session::event_stream::SessionEventStream;
 use crate::session::transcript::TranscriptPage;
 use crate::storage::conversation::{ConversationError, ConversationLog};
 use crate::storage::store::{SessionStore, StoreError, StoredSessionConfig};
-use crate::storage::time::Timestamp;
+use crate::time::Timestamp;
 use crate::tools::{AllowConfiguredTools, ToolName, ToolPolicy, ToolRegistry, UserAnswer};
 use crate::workspace::{Workspace, WorkspaceAccess, WorkspaceError};
 

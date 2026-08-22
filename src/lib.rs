@@ -8,13 +8,15 @@ mod prompt;
 pub mod runtime;
 pub mod session;
 mod storage;
+mod time;
 pub mod tools;
 pub mod value;
 pub mod workspace;
 
 pub use config::{
     CompactionConfig, ConfigError, KernelConfig, RetryPolicy, RetryPolicyError, RuntimeConfig,
-    RuntimeConfigBuilder, SemanticLimits, SessionConfig, SessionSpec,
+    RuntimeConfigBuilder, SemanticLimits, SessionConfig, SessionManifest, SessionSpec, TurnOptions,
+    UserInput,
 };
 pub use error::{PublicErrorCode, PublicErrorSummary, RuntimeError, SessionError};
 pub use event::SessionEventKind;

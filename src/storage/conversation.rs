@@ -10,9 +10,9 @@ use thiserror::Error;
 use tokio::sync::Notify;
 
 use super::store::{SessionRegistration, SessionStore, StoreError};
-use super::time::Timestamp;
 use crate::ids::{InteractionId, SessionId, ToolCallId, TurnId};
 use crate::model::{AssistantPart, ModelMessage, ModelResponse, ReasoningContent, ToolCall, Usage};
+use crate::time::Timestamp;
 use crate::tools::{ToolOutput, UserAnswer, UserQuestion};
 
 mod actor_support;
