@@ -39,6 +39,7 @@ pub enum FakeSessionLogInitError {
         expected: ConversationSeq,
         actual: ConversationSeq,
     },
+    SequenceOverflow,
 }
 
 #[derive(Default)]
@@ -257,15 +258,26 @@ fn current_head(state: &State) -> ConversationSeq {
 }
 
 fn validate_contiguous(entries: &[ConversationEntry]) -> Result<(), FakeSessionLogInitError> {
-    let mut expected = ConversationSeq::ZERO.next();
-    for entry in entries {
-        if entry.seq() != expected {
+    if let Some(first) = entries.first() {
+        let expected = ConversationSeq::new(1);
+        if first.seq() != expected {
             return Err(FakeSessionLogInitError::NonContiguous {
                 expected,
-                actual: entry.seq(),
+                actual: first.seq(),
             });
         }
-        expected = expected.next();
+    }
+    for pair in entries.windows(2) {
+        let expected = pair[0]
+            .seq()
+            .next()
+            .ok_or(FakeSessionLogInitError::SequenceOverflow)?;
+        if pair[1].seq() != expected {
+            return Err(FakeSessionLogInitError::NonContiguous {
+                expected,
+                actual: pair[1].seq(),
+            });
+        }
     }
     Ok(())
 }
@@ -290,12 +302,12 @@ fn append_batch(
     if entries.is_empty() {
         return Err(SessionLogErrorKind::Internal);
     }
-    let first_expected = expected_head.next();
+    let first_expected = expected_head.next().ok_or(SessionLogErrorKind::Internal)?;
     let contiguous = entries.first().is_some_and(|entry| {
         entry.seq() == first_expected
             && entries
                 .windows(2)
-                .all(|pair| pair[1].seq() == pair[0].seq().next())
+                .all(|pair| Some(pair[1].seq()) == pair[0].seq().next())
     });
     if !contiguous {
         return Err(SessionLogErrorKind::Conflict);
