@@ -163,6 +163,11 @@ impl ConversationValidator {
         self.last_summary_through
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_head_for_test(&mut self, head: ConversationSeq) {
+        self.head = head;
+    }
+
     fn apply(&mut self, entry: &ConversationEntry) -> Result<(), ConversationValidationError> {
         let expected = self
             .head

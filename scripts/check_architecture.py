@@ -57,7 +57,11 @@ REQUIRED_FILES = {
     "src/config/session.rs",
     "src/config/session_spec.rs",
     "src/conversation/entry.rs",
+    "src/conversation/log.rs",
+    "src/conversation/log/tests.rs",
     "src/conversation/mod.rs",
+    "src/conversation/projection.rs",
+    "src/conversation/state.rs",
     "src/conversation/validator.rs",
     "src/conversation/validator/tests.rs",
     "src/error.rs",
@@ -334,7 +338,13 @@ FORBIDDEN_MANIFEST_TOKENS = ("heavy-tests", "raw_value", "arbitrary_precision")
 
 EXPECTED_MODULE_VISIBILITY = {
     "src/agent/mod.rs": {"context": "private", "runner": "private"},
-    "src/conversation/mod.rs": {"entry": "private", "validator": "private"},
+    "src/conversation/mod.rs": {
+        "entry": "private",
+        "log": "private",
+        "projection": "private",
+        "state": "private",
+        "validator": "private",
+    },
     "src/model/mod.rs": {
         "gateway": "private",
         "provider": "private",
@@ -944,6 +954,109 @@ def extract_crate_targets(text: str) -> Set[str]:
     return targets
 
 
+def allowed_session_log_conversation_use(path: str, text: str) -> bool:
+    if path != "src/storage/session_log.rs":
+        return False
+    masked = mask_rust(text)
+    statements = list(
+        re.finditer(
+            r"(?ms)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+crate\s*::\s*conversation\s*[^;]*;",
+            masked,
+        )
+    )
+    if len(statements) != 1:
+        return False
+    statement = statements[0]
+    depth = 0
+    for character in masked[: statement.start()]:
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+    if depth != 0:
+        return False
+    compact_statement = re.sub(r"\s+", "", statement.group(0))
+    match = re.fullmatch(r"usecrate::conversation::\{([^{}]*)\};", compact_statement)
+    if match is None:
+        return False
+    symbols = [symbol for symbol in match.group(1).split(",") if symbol]
+    if len(symbols) != 2 or set(symbols) != {"ConversationEntry", "ConversationSeq"}:
+        return False
+
+    chars = list(masked)
+    _blank(chars, statement.start(), statement.end())
+    without_import = "".join(chars)
+    if re.search(r"\bcrate\s*::\s*conversation\b", without_import):
+        return False
+    for group in re.finditer(r"\bcrate\s*::\s*\{", without_import):
+        closing = matching_brace(without_import, group.end() - 1)
+        if closing is not None and re.search(
+            r"\bconversation\b", without_import[group.end() : closing]
+        ):
+            return False
+
+    compact = re.sub(r"\s+", "", without_import)
+    allowed_struct_fragments = (
+        "pubstructConversationPage{pubentries:Vec<ConversationEntry>,"
+        "pubnext_after:Option<ConversationSeq>,pubobserved_head:ConversationSeq,}",
+        "pubstructAppendReceipt{pubprevious_head:ConversationSeq,"
+        "pubnew_head:ConversationSeq,pubappended:usize,}",
+    )
+    if any(compact.count(fragment) != 1 for fragment in allowed_struct_fragments):
+        return False
+    trait_match = re.search(
+        r"\bpub\s+trait\s+SessionLog\s*:\s*Send\s*\+\s*'static\s*\{",
+        without_import,
+    )
+    if trait_match is None:
+        return False
+    trait_end = matching_brace(without_import, trait_match.end() - 1)
+    if trait_end is None:
+        return False
+    trait_body = without_import[trait_match.end() : trait_end]
+    methods = list(re.finditer(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\b", trait_body))
+    method_sections: Dict[str, str] = {}
+    for index, method in enumerate(methods):
+        end = methods[index + 1].start() if index + 1 < len(methods) else len(trait_body)
+        method_sections[method.group(1)] = trait_body[method.start() : end]
+    expected_methods = {
+        "initialize": (1, 0, 0),
+        "read_page": (1, 0, 1),
+        "append": (1, 1, 1),
+    }
+    if any(name not in method_sections for name in expected_methods):
+        return False
+    for name, (seq_count, entry_count, named_result_count) in expected_methods.items():
+        section = method_sections[name]
+        if len(re.findall(r"\bConversationSeq\b", section)) != seq_count:
+            return False
+        if len(re.findall(r"\bConversationEntry\b", section)) != entry_count:
+            return False
+        result_name = "ConversationPage" if name == "read_page" else "AppendReceipt"
+        if len(re.findall(rf"\b{result_name}\b", section)) != named_result_count:
+            return False
+    for name, section in method_sections.items():
+        if name not in expected_methods and re.search(
+            r"\bConversation(?:Entry|Seq|Page)\b", section
+        ):
+            return False
+    if any(
+        name not in method_sections
+        for name in ("load_manifest", "close")
+    ):
+        return False
+    return (
+        len(re.findall(r"\bConversationEntry\b", compact)) == 2
+        and len(re.findall(r"\bConversationSeq\b", compact)) == 7
+        and len(re.findall(r"\bConversationPage\b", compact)) == 1
+        and len(re.findall(r"\bAppendReceipt\b", compact)) == 1
+    )
+
+
+def omit_semantic_edge(path: str, target: str, text: str) -> bool:
+    return target == "conversation" and allowed_session_log_conversation_use(path, text)
+
+
 def root_type_import_errors(path: str, text: str) -> List[str]:
     masked = mask_rust(text)
     errors: List[str] = []
@@ -1337,6 +1450,8 @@ def check_sizes_and_graph(
                 if target in DELETED_TOP_MODULES:
                     errors.append(f"{path}: edge targets deleted top module {target}")
                 continue
+            if omit_semantic_edge(path, target, view):
+                continue
             # Self loops do not create cross-owner SCCs and are intentionally ignored.
             if target != top:
                 edges[top].add(target)
@@ -1456,6 +1571,83 @@ use crate::{
             f"comment_export={comment_export} comment_owners={comment_owners} "
             f"unsupported_exports={unsupported_exports}"
         )
+
+    exact_port_use = "use crate::conversation::{ConversationEntry, ConversationSeq};\n"
+    exact_port_source = """\
+use crate::conversation::{ConversationEntry, ConversationSeq};
+pub struct ConversationPage {
+    pub entries: Vec<ConversationEntry>,
+    pub next_after: Option<ConversationSeq>,
+    pub observed_head: ConversationSeq,
+}
+pub struct AppendReceipt {
+    pub previous_head: ConversationSeq,
+    pub new_head: ConversationSeq,
+    pub appended: usize,
+}
+pub trait SessionLog: Send + 'static {
+    fn initialize<'a>(&'a mut self, manifest: SessionManifest) -> LogFuture<'a, ConversationSeq>;
+    fn read_page<'a>(&'a mut self, after: Option<ConversationSeq>, limit: usize) -> LogFuture<'a, ConversationPage>;
+    fn append<'a>(&'a mut self, expected_head: ConversationSeq, entries: Vec<ConversationEntry>) -> LogFuture<'a, AppendReceipt>;
+    fn load_manifest<'a>(&'a mut self) -> LogFuture<'a, SessionManifest>;
+    fn close<'a>(&'a mut self) -> LogFuture<'a, ()>;
+}
+"""
+    if not allowed_session_log_conversation_use(
+        "src/storage/session_log.rs", exact_port_source
+    ):
+        errors.append("internal SessionLog conversation edge self-check rejected exact use")
+    rejected_port_sources = [
+        exact_port_source.replace(
+            exact_port_use,
+            "fn helper() {\n    use crate::conversation::{ConversationEntry, ConversationSeq};\n}\n",
+        ),
+        exact_port_source.replace(
+            exact_port_use,
+            "use crate::conversation::{ConversationEntry, ConversationSeq, TurnId};\n",
+        ),
+        exact_port_source.replace(
+            exact_port_use,
+            "use crate::conversation::{ConversationEntry as Entry, ConversationSeq};\n",
+        ),
+        exact_port_source.replace(exact_port_use, "use crate::conversation::*;\n"),
+        exact_port_source.replace(
+            exact_port_use,
+            "use crate::{conversation::{ConversationEntry, ConversationSeq}};\n",
+        ),
+        exact_port_source
+        + "fn helper() { let _ = crate::conversation::ConversationEntry; }\n",
+        exact_port_source.replace(
+            "    pub observed_head: ConversationSeq,\n",
+            "    pub observed_head: ConversationSeq,\n    pub extra: ConversationSeq,\n",
+        ),
+    ]
+    for fixture in rejected_port_sources:
+        if allowed_session_log_conversation_use("src/storage/session_log.rs", fixture):
+            errors.append("internal SessionLog conversation edge self-check allowed broader use")
+
+    real_port = read_utf8(ROOT / "src/storage/session_log.rs", errors)
+    if real_port is not None:
+        bidirectional = {"conversation": {"storage"}, "storage": {"conversation"}}
+        filtered = {node: set(targets) for node, targets in bidirectional.items()}
+        if omit_semantic_edge("src/storage/session_log.rs", "conversation", real_port):
+            filtered["storage"].discard("conversation")
+        if any(len(component) > 1 for component in tarjan(filtered)):
+            errors.append("internal SessionLog graph self-check retained exact Port cycle")
+
+        broader_port = real_port + "\nfn helper() { let _ = crate::conversation::ConversationEntry; }\n"
+        broader_filtered = {
+            node: set(targets) for node, targets in bidirectional.items()
+        }
+        if omit_semantic_edge(
+            "src/storage/session_log.rs", "conversation", broader_port
+        ):
+            broader_filtered["storage"].discard("conversation")
+        if not any(
+            component == {"conversation", "storage"}
+            for component in tarjan(broader_filtered)
+        ):
+            errors.append("internal SessionLog graph self-check missed broader cycle")
     return errors
 
 
