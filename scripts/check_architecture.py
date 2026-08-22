@@ -16,8 +16,10 @@ SRC = ROOT / "src"
 
 CANONICAL_TOPS = (
     "agent",
+    "compaction",
     "config",
     "conversation",
+    "context",
     "error",
     "event",
     "ids",
@@ -34,7 +36,9 @@ CANONICAL_TOPS = (
 
 REQUIRED_DIRS = {
     "src/agent",
+    "src/compaction",
     "src/conversation",
+    "src/context",
     "src/model",
     "src/model/providers",
     "src/prompt",
@@ -71,6 +75,11 @@ REQUIRED_FILES = {
     "src/conversation/state.rs",
     "src/conversation/transcript.rs",
     "src/conversation/validator.rs",
+    "src/conversation/view.rs",
+    "src/compaction/mod.rs",
+    "src/compaction/strategy.rs",
+    "src/context/mod.rs",
+    "src/context/provider.rs",
     "src/conversation/validator/tests.rs",
     "src/error.rs",
     "src/event.rs",
@@ -288,8 +297,10 @@ EXPECTED_ROOT_EXPORTS = {
 }
 
 EXPECTED_PUBLIC_MODULES = {
+    "compaction",
     "config",
     "conversation",
+    "context",
     "error",
     "event",
     "ids",
@@ -353,7 +364,10 @@ EXPECTED_MODULE_VISIBILITY = {
         "state": "private",
         "transcript": "public",
         "validator": "private",
+        "view": "private",
     },
+    "src/compaction/mod.rs": {"strategy": "private"},
+    "src/context/mod.rs": {"provider": "private"},
     "src/model/mod.rs": {
         "gateway": "private",
         "provider": "private",

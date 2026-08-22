@@ -1,5 +1,7 @@
 mod agent;
+pub mod compaction;
 pub mod config;
+pub mod context;
 pub mod conversation;
 pub mod error;
 pub mod event;

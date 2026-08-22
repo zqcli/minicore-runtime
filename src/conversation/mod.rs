@@ -6,6 +6,7 @@ mod recovery;
 mod state;
 pub mod transcript;
 mod validator;
+mod view;
 
 const _: () = {
     // Temporary compile anchor; RunnerProtocol draft construction will replace it.
@@ -21,6 +22,7 @@ const _: () = {
     let _ = load::PendingConversationLoad::abort;
     let _ = load::PendingConversationLoad::manifest;
     let _ = LoadCompatibilityValidated::after_session_bindings_validation;
+    let _ = view::ConversationView::from_confirmed;
     let _ = log::UnsequencedEntry::UserMessage;
     let _ = log::UnsequencedEntry::AssistantMessage;
     let _ = log::UnsequencedEntry::Summary;
@@ -34,3 +36,4 @@ pub use entry::{
     UserInputRecord, UserInputRecordError, UserMessageEntry,
 };
 pub use transcript::TranscriptPage;
+pub use view::ConversationView;
