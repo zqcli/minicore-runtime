@@ -146,6 +146,7 @@ macro_rules! runtime_id {
 }
 
 runtime_id!(SessionId, "ses_");
+runtime_id!(SessionInstanceId, "ins_");
 runtime_id!(TurnId, "trn_");
 runtime_id!(InteractionId, "int_");
 

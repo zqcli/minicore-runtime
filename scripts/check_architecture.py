@@ -26,6 +26,7 @@ CANONICAL_TOPS = (
     "session",
     "storage",
     "tools",
+    "value",
     "workspace",
 )
 
@@ -97,6 +98,7 @@ REQUIRED_FILES = {
     "src/tools/process.rs",
     "src/tools/registry.rs",
     "src/tools/types.rs",
+    "src/value.rs",
     "src/workspace/mod.rs",
     "src/workspace/path.rs",
     "src/workspace/root.rs",
@@ -230,6 +232,7 @@ EXPECTED_ROOT_EXPORTS = {
         "InteractionId",
         "RuntimeIdError",
         "SessionId",
+        "SessionInstanceId",
         "ToolCallId",
         "ToolCallIdError",
         "TurnId",
@@ -251,6 +254,7 @@ EXPECTED_ROOT_EXPORTS = {
         "TurnTerminal",
         "TurnTerminalSummary",
     },
+    "value": {"BoundedText"},
 }
 
 EXPECTED_PUBLIC_MODULES = {
@@ -262,6 +266,7 @@ EXPECTED_PUBLIC_MODULES = {
     "runtime",
     "session",
     "tools",
+    "value",
     "workspace",
 }
 

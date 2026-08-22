@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use minicore_runtime::{InteractionId, SessionId, ToolCallId, TurnId};
+use minicore_runtime::{InteractionId, SessionId, SessionInstanceId, ToolCallId, TurnId};
 
 fn assert_runtime_id<T>(id: T, prefix: &str)
 where
@@ -22,15 +22,17 @@ where
 #[test]
 fn runtime_ids_are_canonical_random_prefixed_hex_values() {
     let session_id = SessionId::new().expect("the test entropy source is available");
+    let instance_id = SessionInstanceId::new().expect("the test entropy source is available");
     let turn_id = TurnId::new().expect("the test entropy source is available");
     let interaction_id = InteractionId::new().expect("the test entropy source is available");
 
     assert_runtime_id(session_id, "ses_");
+    assert_runtime_id(instance_id, "ins_");
     assert_runtime_id(turn_id, "trn_");
     assert_runtime_id(interaction_id, "int_");
 
-    let first = SessionId::new().unwrap().to_string();
-    let second = SessionId::new().unwrap().to_string();
+    let first = SessionInstanceId::new().unwrap().to_string();
+    let second = SessionInstanceId::new().unwrap().to_string();
     assert_ne!(first, second, "fresh runtime IDs must not be deterministic");
 }
 
@@ -58,6 +60,14 @@ fn runtime_id_json_is_the_same_canonical_string() {
     let json = serde_json::to_string(&id).unwrap();
     assert_eq!(json, format!("\"{id}\""));
     assert_eq!(serde_json::from_str::<InteractionId>(&json).unwrap(), id);
+
+    let instance_id = SessionInstanceId::new().unwrap();
+    let json = serde_json::to_string(&instance_id).unwrap();
+    assert_eq!(json, format!("\"{instance_id}\""));
+    assert_eq!(
+        serde_json::from_str::<SessionInstanceId>(&json).unwrap(),
+        instance_id
+    );
 }
 
 #[test]
