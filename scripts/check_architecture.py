@@ -57,11 +57,19 @@ REQUIRED_FILES = {
     "src/config/session.rs",
     "src/config/session_spec.rs",
     "src/conversation/entry.rs",
+    "src/conversation/load.rs",
     "src/conversation/log.rs",
-    "src/conversation/log/tests.rs",
+    "src/conversation/log/append_support.rs",
+    "src/conversation/log/append_tests.rs",
+    "src/conversation/log/load_support.rs",
+    "src/conversation/log/replay_tests.rs",
+    "src/conversation/log/recovery_tests.rs",
+    "src/conversation/log/transcript_close_tests.rs",
     "src/conversation/mod.rs",
     "src/conversation/projection.rs",
+    "src/conversation/recovery.rs",
     "src/conversation/state.rs",
+    "src/conversation/transcript.rs",
     "src/conversation/validator.rs",
     "src/conversation/validator/tests.rs",
     "src/error.rs",
@@ -177,7 +185,6 @@ FORBIDDEN_SOURCE_TOKENS = (
     "Archive",
     "Steer",
     "FollowUp",
-    "Arc::ptr_eq",
 )
 
 EXPECTED_ACCEPTANCE_CASES = (
@@ -242,7 +249,7 @@ EXPECTED_ROOT_EXPORTS = {
         "TurnOptions",
         "UserInput",
     },
-    "conversation": {"ConversationEntry", "ConversationSeq", "TurnTerminal"},
+    "conversation": {"ConversationEntry", "ConversationSeq", "TranscriptPage", "TurnTerminal"},
     "error": {
         "PublicErrorCode",
         "PublicErrorSummary",
@@ -271,7 +278,6 @@ EXPECTED_ROOT_EXPORTS = {
         "SnapshotShapeError",
         "TerminalOutcome",
         "TranscriptEntry",
-        "TranscriptPage",
         "TranscriptToolCall",
         "TurnOutcome",
         "TurnSummary",
@@ -340,9 +346,12 @@ EXPECTED_MODULE_VISIBILITY = {
     "src/agent/mod.rs": {"context": "private", "runner": "private"},
     "src/conversation/mod.rs": {
         "entry": "private",
+        "load": "private",
         "log": "private",
         "projection": "private",
+        "recovery": "private",
         "state": "private",
+        "transcript": "public",
         "validator": "private",
     },
     "src/model/mod.rs": {

@@ -19,7 +19,7 @@ pub use config::{
     RuntimeConfigBuilder, SemanticLimits, SessionConfig, SessionManifest, SessionSpec, TurnOptions,
     UserInput,
 };
-pub use conversation::{ConversationEntry, ConversationSeq, TurnTerminal};
+pub use conversation::{ConversationEntry, ConversationSeq, TranscriptPage, TurnTerminal};
 pub use error::{PublicErrorCode, PublicErrorSummary, RuntimeError, SessionError};
 pub use event::SessionEventKind;
 pub use ids::{
@@ -29,8 +29,8 @@ pub use ids::{
 pub use runtime::{Runtime, SessionSummary};
 pub use session::{
     SessionEvent, SessionEventStream, SessionSnapshot, SessionStatus, SnapshotHistory,
-    SnapshotShapeError, TerminalOutcome, TranscriptEntry, TranscriptPage, TranscriptToolCall,
-    TurnOutcome, TurnSummary, TurnTerminalSummary,
+    SnapshotShapeError, TerminalOutcome, TranscriptEntry, TranscriptToolCall, TurnOutcome,
+    TurnSummary, TurnTerminalSummary,
 };
 pub use storage::{AppendReceipt, ConversationPage, SessionLog, SessionLogError};
 pub use value::BoundedText;
