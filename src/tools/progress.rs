@@ -1,14 +1,29 @@
+use std::fmt;
 use std::sync::Arc;
 
 use thiserror::Error;
 
 use crate::value::BoundedText;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ToolProgress {
     pub message: Option<BoundedText>,
     pub completed: Option<u64>,
     pub total: Option<u64>,
+}
+
+impl fmt::Debug for ToolProgress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolProgress")
+            .field(
+                "message_bytes",
+                &self.message.as_ref().map(BoundedText::byte_len),
+            )
+            .field("completed", &self.completed)
+            .field("total", &self.total)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]

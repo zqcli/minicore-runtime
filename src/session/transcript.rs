@@ -4,7 +4,7 @@ use crate::error::{PublicErrorCode, PublicErrorSummary};
 use crate::ids::{InteractionId, ToolCallId, TurnId};
 use crate::tools::ToolName;
 
-use super::snapshot::TurnOutcome;
+use super::legacy_snapshot::LegacyTurnOutcome;
 use crate::storage::conversation::{
     ConversationEntry, ConversationError, ConversationLog, ConversationSnapshot, StoredTurnOutcome,
 };
@@ -52,7 +52,7 @@ pub enum TranscriptEntry {
     Terminal {
         seq: u64,
         turn_id: TurnId,
-        outcome: TurnOutcome,
+        outcome: LegacyTurnOutcome,
     },
 }
 
@@ -111,13 +111,13 @@ impl ConversationSnapshot {
     }
 }
 
-fn terminal_outcome(outcome: StoredTurnOutcome) -> TurnOutcome {
+fn terminal_outcome(outcome: StoredTurnOutcome) -> LegacyTurnOutcome {
     match outcome {
-        StoredTurnOutcome::Completed => TurnOutcome::Completed,
+        StoredTurnOutcome::Completed => LegacyTurnOutcome::Completed,
         StoredTurnOutcome::Cancelled | StoredTurnOutcome::CancelledByRestart => {
-            TurnOutcome::Cancelled
+            LegacyTurnOutcome::Cancelled
         }
-        StoredTurnOutcome::Failed => TurnOutcome::Failed {
+        StoredTurnOutcome::Failed => LegacyTurnOutcome::Failed {
             error: PublicErrorSummary::with_retryable(PublicErrorCode::Internal, false),
         },
     }

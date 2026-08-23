@@ -146,6 +146,7 @@ def self_test() -> None:
             ("port-nested-declaration", "typed Port declaration missing or wrong kind", lambda root: (root / "src/tools/tool.rs").write_text("mod nested { pub trait Tool {} }\n", encoding="utf-8")),
             ("port-agent-direction", "Port dependency violation", lambda root: (root / "src/context/provider.rs").write_text("use crate::agent::Runner;\npub trait ContextProvider {}\n", encoding="utf-8")),
             ("port-runtime-direction", "Port dependency violation", lambda root: (root / "src/storage/session_log.rs").write_text("use crate::runtime::Inner;\npub trait SessionLog {}\n", encoding="utf-8")),
+            ("final-legacy-observation", "forbidden production symbol SessionSnapshot", lambda root: (root / "src/session/state.rs").write_text("pub struct SessionState {}\npub struct SessionSnapshot;\n", encoding="utf-8")),
             ("storage-jsonl-dir", "forbidden production storage implementation", lambda root: ((root / "src/storage/jsonl").mkdir(), (root / "src/storage/jsonl/adapter.rs").write_text("", encoding="utf-8"))),
             ("storage-store-dir", "forbidden production storage implementation", lambda root: ((root / "src/storage/store").mkdir(), (root / "src/storage/store/adapter.rs").write_text("", encoding="utf-8"))),
             ("storage-conversation-jsonl-dir", "forbidden production storage implementation", lambda root: ((root / "src/storage/conversation_jsonl").mkdir(), (root / "src/storage/conversation_jsonl/adapter.rs").write_text("", encoding="utf-8"))),
@@ -287,6 +288,13 @@ def self_test() -> None:
             "pub(crate) trait LegacyToolPolicy {}\n", encoding="utf-8"
         )
         assert not scan(transitional_policy), scan(transitional_policy)
+
+        transitional_session = directory_path / "transitional-session"
+        shutil.copytree(base, transitional_session)
+        (transitional_session / "src/session/legacy_snapshot.rs").write_text(
+            "pub(crate) struct SessionSnapshot;\n", encoding="utf-8"
+        )
+        assert not scan(transitional_session), scan(transitional_session)
 
         grouped = directory_path / "grouped-cycle"
         shutil.copytree(base, grouped)

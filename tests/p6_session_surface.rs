@@ -38,7 +38,7 @@ fn p6_session_actor_surface_is_private_and_owner_proof_free() {
         .find("self.finish_active(result, true).await")
         .unwrap();
     assert!(abort < wait_idle && wait_idle == refresh && refresh < finish);
-    assert!(production.contains("SessionObservation"));
+    assert!(production.contains("LegacySessionObservation"));
     assert!(production.contains("CancelSlot"));
     assert!(production.contains("cancel_slot.install(turn_id, cancellation.clone())"));
     let slot_install = production
@@ -123,8 +123,11 @@ fn p6_session_actor_surface_is_private_and_owner_proof_free() {
     assert!(support.contains("MAX_USER_TEXT_BYTES"));
     assert!(support.contains("pub(crate) fn usage(&self)"));
     assert!(usage.contains("usage_from_entries"));
-    let state = include_str!("../src/session/state.rs");
-    assert_eq!(state.matches("pub enum SessionStatus").count(), 1);
+    let state = include_str!("../src/session/legacy_state.rs");
+    assert_eq!(
+        state.matches("pub(crate) enum LegacySessionStatus").count(),
+        1
+    );
     for variant in ["Idle", "Running", "WaitingForInput", "Closing"] {
         assert!(state.contains(variant));
     }

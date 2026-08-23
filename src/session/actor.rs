@@ -8,10 +8,13 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::command::{CancelSlot, CloseCompletion, SessionCommand, SessionHandle};
-use super::event::SessionEvent;
-use super::event_stream::SessionObservation;
-use super::snapshot::{SessionSnapshot, SnapshotHistory, TurnOutcome, TurnSummary, TurnTerminal};
-use super::state::SessionStatus;
+use super::legacy_event::LegacySessionEvent;
+use super::legacy_event_stream::LegacySessionObservation;
+use super::legacy_snapshot::{
+    LegacySessionSnapshot, LegacySnapshotHistory, LegacyTurnOutcome, LegacyTurnSummary,
+    LegacyTurnTerminal,
+};
+use super::legacy_state::LegacySessionStatus;
 use crate::agent::{
     RunnerEvent, RunnerEventSink, TimestampSource, TurnContext, TurnContextDependencies,
     TurnFailure, TurnTaskResult, run_turn,
@@ -88,7 +91,7 @@ pub(crate) struct SessionActor {
     config: StoredSessionConfig,
     resources: SessionResources,
     dependencies: Arc<SessionActorDependencies>,
-    status: SessionStatus,
+    status: LegacySessionStatus,
     active: Option<ActiveTurn>,
     pending: Option<PendingInteraction>,
     forced_failure: Option<TurnFailure>,
@@ -99,13 +102,13 @@ pub(crate) struct SessionActor {
     cancel_slot: Arc<CancelSlot>,
     close_requested: CancellationToken,
     close_complete: CloseCompletion,
-    observation: SessionObservation,
+    observation: LegacySessionObservation,
     conversation: Arc<ConversationLog>,
     workspace: Arc<Workspace>,
     usage: Usage,
     conversation_seq: u64,
     last_error: Option<PublicErrorSummary>,
-    last_terminal: Option<TurnTerminal>,
+    last_terminal: Option<LegacyTurnTerminal>,
     interactions_open: bool,
 }
 
@@ -115,7 +118,7 @@ impl SessionActorDependencies {
             return Err(SessionError::InvalidInput);
         }
         if !(1..=super::command::MAX_COMMAND_CAPACITY).contains(&self.command_capacity)
-            || !(1..=super::event_stream::MAX_EVENT_CAPACITY).contains(&self.event_capacity)
+            || !(1..=super::legacy_event_stream::MAX_EVENT_CAPACITY).contains(&self.event_capacity)
             || !(1..=crate::agent::MAX_RUNNER_EVENT_CAPACITY).contains(&self.runner_event_capacity)
         {
             return Err(SessionError::InvalidInput);
@@ -168,17 +171,17 @@ impl SessionActor {
             .has_failed_terminal()
             .then(|| PublicErrorSummary::with_retryable(PublicErrorCode::Internal, false));
         let usage = stored.usage();
-        let initial = SessionSnapshot::new(
+        let initial = LegacySessionSnapshot::new(
             config.session_id(),
-            SessionStatus::Idle,
+            LegacySessionStatus::Idle,
             None,
             None,
             usage,
-            SnapshotHistory::new(last_error.clone(), latest_terminal.clone()),
+            LegacySnapshotHistory::new(last_error.clone(), latest_terminal.clone()),
             stored.max_seq(),
         )
         .map_err(|_| SessionError::InvalidInput)?;
-        let observation = SessionObservation::new(initial, dependencies.event_capacity)?;
+        let observation = LegacySessionObservation::new(initial, dependencies.event_capacity)?;
         let (commands, receiver) = mpsc::channel(dependencies.command_capacity);
         let (interaction_client, interactions) = InteractionClient::channel();
         let cancel_slot = Arc::new(CancelSlot::new());
@@ -208,7 +211,7 @@ impl SessionActor {
                 config,
                 resources,
                 dependencies: Arc::new(dependencies),
-                status: SessionStatus::Idle,
+                status: LegacySessionStatus::Idle,
                 active: None,
                 pending: None,
                 forced_failure: None,
@@ -233,11 +236,11 @@ impl SessionActor {
 
     pub(crate) async fn run(mut self) -> Result<(), SessionError> {
         loop {
-            if self.status == SessionStatus::Closing {
+            if self.status == LegacySessionStatus::Closing {
                 return self.close_session(None).await;
             }
             let step = match self.status {
-                SessionStatus::Idle => {
+                LegacySessionStatus::Idle => {
                     let command = tokio::select! {
                         biased;
                         _ = self.close_requested.cancelled() => None,
@@ -251,10 +254,9 @@ impl SessionActor {
                         }
                     }
                 }
-                SessionStatus::Running { .. } | SessionStatus::WaitingForInput { .. } => {
-                    self.active_step().await
-                }
-                SessionStatus::Closing => Ok(()),
+                LegacySessionStatus::Running { .. }
+                | LegacySessionStatus::WaitingForInput { .. } => self.active_step().await,
+                LegacySessionStatus::Closing => Ok(()),
             };
             if let Err(error) = step {
                 self.close_requested.cancel();
@@ -331,7 +333,7 @@ impl SessionActor {
                 answer,
                 reply,
             } => {
-                let result = if matches!(self.status, SessionStatus::WaitingForInput { .. }) {
+                let result = if matches!(self.status, LegacySessionStatus::WaitingForInput { .. }) {
                     self.handle_answer(interaction_id, answer).await
                 } else {
                     Err(SessionError::InteractionMismatch)
@@ -403,8 +405,8 @@ impl SessionActor {
             events: runner_events,
             events_open: true,
         });
-        self.status = SessionStatus::Running { turn_id };
-        self.publish_event(SessionEvent::TurnStarted { turn_id })?;
+        self.status = LegacySessionStatus::Running { turn_id };
+        self.publish_event(LegacySessionEvent::TurnStarted { turn_id })?;
         Ok(turn_id)
     }
 
@@ -494,11 +496,11 @@ impl SessionActor {
             question: question.clone(),
             request: Some(request),
         });
-        self.status = SessionStatus::WaitingForInput {
+        self.status = LegacySessionStatus::WaitingForInput {
             turn_id: active_turn_id,
             interaction_id,
         };
-        if let Err(error) = self.publish_event(SessionEvent::InputRequested {
+        if let Err(error) = self.publish_event(LegacySessionEvent::InputRequested {
             turn_id: active_turn_id,
             question,
         }) {
@@ -626,7 +628,7 @@ impl SessionActor {
         }
 
         self.pending.take();
-        self.status = SessionStatus::Running { turn_id };
+        self.status = LegacySessionStatus::Running { turn_id };
         if self.publish_snapshot().is_err() {
             let _ = response.respond(answer);
             self.force_failure(TurnFailure::Internal);
@@ -652,18 +654,18 @@ impl SessionActor {
         let turn_id = self.active.as_ref().ok_or(SessionError::Internal)?.turn_id;
         let event = match event {
             RunnerEvent::Model(LegacyModelEvent::TextDelta { delta }) => {
-                SessionEvent::TextDelta { turn_id, delta }
+                LegacySessionEvent::TextDelta { turn_id, delta }
             }
             RunnerEvent::Model(LegacyModelEvent::ReasoningDelta { delta }) => {
-                SessionEvent::ReasoningDelta { turn_id, delta }
+                LegacySessionEvent::ReasoningDelta { turn_id, delta }
             }
             RunnerEvent::ToolStarted(call) => {
                 self.refresh_projection().await;
-                SessionEvent::ToolStarted { turn_id, call }
+                LegacySessionEvent::ToolStarted { turn_id, call }
             }
             RunnerEvent::ToolFinished(result) => {
                 self.refresh_projection().await;
-                SessionEvent::ToolFinished { turn_id, result }
+                LegacySessionEvent::ToolFinished { turn_id, result }
             }
         };
         self.publish_event(event)
@@ -696,14 +698,14 @@ impl SessionActor {
         aborted: bool,
     ) -> Result<(), SessionError> {
         let turn_id = self.active.as_ref().ok_or(SessionError::Internal)?.turn_id;
-        if self.close_requested.is_cancelled() && self.status != SessionStatus::Closing {
+        if self.close_requested.is_cancelled() && self.status != LegacySessionStatus::Closing {
             self.mark_closing()?;
         }
         let forced = self.forced_failure.take();
         let (mut outcome, stored) = if let Some(failure) = forced {
             failure_outcome(failure)
         } else if aborted {
-            (TurnOutcome::Cancelled, StoredTurnOutcome::Cancelled)
+            (LegacyTurnOutcome::Cancelled, StoredTurnOutcome::Cancelled)
         } else {
             match result {
                 Some(result) => task_outcome(result),
@@ -713,7 +715,7 @@ impl SessionActor {
         let terminal_result = self.append_terminal(turn_id, stored).await;
         if terminal_result.is_err() {
             self.unavailable = true;
-            outcome = TurnOutcome::Failed {
+            outcome = LegacyTurnOutcome::Failed {
                 error: PublicErrorSummary::with_retryable(PublicErrorCode::Internal, false),
             };
         }
@@ -721,14 +723,14 @@ impl SessionActor {
         self.cancel_slot.clear(turn_id);
         self.reject_pending();
         self.refresh_projection().await;
-        self.last_terminal = Some(TurnTerminal::new(turn_id, outcome.clone()));
-        if let TurnOutcome::Failed { ref error } = outcome {
+        self.last_terminal = Some(LegacyTurnTerminal::new(turn_id, outcome.clone()));
+        if let LegacyTurnOutcome::Failed { ref error } = outcome {
             self.last_error = Some(error.clone());
         }
-        if self.status != SessionStatus::Closing {
-            self.status = SessionStatus::Idle;
+        if self.status != LegacySessionStatus::Closing {
+            self.status = LegacySessionStatus::Idle;
         }
-        self.publish_event(SessionEvent::TurnFinished { turn_id, outcome })?;
+        self.publish_event(LegacySessionEvent::TurnFinished { turn_id, outcome })?;
         Ok(())
     }
 
@@ -752,12 +754,15 @@ impl SessionActor {
             .is_ok();
         self.refresh_projection().await;
         if appended {
-            self.last_terminal = Some(TurnTerminal::cancelled(turn_id));
+            self.last_terminal = Some(LegacyTurnTerminal::cancelled(turn_id));
         } else {
             self.unavailable = true;
             let error = PublicErrorSummary::with_retryable(PublicErrorCode::Internal, false);
             self.last_error = Some(error.clone());
-            self.last_terminal = Some(TurnTerminal::new(turn_id, TurnOutcome::Failed { error }));
+            self.last_terminal = Some(LegacyTurnTerminal::new(
+                turn_id,
+                LegacyTurnOutcome::Failed { error },
+            ));
         }
     }
 
@@ -775,14 +780,14 @@ impl SessionActor {
     }
 
     fn mark_closing(&mut self) -> Result<(), SessionError> {
-        if self.status == SessionStatus::Closing {
+        if self.status == LegacySessionStatus::Closing {
             return Ok(());
         }
         self.reject_pending();
         if let Some(active) = self.active.as_ref() {
             active.cancellation.cancel();
         }
-        self.status = SessionStatus::Closing;
+        self.status = LegacySessionStatus::Closing;
         self.publish_snapshot()
     }
 
@@ -913,18 +918,18 @@ impl SessionActor {
         }
     }
 
-    fn snapshot(&self) -> Result<SessionSnapshot, SessionError> {
-        SessionSnapshot::new(
+    fn snapshot(&self) -> Result<LegacySessionSnapshot, SessionError> {
+        LegacySessionSnapshot::new(
             self.config.session_id(),
             self.status,
             self.active
                 .as_ref()
-                .map(|active| TurnSummary::new(active.turn_id)),
+                .map(|active| LegacyTurnSummary::new(active.turn_id)),
             self.pending
                 .as_ref()
                 .map(|pending| pending.question.clone()),
             self.usage,
-            SnapshotHistory::new(self.last_error.clone(), self.last_terminal.clone()),
+            LegacySnapshotHistory::new(self.last_error.clone(), self.last_terminal.clone()),
             self.conversation_seq,
         )
         .map_err(|_| SessionError::Internal)
@@ -935,7 +940,7 @@ impl SessionActor {
         self.observation.publish_snapshot(snapshot)
     }
 
-    fn publish_event(&self, event: SessionEvent) -> Result<(), SessionError> {
+    fn publish_event(&self, event: LegacySessionEvent) -> Result<(), SessionError> {
         let snapshot = self.snapshot()?;
         self.observation.publish(snapshot, Some(event))
     }
@@ -965,28 +970,32 @@ fn validate_descriptor(
     Ok(())
 }
 
-fn terminal_from_stored(turn_id: TurnId, outcome: StoredTurnOutcome) -> TurnTerminal {
+fn terminal_from_stored(turn_id: TurnId, outcome: StoredTurnOutcome) -> LegacyTurnTerminal {
     let outcome = match outcome {
-        StoredTurnOutcome::Completed => TurnOutcome::Completed,
+        StoredTurnOutcome::Completed => LegacyTurnOutcome::Completed,
         StoredTurnOutcome::Cancelled | StoredTurnOutcome::CancelledByRestart => {
-            TurnOutcome::Cancelled
+            LegacyTurnOutcome::Cancelled
         }
-        StoredTurnOutcome::Failed => TurnOutcome::Failed {
+        StoredTurnOutcome::Failed => LegacyTurnOutcome::Failed {
             error: PublicErrorSummary::with_retryable(PublicErrorCode::Internal, false),
         },
     };
-    TurnTerminal::new(turn_id, outcome)
+    LegacyTurnTerminal::new(turn_id, outcome)
 }
 
-fn task_outcome(result: TurnTaskResult) -> (TurnOutcome, StoredTurnOutcome) {
+fn task_outcome(result: TurnTaskResult) -> (LegacyTurnOutcome, StoredTurnOutcome) {
     match result {
-        TurnTaskResult::Completed { .. } => (TurnOutcome::Completed, StoredTurnOutcome::Completed),
-        TurnTaskResult::Cancelled { .. } => (TurnOutcome::Cancelled, StoredTurnOutcome::Cancelled),
+        TurnTaskResult::Completed { .. } => {
+            (LegacyTurnOutcome::Completed, StoredTurnOutcome::Completed)
+        }
+        TurnTaskResult::Cancelled { .. } => {
+            (LegacyTurnOutcome::Cancelled, StoredTurnOutcome::Cancelled)
+        }
         TurnTaskResult::Failed { failure, .. } => failure_outcome(failure),
     }
 }
 
-fn failure_outcome(failure: TurnFailure) -> (TurnOutcome, StoredTurnOutcome) {
+fn failure_outcome(failure: TurnFailure) -> (LegacyTurnOutcome, StoredTurnOutcome) {
     let error = match failure {
         TurnFailure::Model => {
             PublicErrorSummary::with_retryable(PublicErrorCode::Unavailable, true)
@@ -1003,7 +1012,10 @@ fn failure_outcome(failure: TurnFailure) -> (TurnOutcome, StoredTurnOutcome) {
             PublicErrorSummary::with_retryable(PublicErrorCode::Internal, false)
         }
     };
-    (TurnOutcome::Failed { error }, StoredTurnOutcome::Failed)
+    (
+        LegacyTurnOutcome::Failed { error },
+        StoredTurnOutcome::Failed,
+    )
 }
 
 fn map_conversation_error(error: ConversationError) -> SessionError {
@@ -1486,14 +1498,14 @@ mod tests {
         let snapshot = handle.snapshot();
         assert_eq!(
             snapshot.status(),
-            crate::session::state::SessionStatus::Idle
+            crate::session::legacy_state::LegacySessionStatus::Idle
         );
         assert_eq!(snapshot.conversation_seq(), 3);
         assert_eq!(snapshot.usage(), &Usage::new(1, 2, 3));
         assert_eq!(snapshot.last_terminal().unwrap().turn_id, turn_id);
         assert_eq!(
             snapshot.last_terminal().unwrap().outcome,
-            crate::session::snapshot::TurnOutcome::Completed
+            crate::session::legacy_snapshot::LegacyTurnOutcome::Completed
         );
         drop(actor);
         log.close().await.unwrap();
@@ -1548,19 +1560,19 @@ mod tests {
         let mut stream = handle.subscribe().unwrap();
         assert!(matches!(
             stream.recv().await,
-            Some(SessionEvent::Snapshot(snapshot))
-                if snapshot.status() == SessionStatus::Idle
+            Some(LegacySessionEvent::Snapshot(snapshot))
+                if snapshot.status() == LegacySessionStatus::Idle
         ));
         let actor_task = tokio::runtime::Handle::current().spawn(actor.run());
         let turn_id = handle.submit("question".to_owned()).await.unwrap();
         assert_eq!(
             stream.recv().await,
-            Some(SessionEvent::TurnStarted { turn_id })
+            Some(LegacySessionEvent::TurnStarted { turn_id })
         );
         assert!(stream.snapshot().conversation_seq() >= 1);
         assert_eq!(
             stream.recv().await,
-            Some(SessionEvent::TextDelta {
+            Some(LegacySessionEvent::TextDelta {
                 turn_id,
                 delta: "delta".to_owned(),
             })
@@ -1568,18 +1580,18 @@ mod tests {
         let finished = stream.recv().await.unwrap();
         assert!(matches!(
             finished,
-            SessionEvent::TurnFinished {
+            LegacySessionEvent::TurnFinished {
                 turn_id: finished_turn,
-                outcome: TurnOutcome::Completed,
+                outcome: LegacyTurnOutcome::Completed,
             } if finished_turn == turn_id
         ));
-        assert_eq!(handle.snapshot().status(), SessionStatus::Idle);
+        assert_eq!(handle.snapshot().status(), LegacySessionStatus::Idle);
         assert_eq!(handle.snapshot().conversation_seq(), 3);
         assert_eq!(handle.snapshot().usage(), &Usage::new(1, 2, 3));
         assert_eq!(log.snapshot().await.entries().len(), 3);
         handle.close().await.unwrap();
         actor_task.await.unwrap().unwrap();
-        assert_eq!(stream.recv().await, Some(SessionEvent::Closed));
+        assert_eq!(stream.recv().await, Some(LegacySessionEvent::Closed));
         assert_eq!(stream.recv().await, None);
         store.shutdown().await.unwrap();
         fs::remove_dir_all(root).unwrap();
@@ -1635,20 +1647,20 @@ mod tests {
         let turn_id = handle.submit("question".to_owned()).await.unwrap();
         assert_eq!(
             stream.recv().await,
-            Some(SessionEvent::TurnStarted { turn_id })
+            Some(LegacySessionEvent::TurnStarted { turn_id })
         );
         let mut lifecycle = Vec::new();
         loop {
             match stream.recv().await.unwrap() {
-                SessionEvent::ToolStarted { call, .. } => {
+                LegacySessionEvent::ToolStarted { call, .. } => {
                     lifecycle.push(format!("started:{}", call.tool_name()))
                 }
-                SessionEvent::ToolFinished { result, .. } => {
+                LegacySessionEvent::ToolFinished { result, .. } => {
                     lifecycle.push(format!("finished:{:?}", result.status()));
                     assert!(handle.snapshot().conversation_seq() >= 3);
                 }
-                SessionEvent::TurnFinished { outcome, .. } => {
-                    assert_eq!(outcome, TurnOutcome::Completed);
+                LegacySessionEvent::TurnFinished { outcome, .. } => {
+                    assert_eq!(outcome, LegacyTurnOutcome::Completed);
                     break;
                 }
                 _ => {}
@@ -1718,11 +1730,11 @@ mod tests {
         let turn_id = handle.submit("question".to_owned()).await.unwrap();
         assert_eq!(
             stream.recv().await,
-            Some(SessionEvent::TurnStarted { turn_id })
+            Some(LegacySessionEvent::TurnStarted { turn_id })
         );
         let question = loop {
             match stream.recv().await.unwrap() {
-                SessionEvent::InputRequested {
+                LegacySessionEvent::InputRequested {
                     turn_id: event_turn,
                     question,
                 } if event_turn == turn_id => break question,
@@ -1733,7 +1745,7 @@ mod tests {
         assert_eq!(stream.snapshot().conversation_seq(), 2);
         assert!(matches!(
             handle.snapshot().status(),
-            SessionStatus::WaitingForInput {
+            LegacySessionStatus::WaitingForInput {
                 turn_id: waiting_turn,
                 interaction_id: waiting_interaction,
             } if waiting_turn == turn_id && waiting_interaction == interaction_id
@@ -1746,7 +1758,7 @@ mod tests {
         );
         assert!(matches!(
             handle.snapshot().status(),
-            SessionStatus::WaitingForInput {
+            LegacySessionStatus::WaitingForInput {
                 interaction_id: current,
                 ..
             } if current == interaction_id
@@ -1761,21 +1773,21 @@ mod tests {
         assert!(handle.snapshot().conversation_seq() >= 3);
         loop {
             match stream.recv().await.unwrap() {
-                SessionEvent::ToolStarted { .. } => {
+                LegacySessionEvent::ToolStarted { .. } => {
                     assert!(handle.snapshot().conversation_seq() >= 3);
                     match handle.snapshot().status() {
-                        SessionStatus::Idle | SessionStatus::Closing => {}
-                        SessionStatus::Running { turn_id: current } => {
+                        LegacySessionStatus::Idle | LegacySessionStatus::Closing => {}
+                        LegacySessionStatus::Running { turn_id: current } => {
                             assert_eq!(current, turn_id)
                         }
-                        SessionStatus::WaitingForInput {
+                        LegacySessionStatus::WaitingForInput {
                             interaction_id: current,
                             ..
                         } => assert_eq!(current, interaction_id),
                     }
                 }
-                SessionEvent::TurnFinished { outcome, .. } => {
-                    assert_eq!(outcome, TurnOutcome::Completed);
+                LegacySessionEvent::TurnFinished { outcome, .. } => {
+                    assert_eq!(outcome, LegacyTurnOutcome::Completed);
                     break;
                 }
                 _ => {}
@@ -1832,7 +1844,9 @@ mod tests {
         let actor_task = tokio::runtime::Handle::current().spawn(actor.run());
         let turn_id = handle.submit("question".to_owned()).await.unwrap();
         let interaction_id = loop {
-            if let SessionEvent::InputRequested { question, .. } = stream.recv().await.unwrap() {
+            if let LegacySessionEvent::InputRequested { question, .. } =
+                stream.recv().await.unwrap()
+            {
                 break question.interaction_id();
             }
         };
@@ -1848,18 +1862,18 @@ mod tests {
         );
         let cancellation_snapshot = handle.snapshot();
         match cancellation_snapshot.status() {
-            SessionStatus::WaitingForInput {
+            LegacySessionStatus::WaitingForInput {
                 turn_id: current,
                 interaction_id: current_id,
             } => {
                 assert_eq!(current, turn_id);
                 assert_eq!(current_id, interaction_id);
             }
-            SessionStatus::Idle => assert!(matches!(
+            LegacySessionStatus::Idle => assert!(matches!(
                 cancellation_snapshot.last_terminal(),
-                Some(TurnTerminal {
+                Some(LegacyTurnTerminal {
                     turn_id: current,
-                    outcome: TurnOutcome::Cancelled,
+                    outcome: LegacyTurnOutcome::Cancelled,
                 }) if *current == turn_id
             )),
             status => panic!("unexpected post-cancel status: {status:?}"),
@@ -1898,8 +1912,8 @@ mod tests {
             );
         }
         loop {
-            if let SessionEvent::TurnFinished {
-                outcome: TurnOutcome::Cancelled,
+            if let LegacySessionEvent::TurnFinished {
+                outcome: LegacyTurnOutcome::Cancelled,
                 ..
             } = stream.recv().await.unwrap()
             {
@@ -1975,7 +1989,9 @@ mod tests {
         let actor_task = tokio::runtime::Handle::current().spawn(actor.run());
         let turn_id = handle.submit("question".to_owned()).await.unwrap();
         let interaction_id = loop {
-            if let SessionEvent::InputRequested { question, .. } = stream.recv().await.unwrap() {
+            if let LegacySessionEvent::InputRequested { question, .. } =
+                stream.recv().await.unwrap()
+            {
                 break question.interaction_id();
             }
         };
@@ -2053,7 +2069,9 @@ mod tests {
         let actor_task = tokio::runtime::Handle::current().spawn(actor.run());
         let turn_id = handle.submit("question".to_owned()).await.unwrap();
         let interaction_id = loop {
-            if let SessionEvent::InputRequested { question, .. } = stream.recv().await.unwrap() {
+            if let LegacySessionEvent::InputRequested { question, .. } =
+                stream.recv().await.unwrap()
+            {
                 break question.interaction_id();
             }
         };
@@ -2067,7 +2085,7 @@ mod tests {
         loop {
             if matches!(
                 stream.recv().await.unwrap(),
-                SessionEvent::ToolFinished { .. }
+                LegacySessionEvent::ToolFinished { .. }
             ) {
                 break;
             }
@@ -2081,9 +2099,9 @@ mod tests {
         assert_eq!(close_task.await.unwrap(), Ok(()));
         assert!(matches!(
             stream.recv().await,
-            Some(SessionEvent::TurnFinished {
+            Some(LegacySessionEvent::TurnFinished {
                 turn_id: finished,
-                outcome: TurnOutcome::Cancelled,
+                outcome: LegacyTurnOutcome::Cancelled,
             }) if finished == turn_id
         ));
         assert_eq!(
@@ -2139,7 +2157,9 @@ mod tests {
         let actor_task = tokio::runtime::Handle::current().spawn(actor.run());
         let turn_id = handle.submit("question".to_owned()).await.unwrap();
         let interaction_id = loop {
-            if let SessionEvent::InputRequested { question, .. } = stream.recv().await.unwrap() {
+            if let LegacySessionEvent::InputRequested { question, .. } =
+                stream.recv().await.unwrap()
+            {
                 break question.interaction_id();
             }
         };
@@ -2170,16 +2190,16 @@ mod tests {
         loop {
             if matches!(
                 stream.recv().await.unwrap(),
-                SessionEvent::ToolFinished { .. }
+                LegacySessionEvent::ToolFinished { .. }
             ) {
                 break;
             }
         }
         assert!(matches!(
             stream.recv().await,
-            Some(SessionEvent::TurnFinished {
+            Some(LegacySessionEvent::TurnFinished {
                 turn_id: finished,
-                outcome: TurnOutcome::Cancelled,
+                outcome: LegacyTurnOutcome::Cancelled,
             }) if finished == turn_id
         ));
         assert!(
@@ -2237,7 +2257,9 @@ mod tests {
         let actor_task = tokio::runtime::Handle::current().spawn(actor.run());
         let turn_id = handle.submit("question".to_owned()).await.unwrap();
         let interaction_id = loop {
-            if let SessionEvent::InputRequested { question, .. } = stream.recv().await.unwrap() {
+            if let LegacySessionEvent::InputRequested { question, .. } =
+                stream.recv().await.unwrap()
+            {
                 break question.interaction_id();
             }
         };
@@ -2332,7 +2354,9 @@ mod tests {
         let actor_task = tokio::runtime::Handle::current().spawn(actor.run());
         let _turn_id = handle.submit("question".to_owned()).await.unwrap();
         let interaction_id = loop {
-            if let SessionEvent::InputRequested { question, .. } = stream.recv().await.unwrap() {
+            if let LegacySessionEvent::InputRequested { question, .. } =
+                stream.recv().await.unwrap()
+            {
                 break question.interaction_id();
             }
         };
@@ -2348,8 +2372,8 @@ mod tests {
         );
         assert!(matches!(
             stream.recv().await,
-            Some(SessionEvent::TurnFinished {
-                outcome: TurnOutcome::Failed { error },
+            Some(LegacySessionEvent::TurnFinished {
+                outcome: LegacyTurnOutcome::Failed { error },
                 ..
             }) if error.code() == PublicErrorCode::Internal
         ));
@@ -2411,7 +2435,9 @@ mod tests {
         let actor_task = tokio::runtime::Handle::current().spawn(actor.run());
         let _turn_id = handle.submit("question".to_owned()).await.unwrap();
         let interaction_id = loop {
-            if let SessionEvent::InputRequested { question, .. } = stream.recv().await.unwrap() {
+            if let LegacySessionEvent::InputRequested { question, .. } =
+                stream.recv().await.unwrap()
+            {
                 break question.interaction_id();
             }
         };
@@ -2435,7 +2461,7 @@ mod tests {
         loop {
             if matches!(
                 stream.recv().await.unwrap(),
-                SessionEvent::TurnFinished { .. }
+                LegacySessionEvent::TurnFinished { .. }
             ) {
                 break;
             }
@@ -2618,21 +2644,21 @@ mod tests {
         let turn_id = handle.submit("question".to_owned()).await.unwrap();
         assert_eq!(
             stream.recv().await,
-            Some(SessionEvent::TurnStarted { turn_id })
+            Some(LegacySessionEvent::TurnStarted { turn_id })
         );
         assert_eq!(handle.cancel(), Ok(()));
         assert_eq!(
             handle.snapshot().status(),
-            SessionStatus::Running { turn_id }
+            LegacySessionStatus::Running { turn_id }
         );
         assert!(matches!(
             stream.recv().await,
-            Some(SessionEvent::TurnFinished {
+            Some(LegacySessionEvent::TurnFinished {
                 turn_id: finished_turn,
-                outcome: TurnOutcome::Cancelled,
+                outcome: LegacyTurnOutcome::Cancelled,
             }) if finished_turn == turn_id
         ));
-        assert_eq!(handle.snapshot().status(), SessionStatus::Idle);
+        assert_eq!(handle.snapshot().status(), LegacySessionStatus::Idle);
         assert_eq!(log.snapshot().await.entries().len(), 2);
         handle.close().await.unwrap();
         actor_task.await.unwrap().unwrap();
@@ -2674,23 +2700,25 @@ mod tests {
         let turn_id = handle.submit("question".to_owned()).await.unwrap();
         assert_eq!(
             stream.recv().await,
-            Some(SessionEvent::TurnStarted { turn_id })
+            Some(LegacySessionEvent::TurnStarted { turn_id })
         );
         let interaction_id = loop {
-            if let SessionEvent::InputRequested { question, .. } = stream.recv().await.unwrap() {
+            if let LegacySessionEvent::InputRequested { question, .. } =
+                stream.recv().await.unwrap()
+            {
                 break question.interaction_id();
             }
         };
         assert_eq!(handle.cancel(), Ok(()));
         assert!(matches!(
             handle.snapshot().status(),
-            SessionStatus::WaitingForInput {
+            LegacySessionStatus::WaitingForInput {
                 interaction_id: current,
                 ..
             } if current == interaction_id
         ));
         loop {
-            if let SessionEvent::ToolFinished { result, .. } = stream.recv().await.unwrap() {
+            if let LegacySessionEvent::ToolFinished { result, .. } = stream.recv().await.unwrap() {
                 assert_eq!(
                     result.status(),
                     crate::tools::LegacyToolResultStatus::Cancelled
@@ -2699,15 +2727,15 @@ mod tests {
             }
         }
         loop {
-            if let SessionEvent::TurnFinished {
-                outcome: TurnOutcome::Cancelled,
+            if let LegacySessionEvent::TurnFinished {
+                outcome: LegacyTurnOutcome::Cancelled,
                 ..
             } = stream.recv().await.unwrap()
             {
                 break;
             }
         }
-        assert_eq!(handle.snapshot().status(), SessionStatus::Idle);
+        assert_eq!(handle.snapshot().status(), LegacySessionStatus::Idle);
         assert_eq!(log.snapshot().await.entries().len(), 4);
         handle.close().await.unwrap();
         actor_task.await.unwrap().unwrap();
@@ -2778,11 +2806,14 @@ mod tests {
         let _ = stream.recv().await;
         let actor_task = tokio::runtime::Handle::current().spawn(actor.run());
         loop {
-            if matches!(stream.recv().await, Some(SessionEvent::TurnFinished { .. })) {
+            if matches!(
+                stream.recv().await,
+                Some(LegacySessionEvent::TurnFinished { .. })
+            ) {
                 break;
             }
         }
-        assert_eq!(handle.snapshot().status(), SessionStatus::Idle);
+        assert_eq!(handle.snapshot().status(), LegacySessionStatus::Idle);
         assert_eq!(log.snapshot().await.entries().len(), 3);
         handle.close().await.unwrap();
         actor_task.await.unwrap().unwrap();
@@ -2809,7 +2840,7 @@ mod tests {
         let _ = stream.recv().await;
         let actor_task = tokio::runtime::Handle::current().spawn(actor.run());
         handle.close().await.unwrap();
-        assert_eq!(handle.snapshot().status(), SessionStatus::Closing);
+        assert_eq!(handle.snapshot().status(), LegacySessionStatus::Closing);
         assert_eq!(
             handle.submit("after close".to_owned()).await,
             Err(crate::error::SessionError::Closing)
@@ -2823,7 +2854,7 @@ mod tests {
                 .await,
             Err(crate::error::SessionError::Closing)
         );
-        assert_eq!(stream.recv().await, Some(SessionEvent::Closed));
+        assert_eq!(stream.recv().await, Some(LegacySessionEvent::Closed));
         assert_eq!(stream.recv().await, None);
         actor_task.await.unwrap().unwrap();
         store.shutdown().await.unwrap();
@@ -2844,7 +2875,7 @@ mod tests {
         .await
         .unwrap();
         let turn_id = TurnId::new().unwrap();
-        actor.status = SessionStatus::Running { turn_id };
+        actor.status = LegacySessionStatus::Running { turn_id };
         let actor_task = tokio::runtime::Handle::current().spawn(actor.run());
         assert_eq!(handle.close().await, Err(SessionError::Internal));
         assert_eq!(actor_task.await.unwrap(), Err(SessionError::Internal));
@@ -2929,15 +2960,15 @@ mod tests {
         let turn_id = handle.submit("question".to_owned()).await.unwrap();
         assert_eq!(
             stream.recv().await,
-            Some(SessionEvent::TurnStarted { turn_id })
+            Some(LegacySessionEvent::TurnStarted { turn_id })
         );
         let close_handle = handle.clone();
         let close_task =
             tokio::runtime::Handle::current().spawn(async move { close_handle.close().await });
         loop {
-            if let SessionEvent::TurnFinished {
+            if let LegacySessionEvent::TurnFinished {
                 turn_id: finished_turn,
-                outcome: TurnOutcome::Cancelled,
+                outcome: LegacyTurnOutcome::Cancelled,
             } = stream.recv().await.unwrap()
             {
                 assert_eq!(finished_turn, turn_id);
@@ -2945,7 +2976,7 @@ mod tests {
             }
         }
         close_task.await.unwrap().unwrap();
-        assert_eq!(stream.recv().await, Some(SessionEvent::Closed));
+        assert_eq!(stream.recv().await, Some(LegacySessionEvent::Closed));
         assert_eq!(stream.recv().await, None);
         actor_task.await.unwrap().unwrap();
         assert_eq!(log.snapshot().await.entries().len(), 2);
@@ -2973,13 +3004,13 @@ mod tests {
         let actor_task = tokio::runtime::Handle::current().spawn(actor.run());
         let turn_id = handle.submit("question".to_owned()).await.unwrap();
         let outcome = loop {
-            if let SessionEvent::TurnFinished { outcome, .. } = stream.recv().await.unwrap() {
+            if let LegacySessionEvent::TurnFinished { outcome, .. } = stream.recv().await.unwrap() {
                 break outcome;
             }
         };
         assert_eq!(
             outcome,
-            TurnOutcome::Failed {
+            LegacyTurnOutcome::Failed {
                 error: PublicErrorSummary::with_retryable(PublicErrorCode::Unavailable, true),
             }
         );
@@ -3137,11 +3168,11 @@ mod tests {
         let turn_id = handle.submit("question".to_owned()).await.unwrap();
         assert_eq!(
             stream.recv().await,
-            Some(SessionEvent::TurnStarted { turn_id })
+            Some(LegacySessionEvent::TurnStarted { turn_id })
         );
         assert!(matches!(
             stream.recv().await,
-            Some(SessionEvent::ToolStarted { .. })
+            Some(LegacySessionEvent::ToolStarted { .. })
         ));
         let close_handle = handle.clone();
         let close_task =
@@ -3150,13 +3181,13 @@ mod tests {
         tokio::time::advance(Duration::from_secs(31)).await;
         assert!(matches!(
             stream.recv().await,
-            Some(SessionEvent::TurnFinished {
-                outcome: TurnOutcome::Failed { error },
+            Some(LegacySessionEvent::TurnFinished {
+                outcome: LegacyTurnOutcome::Failed { error },
                 ..
             }) if error.code() == PublicErrorCode::Internal
         ));
         close_task.await.unwrap().unwrap();
-        assert_eq!(stream.recv().await, Some(SessionEvent::Closed));
+        assert_eq!(stream.recv().await, Some(LegacySessionEvent::Closed));
         assert_eq!(stream.recv().await, None);
         actor_task.await.unwrap().unwrap();
         assert_eq!(log.snapshot().await.entries().len(), 2);

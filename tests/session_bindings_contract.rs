@@ -129,7 +129,20 @@ fn surface_is_exact_clone_send_sync_and_redacted() {
         include_str!("../src/session/mod.rs")
             .contains("pub use bindings::{SessionBindingError, SessionBindings};")
     );
-    assert!(include_str!("../src/lib.rs").contains("pub use session::SessionBindings;"));
+    let root = include_str!("../src/lib.rs")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("");
+    let session_exports = root
+        .split_once("pubusesession::{")
+        .and_then(|(_, rest)| rest.split_once("};"))
+        .map(|(exports, _)| exports)
+        .expect("root must contain one grouped public session export");
+    assert!(
+        session_exports
+            .split(',')
+            .any(|export| export == "SessionBindings")
+    );
     let tool_source = include_str!("../src/tools/tool.rs");
     assert!(tool_source.contains("!self.input_schema.is_object()"));
     assert!(tool_source.contains("validate_json_size(&self.input_schema, max_schema_bytes)"));

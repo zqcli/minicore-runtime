@@ -1,7 +1,7 @@
 # Current Implementation Context
 
-> Transitional v0.2 checkpoint. P3-E has added pure immutable SessionBindings
-> after removing public registries and concrete model/tool adapters; current seams are
+> Transitional v0.2 checkpoint. P4-A adds final state/event/TurnHandle foundations
+> after pure SessionBindings; current seams are
 > described by the v0.3 README and architecture/module map.
 
 ## Checkpoint
@@ -20,14 +20,14 @@ The crate is Rust 2024 with Rust 1.85 as its MSRV. The default build is offline.
 - `prompt`: private prompt assembly and compaction planning.
 - `agent`: private turn runner, model/tool ordering, retries, cancellation, and compaction integration.
 - `storage`: private durable session configuration, timestamps, root lock, store worker, conversation log, replay, repair, and transcript source.
-- `session`: public immutable SessionBindings plus private actor, mailbox, observation, terminal/lifecycle orchestration, snapshots, events, and transcript projection.
+- `session`: public bindings/interactions/lightweight state/bounded events/exact TurnHandle plus private legacy actor, mailbox, observation, snapshot, and transcript implementation.
 - `runtime`: public orchestration and session residency manager.
 
-The public root exposes canonical `config`, `error`, `event`, `ids`, `model`, `session`, `tools`, and typed Port modules. `agent`, `prompt`, `runtime`, `storage`, and `workspace` remain private. Storage workers, legacy lookup, actor commands, and prompt internals are not public extension seams.
+The public root exposes canonical `compaction`, `config`, `context`, `conversation`, `error`, `ids`, `model`, `session`, `storage`, `tools`, and `value` modules. `agent`, `prompt`, `runtime`, `time`, and `workspace` remain private. Storage workers, legacy lookup, actor commands, and prompt internals are not public extension seams.
 
 ## Core Invariants
 
-- The transitional `Runtime` owns one storage root plus private legacy model/tool collections until P4/P5 replace it.
+- The transitional `Runtime` owns one storage root plus private legacy model/tool/observation collections until P4-B/P5 replace it.
 - One loaded session coordinates one storage-owned conversation log, one actor, one bounded command mailbox, one workspace, and one active turn at most.
 - Session states are exactly `Idle`, `Running`, `WaitingForInput`, and `Closing`.
 - Submit and answer use the same bounded mailbox. Cancellation is an out-of-band request and never waits behind normal work.
@@ -44,7 +44,7 @@ The public root exposes canonical `config`, `error`, `event`, `ids`, `model`, `s
 
 `Runtime::open(config, handle)` is asynchronous and returns `RuntimeError`. This is private migration implementation; final P4 bindings will carry one direct model and immutable tool set.
 
-The session methods are:
+The private legacy Runtime methods retained for actor migration are:
 
 - `create_session(SessionConfig) -> Result<SessionId, SessionError>`
 - `load_session(SessionId) -> Result<(), SessionError>`
@@ -54,8 +54,8 @@ The session methods are:
 - `submit(SessionId, String) -> Result<TurnId, SessionError>`
 - `answer(SessionId, InteractionId, UserAnswer) -> Result<(), SessionError>`
 - `cancel(SessionId) -> Result<(), SessionError>`
-- `snapshot(SessionId) -> Result<SessionSnapshot, SessionError>`
-- `subscribe(SessionId) -> Result<SessionEventStream, SessionError>`
+- `snapshot(SessionId) -> Result<LegacySessionSnapshot, SessionError>`
+- `subscribe(SessionId) -> Result<LegacySessionEventStream, SessionError>`
 - `transcript(SessionId, Option<u64>, usize) -> Result<TranscriptPage, SessionError>`
 - `shutdown() -> Result<(), RuntimeError>`
 
@@ -110,5 +110,5 @@ Root concrete model/live-network tests were removed in P3-D. The independent pro
 - Tool contract: `src/tools/tool.rs`, `src/tools/set.rs`, `src/tools/policy.rs`, and their focused contract tests.
 - Storage contract: `src/storage/store.rs`, `src/storage/conversation.rs`, `src/storage/conversation/codec.rs`, and `src/session/transcript.rs`.
 - Lifecycle contract: `src/session/actor.rs`, `src/session/command.rs`, and `src/runtime/session_manager.rs`.
-- Acceptance contract: focused v0.3 Port tests now; owner/runtime acceptance remains deferred to P4/P5.
+- Acceptance contract: focused v0.3 Port and P4-A foundation tests now; owner/runtime acceptance remains deferred to P4-B/P5.
 - Documentation validation: `scripts/check_docs.py` checks current authority plus selected non-pre-reset evidence.

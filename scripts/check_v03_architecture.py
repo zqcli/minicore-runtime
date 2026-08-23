@@ -42,6 +42,10 @@ TRANSITIONAL_PRIVATE_FILES = {
     "src/model/legacy_gateway.rs",
     "src/model/legacy_provider.rs",
     "src/model/legacy_registry.rs",
+    "src/session/legacy_event.rs",
+    "src/session/legacy_event_stream.rs",
+    "src/session/legacy_snapshot.rs",
+    "src/session/legacy_state.rs",
     "src/tools/registry.rs",
     "src/tools/legacy_context.rs",
     "src/tools/legacy_policy.rs",
@@ -86,6 +90,8 @@ PORT_FILES = {
     "src/model/model.rs", "src/model/response.rs", "src/tools/tool.rs", "src/tools/set.rs",
     "src/tools/context.rs", "src/tools/input.rs", "src/tools/policy.rs", "src/tools/progress.rs", "src/tools/types.rs",
     "src/context/provider.rs", "src/compaction/strategy.rs", "src/session/bindings.rs",
+    "src/session/event.rs", "src/session/event_stream.rs", "src/session/state.rs",
+    "src/session/turn_handle.rs",
     "src/storage/session_log.rs",
 }
 REQUIRED_FILES = {
@@ -939,7 +945,17 @@ def port_direction_errors(root: Path, views: dict[str, tuple[str, int]]) -> list
         if module_components(root / relative, root)
     }
     errors: list[str] = []
-    port_paths = set(PORT_DECLARATIONS) | TOOLSET_ROLE_FILES | SESSION_BINDINGS_ROLE_FILES
+    port_paths = (
+        set(PORT_DECLARATIONS)
+        | TOOLSET_ROLE_FILES
+        | SESSION_BINDINGS_ROLE_FILES
+        | {
+            "src/session/event.rs",
+            "src/session/event_stream.rs",
+            "src/session/state.rs",
+            "src/session/turn_handle.rs",
+        }
+    )
     for relative in sorted(port_paths):
         if relative not in views:
             continue

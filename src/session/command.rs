@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::event_stream::{SessionEventStream, SessionObservation};
-use super::snapshot::SessionSnapshot;
+use super::legacy_event_stream::{LegacySessionEventStream, LegacySessionObservation};
+use super::legacy_snapshot::LegacySessionSnapshot;
 use crate::error::SessionError;
 use crate::ids::{InteractionId, TurnId};
 use crate::storage::conversation::validate_user_text;
@@ -113,7 +113,7 @@ impl CancelSlot {
 #[derive(Clone)]
 pub(crate) struct SessionHandle {
     commands: mpsc::Sender<SessionCommand>,
-    observation: SessionObservation,
+    observation: LegacySessionObservation,
     cancel: Arc<CancelSlot>,
     close_requested: CancellationToken,
     close_complete: CloseCompletionWaiter,
@@ -128,7 +128,7 @@ impl fmt::Debug for SessionHandle {
 impl SessionHandle {
     pub(super) fn new_for_actor(
         commands: mpsc::Sender<SessionCommand>,
-        observation: SessionObservation,
+        observation: LegacySessionObservation,
         cancel: Arc<CancelSlot>,
         close_requested: CancellationToken,
         close_complete: CloseCompletionWaiter,
@@ -194,11 +194,11 @@ impl SessionHandle {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> SessionSnapshot {
+    pub(crate) fn snapshot(&self) -> LegacySessionSnapshot {
         self.observation.snapshot()
     }
 
-    pub(crate) fn subscribe(&self) -> Result<SessionEventStream, SessionError> {
+    pub(crate) fn subscribe(&self) -> Result<LegacySessionEventStream, SessionError> {
         self.observation.subscribe()
     }
 

@@ -10,6 +10,7 @@ MiniCore Runtime is an embeddable Rust 2024 core for typed, bounded session exec
 - Typed context and compaction Ports with immutable DTOs.
 - Public direct `model::Model` streaming Port with checked descriptors, contexts, requests, events, delivery-aware errors, cancellation, and deadlines.
 - Public `SessionBindings` freezes one direct Model, ToolSet, and optional policy/context/compaction adapters, then validates them purely against `SessionSpec` and `SemanticLimits`.
+- Public process-local `SessionState`, bounded single-consumer `SessionEventStream`, and exact-turn `TurnHandle` foundations with redacted diagnostics and no snapshot/broadcast recovery protocol.
 - Crate-private legacy runner/session/storage execution seam, including exact legacy tool-result wire preservation.
 - Conversation, storage, and workspace implementations remain transitional internal slices while their v0.3 owners are migrated.
 - No concrete builtin, process adapter, model network adapter, default tool set, or network service is installed by the public seams.
@@ -57,6 +58,14 @@ Each loaded session will bind one host-owned `Arc<dyn model::Model>` directly. `
 
 Stream events are typed text/reasoning deltas, tool-call boundaries, usage, and finish events. `DeliveryState` is exactly `NotStarted`, `Started`, or `Unknown`; automatic retry is only meaningful when an error is explicitly retryable and delivery is `NotStarted`. Stream assembly, panic catching, cancellation polling, and retry ownership remain the P5 `ModelDriver` cutover.
 
+## State, Events, And Turns
+
+`SessionState` is the lightweight authoritative current-state DTO: four statuses, healthy/degraded health, exact active Turn and pending Interaction, confirmed conversation sequence, and the latest durable terminal outcome. Its validator rejects illegal status/turn/interaction combinations. It is process-local and has no serde representation.
+
+`SessionEventStream` is one bounded Tokio mpsc receiver and is not Clone. Internal publication is synchronous best effort: queue overflow drops the current event, counts losses, and attempts an `EventsDropped` marker before a later ordinary event. Events contain bounded deltas and summaries, never raw tool output, arguments, answers, or adapter errors.
+
+`TurnHandle` is Clone + Send + Sync and controls one exact Turn. Cancellation and completion share one mutex linearization point; cancellation is first-request-only, completion is first-wins, multiple waiters receive the same durable outcome, and dropping handles does not cancel. The P4-A foundation is not yet wired into the transitional actor; P4-B owns that migration.
+
 ## Public Modules
 
 | Module | Public responsibility |
@@ -66,24 +75,23 @@ Stream events are typed text/reasoning deltas, tool-call boundaries, usage, and 
 | `context` | Typed context provider Port and validated context bundles |
 | `compaction` | Typed compaction strategy Port and immutable candidates/proposals |
 | `error` | Public error summaries; legacy session errors remain private |
-| `event` | Stable event-kind values |
 | `ids` | Checked session, instance, turn, interaction, tool-call, and context-source identifiers |
 | `model` | Direct streaming `Model` Port, checked descriptor/context/request/events, and delivery-aware errors |
-| `session` | Process-local interactions and pure immutable `SessionBindings`; SessionRuntime ownership remains deferred |
+| `session` | Bindings, interactions, lightweight state, bounded events, and exact TurnHandle foundations; SessionRuntime ownership remains deferred |
 | `storage` | `SessionLog` Port and storage DTOs |
 | `tools` | `Tool`, immutable `ToolSet`, async `ToolPolicy`, approval, invocation/context/progress/output DTOs |
 
-The old `runtime` and `workspace` modules, `RuntimeConfig`, `SessionConfig`, `SessionSummary`, `ToolRegistry`, synchronous legacy policy, and legacy model lookup are not public compatibility surfaces. `model/legacy_*` and `tools/legacy_*` are private migration scaffolding scheduled for P5/P6 deletion.
+The old `runtime` and `workspace` modules, `RuntimeConfig`, `SessionConfig`, `SessionSummary`, `ToolRegistry`, synchronous legacy policy, and legacy model lookup are not public compatibility surfaces. `model/legacy_*`, `tools/legacy_*`, and `session/legacy_*` are private migration scaffolding scheduled for P4-B/P5/P6 deletion.
 
 ## Transitional Scope
 
-The removed v0.2 Runtime, concrete builtin/process/model adapters, and their integration tests are baseline evidence for the reset, not current extension contracts. Focused P3-B/P3-C/P3-D/P3-E contracts cover ToolSet, policy/interactions, Model, and SessionBindings. SessionRuntime acceptance coverage is intentionally deferred to P4/P5; this revision does not claim that the full replacement is complete.
+The removed v0.2 Runtime, concrete builtin/process/model adapters, and their integration tests are baseline evidence for the reset, not current extension contracts. Focused P3-B through P4-A contracts cover Ports, bindings, state/events, and TurnHandle primitives. SessionRuntime/actor integration remains deferred to P4-B/P5; this revision does not claim that the full replacement is complete.
 
 The former Runtime/model-network examples and root integration suites were removed with their public facades. The standalone `provider-gate/` package remains independent historical protocol evidence and does not establish a root-crate model adapter API.
 
 ## Testing
 
-The deterministic offline checks are Python/docs/diff/architecture checks. Rust validation for this phase is intentionally run remotely by the project workflow; no local Rust build or test command is part of the current P3-E review.
+The deterministic offline checks are Python/docs/diff/architecture checks. Rust validation for this phase is intentionally run remotely by the project workflow; no local Rust build or test command is part of the current P4-A review.
 
 ```bash
 python3 scripts/check_architecture.py

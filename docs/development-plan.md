@@ -2,7 +2,7 @@
 
 ## Status
 
-P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is in progress: P3-B/P3-C/P3-D/P3-E expose the final Tool, policy/interaction, direct Model, and SessionBindings seams while deleting the old public registries and concrete adapters. P4/P5 SessionRuntime, ModelDriver, and remaining workspace migration are still deferred.
+P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is in progress: P3-B through P4-A expose the final Port/bindings/state/event/TurnHandle foundations while isolating old implementations under `Legacy*`. P4-B/P5 SessionRuntime, actor, ModelDriver, and remaining workspace migration are still deferred.
 
 ## Completed Foundations
 
@@ -20,7 +20,8 @@ P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is 
 - [x] **P3-C — policy/approval seam:** async typed `ToolPolicy`, checked approval DTOs, and process-local interaction values; actor suspension/consumption wiring remains deferred to the owner migration.
 - [x] **P3-D — direct Model Port:** host-neutral streaming `Model`, checked descriptors/contexts/events/errors/requests, private `Legacy*` runner lookup, concrete adapter/transport deletion, and focused contract coverage.
 - [x] **P3-E — SessionBindings:** exact immutable Port bundle, pure spec/limits/model/tool/compaction validation, descriptor panic isolation, frozen ToolSpec semantic budgets, root export, and focused contract coverage.
-- [ ] **P4/P5 — SessionRuntime acceptance:** owner/runtime integration and replacement end-to-end contract suite.
+- [x] **P4-A — state/event/TurnHandle foundation:** lightweight invariant-checked state, redacted diagnostics, exact event DTOs, bounded single-consumer lossy stream, exact-Turn cancellation/completion, and physical legacy observation split.
+- [ ] **P4-B/P5 — SessionRuntime acceptance:** owner/actor integration and replacement end-to-end contract suite.
 
 ## Current Maintenance Gates
 

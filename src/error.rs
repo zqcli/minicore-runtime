@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -88,12 +90,24 @@ pub enum DiagnosticCode {
     Internal,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct DiagnosticSummary {
     pub code: DiagnosticCode,
     pub category: DiagnosticCategory,
     pub message: BoundedText,
     pub retryable: bool,
+}
+
+impl fmt::Debug for DiagnosticSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiagnosticSummary")
+            .field("code", &self.code)
+            .field("category", &self.category)
+            .field("message_bytes", &self.message.byte_len())
+            .field("retryable", &self.retryable)
+            .finish()
+    }
 }
 
 impl DiagnosticSummary {
@@ -134,6 +148,23 @@ impl<'de> Deserialize<'de> for DiagnosticSummary {
             value.retryable,
         ))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum EventStreamTakenError {
+    #[error("session event stream was already taken")]
+    AlreadyTaken,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum TurnWaitError {
+    #[error("turn durability outcome is unknown")]
+    DurabilityUnknown(DiagnosticSummary),
+    #[error("turn durability is unavailable")]
+    DurabilityUnavailable(DiagnosticSummary),
+    #[error("turn runtime terminated before durable completion")]
+    RuntimeTerminated(DiagnosticSummary),
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]

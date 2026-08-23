@@ -1,243 +1,42 @@
 use std::fmt;
-use std::sync::{Arc, Mutex};
 
-use tokio::sync::{broadcast, watch};
+use thiserror::Error;
+use tokio::sync::mpsc;
 
-use super::event::SessionEvent;
-use super::snapshot::SessionSnapshot;
-use super::state::SessionStatus;
-use crate::error::SessionError;
+use crate::ids::{SessionId, SessionInstanceId};
 
-pub(crate) const MAX_EVENT_CAPACITY: usize = 4_096;
+use super::event::{SessionEvent, SessionEventEnvelope};
 
-const _: () = {
-    let _ = std::mem::size_of::<SessionObservation>();
-    let _ = std::mem::size_of::<SessionEventStream>();
-    let _ = SessionObservation::new;
-    let _ = SessionObservation::snapshot;
-    let _ = SessionObservation::publish_snapshot;
-    let _ = SessionObservation::publish;
-    let _ = SessionObservation::close;
-    let _ = SessionObservation::subscribe;
-    let _ = SessionEventStream::snapshot;
-    let _ = SessionEventStream::recv;
-};
+const MAX_EVENT_CAPACITY: usize = 4_096;
 
-struct ObservationInner {
-    gate: Mutex<ObservationState>,
-    snapshot_tx: watch::Sender<SessionSnapshot>,
+pub struct SessionEventStream {
+    receiver: mpsc::Receiver<SessionEventEnvelope>,
 }
 
-struct ObservationState {
-    closed: bool,
-    owner_count: usize,
-    event_tx: Option<broadcast::Sender<SessionEvent>>,
+pub(crate) struct InternalEventSink {
+    session_id: SessionId,
+    instance_id: SessionInstanceId,
+    sender: mpsc::Sender<SessionEventEnvelope>,
+    dropped: u64,
 }
 
-pub(crate) struct SessionObservation {
-    inner: Arc<ObservationInner>,
-}
-
-impl SessionObservation {
-    pub(crate) fn new(
-        initial: SessionSnapshot,
-        event_capacity: usize,
-    ) -> Result<Self, SessionError> {
-        if event_capacity == 0 || event_capacity > MAX_EVENT_CAPACITY {
-            return Err(SessionError::InvalidInput);
-        }
-        initial.validate().map_err(|_| SessionError::InvalidInput)?;
-        let (snapshot_tx, _) = watch::channel(initial);
-        let (event_tx, _) = broadcast::channel(event_capacity);
-        Ok(Self {
-            inner: Arc::new(ObservationInner {
-                gate: Mutex::new(ObservationState {
-                    closed: false,
-                    owner_count: 1,
-                    event_tx: Some(event_tx),
-                }),
-                snapshot_tx,
-            }),
-        })
-    }
-
-    pub(crate) fn snapshot(&self) -> SessionSnapshot {
-        self.inner.snapshot_tx.borrow().clone()
-    }
-
-    pub(crate) fn publish_snapshot(&self, snapshot: SessionSnapshot) -> Result<(), SessionError> {
-        self.publish(snapshot, None)
-    }
-
-    pub(crate) fn publish(
-        &self,
-        snapshot: SessionSnapshot,
-        event: Option<SessionEvent>,
-    ) -> Result<(), SessionError> {
-        snapshot
-            .validate()
-            .map_err(|_| SessionError::InvalidInput)?;
-        let state = self
-            .inner
-            .gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.closed {
-            return Err(SessionError::Closing);
-        }
-        if event.as_ref().is_some_and(|event| {
-            matches!(
-                event,
-                SessionEvent::Snapshot(_) | SessionEvent::ResyncRequired | SessionEvent::Closed
-            )
-        }) {
-            return Err(SessionError::InvalidInput);
-        }
-        self.inner.snapshot_tx.send_replace(snapshot);
-        if let Some(event) = event {
-            if let Some(sender) = state.event_tx.as_ref() {
-                let _ = sender.send(event);
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn close(&self, snapshot: SessionSnapshot) -> Result<(), SessionError> {
-        if snapshot.status() != SessionStatus::Closing {
-            return Err(SessionError::InvalidInput);
-        }
-        snapshot
-            .validate()
-            .map_err(|_| SessionError::InvalidInput)?;
-        let mut state = self
-            .inner
-            .gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.closed {
-            return Err(SessionError::Closing);
-        }
-        self.inner.snapshot_tx.send_replace(snapshot);
-        if let Some(sender) = state.event_tx.as_ref() {
-            let _ = sender.send(SessionEvent::Closed);
-        }
-        state.closed = true;
-        Ok(())
-    }
-
-    pub(crate) fn subscribe(&self) -> Result<SessionEventStream, SessionError> {
-        let state = self
-            .inner
-            .gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.closed {
-            return Err(SessionError::Closing);
-        }
-        let events = state
-            .event_tx
-            .as_ref()
-            .ok_or(SessionError::Closing)?
-            .subscribe();
-        let initial = self.inner.snapshot_tx.borrow().clone();
-        Ok(SessionEventStream {
-            observation: Arc::clone(&self.inner),
-            initial: Some(initial),
-            pending_resync_snapshot: None,
-            pending_resync_close: false,
-            events,
-            closed: false,
-        })
-    }
-}
-
-impl Clone for SessionObservation {
-    fn clone(&self) -> Self {
-        let mut state = self
-            .inner
-            .gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.owner_count = state.owner_count.saturating_add(1);
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-impl Drop for SessionObservation {
-    fn drop(&mut self) {
-        let mut state = self
-            .inner
-            .gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.owner_count = state.owner_count.saturating_sub(1);
-        if state.owner_count == 0 {
-            state.closed = true;
-            state.event_tx.take();
-        }
-    }
-}
-
-pub(crate) struct SessionEventStream {
-    observation: Arc<ObservationInner>,
-    initial: Option<SessionSnapshot>,
-    pending_resync_snapshot: Option<SessionSnapshot>,
-    pending_resync_close: bool,
-    events: broadcast::Receiver<SessionEvent>,
-    closed: bool,
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum InternalEventSinkError {
+    #[error("event stream capacity is invalid")]
+    InvalidCapacity,
+    #[error("events-dropped markers are owned by the internal event sink")]
+    MarkerReserved,
+    #[error("event stream receiver is closed")]
+    Closed,
 }
 
 impl SessionEventStream {
-    pub(crate) fn snapshot(&self) -> SessionSnapshot {
-        self.observation.snapshot_tx.borrow().clone()
+    pub async fn recv(&mut self) -> Option<SessionEventEnvelope> {
+        self.receiver.recv().await
     }
 
-    pub(crate) async fn recv(&mut self) -> Option<SessionEvent> {
-        if self.closed {
-            return None;
-        }
-        if let Some(snapshot) = self.initial.take() {
-            return Some(SessionEvent::Snapshot(snapshot));
-        }
-        if let Some(snapshot) = self.pending_resync_snapshot.take() {
-            return Some(SessionEvent::Snapshot(snapshot));
-        }
-        if self.pending_resync_close {
-            self.pending_resync_close = false;
-            self.closed = true;
-            return Some(SessionEvent::Closed);
-        }
-        match self.events.recv().await {
-            Ok(SessionEvent::Closed) => {
-                self.closed = true;
-                Some(SessionEvent::Closed)
-            }
-            Ok(event) => Some(event),
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                let (events, snapshot, closed) = {
-                    let state = self
-                        .observation
-                        .gate
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let events = state.event_tx.as_ref().map(|sender| sender.subscribe());
-                    let snapshot = self.observation.snapshot_tx.borrow().clone();
-                    (events, snapshot, state.closed)
-                };
-                if let Some(events) = events {
-                    self.events = events;
-                }
-                self.pending_resync_snapshot = Some(snapshot);
-                self.pending_resync_close = closed;
-                Some(SessionEvent::ResyncRequired)
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                self.closed = true;
-                Some(SessionEvent::Closed)
-            }
-        }
+    pub fn try_recv(&mut self) -> Result<SessionEventEnvelope, mpsc::error::TryRecvError> {
+        self.receiver.try_recv()
     }
 }
 
@@ -247,250 +46,172 @@ impl fmt::Debug for SessionEventStream {
     }
 }
 
+impl InternalEventSink {
+    pub(crate) fn channel(
+        session_id: SessionId,
+        instance_id: SessionInstanceId,
+        capacity: usize,
+    ) -> Result<(Self, SessionEventStream), InternalEventSinkError> {
+        if !(1..=MAX_EVENT_CAPACITY).contains(&capacity) {
+            return Err(InternalEventSinkError::InvalidCapacity);
+        }
+        let (sender, receiver) = mpsc::channel(capacity);
+        Ok((
+            Self {
+                session_id,
+                instance_id,
+                sender,
+                dropped: 0,
+            },
+            SessionEventStream { receiver },
+        ))
+    }
+
+    pub(crate) fn try_emit(&mut self, event: SessionEvent) -> Result<(), InternalEventSinkError> {
+        if matches!(&event, SessionEvent::EventsDropped { .. }) {
+            return Err(InternalEventSinkError::MarkerReserved);
+        }
+        if self.sender.is_closed() {
+            return Err(InternalEventSinkError::Closed);
+        }
+        if self.dropped != 0 {
+            let marker = self.envelope(SessionEvent::EventsDropped {
+                count: self.dropped,
+            });
+            match self.sender.try_send(marker) {
+                Ok(()) => self.dropped = 0,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.record_drop();
+                    return Ok(());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(InternalEventSinkError::Closed);
+                }
+            }
+        }
+        let envelope = self.envelope(event);
+        match self.sender.try_send(envelope) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.record_drop();
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(InternalEventSinkError::Closed),
+        }
+    }
+
+    fn envelope(&self, event: SessionEvent) -> SessionEventEnvelope {
+        SessionEventEnvelope {
+            session_id: self.session_id,
+            instance_id: self.instance_id,
+            event,
+        }
+    }
+
+    fn record_drop(&mut self) {
+        self.dropped = self.dropped.saturating_add(1);
+    }
+}
+
+const _: () = {
+    // P4-B activation target: the actor will own this sink.
+    let _ = std::mem::size_of::<InternalEventSink>();
+    let _ = InternalEventSink::channel;
+    let _ = InternalEventSink::try_emit;
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::TurnId;
 
-    use crate::ids::{SessionId, TurnId};
-    use crate::model::Usage;
-    use crate::session::snapshot::{SessionSnapshot, SnapshotHistory, TurnSummary};
-    use crate::session::state::SessionStatus;
-
-    fn snapshot(session_id: SessionId, sequence: u64, status: SessionStatus) -> SessionSnapshot {
-        SessionSnapshot::new(
-            session_id,
-            status,
-            status.turn_id().map(TurnSummary::new),
-            None,
-            Usage::default(),
-            SnapshotHistory::new(None, None),
-            sequence,
+    fn ids() -> (SessionId, SessionInstanceId) {
+        (
+            "ses_00000000000000000000000000000001".parse().unwrap(),
+            "ins_00000000000000000000000000000001".parse().unwrap(),
         )
-        .unwrap()
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn observation_rejects_zero_capacity_and_delivers_first_snapshot_then_event() {
-        let session_id = SessionId::new().unwrap();
-        let initial = snapshot(session_id, 0, SessionStatus::Idle);
-        assert!(matches!(
-            SessionObservation::new(initial.clone(), 0),
-            Err(SessionError::InvalidInput)
-        ));
-        assert!(matches!(
-            SessionObservation::new(initial.clone(), MAX_EVENT_CAPACITY + 1),
-            Err(SessionError::InvalidInput)
-        ));
-        assert!(matches!(
-            SessionObservation::new(initial.clone(), usize::MAX),
-            Err(SessionError::InvalidInput)
-        ));
-        let exact_capacity = SessionObservation::new(initial.clone(), MAX_EVENT_CAPACITY).unwrap();
-        drop(exact_capacity);
-        let observation = SessionObservation::new(initial.clone(), 4).unwrap();
-        for event in [
-            SessionEvent::Snapshot(initial.clone()),
-            SessionEvent::ResyncRequired,
-            SessionEvent::Closed,
-        ] {
-            assert!(matches!(
-                observation.publish(initial.clone(), Some(event)),
-                Err(SessionError::InvalidInput)
-            ));
+    fn event(value: u8) -> SessionEvent {
+        SessionEvent::ModelStarted {
+            turn_id: format!("trn_{value:032}").parse::<TurnId>().unwrap(),
+            round: value.into(),
         }
-        let mut stream = observation.subscribe().unwrap();
-        assert_eq!(stream.recv().await, Some(SessionEvent::Snapshot(initial)));
-        let turn_id = TurnId::new().unwrap();
-        let running = snapshot(session_id, 1, SessionStatus::Running { turn_id });
-        observation
-            .publish(running.clone(), Some(SessionEvent::TurnStarted { turn_id }))
-            .unwrap();
-        assert_eq!(
-            stream.recv().await,
-            Some(SessionEvent::TurnStarted { turn_id })
-        );
-        assert_eq!(stream.snapshot(), running);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn subscribe_after_publish_captures_latest_snapshot_without_replaying_event() {
-        let session_id = SessionId::new().unwrap();
-        let initial = snapshot(session_id, 0, SessionStatus::Idle);
-        let observation = SessionObservation::new(initial, 4).unwrap();
-        let turn_id = TurnId::new().unwrap();
-        let running = snapshot(session_id, 1, SessionStatus::Running { turn_id });
-        observation
-            .publish(running.clone(), Some(SessionEvent::TurnStarted { turn_id }))
-            .unwrap();
-        let mut stream = observation.subscribe().unwrap();
-        assert_eq!(
-            stream.recv().await,
-            Some(SessionEvent::Snapshot(running.clone()))
-        );
-        assert_eq!(observation.snapshot(), running);
-        drop(observation);
-        assert_eq!(stream.recv().await, Some(SessionEvent::Closed));
-        assert_eq!(stream.recv().await, None);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn lag_returns_resync_then_continues_and_snapshot_recovers_latest_state() {
-        let session_id = SessionId::new().unwrap();
-        let initial = snapshot(session_id, 0, SessionStatus::Idle);
-        let observation = SessionObservation::new(initial, 2).unwrap();
-        let mut stream = observation.subscribe().unwrap();
+    #[test]
+    fn channel_capacity_is_checked_and_stream_is_truly_bounded() {
+        let (session_id, instance_id) = ids();
         assert!(matches!(
-            stream.recv().await,
-            Some(SessionEvent::Snapshot(_))
+            InternalEventSink::channel(session_id, instance_id, 0),
+            Err(InternalEventSinkError::InvalidCapacity)
         ));
-        let first_turn = TurnId::new().unwrap();
-        let first = snapshot(
-            session_id,
-            1,
-            SessionStatus::Running {
-                turn_id: first_turn,
-            },
-        );
-        observation
-            .publish(
-                first,
-                Some(SessionEvent::TurnStarted {
-                    turn_id: first_turn,
-                }),
-            )
-            .unwrap();
-        let second = snapshot(
-            session_id,
-            2,
-            SessionStatus::Running {
-                turn_id: first_turn,
-            },
-        );
-        observation
-            .publish(
-                second.clone(),
-                Some(SessionEvent::TextDelta {
-                    turn_id: first_turn,
-                    delta: "e2".to_owned(),
-                }),
-            )
-            .unwrap();
-        let third = snapshot(
-            session_id,
-            3,
-            SessionStatus::Running {
-                turn_id: first_turn,
-            },
-        );
-        observation
-            .publish(
-                third.clone(),
-                Some(SessionEvent::ReasoningDelta {
-                    turn_id: first_turn,
-                    delta: "e3".to_owned(),
-                }),
-            )
-            .unwrap();
-        assert_eq!(stream.recv().await, Some(SessionEvent::ResyncRequired));
-        assert_eq!(
-            stream.recv().await,
-            Some(SessionEvent::Snapshot(third.clone()))
-        );
-        assert_eq!(stream.snapshot(), third);
-        let fourth = snapshot(
-            session_id,
-            4,
-            SessionStatus::Running {
-                turn_id: first_turn,
-            },
-        );
-        observation
-            .publish(
-                fourth.clone(),
-                Some(SessionEvent::TextDelta {
-                    turn_id: first_turn,
-                    delta: "e4".to_owned(),
-                }),
-            )
-            .unwrap();
-        assert_eq!(
-            stream.recv().await,
-            Some(SessionEvent::TextDelta {
-                turn_id: first_turn,
-                delta: "e4".to_owned(),
-            })
-        );
-        assert_eq!(stream.snapshot(), fourth);
+        assert!(matches!(
+            InternalEventSink::channel(session_id, instance_id, MAX_EVENT_CAPACITY + 1),
+            Err(InternalEventSinkError::InvalidCapacity)
+        ));
+        let (mut sink, mut stream) =
+            InternalEventSink::channel(session_id, instance_id, 1).unwrap();
+        assert_eq!(sink.try_emit(event(1)), Ok(()));
+        assert_eq!(sink.try_emit(event(2)), Ok(()));
+        assert_eq!(sink.dropped, 1);
+        assert!(matches!(
+            stream.try_recv().unwrap().event,
+            SessionEvent::ModelStarted { round: 1, .. }
+        ));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn close_delivers_closed_once_then_eof_and_rejects_future_publish() {
-        let session_id = SessionId::new().unwrap();
-        let initial = snapshot(session_id, 0, SessionStatus::Idle);
-        let observation = SessionObservation::new(initial, 4).unwrap();
-        assert!(matches!(
-            observation.close(snapshot(session_id, 1, SessionStatus::Idle)),
-            Err(SessionError::InvalidInput)
-        ));
-        let mut stream = observation.subscribe().unwrap();
-        assert!(matches!(
-            stream.recv().await,
-            Some(SessionEvent::Snapshot(_))
-        ));
-        let closing = snapshot(session_id, 1, SessionStatus::Closing);
-        observation.close(closing.clone()).unwrap();
-        assert_eq!(stream.snapshot(), closing);
-        assert_eq!(stream.recv().await, Some(SessionEvent::Closed));
-        assert_eq!(stream.recv().await, None);
-        assert_eq!(
-            observation.close(closing.clone()),
-            Err(SessionError::Closing)
-        );
-        assert_eq!(
-            observation.publish_snapshot(closing),
-            Err(SessionError::Closing)
-        );
+    #[test]
+    fn full_marker_attempt_accumulates_then_precedes_the_next_ordinary_event() {
+        let (session_id, instance_id) = ids();
+        let (mut sink, mut stream) =
+            InternalEventSink::channel(session_id, instance_id, 2).unwrap();
+        sink.try_emit(event(1)).unwrap();
+        sink.try_emit(event(2)).unwrap();
+        sink.try_emit(event(3)).unwrap();
+        assert_eq!(sink.dropped, 1);
+
+        sink.try_emit(event(4)).unwrap();
+        assert_eq!(sink.dropped, 2);
+
+        let first = stream.try_recv().unwrap();
+        assert_eq!(first.session_id, session_id);
+        assert_eq!(first.instance_id, instance_id);
+        assert_eq!(first.event, event(1));
+        let second = stream.try_recv().unwrap();
+        assert_eq!(second.session_id, session_id);
+        assert_eq!(second.instance_id, instance_id);
+        assert_eq!(second.event, event(2));
+
+        sink.try_emit(event(5)).unwrap();
+        let marker = stream.try_recv().unwrap();
+        assert_eq!(marker.session_id, session_id);
+        assert_eq!(marker.instance_id, instance_id);
+        assert_eq!(marker.event, SessionEvent::EventsDropped { count: 2 });
+        let ordinary = stream.try_recv().unwrap();
+        assert_eq!(ordinary.session_id, session_id);
+        assert_eq!(ordinary.instance_id, instance_id);
+        assert_eq!(ordinary.event, event(5));
+        assert_eq!(sink.dropped, 0);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn dropped_owner_closes_stream_without_a_closed_event() {
-        let session_id = SessionId::new().unwrap();
-        let initial = snapshot(session_id, 0, SessionStatus::Idle);
-        let observation = SessionObservation::new(initial, 4).unwrap();
-        let mut stream = observation.subscribe().unwrap();
-        assert!(matches!(
-            stream.recv().await,
-            Some(SessionEvent::Snapshot(_))
-        ));
-        drop(observation);
-        assert_eq!(stream.recv().await, Some(SessionEvent::Closed));
-        assert_eq!(stream.recv().await, None);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn multiple_subscribers_each_receive_their_own_first_snapshot_and_event() {
-        let session_id = SessionId::new().unwrap();
-        let initial = snapshot(session_id, 0, SessionStatus::Idle);
-        let observation = SessionObservation::new(initial.clone(), 4).unwrap();
-        let mut first = observation.subscribe().unwrap();
-        let mut second = observation.subscribe().unwrap();
+    #[test]
+    fn marker_full_drops_current_and_closed_receiver_is_terminal() {
+        let (session_id, instance_id) = ids();
+        let (mut sink, mut stream) =
+            InternalEventSink::channel(session_id, instance_id, 1).unwrap();
+        sink.try_emit(event(1)).unwrap();
+        sink.try_emit(event(2)).unwrap();
+        sink.try_emit(event(3)).unwrap();
+        assert_eq!(sink.dropped, 2);
+        let _ = stream.try_recv().unwrap();
         assert_eq!(
-            first.recv().await,
-            Some(SessionEvent::Snapshot(initial.clone()))
+            sink.try_emit(SessionEvent::EventsDropped { count: 99 }),
+            Err(InternalEventSinkError::MarkerReserved)
         );
-        assert_eq!(second.recv().await, Some(SessionEvent::Snapshot(initial)));
-        let turn_id = TurnId::new().unwrap();
-        let running = snapshot(session_id, 1, SessionStatus::Running { turn_id });
-        observation
-            .publish(running, Some(SessionEvent::TurnStarted { turn_id }))
-            .unwrap();
-        assert_eq!(
-            first.recv().await,
-            Some(SessionEvent::TurnStarted { turn_id })
-        );
-        assert_eq!(
-            second.recv().await,
-            Some(SessionEvent::TurnStarted { turn_id })
-        );
+        drop(stream);
+        assert_eq!(sink.try_emit(event(4)), Err(InternalEventSinkError::Closed));
+        assert_eq!(sink.try_emit(event(5)), Err(InternalEventSinkError::Closed));
+        assert_eq!(sink.dropped, 2);
     }
 }

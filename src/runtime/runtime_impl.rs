@@ -13,8 +13,8 @@ use crate::error::{RuntimeError, SessionError};
 use crate::ids::{InteractionId, SessionId, TurnId};
 use crate::model::{LegacyModelGateway, LegacyModelSelection, ReasoningPreference};
 use crate::session::actor::{SessionActor, SessionActorDependencies};
-use crate::session::event_stream::SessionEventStream;
-use crate::session::snapshot::SessionSnapshot;
+use crate::session::legacy_event_stream::LegacySessionEventStream;
+use crate::session::legacy_snapshot::LegacySessionSnapshot;
 use crate::session::transcript::TranscriptPage;
 use crate::storage::conversation::{ConversationError, ConversationLog};
 use crate::storage::store::{SessionStore, StoreError, StoredSessionConfig};
@@ -208,11 +208,14 @@ impl Runtime {
         self.loaded(id)?.handle.cancel()
     }
 
-    pub(crate) fn snapshot(&self, id: SessionId) -> Result<SessionSnapshot, SessionError> {
+    pub(crate) fn snapshot(&self, id: SessionId) -> Result<LegacySessionSnapshot, SessionError> {
         Ok(self.loaded(id)?.handle.snapshot())
     }
 
-    pub(crate) fn subscribe(&self, id: SessionId) -> Result<SessionEventStream, SessionError> {
+    pub(crate) fn subscribe(
+        &self,
+        id: SessionId,
+    ) -> Result<LegacySessionEventStream, SessionError> {
         self.loaded(id)?.handle.subscribe()
     }
 
