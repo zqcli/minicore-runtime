@@ -3,7 +3,7 @@
 > P4-B checkpoint of the breaking v0.3 single-session runtime refactor. The
 > multi-session Runtime has been deleted. `SessionRuntime` now owns create/load,
 > durable log lifetime, root cancellation, events, and deterministic shutdown;
-> final SessionHandle/commands and turn execution remain P4-C/P5 work.
+> final SessionHandle/commands and actor-owned durable settlement remain P4-C work.
 
 ## Checkpoint
 
@@ -20,8 +20,8 @@ The crate is Rust 2024 with Rust 1.85 as its MSRV. Concrete storage acquisition,
 - `model::driver`: private P5-A execution module binding one direct Model, a checked Kernel-derived timeout/retry/semantic snapshot, strict stream assembly, and best-effort delta progress; no session/log/tool-execution authority.
 - `agent::tool_driver` and `agent::runner_protocol`: private P5-B execution modules owning frozen-spec policy evaluation, typed approval/input suspension, panic-safe Tool execution, child cancellation, output bounds, and lossy progress. They never append, spawn, or own SessionRuntime/log authority.
 - `context::driver` and `prompt::builder`: private P5-C modules owning one-provider context deadlines/panic isolation, canonical context bundles, consumption of conversation-owned prompt proofs, deterministic mapping, stable context headers, exact frozen tools, and exact serialized-request output-reserved budgeting. They invoke no model, tool, log, workspace, or owner.
-- `compaction::driver`: private P5-D module binding zero or one CompactionStrategy, a checked timeout/summary snapshot, completed-boundary-only proposal validation, scoped child cancellation, and a stale-head proof. It has no conversation mutation, log, model, tool, context, workspace, or owner authority.
-- `agent::runner`, `agent::turn_context`, and `agent::runner_protocol`: private P5-E1 ordinary Turn execution. They bind durable effective rounds, accept exact prefix-extending acknowledgements, consume detailed Context/Model deadline provenance, distinguish Core Turn deadlines from configured/adapter port timeouts without post-error clock inference, order ToolStarted before suspension, and retain conservative usage in every outcome and Join fallback. They never append or own a log/runtime/workspace; compaction is intentionally absent until P5-E2.
+- `compaction::driver`: private P5-D/P5-E2 module binding zero or one CompactionStrategy, a checked timeout/summary snapshot, cancellation/deadline-first preflight plus an identical post-candidate control check before boundary/strategy availability, completed-boundary-only proposal validation, scoped child cancellation, exact Turn/Port deadline provenance, and a stale-head proof. It has no conversation mutation, log, model, tool, context, workspace, or owner authority.
+- `agent::runner`, `agent::turn_context`, and `agent::runner_protocol`: private P5-E1/P5-E2 Turn execution. They bind durable effective rounds, accept exact prefix-extending acknowledgements, apply cancellation-first Turn control before compaction availability/overflow decisions and after Context success, distinguish Core Turn deadlines from configured/adapter port timeouts without post-error provenance inference, run proactive best-effort and forced one-shot compaction, emit stale-head Summary commit requests, preserve ordinary critical commit diagnostics, rebuild Context/Prompt after acknowledgement, order ToolStarted before suspension, and retain conservative usage in every outcome and Join fallback. They never append or own a log/runtime/workspace.
 - `workspace`, the old filesystem store, legacy prompt compaction, and the legacy agent/actor/model/tool observation graph: `cfg(test)` migration evidence only; none is present in the production library graph or owned by SessionRuntime.
 
 The public root exposes `compaction`, `config`, `context`, `conversation`, `error`, `ids`, `model`, `session`, `storage`, `tools`, and `value`. There is no top-level `runtime` module, multi-session manager, loaded-session map, repository, or shutdown-all owner.
@@ -78,7 +78,7 @@ Model descriptor access, SessionLog future construction and polling, and the pos
 
 ## Deferred Work
 
-P4-C will replace the private legacy actor/command scaffolding with the final cloneable SessionHandle, state watch access, bounded submit/answer commands, and transcript routing. P5-A through P5-E1 now provide independently tested ModelDriver, ToolDriver/suspension, ContextDriver/PromptBuilder, CompactionDriver/candidate proof, and the ordinary no-compaction TurnRunner. P5-E2 will add compaction integration and stale-head-checked Summary commits through the future actor. The current SessionRuntime owner remains deliberately idle.
+P4-C will replace the private legacy actor/command scaffolding with the final cloneable SessionHandle, state watch access, bounded submit/answer commands, transcript routing, actor-owned Summary append, and durable terminal settlement. P5-A through P5-E2 now provide independently tested drivers, canonical prompt/compaction proofs, ordinary execution, proactive and forced compaction, and the exact stale-head Summary commit protocol. The current SessionRuntime owner remains deliberately idle.
 
 ## Verification
 

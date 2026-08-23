@@ -33,7 +33,7 @@ const _: () = {
 pub(crate) use load::{LoadCompatibilityValidated, close_unopened_log};
 pub(crate) use log::{
     AssistantMessageDraft, ConversationCloseOutcome, ConversationCommitError,
-    ConversationCommitErrorKind, ConversationLog, TimestampSource, ToolResultDraft,
+    ConversationCommitErrorKind, ConversationLog, SummaryDraft, TimestampSource, ToolResultDraft,
 };
 pub(crate) use view::PromptConversationProjection;
 

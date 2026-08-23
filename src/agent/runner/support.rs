@@ -2,7 +2,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant as TokioInstant;
 
 use crate::conversation::{
-    AssistantMessageDraft, ConversationEntry, ConversationSeq, ConversationView, ToolResultDraft,
+    AssistantMessageDraft, ConversationEntry, ConversationSeq, ConversationView, SummaryDraft,
+    ToolResultDraft,
 };
 use crate::model::{AssistantPart, ModelDriverProgress, ModelResponse, Usage};
 use crate::value::BoundedText;
@@ -109,6 +110,24 @@ pub(super) async fn commit_tool_result(
     await_commit(context, receiver).await
 }
 
+pub(super) async fn commit_summary(
+    context: &TurnRunnerContext,
+    snapshot_head: ConversationSeq,
+    draft: SummaryDraft,
+) -> Result<CommitAck, CriticalFailure> {
+    let (reply, receiver) = oneshot::channel();
+    send_critical_for_context(
+        context,
+        RunnerEvent::CommitSummary {
+            snapshot_head,
+            draft,
+            reply,
+        },
+    )
+    .await?;
+    await_commit(context, receiver).await
+}
+
 async fn await_commit(
     context: &TurnRunnerContext,
     mut receiver: oneshot::Receiver<Result<CommitAck, RunnerCommitError>>,
@@ -169,6 +188,41 @@ pub(super) fn validate_tool_ack(
                 && entry.tool_name == draft.tool_name
                 && entry.outcome == draft.outcome
                 && entry.content == draft.content =>
+        {
+            Ok(acknowledgement.conversation)
+        }
+        _ => Err(CriticalFailure::InvalidAck),
+    }
+}
+
+pub(super) fn validate_summary_ack(
+    context: &TurnRunnerContext,
+    snapshot_head: ConversationSeq,
+    draft: &SummaryDraft,
+    acknowledgement: CommitAck,
+) -> Result<ConversationView, CriticalFailure> {
+    if context.conversation.head() != snapshot_head {
+        return Err(CriticalFailure::InvalidAck);
+    }
+    validate_ack_shape(context, snapshot_head, &acknowledgement)?;
+    let before = context
+        .conversation
+        .validated_prompt_projection(&context.spec, &context.limits)
+        .map_err(|_| CriticalFailure::InvalidAck)?;
+    let after = acknowledgement
+        .conversation
+        .validated_prompt_projection(&context.spec, &context.limits)
+        .map_err(|_| CriticalFailure::InvalidAck)?;
+    if before.active_turn_id() != after.active_turn_id()
+        || before.active_turn_execution() != after.active_turn_execution()
+    {
+        return Err(CriticalFailure::InvalidAck);
+    }
+    match acknowledgement.conversation.entries().last() {
+        Some(ConversationEntry::Summary(entry))
+            if entry.seq == acknowledgement.head
+                && entry.through == draft.through
+                && entry.summary == draft.summary =>
         {
             Ok(acknowledgement.conversation)
         }

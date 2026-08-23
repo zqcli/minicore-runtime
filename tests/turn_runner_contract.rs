@@ -19,17 +19,20 @@ fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
     }
 
     let runner = include_str!("../src/agent/runner.rs");
+    let compaction = include_str!("../src/agent/runner/compaction.rs");
     let support = include_str!("../src/agent/runner/support.rs");
     let diagnostics = include_str!("../src/agent/runner/diagnostics.rs");
     let context = include_str!("../src/agent/turn_context.rs");
     let protocol = include_str!("../src/agent/runner_protocol.rs");
-    let production = format!("{runner}\n{support}\n{diagnostics}\n{context}\n{protocol}");
+    let production =
+        format!("{runner}\n{compaction}\n{support}\n{diagnostics}\n{context}\n{protocol}");
     let compact_production = compact(&production);
     for required in [
         "pub(crate) async fn run_turn(",
         "async fn run_ordinary_loop(",
         "RunnerEvent::CommitAssistant",
         "RunnerEvent::CommitToolResult",
+        "RunnerEvent::CommitSummary",
         "RunnerEvent::Suspend { suspension }",
         "UsageAccumulator",
     ] {
@@ -45,6 +48,9 @@ fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
         ".provide_detailed(ContextRequest{",
         "letrun=context.model.run_detailed(",
         "letrun=context.tools.run(",
+        "prepare_model_request(",
+        ".run_detailed(",
+        "estimated_fixed_input_tokens(",
         "context.conversation=conversation;",
         "ToolInvocation::new(",
         "try_send(event)",
@@ -82,9 +88,8 @@ fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
             "turn runner contains {forbidden}"
         );
     }
-    assert!(!production.contains("CompactionDriver"));
-    assert!(!protocol.contains("CommitSummary"));
-    for source in [runner, support, diagnostics, context, protocol] {
+    assert!(production.contains("CompactionDriver"));
+    for source in [runner, compaction, support, diagnostics, context, protocol] {
         assert!(source.lines().count() < 500);
     }
     let immediate = support.find("control.sender.try_send(event)").unwrap();
@@ -94,6 +99,7 @@ fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
         "previous_head != context.conversation.head()",
         "checked_add(1)",
         "replacement_entries.get(..current_entries.len()) != Some(current_entries)",
+        "before.active_turn_execution() != after.active_turn_execution()",
     ] {
         assert!(
             support.contains(required),
@@ -134,6 +140,10 @@ fn runner_protocol_has_exact_critical_ack_outcome_and_progress_roles() {
         ),
         concat!(
             "CommitToolResult{draft:ToolResultDraft,",
+            "reply:oneshot::Sender<Result<CommitAck,RunnerCommitError>>,}"
+        ),
+        concat!(
+            "CommitSummary{snapshot_head:ConversationSeq,draft:SummaryDraft,",
             "reply:oneshot::Sender<Result<CommitAck,RunnerCommitError>>,}"
         ),
         "Suspend{suspension:TurnSuspension,}",
@@ -181,6 +191,68 @@ fn runner_protocol_has_exact_critical_ack_outcome_and_progress_roles() {
 }
 
 #[test]
+fn summary_commit_is_stale_head_checked_redacted_and_actor_owned() {
+    let protocol = include_str!("../src/agent/runner_protocol.rs");
+    let runner_compaction = include_str!("../src/agent/runner/compaction.rs");
+    let support = include_str!("../src/agent/runner/support.rs");
+    let actor_evidence = include_str!("../src/agent/runner/tests/compaction_support.rs");
+    for required in [
+        "let snapshot_head = proposal.snapshot_head();",
+        "context.conversation.head() != snapshot_head",
+        "commit_summary(context, snapshot_head, draft.clone())",
+        "validate_summary_ack(",
+        "critical_failure(error, usage)",
+        "pub(super) fn turn_control_outcome(",
+        "context.cancellation.is_cancelled()",
+        "TokioInstant::now() >= TokioInstant::from_std(context.deadline)",
+    ] {
+        assert!(
+            runner_compaction.contains(required),
+            "summary orchestration misses {required}"
+        );
+    }
+    assert!(!runner_compaction.contains("fn commit_failure("));
+    assert!(
+        runner_compaction
+            .matches("turn_control_outcome(context, usage)")
+            .count()
+            >= 10
+    );
+    for required in [
+        "RunnerEvent::CommitSummary {",
+        "snapshot_head,",
+        ".field(\"through\", &draft.through)",
+        ".field(\"summary_bytes\", &draft.summary.byte_len())",
+        "RunnerEvent::CommitSummary { reply, .. } => Some(reply)",
+    ] {
+        assert!(
+            protocol.contains(required),
+            "summary protocol misses {required}"
+        );
+    }
+    let debug = &protocol[protocol.find("Self::CommitSummary").unwrap()..];
+    let debug = &debug[..debug.find("Self::Suspend").unwrap()];
+    assert!(!debug.contains(".field(\"draft\""));
+    assert!(!debug.contains("draft.summary.as_str()"));
+    for required in [
+        "replacement_entries.get(..current_entries.len()) != Some(current_entries)",
+        "before.active_turn_id() != after.active_turn_id()",
+        "before.active_turn_execution() != after.active_turn_execution()",
+        "Some(ConversationEntry::Summary(entry))",
+        "entry.through == draft.through",
+        "entry.summary == draft.summary",
+    ] {
+        assert!(support.contains(required), "summary ack misses {required}");
+    }
+    let stale = actor_evidence
+        .find("if conversation.head() != snapshot_head")
+        .unwrap();
+    let append = actor_evidence.find("entries.push(").unwrap();
+    assert!(stale < append);
+    assert!(actor_evidence.contains("return Err(RunnerCommitError::Stale)"));
+}
+
+#[test]
 fn request_context_validates_full_turn_configuration_without_owner_authority() {
     let runner = include_str!("../src/agent/runner.rs");
     let context = include_str!("../src/agent/turn_context.rs");
@@ -217,6 +289,8 @@ fn request_context_validates_full_turn_configuration_without_owner_authority() {
         "ContextDriver::new(",
         "ModelDriver::new(",
         "ToolDriver::new(",
+        "CompactionDriver::new(",
+        "request.kernel.context_timeout",
     ] {
         assert!(
             compact_context.contains(required),
@@ -232,15 +306,19 @@ fn request_context_validates_full_turn_configuration_without_owner_authority() {
 #[test]
 fn detailed_deadline_provenance_is_wired_without_clock_inference() {
     let runner = include_str!("../src/agent/runner.rs");
+    let runner_compaction = include_str!("../src/agent/runner/compaction.rs");
     let diagnostics = include_str!("../src/agent/runner/diagnostics.rs");
     let context = include_str!("../src/context/driver.rs");
     let model = include_str!("../src/model/driver.rs");
-    let combined = format!("{runner}\n{diagnostics}\n{context}\n{model}");
+    let compaction = include_str!("../src/compaction/driver.rs");
+    let combined =
+        format!("{runner}\n{runner_compaction}\n{diagnostics}\n{context}\n{model}\n{compaction}");
     for required in [
         ".provide_detailed(ContextRequest {",
         "context.model.run_detailed(",
         "ContextDriverFailure",
         "ModelDriverFailure",
+        "CompactionDriverFailure",
         "Some(DeadlineSource::Turn)",
     ] {
         assert!(
@@ -261,6 +339,12 @@ fn reviewer_regressions_have_deterministic_private_evidence() {
     let panic_support = include_str!("../src/agent/runner/tests/panic_support.rs");
     let interactions = include_str!("../src/agent/runner/tests/interactions.rs");
     let usage = include_str!("../src/agent/runner/tests/usage_errors.rs");
+    let compaction = include_str!("../src/agent/runner/tests/compaction.rs");
+    let compaction_usage = include_str!("../src/agent/runner/tests/compaction/usage.rs");
+    let compaction_ack = include_str!("../src/agent/runner/tests/compaction_acknowledgements.rs");
+    let compaction_control = include_str!("../src/agent/runner/tests/compaction_control.rs");
+    let compaction_priority =
+        include_str!("../src/agent/runner/tests/compaction_control/priority.rs");
     for required in [
         "assistant_ack_cannot_replace_an_earlier_canonical_user_entry",
         "tool_ack_cannot_replace_an_earlier_canonical_assistant_entry",
@@ -304,6 +388,45 @@ fn reviewer_regressions_have_deterministic_private_evidence() {
         "configured_tool_timeout_commits_failed_result_and_continues",
     ] {
         assert!(deadlines.contains(required));
+    }
+    for required in [
+        "proactive_compaction_commits_before_context_and_model_use_the_new_view",
+        "forced_final_build_overflow_commits_then_retries_the_same_model_round",
+        "forced_retry_overflow_fails_without_a_second_strategy_call_or_loop",
+        "proactive_trigger_equality_and_same_head_suppression_are_exact",
+    ] {
+        assert!(compaction.contains(required));
+    }
+    for required in [
+        "stale_summary_snapshot_is_rejected_before_actor_append",
+        "summary_ack_cannot_replace_an_earlier_canonical_entry",
+        "summary_ack_must_end_with_the_exact_committed_summary",
+        "every_summary_commit_error_uses_the_existing_critical_taxonomy",
+    ] {
+        assert!(compaction_ack.contains(required));
+    }
+    for required in [
+        "forced_compaction_turn_deadline_is_budget_exceeded",
+        "forced_compaction_configured_timeout_is_a_compaction_failure",
+        "full_summary_send_is_cancellable_without_a_delayed_commit",
+        "deadline_while_waiting_for_summary_ack_has_no_model_continuation",
+        "proactive_configured_timeout_is_skipped_and_model_continues",
+        "proactive_parent_cancellation_is_terminal_without_model_continuation",
+        "proactive_turn_deadline_is_terminal_without_model_continuation",
+    ] {
+        assert!(compaction_control.contains(required));
+    }
+    for required in [
+        "provider_cancellation_after_success_wins_forced_overflow_interpretation",
+        "expired_turn_after_context_success_wins_without_strategy_or_boundary",
+    ] {
+        assert!(compaction_priority.contains(required));
+    }
+    for required in [
+        "proactive_commit_failure_after_model_usage_preserves_usage",
+        "forced_failure_after_model_usage_preserves_usage",
+    ] {
+        assert!(compaction_usage.contains(required));
     }
     for source in [acknowledgements, deadlines, request, panic, panic_support] {
         assert!(source.lines().count() < 500);

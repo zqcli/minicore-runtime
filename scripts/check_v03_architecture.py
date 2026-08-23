@@ -39,7 +39,7 @@ CANONICAL_PRODUCTION_FILES = {
     "src/tools": {"mod.rs", "tool.rs", "set.rs", "context.rs", "input.rs", "policy.rs", "progress.rs", "types.rs"},
 }
 CANONICAL_PRODUCTION_DIRECTORIES = {
-    "src/agent/runner": {"diagnostics.rs", "support.rs"},
+    "src/agent/runner": {"compaction.rs", "diagnostics.rs", "support.rs"},
     "src/agent/tool_driver": {"support.rs"},
     "src/compaction/driver": set(),
     "src/model/driver": {"assembler.rs", "failure.rs"},
@@ -116,7 +116,8 @@ PORT_FILES = {
 }
 REQUIRED_FILES = {
     "src/lib.rs", "src/config.rs", "src/error.rs", "src/error/operations.rs", "src/ids.rs", "src/value.rs", "src/time.rs",
-    "src/agent/mod.rs", "src/agent/runner.rs", "src/agent/runner/diagnostics.rs",
+    "src/agent/mod.rs", "src/agent/runner.rs", "src/agent/runner/compaction.rs",
+    "src/agent/runner/diagnostics.rs",
     "src/agent/runner/support.rs", "src/agent/runner_protocol.rs", "src/agent/tool_driver.rs",
     "src/agent/tool_driver/support.rs", "src/agent/turn_context.rs",
     "src/prompt/mod.rs", "src/prompt/builder.rs",

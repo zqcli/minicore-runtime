@@ -6,7 +6,8 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{KernelConfig, SemanticLimits, SessionSpec};
+use crate::compaction::CompactionDriver;
+use crate::config::{CompactionConfig, KernelConfig, SemanticLimits, SessionSpec};
 use crate::context::{ContextDriver, ContextError};
 use crate::conversation::ConversationView;
 use crate::ids::{SessionId, SessionInstanceId, TurnId};
@@ -166,8 +167,15 @@ pub(super) struct TurnRunnerContext {
     pub(super) limits: SemanticLimits,
     pub(super) prompt: PromptBuilder,
     pub(super) context: ContextDriver,
+    pub(super) compaction: Option<TurnCompaction>,
     pub(super) model: ModelDriver,
     pub(super) tools: ToolDriver,
+}
+
+pub(super) struct TurnCompaction {
+    pub(super) driver: CompactionDriver,
+    pub(super) trigger_tokens: u64,
+    pub(super) target_tokens: u64,
 }
 
 impl TurnRunnerContext {
@@ -185,6 +193,24 @@ impl TurnRunnerContext {
             request.kernel.limits.clone(),
         )
         .map_err(map_context_error)?;
+        let compaction = match &request.spec.compaction {
+            CompactionConfig::Disabled => None,
+            CompactionConfig::Enabled {
+                trigger_tokens,
+                target_tokens,
+            } => Some(TurnCompaction {
+                // Compaction is external context shaping, so it shares the explicit Context
+                // adapter timeout while still being capped by the absolute Turn deadline.
+                driver: CompactionDriver::new(
+                    request.bindings.compaction.clone(),
+                    request.kernel.context_timeout,
+                    request.kernel.limits.clone(),
+                )
+                .map_err(map_compaction_error)?,
+                trigger_tokens: *trigger_tokens,
+                target_tokens: *target_tokens,
+            }),
+        };
         let model = ModelDriver::new(
             request.bindings.model.clone(),
             ModelDriverConfig::from_kernel_values(
@@ -229,6 +255,7 @@ impl TurnRunnerContext {
             limits: request.kernel.limits,
             prompt,
             context,
+            compaction,
             model,
             tools,
         })
@@ -293,6 +320,10 @@ fn map_prompt_error(_error: PromptError) -> TurnRunnerRequestError {
 }
 
 fn map_context_error(_error: ContextError) -> TurnRunnerRequestError {
+    TurnRunnerRequestError::Configuration
+}
+
+fn map_compaction_error(_error: crate::compaction::CompactionError) -> TurnRunnerRequestError {
     TurnRunnerRequestError::Configuration
 }
 

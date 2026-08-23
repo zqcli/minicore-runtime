@@ -17,8 +17,7 @@ pub(super) fn request_failure(error: TurnRunnerRequestError) -> RunnerOutcome {
             false,
             Usage::default(),
         ),
-        TurnRunnerRequestError::Bindings
-        | TurnRunnerRequestError::ModelDescriptor => failed(
+        TurnRunnerRequestError::Bindings | TurnRunnerRequestError::ModelDescriptor => failed(
             DiagnosticCode::ModelMismatch,
             DiagnosticCategory::Configuration,
             "turn runner bindings are invalid",
@@ -75,6 +74,16 @@ pub(super) fn prompt_failure(error: PromptError, usage: Usage) -> RunnerOutcome 
         ),
         _ => internal_failure("turn prompt construction failed", usage),
     }
+}
+
+pub(super) fn compaction_failure(usage: Usage) -> RunnerOutcome {
+    failed(
+        DiagnosticCode::ContextFailed,
+        DiagnosticCategory::Compaction,
+        "turn compaction failed",
+        false,
+        usage,
+    )
 }
 
 pub(super) fn model_failure(failure: ModelDriverFailure, usage: Usage) -> RunnerOutcome {

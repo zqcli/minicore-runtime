@@ -4,7 +4,7 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 
 use crate::conversation::{
-    AssistantMessageDraft, ConversationSeq, ConversationView, ToolResultDraft,
+    AssistantMessageDraft, ConversationSeq, ConversationView, SummaryDraft, ToolResultDraft,
 };
 use crate::error::DiagnosticSummary;
 use crate::ids::{ToolCallId, TurnId};
@@ -122,6 +122,11 @@ pub(crate) enum RunnerEvent {
         draft: ToolResultDraft,
         reply: oneshot::Sender<Result<CommitAck, RunnerCommitError>>,
     },
+    CommitSummary {
+        snapshot_head: ConversationSeq,
+        draft: SummaryDraft,
+        reply: oneshot::Sender<Result<CommitAck, RunnerCommitError>>,
+    },
     Suspend {
         suspension: TurnSuspension,
     },
@@ -135,7 +140,8 @@ pub(crate) fn take_commit_reply_for_actor(
 ) -> Option<oneshot::Sender<Result<CommitAck, RunnerCommitError>>> {
     match event {
         RunnerEvent::CommitAssistant { reply, .. }
-        | RunnerEvent::CommitToolResult { reply, .. } => Some(reply),
+        | RunnerEvent::CommitToolResult { reply, .. }
+        | RunnerEvent::CommitSummary { reply, .. } => Some(reply),
         RunnerEvent::Suspend { .. } | RunnerEvent::Finish { .. } => None,
     }
 }
@@ -150,6 +156,16 @@ impl fmt::Debug for RunnerEvent {
             Self::CommitToolResult { draft, .. } => formatter
                 .debug_struct("CommitToolResult")
                 .field("draft", draft)
+                .finish_non_exhaustive(),
+            Self::CommitSummary {
+                snapshot_head,
+                draft,
+                ..
+            } => formatter
+                .debug_struct("CommitSummary")
+                .field("snapshot_head", snapshot_head)
+                .field("through", &draft.through)
+                .field("summary_bytes", &draft.summary.byte_len())
                 .finish_non_exhaustive(),
             Self::Suspend { suspension } => formatter
                 .debug_struct("Suspend")

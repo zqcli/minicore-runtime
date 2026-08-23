@@ -4,7 +4,6 @@ use futures_util::FutureExt;
 use tokio::sync::mpsc;
 use tokio::time::Instant as TokioInstant;
 
-use crate::context::ContextRequest;
 use crate::conversation::ToolResultDraft;
 use crate::model::{ModelCallContext, ModelDriverFailure, ModelResponse};
 use crate::tools::ToolInvocation;
@@ -13,12 +12,13 @@ use super::runner_protocol::{RunnerEvent, RunnerOutcome, RunnerProgress, TurnRun
 use super::tool_driver::ToolDriverResult;
 use super::turn_context::{TurnRunnerContext, TurnRunnerRequest, TurnRunnerRequestError};
 
+mod compaction;
 mod diagnostics;
 mod support;
 
+use compaction::{CompactionState, prepare_model_request};
 use diagnostics::{
-    budget_exceeded, context_failure, critical_failure, internal_failure, model_failure,
-    prompt_failure, request_failure,
+    budget_exceeded, critical_failure, internal_failure, model_failure, request_failure,
 };
 use support::{
     CriticalFailure, FinishControl, UsageAccumulator, assistant_draft, commit_assistant,
@@ -62,6 +62,7 @@ async fn run_ordinary_loop(context: &mut TurnRunnerContext) -> RunnerOutcome {
     let mut model_round = 0_u16;
     let mut tool_round = 0_u16;
     let mut usage = UsageAccumulator::default();
+    let mut compaction = CompactionState::default();
     #[cfg(test)]
     if tests::take_scripted_turn_panic(context.turn_id) {
         panic!("scripted turn runner panic after context creation");
@@ -76,37 +77,12 @@ async fn run_ordinary_loop(context: &mut TurnRunnerContext) -> RunnerOutcome {
             return budget_exceeded(usage.current());
         }
 
-        let remaining = match context
-            .prompt
-            .remaining_context_budget(&context.conversation, context.model_limits)
-        {
-            Ok(remaining) => remaining,
-            Err(error) => return prompt_failure(error, usage.current()),
-        };
-        let context_bundle = match context
-            .context
-            .provide_detailed(ContextRequest {
-                session_id: context.session_id,
-                instance_id: context.instance_id,
-                turn_id: context.turn_id,
-                model_round,
-                conversation: context.conversation.clone(),
-                remaining_context_budget: remaining,
-                cancellation: context.cancellation.clone(),
-                deadline: context.deadline,
-            })
-            .await
-        {
-            Ok(bundle) => bundle,
-            Err(error) => return context_failure(error, usage.current()),
-        };
         let request =
-            match context
-                .prompt
-                .build(&context.conversation, &context_bundle, context.model_limits)
+            match prepare_model_request(context, model_round, usage.current(), &mut compaction)
+                .await
             {
                 Ok(request) => request,
-                Err(error) => return prompt_failure(error, usage.current()),
+                Err(outcome) => return outcome,
             };
 
         progress(context, RunnerProgress::ModelStarted { model_round });

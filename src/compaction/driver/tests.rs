@@ -1,8 +1,8 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll};
 
 use tokio::sync::{Barrier, Notify};
@@ -25,7 +25,54 @@ mod cancellation;
 #[cfg(test)]
 mod concurrency;
 #[cfg(test)]
+mod deadline;
+#[cfg(test)]
 mod validation;
+
+#[derive(Clone)]
+pub(super) struct CandidateControlHook {
+    reached: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+impl CandidateControlHook {
+    pub(super) async fn wait_reached(&self) {
+        self.reached.wait().await;
+    }
+
+    pub(super) async fn release(&self) {
+        self.release.wait().await;
+    }
+}
+
+static CANDIDATE_CONTROL_HOOKS: OnceLock<Mutex<BTreeMap<TurnId, CandidateControlHook>>> =
+    OnceLock::new();
+
+pub(super) fn install_candidate_control_hook(turn_id: TurnId) -> CandidateControlHook {
+    let hook = CandidateControlHook {
+        reached: Arc::new(Barrier::new(2)),
+        release: Arc::new(Barrier::new(2)),
+    };
+    assert!(
+        lock(candidate_control_hooks())
+            .insert(turn_id, hook.clone())
+            .is_none(),
+        "candidate control hook already installed for turn"
+    );
+    hook
+}
+
+pub(super) async fn pause_after_candidate(turn_id: TurnId) {
+    let hook = lock(candidate_control_hooks()).remove(&turn_id);
+    if let Some(hook) = hook {
+        hook.reached.wait().await;
+        hook.release.wait().await;
+    }
+}
+
+fn candidate_control_hooks() -> &'static Mutex<BTreeMap<TurnId, CandidateControlHook>> {
+    CANDIDATE_CONTROL_HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
 
 fn timestamp() -> Timestamp {
     "2026-08-19T12:34:56.789Z".parse().unwrap()

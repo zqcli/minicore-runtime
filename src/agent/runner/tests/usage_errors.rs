@@ -344,7 +344,7 @@ impl crate::compaction::CompactionStrategy for UnusedCompaction {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn enabled_compaction_is_accepted_but_not_invoked_on_context_overflow() {
+async fn enabled_compaction_without_boundary_fails_overflow_without_strategy_call() {
     let model = ScriptModel::new(
         1,
         vec![ModelBehavior::Events(final_events(

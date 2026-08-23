@@ -9,6 +9,9 @@ use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::model::{ModelRef, ReasoningPreference, ToolCall, Usage};
 use crate::tools::ToolResultOutcome;
 
+#[cfg(test)]
+mod summary;
+
 fn timestamp() -> crate::config::Timestamp {
     "2026-08-19T12:34:56.789Z".parse().unwrap()
 }
@@ -734,10 +737,6 @@ fn sequence_and_summary_boundaries_are_checked_without_mutating_state() {
     assert_error(
         after_terminal.validate_batch(&[empty_summary]),
         ConversationValidationError::InvalidSummary,
-    );
-    assert_error(
-        after_terminal.validate_batch(&[user(4, turn_id), summary(5, 3)]),
-        ConversationValidationError::SummaryDuringActiveTurn,
     );
     let later_turn = TurnId::new().unwrap();
     let before_summary = after_terminal
