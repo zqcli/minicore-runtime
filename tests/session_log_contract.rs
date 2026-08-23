@@ -1,8 +1,5 @@
 pub mod support;
 
-// P2-A boundary: the legacy storage::conversation actor path remains
-// transitional until P2-C/P6; this Port accepts only conversation module DTOs.
-
 use std::collections::BTreeSet;
 
 use minicore_runtime::config::{CompactionConfig, SessionManifest, SessionSpec, Timestamp};

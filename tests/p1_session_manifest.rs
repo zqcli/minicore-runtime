@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::Instant;
 
+use minicore_runtime::config::ConfigError;
 use minicore_runtime::config::{
     SessionManifest, Timestamp, TimestampError, TurnOptions, UserInput,
 };
@@ -8,7 +9,7 @@ use minicore_runtime::ids::{SessionId, SessionInstanceId};
 use minicore_runtime::model::ReasoningPreference;
 use minicore_runtime::tools::ToolName;
 use minicore_runtime::value::{BoundedText, MAX_TEXT_BYTES};
-use minicore_runtime::{CompactionConfig, ConfigError, SemanticLimits, SessionSpec};
+use minicore_runtime::{CompactionConfig, SemanticLimits, SessionSpec};
 use serde_json::{Value, json};
 
 fn spec() -> SessionSpec {

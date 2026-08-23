@@ -1,10 +1,4 @@
 mod driver;
-#[cfg(test)]
-mod legacy_gateway;
-#[cfg(test)]
-pub(crate) mod legacy_provider;
-#[cfg(test)]
-pub(crate) mod legacy_registry;
 #[path = "model.rs"]
 mod model_port;
 mod response;
@@ -23,15 +17,6 @@ pub use types::{
 
 pub(crate) use driver::{
     ModelDriver, ModelDriverConfig, ModelDriverFailure, ModelDriverProgress, SemanticLimitsSnapshot,
-};
-
-#[cfg(test)]
-pub(crate) use legacy_gateway::LegacyModelGateway;
-#[cfg(test)]
-pub(crate) use legacy_provider::{LegacyModelCallContext, LegacyModelEventSink};
-#[cfg(test)]
-pub(crate) use types::{
-    LegacyModelDescriptor, LegacyModelEvent, LegacyModelId, LegacyModelSelection, LegacyProviderId,
 };
 
 const _: () = {

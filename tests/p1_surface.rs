@@ -10,7 +10,6 @@ fn canonical_modules_keep_only_the_current_root_facade() {
         "pub mod session;",
         "pub mod storage;",
         "pub mod tools;",
-        "mod workspace;",
     ] {
         assert!(
             lib.contains(declaration),
@@ -27,7 +26,8 @@ fn canonical_modules_keep_only_the_current_root_facade() {
     assert!(!lib.contains("pub mod runtime;"));
     assert!(!lib.contains("pub mod workspace;"));
     assert!(!lib.contains("pub use workspace"));
-    assert!(!include_str!("../src/workspace/mod.rs").contains("pub use "));
+    let root_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(!root_dir.join("src/workspace").exists());
     for removed in [
         "RuntimeConfig",
         "RuntimeConfigBuilder",
@@ -55,7 +55,7 @@ fn canonical_modules_keep_only_the_current_root_facade() {
 }
 
 #[test]
-fn model_and_tool_errors_keep_the_public_legacy_split() {
+fn model_and_tool_sources_have_no_legacy_dto_graph() {
     let model = include_str!("../src/model/types.rs");
     let public_model = model
         .split("pub enum ModelMessage")
@@ -76,7 +76,8 @@ fn model_and_tool_errors_keep_the_public_legacy_split() {
     ] {
         assert!(!tool_errors.contains(legacy_variant));
     }
-    assert!(include_str!("../src/tools/legacy_types.rs").contains("enum LegacyToolError"));
+    let root_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(!root_dir.join("src/tools/legacy_types.rs").exists());
 }
 
 #[test]

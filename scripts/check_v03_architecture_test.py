@@ -1,7 +1,10 @@
 """Fixture-based self-tests for check_v03_architecture.py (Python 3.11+)."""
 from __future__ import annotations
 
+import os
 import shutil
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Callable
@@ -84,9 +87,69 @@ def expect_failure(root: Path, needle: str) -> None:
     assert any(needle in error for error in errors), (needle, errors)
 
 
+def check_compatibility_delegate(root: Path) -> None:
+    checkout = root / "delegate-checkout"
+    scripts = checkout / "scripts"
+    scripts.mkdir(parents=True)
+    wrapper = Path(__file__).with_name("check_architecture.py").read_text(encoding="utf-8")
+    (scripts / "check_architecture.py").write_text(wrapper, encoding="utf-8")
+    (scripts / "check_v03_architecture.py").write_text(
+        "def main():\n    print('delegate-main')\n    return 0\n",
+        encoding="utf-8",
+    )
+    outside = root / "delegate-outside"
+    outside.mkdir()
+    import_command = (
+        "import scripts.check_architecture as delegate; "
+        "import scripts.check_v03_architecture as authoritative; "
+        "assert delegate.main is authoritative.main; "
+        "print('delegate-import')"
+    )
+    cases = [
+        (
+            "direct checkout",
+            [sys.executable, "scripts/check_architecture.py"],
+            checkout,
+            "delegate-main",
+        ),
+        (
+            "direct arbitrary cwd",
+            [sys.executable, str((scripts / "check_architecture.py").resolve())],
+            outside,
+            "delegate-main",
+        ),
+        (
+            "package module",
+            [sys.executable, "-m", "scripts.check_architecture"],
+            checkout,
+            "delegate-main",
+        ),
+        (
+            "package import",
+            [sys.executable, "-c", import_command],
+            checkout,
+            "delegate-import",
+        ),
+    ]
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    for name, command, cwd, marker in cases:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, (name, result.stdout, result.stderr)
+        assert marker in result.stdout, (name, result.stdout, result.stderr)
+
+
 def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="minicore-v03-gate-") as directory:
         directory_path = Path(directory)
+        check_compatibility_delegate(directory_path)
         base = directory_path / "good"
         make_fixture(base)
         assert not scan(base), scan(base)
@@ -164,7 +227,7 @@ def self_test() -> None:
             ("policy-port-missing", "typed Port declaration missing or wrong kind", lambda root: (root / "src/tools/policy.rs").write_text("pub(crate) const _POLICY: () = ();\n", encoding="utf-8")),
             ("bindings-role-missing", "typed Port declaration missing or wrong kind", lambda root: (root / "src/bindings.rs").write_text("pub(crate) const _BINDINGS: () = ();\n", encoding="utf-8")),
             ("port-wrong-kind", "typed Port declaration missing or wrong kind", lambda root: (root / "src/tools/tool.rs").write_text("pub struct Tool {}\n", encoding="utf-8")),
-            ("port-test-only", "typed Port declaration missing or wrong kind", lambda root: (root / "src/storage/session_log.rs").write_text("#[cfg(test)]\npub trait SessionLog {}\n", encoding="utf-8")),
+            ("port-test-only", "typed Port declaration missing or wrong kind", lambda root: (root / "src/conversation/session_log.rs").write_text("#[cfg(test)]\npub trait SessionLog {}\n", encoding="utf-8")),
             ("port-comment-string", "typed Port declaration missing or wrong kind", lambda root: (root / "src/model/model.rs").write_text("// pub trait Model {}\nlet x = \"pub trait Model {}\";\n", encoding="utf-8")),
             ("port-session-direction", "Port dependency violation", lambda root: (root / "src/tools/tool.rs").write_text("use crate::session::State;\npub trait Tool {}\n", encoding="utf-8")),
             ("policy-port-session-direction", "Port dependency violation", lambda root: (root / "src/tools/policy.rs").write_text("use crate::session::State;\npub trait ToolPolicy {}\n", encoding="utf-8")),
@@ -172,7 +235,7 @@ def self_test() -> None:
             ("port-signature-direction", "Port dependency violation", lambda root: (root / "src/tools/tool.rs").write_text("pub trait Tool { fn state(&self) -> crate::session::State; }\n", encoding="utf-8")),
             ("port-nested-declaration", "typed Port declaration missing or wrong kind", lambda root: (root / "src/tools/tool.rs").write_text("mod nested { pub trait Tool {} }\n", encoding="utf-8")),
             ("port-agent-direction", "Port dependency violation", lambda root: (root / "src/context/provider.rs").write_text("use crate::agent::Runner;\npub trait ContextProvider {}\n", encoding="utf-8")),
-            ("port-runtime-direction", "Port dependency violation", lambda root: (root / "src/storage/session_log.rs").write_text("use crate::runtime::Inner;\npub trait SessionLog {}\n", encoding="utf-8")),
+            ("port-runtime-direction", "Port dependency violation", lambda root: (root / "src/conversation/session_log.rs").write_text("use crate::runtime::Inner;\npub trait SessionLog {}\n", encoding="utf-8")),
             ("final-legacy-observation", "forbidden production symbol SessionSnapshot", lambda root: (root / "src/session/state.rs").write_text("pub struct SessionState {}\npub struct SessionSnapshot;\n", encoding="utf-8")),
             ("storage-jsonl-dir", "forbidden production storage implementation", lambda root: ((root / "src/storage/jsonl").mkdir(), (root / "src/storage/jsonl/adapter.rs").write_text("", encoding="utf-8"))),
             ("storage-store-dir", "forbidden production storage implementation", lambda root: ((root / "src/storage/store").mkdir(), (root / "src/storage/store/adapter.rs").write_text("", encoding="utf-8"))),
@@ -271,7 +334,7 @@ def self_test() -> None:
         (cfg_directory_modules / "src/storage/storage_fixture/mod.rs").write_text(
             "use std::fs;\npub struct Runtime;\n", encoding="utf-8"
         )
-        assert not scan(cfg_directory_modules), scan(cfg_directory_modules)
+        expect_failure(cfg_directory_modules, "forbidden final source symbol")
 
         for variant in ("file", "directory"):
             root_cfg_modules = directory_path / f"root-cfg-{variant}"
@@ -283,7 +346,7 @@ def self_test() -> None:
             else:
                 (root_cfg_modules / "src/helper").mkdir()
                 (root_cfg_modules / "src/helper/mod.rs").write_text("pub struct Workspace;\n", encoding="utf-8")
-            assert not scan(root_cfg_modules), scan(root_cfg_modules)
+            expect_failure(root_cfg_modules, "forbidden final source symbol")
 
         non_test_module = directory_path / "non-test-module"
         shutil.copytree(base, non_test_module)
@@ -307,21 +370,21 @@ def self_test() -> None:
         shutil.copytree(base, legacy_roles)
         (legacy_roles / "src/model/legacy_gateway.rs").write_text("pub(crate) const _MODEL_GATEWAY: () = ();\n", encoding="utf-8")
         (legacy_roles / "src/tools/registry.rs").write_text("pub(crate) const _REGISTRY: () = ();\n", encoding="utf-8")
-        assert not scan(legacy_roles), scan(legacy_roles)
+        expect_failure(legacy_roles, "forbidden final legacy path")
 
         transitional_policy = directory_path / "transitional-policy"
         shutil.copytree(base, transitional_policy)
         (transitional_policy / "src/tools/legacy_policy.rs").write_text(
             "pub(crate) trait LegacyToolPolicy {}\n", encoding="utf-8"
         )
-        assert not scan(transitional_policy), scan(transitional_policy)
+        expect_failure(transitional_policy, "forbidden final legacy path")
 
         transitional_session = directory_path / "transitional-session"
         shutil.copytree(base, transitional_session)
         (transitional_session / "src/session/legacy_snapshot.rs").write_text(
             "pub(crate) struct SessionSnapshot;\n", encoding="utf-8"
         )
-        assert not scan(transitional_session), scan(transitional_session)
+        expect_failure(transitional_session, "forbidden final legacy path")
 
         grouped = directory_path / "grouped-cycle"
         shutil.copytree(base, grouped)
@@ -372,7 +435,7 @@ def self_test() -> None:
         )
         view, count, _ = production_view(cfg_source.read_text(encoding="utf-8"))
         assert "Runtime" not in view and count == 1, (view, count)
-        assert not scan(cfg), scan(cfg)
+        expect_failure(cfg, "forbidden final source symbol")
         cfg_source.write_text("pub(crate) const _ACTOR: () = ();\n#[cfg(all(feature=\"test\", unix))]\nfn production() { struct Runtime; }\n", encoding="utf-8")
         expect_failure(cfg, "forbidden production symbol Runtime")
         for predicate in ("any(test, windows)", "not(test)", 'feature="test"'):
@@ -381,7 +444,7 @@ def self_test() -> None:
         cfg_source.write_text("pub(crate) const _ACTOR: () = ();\n", encoding="utf-8")
         crate_test_file = cfg / "src/agent/fixture.rs"
         crate_test_file.write_text("#![cfg(all(test, unix))]\npub struct Workspace;\n", encoding="utf-8")
-        assert not scan(cfg), scan(cfg)
+        expect_failure(cfg, "forbidden final source symbol")
         nested_file = cfg / "src/agent/nested.rs"
         nested_file.write_text("mod inner { #![cfg(test)] pub struct Workspace; }\npub struct Runtime;\n", encoding="utf-8")
         expect_failure(cfg, "forbidden production symbol Runtime")

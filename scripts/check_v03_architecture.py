@@ -4,7 +4,7 @@
 This is a purpose-built scanner, not a Rust parser. It uses a small lexer,
 structured cfg(test) predicate/span handling, import expansion, root API
 checking, and Tarjan SCC detection. It requires Python 3.11+ for ``tomllib``.
-The active v0.2 gate remains separate until P7 removes the old production tree.
+This scanner is the authoritative final v0.3 architecture gate.
 """
 from __future__ import annotations
 
@@ -27,6 +27,20 @@ FORBIDDEN_PATHS = {
 FORBIDDEN_ADAPTER_DIRECTORIES = {
     "src/storage/jsonl", "src/storage/store", "src/storage/conversation_jsonl",
 }
+FINAL_ABSENT_PATHS = {
+    "src/agent/legacy.rs", "src/agent/legacy_context.rs", "src/agent/legacy_runner.rs",
+    "src/model/legacy_gateway.rs", "src/model/legacy_provider.rs",
+    "src/model/legacy_registry.rs", "src/prompt/legacy.rs",
+    "src/prompt/legacy_builder.rs", "src/prompt/legacy_compaction.rs",
+    "src/session/legacy_actor.rs", "src/session/legacy_command.rs",
+    "src/session/legacy_event.rs", "src/session/legacy_event_stream.rs",
+    "src/session/legacy_snapshot.rs", "src/session/legacy_state.rs",
+    "src/session/transcript.rs", "src/tools/legacy_context.rs",
+    "src/tools/legacy_policy.rs", "src/tools/legacy_types.rs", "src/tools/registry.rs",
+    "src/workspace", "src/workspace.rs", "src/storage/conversation",
+    "src/storage/conversation.rs", "src/storage/store.rs",
+    "src/storage/compaction_visibility.rs",
+}
 CONCRETE_FILENAMES = {
     "anthropic.rs", "openai.rs", "provider.rs", "providers.rs", "filesystem.rs",
     "process.rs", "builtins.rs",
@@ -44,7 +58,8 @@ CANONICAL_PRODUCTION_DIRECTORIES = {
     "src/compaction/driver": set(),
     "src/model/driver": {"assembler.rs", "failure.rs"},
     "src/session/actor": {
-        "commands.rs", "run.rs", "runner.rs", "settlement.rs", "supervisor.rs",
+        "commands.rs", "lifecycle.rs", "run.rs", "runner.rs", "settlement.rs",
+        "supervisor.rs",
     },
 }
 MODEL_DRIVER_ROLE_FILES = {"src/model/driver.rs"}
@@ -56,26 +71,10 @@ PROMPT_BUILDER_ROLE_FILES = {"src/prompt/builder.rs"}
 TOOLSET_ROLE_FILES = {"src/tools/set.rs"}
 SESSION_BINDINGS_ROLE_FILES = {"src/bindings.rs"}
 SESSION_RUNTIME_ROLE_FILES = {"src/session/runtime.rs"}
-TRANSITIONAL_PRIVATE_FILES = {
-    "src/agent/legacy_context.rs",
-    "src/agent/legacy_runner.rs",
-    "src/model/legacy_gateway.rs",
-    "src/model/legacy_provider.rs",
-    "src/model/legacy_registry.rs",
-    "src/session/legacy_event.rs",
-    "src/session/legacy_actor.rs",
-    "src/session/legacy_command.rs",
-    "src/session/legacy_event_stream.rs",
-    "src/session/legacy_snapshot.rs",
-    "src/session/legacy_state.rs",
-    "src/tools/registry.rs",
-    "src/tools/legacy_context.rs",
-    "src/tools/legacy_policy.rs",
-    "src/tools/legacy_types.rs",
-}
+TRANSITIONAL_PRIVATE_FILES: set[str] = set()
 ALLOWED_PORT_PATHS = {
     "src/compaction/strategy.rs", "src/context/provider.rs", "src/model/model.rs",
-    "src/storage/session_log.rs",
+    "src/conversation/session_log.rs",
 }
 FORBIDDEN_SYMBOLS = {
     "Runtime", "RuntimeClient", "RuntimeConfig", "RuntimeConfigBuilder", "RuntimeError",
@@ -90,19 +89,7 @@ FORBIDDEN_SYMBOLS = {
     "TurnSummary", "TurnTerminalSummary", "TerminalOutcome",
     "SessionEventKind", "RuntimeEvent", "ToolRegistry", "ToolRegistryBuilder",
 }
-# The old runner still consumes these names through the explicitly private
-# migration seam. The symbols remain forbidden everywhere else, especially in
-# the public tools module and final canonical role inventory.
-FORBIDDEN_SYMBOL_EXEMPTIONS = {
-    "ToolRegistry": {
-        "src/agent/legacy_context.rs", "src/agent/mod.rs", "src/config.rs",
-        "src/session/legacy_actor.rs", "src/tools/registry.rs",
-    },
-    "InteractionClient": {
-        "src/agent/legacy_context.rs", "src/agent/mod.rs", "src/session/legacy_actor.rs",
-        "src/tools/mod.rs",
-    },
-}
+FORBIDDEN_SYMBOL_EXEMPTIONS: dict[str, set[str]] = {}
 FORBIDDEN_IMPORTS = {
     ("reqwest",), ("cap_std",), ("cap_primitives",), ("fs4",),
     ("std", "fs"), ("std", "env"), ("std", "net"), ("std", "process"),
@@ -119,7 +106,7 @@ PORT_FILES = {
     "src/session/runtime_log.rs", "src/session/runtime_open.rs",
     "src/session/state.rs",
     "src/session/turn_handle.rs",
-    "src/storage/session_log.rs",
+    "src/conversation/session_log.rs",
 }
 REQUIRED_FILES = {
     "src/lib.rs", "src/config.rs", "src/error.rs", "src/error/operations.rs", "src/ids.rs", "src/value.rs", "src/time.rs",
@@ -142,19 +129,21 @@ REQUIRED_FILES = {
     "src/interaction.rs", "src/bindings.rs",
     "src/conversation/mod.rs", "src/conversation/compaction_candidate.rs", "src/conversation/entry.rs", "src/conversation/load.rs", "src/conversation/state.rs",
     "src/conversation/validator.rs", "src/conversation/projection.rs", "src/conversation/log.rs",
-    "src/conversation/recovery.rs", "src/conversation/transcript.rs", "src/model/mod.rs", "src/model/model.rs", "src/model/driver.rs", "src/model/driver/assembler.rs", "src/model/response.rs", "src/model/types.rs",
+    "src/conversation/recovery.rs", "src/conversation/session_log.rs",
+    "src/conversation/transcript.rs", "src/model/mod.rs", "src/model/model.rs",
+    "src/model/driver.rs", "src/model/driver/assembler.rs", "src/model/response.rs",
+    "src/model/types.rs",
     "src/conversation/settlement.rs",
     "src/conversation/view.rs",
     "src/tools/mod.rs", "src/tools/tool.rs", "src/tools/context.rs", "src/tools/input.rs", "src/tools/policy.rs", "src/tools/progress.rs", "src/tools/set.rs", "src/tools/types.rs",
     "src/context/mod.rs", "src/context/provider.rs", "src/context/driver.rs",
     "src/compaction/mod.rs", "src/compaction/strategy.rs", "src/storage/mod.rs",
-    "src/storage/session_log.rs",
 }
 PUBLIC_MODULES = {
     "compaction", "config", "context", "conversation", "error", "ids", "model", "session",
     "storage", "tools", "value",
 }
-PRIVATE_MODULES = {"agent", "bindings", "interaction", "prompt", "time", "workspace"}
+PRIVATE_MODULES = {"agent", "bindings", "interaction", "prompt", "time"}
 ROOT_EXPORTS = {
     "value": {"BoundedText"},
     "config": {"CompactionConfig", "KernelConfig", "RetryPolicy", "SemanticLimits", "SessionManifest", "SessionSpec", "TurnOptions", "UserInput"},
@@ -169,7 +158,7 @@ PORT_DECLARATIONS = {
     "src/tools/policy.rs": ("trait", "ToolPolicy"),
     "src/context/provider.rs": ("trait", "ContextProvider"),
     "src/compaction/strategy.rs": ("trait", "CompactionStrategy"),
-    "src/storage/session_log.rs": ("trait", "SessionLog"),
+    "src/conversation/session_log.rs": ("trait", "SessionLog"),
 }
 
 CFG_START_RE = re.compile(r"#\s*\[\s*cfg\s*\(")
@@ -718,6 +707,13 @@ def root_surface_errors(views: dict[str, tuple[str, int]]) -> list[str]:
 
 def forbidden_path_errors(root: Path, test_files: set[str]) -> list[str]:
     errors: list[str] = []
+    for path in source_files(root):
+        relative = path.relative_to(root).as_posix()
+        if any(part.casefold().startswith("legacy") for part in Path(relative).parts):
+            errors.append(f"forbidden final legacy path: {relative}")
+    for relative in sorted(FINAL_ABSENT_PATHS):
+        if (root / relative).exists():
+            errors.append(f"forbidden final legacy path: {relative}")
     for relative in sorted(FORBIDDEN_PATHS):
         path = root / relative
         if path.is_dir():
@@ -763,7 +759,7 @@ def storage_allowlist_errors(
     source_texts: dict[str, str],
 ) -> list[str]:
     errors: list[str] = []
-    allowed = {"src/storage/mod.rs", "src/storage/session_log.rs"}
+    allowed = {"src/storage/mod.rs"}
 
     def test_only(relative: str) -> bool:
         return test_helper_with_empty_production_view(relative, source_texts, test_files)
@@ -1105,6 +1101,13 @@ def strongly_connected(edges: dict[str, set[str]]) -> list[list[str]]:
 
 def scan(root: Path) -> list[str]:
     paths, source_texts, errors = read_source_texts(root)
+    for relative, raw_text in source_texts.items():
+        masked_raw = mask_rust(raw_text)
+        if re.search(r"\b(?:Legacy[A-Za-z0-9_]*|legacy_[A-Za-z0-9_]*)\b", masked_raw):
+            errors.append(f"{relative}: forbidden final legacy symbol")
+        for symbol in FORBIDDEN_SYMBOLS:
+            if re.search(rf"\b{re.escape(symbol)}\b", masked_raw):
+                errors.append(f"{relative}: forbidden final source symbol {symbol}")
     test_files = test_only_files(root, paths, source_texts)
     test_files.update(
         relative for relative, text in source_texts.items() if file_is_test_only(text)
@@ -1171,7 +1174,7 @@ def main() -> int:
             from check_v03_architecture_test import self_test
 
         self_test()
-        print("v0.3 architecture scanner self-test passed: cfg predicates/spans, imports, super depth, root API, Cargo TOML, paths, sizes, SCCs, cfg exclusion, lexer masking")
+        print("v0.3 architecture scanner self-test passed: delegate modes, cfg predicates/spans, imports, super depth, root API, Cargo TOML, paths, sizes, SCCs, cfg exclusion, lexer masking")
         return 0
     errors = scan(args.path.resolve())
     if errors:

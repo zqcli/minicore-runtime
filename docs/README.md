@@ -1,26 +1,21 @@
 # Documentation Authority
 
-> The pages below retain the v0.2 reset record as transitional migration
-> evidence. The current v0.3 P4-B Port/bindings/state/event/TurnHandle and SessionRuntime owner seams are documented
-> in the root README, `docs/architecture.md`, and `docs/modules/README.md`.
+The final v0.3 Core is documented by the current source tree and these pages:
 
-The transitional v0.2 documentation follows this order:
+1. [Architecture](architecture.md) for owners, lifecycle, durability, and dependency direction.
+2. [Canonical module map](modules/README.md) for physical source ownership and public/private boundaries.
+3. [Current ADR index](adr/README.md) for accepted cross-cutting decisions.
+4. [Development plan](development-plan.md) for completed phases and maintenance gates.
+5. [Test inventory](../tests/README.md) for current contract and integration evidence.
 
-1. [Architecture](architecture.md) for dependency direction, owners, lifecycle, and cross-module invariants.
-2. [Canonical module map](modules/README.md) for source ownership and public/private boundaries.
-3. [Current formats](formats/session-json-v2.md) and [conversation JSONL v2](formats/conversation-jsonl-v2.md) for durable bytes and limits.
-4. [Current ADR index](adr/README.md) for accepted decisions that explain why the current source has its boundaries.
-5. [Final migration guide](migration-v0.1-v0.2.md) for the breaking public and persistence reset.
-6. [v0.2 Core Reset release readiness](release-v0.2-core-reset.md) for the final source graph, public surface, persistence, dependency, verification, and deferred-host result.
-7. [Development plan](development-plan.md) for completed foundations, maintenance gates, and non-core follow-up.
+The [current implementation context](../CONTEXT.md) is a short maintainer checkpoint. The [root README](../README.md) is the Host-facing introduction.
 
-The [current implementation context](../CONTEXT.md) is a short checkpoint for maintainers. The [root README](../README.md) is the host-facing introduction and API example.
+The final v0.3 architecture, regenerated lockfile, and remote P6 Rust/script gates are complete. P8 user documentation and release acceptance are next. In particular, there is not yet a current Host-boundary guide, v0.2-to-v0.3 migration guide, complete SessionRuntime lifecycle example, or v0.3 release note.
+
+Core intentionally does not define a filesystem persistence format, workspace abstraction, provider installation format, or builtin/process adapter. Hosts implement those concerns behind the public Ports.
 
 ## Historical Material
 
-- [archived pre-reset authority](archive/v2/pre-reset/README.md) contains the prose that described the repository before the v0.2 reset. Its internal links are intentionally historical and are not validated as current contracts.
-- [archived v1 material](archive/v1/README.md) is retained for provenance only.
-- [archived v2 fixtures](archive/v2/fixtures/wire-v1/README.md) remain byte-level evidence and are not default gates.
-- [archived v2 ADR and review evidence](archive/v2/adr/README.md) is not current source authority.
+All v0.1/v0.2 migration, persistence-format, workspace, store, release, review, and pre-reset documents are preserved under [`docs/archive/`](archive/) for provenance. Archive documents are not current API or architecture authority, and their internal source links are not validated against the final tree.
 
-When source and documentation disagree, source plus the current architecture, module map, formats, and ADR index win. Historical documents may explain a prior decision but may not define a current API or persistence contract.
+When historical prose and current authority differ, current source plus the architecture, module map, ADR index, development plan, and tests win.

@@ -174,13 +174,14 @@ fn conversation_owns_the_canonical_prompt_projection_proof() {
 }
 
 #[test]
-fn legacy_prompt_files_are_test_only_and_public_surfaces_do_not_expand() {
-    for source in [
-        include_str!("../src/prompt/legacy.rs"),
-        include_str!("../src/prompt/legacy_builder.rs"),
-        include_str!("../src/prompt/legacy_compaction.rs"),
+fn prompt_legacy_files_are_absent_and_public_surfaces_do_not_expand() {
+    let root_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for relative in [
+        "src/prompt/legacy.rs",
+        "src/prompt/legacy_builder.rs",
+        "src/prompt/legacy_compaction.rs",
     ] {
-        assert!(source.starts_with("#![cfg(test)]"));
+        assert!(!root_dir.join(relative).exists());
     }
     let context = include_str!("../src/context/mod.rs");
     let root = include_str!("../src/lib.rs");

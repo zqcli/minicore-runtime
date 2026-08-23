@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
+use minicore_runtime::config::ConfigError;
 use minicore_runtime::model::{ModelRef, ModelRefError, ReasoningPreference};
 use minicore_runtime::tools::ToolName;
 use minicore_runtime::value::{BoundedText, MAX_TEXT_BYTES};
-use minicore_runtime::{CompactionConfig, ConfigError, SemanticLimits, SessionSpec};
+use minicore_runtime::{CompactionConfig, SemanticLimits, SessionSpec};
 use serde_json::{Value, json};
 
 fn model_ref() -> ModelRef {

@@ -1,7 +1,8 @@
 use std::time::Duration;
 
+use minicore_runtime::config::ConfigError;
 use minicore_runtime::value::{MAX_JSON_BYTES, MAX_TEXT_BYTES};
-use minicore_runtime::{ConfigError, KernelConfig, RetryPolicy, SemanticLimits};
+use minicore_runtime::{KernelConfig, RetryPolicy, SemanticLimits};
 
 const MAX_CAPACITY: usize = 4_096;
 const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5 * 60);

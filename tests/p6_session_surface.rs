@@ -3,7 +3,7 @@ fn compact(source: &str) -> String {
 }
 
 #[test]
-fn final_session_handle_commands_and_actor_are_canonical_and_legacy_is_quarantined() {
+fn final_session_handle_commands_and_actor_are_canonical() {
     let module = include_str!("../src/session/mod.rs");
     let compact_module = compact(module);
     for required in [
@@ -11,16 +11,13 @@ fn final_session_handle_commands_and_actor_are_canonical_and_legacy_is_quarantin
         "modcommand;",
         "modhandle;",
         "pubusehandle::SessionHandle;",
-        "#[cfg(test)]pub(crate)modlegacy_actor;",
-        "#[cfg(test)]pub(crate)modlegacy_command;",
     ] {
         assert!(
             compact_module.contains(required),
             "session module misses {required}"
         );
     }
-    assert!(!module.contains("pub use legacy_actor"));
-    assert!(!module.contains("pub use legacy_command"));
+    assert!(!module.contains("legacy_"));
 
     let command = include_str!("../src/session/command.rs");
     let compact_command = compact(command);

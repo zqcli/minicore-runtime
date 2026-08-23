@@ -23,7 +23,7 @@ fn session_error_handle_and_runtime_surface_are_exact() {
             "SessionError misses {required}"
         );
     }
-    assert!(error.contains("pub(crate) enum LegacySessionError"));
+    assert!(!error.contains("LegacySessionError"));
 
     let handle = include_str!("../src/session/handle.rs");
     let compact_handle = compact(handle);

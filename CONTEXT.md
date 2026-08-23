@@ -1,9 +1,6 @@
 # Current Implementation Context
 
-> P4-B checkpoint of the breaking v0.3 single-session runtime refactor. The
-> multi-session Runtime has been deleted. `SessionRuntime` now owns create/load,
-> durable log lifetime, root cancellation, events, and deterministic shutdown;
-> final SessionHandle/commands and actor-owned durable settlement are integrated.
+> Final v0.3 single-session architecture after completed P6 source, lockfile, and remote Rust/script validation.
 
 ## Checkpoint
 
@@ -16,14 +13,14 @@ The crate is Rust 2024 with Rust 1.85 as its MSRV. Concrete storage acquisition,
 - `session::SessionRuntimeOptions`: checked `KernelConfig`, immutable `SessionBindings`, and the Host-selected Tokio `Handle` used to spawn the whole open lifecycle.
 - `conversation`: canonical entries, semantic validation, proof-gated load, paged replay, restart repair, append coordination, confirmed projection, canonical prompt-history and compaction-candidate proofs, transcript, and close classification.
 - `storage::SessionLog`: the only public persistence Port. Host code acquires one exclusive adapter and passes ownership into `SessionRuntime::create/load`.
-- `session`: public SessionHandle/bindings/interactions/state/events/TurnHandle plus the single-session owner and final command/runner/settlement actor. Legacy actor/command/observation files are test-only P6 cleanup evidence.
+- `session`: public SessionHandle/bindings/interactions/state/events/TurnHandle plus the single-session owner and final command/runner/settlement actor.
 - `model`, `tools`, `context`, `compaction`: host-neutral Ports and checked DTOs bound immutably for the loaded lifetime. Their private drivers share one crate-private deadline selector whose equal-deadline rule conservatively chooses the Turn source.
 - `model::driver`: private P5-A execution module binding one direct Model, a checked Kernel-derived timeout/retry/semantic snapshot, strict stream assembly, and best-effort delta progress; no session/log/tool-execution authority.
 - `agent::tool_driver` and `agent::runner_protocol`: private P5-B execution modules owning frozen-spec policy evaluation, typed approval/input suspension, panic-safe Tool execution, child cancellation, output bounds, and lossy progress. They never append, spawn, or own SessionRuntime/log authority.
 - `context::driver` and `prompt::builder`: private P5-C modules owning one-provider context deadlines/panic isolation, canonical context bundles, consumption of conversation-owned prompt proofs, deterministic mapping, stable context headers, exact frozen tools, and exact serialized-request output-reserved budgeting. They invoke no model, tool, log, workspace, or owner.
 - `compaction::driver`: private P5-D/P5-E2 module binding zero or one CompactionStrategy, a checked timeout/summary snapshot, cancellation/deadline-first preflight plus an identical post-candidate control check before boundary/strategy availability, completed-boundary-only proposal validation, scoped child cancellation, exact Turn/Port deadline provenance, and a stale-head proof. It has no conversation mutation, log, model, tool, context, workspace, or owner authority.
 - `agent::runner`, `agent::turn_context`, and `agent::runner_protocol`: private P5-E1/P5-E2 Turn execution. They bind durable effective rounds, accept exact prefix-extending acknowledgements, apply cancellation-first Turn control before compaction availability/overflow decisions and after Context success, distinguish Core Turn deadlines from configured/adapter port timeouts without post-error provenance inference, run proactive best-effort and forced one-shot compaction, emit stale-head Summary commit requests, preserve ordinary critical commit diagnostics, rebuild Context/Prompt after acknowledgement, order ToolStarted before suspension, and retain conservative usage in every outcome and Join fallback. They never append or own a log/runtime/workspace.
-- `workspace`, the old filesystem store, legacy prompt compaction, and the legacy agent/actor/model/tool observation graph: `cfg(test)` migration evidence only; none is present in the production library graph or owned by SessionRuntime.
+- Workspace, filesystem storage, concrete providers/tools, and multi-session management are Host responsibilities and have no Core implementation module.
 
 The public root exposes `compaction`, `config`, `context`, `conversation`, `error`, `ids`, `model`, `session`, `storage`, `tools`, and `value`. There is no top-level `runtime` module, multi-session manager, loaded-session map, repository, or shutdown-all owner.
 
@@ -77,10 +74,10 @@ Model descriptor access, SessionLog future construction and polling, and the pos
 
 `SessionShutdownError` is non-exhaustive and distinguishes Timeout, Durability, LogClose, and ActorTerminated. Diagnostics use bounded static text; raw adapter sources, paths, credentials, prompts, and response bodies are not retained.
 
-## Deferred Work
+## Cleanup Status
 
-P4-C is complete: SessionRuntime exposes one cloneable SessionHandle backed by a bounded actor mailbox and watch state; the actor owns User/Assistant/Tool/Summary/terminal commits, interaction resume senders, transcript serialization, runner progress, settlement, and shutdown sequencing. P6 removes the remaining test-only legacy actor/storage/workspace/dependency graph.
+P4-C and P6 are complete: SessionRuntime exposes one cloneable SessionHandle backed by a bounded actor mailbox and watch state; the actor owns User/Assistant/Tool/Summary/terminal commits, interaction resume senders, transcript serialization, runner progress, settlement, and shutdown sequencing. No compatibility or legacy implementation graph remains. The lockfile was regenerated and the remote P6 Rust/script gates passed. The P8 Host-boundary, migration, lifecycle-example, and release-note documents plus release acceptance remain next.
 
 ## Verification
 
-Local work for this phase uses Python architecture/docs/source checks and `git diff --check`. Rust build, tests, Clippy, rustdoc, and rustfmt validation are run remotely by the project workflow. The focused owner evidence is `tests/session_runtime_owner_contract.rs`, private runtime/actor unit tests, and the deterministic `FakeSessionLog` operation-admission controls.
+Local work for this phase uses Python architecture/docs/source checks and `git diff --check`. Remote P6 evidence includes the regenerated lockfile, the supplied formatting/check commands, and a passing `scripts/check.sh`; that script covers locked root tests and Clippy, provider-gate tests and Clippy, docs, architecture, and diff checks. The cleaned root library run reported 285 passing tests, with integration and provider-gate suites also passing. The focused owner evidence is `tests/session_runtime_owner_contract.rs`, private runtime/actor unit tests, and the deterministic `FakeSessionLog` operation-admission controls.

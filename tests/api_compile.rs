@@ -45,9 +45,7 @@ mod v03_public_api_compile_contract {
         runtime: tokio::runtime::Handle,
     }
 
-    async fn compile_contract(
-        inputs: CompileInputs,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn compile_contract(inputs: CompileInputs) -> Result<(), Box<dyn std::error::Error>> {
         let CompileInputs {
             session_id,
             spec,

@@ -1,5 +1,5 @@
 #[test]
-fn canonical_agent_module_is_private_unconditional_and_legacy_is_test_only() {
+fn canonical_agent_module_is_private_and_legacy_free() {
     let root = include_str!("../src/lib.rs");
     assert!(root.starts_with("mod agent;"));
     assert!(!root.contains("pub mod agent;"));
@@ -8,13 +8,9 @@ fn canonical_agent_module_is_private_unconditional_and_legacy_is_test_only() {
     let module = include_str!("../src/agent/mod.rs");
     assert!(module.contains("mod runner_protocol;"));
     assert!(module.contains("mod tool_driver;"));
-    assert!(module.contains("#[cfg(test)]\nmod legacy;"));
     assert!(module.contains("pub(crate) use runner_protocol::{"));
     assert!(module.contains("pub(crate) use tool_driver::{"));
-
-    let legacy = include_str!("../src/agent/legacy.rs");
-    assert!(legacy.contains("#[path = \"legacy_context.rs\"]\nmod context;"));
-    assert!(legacy.contains("#[path = \"legacy_runner.rs\"]\nmod runner;"));
+    assert!(!module.contains("legacy"));
 }
 
 #[test]

@@ -333,7 +333,6 @@ fn policy_and_interaction_sources_are_process_local_and_owner_neutral() {
     let policy = include_str!("../src/tools/policy.rs");
     let interaction = include_str!("../src/interaction.rs");
     let tools = include_str!("../src/tools/mod.rs");
-    let legacy = include_str!("../src/tools/legacy_policy.rs");
 
     for source in [policy, interaction] {
         for forbidden in [
@@ -375,8 +374,5 @@ fn policy_and_interaction_sources_are_process_local_and_owner_neutral() {
     assert!(approval.contains("Deny"));
     assert!(!approval.contains("AllowForSession"));
     assert!(tools.contains("pub use policy::{"));
-    assert!(tools.contains("pub(crate) mod legacy_policy;"));
-    assert!(!tools.contains("pub use legacy_policy"));
-    assert!(legacy.contains("trait LegacyToolPolicy"));
-    assert!(!legacy.contains("pub trait ToolPolicy"));
+    assert!(!tools.contains("legacy_"));
 }

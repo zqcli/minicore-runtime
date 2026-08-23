@@ -2,9 +2,9 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::session_log::SessionLog;
 use crate::config::{KernelConfig, SemanticLimits, SessionManifest};
 use crate::ids::SessionId;
-use crate::storage::SessionLog;
 use futures_util::FutureExt;
 
 use super::log::{

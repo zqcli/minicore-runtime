@@ -18,13 +18,11 @@ MiniCore Runtime is an embeddable Rust 2024 single-session execution kernel. The
 - Public process-local `SessionState`, bounded single-consumer `SessionEventStream`, and exact-turn `TurnHandle` foundations with redacted diagnostics and no snapshot/broadcast recovery protocol.
 - Public non-Clone `SessionRuntime` create/load/take-events/handle/shutdown lifecycle with spawn-first OpenGuard cancellation, proof-gated replay/recovery, one durable log owner, and typed open/shutdown failures.
 - Public cloneable `SessionHandle` with bounded submit/answer/transcript commands and watch state; SessionActor owns runner acknowledgements, durable unresolved-tool suspension proof, first-wins active commit failure latches, settlement, and shutdown durability propagation.
-- Crate-private legacy runner/session/storage execution seam, including exact legacy tool-result wire preservation.
-- Conversation, storage, and workspace implementations remain transitional internal slices while their v0.3 owners are migrated.
 - No concrete builtin, process adapter, model network adapter, default tool set, or network service is installed by the public seams.
 
 ## Install and MSRV
 
-The crate targets Rust `1.85` and edition 2024. The repository's pinned-toolchain and offline architecture gates are the authoritative checks for this transitional phase.
+The crate targets Rust `1.85` and edition 2024. The final v0.3 architecture, regenerated lockfile, and remote P6 Rust/script gates are complete. P8 Host-boundary, migration, runtime-example, release-note documentation, and release acceptance are next.
 
 The host owns tool capabilities. A host implementation captures workspace, process, RPC, or other authority inside its `Tool` implementation rather than receiving those capabilities through `ToolContext`.
 
@@ -51,7 +49,7 @@ fn install_tools(host_tool: impl Tool + 'static) -> Result<ToolSet, Box<dyn std:
 }
 ```
 
-`ToolContext` contains only cancellation, deadline, and nonblocking progress. `ToolInvocation` validates object-shaped JSON arguments and redacts them from `Debug`. `ToolSet::specs_for` returns deterministic registered specs and omits unknown names; invalid public-field mutations are rejected during `build()`, while `SessionBindings::validate` rejects unknown enabled tools and enforces semantic ToolSpec budgets. `ToolOutput` serializes as `{ "content": "..." }`; `ModelMessage::Tool` carries its public `ToolResultOutcome`, while legacy `{ "text": "...", "is_error": ... }` values belong only to physical private storage.
+`ToolContext` contains only cancellation, deadline, and nonblocking progress. `ToolInvocation` validates object-shaped JSON arguments and redacts them from `Debug`. `ToolSet::specs_for` returns deterministic registered specs and omits unknown names; invalid public-field mutations are rejected during `build()`, while `SessionBindings::validate` rejects unknown enabled tools and enforces semantic ToolSpec budgets. `ToolOutput` serializes as `{ "content": "..." }`; `ModelMessage::Tool` carries its public `ToolResultOutcome`.
 
 `ToolPolicy` is an asynchronous host Port over an owned, checked `ToolPolicyRequest`. Decisions are exactly `Allow`, bounded `Deny`, or `RequireApproval`; approval answers are typed `AllowOnce`/`Deny`. Process-local `session::PendingInteraction` values pair approval and tool-input requests with matching typed answers without carrying resume senders, callbacks, owner handles, or durable state.
 
@@ -71,7 +69,7 @@ Stream events are typed text/reasoning deltas, tool-call boundaries, usage, and 
 
 `SessionEventStream` is one bounded Tokio mpsc receiver and is not Clone. Internal publication is synchronous best effort: queue overflow drops the current event, counts losses, and attempts an `EventsDropped` marker before a later ordinary event. Events contain bounded deltas and summaries, never raw tool output, arguments, answers, or adapter errors.
 
-`TurnHandle` is Clone + Send + Sync and controls one exact Turn. Cancellation and completion share one mutex linearization point; cancellation is first-request-only, completion is first-wins, multiple waiters receive the same durable outcome, and dropping handles does not cancel. Turn execution and completion wiring remain P5 work.
+`TurnHandle` is Clone + Send + Sync and controls one exact Turn. Cancellation and completion share one mutex linearization point; cancellation is first-request-only, completion is first-wins, multiple waiters receive the same durable outcome, and dropping handles does not cancel.
 
 ## Session Runtime
 
@@ -93,16 +91,16 @@ The private integration test `post_ready_actor_panic_joins_pending_runner_before
 | `conversation` | Canonical v0.3 conversation entries, loading, transcript, and read-only views |
 | `context` | Typed context provider Port and validated context bundles |
 | `compaction` | Typed compaction strategy Port and immutable candidates/proposals |
-| `error` | Public error summaries; legacy session errors remain private |
+| `error` | Redacted diagnostics and typed session/log/open/shutdown/turn errors |
 | `ids` | Checked session, instance, turn, interaction, tool-call, and context-source identifiers |
 | `model` | Direct streaming `Model` Port, checked descriptor/context/request/events, and delivery-aware errors |
 | `session` | Single-session owner lifecycle, bindings, interactions, lightweight state, bounded events, and exact TurnHandle foundations |
 | `storage` | `SessionLog` Port and storage DTOs |
 | `tools` | `Tool`, immutable `ToolSet`, async `ToolPolicy`, approval, invocation/context/progress/output DTOs |
 
-The old top-level `runtime` module, Runtime configuration/manager graph, loaded-session map, repository ownership, and legacy `SessionConfig` are deleted. Legacy actor/command/observation/transcript, workspace/store implementation, synchronous policy, and legacy model/tool lookup compile only under `cfg(test)` as migration evidence and remain scheduled for P6/P7 deletion.
+The old top-level `runtime` module, manager graph, legacy execution graph, workspace implementation, filesystem store, provider lookup, and concrete tool/model adapters are physically absent. Hosts own adapter acquisition and any multi-session repository or supervisor.
 
-## Transitional Scope
+## Breaking Scope
 
 The removed v0.2 Runtime, concrete builtin/process/model adapters, and their integration tests are baseline evidence, not compatibility contracts. Focused P3-B through P5-E2/P4-C contracts cover Ports, bindings, state/events, SessionHandle/TurnHandle, create/load recovery, commands, runner integration, interactions, transcript, settlement, and shutdown.
 
@@ -110,7 +108,7 @@ The former Runtime/model-network examples and root integration suites were remov
 
 ## Testing
 
-The deterministic offline checks are Python/docs/diff/architecture checks. Rust validation for this phase is intentionally run remotely by the project workflow; no local Rust build or test command is part of the current P4-B review.
+The deterministic offline checks are Python/docs/diff/architecture checks. Rust validation is run remotely by the project workflow.
 
 ```bash
 python3 scripts/check_architecture.py

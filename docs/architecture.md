@@ -1,6 +1,6 @@
 # Current Architecture
 
-This document describes the current v0.3 reset slice. The former v0.2 multi-session Runtime and SessionManager are deleted. The remaining old actor/command/provider/workspace/storage graph is gated at owning module declarations with `cfg(test)`: it compiles for legacy unit evidence, not in the production library and not as a compatibility facade.
+This document describes the final v0.3 single-session Core. The former multi-session Runtime, legacy execution graph, workspace implementation, concrete storage, provider lookup, and builtin/process tools are physically absent rather than hidden behind compatibility or test-only modules.
 
 ## Public Spine
 
@@ -98,23 +98,13 @@ Progress is synchronous and nonblocking. `ToolProgressSink::emit` validates `com
 
 `ModelRequest` contains only checked messages, tools, limits, and reasoning. `ModelStream` emits bounded typed `ModelEvent` values for text, reasoning, tool-call grammar, usage, and finish. Event `Debug` output reports only safe identities and byte counts. `ModelError` reports `DeliveryState::{NotStarted, Started, Unknown}`, retryability, and an optional retry-after hint; retryable/hint combinations are rejected unless delivery is `NotStarted`.
 
-The old runner/context, batch Model gateway/provider lookup, Workspace, old actor/commands, and old prompt/compaction implementation now live only under explicit `legacy_*` or `cfg(test)` migration modules. P4-C/P5 provide the final actor, handle, drivers, TurnRunner, compaction protocol, and settlement.
+## Final Boundary
 
-## Legacy Boundary
-
-The test-only actor/runner/storage path uses `LegacyTool`, `LegacyToolContext`, and `legacy_types` DTOs. `LegacyToolOutput` deliberately preserves the old `{ "text": ..., "is_error": ... }` JSON shape for legacy unit tests. Production `ModelMessage::Tool` uses only public `ToolOutput` plus `ToolResultOutcome`; the legacy conversion itself is `cfg(test)`.
-
-The test-only old actor uses `legacy_state.rs`, `legacy_event.rs`, `legacy_event_stream.rs`, and `legacy_snapshot.rs`. Their modules are gated with actor, command, and old transcript at `session/mod.rs`. Broadcast, first-snapshot delivery, resync, old commands, and legacy terminal behavior are absent from the production SessionRuntime graph.
-
-`session/legacy_actor.rs`, `legacy_command.rs`, agent/tool legacy files, and registry/storage/workspace implementations are staged test-only P6 cleanup files. Final actor/command/policy files are canonical production modules.
-
-## Deferred Execution
-
-The old top-level Runtime manager graph and legacy SessionConfig are removed. ToolRegistry, legacy actor/commands/model lookup, workspace, and filesystem store remain test-only P6/P7 evidence and are not reached by SessionRuntime.
+The old top-level Runtime manager graph, legacy SessionConfig, ToolRegistry, actor/command/observation graph, provider registry/gateway, workspace implementation, filesystem store, old prompt/compaction implementation, and legacy tool wire DTOs are physically removed. The Core provides no aliases or test-only compatibility modules for them.
 
 Concrete filesystem/process adapters and their tests were deleted in P3-B rather than replaced with defaults. Future concrete tools must be host-owned implementations of the public `Tool` Port, not reintroduced builtins or process policy modules.
 
-P4-C/P5-E2 now supply the final SessionHandle, state watch, bounded commands, transcript routing, actor-owned acknowledgements and suspension state, ordinary Turn execution, compaction, and durable terminal settlement. P6 cleanup remains.
+P4-C/P5-E2 supply the final SessionHandle, state watch, bounded commands, transcript routing, actor-owned acknowledgements and suspension state, ordinary Turn execution, compaction, and durable terminal settlement. The P6 cleanup graph, regenerated lockfile, and remote Rust/script gates are complete; P8 documentation and release acceptance are next.
 
 ## Model Retry
 

@@ -1,112 +1,73 @@
 # Canonical Module Map
 
-This page maps the current v0.3 source graph. The v0.2 multi-session Runtime is deleted; concrete adapters and the remaining old actor/command/provider/workspace files are migration history, not public extension points.
+This page maps the final v0.3 source graph. Core contains host-neutral Ports, checked DTOs, private execution drivers, and one single-session owner. It contains no workspace, concrete storage, provider registry, builtin/process adapter, multi-session manager, or compatibility implementation.
 
 ## Root Surface
 
-`src/lib.rs` keeps the checked DTO, Port, and single-session owner modules public. There is no top-level `runtime` module. `agent` and `prompt` are unconditional private modules containing the P5-E1/P5-E2 TurnRunner/ToolDriver/compaction protocol and P5-C final PromptBuilder. Workspace, old prompt compaction, old storage implementations, actor/commands/observation/transcript, the legacy agent runner, and legacy model/tool execution modules are `cfg(test)` at their owning declarations and absent from production compilation.
+`src/lib.rs` exposes the public modules `compaction`, `config`, `context`, `conversation`, `error`, `ids`, `model`, `session`, `storage`, `tools`, and `value`. The private root modules are `agent`, `bindings`, `interaction`, `prompt`, and `time`.
 
-| Module | Current responsibility |
+`src/bindings.rs` and `src/interaction.rs` are neutral physical modules used to keep the module graph acyclic. Their public types are reexported through `session`; they are not duplicate public paths.
+
+| Module | Responsibility |
 | --- | --- |
-| `config` | Kernel limits, session specs, manifests, retry policy, and checked configuration values |
-| `conversation` | Canonical conversation entries, proof-gated loading, replay/recovery, transcript, and read-only views |
-| `context` | Typed `ContextProvider` Port, validated context DTOs, and private ContextDriver |
-| `compaction` | Typed `CompactionStrategy` Port, immutable candidates/proposals, and private CompactionDriver |
-| `error` | Redacted diagnostics plus typed log/open/shutdown/turn errors |
-| `ids` | Checked identifiers, including `ContextSourceId` |
-| `model` | Final direct streaming `Model` Port and shared checked DTOs plus private legacy runner lookup |
-| `prompt` | Private deterministic PromptBuilder plus test-only legacy prompt/compaction evidence |
-| `agent` | Private TurnRunner, exact prefix commit/suspension/Summary protocol, compaction recovery, usage settlement, and ToolDriver |
-| `session` | Public single-session owner, bindings/interactions/state/events/TurnHandle foundation, plus explicitly private legacy execution scaffolding |
-| `storage` | `SessionLog` Port and private durable store implementation |
-| `tools` | Final public `Tool`/`ToolSet` execution seam plus private legacy runner scaffolding |
+| `config` | Kernel limits, retry policy, session specs, manifests, and checked inputs |
+| `conversation` | Canonical entries, validation, replay/recovery, transcript, prompt/compaction proofs, settlement, and the physical SessionLog Port declaration |
+| `context` | Public ContextProvider Port, checked context DTOs, and private ContextDriver |
+| `compaction` | Public CompactionStrategy Port, candidates/proposals, and private CompactionDriver |
+| `error` | Redacted diagnostics plus typed session/log/open/shutdown/turn errors |
+| `ids` | Checked runtime, interaction, tool-call, and context-source identifiers |
+| `model` | Direct streaming Model Port, checked DTOs, and private ModelDriver |
+| `prompt` | Private deterministic PromptBuilder |
+| `agent` | Private TurnRunner, ToolDriver, commit/suspension protocol, and compaction recovery |
+| `session` | SessionRuntime, SessionHandle, actor, commands, state/events, interactions, and TurnHandle |
+| `storage` | Public reexport facade for the SessionLog Port and its DTOs; no adapter implementation |
+| `tools` | Tool, ToolSet, ToolPolicy, invocation/context/input/progress/output DTOs |
 
-## Tools
+## Ownership
 
-The final execution seam is `tools::Tool`, `tools::ToolSet`, `tools::ToolInvocation`, `tools::ToolContext`, `tools::ToolOutput`, `tools::ToolInputRequest`, and progress DTOs. P3-C adds the independent async `tools::ToolPolicy` Port with owned requests and typed approval decisions. `ToolContext` contains only cancellation, deadline, and a synchronous nonblocking progress sink. Workspace, process, RPC, credential, and policy authorities remain outside the public Tool context.
+The Host acquires exactly one `Box<dyn SessionLog>` and passes it to `SessionRuntime::create` or `load`. Core owns that adapter for the loaded lifetime. Listing sessions, selecting storage formats, writer leases, repository policy, and multi-session shutdown belong to the Host.
 
-`ToolSet` is mutable only during `ToolSetBuilder` registration. Registration returns the builder and records the first duplicate, spec-panic, or invalid-spec error; `build()` emits that error or freezes the tool and spec maps. `specs_for` deterministically omits unknown enabled names; `SessionBindings::validate` rejects them and validates the full frozen spec snapshot. Cloned sets share immutable `Arc` state and can dispatch the same `Arc<dyn Tool>` concurrently. There is no public ToolRegistry facade and no default concrete tool set.
+`SessionBindings` freezes one direct `Arc<dyn Model>`, one immutable `ToolSet`, and optional ToolPolicy, ContextProvider, and CompactionStrategy adapters. Validation is pure apart from panic-isolated descriptor inspection and invokes no adapter future.
 
-`src/tools/legacy_context.rs`, `src/tools/legacy_policy.rs`, and `src/tools/legacy_types.rs` are private staged migration scaffolding scheduled for P6 deletion. Final policy and SessionActor suspension/consumption wiring are canonical.
+`SessionActor` is the sole durable mutation owner. It serializes commands, runner commit acknowledgements, interactions, transcript reads, settlement, health degradation, and close ordering. `SessionHandle` contains only stable IDs, a bounded command sender, and watch state.
 
-`src/interaction.rs` owns the single public process-local interaction vocabulary and is reexported through `session`; SessionActor owns one-shot consumption separately.
+The SessionLog trait is physically declared in `conversation/session_log.rs` because conversation validation and ConversationLog consume it. `storage` publicly reexports the Port so the external API remains `storage::SessionLog`. This placement removes the former `conversation ↔ storage` module cycle.
 
-`src/bindings.rs` owns the public immutable adapter bundle and is reexported through `session`. Its pure validation invokes no adapter future and owns no lifecycle authority.
+## Execution Modules
 
-`src/session/state.rs`, `event.rs`, `event_stream.rs`, and `turn_handle.rs` own the final P4-A foundation. State is process-local and invariant-checked; EventStream is one bounded mpsc receiver with crate-private lossy publication; TurnHandle provides exact cancellation and first-wins durable completion. None contains actor, log, Workspace, snapshot recovery, broadcast, or serde capabilities.
+- `model::driver` owns stream grammar, usage settlement, retry truth, cancellation, deadline provenance, and panic isolation for one direct Model.
+- `agent::tool_driver` owns frozen-spec policy decisions, approval/input suspension, Tool execution, output bounds, and lossy progress.
+- `context::driver` owns zero-or-one provider execution, validation, cancellation, and deadline provenance.
+- `prompt::builder` owns deterministic prompt ordering and exact serialized-request budgeting.
+- `compaction::driver` owns canonical candidate validation and one strategy call without commit authority.
+- `agent::runner` owns ordinary model/tool rounds, compaction recovery, exact prefix acknowledgements, and conservative usage.
+- `session::actor` owns durable append authority and terminal settlement.
 
-`src/session/runtime.rs` owns the non-Clone lifecycle, OpenGuard, actor JoinHandle, and shutdown timeout. The split actor owns bounded commands, next-unresolved-tool suspension proof, first-wins active commit failure latches, no-terminal durability completion, panic runner ownership, and close ordering. Focused actor production files remain below 500 lines.
-
-`src/error/operations.rs` owns SessionLogError, struct-plus-kind SessionOpenError, and non-exhaustive SessionShutdownError. Public diagnostics contain bounded static messages; SessionOpenError preserves primary log/identity distinctions and records failed-open close failure only as a secondary diagnostic.
-
-`src/session/legacy_actor.rs`, `legacy_command.rs`, legacy observation files, and legacy transcript preserve old unit evidence under `cfg(test)`. None is reached or publicly reexported.
-
-Legacy physical storage persists separately as `LegacyToolOutput { text, is_error }`. Public `ToolOutput` is content-only and pairs with `ToolResultOutcome` in `ModelMessage::Tool`; the crate-private prompt conversion maps legacy status before provider encoding, while conversation storage retains the old DTO until that path is deleted.
-
-## Model
-
-`src/model/model.rs` owns the direct `Model` Port, checked descriptor, process-local call context, and exact start/stream aliases. `src/model/response.rs` owns delivery-aware errors and the bounded typed stream grammar. `ModelRequest` is host-neutral: messages, tools, limits, and reasoning only.
-
-`src/model/legacy_gateway.rs`, `legacy_provider.rs`, and `legacy_registry.rs` are crate-private P5/P6 scaffolding for the old batch runner. Their identities are explicitly `Legacy*`; no public alias exposes lookup or provider concepts. Concrete OpenAI/Anthropic adapters, HTTP transport, root provider tests, and the root `reqwest` dependency were deleted in P3-D. The independent `provider-gate/` package remains separate evidence.
-
-## Workspace
-
-Workspace capability ownership remains a private transitional implementation detail. `workspace` is not a public root module, and the public Tool seam does not pass a workspace or process handle through `ToolContext`.
-
-## Other Owners
-
-- `config` owns checked kernel/session-spec values. RuntimeConfig/Builder and legacy SessionConfig are deleted.
-- `model` owns the final direct Port, shared DTOs, and private P5-A `ModelDriver`; legacy lookup remains test-only until P4-C removes the old actor path.
-- `agent` owns the private P5-E1/P5-E2 TurnRunner, durable rounds, cancellation-first Turn control, exact prefix commits, detailed Context/Model/Compaction deadline routing, proactive best-effort compaction with per-head suppression, one-shot forced overflow recovery, stale-head Summary requests using ordinary critical commit diagnostics, Tool Turn-deadline control exits, configured-timeout ordinary ToolResults, all-outcome usage, bounded panic fallback, and P5-B ToolDriver. The old context/runner lives only under `agent::legacy`.
-- `context` owns the public ContextProvider seam and private P5-C `ContextDriver`; `prompt` owns the private final P5-C PromptBuilder. The old prompt builder/compactor and tests live under `prompt::legacy` only.
-- `conversation` owns confirmed state, durable append coordination, replay/recovery, transcript projection, proof-gated load completion, the canonical prompt-history proof, and the physical CompactionCandidate proof DTO.
-- `compaction` owns the public strategy seam and private P5-D/P5-E2 CompactionDriver. Cancellation and the selected effective deadline are checked before target/candidate work and again after candidate validation before boundary/strategy availability; the driver returns detailed deadline provenance and a stale-head proof but has no Summary commit authority.
-- `storage` owns the current private filesystem store and exposes only the `SessionLog` Port to future v0.3 owners.
-- `session` owns the final single-session lifecycle, SessionHandle, bounded commands, state/events, interactions, runner commit acknowledgements, transcript routing, TurnHandle completion, settlement, and shutdown.
-
-## File Inventory
+## Source Inventory
 
 ```text
 src/
+├── agent/{mod.rs,runner.rs,runner/{compaction.rs,diagnostics.rs,support.rs,tests/...},runner_protocol.rs,tool_driver.rs,tool_driver/{support.rs,tests/...},turn_context.rs}
 ├── bindings.rs
-├── config.rs
-├── interaction.rs
-├── conversation/{compaction_candidate.rs,entry.rs,load.rs,log.rs,projection.rs,recovery.rs,settlement.rs,state.rs,transcript.rs,validator.rs,view.rs,view/tests/...}
-├── context/{mod.rs,provider.rs}
 ├── compaction/{mod.rs,strategy.rs,driver.rs,driver/tests/...}
-├── agent/{mod.rs,runner.rs,runner/{compaction.rs,support.rs,diagnostics.rs,tests/...},runner_protocol.rs,turn_context.rs,tool_driver.rs,tool_driver/support.rs,legacy.rs,legacy_context.rs,legacy_runner.rs}
+├── config/{kernel.rs,retry.rs,session.rs,session_spec.rs}
 ├── context/{mod.rs,provider.rs,driver.rs,driver/tests/...}
-├── model/{driver.rs,driver/assembler.rs,legacy_gateway.rs,legacy_provider.rs,legacy_registry.rs,mod.rs,model.rs,response.rs,types.rs}
-├── prompt/{mod.rs,builder.rs,builder/tests/...,legacy.rs,...test-only legacy files}
+├── conversation/{compaction_candidate.rs,entry.rs,load.rs,log.rs,log/tests/...,projection.rs,recovery.rs,session_log.rs,settlement.rs,state.rs,transcript.rs,validator.rs,view.rs}
 ├── error/{operations.rs}
-├── session/{actor.rs,actor/{lifecycle,run,commands,runner,settlement,supervisor}.rs,command.rs,handle.rs,event.rs,event_stream.rs,runtime.rs,runtime_open.rs,runtime_log.rs,runtime_shutdown.rs,state.rs,turn_handle.rs,...legacy files}
-├── storage/{mod.rs,session_log.rs,...private implementation files}
-└── tools/{context.rs,input.rs,legacy_context.rs,legacy_policy.rs,legacy_types.rs,mod.rs,policy.rs,progress.rs,registry.rs,set.rs,tool.rs,types.rs}
+├── interaction.rs
+├── model/{mod.rs,model.rs,response.rs,types.rs,driver.rs,driver/{assembler.rs,failure.rs,tests/...}}
+├── prompt/{mod.rs,builder.rs,builder/tests/...}
+├── session/{mod.rs,actor.rs,actor/{commands.rs,lifecycle.rs,run.rs,runner.rs,settlement.rs,supervisor.rs,tests/...},command.rs,event.rs,event_stream.rs,handle.rs,runtime.rs,runtime_log.rs,runtime_open.rs,runtime_shutdown.rs,state.rs,turn_handle.rs}
+├── storage/mod.rs
+├── time.rs
+├── tools/{mod.rs,context.rs,input.rs,policy.rs,progress.rs,set.rs,tool.rs,types.rs}
+└── value.rs
 ```
 
-Concrete `src/tools/builtins/**` and `src/tools/process.rs` adapters were deleted in P3-B. They must not return as canonical files or as a default registration path.
+## Tests
 
-## Test Migration
-
-- `tests/tool_set_contract.rs` is the focused P3-B replacement for removed v0.2 Tool/Registry/concrete-adapter integration tests.
-- `tests/tool_policy_interaction_contract.rs` covers the final async policy Port, checked approvals, process-local interactions, matching answers, and source boundaries.
-- `tests/model_port_contract.rs` covers the direct Model trait/start/stream contract, descriptor/context/request neutrality, event grammar, error delivery/retry invariants, redaction, and shared concurrency.
-- `tests/model_driver_contract.rs` protects the private driver role and public isolation; private driver tests cover assembly, malformed streams, limits, panic/cancellation/deadline behavior, retry, progress loss, drop probes, and concurrency.
-- `tests/tool_driver_contract.rs` protects the private ToolDriver/suspension role, forbidden owner dependencies, legacy quarantine, narrow frozen-spec/progress capabilities, file bounds, and unchanged public surfaces; behavioral tests live under `src/agent/tool_driver/tests/`.
-- `tests/context_prompt_driver_contract.rs` protects the private ContextDriver/final PromptBuilder roles, conversation-owned canonical proof, exact final-request estimation, owner-neutral dependencies, legacy prompt quarantine, file bounds, and unchanged public surfaces; behavioral tests live beside the private modules and ConversationView proof.
-- `tests/compaction_driver_contract.rs` protects the private CompactionDriver role, detailed deadline provenance, conversation-owned canonical candidate, stale-head proof without commit authority, owner-neutral dependencies, public Port stability, and file bounds; behavioral tests live beside the driver and ConversationView proof.
-- `tests/turn_runner_contract.rs` protects private P5-E1/P5-E2 roles, cancellation-first checkpoints, exact prefix and Summary acknowledgements, ordinary critical commit taxonomy, stale-head fields, durable rounds, shared Turn/Port provenance, proactive trigger/head suppression and configured-timeout continuation, forced compaction, nonzero usage retention, same-task execution, deterministic panic fallback, owner neutrality, legacy quarantine, and file bounds; behavioral tests live under `src/agent/runner/tests/`.
-- `tests/session_bindings_contract.rs` covers exact bindings shape, pure validation, descriptor panic isolation, compatibility failures, frozen ToolSpec limits, optional adapter non-invocation, and P4 load ordering.
-- `tests/session_state_event_contract.rs` covers exact state/event shapes, legal and illegal state matrices, diagnostic/event redaction, envelopes, and the single-consumer stream source contract; sink behavior is tested in `event_stream.rs`.
-- `tests/turn_handle_contract.rs` covers the public exact-Turn surface and safe wait errors; mutex/cancellation/completion races are tested in `turn_handle.rs` beside the private publisher.
-- `tests/session_runtime_owner_contract.rs` covers options, create/load order, repair-before-ready, error preservation, one-shot events, explicit/Drop shutdown, open cancellation, timeout abort+await, stopped task runtimes, and independent concurrent owners using FakeSessionLog.
-- Final P4-C evidence spans `session_handle_contract.rs`, `session_runtime_{turn,interaction,command,compaction_commit}_contract.rs`, private actor suspension/summary/scheduling tests, and the runtime panic Drop-probe test.
-- `tests/p1_dto.rs` covers the final checked Tool DTOs and input-answer validation.
-- Private `src/tools/progress.rs` tests cover synchronous bounded `try_send` behavior.
-- Private `src/tools/legacy_types.rs` tests prove legacy failure output wire round-trip.
-- Removed v0.2 model registry, transport, concrete adapter, Runtime smoke, and Runtime surface tests are baseline evidence, not compatibility contracts.
-- P4-C public and actor contracts are active; P6 removes remaining legacy/storage/workspace/dependency scaffolding.
+Focused source contracts protect each public Port and private driver boundary. Public integration tests cover create/load/shutdown, command admission, interactions, compaction commits, durability failures, transcript behavior, panic cleanup, and concurrent owner isolation. `tests/final_architecture_contract.rs` plus `scripts/check_v03_architecture.py` protect physical absence of the removed graph and the exact root/dependency/module surface.
 
 ## Boundary Rules
 
-A public DTO has a checked constructor or strict deserializer. Public Debug implementations redact payloads. A Port does not depend on Workspace, SessionHandle, Runtime, Store, Model, provider lookup, direct I/O, or fanout. Transitional owners may use private legacy seams until their scheduled migration phase, but they cannot be reintroduced through public aliases.
+A public DTO has a checked constructor or strict deserializer. Public Debug implementations redact payloads. Ports do not import SessionRuntime, SessionHandle, direct I/O, registries, repositories, or fanout. Concrete adapters capture Host authority behind the public Port traits rather than receiving Core owner handles.
