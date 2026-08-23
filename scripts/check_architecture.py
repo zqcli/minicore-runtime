@@ -40,7 +40,6 @@ REQUIRED_DIRS = {
     "src/conversation",
     "src/context",
     "src/model",
-    "src/model/providers",
     "src/prompt",
     "src/runtime",
     "src/session",
@@ -84,14 +83,12 @@ REQUIRED_FILES = {
     "src/event.rs",
     "src/ids.rs",
     "src/lib.rs",
-    "src/model/gateway.rs",
+    "src/model/legacy_gateway.rs",
+    "src/model/legacy_provider.rs",
+    "src/model/legacy_registry.rs",
+    "src/model/model.rs",
     "src/model/mod.rs",
-    "src/model/provider.rs",
-    "src/model/providers/anthropic.rs",
-    "src/model/providers/mod.rs",
-    "src/model/providers/openai.rs",
-    "src/model/registry.rs",
-    "src/model/transport.rs",
+    "src/model/response.rs",
     "src/model/types.rs",
     "src/prompt/builder.rs",
     "src/prompt/compaction.rs",
@@ -254,7 +251,6 @@ EXPECTED_DIRECT_DEPENDENCIES = {
     "tokio-util",
     "fs4",
     "futures-util",
-    "reqwest",
 }
 
 DIRECT_DEP_CONSUMERS = {
@@ -276,10 +272,9 @@ DIRECT_DEP_CONSUMERS = {
     ],
     "fs4": [("src/storage/store.rs", "use fs4::fs_std::FileExt;")],
     "futures-util": [("src/agent/runner.rs", "use futures_util::FutureExt;")],
-    "reqwest": [("src/model/providers/openai.rs", "use reqwest::header")],
 }
 
-REMOVED_DEPENDENCIES = ("base64", "regex-syntax", "same-file", "file-id")
+REMOVED_DEPENDENCIES = ("base64", "regex-syntax", "same-file", "file-id", "reqwest")
 FORBIDDEN_MANIFEST_TOKENS = ("heavy-tests", "raw_value", "arbitrary_precision")
 
 EXPECTED_MODULE_VISIBILITY = {
@@ -298,14 +293,13 @@ EXPECTED_MODULE_VISIBILITY = {
     "src/compaction/mod.rs": {"strategy": "private"},
     "src/context/mod.rs": {"provider": "private"},
     "src/model/mod.rs": {
-        "gateway": "private",
-        "provider": "private",
-        "providers": "private",
-        "registry": "private",
-        "transport": "crate",
+        "legacy_gateway": "private",
+        "legacy_provider": "crate",
+        "legacy_registry": "private",
+        "model_port": "private",
+        "response": "private",
         "types": "private",
     },
-    "src/model/providers/mod.rs": {"anthropic": "private", "openai": "private"},
     "src/prompt/mod.rs": {"builder": "private", "compaction": "private"},
     "src/runtime/mod.rs": {"runtime_impl": "private", "session_manager": "private"},
     "src/session/mod.rs": {
@@ -427,7 +421,12 @@ def check_source_tokens(sources: Dict[str, str]) -> List[str]:
     errors: List[str] = []
     for path in sorted(sources):
         text = sources[path]
-        if "#[path" in text:
+        allowed_model_port = '#[path = "model.rs"]\nmod model_port;'
+        if "#[path" in text and not (
+            path == "src/model/mod.rs"
+            and text.count("#[path") == 1
+            and allowed_model_port in text
+        ):
             errors.append(f"{path}: #[path] module aliases are forbidden")
         for token in FORBIDDEN_SOURCE_TOKENS:
             if token in text:
@@ -702,23 +701,6 @@ def check_dependencies(sources: Dict[str, str]) -> Tuple[List[str], List[str]]:
     for token in FORBIDDEN_MANIFEST_TOKENS:
         if re.search(rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])", cargo):
             errors.append(f"Cargo.toml: forbidden manifest token remains: {token}")
-
-    reqwest = re.search(r"(?ms)^\s*reqwest\s*=\s*\{(.*?)\}", section)
-    if reqwest is None:
-        errors.append("Cargo.toml: reqwest must use an explicit inline dependency table")
-    else:
-        spec = reqwest.group(1)
-        features_match = re.search(r"features\s*=\s*\[([^]]*)\]", spec)
-        features = set(re.findall(r'"([^"]+)"', features_match.group(1))) if features_match else set()
-        if "json" in features or features != {"rustls", "stream"}:
-            errors.append(
-                "Cargo.toml: reqwest features must be exactly rustls and stream, "
-                f"found={sorted(features)}"
-            )
-        if not re.search(r"default-features\s*=\s*false", spec):
-            errors.append("Cargo.toml: reqwest default-features=false is required")
-        if not re.search(r'version\s*=\s*"=0.13.4"', spec):
-            errors.append("Cargo.toml: reqwest version must remain exactly =0.13.4")
 
     return errors, sorted(names)
 
@@ -1441,7 +1423,7 @@ use crate::{
             "internal crate-import self-check mismatch: "
             f"expected={sorted(expected_targets)} actual={sorted(extract_crate_targets(grouped))}"
         )
-    depth_three = "src/model/providers/anthropic.rs"
+    depth_three = "src/session/nested/worker.rs"
     if not super_escape_errors(depth_three, "use super::super::super::Value;\n"):
         errors.append("internal super escape self-check missed a depth-three escape")
     if super_escape_errors(depth_three, "use super::Value;\n") or super_escape_errors(
@@ -1462,14 +1444,14 @@ use crate::{
     inline_visibility = inline_mod_declarations("mod inline_mod { }\n")
     comment_inline = inline_mod_declarations("pub /* comment */ mod leaked { }\n")
     comment_export, comment_owners, unsupported_exports = parse_root_pub_uses(
-        "pub /* comment */ use model /* comment */ :: ProviderRegistry;\n"
+        "pub /* comment */ use model /* comment */ :: Model;\n"
         "pub use model::Other as Alias;\n"
     )
     if (
         visibility != expected_visibility
         or inline_visibility != {"inline_mod": "private"}
         or comment_inline != {"leaked": "public"}
-        or comment_export != {"model": {"ProviderRegistry"}}
+        or comment_export != {"model": {"Model"}}
         or comment_owners != ["model"]
         or unsupported_exports != ["pub use model::Other as Alias;"]
     ):
@@ -1480,6 +1462,17 @@ use crate::{
             f"comment_export={comment_export} comment_owners={comment_owners} "
             f"unsupported_exports={unsupported_exports}"
         )
+
+    path_alias_errors = check_source_tokens(
+        {"src/model/mod.rs": '#[path = "model.rs"]\nmod model_port;\n'}
+    )
+    wrong_path_alias_errors = check_source_tokens(
+        {"src/model/mod.rs": '#[path = "port.rs"]\nmod model_port;\n'}
+    )
+    if path_alias_errors or not any(
+        "#[path] module aliases are forbidden" in error for error in wrong_path_alias_errors
+    ):
+        errors.append("internal canonical model path-alias self-check mismatch")
 
     exact_port_use = "use crate::conversation::{ConversationEntry, ConversationSeq};\n"
     exact_port_source = """\

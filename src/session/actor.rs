@@ -20,7 +20,8 @@ use crate::config::RetryPolicy;
 use crate::error::{PublicErrorCode, PublicErrorSummary, SessionError};
 use crate::ids::{InteractionId, TurnId};
 use crate::model::{
-    ModelDescriptor, ModelEvent, ModelGateway, ModelSelection, ReasoningPreference, Usage,
+    LegacyModelDescriptor, LegacyModelEvent, LegacyModelGateway, LegacyModelSelection,
+    ReasoningPreference, Usage,
 };
 use crate::prompt::{CompactionConfig, Compactor, PromptBuildOptions, PromptBuilder};
 use crate::storage::conversation::{
@@ -39,7 +40,7 @@ use crate::workspace::Workspace;
 const MAX_CLOSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(crate) struct SessionActorDependencies {
-    pub(crate) model_gateway: ModelGateway,
+    pub(crate) model_gateway: LegacyModelGateway,
     pub(crate) tool_registry: ToolRegistry,
     pub(crate) tool_policy: Arc<dyn LegacyToolPolicy>,
     pub(crate) coding_instructions: Arc<str>,
@@ -283,7 +284,10 @@ impl SessionActor {
                 biased;
                 _ = self.close_requested.cancelled() => ActiveSignal::Close,
                 result = &mut active.task => ActiveSignal::Finished(result.ok()),
-                event = recv_runner_event(&mut active.events, active.events_open) => ActiveSignal::Event(event),
+                event = recv_runner_event(
+                    &mut active.events,
+                    active.events_open,
+                ) => ActiveSignal::Event(event),
                 request = self.interactions.recv(), if self.interactions_open => {
                     ActiveSignal::Interaction(request)
                 }
@@ -647,10 +651,10 @@ impl SessionActor {
     async fn handle_runner_event(&mut self, event: RunnerEvent) -> Result<(), SessionError> {
         let turn_id = self.active.as_ref().ok_or(SessionError::Internal)?.turn_id;
         let event = match event {
-            RunnerEvent::Model(ModelEvent::TextDelta { delta }) => {
+            RunnerEvent::Model(LegacyModelEvent::TextDelta { delta }) => {
                 SessionEvent::TextDelta { turn_id, delta }
             }
-            RunnerEvent::Model(ModelEvent::ReasoningDelta { delta }) => {
+            RunnerEvent::Model(LegacyModelEvent::ReasoningDelta { delta }) => {
                 SessionEvent::ReasoningDelta { turn_id, delta }
             }
             RunnerEvent::ToolStarted(call) => {
@@ -858,7 +862,10 @@ impl SessionActor {
                 tokio::select! {
                     biased;
                     result = &mut active.task => return result.ok(),
-                    event = recv_runner_event(&mut active.events, active.events_open) => ActiveSignal::Event(event),
+                    event = recv_runner_event(
+                        &mut active.events,
+                        active.events_open,
+                    ) => ActiveSignal::Event(event),
                     request = self.interactions.recv(), if self.interactions_open => {
                         ActiveSignal::Interaction(request)
                     }
@@ -946,8 +953,8 @@ async fn recv_runner_event(
 }
 
 fn validate_descriptor(
-    descriptor: &ModelDescriptor,
-    selection: &ModelSelection,
+    descriptor: &LegacyModelDescriptor,
+    selection: &LegacyModelSelection,
 ) -> Result<(), SessionError> {
     if descriptor.selection() != selection
         || !descriptor.supports_reasoning(ReasoningPreference::Auto)
@@ -1046,10 +1053,12 @@ mod tests {
     use super::*;
     use crate::config::RetryPolicy;
     use crate::ids::{SessionId, TurnId};
+    use crate::model::legacy_provider::{LegacyModelFuture, LegacyModelProvider};
     use crate::model::{
-        AssistantPart, ModelCallContext, ModelDescriptor, ModelError, ModelEvent,
-        ModelFinishReason, ModelFuture, ModelGateway, ModelLimits, ModelProvider, ModelRequest,
-        ModelResponse, ModelSelection, ProviderId, ProviderRegistry, ReasoningPreference, Usage,
+        AssistantPart, LegacyModelCallContext, LegacyModelDescriptor, LegacyModelEvent,
+        LegacyModelGateway, LegacyModelSelection, LegacyProviderId, LegacyProviderRegistry,
+        ModelError, ModelFinishReason, ModelLimits, ModelRequest, ModelResponse,
+        ReasoningPreference, Usage,
     };
     use crate::storage::conversation::{
         ConversationEntry, ConversationLog, NewConversationEntry, StoredTurnOutcome,
@@ -1144,14 +1153,14 @@ mod tests {
     }
 
     struct NoopProvider {
-        id: ProviderId,
-        descriptor: ModelDescriptor,
+        id: LegacyProviderId,
+        descriptor: LegacyModelDescriptor,
     }
 
     enum ScriptedStep {
         Response {
             response: ModelResponse,
-            event: Option<ModelEvent>,
+            event: Option<LegacyModelEvent>,
         },
         Pending,
     }
@@ -1217,21 +1226,25 @@ mod tests {
     }
 
     struct ScriptedProvider {
-        id: ProviderId,
-        descriptor: ModelDescriptor,
+        id: LegacyProviderId,
+        descriptor: LegacyModelDescriptor,
         steps: Arc<Mutex<VecDeque<ScriptedStep>>>,
     }
 
-    impl ModelProvider for ScriptedProvider {
-        fn id(&self) -> &ProviderId {
+    impl LegacyModelProvider for ScriptedProvider {
+        fn id(&self) -> &LegacyProviderId {
             &self.id
         }
 
-        fn models(&self) -> &[ModelDescriptor] {
+        fn models(&self) -> &[LegacyModelDescriptor] {
             std::slice::from_ref(&self.descriptor)
         }
 
-        fn generate(&self, _request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'_> {
+        fn generate(
+            &self,
+            _request: ModelRequest,
+            ctx: LegacyModelCallContext,
+        ) -> LegacyModelFuture<'_> {
             let step = self
                 .steps
                 .lock()
@@ -1254,23 +1267,27 @@ mod tests {
         }
     }
 
-    impl ModelProvider for NoopProvider {
-        fn id(&self) -> &ProviderId {
+    impl LegacyModelProvider for NoopProvider {
+        fn id(&self) -> &LegacyProviderId {
             &self.id
         }
 
-        fn models(&self) -> &[ModelDescriptor] {
+        fn models(&self) -> &[LegacyModelDescriptor] {
             std::slice::from_ref(&self.descriptor)
         }
 
-        fn generate(&self, _request: ModelRequest, _ctx: ModelCallContext) -> ModelFuture<'_> {
+        fn generate(
+            &self,
+            _request: ModelRequest,
+            _ctx: LegacyModelCallContext,
+        ) -> LegacyModelFuture<'_> {
             let future: Pin<Box<dyn Future<Output = Result<ModelResponse, ModelError>> + Send>> =
                 Box::pin(async { Err(ModelError::Internal) });
             future
         }
     }
 
-    fn dependencies(gateway: ModelGateway) -> SessionActorDependencies {
+    fn dependencies(gateway: LegacyModelGateway) -> SessionActorDependencies {
         SessionActorDependencies {
             model_gateway: gateway,
             tool_registry: ToolRegistry::builder().build(),
@@ -1310,7 +1327,8 @@ mod tests {
         let workspace_root = root.join("workspace");
         fs::create_dir_all(&workspace_root).unwrap();
         let store = SessionStore::open(root.clone()).await.unwrap();
-        let selection = ModelSelection::new("noop".parse().unwrap(), "model".parse().unwrap());
+        let selection =
+            LegacyModelSelection::new("noop".parse().unwrap(), "model".parse().unwrap());
         let config = StoredSessionConfig::new(
             id,
             timestamp(),
@@ -1333,7 +1351,7 @@ mod tests {
         (store, log, workspace, config, root)
     }
 
-    fn gateway(selection: &ModelSelection) -> ModelGateway {
+    fn gateway(selection: &LegacyModelSelection) -> LegacyModelGateway {
         gateway_with_reasoning(
             selection,
             BTreeSet::from([ReasoningPreference::Auto, ReasoningPreference::Disabled]),
@@ -1341,10 +1359,10 @@ mod tests {
     }
 
     fn gateway_with_reasoning(
-        selection: &ModelSelection,
+        selection: &LegacyModelSelection,
         supported_reasoning: BTreeSet<ReasoningPreference>,
-    ) -> ModelGateway {
-        let descriptor = ModelDescriptor::new(
+    ) -> LegacyModelGateway {
+        let descriptor = LegacyModelDescriptor::new(
             selection.clone(),
             "noop-model",
             ModelLimits::default(),
@@ -1355,13 +1373,16 @@ mod tests {
             id: selection.provider_id().clone(),
             descriptor,
         };
-        let mut providers = ProviderRegistry::builder();
+        let mut providers = LegacyProviderRegistry::builder();
         providers.register(provider).unwrap();
-        ModelGateway::new(providers.build())
+        LegacyModelGateway::new(providers.build())
     }
 
-    fn scripted_gateway(selection: &ModelSelection, steps: Vec<ScriptedStep>) -> ModelGateway {
-        let descriptor = ModelDescriptor::new(
+    fn scripted_gateway(
+        selection: &LegacyModelSelection,
+        steps: Vec<ScriptedStep>,
+    ) -> LegacyModelGateway {
+        let descriptor = LegacyModelDescriptor::new(
             selection.clone(),
             "scripted-model",
             ModelLimits::default(),
@@ -1373,9 +1394,9 @@ mod tests {
             descriptor,
             steps: Arc::new(Mutex::new(steps.into_iter().collect())),
         };
-        let mut providers = ProviderRegistry::builder();
+        let mut providers = LegacyProviderRegistry::builder();
         providers.register(provider).unwrap();
-        ModelGateway::new(providers.build())
+        LegacyModelGateway::new(providers.build())
     }
 
     fn text_response(text: &str) -> ModelResponse {
@@ -1407,7 +1428,7 @@ mod tests {
     }
 
     fn dependencies_with(
-        gateway: ModelGateway,
+        gateway: LegacyModelGateway,
         tool_registry: ToolRegistry,
         tool_policy: Arc<dyn LegacyToolPolicy>,
     ) -> SessionActorDependencies {
@@ -1511,7 +1532,7 @@ mod tests {
             config.model().selection(),
             vec![ScriptedStep::Response {
                 response: text_response("done"),
-                event: Some(ModelEvent::TextDelta {
+                event: Some(LegacyModelEvent::TextDelta {
                     delta: "delta".to_owned(),
                 }),
             }],
@@ -1525,9 +1546,11 @@ mod tests {
         .await
         .unwrap();
         let mut stream = handle.subscribe().unwrap();
-        assert!(
-            matches!(stream.recv().await, Some(SessionEvent::Snapshot(snapshot)) if snapshot.status() == SessionStatus::Idle)
-        );
+        assert!(matches!(
+            stream.recv().await,
+            Some(SessionEvent::Snapshot(snapshot))
+                if snapshot.status() == SessionStatus::Idle
+        ));
         let actor_task = tokio::runtime::Handle::current().spawn(actor.run());
         let turn_id = handle.submit("question".to_owned()).await.unwrap();
         assert_eq!(
@@ -1543,9 +1566,13 @@ mod tests {
             })
         );
         let finished = stream.recv().await.unwrap();
-        assert!(
-            matches!(finished, SessionEvent::TurnFinished { turn_id: finished_turn, outcome: TurnOutcome::Completed } if finished_turn == turn_id)
-        );
+        assert!(matches!(
+            finished,
+            SessionEvent::TurnFinished {
+                turn_id: finished_turn,
+                outcome: TurnOutcome::Completed,
+            } if finished_turn == turn_id
+        ));
         assert_eq!(handle.snapshot().status(), SessionStatus::Idle);
         assert_eq!(handle.snapshot().conversation_seq(), 3);
         assert_eq!(handle.snapshot().usage(), &Usage::new(1, 2, 3));
@@ -1719,7 +1746,10 @@ mod tests {
         );
         assert!(matches!(
             handle.snapshot().status(),
-            SessionStatus::WaitingForInput { interaction_id: current, .. } if current == interaction_id
+            SessionStatus::WaitingForInput {
+                interaction_id: current,
+                ..
+            } if current == interaction_id
         ));
         handle
             .answer(
@@ -2438,7 +2468,7 @@ mod tests {
             config,
             Arc::clone(&log),
             Arc::clone(&workspace),
-            dependencies(gateway(&ModelSelection::new(
+            dependencies(gateway(&LegacyModelSelection::new(
                 "noop".parse().unwrap(),
                 "model".parse().unwrap(),
             ))),
@@ -2654,7 +2684,10 @@ mod tests {
         assert_eq!(handle.cancel(), Ok(()));
         assert!(matches!(
             handle.snapshot().status(),
-            SessionStatus::WaitingForInput { interaction_id: current, .. } if current == interaction_id
+            SessionStatus::WaitingForInput {
+                interaction_id: current,
+                ..
+            } if current == interaction_id
         ));
         loop {
             if let SessionEvent::ToolFinished { result, .. } = stream.recv().await.unwrap() {
@@ -2765,7 +2798,7 @@ mod tests {
             config,
             Arc::clone(&log),
             Arc::clone(&workspace),
-            dependencies(gateway(&ModelSelection::new(
+            dependencies(gateway(&LegacyModelSelection::new(
                 "noop".parse().unwrap(),
                 "model".parse().unwrap(),
             ))),
@@ -2827,7 +2860,7 @@ mod tests {
             config,
             Arc::clone(&log),
             Arc::clone(&workspace),
-            dependencies(gateway(&ModelSelection::new(
+            dependencies(gateway(&LegacyModelSelection::new(
                 "noop".parse().unwrap(),
                 "model".parse().unwrap(),
             ))),
@@ -2854,7 +2887,7 @@ mod tests {
             config,
             Arc::clone(&log),
             Arc::clone(&workspace),
-            dependencies(gateway(&ModelSelection::new(
+            dependencies(gateway(&LegacyModelSelection::new(
                 "noop".parse().unwrap(),
                 "model".parse().unwrap(),
             ))),
@@ -2928,7 +2961,7 @@ mod tests {
             config,
             Arc::clone(&log),
             Arc::clone(&workspace),
-            dependencies(gateway(&ModelSelection::new(
+            dependencies(gateway(&LegacyModelSelection::new(
                 "noop".parse().unwrap(),
                 "model".parse().unwrap(),
             ))),

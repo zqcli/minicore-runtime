@@ -10,8 +10,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::context::TurnContext;
 use crate::model::{
-    DeliveryState, ModelCallContext, ModelError, ModelErrorKind, ModelEvent, ModelFinishReason,
-    ModelResponse, ToolCall, Usage,
+    DeliveryState, LegacyModelCallContext, LegacyModelEvent, ModelError, ModelErrorKind,
+    ModelFinishReason, ModelResponse, ToolCall, Usage,
 };
 use crate::prompt::{PromptError, append_validated_summary};
 use crate::storage::conversation::{ConversationError, NewConversationEntry};
@@ -30,7 +30,7 @@ const TOOL_EXECUTION_DENIED_TEXT: &str = "tool execution denied";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RunnerEvent {
-    Model(ModelEvent),
+    Model(LegacyModelEvent),
     ToolStarted(LegacyToolCallSummary),
     ToolFinished(LegacyToolResultSummary),
 }
@@ -123,9 +123,9 @@ impl RunnerEventSink {
     }
 }
 
-fn valid_model_event(event: &ModelEvent) -> bool {
+fn valid_model_event(event: &LegacyModelEvent) -> bool {
     let delta = match event {
-        ModelEvent::TextDelta { delta } | ModelEvent::ReasoningDelta { delta } => delta,
+        LegacyModelEvent::TextDelta { delta } | LegacyModelEvent::ReasoningDelta { delta } => delta,
     };
     !delta.is_empty()
         && delta.len() <= 64 * 1024
@@ -519,7 +519,7 @@ async fn generate_once(
     forward_events: bool,
 ) -> ModelAttempt {
     let (model_events, mut receiver) =
-        match crate::model::ModelEventSink::channel(MODEL_EVENT_CAPACITY) {
+        match crate::model::LegacyModelEventSink::channel(MODEL_EVENT_CAPACITY) {
             Ok(value) => value,
             Err(error) => {
                 return ModelAttempt {
@@ -528,20 +528,21 @@ async fn generate_once(
                 };
             }
         };
-    let call_context = match ModelCallContext::new(ctx.cancellation().clone(), model_events.clone())
-    {
-        Ok(context) => context,
-        Err(error) => {
-            return ModelAttempt {
-                result: Err(error),
-                observed_event: false,
-            };
-        }
-    };
-    let mut generation = Box::pin(
-        ctx.gateway()
-            .generate((*request).clone(), call_context.clone()),
-    );
+    let call_context =
+        match LegacyModelCallContext::new(ctx.cancellation().clone(), model_events.clone()) {
+            Ok(context) => context,
+            Err(error) => {
+                return ModelAttempt {
+                    result: Err(error),
+                    observed_event: false,
+                };
+            }
+        };
+    let mut generation = Box::pin(ctx.gateway().generate(
+        ctx.prompt_options().selection(),
+        (*request).clone(),
+        call_context.clone(),
+    ));
     let mut receiver_open = true;
     let mut observed_event = false;
     let result = loop {
@@ -584,16 +585,7 @@ async fn generate_once(
 }
 
 fn is_retryable(error: &ModelError) -> bool {
-    matches!(
-        (error.kind(), error.delivery()),
-        (
-            ModelErrorKind::ProviderUnavailable
-                | ModelErrorKind::RateLimited
-                | ModelErrorKind::Timeout
-                | ModelErrorKind::TransportUnavailable,
-            DeliveryState::NotSent | DeliveryState::RejectedBeforeExecution
-        )
-    )
+    error.retryable() && error.delivery() == DeliveryState::NotStarted
 }
 
 async fn wait_for_retry(cancellation: &CancellationToken, delay: Duration) -> bool {

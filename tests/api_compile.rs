@@ -18,7 +18,9 @@ mod v03_public_api_compile_contract {
         EventStreamTakenError, SessionError, SessionOpenError, SessionShutdownError, TurnWaitError,
     };
     use minicore_runtime::ids::TurnId;
-    use minicore_runtime::model::Model;
+    use minicore_runtime::model::{
+        Model, ModelCallContext, ModelDescriptor, ModelRequest, ModelStartFuture,
+    };
     use minicore_runtime::session::{
         InteractionAnswer, SessionEventEnvelope, SessionEventStream, SessionState, TurnOutcome,
     };
@@ -35,6 +37,8 @@ mod v03_public_api_compile_contract {
         create_log: Box<dyn SessionLog>,
         load_log: Box<dyn SessionLog>,
         model: Arc<dyn Model>,
+        model_request: ModelRequest,
+        model_context: ModelCallContext,
         tools: ToolSet,
         tool: Arc<dyn Tool>,
         policy: Arc<dyn ToolPolicy>,
@@ -42,6 +46,9 @@ mod v03_public_api_compile_contract {
         compaction: Arc<dyn CompactionStrategy>,
         runtime: tokio::runtime::Handle,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let _descriptor: &ModelDescriptor = model.descriptor();
+        let start: ModelStartFuture<'_> = model.start(model_request, model_context);
+        drop(start);
         let bindings =
             SessionBindings::new(model, tools, Some(policy), Some(context), Some(compaction));
         let options = SessionRuntimeOptions::new(

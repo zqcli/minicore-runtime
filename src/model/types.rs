@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
-use std::time::Duration;
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -14,8 +13,11 @@ use crate::tools::{
     LegacyToolOutput, ToolName, ToolOutput, ToolResultOutcome, validate_json_shape,
 };
 
+#[cfg(test)]
+use super::response::ModelError;
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum ModelIdentityError {
+pub(crate) enum LegacyModelIdentityError {
     #[error("model identity must be 1..=128 bytes")]
     InvalidLength,
     #[error("model identity violates its stable symbolic grammar")]
@@ -117,287 +119,12 @@ pub enum ModelValueError {
     DuplicateToolCallIndex,
     #[error("assistant tool call indices must be contiguous and ordered")]
     InvalidToolCallOrder,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelErrorKind {
-    InvalidRequest,
-    Unavailable,
-    ProviderUnavailable,
-    AuthMissing,
-    AuthRejected,
-    RateLimited,
-    QuotaExceeded,
-    ContextOverflow,
-    Timeout,
-    TransportUnavailable,
-    Cancelled,
-    InvalidProviderResponse,
-    IncompleteResponse,
-    StreamInterrupted,
-    RequestOutcomeUnknown,
-    UnexpectedToolCall,
-    Internal,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct ModelErrorDetails {
-    kind: ModelErrorKind,
-    delivery: DeliveryState,
-    retry_after_ms: Option<u64>,
-}
-
-impl ModelErrorDetails {
-    fn new(
-        kind: ModelErrorKind,
-        delivery: DeliveryState,
-        retry_after_ms: Option<u64>,
-    ) -> Result<Self, ModelError> {
-        if retry_after_ms.is_some()
-            && !(kind == ModelErrorKind::RateLimited
-                && delivery == DeliveryState::RejectedBeforeExecution)
-        {
-            return Err(ModelError::InvalidRequest);
-        }
-        let delivery_allowed = match kind {
-            ModelErrorKind::ProviderUnavailable
-            | ModelErrorKind::RateLimited
-            | ModelErrorKind::Timeout
-            | ModelErrorKind::TransportUnavailable => matches!(
-                delivery,
-                DeliveryState::NotSent | DeliveryState::RejectedBeforeExecution
-            ),
-            ModelErrorKind::QuotaExceeded | ModelErrorKind::AuthRejected => {
-                delivery == DeliveryState::RejectedBeforeExecution
-            }
-            ModelErrorKind::InvalidRequest | ModelErrorKind::ContextOverflow => matches!(
-                delivery,
-                DeliveryState::NotSent | DeliveryState::RejectedBeforeExecution
-            ),
-            ModelErrorKind::Unavailable | ModelErrorKind::AuthMissing => {
-                delivery == DeliveryState::NotSent
-            }
-            ModelErrorKind::Cancelled => true,
-            _ => true,
-        };
-        if !delivery_allowed {
-            return Err(ModelError::InvalidRequest);
-        }
-        if kind == ModelErrorKind::StreamInterrupted && delivery != DeliveryState::OutputStarted {
-            return Err(ModelError::InvalidRequest);
-        }
-        if kind == ModelErrorKind::RequestOutcomeUnknown && delivery != DeliveryState::Unknown {
-            return Err(ModelError::InvalidRequest);
-        }
-        Ok(Self {
-            kind,
-            delivery,
-            retry_after_ms,
-        })
-    }
-
-    pub const fn kind(&self) -> ModelErrorKind {
-        self.kind
-    }
-
-    pub const fn delivery(&self) -> DeliveryState {
-        self.delivery
-    }
-
-    pub const fn retry_after(&self) -> Option<Duration> {
-        match self.retry_after_ms {
-            Some(milliseconds) => Some(Duration::from_millis(milliseconds)),
-            None => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Serialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum ModelError {
-    #[error("model request is invalid")]
-    InvalidRequest,
-    #[error("model is unavailable")]
-    Unavailable,
-    #[error("model provider is unavailable")]
-    ProviderUnavailable,
-    #[error("model credentials are missing")]
-    AuthMissing,
-    #[error("model credentials were rejected")]
-    AuthRejected,
-    #[error("model provider rate limited the request")]
-    RateLimited,
-    #[error("model quota was exceeded")]
-    QuotaExceeded,
-    #[error("model request exceeds context limits")]
-    ContextOverflow,
-    #[error("model request timed out")]
-    Timeout,
-    #[error("model transport is unavailable")]
-    TransportUnavailable,
-    #[error("model request was cancelled")]
-    Cancelled,
-    #[error("model provider response is invalid")]
-    InvalidProviderResponse,
-    #[error("model response is incomplete")]
-    IncompleteResponse,
-    #[error("model stream was interrupted")]
-    StreamInterrupted,
-    #[error("model request outcome is unknown")]
-    RequestOutcomeUnknown,
-    #[error("model returned an unexpected tool call")]
-    UnexpectedToolCall,
-    #[error("model operation failed internally")]
-    Internal,
-    #[error("model operation failed")]
-    Detailed(ModelErrorDetails),
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-enum ModelErrorWire {
-    InvalidRequest,
-    Unavailable,
-    ProviderUnavailable,
-    AuthMissing,
-    AuthRejected,
-    RateLimited,
-    QuotaExceeded,
-    ContextOverflow,
-    Timeout,
-    TransportUnavailable,
-    Cancelled,
-    InvalidProviderResponse,
-    IncompleteResponse,
-    StreamInterrupted,
-    RequestOutcomeUnknown,
-    UnexpectedToolCall,
-    Internal,
-    Detailed {
-        kind: ModelErrorKind,
-        delivery: DeliveryState,
-        retry_after_ms: Option<u64>,
-    },
-}
-
-impl ModelError {
-    pub fn detailed(
-        kind: ModelErrorKind,
-        delivery: DeliveryState,
-        retry_after: Option<Duration>,
-    ) -> Result<Self, Self> {
-        let retry_after_ms = retry_after
-            .map(|value| value.as_millis().try_into())
-            .transpose()
-            .map_err(|_| Self::InvalidRequest)?;
-        Ok(Self::Detailed(ModelErrorDetails::new(
-            kind,
-            delivery,
-            retry_after_ms,
-        )?))
-    }
-
-    pub fn with_delivery(
-        kind: ModelErrorKind,
-        delivery: DeliveryState,
-        retry_after: Option<Duration>,
-    ) -> Result<Self, Self> {
-        Self::detailed(kind, delivery, retry_after)
-    }
-
-    pub const fn kind(self) -> ModelErrorKind {
-        match self {
-            Self::InvalidRequest => ModelErrorKind::InvalidRequest,
-            Self::Unavailable => ModelErrorKind::Unavailable,
-            Self::ProviderUnavailable => ModelErrorKind::ProviderUnavailable,
-            Self::AuthMissing => ModelErrorKind::AuthMissing,
-            Self::AuthRejected => ModelErrorKind::AuthRejected,
-            Self::RateLimited => ModelErrorKind::RateLimited,
-            Self::QuotaExceeded => ModelErrorKind::QuotaExceeded,
-            Self::ContextOverflow => ModelErrorKind::ContextOverflow,
-            Self::Timeout => ModelErrorKind::Timeout,
-            Self::TransportUnavailable => ModelErrorKind::TransportUnavailable,
-            Self::Cancelled => ModelErrorKind::Cancelled,
-            Self::InvalidProviderResponse => ModelErrorKind::InvalidProviderResponse,
-            Self::IncompleteResponse => ModelErrorKind::IncompleteResponse,
-            Self::StreamInterrupted => ModelErrorKind::StreamInterrupted,
-            Self::RequestOutcomeUnknown => ModelErrorKind::RequestOutcomeUnknown,
-            Self::UnexpectedToolCall => ModelErrorKind::UnexpectedToolCall,
-            Self::Internal => ModelErrorKind::Internal,
-            Self::Detailed(details) => details.kind(),
-        }
-    }
-
-    pub const fn delivery(&self) -> DeliveryState {
-        match self {
-            Self::Detailed(details) => details.delivery(),
-            Self::InvalidRequest
-            | Self::Unavailable
-            | Self::AuthMissing
-            | Self::ContextOverflow
-            | Self::Cancelled => DeliveryState::NotSent,
-            Self::AuthRejected | Self::QuotaExceeded | Self::RateLimited => {
-                DeliveryState::RejectedBeforeExecution
-            }
-            Self::StreamInterrupted => DeliveryState::OutputStarted,
-            Self::RequestOutcomeUnknown => DeliveryState::Unknown,
-            Self::ProviderUnavailable
-            | Self::Timeout
-            | Self::TransportUnavailable
-            | Self::InvalidProviderResponse
-            | Self::IncompleteResponse
-            | Self::UnexpectedToolCall
-            | Self::Internal => DeliveryState::Unknown,
-        }
-    }
-
-    pub const fn delivery_state(&self) -> DeliveryState {
-        self.delivery()
-    }
-
-    pub const fn retry_after(&self) -> Option<Duration> {
-        match self {
-            Self::Detailed(details) => details.retry_after(),
-            _ => None,
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for ModelError {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = match ModelErrorWire::deserialize(deserializer)? {
-            ModelErrorWire::InvalidRequest => Self::InvalidRequest,
-            ModelErrorWire::Unavailable => Self::Unavailable,
-            ModelErrorWire::ProviderUnavailable => Self::ProviderUnavailable,
-            ModelErrorWire::AuthMissing => Self::AuthMissing,
-            ModelErrorWire::AuthRejected => Self::AuthRejected,
-            ModelErrorWire::RateLimited => Self::RateLimited,
-            ModelErrorWire::QuotaExceeded => Self::QuotaExceeded,
-            ModelErrorWire::ContextOverflow => Self::ContextOverflow,
-            ModelErrorWire::Timeout => Self::Timeout,
-            ModelErrorWire::TransportUnavailable => Self::TransportUnavailable,
-            ModelErrorWire::Cancelled => Self::Cancelled,
-            ModelErrorWire::InvalidProviderResponse => Self::InvalidProviderResponse,
-            ModelErrorWire::IncompleteResponse => Self::IncompleteResponse,
-            ModelErrorWire::StreamInterrupted => Self::StreamInterrupted,
-            ModelErrorWire::RequestOutcomeUnknown => Self::RequestOutcomeUnknown,
-            ModelErrorWire::UnexpectedToolCall => Self::UnexpectedToolCall,
-            ModelErrorWire::Internal => Self::Internal,
-            ModelErrorWire::Detailed {
-                kind,
-                delivery,
-                retry_after_ms,
-            } => Self::Detailed(
-                ModelErrorDetails::new(kind, delivery, retry_after_ms)
-                    .map_err(serde::de::Error::custom)?,
-            ),
-        };
-        Ok(value)
-    }
+    #[error("model descriptor is invalid")]
+    InvalidDescriptor,
+    #[error("model stream event is invalid")]
+    InvalidEvent,
+    #[error("model request tools are invalid or not strictly ordered")]
+    InvalidTools,
 }
 
 fn deserialize_from_str<'de, D, T>(deserializer: D) -> Result<T, D::Error>
@@ -421,20 +148,14 @@ fn valid_text(value: &str, maximum: usize) -> bool {
 macro_rules! model_identity {
     ($name:ident, $allow_slash:literal) => {
         #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub struct $name(Box<str>);
-
-        impl $name {
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
+        pub(crate) struct $name(Box<str>);
 
         impl FromStr for $name {
-            type Err = ModelIdentityError;
+            type Err = LegacyModelIdentityError;
 
             fn from_str(value: &str) -> Result<Self, Self::Err> {
                 if value.is_empty() || value.len() > 128 {
-                    return Err(ModelIdentityError::InvalidLength);
+                    return Err(LegacyModelIdentityError::InvalidLength);
                 }
                 let valid = value.bytes().all(|byte| {
                     byte.is_ascii_alphanumeric()
@@ -442,7 +163,7 @@ macro_rules! model_identity {
                         || ($allow_slash && byte == b'/')
                 });
                 if !valid {
-                    return Err(ModelIdentityError::InvalidGrammar);
+                    return Err(LegacyModelIdentityError::InvalidGrammar);
                 }
                 Ok(Self(value.into()))
             }
@@ -480,84 +201,28 @@ macro_rules! model_identity {
     };
 }
 
-model_identity!(ProviderId, false);
-model_identity!(ModelId, true);
-
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum ProviderItemIdError {
-    #[error("provider item id must be 1..=256 safe opaque ASCII bytes")]
-    Invalid,
-}
-
-#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ProviderItemId(Box<str>);
-
-impl ProviderItemId {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FromStr for ProviderItemId {
-    type Err = ProviderItemIdError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.is_empty()
-            || value.len() > 256
-            || value
-                .bytes()
-                .any(|byte| !(0x21..=0x7e).contains(&byte) || matches!(byte, b'"' | b'\\'))
-        {
-            return Err(ProviderItemIdError::Invalid);
-        }
-        Ok(Self(value.into()))
-    }
-}
-
-impl fmt::Debug for ProviderItemId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ProviderItemId(<redacted>)")
-    }
-}
-
-impl Serialize for ProviderItemId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for ProviderItemId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        value.parse().map_err(serde::de::Error::custom)
-    }
-}
+model_identity!(LegacyProviderId, false);
+model_identity!(LegacyModelId, true);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct ModelSelection {
-    provider_id: ProviderId,
-    model_id: ModelId,
+pub(crate) struct LegacyModelSelection {
+    provider_id: LegacyProviderId,
+    model_id: LegacyModelId,
 }
 
-impl ModelSelection {
-    pub const fn new(provider_id: ProviderId, model_id: ModelId) -> Self {
+impl LegacyModelSelection {
+    pub(crate) const fn new(provider_id: LegacyProviderId, model_id: LegacyModelId) -> Self {
         Self {
             provider_id,
             model_id,
         }
     }
 
-    pub const fn provider_id(&self) -> &ProviderId {
+    pub(crate) const fn provider_id(&self) -> &LegacyProviderId {
         &self.provider_id
     }
 
-    pub const fn model_id(&self) -> &ModelId {
+    pub(crate) const fn model_id(&self) -> &LegacyModelId {
         &self.model_id
     }
 }
@@ -582,6 +247,7 @@ pub struct ModelLimits {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ModelLimitsWire {
     context_window_tokens: Option<u32>,
     max_output_tokens: Option<u32>,
@@ -622,16 +288,17 @@ impl<'de> Deserialize<'de> for ModelLimits {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub struct ModelDescriptor {
-    selection: ModelSelection,
+pub(crate) struct LegacyModelDescriptor {
+    selection: LegacyModelSelection,
     api_model_name: Box<str>,
     limits: ModelLimits,
     supported_reasoning: BTreeSet<ReasoningPreference>,
 }
 
-impl ModelDescriptor {
-    pub fn new(
-        selection: ModelSelection,
+impl LegacyModelDescriptor {
+    #[cfg(test)]
+    pub(crate) fn new(
+        selection: LegacyModelSelection,
         api_model_name: impl Into<String>,
         limits: ModelLimits,
         supported_reasoning: BTreeSet<ReasoningPreference>,
@@ -654,11 +321,11 @@ impl ModelDescriptor {
         })
     }
 
-    pub const fn selection(&self) -> &ModelSelection {
+    pub(crate) const fn selection(&self) -> &LegacyModelSelection {
         &self.selection
     }
 
-    pub const fn limits(&self) -> &ModelLimits {
+    pub(crate) const fn limits(&self) -> &ModelLimits {
         &self.limits
     }
 
@@ -666,19 +333,15 @@ impl ModelDescriptor {
         &self.api_model_name
     }
 
-    pub fn supported_reasoning(&self) -> &BTreeSet<ReasoningPreference> {
-        &self.supported_reasoning
-    }
-
-    pub fn supports_reasoning(&self, preference: ReasoningPreference) -> bool {
+    pub(crate) fn supports_reasoning(&self, preference: ReasoningPreference) -> bool {
         self.supported_reasoning.contains(&preference)
     }
 }
 
-impl fmt::Debug for ModelDescriptor {
+impl fmt::Debug for LegacyModelDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ModelDescriptor")
+            .debug_struct("LegacyModelDescriptor")
             .field("selection", &self.selection)
             .field("limits", &self.limits)
             .field("supported_reasoning", &self.supported_reasoning)
@@ -686,7 +349,7 @@ impl fmt::Debug for ModelDescriptor {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AssistantPart {
     Text(String),
@@ -695,7 +358,12 @@ pub enum AssistantPart {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 enum AssistantPartWire {
     Text(String),
     Reasoning(ReasoningContent),
@@ -708,16 +376,15 @@ pub struct ReasoningContent {
     summary: Option<String>,
     encrypted: Option<String>,
     signature: Option<String>,
-    provider_item_id: Option<ProviderItemId>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReasoningContentWire {
     text: Option<String>,
     summary: Option<String>,
     encrypted: Option<String>,
     signature: Option<String>,
-    provider_item_id: Option<ProviderItemId>,
 }
 
 impl ReasoningContent {
@@ -726,7 +393,6 @@ impl ReasoningContent {
         summary: Option<String>,
         encrypted: Option<String>,
         signature: Option<String>,
-        provider_item_id: Option<ProviderItemId>,
     ) -> Result<Self, ModelValueError> {
         validate_optional_text(&text, 262_144)?;
         validate_optional_text(&summary, 131_072)?;
@@ -740,7 +406,6 @@ impl ReasoningContent {
             summary,
             encrypted,
             signature,
-            provider_item_id,
         })
     }
 
@@ -759,9 +424,24 @@ impl ReasoningContent {
     pub fn signature(&self) -> Option<&str> {
         self.signature.as_deref()
     }
+}
 
-    pub const fn provider_item_id(&self) -> Option<&ProviderItemId> {
-        self.provider_item_id.as_ref()
+impl fmt::Debug for AssistantPart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => formatter
+                .debug_struct("AssistantPart::Text")
+                .field("text_bytes", &text.len())
+                .finish(),
+            Self::Reasoning(reasoning) => formatter
+                .debug_tuple("AssistantPart::Reasoning")
+                .field(reasoning)
+                .finish(),
+            Self::ToolCall(call) => formatter
+                .debug_tuple("AssistantPart::ToolCall")
+                .field(call)
+                .finish(),
+        }
     }
 }
 
@@ -773,7 +453,6 @@ impl fmt::Debug for ReasoningContent {
             .field("summary_bytes", &self.summary.as_ref().map(String::len))
             .field("has_encrypted", &self.encrypted.is_some())
             .field("has_signature", &self.signature.is_some())
-            .field("has_provider_item_id", &self.provider_item_id.is_some())
             .finish()
     }
 }
@@ -784,14 +463,8 @@ impl<'de> Deserialize<'de> for ReasoningContent {
         D: Deserializer<'de>,
     {
         let value = ReasoningContentWire::deserialize(deserializer)?;
-        Self::new(
-            value.text,
-            value.summary,
-            value.encrypted,
-            value.signature,
-            value.provider_item_id,
-        )
-        .map_err(serde::de::Error::custom)
+        Self::new(value.text, value.summary, value.encrypted, value.signature)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -959,7 +632,7 @@ impl<'de> Deserialize<'de> for ToolCall {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(tag = "role", content = "content", rename_all = "snake_case")]
 pub enum ModelMessage {
     System(String),
@@ -984,6 +657,36 @@ enum ModelMessageWire {
         output: ToolOutput,
         outcome: ToolResultOutcome,
     },
+}
+
+impl fmt::Debug for ModelMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::System(text) => formatter
+                .debug_struct("ModelMessage::System")
+                .field("text_bytes", &text.len())
+                .finish(),
+            Self::User(text) => formatter
+                .debug_struct("ModelMessage::User")
+                .field("text_bytes", &text.len())
+                .finish(),
+            Self::Assistant(parts) => formatter
+                .debug_struct("ModelMessage::Assistant")
+                .field("part_count", &parts.len())
+                .field("parts", parts)
+                .finish(),
+            Self::Tool {
+                tool_call_id,
+                output,
+                outcome,
+            } => formatter
+                .debug_struct("ModelMessage::Tool")
+                .field("tool_call_id", tool_call_id)
+                .field("output", output)
+                .field("outcome", outcome)
+                .finish(),
+        }
+    }
 }
 
 impl ModelMessage {
@@ -1082,9 +785,8 @@ impl<'de> Deserialize<'de> for ModelMessage {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ModelRequest {
-    selection: ModelSelection,
     messages: Vec<ModelMessage>,
     tools: Vec<ToolSpec>,
     limits: ModelLimits,
@@ -1092,8 +794,8 @@ pub struct ModelRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ModelRequestWire {
-    selection: ModelSelection,
     messages: Vec<ModelMessage>,
     tools: Vec<ToolSpec>,
     limits: ModelLimits,
@@ -1102,7 +804,6 @@ struct ModelRequestWire {
 
 impl ModelRequest {
     pub fn new(
-        selection: ModelSelection,
         messages: Vec<ModelMessage>,
         tools: Vec<ToolSpec>,
         limits: ModelLimits,
@@ -1112,17 +813,13 @@ impl ModelRequest {
             return Err(ModelValueError::EmptyMessages);
         }
         validate_tool_exchange(&messages)?;
+        validate_request_tools(&tools)?;
         Ok(Self {
-            selection,
             messages,
             tools,
             limits,
             reasoning,
         })
-    }
-
-    pub const fn selection(&self) -> &ModelSelection {
-        &self.selection
     }
 
     pub fn messages(&self) -> &[ModelMessage] {
@@ -1142,20 +839,26 @@ impl ModelRequest {
     }
 }
 
+impl fmt::Debug for ModelRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelRequest")
+            .field("message_count", &self.messages.len())
+            .field("tool_count", &self.tools.len())
+            .field("limits", &self.limits)
+            .field("reasoning", &self.reasoning)
+            .finish()
+    }
+}
+
 impl<'de> Deserialize<'de> for ModelRequest {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let value = ModelRequestWire::deserialize(deserializer)?;
-        Self::new(
-            value.selection,
-            value.messages,
-            value.tools,
-            value.limits,
-            value.reasoning,
-        )
-        .map_err(serde::de::Error::custom)
+        Self::new(value.messages, value.tools, value.limits, value.reasoning)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -1264,17 +967,7 @@ impl Usage {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeliveryState {
-    NotSent,
-    RejectedBeforeExecution,
-    AcceptedNoOutput,
-    OutputStarted,
-    Unknown,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ModelResponse {
     parts: Vec<AssistantPart>,
     finish_reason: ModelFinishReason,
@@ -1282,6 +975,7 @@ pub struct ModelResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ModelResponseWire {
     parts: Vec<AssistantPart>,
     finish_reason: ModelFinishReason,
@@ -1318,6 +1012,18 @@ impl ModelResponse {
     }
 }
 
+impl fmt::Debug for ModelResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelResponse")
+            .field("part_count", &self.parts.len())
+            .field("parts", &self.parts)
+            .field("finish_reason", &self.finish_reason)
+            .field("usage", &self.usage)
+            .finish()
+    }
+}
+
 impl<'de> Deserialize<'de> for ModelResponse {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1328,12 +1034,21 @@ impl<'de> Deserialize<'de> for ModelResponse {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum ModelEvent {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LegacyModelEvent {
     TextDelta { delta: String },
     ReasoningDelta { delta: String },
 }
+
+fn legacy_model_event_compile_anchor(delta: String, reasoning: bool) -> LegacyModelEvent {
+    if reasoning {
+        LegacyModelEvent::ReasoningDelta { delta }
+    } else {
+        LegacyModelEvent::TextDelta { delta }
+    }
+}
+
+const _: fn(String, bool) -> LegacyModelEvent = legacy_model_event_compile_anchor;
 
 fn validate_tool_call_order(parts: &[AssistantPart]) -> Result<(), ModelValueError> {
     let mut ids = BTreeSet::new();
@@ -1399,6 +1114,18 @@ fn validate_tool_exchange(messages: &[ModelMessage]) -> Result<(), ModelValueErr
     } else {
         Err(ModelValueError::IncompleteToolExchange)
     }
+}
+
+fn validate_request_tools(tools: &[ToolSpec]) -> Result<(), ModelValueError> {
+    let mut previous: Option<&ToolName> = None;
+    for tool in tools {
+        tool.validate().map_err(|_| ModelValueError::InvalidTools)?;
+        if previous.is_some_and(|previous| previous >= tool.name()) {
+            return Err(ModelValueError::InvalidTools);
+        }
+        previous = Some(tool.name());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -21,7 +21,7 @@ use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 
 use crate::config::{ConfigError, SessionConfig};
 use crate::ids::SessionId;
-use crate::model::{ModelId, ModelSelection, ProviderId};
+use crate::model::{LegacyModelId, LegacyModelSelection, LegacyProviderId};
 use crate::time::Timestamp;
 use crate::tools::ToolName;
 
@@ -92,15 +92,15 @@ pub(crate) enum StoreError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredModelConfig {
-    selection: ModelSelection,
+    selection: LegacyModelSelection,
 }
 
 impl StoredModelConfig {
-    pub(crate) const fn new(selection: ModelSelection) -> Self {
+    pub(crate) const fn new(selection: LegacyModelSelection) -> Self {
         Self { selection }
     }
 
-    pub(crate) const fn selection(&self) -> &ModelSelection {
+    pub(crate) const fn selection(&self) -> &LegacyModelSelection {
         &self.selection
     }
 }
@@ -299,8 +299,8 @@ impl Serialize for StoredModelConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredModelConfigRead {
-    provider: ProviderId,
-    model: ModelId,
+    provider: LegacyProviderId,
+    model: LegacyModelId,
 }
 
 impl<'de> Deserialize<'de> for StoredModelConfig {
@@ -309,7 +309,10 @@ impl<'de> Deserialize<'de> for StoredModelConfig {
         D: Deserializer<'de>,
     {
         let value = StoredModelConfigRead::deserialize(deserializer)?;
-        Ok(Self::new(ModelSelection::new(value.provider, value.model)))
+        Ok(Self::new(LegacyModelSelection::new(
+            value.provider,
+            value.model,
+        )))
     }
 }
 
@@ -1063,7 +1066,7 @@ mod tests {
     }
 
     fn sample_config(id: SessionId, workspace_root: &Path) -> StoredSessionConfig {
-        let model = StoredModelConfig::new(ModelSelection::new(
+        let model = StoredModelConfig::new(LegacyModelSelection::new(
             "anthropic".parse().unwrap(),
             "claude-sonnet".parse().unwrap(),
         ));
@@ -1142,7 +1145,7 @@ mod tests {
         assert!(StoredCompactionConfig::new(0, 0).is_err());
         assert!(StoredCompactionConfig::new(10, 10).is_err());
         assert!(StoredCompactionConfig::new(10, 11).is_err());
-        let model = StoredModelConfig::new(ModelSelection::new(
+        let model = StoredModelConfig::new(LegacyModelSelection::new(
             "anthropic".parse().unwrap(),
             "claude".parse().unwrap(),
         ));

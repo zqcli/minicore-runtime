@@ -1,8 +1,8 @@
 # Documentation Authority
 
 > The pages below retain the v0.2 reset record as transitional migration
-> evidence. The current v0.3 P3-B public Tool/ToolSet boundary is documented in
-> the root README, `docs/architecture.md`, and `docs/modules/README.md`.
+> evidence. The current v0.3 P3-D Model/Tool/policy Port boundaries are documented
+> in the root README, `docs/architecture.md`, and `docs/modules/README.md`.
 
 The transitional v0.2 documentation follows this order:
 

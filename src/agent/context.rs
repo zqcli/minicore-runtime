@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::RetryPolicy;
 use crate::ids::{SessionId, TurnId};
-use crate::model::{ModelGateway, ModelLimits, ReasoningPreference};
+use crate::model::{LegacyModelGateway, ModelLimits, ReasoningPreference};
 use crate::prompt::{Compactor, PromptBuildOptions, PromptBuilder};
 use crate::storage::conversation::ConversationLog;
 use crate::time::{Timestamp, TimestampError};
@@ -40,7 +40,7 @@ pub(crate) struct TurnContextDependencies {
     pub(crate) prompt_builder: PromptBuilder,
     pub(crate) prompt_options: PromptBuildOptions,
     pub(crate) compactor: Compactor,
-    pub(crate) gateway: ModelGateway,
+    pub(crate) gateway: LegacyModelGateway,
     pub(crate) tools: ToolRegistry,
     pub(crate) policy: Arc<dyn LegacyToolPolicy>,
     pub(crate) workspace: Arc<Workspace>,
@@ -58,7 +58,7 @@ pub(crate) struct TurnContext {
     prompt_builder: PromptBuilder,
     prompt_options: PromptBuildOptions,
     compactor: Compactor,
-    gateway: ModelGateway,
+    gateway: LegacyModelGateway,
     tools: ToolRegistry,
     policy: Arc<dyn LegacyToolPolicy>,
     enabled_tools: BTreeSet<ToolName>,
@@ -159,7 +159,7 @@ impl TurnContext {
         &self.compactor
     }
 
-    pub(crate) const fn gateway(&self) -> &ModelGateway {
+    pub(crate) const fn gateway(&self) -> &LegacyModelGateway {
         &self.gateway
     }
 

@@ -2,8 +2,8 @@ use std::fmt::Debug;
 use std::str::FromStr;
 
 use minicore_runtime::model::{
-    AssistantPart, ModelFinishReason, ModelId, ModelLimits, ModelMessage, ModelRequest,
-    ModelResponse, ModelSelection, ProviderId, Usage,
+    AssistantPart, ModelFinishReason, ModelLimits, ModelMessage, ModelRequest, ModelResponse,
+    ReasoningContent, ToolCall, Usage,
 };
 use minicore_runtime::tools::{
     ToolInputAnswer, ToolInputAnswerKind, ToolInputRequest, ToolInvocation, ToolName, ToolOutput,
@@ -350,12 +350,7 @@ fn input_request_and_answer_validation_is_strict() {
 
 #[test]
 fn model_and_progress_values_remain_checked() {
-    let selection = ModelSelection::new(
-        ProviderId::from_str("openai").unwrap(),
-        ModelId::from_str("responses/gpt-5").unwrap(),
-    );
     let request = ModelRequest::new(
-        selection,
         vec![ModelMessage::user("hello").unwrap()],
         Vec::new(),
         ModelLimits::default(),
@@ -372,4 +367,114 @@ fn model_and_progress_values_remain_checked() {
     assert_json_round_trip(&response);
     assert!(ToolProgress::new(None, Some(2), Some(1)).is_err());
     assert!(ToolSet::default().specs_for(&Default::default()).is_empty());
+}
+
+#[test]
+fn public_model_wires_reject_unknown_fields() {
+    assert!(
+        serde_json::from_value::<ModelLimits>(json!({
+            "context_window_tokens": 1024,
+            "max_output_tokens": 128,
+            "extra": true
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<AssistantPart>(json!({
+            "type": "text",
+            "data": "hello",
+            "extra": true
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ReasoningContent>(json!({
+            "text": "thinking",
+            "extra": true
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ModelResponse>(json!({
+            "parts": [{"type": "text", "data": "done"}],
+            "finish_reason": "stop",
+            "usage": null,
+            "extra": true
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn public_model_debug_redacts_nested_payloads() {
+    let (_, _, _, call_id) = id_values();
+    let parts = vec![
+        AssistantPart::Text("assistant-text-secret".to_owned()),
+        AssistantPart::Reasoning(
+            ReasoningContent::new(
+                Some("reasoning-text-secret".to_owned()),
+                Some("reasoning-summary-secret".to_owned()),
+                Some("encrypted-secret-value".to_owned()),
+                Some("signature-secret-value".to_owned()),
+            )
+            .unwrap(),
+        ),
+        AssistantPart::ToolCall(
+            ToolCall::new(
+                call_id,
+                "safe_tool".parse().unwrap(),
+                json!({"argument-secret-key": "argument-secret-value"}),
+                0,
+            )
+            .unwrap(),
+        ),
+    ];
+    let assistant = ModelMessage::assistant(parts.clone()).unwrap();
+    let system = ModelMessage::system("system-text-secret").unwrap();
+    let user = ModelMessage::user("user-text-secret").unwrap();
+    let tool = ModelMessage::tool_with_outcome(
+        "call_00000000000000000000000000000001".parse().unwrap(),
+        ToolOutput::new("tool-output-secret").unwrap(),
+        ToolResultOutcome::Failed,
+    )
+    .unwrap();
+    let response =
+        ModelResponse::new(parts.clone(), ModelFinishReason::Stop, Usage::new(7, 3, 2)).unwrap();
+    let debug = format!("{parts:?} {assistant:?} {system:?} {user:?} {tool:?} {response:?}");
+
+    for secret in [
+        "assistant-text-secret",
+        "reasoning-text-secret",
+        "reasoning-summary-secret",
+        "encrypted-secret-value",
+        "signature-secret-value",
+        "argument-secret-key",
+        "argument-secret-value",
+        "system-text-secret",
+        "user-text-secret",
+        "tool-output-secret",
+    ] {
+        assert!(!debug.contains(secret), "debug leaked {secret}");
+    }
+    for safe_shape in [
+        "AssistantPart::Text",
+        "AssistantPart::Reasoning",
+        "AssistantPart::ToolCall",
+        "ModelMessage::Assistant",
+        "ModelMessage::System",
+        "ModelMessage::User",
+        "ModelMessage::Tool",
+        "part_count: 3",
+        "text_bytes:",
+        "summary_bytes:",
+        "call_00000000000000000000000000000001",
+        "safe_tool",
+        "call_index: 0",
+        "content_bytes: 18",
+        "outcome: Failed",
+        "finish_reason: Stop",
+        "input_tokens: Some(7)",
+    ] {
+        assert!(debug.contains(safe_shape), "debug omitted {safe_shape}");
+    }
 }
