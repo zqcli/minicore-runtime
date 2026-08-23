@@ -4,7 +4,9 @@ use std::sync::Arc;
 use serde_json::to_vec;
 use thiserror::Error;
 
-use crate::model::{ModelLimits, ModelMessage, ModelRequest, ModelSelection, ReasoningPreference};
+use crate::model::{
+    LegacyModelSelection, ModelLimits, ModelMessage, ModelRequest, ReasoningPreference,
+};
 use crate::storage::conversation::PromptConversationView;
 use crate::tools::{ToolName, ToolSpec};
 
@@ -84,14 +86,8 @@ impl PromptBuilder {
         validate_tools(tools)?;
         let estimated_input = estimate_serialized(&messages, tools)?;
         check_context(estimated_input, options.limits)?;
-        ModelRequest::new(
-            options.selection.clone(),
-            messages,
-            tools.to_vec(),
-            options.limits,
-            options.reasoning,
-        )
-        .map_err(|_| PromptError::InvalidRequest)
+        ModelRequest::new(messages, tools.to_vec(), options.limits, options.reasoning)
+            .map_err(|_| PromptError::InvalidRequest)
     }
 
     pub(super) fn estimate_parts(
@@ -137,14 +133,14 @@ impl PromptBuilder {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PromptBuildOptions {
-    selection: ModelSelection,
+    selection: LegacyModelSelection,
     limits: ModelLimits,
     reasoning: ReasoningPreference,
 }
 
 impl PromptBuildOptions {
     pub(crate) const fn new(
-        selection: ModelSelection,
+        selection: LegacyModelSelection,
         limits: ModelLimits,
         reasoning: ReasoningPreference,
     ) -> Self {
@@ -155,7 +151,7 @@ impl PromptBuildOptions {
         }
     }
 
-    pub(crate) const fn selection(&self) -> &ModelSelection {
+    pub(crate) const fn selection(&self) -> &LegacyModelSelection {
         &self.selection
     }
 

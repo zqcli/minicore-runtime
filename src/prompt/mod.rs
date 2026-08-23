@@ -43,8 +43,8 @@ mod tests {
     use super::*;
     use crate::ids::{SessionId, TurnId};
     use crate::model::{
-        AssistantPart, ModelFinishReason, ModelLimits, ModelMessage, ModelResponse, ModelSelection,
-        ReasoningContent, ReasoningPreference,
+        AssistantPart, LegacyModelSelection, ModelFinishReason, ModelLimits, ModelMessage,
+        ModelResponse, ReasoningContent, ReasoningPreference,
     };
     use crate::storage::conversation::{
         ConversationError, ConversationLog, NewConversationEntry, StoredTurnOutcome,
@@ -69,7 +69,7 @@ mod tests {
     }
 
     fn config(id: SessionId) -> StoredSessionConfig {
-        let model = StoredModelConfig::new(ModelSelection::new(
+        let model = StoredModelConfig::new(LegacyModelSelection::new(
             "anthropic".parse().unwrap(),
             "claude".parse().unwrap(),
         ));
@@ -112,7 +112,7 @@ mod tests {
 
     fn options(limits: ModelLimits, reasoning: ReasoningPreference) -> PromptBuildOptions {
         PromptBuildOptions::new(
-            ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+            LegacyModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
             limits,
             reasoning,
         )
@@ -217,8 +217,6 @@ mod tests {
             ]
         );
         assert_eq!(request.tools(), &[alpha, beta]);
-        assert_eq!(request.selection().provider_id().as_str(), "openai");
-        assert_eq!(request.selection().model_id().as_str(), "gpt-5");
         assert_eq!(request.limits(), &limits);
         assert_eq!(request.reasoning(), ReasoningPreference::Low);
         cleanup(&store, &log, root).await;
@@ -307,7 +305,6 @@ mod tests {
         let request = plan.clone_request();
         assert_eq!(request.reasoning(), ReasoningPreference::Disabled);
         assert!(request.tools().is_empty());
-        assert_eq!(request.selection().provider_id().as_str(), "openai");
         assert_eq!(request.limits(), &active_limits);
         assert_eq!(
             request.messages(),
@@ -450,7 +447,7 @@ mod tests {
         ));
         let reasoning = ModelResponse::new(
             vec![AssistantPart::Reasoning(
-                ReasoningContent::new(Some("thinking".to_owned()), None, None, None, None).unwrap(),
+                ReasoningContent::new(Some("thinking".to_owned()), None, None, None).unwrap(),
             )],
             ModelFinishReason::Stop,
             None,

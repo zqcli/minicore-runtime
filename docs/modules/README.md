@@ -15,7 +15,7 @@ This page maps the current v0.3 source graph. The v0.2 Runtime, concrete tool ad
 | `error` | Checked public error summaries and internal session errors |
 | `event` | Stable event-kind values |
 | `ids` | Checked identifiers, including `ContextSourceId` |
-| `model` | Transitional model/provider implementation used by the current internal runner |
+| `model` | Final direct streaming `Model` Port and shared checked DTOs plus private legacy runner lookup |
 | `session` | Public process-local interaction DTOs plus transitional actor/session implementation; its old observation facade is not a v0.3 public contract |
 | `storage` | `SessionLog` Port and private durable store implementation |
 | `tools` | Final public `Tool`/`ToolSet` execution seam plus private legacy runner scaffolding |
@@ -34,7 +34,9 @@ Legacy physical storage persists separately as `LegacyToolOutput { text, is_erro
 
 ## Model
 
-The current model/provider implementation remains transitional and private-by-ownership even though the `model` module is retained for migration evidence. Provider adapters own their wire encoding and bounded transport behavior; P3-B does not treat them as a Runtime facade.
+`src/model/model.rs` owns the direct `Model` Port, checked descriptor, process-local call context, and exact start/stream aliases. `src/model/response.rs` owns delivery-aware errors and the bounded typed stream grammar. `ModelRequest` is host-neutral: messages, tools, limits, and reasoning only.
+
+`src/model/legacy_gateway.rs`, `legacy_provider.rs`, and `legacy_registry.rs` are crate-private P5/P6 scaffolding for the old batch runner. Their identities are explicitly `Legacy*`; no public alias exposes lookup or provider concepts. Concrete OpenAI/Anthropic adapters, HTTP transport, root provider tests, and the root `reqwest` dependency were deleted in P3-D. The independent `provider-gate/` package remains separate evidence.
 
 ## Workspace
 
@@ -43,7 +45,7 @@ Workspace capability ownership remains a private transitional implementation det
 ## Other Owners
 
 - `config` owns checked kernel/session-spec values. `RuntimeConfig`, `RuntimeConfigBuilder`, and `SessionConfig` remain crate-private transitional values.
-- `model` owns the current internal provider gateway and protocol adapters. Provider integration tests are transitional evidence and do not establish a Runtime facade.
+- `model` owns the final direct Port and shared DTOs; legacy lookup remains private only until `ModelDriver` replaces the old runner path.
 - `conversation` owns confirmed state, durable append coordination, replay/recovery, transcript projection, and proof-gated load completion.
 - `storage` owns the current private filesystem store and exposes only the `SessionLog` Port to future v0.3 owners.
 - `session` and `runtime` retain old actor/lifecycle implementation only so the migration can proceed in later phases; neither is the P3-B public extension seam.
@@ -56,7 +58,7 @@ src/
 ├── conversation/{entry.rs,load.rs,log.rs,projection.rs,recovery.rs,state.rs,transcript.rs,validator.rs,view.rs}
 ├── context/{mod.rs,provider.rs}
 ├── compaction/{mod.rs,strategy.rs}
-├── model/{gateway.rs,mod.rs,provider.rs,registry.rs,transport.rs,types.rs}
+├── model/{legacy_gateway.rs,legacy_provider.rs,legacy_registry.rs,mod.rs,model.rs,response.rs,types.rs}
 ├── session/{actor.rs,command.rs,event.rs,event_stream.rs,interaction.rs,mod.rs,snapshot.rs,state.rs,transcript.rs}
 ├── storage/{mod.rs,session_log.rs,...private implementation files}
 └── tools/{context.rs,input.rs,legacy_context.rs,legacy_policy.rs,legacy_types.rs,mod.rs,policy.rs,progress.rs,registry.rs,set.rs,tool.rs,types.rs}
@@ -68,10 +70,11 @@ Concrete `src/tools/builtins/**` and `src/tools/process.rs` adapters were delete
 
 - `tests/tool_set_contract.rs` is the focused P3-B replacement for removed v0.2 Tool/Registry/concrete-adapter integration tests.
 - `tests/tool_policy_interaction_contract.rs` covers the final async policy Port, checked approvals, process-local interactions, matching answers, and source boundaries.
+- `tests/model_port_contract.rs` covers the direct Model trait/start/stream contract, descriptor/context/request neutrality, event grammar, error delivery/retry invariants, redaction, and shared concurrency.
 - `tests/p1_dto.rs` covers the final checked Tool DTOs and input-answer validation.
 - Private `src/tools/progress.rs` tests cover synchronous bounded `try_send` behavior.
 - Private `src/tools/legacy_types.rs` tests prove legacy failure output wire round-trip.
-- The removed v0.2 Runtime/provider smoke and Runtime surface tests are baseline evidence, not a complete replacement claim.
+- Removed v0.2 model registry, transport, concrete adapter, Runtime smoke, and Runtime surface tests are baseline evidence, not compatibility contracts.
 - SessionRuntime acceptance coverage is deferred to P4/P5.
 
 ## Boundary Rules

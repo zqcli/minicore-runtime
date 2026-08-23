@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::model::{ModelSelection, ProviderRegistry};
+use crate::model::{LegacyModelSelection, LegacyProviderRegistry};
 pub use crate::time::{Timestamp, TimestampError};
 use crate::tools::ToolName;
 use crate::tools::registry::ToolRegistry;
@@ -44,7 +44,7 @@ pub enum ConfigError {
 
 struct RuntimeConfigParts {
     data_dir: PathBuf,
-    provider_registry: ProviderRegistry,
+    provider_registry: LegacyProviderRegistry,
     tool_registry: ToolRegistry,
     coding_instructions: String,
     shutdown_timeout: Duration,
@@ -57,7 +57,7 @@ struct RuntimeConfigParts {
 #[derive(Clone)]
 pub(crate) struct RuntimeConfig {
     data_dir: PathBuf,
-    provider_registry: ProviderRegistry,
+    provider_registry: LegacyProviderRegistry,
     tool_registry: ToolRegistry,
     coding_instructions: Arc<str>,
     shutdown_timeout: Duration,
@@ -87,7 +87,7 @@ impl fmt::Debug for RuntimeConfig {
 impl RuntimeConfig {
     pub(crate) fn new(
         data_dir: PathBuf,
-        provider_registry: ProviderRegistry,
+        provider_registry: LegacyProviderRegistry,
         tool_registry: ToolRegistry,
         coding_instructions: impl Into<String>,
         retry_policy: RetryPolicy,
@@ -107,7 +107,7 @@ impl RuntimeConfig {
 
     pub(crate) fn with_defaults(
         data_dir: PathBuf,
-        provider_registry: ProviderRegistry,
+        provider_registry: LegacyProviderRegistry,
         tool_registry: ToolRegistry,
         coding_instructions: impl Into<String>,
         retry_policy: RetryPolicy,
@@ -123,7 +123,7 @@ impl RuntimeConfig {
 
     pub(crate) fn builder(
         data_dir: PathBuf,
-        provider_registry: ProviderRegistry,
+        provider_registry: LegacyProviderRegistry,
         tool_registry: ToolRegistry,
         coding_instructions: impl Into<String>,
         retry_policy: RetryPolicy,
@@ -169,7 +169,7 @@ impl RuntimeConfig {
         &self.data_dir
     }
 
-    pub(crate) fn provider_registry(&self) -> ProviderRegistry {
+    pub(crate) fn provider_registry(&self) -> LegacyProviderRegistry {
         self.provider_registry.clone()
     }
 
@@ -204,7 +204,7 @@ impl RuntimeConfig {
 
 pub(crate) struct RuntimeConfigBuilder {
     data_dir: PathBuf,
-    provider_registry: ProviderRegistry,
+    provider_registry: LegacyProviderRegistry,
     tool_registry: ToolRegistry,
     coding_instructions: String,
     shutdown_timeout: Duration,
@@ -250,7 +250,7 @@ impl RuntimeConfigBuilder {
 #[derive(Clone)]
 pub(crate) struct SessionConfig {
     workspace_root: PathBuf,
-    model: ModelSelection,
+    model: LegacyModelSelection,
     system_prompt: String,
     enabled_tools: BTreeSet<ToolName>,
     compaction_trigger_tokens: u64,
@@ -276,7 +276,7 @@ impl fmt::Debug for SessionConfig {
 impl SessionConfig {
     pub(crate) fn new(
         workspace_root: PathBuf,
-        model: ModelSelection,
+        model: LegacyModelSelection,
         system_prompt: impl Into<String>,
         enabled_tools: BTreeSet<ToolName>,
         compaction_trigger_tokens: u64,
@@ -309,7 +309,7 @@ impl SessionConfig {
         &self.workspace_root
     }
 
-    pub(crate) const fn model(&self) -> &ModelSelection {
+    pub(crate) const fn model(&self) -> &LegacyModelSelection {
         &self.model
     }
 
@@ -366,7 +366,7 @@ fn validate_text(value: &str, allow_empty: bool) -> Result<(), ConfigError> {
 
 type SessionConfigConstructor = fn(
     PathBuf,
-    ModelSelection,
+    LegacyModelSelection,
     String,
     BTreeSet<ToolName>,
     u64,
@@ -380,14 +380,14 @@ const _: () = {
     let _ = std::mem::size_of::<RuntimeConfig>();
     let _: fn(
         PathBuf,
-        ProviderRegistry,
+        LegacyProviderRegistry,
         ToolRegistry,
         String,
         RetryPolicy,
     ) -> Result<RuntimeConfig, ConfigError> = RuntimeConfig::new;
     let _: fn(
         PathBuf,
-        ProviderRegistry,
+        LegacyProviderRegistry,
         ToolRegistry,
         String,
         RetryPolicy,
@@ -403,7 +403,7 @@ const _: () = {
     let _ = std::mem::size_of::<SessionConfig>();
     let _: fn(
         PathBuf,
-        ProviderRegistry,
+        LegacyProviderRegistry,
         ToolRegistry,
         String,
         RetryPolicy,

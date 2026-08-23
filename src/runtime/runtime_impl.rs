@@ -11,7 +11,7 @@ use crate::agent::system_timestamp_source;
 use crate::config::{RetryPolicy, RuntimeConfig, SessionConfig};
 use crate::error::{RuntimeError, SessionError};
 use crate::ids::{InteractionId, SessionId, TurnId};
-use crate::model::{ModelGateway, ModelSelection, ReasoningPreference};
+use crate::model::{LegacyModelGateway, LegacyModelSelection, ReasoningPreference};
 use crate::session::actor::{SessionActor, SessionActorDependencies};
 use crate::session::event_stream::SessionEventStream;
 use crate::session::snapshot::SessionSnapshot;
@@ -29,7 +29,7 @@ use super::session_manager::{JoinOnce, LoadedSessionId, ManagedSession, SessionM
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct SessionSummary {
     pub(crate) session_id: SessionId,
-    pub(crate) model: ModelSelection,
+    pub(crate) model: LegacyModelSelection,
     pub(crate) loaded: bool,
 }
 
@@ -44,7 +44,7 @@ pub(crate) struct Runtime {
 
 struct RuntimeInner {
     store: Arc<SessionStore>,
-    gateway: ModelGateway,
+    gateway: LegacyModelGateway,
     tools: ToolRegistry,
     policy: Arc<dyn LegacyToolPolicy>,
     coding_instructions: Arc<str>,
@@ -73,7 +73,7 @@ impl Runtime {
         Ok(Self {
             inner: Arc::new(RuntimeInner {
                 store: Arc::new(store),
-                gateway: ModelGateway::new(config.provider_registry()),
+                gateway: LegacyModelGateway::new(config.provider_registry()),
                 tools: config.tool_registry(),
                 policy: Arc::new(LegacyAllowConfiguredTools::new()),
                 coding_instructions: config.coding_instructions(),
@@ -375,7 +375,7 @@ impl RuntimeInner {
 }
 
 fn validate_stored(
-    gateway: &ModelGateway,
+    gateway: &LegacyModelGateway,
     tools: &ToolRegistry,
     config: &StoredSessionConfig,
 ) -> Result<(), SessionError> {

@@ -1441,7 +1441,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::model::{ModelFinishReason, ModelMessage, ModelSelection, ReasoningContent, Usage};
+    use crate::model::{
+        LegacyModelSelection, ModelFinishReason, ModelMessage, ReasoningContent, Usage,
+    };
     use crate::storage::store::{
         StoredCompactionConfig, StoredExecutionConfig, StoredModelConfig, StoredSessionConfig,
     };
@@ -1463,7 +1465,7 @@ mod tests {
     }
 
     fn config(id: SessionId) -> StoredSessionConfig {
-        let model = StoredModelConfig::new(ModelSelection::new(
+        let model = StoredModelConfig::new(LegacyModelSelection::new(
             "anthropic".parse().unwrap(),
             "claude".parse().unwrap(),
         ));
@@ -1636,7 +1638,7 @@ mod tests {
         );
 
         let reasoning =
-            ReasoningContent::new(Some("thinking".to_owned()), None, None, None, None).unwrap();
+            ReasoningContent::new(Some("thinking".to_owned()), None, None, None).unwrap();
         let assistant = assistant(
             turn_id,
             response(
@@ -1660,7 +1662,7 @@ mod tests {
     fn assistant_response_is_flattened_into_the_exact_persisted_shape() {
         let turn_id = TurnId::new().unwrap();
         let reasoning =
-            ReasoningContent::new(Some("thinking".to_owned()), None, None, None, None).unwrap();
+            ReasoningContent::new(Some("thinking".to_owned()), None, None, None).unwrap();
         let assistant_response = response(
             vec![
                 AssistantPart::Text("first".to_owned()),
@@ -1690,10 +1692,10 @@ mod tests {
         let duplicate_reasoning = response(
             vec![
                 AssistantPart::Reasoning(
-                    ReasoningContent::new(Some("one".to_owned()), None, None, None, None).unwrap(),
+                    ReasoningContent::new(Some("one".to_owned()), None, None, None).unwrap(),
                 ),
                 AssistantPart::Reasoning(
-                    ReasoningContent::new(Some("two".to_owned()), None, None, None, None).unwrap(),
+                    ReasoningContent::new(Some("two".to_owned()), None, None, None).unwrap(),
                 ),
             ],
             None,
@@ -2285,7 +2287,13 @@ mod tests {
         let reopened_store = SessionStore::open(root.clone()).await.unwrap();
         let repaired = ConversationLog::open(&reopened_store, id).await.unwrap();
         let snapshot = repaired.snapshot().await;
-        assert!(snapshot.entries().iter().any(|entry| matches!(entry.as_ref(), ConversationEntry::ToolResult { result, .. } if result.text() == "cancelled by restart" && result.is_error())));
+        assert!(snapshot.entries().iter().any(|entry| {
+            matches!(
+                entry.as_ref(),
+                ConversationEntry::ToolResult { result, .. }
+                    if result.text() == "cancelled by restart" && result.is_error()
+            )
+        }));
         assert!(snapshot.entries().iter().any(|entry| matches!(
             entry.as_ref(),
             ConversationEntry::TurnTerminal {
@@ -2348,7 +2356,13 @@ mod tests {
             snapshot
                 .entries()
                 .iter()
-                .filter(|entry| matches!(entry.as_ref(), ConversationEntry::ToolResult { result, .. } if result.text() == RESTART_CANCELLED_TEXT))
+                .filter(|entry| {
+                    matches!(
+                        entry.as_ref(),
+                        ConversationEntry::ToolResult { result, .. }
+                            if result.text() == RESTART_CANCELLED_TEXT
+                    )
+                })
                 .count(),
             2
         );
@@ -2534,7 +2548,10 @@ mod tests {
         let reopened_store = SessionStore::open(root.clone()).await.unwrap();
         let reopened = ConversationLog::open(&reopened_store, id).await.unwrap();
         assert!(reopened.snapshot().await.entries().iter().any(|entry| {
-            matches!(entry.as_ref(), ConversationEntry::Interaction { answer, .. } if answer.text() == "one")
+            matches!(
+                entry.as_ref(),
+                ConversationEntry::Interaction { answer, .. } if answer.text() == "one"
+            )
         }));
         assert_eq!(
             reopened.prompt_view().await.unwrap().messages(),
@@ -2654,10 +2671,20 @@ mod tests {
         let snapshot = reopened.snapshot().await;
         assert_eq!(snapshot.entries().len(), 5);
         assert!(snapshot.entries().iter().any(|entry| {
-            matches!(entry.as_ref(), ConversationEntry::Interaction { interaction_id: current, .. } if *current == interaction_id)
+            matches!(
+                entry.as_ref(),
+                ConversationEntry::Interaction {
+                    interaction_id: current,
+                    ..
+                } if *current == interaction_id
+            )
         }));
         assert!(snapshot.entries().iter().any(|entry| {
-            matches!(entry.as_ref(), ConversationEntry::ToolResult { result, .. } if result.text() == RESTART_CANCELLED_TEXT)
+            matches!(
+                entry.as_ref(),
+                ConversationEntry::ToolResult { result, .. }
+                    if result.text() == RESTART_CANCELLED_TEXT
+            )
         }));
         assert!(snapshot.entries().iter().any(|entry| {
             matches!(
@@ -2852,8 +2879,7 @@ mod tests {
         let (store, log, root, id) = opened().await;
         let turn_id = TurnId::new().unwrap();
         let reasoning =
-            ReasoningContent::new(Some("private reasoning".to_owned()), None, None, None, None)
-                .unwrap();
+            ReasoningContent::new(Some("private reasoning".to_owned()), None, None, None).unwrap();
         let response = response(
             vec![
                 AssistantPart::Reasoning(reasoning.clone()),

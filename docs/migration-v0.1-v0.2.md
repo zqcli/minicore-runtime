@@ -1,8 +1,8 @@
 # v0.1 to v0.2 Migration
 
 > Historical migration record. The v0.3 reset is breaking and does not add a
-> compatibility wrapper; P3-B specifically removes the public Runtime and
-> ToolRegistry facades.
+> compatibility wrapper. P3-B removes the public Runtime/ToolRegistry facade;
+> P3-D removes model registries, concrete network adapters, and transport APIs.
 
 ## Status
 
@@ -54,30 +54,7 @@ The current public methods have these exact call styles and result types:
 
 `RuntimeError` describes runtime configuration, closing, and runtime-internal failures. `SessionError` describes session existence, residency, busy/closing state, invalid input, interaction mismatch, unavailability, and session-internal failures.
 
-A host must install a real provider descriptor before creating a session that selects it:
-
-```rust
-let mut providers = ProviderRegistry::builder();
-providers.register(OpenAiResponsesProvider::new_https(
-    "https://api.openai.com/v1/responses",
-    fixed_credential_source(&std::env::var("OPENAI_API_KEY")?)?,
-    vec![descriptor],
-)?)?;
-let provider_registry = providers.build();
-
-let mut tools = ToolRegistry::builder();
-tools.register(ReadFileTool::new())?;
-let config = RuntimeConfig::new(
-    data_dir,
-    provider_registry,
-    tools.build(),
-    "coding instructions",
-    RetryPolicy::new(3, Duration::from_millis(250))?,
-)?;
-let runtime = Runtime::open(config, Handle::current()).await?;
-```
-
-A host may instead install `AnthropicMessagesProvider::new_https` with its required version string. Credentials are opaque values resolved inside provider attempts; they must not be placed in command-line arguments or persisted session configuration.
+The historical v0.2 registry-based construction example was removed in P3-D. Current v0.3 hosts bind one checked `Arc<dyn Model>` and an immutable `ToolSet` through the future `SessionBindings` owner; network adapter configuration is outside this crate.
 
 Session configuration selects a workspace root, model selection, system prompt, enabled tool names, compaction trigger/target, and maximum tool rounds. The selected names must already exist in the immutable `ToolRegistry`.
 
@@ -106,20 +83,9 @@ The v2 core does not automatically read or transform the historical Store V1 lay
 
 This is deliberately not an online compatibility mode. A malformed, ambiguous, or unsupported old record must be rejected or quarantined by the migration tool rather than guessed by the v2 runtime.
 
-## Tool and Provider Configuration
+## Historical Configuration Note
 
-The v2 host owns both registries. A minimal filesystem configuration is:
-
-```rust
-let mut tools = ToolRegistry::builder();
-tools.register(ReadFileTool::new())?;
-tools.register(ListDirectoryTool::new())?;
-tools.register(WriteFileTool::new())?;
-```
-
-`ask_user` is a question/answer builtin. `read_file` returns one bounded UTF-8 text result from a relative path. `list_directory` returns sorted direct entries as compact JSON. `write_file` replaces one relative UTF-8 file and does not create directories. `run_command` is enabled only when the host registers `RunCommandTool` with an explicit `ProcessPolicy`.
-
-The model registry freezes descriptors at build time. A descriptor binds a stable provider/model selection to an API model name, model limits, and supported reasoning preferences. The current direct providers are OpenAI Responses and Anthropic Messages. No provider is selected or installed implicitly.
+The v0.2 registry and builtin examples are baseline history, not current v0.3 interfaces. P3-B replaced tool registration with immutable `ToolSet`; P3-D replaced model lookup with one directly bound `Arc<dyn Model>`. Concrete filesystem, process, and network adapters are host-owned and are not installed by the core.
 
 ## Security Behavior
 
@@ -127,7 +93,7 @@ Filesystem routes use one capability-backed workspace root. Configuration requir
 
 `run_command` is structured `program + args`, never a shell string. Its `cwd` is checked as a workspace-relative path before spawn, but the child receives an ambient host path and host process authority. The process policy controls executable allowlist, inherited environment keys, default/max timeout, and output limits. The environment is cleared before permitted values are added. The runtime does not claim a process sandbox or process-tree sandbox.
 
-Provider credentials are checked opaque values and are redacted in debug/error surfaces. Provider transport disables redirects, automatic retries, proxies, and compression. Delivery state distinguishes pre-send/rejected failures from unknown or output-started outcomes, so logical retry is conservative.
+Model adapters must report safe typed errors. Delivery state is exactly `NotStarted`, `Started`, or `Unknown`; only explicitly retryable `NotStarted` failures are eligible for logical retry.
 
 ## Observation and Conversation Differences
 
@@ -140,9 +106,8 @@ Restart recovery completes unresolved tool calls with the fixed error text `canc
 ## Migration Checklist
 
 - [ ] Stop the old runtime and make a durable source backup.
-- [ ] Install concrete provider descriptors in a `ProviderRegistry`.
-- [ ] Resolve credentials through a host-owned `CredentialSource`.
-- [ ] Build an explicit `ToolRegistry`; enable only the names it contains.
+- [ ] Bind one checked host `Arc<dyn Model>` per loaded session.
+- [ ] Build an explicit immutable `ToolSet`; enable only the names it contains.
 - [ ] Convert each workspace to one absolute root and review requested access.
 - [ ] Convert session model/prompt/compaction/tool-round settings to `SessionConfig`.
 - [ ] Convert or regenerate storage into the v2 flat layout offline.
@@ -150,7 +115,7 @@ Restart recovery completes unresolved tool calls with the fixed error text `canc
 - [ ] Replace old lifecycle/queue operations with submit, answer, cancel, close, and shutdown semantics.
 - [ ] Observe a snapshot before consuming a subscription stream.
 - [ ] Await `Runtime::shutdown()` before host runtime teardown.
-- [ ] Keep live provider smokes explicitly ignored unless release evidence is intended.
+- [ ] Keep external adapter evidence separate from deterministic core validation.
 
 No compatibility wrapper is supplied. Downstream applications that need the previous surface must own a separate adapter and an explicit data migration program.
 
@@ -165,43 +130,16 @@ The old caller should not translate every failure into a generic transport error
 | data root lock already held or store worker cannot bootstrap | `RuntimeError` from `Runtime::open` |
 | unknown session ID | `SessionError::NotFound` |
 | session is loading/closing or another operation owns its boundary | `SessionError::Busy` or `SessionError::Closing` |
-| selected provider/model is not registered | `SessionError::Unavailable` during create/load/admission |
+| the bound model does not match the session model reference | `SessionError::Unavailable` during create/load/admission |
 | answer targets another interaction | `SessionError::InteractionMismatch` |
 | model cancellation wins | a cancelled turn outcome and `SessionError` only for the caller boundary that was rejected |
 | durable middle corruption or unrecoverable append failure | unavailable/internal session state rather than fabricated success |
 
 `close_session` waits for the actor-owned completion and removes only the exact loaded owner. `delete_session` is a durable namespace operation and refuses a loaded session. `shutdown` closes admission across the Runtime, joins session and store owners, and releases the root lock; it is not equivalent to dropping a handle.
 
-## Host Configuration Example
+## Host Configuration Direction
 
-A host that previously sent a command envelope should now build values directly:
-
-```rust
-let mut provider_builder = ProviderRegistry::builder();
-provider_builder.register(real_openai_provider)?;
-let providers = provider_builder.build();
-
-let mut tool_builder = ToolRegistry::builder();
-tool_builder.register(ReadFileTool::new())?;
-tool_builder.register(ListDirectoryTool::new())?;
-tool_builder.register(WriteFileTool::new())?;
-// Register RunCommandTool only with an explicit ProcessPolicy.
-let tools = tool_builder.build();
-
-let runtime = Runtime::open(
-    RuntimeConfig::new(
-        data_dir,
-        providers,
-        tools,
-        coding_instructions,
-        RetryPolicy::new(3, Duration::from_millis(250))?,
-    )?,
-    Handle::current(),
-)
-.await?;
-```
-
-The provider descriptor must bind the stable selection used by `SessionConfig`. The API model name, endpoint, credential source, reasoning support, and model limits remain provider installation details. The session persists only the stable provider/model selection, not the credential or endpoint.
+Current v0.3 host construction is module-qualified and direct: build a checked `Model` implementation, immutable `ToolSet`, optional `ToolPolicy`/context/compaction adapters, and a `SessionLog`; P4 will bind them through `SessionBindings`. No registry, resolver, builtin set, or network configuration enters the core interface.
 
 ## Tool Behavior Checklist
 
@@ -222,5 +160,5 @@ Keep the old data copy until:
 2. session JSON round-trips with format version 2;
 3. conversation replay either succeeds or reports a located complete corruption;
 4. partial tails are repaired only at the end of a file;
-5. provider and tool selections are intentionally reviewed;
+5. model and tool bindings are intentionally reviewed;
 6. shutdown releases the new root lock after the verification run.

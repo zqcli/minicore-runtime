@@ -2,23 +2,23 @@
 
 状态：Accepted
 
-> Transitional v0.2 record. Provider retry behavior remains internal migration
-> evidence while the v0.3 owner Ports are introduced.
+> Refined for v0.3 P3-D. The direct Model Port reports delivery truth; P5 will
+> centralize stream consumption and retry in ModelDriver.
 
 日期：2026-08-20
 
 ## Context
 
-Provider transports can fail before a request is sent, after a request may have been accepted, or after semantic output has started. Retrying at the transport layer would make the outcome ambiguous and could duplicate a remote operation.
+A host Model adapter can fail before work starts, after work starts, or when the delivery outcome is unknown. Retrying inside an adapter would make the outcome ambiguous and could duplicate a remote operation.
 
 ## Decision
 
-Each provider execution is one stateless full request and at most one HTTP attempt. The provider reports `DeliveryState` and a typed `ModelError`. The turn runner owns logical retries using `RetryPolicy`: one through four total attempts, base delay no greater than 30 seconds, bounded exponential delay, and an optional provider retry-after hint.
+Each `Model::start` call is one logical attempt. The adapter reports `DeliveryState` and a typed `ModelError`. The future P5 `ModelDriver` owns logical retries using `RetryPolicy`: one through four total attempts, base delay no greater than 30 seconds, bounded exponential delay, and an optional retry-after hint.
 
-Only permitted transient errors with `NotSent` or `RejectedBeforeExecution` delivery may retry. `AcceptedNoOutput`, `Unknown`, and `OutputStarted` are conservative non-retryable outcomes. A retry-after value above 30 seconds disables retry. Credentials are resolved afresh within each provider attempt.
+Automatic retry requires `retryable == true` and `delivery == NotStarted`. `Started` and `Unknown` are conservative non-retryable outcomes. A retry-after value above the remaining budget disables retry.
 
 ## Consequences
 
-The model transport never silently replays a request. Provider adapters own protocol parsing and terminal proof; the turn runner owns retry timing and cancellation; the session actor owns final durable settlement. An unknown remote outcome becomes a truthful terminal error rather than an optimistic retry.
+The core never silently replays a request. Host adapters own their external protocol and cleanup; `ModelDriver` owns stream assembly, panic conversion, retry timing, deadlines, and cancellation; the session actor owns final durable settlement. An unknown outcome becomes a truthful terminal error rather than an optimistic retry.
 
-See [architecture](../architecture.md#provider-retry), [model module ownership](../modules/README.md#model), and [`src/agent/context.rs`](../../src/agent/context.rs).
+See [architecture](../architecture.md#model-retry), [model module ownership](../modules/README.md#model), and [`src/model/model.rs`](../../src/model/model.rs).

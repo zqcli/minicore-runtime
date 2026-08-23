@@ -1,21 +1,21 @@
 # Current Implementation Context
 
-> Transitional v0.2 checkpoint. P3-B has removed the public Runtime/ToolRegistry
-> facade and concrete tool adapters; the current public tool boundary is
+> Transitional v0.2 checkpoint. P3-D has removed public registries and concrete
+> model/tool adapters; the current public Port boundaries are
 > described by the v0.3 README and architecture/module map.
 
 ## Checkpoint
 
 This repository retains the v0.2 typed runtime core as migration evidence. The current authority is the source tree and the documents linked from [docs/README.md](docs/README.md). Pre-reset design material is historical and lives under `docs/archive/v2/pre-reset/`.
 
-The crate is Rust 2024 with Rust 1.85 as its MSRV. The default build is offline. Provider installation, credentials, endpoint selection, and the Tokio runtime handle are host responsibilities.
+The crate is Rust 2024 with Rust 1.85 as its MSRV. The default build is offline. External model networking and the Tokio runtime handle are host responsibilities.
 
 ## Ownership Map
 
 - `config`: checked `RuntimeConfig`, `SessionConfig`, `RetryPolicy`, paths, text, capacities, and bounds.
 - `ids`: checked session, turn, interaction, and tool-call identifiers.
-- `model`: provider traits, immutable registry, descriptors, credentials, request/response DTOs, transport, and direct OpenAI/Anthropic implementations.
-- `tools`: immutable registry, tool policy, interaction client, process policy, workspace builtins, and structured command execution.
+- `model`: direct streaming `Model` Port, checked descriptors/contexts/requests/events/errors, shared response DTOs, and private legacy batch lookup.
+- `tools`: immutable `ToolSet`, async policy Port, interaction/tool DTOs, and private legacy runner scaffolding.
 - `workspace`: one capability-backed root, relative-path validation, bounded file operations, directory enumeration, and workspace shutdown.
 - `prompt`: private prompt assembly and compaction planning.
 - `agent`: private turn runner, model/tool ordering, retries, cancellation, and compaction integration.
@@ -23,26 +23,26 @@ The crate is Rust 2024 with Rust 1.85 as its MSRV. The default build is offline.
 - `session`: actor, mailbox, observation, terminal/lifecycle orchestration, snapshots, events, and public transcript projection.
 - `runtime`: public orchestration and session residency manager.
 
-The public root exposes canonical `config`, `error`, `event`, `ids`, `model`, `session`, `tools`, and typed Port modules. `agent`, `prompt`, `runtime`, `storage`, and `workspace` remain private. Storage workers, provider transport, actor commands, and prompt internals are not public extension seams.
+The public root exposes canonical `config`, `error`, `event`, `ids`, `model`, `session`, `tools`, and typed Port modules. `agent`, `prompt`, `runtime`, `storage`, and `workspace` remain private. Storage workers, legacy lookup, actor commands, and prompt internals are not public extension seams.
 
 ## Core Invariants
 
-- One `Runtime` owns one storage `SessionStore`, its root lock, its provider registry, and its tool registry.
+- The transitional `Runtime` owns one storage root plus private legacy model/tool collections until P4/P5 replace it.
 - One loaded session coordinates one storage-owned conversation log, one actor, one bounded command mailbox, one workspace, and one active turn at most.
 - Session states are exactly `Idle`, `Running`, `WaitingForInput`, and `Closing`.
 - Submit and answer use the same bounded mailbox. Cancellation is an out-of-band request and never waits behind normal work.
 - A response to an interaction has one first-winner claim. The actor persists the interaction before resuming model work.
 - A terminal outcome is persisted by the actor. Cancellation, denial, failure, and close are never represented as successful completion.
 - Model tool-call indexes are ordered within each response round. Tool results are matched by checked call identifiers.
-- Provider resolution is performed by the immutable registry owned by the model gateway. A provider attempt gets a fresh credential resolution.
-- Only delivery-safe, pre-execution transient model failures may use the configured logical retry policy.
+- Final sessions bind one `Arc<dyn Model>` directly; legacy lookup remains private only for old actor tests.
+- Only explicitly retryable `NotStarted` model failures may use the configured logical retry policy.
 - Compaction appends a summary at a checked boundary. It never rewrites source history or invents an incomplete tool exchange.
 - Snapshots publish before event delivery. A lagged subscriber must resynchronize from a fresh snapshot/subscription baseline.
 - `Runtime::shutdown()` starts one owner-tracked cleanup operation and returns its authoritative result. `Drop` may start it but cannot report the result.
 
 ## Public API
 
-`Runtime::open(config, handle)` is asynchronous and returns `RuntimeError`. The configuration carries the data directory, immutable provider/tool registries, coding instructions, shutdown timeout, capacities, and retry policy.
+`Runtime::open(config, handle)` is asynchronous and returns `RuntimeError`. This is private migration implementation; final P4 bindings will carry one direct model and immutable tool set.
 
 The session methods are:
 
@@ -77,7 +77,7 @@ Workspace access starts from one configured absolute root. File and directory to
 
 The process tool is deliberately different: it starts one direct child with structured arguments and a validated ambient host cwd. It never invokes a shell. `ProcessPolicy` controls enabled state, executable allowlist, inherited environment allowlist, timeout, stdout bound, and stderr bound. The child environment is cleared before explicitly permitted values are added. The runtime does not claim an OS process sandbox or process-tree cleanup guarantee.
 
-Credentials are checked opaque ASCII values, redacted in debug output, and resolved inside provider futures. Provider transport disables redirect, automatic retry, proxy, and decompression behavior. Provider errors carry delivery state so the actor cannot blindly retry an operation whose outcome may already have been delivered.
+Host Model adapters own external networking and cleanup. Core errors carry `NotStarted`, `Started`, or `Unknown` delivery state so the future ModelDriver cannot blindly retry an operation that may already have started.
 
 ## Verification
 
@@ -91,11 +91,11 @@ Deterministic gates are offline:
 - `./scripts/check-msrv.sh`
 - `cargo test --locked --test v2_acceptance`
 
-The two provider live-smoke cases remain ignored and require explicit opt-in environment variables. They are not default evidence. No provider is installed by default, no network credential is required for deterministic tests, and host code must opt into process execution.
+Root concrete model/live-network tests were removed in P3-D. The independent provider-gate package remains deterministic historical evidence; no network access is required by root tests.
 
 ## Intentional Limits
 
-- There is no default provider catalog.
+- There is no model registry or default adapter catalog.
 - There is no shell command interface.
 - There is no process-tree sandbox claim.
 - There is no automatic migration from the historical Store V1 layout; migration is an explicit offline host operation.
@@ -106,9 +106,9 @@ The two provider live-smoke cases remain ignored and require explicit opt-in env
 ## Evidence Map
 
 - Public surface: `src/lib.rs`, `src/config.rs`, `src/error.rs`, `src/runtime/runtime_impl.rs`.
-- Model contract: `src/model/registry.rs`, `src/model/provider.rs`, and the two direct provider modules.
-- Tool contract: `src/tools/registry.rs`, `src/tools/policy.rs`, `src/tools/context.rs`, and `src/tools/builtins/`.
+- Model contract: `src/model/model.rs`, `src/model/response.rs`, `src/model/types.rs`, and `tests/model_port_contract.rs`.
+- Tool contract: `src/tools/tool.rs`, `src/tools/set.rs`, `src/tools/policy.rs`, and their focused contract tests.
 - Storage contract: `src/storage/store.rs`, `src/storage/conversation.rs`, `src/storage/conversation/codec.rs`, and `src/session/transcript.rs`.
 - Lifecycle contract: `src/session/actor.rs`, `src/session/command.rs`, and `src/runtime/session_manager.rs`.
-- Acceptance contract: `tests/v2_acceptance.rs`; provider protocol evidence remains in the P3 suites.
+- Acceptance contract: focused v0.3 Port tests now; owner/runtime acceptance remains deferred to P4/P5.
 - Documentation validation: `scripts/check_docs.py` checks current authority plus selected non-pre-reset evidence.

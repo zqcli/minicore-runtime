@@ -1,6 +1,6 @@
 # MiniCore Runtime
 
-MiniCore Runtime is an embeddable Rust 2024 core for typed, bounded session execution. The current v0.3 reset exposes the host-neutral tool execution seam first; the former v0.2 Runtime/configuration facade remains crate-private transitional implementation until the P6 migration boundary.
+MiniCore Runtime is an embeddable Rust 2024 core for typed, bounded session execution. The current v0.3 reset exposes host-neutral Model, Tool, policy, context, compaction, and storage Ports; the former v0.2 Runtime/configuration facade remains crate-private transitional implementation until the P6 migration boundary.
 
 ## Implemented Core
 
@@ -8,9 +8,10 @@ MiniCore Runtime is an embeddable Rust 2024 core for typed, bounded session exec
 - Public `tools::Tool`, immutable `tools::ToolSet`, async `tools::ToolPolicy`, checked invocations, typed approval decisions, content-only outputs, input requests, cancellation, deadlines, and best-effort progress.
 - `ToolSet` registration is explicit, deterministic, duplicate-safe, and panic-safe while freezing tool specs for shared cloned sets.
 - Typed context and compaction Ports with immutable DTOs.
+- Public direct `model::Model` streaming Port with checked descriptors, contexts, requests, events, delivery-aware errors, cancellation, and deadlines.
 - Crate-private legacy runner/session/storage execution seam, including exact legacy tool-result wire preservation.
-- Model/provider, conversation, storage, and workspace implementations remain transitional internal slices while their v0.3 owners are migrated.
-- No concrete builtin, process adapter, default tool set, provider credential, or network service is installed by the public Tool seam.
+- Conversation, storage, and workspace implementations remain transitional internal slices while their v0.3 owners are migrated.
+- No concrete builtin, process adapter, model network adapter, default tool set, or network service is installed by the public seams.
 
 ## Install and MSRV
 
@@ -45,6 +46,12 @@ fn install_tools(host_tool: impl Tool + 'static) -> Result<ToolSet, Box<dyn std:
 
 `ToolPolicy` is an asynchronous host Port over an owned, checked `ToolPolicyRequest`. Decisions are exactly `Allow`, bounded `Deny`, or `RequireApproval`; approval answers are typed `AllowOnce`/`Deny`. Process-local `session::PendingInteraction` values pair approval and tool-input requests with matching typed answers without carrying resume senders, callbacks, owner handles, or durable state.
 
+## Typed Model API
+
+Each loaded session will bind one host-owned `Arc<dyn model::Model>` directly. `Model::start` receives a host-neutral checked `ModelRequest` and exact process-local `ModelCallContext`, then returns a typed `ModelStream`. Descriptors contain only a `ModelRef`, context window, supported reasoning set, and tool support. The core exposes no registry, resolver, endpoint, credential, or concrete network adapter.
+
+Stream events are typed text/reasoning deltas, tool-call boundaries, usage, and finish events. `DeliveryState` is exactly `NotStarted`, `Started`, or `Unknown`; automatic retry is only meaningful when an error is explicitly retryable and delivery is `NotStarted`. Stream assembly, panic catching, cancellation polling, and retry ownership remain the P5 `ModelDriver` cutover.
+
 ## Public Modules
 
 | Module | Public responsibility |
@@ -56,21 +63,21 @@ fn install_tools(host_tool: impl Tool + 'static) -> Result<ToolSet, Box<dyn std:
 | `error` | Public error summaries; legacy session errors remain private |
 | `event` | Stable event-kind values |
 | `ids` | Checked session, instance, turn, interaction, tool-call, and context-source identifiers |
-| `model` | Transitional model/provider implementation surface pending later owner migration |
+| `model` | Direct streaming `Model` Port, checked descriptor/context/request/events, and delivery-aware errors |
 | `storage` | `SessionLog` Port and storage DTOs |
 | `tools` | `Tool`, immutable `ToolSet`, async `ToolPolicy`, approval, invocation/context/progress/output DTOs |
 
-The old `runtime` and `workspace` modules, `RuntimeConfig`, `SessionConfig`, `SessionSummary`, `ToolRegistry`, and synchronous legacy policy are not public compatibility surfaces. `legacy_context`, `legacy_policy`, and `legacy_types` are private migration scaffolding scheduled for P5/P6 deletion or replacement.
+The old `runtime` and `workspace` modules, `RuntimeConfig`, `SessionConfig`, `SessionSummary`, `ToolRegistry`, synchronous legacy policy, and legacy model lookup are not public compatibility surfaces. `model/legacy_*` and `tools/legacy_*` are private migration scaffolding scheduled for P5/P6 deletion.
 
 ## Transitional Scope
 
-The removed v0.2 Runtime, concrete builtin/process, and public Tool integration tests are baseline evidence for the reset, not current extension contracts. `tests/tool_set_contract.rs` and `tests/tool_policy_interaction_contract.rs` are the focused P3-B/P3-C replacements. SessionRuntime acceptance coverage is intentionally deferred to P4/P5; this revision does not claim that the full replacement is complete.
+The removed v0.2 Runtime, concrete builtin/process/model adapters, and their integration tests are baseline evidence for the reset, not current extension contracts. `tests/tool_set_contract.rs`, `tests/tool_policy_interaction_contract.rs`, and `tests/model_port_contract.rs` are the focused P3-B/P3-C/P3-D replacements. SessionRuntime acceptance coverage is intentionally deferred to P4/P5; this revision does not claim that the full replacement is complete.
 
-The former Runtime/provider example and live Runtime smoke harness were removed with the public facade. Provider protocol suites remain separate transitional evidence and do not establish a public Runtime API.
+The former Runtime/model-network examples and root integration suites were removed with their public facades. The standalone `provider-gate/` package remains independent historical protocol evidence and does not establish a root-crate model adapter API.
 
 ## Testing
 
-The deterministic offline checks are Python/docs/diff/architecture checks. Rust validation for this phase is intentionally run remotely by the project workflow; no local Rust build or test command is part of the current P3-C review.
+The deterministic offline checks are Python/docs/diff/architecture checks. Rust validation for this phase is intentionally run remotely by the project workflow; no local Rust build or test command is part of the current P3-D review.
 
 ```bash
 python3 scripts/check_architecture.py

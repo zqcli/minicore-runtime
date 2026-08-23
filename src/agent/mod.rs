@@ -44,10 +44,12 @@ mod tests {
     use super::runner::{TurnTaskResult, run_turn};
     use crate::config::RetryPolicy;
     use crate::ids::{SessionId, TurnId};
+    use crate::model::legacy_provider::{LegacyModelFuture, LegacyModelProvider};
     use crate::model::{
-        AssistantPart, ModelCallContext, ModelDescriptor, ModelError, ModelEvent, ModelEventSink,
-        ModelFinishReason, ModelFuture, ModelGateway, ModelLimits, ModelProvider, ModelRequest,
-        ModelResponse, ModelSelection, ProviderId, ProviderRegistry, ReasoningPreference, Usage,
+        AssistantPart, LegacyModelCallContext, LegacyModelDescriptor, LegacyModelEvent,
+        LegacyModelEventSink, LegacyModelGateway, LegacyModelSelection, LegacyProviderId,
+        LegacyProviderRegistry, ModelError, ModelFinishReason, ModelLimits, ModelRequest,
+        ModelResponse, ReasoningPreference, Usage,
     };
     use crate::prompt::CompactionConfig;
     use crate::storage::conversation::{ConversationLog, NewConversationEntry};
@@ -74,8 +76,8 @@ mod tests {
     static TIMESTAMP_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     struct ScriptedProvider {
-        id: ProviderId,
-        models: Vec<ModelDescriptor>,
+        id: LegacyProviderId,
+        models: Vec<LegacyModelDescriptor>,
         steps: Arc<Mutex<VecDeque<ScriptedStep>>>,
         calls: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<ModelRequest>>>,
@@ -84,14 +86,14 @@ mod tests {
     enum ScriptedStep {
         Response {
             response: ModelResponse,
-            event: Option<ModelEvent>,
+            event: Option<LegacyModelEvent>,
         },
         CancelResponse {
             response: ModelResponse,
-            event: Option<ModelEvent>,
+            event: Option<LegacyModelEvent>,
         },
         EventThenPending {
-            event: ModelEvent,
+            event: LegacyModelEvent,
         },
         MutateBeforeResponse {
             response: ModelResponse,
@@ -101,26 +103,30 @@ mod tests {
         },
         ExposeLateSink {
             response: ModelResponse,
-            slot: Arc<Mutex<Option<ModelEventSink>>>,
+            slot: Arc<Mutex<Option<LegacyModelEventSink>>>,
         },
         Error(ModelError),
         ErrorWithEvent {
             error: ModelError,
-            event: ModelEvent,
+            event: LegacyModelEvent,
         },
         Pending,
     }
 
-    impl ModelProvider for ScriptedProvider {
-        fn id(&self) -> &ProviderId {
+    impl LegacyModelProvider for ScriptedProvider {
+        fn id(&self) -> &LegacyProviderId {
             &self.id
         }
 
-        fn models(&self) -> &[ModelDescriptor] {
+        fn models(&self) -> &[LegacyModelDescriptor] {
             &self.models
         }
 
-        fn generate(&self, request: ModelRequest, ctx: ModelCallContext) -> ModelFuture<'_> {
+        fn generate(
+            &self,
+            request: ModelRequest,
+            ctx: LegacyModelCallContext,
+        ) -> LegacyModelFuture<'_> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.requests
                 .lock()
@@ -270,7 +276,7 @@ mod tests {
         fs::create_dir_all(&workspace_root).unwrap();
         let store = SessionStore::open(root.clone()).await.unwrap();
         let model_selection =
-            ModelSelection::new("scripted".parse().unwrap(), "model".parse().unwrap());
+            LegacyModelSelection::new("scripted".parse().unwrap(), "model".parse().unwrap());
         let config = StoredSessionConfig::new(
             session_id,
             timestamp(),
@@ -298,7 +304,7 @@ mod tests {
         .unwrap();
 
         let request_limits = options.request_limits;
-        let descriptor = ModelDescriptor::new(
+        let descriptor = LegacyModelDescriptor::new(
             model_selection.clone(),
             "scripted-model",
             options.descriptor_limits,
@@ -315,9 +321,9 @@ mod tests {
             calls: Arc::clone(&calls),
             requests: Arc::clone(&requests),
         };
-        let mut providers = ProviderRegistry::builder();
+        let mut providers = LegacyProviderRegistry::builder();
         providers.register(provider).unwrap();
-        let gateway = ModelGateway::new(providers.build());
+        let gateway = LegacyModelGateway::new(providers.build());
         let workspace =
             Arc::new(Workspace::open(&workspace_root, WorkspaceAccess::ReadWrite).unwrap());
         let (events, event_receiver) = RunnerEventSink::channel(options.event_capacity).unwrap();
@@ -599,7 +605,7 @@ mod tests {
     #[test]
     fn runner_event_sink_is_bounded_and_deltas_are_best_effort() {
         let (sink, mut receiver) = RunnerEventSink::channel(1).unwrap();
-        let event = RunnerEvent::Model(crate::model::ModelEvent::TextDelta {
+        let event = RunnerEvent::Model(crate::model::LegacyModelEvent::TextDelta {
             delta: "delta".to_owned(),
         });
         assert!(sink.try_publish_model(event.clone()));
@@ -607,7 +613,7 @@ mod tests {
         assert_eq!(receiver.try_recv().unwrap(), event);
         assert!(matches!(
             sink.try_publish_tool(RunnerEvent::Model(
-                crate::model::ModelEvent::ReasoningDelta {
+                crate::model::LegacyModelEvent::ReasoningDelta {
                     delta: "late".to_owned(),
                 }
             )),
@@ -666,7 +672,7 @@ mod tests {
         .unwrap();
         let (context, mut harness) = harness(vec![ScriptedStep::Response {
             response,
-            event: Some(ModelEvent::TextDelta {
+            event: Some(LegacyModelEvent::TextDelta {
                 delta: "answer".to_owned(),
             }),
         }])
@@ -682,7 +688,7 @@ mod tests {
         assert_eq!(harness.calls.load(Ordering::SeqCst), 1);
         assert!(matches!(
             harness.events.recv().await,
-            Some(RunnerEvent::Model(ModelEvent::TextDelta { delta })) if delta == "answer"
+            Some(RunnerEvent::Model(LegacyModelEvent::TextDelta { delta })) if delta == "answer"
         ));
         assert!(harness.events.recv().await.is_none());
         let snapshot = harness.log.snapshot().await;
@@ -707,7 +713,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
             .unwrap();
-        assert!(!late.publish(ModelEvent::TextDelta {
+        assert!(!late.publish(LegacyModelEvent::TextDelta {
             delta: "late".to_owned(),
         }));
         assert!(harness.events.try_recv().is_err());
@@ -1307,13 +1313,13 @@ mod tests {
             vec![
                 ScriptedStep::Response {
                     response: text_response("summary text"),
-                    event: Some(ModelEvent::ReasoningDelta {
+                    event: Some(LegacyModelEvent::ReasoningDelta {
                         delta: "summary must not escape".to_owned(),
                     }),
                 },
                 ScriptedStep::Response {
                     response: text_response("final answer"),
-                    event: Some(ModelEvent::TextDelta {
+                    event: Some(LegacyModelEvent::TextDelta {
                         delta: "ordinary event".to_owned(),
                     }),
                 },
@@ -1327,10 +1333,9 @@ mod tests {
         assert!(matches!(result, TurnTaskResult::Completed { .. }));
         assert_eq!(harness.calls.load(Ordering::SeqCst), 2);
         let prompt = harness.log.prompt_view().await.unwrap();
-        assert!(prompt
-            .messages()
-            .iter()
-            .any(|message| matches!(message, crate::model::ModelMessage::User(text) if text == "question")));
+        assert!(prompt.messages().iter().any(|message| {
+            matches!(message, crate::model::ModelMessage::User(text) if text == "question")
+        }));
         let snapshot = harness.log.snapshot().await;
         assert!(
             snapshot
@@ -1340,7 +1345,7 @@ mod tests {
         );
         assert!(matches!(
             harness.events.try_recv().unwrap(),
-            RunnerEvent::Model(ModelEvent::TextDelta { delta }) if delta == "ordinary event"
+            RunnerEvent::Model(LegacyModelEvent::TextDelta { delta }) if delta == "ordinary event"
         ));
         assert!(harness.events.try_recv().is_err());
         harness.cleanup().await;
@@ -1599,7 +1604,8 @@ mod tests {
     async fn transient_503_delivery_retries_same_request_but_unsafe_error_does_not() {
         let transient = ModelError::detailed(
             crate::model::ModelErrorKind::ProviderUnavailable,
-            crate::model::DeliveryState::RejectedBeforeExecution,
+            crate::model::DeliveryState::NotStarted,
+            true,
             None,
         )
         .unwrap();
@@ -1651,7 +1657,8 @@ mod tests {
         options.retry_policy = RetryPolicy::new(2, Duration::ZERO).unwrap();
         let too_long_hint = ModelError::detailed(
             crate::model::ModelErrorKind::RateLimited,
-            crate::model::DeliveryState::RejectedBeforeExecution,
+            crate::model::DeliveryState::NotStarted,
+            true,
             Some(Duration::from_secs(31)),
         )
         .unwrap();
@@ -1673,7 +1680,7 @@ mod tests {
         let (context, mut harness) = harness_with(
             vec![ScriptedStep::ErrorWithEvent {
                 error: transient,
-                event: ModelEvent::TextDelta {
+                event: LegacyModelEvent::TextDelta {
                     delta: "provisional error event".to_owned(),
                 },
             }],
@@ -1700,7 +1707,7 @@ mod tests {
         options.cancellation = cancellation.clone();
         let (context, mut harness) = harness_with(
             vec![ScriptedStep::EventThenPending {
-                event: ModelEvent::ReasoningDelta {
+                event: LegacyModelEvent::ReasoningDelta {
                     delta: "streaming before cancellation".to_owned(),
                 },
             }],
@@ -1713,7 +1720,7 @@ mod tests {
                 result = &mut task => panic!("pending turn completed early: {result:?}"),
                 event = harness.events.recv() => event,
             },
-            Some(RunnerEvent::Model(ModelEvent::ReasoningDelta { delta }))
+            Some(RunnerEvent::Model(LegacyModelEvent::ReasoningDelta { delta }))
                 if delta == "streaming before cancellation"
         ));
         cancellation.cancel();

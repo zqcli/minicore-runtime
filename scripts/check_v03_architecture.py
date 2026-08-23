@@ -32,12 +32,15 @@ CONCRETE_FILENAMES = {
     "process.rs", "builtins.rs",
 }
 CANONICAL_PRODUCTION_FILES = {
-    "src/model": {"mod.rs", "model.rs", "driver.rs", "gateway.rs", "request.rs", "response.rs", "types.rs"},
+    "src/model": {"mod.rs", "model.rs", "driver.rs", "request.rs", "response.rs", "types.rs"},
     "src/tools": {"mod.rs", "tool.rs", "set.rs", "context.rs", "input.rs", "policy.rs", "progress.rs", "types.rs"},
 }
-MODEL_DRIVER_ROLE_FILES = {"src/model/driver.rs", "src/model/gateway.rs"}
+MODEL_DRIVER_ROLE_FILES = {"src/model/driver.rs"}
 TOOLSET_ROLE_FILES = {"src/tools/set.rs"}
 TRANSITIONAL_PRIVATE_FILES = {
+    "src/model/legacy_gateway.rs",
+    "src/model/legacy_provider.rs",
+    "src/model/legacy_registry.rs",
     "src/tools/registry.rs",
     "src/tools/legacy_context.rs",
     "src/tools/legacy_policy.rs",
@@ -55,7 +58,8 @@ FORBIDDEN_SYMBOLS = {
     "SessionObservation", "ObservationEvent", "ObservationSubscription", "SessionObserver",
     "SnapshotRevision", "SnapshotCursor", "EventCursor", "Resync", "ResyncRequired",
     "Workspace", "WorkspaceAccess", "InteractionClient", "AgentSpawner", "Subagent",
-    "ChildSession", "ModelResolver", "ProviderRegistry", "ProviderCredential",
+    "ChildSession", "ModelGateway", "ModelProvider", "ModelResolver", "ProviderRegistry",
+    "ProviderCredential", "ProviderId", "ModelSelection", "ModelId", "ProviderItemId",
     "TurnSummary", "TurnTerminalSummary", "TerminalOutcome",
     "SessionEventKind", "RuntimeEvent", "ToolRegistry", "ToolRegistryBuilder",
 }
@@ -78,7 +82,7 @@ FORBIDDEN_IMPORTS = {
 }
 FORBIDDEN_DEPENDENCIES = {"reqwest", "cap-std", "cap-primitives", "fs4"}
 PORT_FILES = {
-    "src/model/model.rs", "src/tools/tool.rs", "src/tools/set.rs",
+    "src/model/model.rs", "src/model/response.rs", "src/tools/tool.rs", "src/tools/set.rs",
     "src/tools/context.rs", "src/tools/input.rs", "src/tools/policy.rs", "src/tools/progress.rs", "src/tools/types.rs",
     "src/context/provider.rs", "src/compaction/strategy.rs", "src/storage/session_log.rs",
 }
@@ -92,7 +96,7 @@ REQUIRED_FILES = {
     "src/session/interaction.rs", "src/session/bindings.rs", "src/session/transcript.rs",
     "src/conversation/mod.rs", "src/conversation/entry.rs", "src/conversation/load.rs", "src/conversation/state.rs",
     "src/conversation/validator.rs", "src/conversation/projection.rs", "src/conversation/log.rs",
-    "src/conversation/recovery.rs", "src/conversation/transcript.rs", "src/model/mod.rs", "src/model/model.rs", "src/model/types.rs",
+    "src/conversation/recovery.rs", "src/conversation/transcript.rs", "src/model/mod.rs", "src/model/model.rs", "src/model/response.rs", "src/model/types.rs",
     "src/conversation/view.rs",
     "src/tools/mod.rs", "src/tools/tool.rs", "src/tools/context.rs", "src/tools/input.rs", "src/tools/policy.rs", "src/tools/progress.rs", "src/tools/set.rs", "src/tools/types.rs",
     "src/context/mod.rs", "src/context/provider.rs",

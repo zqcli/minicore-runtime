@@ -2,7 +2,7 @@
 
 ## Status
 
-P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is in progress: P3-B exposes the final Tool/ToolSet seam, removes the old public Runtime/ToolRegistry facade, and deletes concrete builtin/process adapters. P4/P5 SessionRuntime acceptance and the remaining provider/model/workspace migration are still deferred.
+P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is in progress: P3-B/P3-C/P3-D expose the final Tool, policy/interaction, and direct Model seams while deleting the old public registries and concrete adapters. P4/P5 SessionRuntime, ModelDriver, and remaining workspace migration are still deferred.
 
 ## Completed Foundations
 
@@ -18,6 +18,7 @@ P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is 
 
 - [x] **P3-B — Tool seam reset:** public `Tool`/`ToolSet`, checked invocation/context/progress/input/output DTOs, true legacy DTO split, concrete adapter deletion, and focused contract tests.
 - [x] **P3-C — policy/approval seam:** async typed `ToolPolicy`, checked approval DTOs, and process-local interaction values; actor suspension/consumption wiring remains deferred to the owner migration.
+- [x] **P3-D — direct Model Port:** host-neutral streaming `Model`, checked descriptors/contexts/events/errors/requests, private `Legacy*` runner lookup, concrete adapter/transport deletion, and focused contract coverage.
 - [ ] **P4/P5 — SessionRuntime acceptance:** owner/runtime integration and replacement end-to-end contract suite.
 
 ## Current Maintenance Gates
@@ -33,7 +34,7 @@ Every change should preserve these gates:
 7. Git diff/show checks and a clean working tree.
 8. No default network access, live credential use, or detached owner-tracked work.
 
-The two live provider smoke cases remain explicit opt-in and ignored. They are evidence harnesses, not deterministic default gates.
+Historical live-network smoke cases are not root-crate targets. The standalone provider-gate package remains deterministic independent evidence.
 
 ## P9 Scope
 
@@ -76,18 +77,18 @@ Before changing persistence, confirm:
 - restart repair is idempotent and preserves source history;
 - an offline migration story exists if the shape is incompatible.
 
-Before changing a provider or builtin, confirm:
+Before changing a Model adapter or host tool, confirm:
 
-- the registry freezes descriptors and names before Runtime opens;
-- credential and endpoint details remain host-owned and redacted;
-- provider delivery state or tool execution state is retained until settlement;
+- the bound descriptor and tool specs are checked before execution;
+- network configuration remains outside the core and redacted by the host adapter;
+- model delivery state or tool execution state is retained until settlement;
 - retry is owned at the turn boundary, not hidden inside transport;
 - capability and process authority claims match what the operating system can enforce;
 - deterministic offline evidence covers protocol, cancellation, bounds, and failure mapping.
 
 ## Remote Release Gate
 
-The final P9 gate ran on the approved Rust 1.85 toolchain and stable toolchain without changing source behavior. It included current Markdown/ADR validation, format, locked all-target tests, Clippy, the provider-gate package, MSRV checks, locked documentation generation, Cargo metadata resolution, and the active acceptance matrix. Native macOS and Windows all-target plus provider-gate jobs also passed in [GitHub Actions run 32434427759](https://github.com/zqcli/minicore-runtime/actions/runs/32434427759). Live provider smokes remain explicit opt-in and are not part of the default release result.
+The final historical P9 gate ran on the approved Rust 1.85 toolchain and stable toolchain without changing source behavior. It included current Markdown/ADR validation, format, locked all-target tests, Clippy, the provider-gate package, MSRV checks, locked documentation generation, Cargo metadata resolution, and the active acceptance matrix. Native macOS and Windows jobs also passed in [GitHub Actions run 32434427759](https://github.com/zqcli/minicore-runtime/actions/runs/32434427759).
 
 Dependency lockfile regeneration was committed separately after P9-01 manifest cleanup. Rust 1.85 and stable Cargo produced byte-identical lockfiles. Review confirmed a stable 199-package graph with 20 compatible patch-version updates, no package entry added or removed, and green locked gates. The current v0.3 package metadata is `0.3.0`; publication remains a separate decision.
 

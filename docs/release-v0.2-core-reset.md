@@ -1,7 +1,7 @@
 # v0.2 Core Reset Release Readiness
 
 > Historical v0.2 release record. Its Runtime, registry, and v0.2 public-surface
-> descriptions are transitional evidence; the breaking v0.3 P3-B surface is
+> descriptions are transitional evidence; the breaking v0.3 P3-D surface is
 > authoritative in the root README and current architecture/module map.
 
 This note records the implementation and verification milestone for the MiniCore Runtime v0.2 Core Reset from baseline `5088bc254548b3e80e87179898ebb7abbea52c7d`. It records the historical source and durable contracts; it does not reopen the archived pre-reset design.
@@ -12,7 +12,7 @@ The milestone name is v0.2 Core Reset. At that historical milestone the crate pa
 
 The production crate contains 56 Rust source files and approximately 16.6k production lines. Its canonical top-level owners are `agent`, `config`, `error`, `event`, `ids`, `model`, `prompt`, `runtime`, `session`, `storage`, `tools`, and `workspace`. `agent`, `prompt`, and `storage` are private. The production module dependency graph is a DAG: every module SCC is a singleton, with no accepted multi-module cycle.
 
-The architecture gate requires the exact canonical file graph, rejects legacy source paths and migration aliases, checks owner-crossing imports, limits production file and function size, and freezes the direct dependency set. The current direct dependencies are `cap-primitives`, `cap-std`, `fs4`, `futures-util`, `getrandom`, `reqwest`, `serde`, `serde_json`, `thiserror`, `time`, `tokio`, and `tokio-util`.
+The architecture gate requires the exact canonical file graph, rejects legacy source paths and migration aliases, checks owner-crossing imports, limits production file and function size, and freezes the direct dependency set. The current direct dependencies are `cap-primitives`, `cap-std`, `fs4`, `futures-util`, `getrandom`, `serde`, `serde_json`, `thiserror`, `time`, `tokio`, and `tokio-util`; the root `reqwest` dependency was removed with concrete model adapters in P3-D.
 
 ## Public Surface
 
