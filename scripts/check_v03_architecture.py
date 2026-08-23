@@ -35,6 +35,9 @@ CANONICAL_PRODUCTION_FILES = {
     "src/model": {"mod.rs", "model.rs", "driver.rs", "request.rs", "response.rs", "types.rs"},
     "src/tools": {"mod.rs", "tool.rs", "set.rs", "context.rs", "input.rs", "policy.rs", "progress.rs", "types.rs"},
 }
+CANONICAL_PRODUCTION_DIRECTORIES = {
+    "src/model/driver": {"assembler.rs"},
+}
 MODEL_DRIVER_ROLE_FILES = {"src/model/driver.rs"}
 TOOLSET_ROLE_FILES = {"src/tools/set.rs"}
 SESSION_BINDINGS_ROLE_FILES = {"src/session/bindings.rs"}
@@ -109,7 +112,7 @@ REQUIRED_FILES = {
     "src/session/interaction.rs", "src/session/bindings.rs", "src/session/transcript.rs",
     "src/conversation/mod.rs", "src/conversation/entry.rs", "src/conversation/load.rs", "src/conversation/state.rs",
     "src/conversation/validator.rs", "src/conversation/projection.rs", "src/conversation/log.rs",
-    "src/conversation/recovery.rs", "src/conversation/transcript.rs", "src/model/mod.rs", "src/model/model.rs", "src/model/response.rs", "src/model/types.rs",
+    "src/conversation/recovery.rs", "src/conversation/transcript.rs", "src/model/mod.rs", "src/model/model.rs", "src/model/driver.rs", "src/model/driver/assembler.rs", "src/model/response.rs", "src/model/types.rs",
     "src/conversation/view.rs",
     "src/tools/mod.rs", "src/tools/tool.rs", "src/tools/context.rs", "src/tools/input.rs", "src/tools/policy.rs", "src/tools/progress.rs", "src/tools/set.rs", "src/tools/types.rs",
     "src/context/mod.rs", "src/context/provider.rs",
@@ -800,6 +803,31 @@ def canonical_allowlist_errors(
             descendants = list(child.rglob("*"))
             rust_files = [descendant for descendant in descendants if descendant.is_file() and descendant.suffix == ".rs"]
             empty_directories = [descendant for descendant in descendants if descendant.is_dir() and not any(descendant.iterdir())]
+            allowed_production = CANONICAL_PRODUCTION_DIRECTORIES.get(relative)
+            if allowed_production is not None:
+                invalid = [
+                    descendant
+                    for descendant in rust_files
+                    if not (
+                        descendant.parent == child
+                        and descendant.name in allowed_production
+                    )
+                    and not test_helper_with_empty_production_view(
+                        descendant.relative_to(root).as_posix(),
+                        source_texts,
+                        test_files,
+                    )
+                ]
+                if (
+                    invalid
+                    or empty_directories
+                    or any(
+                        descendant.is_file() and descendant.suffix != ".rs"
+                        for descendant in descendants
+                    )
+                ):
+                    errors.append(f"forbidden production {directory} path: {relative}")
+                continue
             if not rust_files or empty_directories or any(
                 not test_helper_with_empty_production_view(descendant.relative_to(root).as_posix(), source_texts, test_files)
                 for descendant in rust_files

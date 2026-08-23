@@ -9,6 +9,7 @@ MiniCore Runtime is an embeddable Rust 2024 single-session execution kernel. The
 - `ToolSet` registration is explicit, deterministic, duplicate-safe, and panic-safe while freezing tool specs for shared cloned sets.
 - Typed context and compaction Ports with immutable DTOs.
 - Public direct `model::Model` streaming Port with checked descriptors, contexts, requests, events, delivery-aware errors, cancellation, and deadlines.
+- Crate-private `ModelDriver` with strict stream assembly, panic isolation, overall deadlines, cancellation, delivery-safe retry, lossy delta progress, and checked tool-call grammar; actor wiring remains P5-B.
 - Public `SessionBindings` freezes one direct Model, ToolSet, and optional policy/context/compaction adapters, then validates them purely against `SessionSpec` and `SemanticLimits`.
 - Public process-local `SessionState`, bounded single-consumer `SessionEventStream`, and exact-turn `TurnHandle` foundations with redacted diagnostics and no snapshot/broadcast recovery protocol.
 - Public non-Clone `SessionRuntime` create/load/take-events/shutdown lifecycle with spawn-first OpenGuard cancellation, proof-gated replay/recovery, one durable log owner, and typed open/shutdown failures.
@@ -75,7 +76,7 @@ Before spawning the owner or awaiting anything, OpenGuard installs cleanup watch
 
 Core isolates host-controlled panic boundaries: Model descriptor access, SessionLog future construction/polling, and the post-ready actor loop. Those paths return typed failures and retain their defined close behavior. Arbitrary Core allocation or invariant panics after ownership transfer are not a recoverable API error boundary and may skip graceful close, as may destruction of every runtime capable of driving cleanup. Core does not claim that every possible panic is converted into a close-complete error.
 
-P4-B intentionally has no public `handle()` or command mailbox. P4-C will add the final SessionHandle and commands; P5 will activate turns, ModelDriver, tools, interactions, and settlement.
+P4-B intentionally has no public `handle()` or command mailbox. P4-C will add the final SessionHandle and commands; P5-B will wire the completed ModelDriver into turns, tools, interactions, and settlement.
 
 ## Public Modules
 

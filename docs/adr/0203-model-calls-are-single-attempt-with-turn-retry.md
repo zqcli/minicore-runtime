@@ -2,8 +2,8 @@
 
 状态：Accepted
 
-> Refined for v0.3 P3-D. The direct Model Port reports delivery truth; P5 will
-> centralize stream consumption and retry in ModelDriver.
+> Refined for v0.3 P5-A. The direct Model Port reports delivery truth;
+> ModelDriver now centralizes stream consumption and retry.
 
 日期：2026-08-20
 
@@ -13,12 +13,12 @@ A host Model adapter can fail before work starts, after work starts, or when the
 
 ## Decision
 
-Each `Model::start` call is one logical attempt. The adapter reports `DeliveryState` and a typed `ModelError`. The future P5 `ModelDriver` owns logical retries using `RetryPolicy`: one through four total attempts, base delay no greater than 30 seconds, bounded exponential delay, and an optional retry-after hint.
+Each `Model::start` call is one logical attempt. The adapter reports `DeliveryState` and a typed `ModelError`. The private `ModelDriver` owns logical retries using the checked Kernel-derived RetryPolicy snapshot: one through four total attempts, base delay no greater than 30 seconds, bounded exponential delay, and an optional retry-after hint.
 
-Automatic retry requires `retryable == true` and `delivery == NotStarted`. `Started` and `Unknown` are conservative non-retryable outcomes. A retry-after value above the remaining budget disables retry.
+Automatic retry requires `retryable == true`, `delivery == NotStarted`, no semantic event observed in the attempt, a remaining attempt, a valid delay, and remaining overall deadline. `Started` and `Unknown` are conservative non-retryable outcomes. A retry-after value above 30 seconds or beyond the remaining budget disables retry. An adapter claiming NotStarted after an event is normalized to Started and never retried.
 
 ## Consequences
 
-The core never silently replays a request. Host adapters own their external protocol and cleanup; `ModelDriver` owns stream assembly, panic conversion, retry timing, deadlines, and cancellation; the session actor owns final durable settlement. An unknown outcome becomes a truthful terminal error rather than an optimistic retry.
+The core never silently replays a request. Host adapters own their external protocol and cleanup; `ModelDriver` owns strict stream assembly, panic conversion, retry timing, one effective deadline, cancellation, and lossy delta progress; P5-B session execution owns final durable settlement. An unknown outcome becomes a truthful terminal error rather than an optimistic retry.
 
-See [architecture](../architecture.md#model-retry), [model module ownership](../modules/README.md#model), and [`src/model/model.rs`](../../src/model/model.rs).
+See [architecture](../architecture.md#model-retry), [model module ownership](../modules/README.md#model), [`src/model/model.rs`](../../src/model/model.rs), and [`src/model/driver.rs`](../../src/model/driver.rs).

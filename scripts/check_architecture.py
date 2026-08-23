@@ -39,6 +39,8 @@ REQUIRED_DIRS = {
     "src/context",
     "src/error",
     "src/model",
+    "src/model/driver",
+    "src/model/driver/tests",
     "src/prompt",
     "src/session",
     "src/session/legacy_event_stream",
@@ -88,6 +90,15 @@ REQUIRED_FILES = {
     "src/model/legacy_gateway.rs",
     "src/model/legacy_provider.rs",
     "src/model/legacy_registry.rs",
+    "src/model/driver.rs",
+    "src/model/driver/assembler.rs",
+    "src/model/driver/tests.rs",
+    "src/model/driver/tests/assembly.rs",
+    "src/model/driver/tests/cancellation.rs",
+    "src/model/driver/tests/preflight_progress.rs",
+    "src/model/driver/tests/retry.rs",
+    "src/model/driver/tests/semantics.rs",
+    "src/model/driver/tests/settlement.rs",
     "src/model/model.rs",
     "src/model/mod.rs",
     "src/model/response.rs",
@@ -332,6 +343,7 @@ EXPECTED_MODULE_VISIBILITY = {
     "src/context/mod.rs": {"provider": "private"},
     "src/error.rs": {"operations": "private"},
     "src/model/mod.rs": {
+        "driver": "private",
         "legacy_gateway": "private",
         "legacy_provider": "crate",
         "legacy_registry": "crate",
@@ -340,6 +352,15 @@ EXPECTED_MODULE_VISIBILITY = {
         "types": "private",
     },
     "src/prompt/mod.rs": {"builder": "private", "compaction": "private"},
+    "src/model/driver.rs": {"assembler": "private", "tests": "private"},
+    "src/model/driver/tests.rs": {
+        "assembly": "private",
+        "cancellation": "private",
+        "preflight_progress": "private",
+        "retry": "private",
+        "semantics": "private",
+        "settlement": "private",
+    },
     "src/session/mod.rs": {
         "actor": "crate",
         "bindings": "private",
@@ -388,6 +409,15 @@ EXPECTED_MODULE_VISIBILITY = {
 }
 
 EXPECTED_TEST_ONLY_MODULES = {
+    "src/model/driver.rs": {"tests"},
+    "src/model/driver/tests.rs": {
+        "assembly",
+        "cancellation",
+        "preflight_progress",
+        "retry",
+        "semantics",
+        "settlement",
+    },
     "src/model/mod.rs": {"legacy_gateway", "legacy_provider", "legacy_registry"},
     "src/session/mod.rs": {
         "actor",

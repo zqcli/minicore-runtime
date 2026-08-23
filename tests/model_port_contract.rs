@@ -427,16 +427,27 @@ fn model_request_is_checked_host_neutral_and_redacted() {
 }
 
 #[test]
-fn stream_panic_and_cancellation_catching_are_deferred_to_p5_model_driver() {
+fn stream_panic_and_cancellation_catching_live_only_in_internal_model_driver() {
     let port = include_str!("../src/model/model.rs");
     assert!(port.contains("pub cancellation: CancellationToken"));
-    for deferred in [
+    for forbidden in [
         "catch_unwind",
         "AssertUnwindSafe",
         "tokio::select!",
         "ModelDriver",
     ] {
-        assert!(!port.contains(deferred));
+        assert!(!port.contains(forbidden));
+    }
+
+    let driver = include_str!("../src/model/driver.rs");
+    for required in [
+        "pub(crate) struct ModelDriver",
+        "catch_unwind",
+        "AssertUnwindSafe(start).catch_unwind()",
+        "AssertUnwindSafe(stream.next()).catch_unwind()",
+        "tokio::select!",
+    ] {
+        assert!(driver.contains(required));
     }
 }
 
@@ -444,6 +455,9 @@ fn stream_panic_and_cancellation_catching_are_deferred_to_p5_model_driver() {
 fn model_module_has_no_public_legacy_or_concrete_adapter_exports() {
     let module = include_str!("../src/model/mod.rs");
     assert!(module.contains("#[path = \"model.rs\"]\nmod model_port;"));
+    assert!(module.contains("mod driver;"));
+    assert!(module.contains("pub(crate) use driver::{"));
+    assert!(!module.contains("pub mod driver;"));
     assert!(module.contains("pub use model_port::{Model, ModelCallContext, ModelDescriptor"));
     assert!(!module.contains("mod port;"));
     assert!(module.contains("pub(crate) use legacy_gateway::LegacyModelGateway;"));

@@ -17,6 +17,7 @@ The crate is Rust 2024 with Rust 1.85 as its MSRV. Concrete storage acquisition,
 - `storage::SessionLog`: the only public persistence Port. Host code acquires one exclusive adapter and passes ownership into `SessionRuntime::create/load`.
 - `session`: public bindings/interactions/state/events/TurnHandle plus the P4-B owner. Old actor/command/observation files remain private P4-C/P5 scaffolding only.
 - `model`, `tools`, `context`, `compaction`: host-neutral Ports and checked DTOs bound immutably for the loaded lifetime.
+- `model::driver`: private P5-A execution module binding one direct Model, a checked Kernel-derived timeout/retry/semantic snapshot, strict stream assembly, and best-effort delta progress; no session/log/tool-execution authority.
 - `agent`, `prompt`, `workspace`, the old filesystem store, and legacy actor/model/tool observation graph: `cfg(test)` migration evidence only; none is present in the production library graph or owned by SessionRuntime.
 
 The public root exposes `compaction`, `config`, `context`, `conversation`, `error`, `ids`, `model`, `session`, `storage`, `tools`, and `value`. There is no top-level `runtime` module, multi-session manager, loaded-session map, repository, or shutdown-all owner.
@@ -73,7 +74,7 @@ Model descriptor access, SessionLog future construction and polling, and the pos
 
 ## Deferred Work
 
-P4-C will replace the private legacy actor/command scaffolding with the final cloneable SessionHandle, state watch access, bounded submit/answer commands, and transcript routing. P5 will wire TurnHandle completion, ModelDriver, tools, policy/interactions, context, compaction, and terminal settlement. The current owner is deliberately idle: it proves lifecycle and durable ownership without fake execution.
+P4-C will replace the private legacy actor/command scaffolding with the final cloneable SessionHandle, state watch access, bounded submit/answer commands, and transcript routing. P5-A ModelDriver is complete and independently tested. P5-B will wire it into turns with tools, policy/interactions, context, compaction, and terminal settlement. The current owner remains deliberately idle.
 
 ## Verification
 

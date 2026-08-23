@@ -2,7 +2,7 @@
 
 ## Status
 
-P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is in progress: P3-B through P4-B expose the final Port/bindings/state/event/TurnHandle foundations and the real single-session create/load/shutdown owner. P4-C/P5 SessionHandle, actor execution, ModelDriver, and remaining workspace migration are still deferred.
+P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is in progress: P3-B through P4-B expose the final Port/bindings/state/event/TurnHandle foundations and the real single-session create/load/shutdown owner. P5-A ModelDriver is complete; P4-C/P5-B SessionHandle and actor execution plus remaining workspace migration are still deferred.
 
 ## Completed Foundations
 
@@ -22,7 +22,8 @@ P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is 
 - [x] **P3-E — SessionBindings:** exact immutable Port bundle, pure spec/limits/model/tool/compaction validation, descriptor panic isolation, frozen ToolSpec semantic budgets, root export, and focused contract coverage.
 - [x] **P4-A — state/event/TurnHandle foundation:** lightweight invariant-checked state, redacted diagnostics, exact event DTOs, bounded single-consumer lossy stream, exact-Turn cancellation/completion, and physical legacy observation split.
 - [x] **P4-B — SessionRuntime owner lifecycle:** spawn-first OpenGuard, create/load validation and recovery, one log/state/event owner, typed open/shutdown errors, cancellation cleanup, one-shot events, deterministic shutdown, multi-owner concurrency, and deletion of the multi-session Runtime.
-- [ ] **P4-C/P5 — commands and execution:** final SessionHandle/commands, actor integration, ModelDriver, turns, interactions, tools, context/compaction, and settlement.
+- [x] **P5-A — ModelDriver:** one direct Model, checked Kernel-derived configuration snapshot, strict stream assembler/tool grammar, panic conversion, effective deadline/cancellation, delivery-safe retry, lossy bounded progress, and deterministic private tests.
+- [ ] **P4-C/P5-B — commands and execution:** final SessionHandle/commands, actor integration, turns, interactions, tools, context/compaction, and settlement through ModelDriver.
 
 ## Current Maintenance Gates
 
