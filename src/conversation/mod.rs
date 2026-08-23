@@ -23,6 +23,7 @@ const _: () = {
     let _ = load::PendingConversationLoad::manifest;
     let _ = LoadCompatibilityValidated::after_session_bindings_validation;
     let _ = view::ConversationView::from_confirmed;
+    let _ = view::ConversationView::validated_prompt_projection;
     let _ = log::UnsequencedEntry::UserMessage;
     let _ = log::UnsequencedEntry::AssistantMessage;
     let _ = log::UnsequencedEntry::Summary;
@@ -33,6 +34,7 @@ pub(crate) use log::{
     ConversationCloseOutcome, ConversationCommitError, ConversationCommitErrorKind,
     ConversationLog, TimestampSource,
 };
+pub(crate) use view::PromptConversationProjection;
 
 pub use entry::{
     AssistantMessageEntry, ConversationEntry, ConversationSeq, SummaryEntry, ToolResultEntry,

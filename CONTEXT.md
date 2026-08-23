@@ -13,13 +13,14 @@ The crate is Rust 2024 with Rust 1.85 as its MSRV. Concrete storage acquisition,
 
 - `session::SessionRuntime`: unique owner of one created or loaded Session, one `ConversationLog`, one root cancellation domain, one state sender, one bounded event sink, and one actor JoinHandle.
 - `session::SessionRuntimeOptions`: checked `KernelConfig`, immutable `SessionBindings`, and the Host-selected Tokio `Handle` used to spawn the whole open lifecycle.
-- `conversation`: canonical entries, semantic validation, proof-gated load, paged replay, restart repair, append coordination, confirmed projection, transcript, and close classification.
+- `conversation`: canonical entries, semantic validation, proof-gated load, paged replay, restart repair, append coordination, confirmed projection, canonical prompt-history proofs, transcript, and close classification.
 - `storage::SessionLog`: the only public persistence Port. Host code acquires one exclusive adapter and passes ownership into `SessionRuntime::create/load`.
 - `session`: public bindings/interactions/state/events/TurnHandle plus the P4-B owner. Old actor/command/observation files remain private P4-C/P5 scaffolding only.
 - `model`, `tools`, `context`, `compaction`: host-neutral Ports and checked DTOs bound immutably for the loaded lifetime.
 - `model::driver`: private P5-A execution module binding one direct Model, a checked Kernel-derived timeout/retry/semantic snapshot, strict stream assembly, and best-effort delta progress; no session/log/tool-execution authority.
 - `agent::tool_driver` and `agent::runner_protocol`: private P5-B execution modules owning frozen-spec policy evaluation, typed approval/input suspension, panic-safe Tool execution, child cancellation, output bounds, and lossy progress. They never append, spawn, or own SessionRuntime/log authority.
-- `prompt`, `workspace`, the old filesystem store, and the legacy agent/actor/model/tool observation graph: `cfg(test)` migration evidence only; none is present in the production library graph or owned by SessionRuntime.
+- `context::driver` and `prompt::builder`: private P5-C modules owning one-provider context deadlines/panic isolation, canonical context bundles, consumption of conversation-owned prompt proofs, deterministic mapping, stable context headers, exact frozen tools, and exact serialized-request output-reserved budgeting. They invoke no model, tool, log, workspace, or owner.
+- `workspace`, the old filesystem store, legacy prompt compaction, and the legacy agent/actor/model/tool observation graph: `cfg(test)` migration evidence only; none is present in the production library graph or owned by SessionRuntime.
 
 The public root exposes `compaction`, `config`, `context`, `conversation`, `error`, `ids`, `model`, `session`, `storage`, `tools`, and `value`. There is no top-level `runtime` module, multi-session manager, loaded-session map, repository, or shutdown-all owner.
 
@@ -75,7 +76,7 @@ Model descriptor access, SessionLog future construction and polling, and the pos
 
 ## Deferred Work
 
-P4-C will replace the private legacy actor/command scaffolding with the final cloneable SessionHandle, state watch access, bounded submit/answer commands, and transcript routing. P5-A ModelDriver and P5-B ToolDriver/suspension protocol are complete and independently tested. P5-C will wire them into the turn runner with actor commits, context, compaction, and terminal settlement. The current owner remains deliberately idle.
+P4-C will replace the private legacy actor/command scaffolding with the final cloneable SessionHandle, state watch access, bounded submit/answer commands, and transcript routing. P5-A ModelDriver, P5-B ToolDriver/suspension protocol, and P5-C ContextDriver/final PromptBuilder are complete and independently tested. P5-D will wire them into the turn runner with actor commits, final compaction, and terminal settlement. The current owner remains deliberately idle.
 
 ## Verification
 

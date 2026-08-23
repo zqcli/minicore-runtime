@@ -33,7 +33,9 @@ CONCRETE_FILENAMES = {
 }
 CANONICAL_PRODUCTION_FILES = {
     "src/agent": {"mod.rs", "runner_protocol.rs", "tool_driver.rs"},
+    "src/context": {"mod.rs", "provider.rs", "driver.rs"},
     "src/model": {"mod.rs", "model.rs", "driver.rs", "request.rs", "response.rs", "types.rs"},
+    "src/prompt": {"mod.rs", "builder.rs"},
     "src/tools": {"mod.rs", "tool.rs", "set.rs", "context.rs", "input.rs", "policy.rs", "progress.rs", "types.rs"},
 }
 CANONICAL_PRODUCTION_DIRECTORIES = {
@@ -42,6 +44,8 @@ CANONICAL_PRODUCTION_DIRECTORIES = {
 }
 MODEL_DRIVER_ROLE_FILES = {"src/model/driver.rs"}
 TOOL_DRIVER_ROLE_FILES = {"src/agent/tool_driver.rs"}
+CONTEXT_DRIVER_ROLE_FILES = {"src/context/driver.rs"}
+PROMPT_BUILDER_ROLE_FILES = {"src/prompt/builder.rs"}
 TOOLSET_ROLE_FILES = {"src/tools/set.rs"}
 SESSION_BINDINGS_ROLE_FILES = {"src/session/bindings.rs"}
 SESSION_RUNTIME_ROLE_FILES = {"src/session/runtime.rs"}
@@ -119,7 +123,7 @@ REQUIRED_FILES = {
     "src/conversation/recovery.rs", "src/conversation/transcript.rs", "src/model/mod.rs", "src/model/model.rs", "src/model/driver.rs", "src/model/driver/assembler.rs", "src/model/response.rs", "src/model/types.rs",
     "src/conversation/view.rs",
     "src/tools/mod.rs", "src/tools/tool.rs", "src/tools/context.rs", "src/tools/input.rs", "src/tools/policy.rs", "src/tools/progress.rs", "src/tools/set.rs", "src/tools/types.rs",
-    "src/context/mod.rs", "src/context/provider.rs",
+    "src/context/mod.rs", "src/context/provider.rs", "src/context/driver.rs",
     "src/compaction/mod.rs", "src/compaction/strategy.rs", "src/storage/mod.rs",
     "src/storage/session_log.rs",
 }
@@ -978,6 +982,8 @@ def responsibility_errors(views: dict[str, tuple[str, int]]) -> list[str]:
     role_groups = (
         ("model driver", MODEL_DRIVER_ROLE_FILES),
         ("tool driver", TOOL_DRIVER_ROLE_FILES),
+        ("context driver", CONTEXT_DRIVER_ROLE_FILES),
+        ("prompt builder", PROMPT_BUILDER_ROLE_FILES),
         ("tools ToolSet", TOOLSET_ROLE_FILES),
         ("session bindings", SESSION_BINDINGS_ROLE_FILES),
         ("session runtime owner", SESSION_RUNTIME_ROLE_FILES),

@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::RetryPolicy;
 use crate::ids::{SessionId, TurnId};
 use crate::model::{LegacyModelGateway, ModelLimits, ReasoningPreference};
-use crate::prompt::{Compactor, PromptBuildOptions, PromptBuilder};
+use crate::prompt::{Compactor, LegacyPromptBuilder as PromptBuilder, PromptBuildOptions};
 use crate::storage::conversation::ConversationLog;
 use crate::time::{Timestamp, TimestampError};
 use crate::tools::legacy_policy::LegacyToolPolicy;

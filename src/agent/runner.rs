@@ -15,7 +15,7 @@ use crate::model::{
     DeliveryState, LegacyModelCallContext, LegacyModelEvent, ModelError, ModelErrorKind,
     ModelFinishReason, ModelResponse, ToolCall, Usage,
 };
-use crate::prompt::{PromptError, append_validated_summary};
+use crate::prompt::{LegacyPromptError as PromptError, append_validated_summary};
 use crate::storage::conversation::{ConversationError, NewConversationEntry};
 use crate::tools::legacy_policy::{LegacyToolContextView, LegacyToolDecision, LegacyToolRequest};
 use crate::tools::{

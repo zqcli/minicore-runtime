@@ -28,7 +28,9 @@ use crate::model::{
     LegacyModelDescriptor, LegacyModelEvent, LegacyModelGateway, LegacyModelSelection,
     ReasoningPreference, Usage,
 };
-use crate::prompt::{CompactionConfig, Compactor, PromptBuildOptions, PromptBuilder};
+use crate::prompt::{
+    CompactionConfig, Compactor, LegacyPromptBuilder as PromptBuilder, PromptBuildOptions,
+};
 use crate::storage::conversation::{
     ConversationError, ConversationHealth, ConversationLog, NewConversationEntry, StoredTurnOutcome,
 };

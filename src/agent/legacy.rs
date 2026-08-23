@@ -340,7 +340,8 @@ mod tests {
             options.enabled_tools.clone(),
             options.max_tool_rounds,
             TurnContextDependencies {
-                prompt_builder: crate::prompt::PromptBuilder::new("system", "coding").unwrap(),
+                prompt_builder: crate::prompt::LegacyPromptBuilder::new("system", "coding")
+                    .unwrap(),
                 prompt_options: crate::prompt::PromptBuildOptions::new(
                     model_selection,
                     request_limits,
