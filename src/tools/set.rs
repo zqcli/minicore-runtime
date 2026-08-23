@@ -57,6 +57,10 @@ impl ToolSet {
     pub(crate) fn frozen_specs(&self) -> impl ExactSizeIterator<Item = &ToolSpec> {
         self.specs.values()
     }
+
+    pub(crate) fn frozen_spec(&self, name: &ToolName) -> Option<&ToolSpec> {
+        self.specs.get(name)
+    }
 }
 
 impl ToolSetBuilder {

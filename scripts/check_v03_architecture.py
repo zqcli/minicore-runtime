@@ -32,13 +32,16 @@ CONCRETE_FILENAMES = {
     "process.rs", "builtins.rs",
 }
 CANONICAL_PRODUCTION_FILES = {
+    "src/agent": {"mod.rs", "runner_protocol.rs", "tool_driver.rs"},
     "src/model": {"mod.rs", "model.rs", "driver.rs", "request.rs", "response.rs", "types.rs"},
     "src/tools": {"mod.rs", "tool.rs", "set.rs", "context.rs", "input.rs", "policy.rs", "progress.rs", "types.rs"},
 }
 CANONICAL_PRODUCTION_DIRECTORIES = {
+    "src/agent/tool_driver": {"support.rs"},
     "src/model/driver": {"assembler.rs"},
 }
 MODEL_DRIVER_ROLE_FILES = {"src/model/driver.rs"}
+TOOL_DRIVER_ROLE_FILES = {"src/agent/tool_driver.rs"}
 TOOLSET_ROLE_FILES = {"src/tools/set.rs"}
 SESSION_BINDINGS_ROLE_FILES = {"src/session/bindings.rs"}
 SESSION_RUNTIME_ROLE_FILES = {"src/session/runtime.rs"}
@@ -102,8 +105,9 @@ PORT_FILES = {
 }
 REQUIRED_FILES = {
     "src/lib.rs", "src/config.rs", "src/error.rs", "src/error/operations.rs", "src/ids.rs", "src/value.rs", "src/time.rs",
-    "src/agent/mod.rs", "src/agent/runner.rs", "src/agent/runner_protocol.rs",
-    "src/agent/turn_context.rs", "src/agent/retry.rs", "src/prompt/mod.rs", "src/prompt/builder.rs",
+    "src/agent/mod.rs", "src/agent/runner_protocol.rs", "src/agent/tool_driver.rs",
+    "src/agent/tool_driver/support.rs",
+    "src/prompt/mod.rs", "src/prompt/builder.rs",
     "src/session/mod.rs", "src/session/runtime.rs", "src/session/runtime_actor.rs",
     "src/session/runtime_log.rs", "src/session/runtime_open.rs", "src/session/handle.rs",
     "src/session/turn_handle.rs",
@@ -973,6 +977,7 @@ def responsibility_errors(views: dict[str, tuple[str, int]]) -> list[str]:
     errors: list[str] = []
     role_groups = (
         ("model driver", MODEL_DRIVER_ROLE_FILES),
+        ("tool driver", TOOL_DRIVER_ROLE_FILES),
         ("tools ToolSet", TOOLSET_ROLE_FILES),
         ("session bindings", SESSION_BINDINGS_ROLE_FILES),
         ("session runtime owner", SESSION_RUNTIME_ROLE_FILES),

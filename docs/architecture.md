@@ -37,6 +37,8 @@ Validation is pure and does not invoke adapter futures. The only adapter call is
 
 `model::driver` is the private P5-A execution module. `ModelDriver` binds one `Arc<dyn Model>` plus an immutable Kernel-derived snapshot of model timeout, retry policy, and semantic limits. The snapshot avoids a `model → config` dependency and preserves the singleton module DAG. One `run` call applies an overall effective deadline, cancellation, panic isolation for start construction/future/stream polling, delivery-safe retry, strict EOF/Finish/Usage/tool-call grammar, checked response construction, and best-effort bounded text/reasoning progress. Missing Usage becomes `Usage::default()`; every response still requires at least one assistant part, and conservative `Refused`/`ContentFiltered` completion requires text. It imports no session, agent, storage, workspace, provider lookup, credential, HTTP, or tool-execution authority.
 
+`agent::tool_driver` is the private P5-B tool-execution module. It binds one immutable ToolSet, the enabled ToolName set, an optional policy that is required whenever tools are enabled, and checked Kernel-derived policy/tool timeout and semantic input/output snapshots. One `run` performs defensive invocation preflight, policy panic/error/timeout conversion, exact approval suspension, panic-safe Tool execution with a child cancellation token, post-future ToolInput suspension, request-aware canonical answer encoding, semantic output checks, and lossy bounded progress. Text input results encode as `{"answer":"..."}`; choices encode as `{"choice_index":N,"choice":"selected text"}` with fixed field order and compact JSON. It returns `Ok(ToolDriverResult)` for all ordinary policy/tool outcomes. Critical send/wait failures return the exact `Err(SuspensionError)`—Cancelled, DeadlineExceeded, StaleTurn, InvalidState, or RuntimeClosed—without fabricating a ToolResult. No policy or Tool future survives suspension, and the module never spawns, appends, or owns runtime/log/workspace authority.
+
 ## State, Event, And Turn Foundation
 
 `session::SessionState` replaces the final heavy snapshot concept with one process-local current-state value. `SessionStatus` is exactly Idle, Running, WaitingForInput, or Closing. Validation centralizes active-turn/pending-interaction shape and prevents an active Turn from also being the latest durable terminal. `SessionHealth::Degraded` carries a checked `DiagnosticSummary`; its Debug reports message bytes rather than message content.
@@ -71,7 +73,7 @@ Progress is synchronous and nonblocking. `ToolProgressSink::emit` validates `com
 
 `ToolPolicy` is an asynchronous `Send + Sync + 'static` Port. It receives an owned `ToolPolicyRequest`, so the exact checked invocation and captured spec cross the seam without borrowing actor/session internals. Decisions are exactly `Allow`, bounded `Deny`, or `RequireApproval`; approval answers are exactly `AllowOnce` or `Deny`. Policy and approval `Debug` output reports safe identities, counts, risks, and byte lengths while redacting arguments, reasons, and prompts.
 
-`session::PendingInteraction`, `InteractionKind`, and `InteractionAnswer` are process-local DTOs only. They validate answer-kind matching and delegate tool-input answer checks to the original checked request. They contain no serde representation, resume sender, callback, owner handle, Workspace, Store, or arbitrary continuation. One-shot consumption remains a future actor responsibility rather than DTO state.
+`session::PendingInteraction`, `InteractionKind`, and `InteractionAnswer` are process-local DTOs only. They validate answer-kind matching and delegate tool-input answer checks to the original checked request. They contain no serde representation, resume sender, callback, owner handle, Workspace, Store, or arbitrary continuation. The internal `TurnSuspension` owns the one-shot sender separately; P5-C actor state will consume it exactly once without changing the public DTOs.
 
 ## Model Port
 
@@ -79,7 +81,7 @@ Progress is synchronous and nonblocking. `ToolProgressSink::emit` validates `com
 
 `ModelRequest` contains only checked messages, tools, limits, and reasoning. `ModelStream` emits bounded typed `ModelEvent` values for text, reasoning, tool-call grammar, usage, and finish. Event `Debug` output reports only safe identities and byte counts. `ModelError` reports `DeliveryState::{NotStarted, Started, Unknown}`, retryability, and an optional retry-after hint; retryable/hint combinations are rejected unless delivery is `NotStarted`.
 
-The test-only runner still consumes batch `ModelResponse` through `LegacyModelGateway`, `LegacyModelProvider`, and `LegacyProviderRegistry`. Those files preserve old unit evidence without entering the production graph or exposing provider lookup. P5-A ModelDriver is complete; P5-B replaces this runner path and owns actor integration and durable settlement.
+The old runner, context, batch Model gateway/provider lookup, Workspace, and direct ConversationLog behavior now live only under `agent::legacy` and other `cfg(test)` migration modules. P5-A ModelDriver and P5-B ToolDriver/suspension protocol are complete. P5-C replaces the legacy runner path with actor commit routing and durable settlement.
 
 ## Legacy Boundary
 
@@ -87,7 +89,7 @@ The test-only actor/runner/storage path uses `LegacyTool`, `LegacyToolContext`, 
 
 The test-only old actor uses `legacy_state.rs`, `legacy_event.rs`, `legacy_event_stream.rs`, and `legacy_snapshot.rs`. Their modules are gated with actor, command, and old transcript at `session/mod.rs`. Broadcast, first-snapshot delivery, resync, old commands, and legacy terminal behavior are absent from the production SessionRuntime graph.
 
-`legacy_context.rs`, `legacy_policy.rs`, `legacy_types.rs`, and `registry.rs` are staged private migration files. `legacy_policy.rs` retains the synchronous string-based decision flow only for the old runner and is marked for P5/P6 deletion. Final `policy.rs` is the public typed Port and is part of the canonical Tool seam.
+`legacy_context.rs`, `legacy_policy.rs`, `legacy_types.rs`, and `registry.rs` are staged private migration files. `legacy_policy.rs` retains the synchronous string-based decision flow only for the test-only old runner and is marked for P5-C/P6 deletion. Final `policy.rs` is the public typed Port and is part of the canonical Tool seam.
 
 ## Deferred Execution
 
@@ -95,7 +97,7 @@ The old top-level `runtime` directory, Runtime configuration/manager/error symbo
 
 Concrete filesystem/process adapters and their tests were deleted in P3-B rather than replaced with defaults. Future concrete tools must be host-owned implementations of the public `Tool` Port, not reintroduced builtins or process policy modules.
 
-P4-C will add the final SessionHandle, state watch access, commands, and transcript routing. P5-B will replace the old actor/runner with TurnHandle, the completed ModelDriver, policy/interaction, tool, context, compaction, and settlement wiring. P4-B deliberately supports no submit path.
+P4-C will add the final SessionHandle, state watch access, commands, and transcript routing. P5-C will replace the old actor/runner with TurnHandle, the completed ModelDriver and ToolDriver, actor commit/suspension routing, context, compaction, and settlement wiring. P4-B deliberately supports no submit path.
 
 ## Model Retry
 

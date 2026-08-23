@@ -19,6 +19,6 @@ Automatic retry requires `retryable == true`, `delivery == NotStarted`, no seman
 
 ## Consequences
 
-The core never silently replays a request. Host adapters own their external protocol and cleanup; `ModelDriver` owns strict stream assembly, panic conversion, retry timing, one effective deadline, cancellation, and lossy delta progress; P5-B session execution owns final durable settlement. An unknown outcome becomes a truthful terminal error rather than an optimistic retry.
+The core never silently replays a request. Host adapters own their external protocol and cleanup; `ModelDriver` owns strict stream assembly, panic conversion, retry timing, one effective deadline, cancellation, and lossy delta progress; P5-C session execution will own final durable settlement. An unknown outcome becomes a truthful terminal error rather than an optimistic retry.
 
 See [architecture](../architecture.md#model-retry), [model module ownership](../modules/README.md#model), [`src/model/model.rs`](../../src/model/model.rs), and [`src/model/driver.rs`](../../src/model/driver.rs).

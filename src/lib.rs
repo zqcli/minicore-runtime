@@ -1,4 +1,3 @@
-#[cfg(test)]
 mod agent;
 pub mod compaction;
 pub mod config;

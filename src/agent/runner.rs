@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};

@@ -2,7 +2,7 @@
 
 ## Status
 
-P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is in progress: P3-B through P4-B expose the final Port/bindings/state/event/TurnHandle foundations and the real single-session create/load/shutdown owner. P5-A ModelDriver is complete; P4-C/P5-B SessionHandle and actor execution plus remaining workspace migration are still deferred.
+P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is in progress: P3-B through P4-B expose the final Port/bindings/state/event/TurnHandle foundations and the real single-session create/load/shutdown owner. P5-A ModelDriver and P5-B ToolDriver/suspension protocol are complete; P4-C/P5-C SessionHandle and actor/runner execution plus remaining workspace migration are still deferred.
 
 ## Completed Foundations
 
@@ -23,7 +23,8 @@ P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is 
 - [x] **P4-A — state/event/TurnHandle foundation:** lightweight invariant-checked state, redacted diagnostics, exact event DTOs, bounded single-consumer lossy stream, exact-Turn cancellation/completion, and physical legacy observation split.
 - [x] **P4-B — SessionRuntime owner lifecycle:** spawn-first OpenGuard, create/load validation and recovery, one log/state/event owner, typed open/shutdown errors, cancellation cleanup, one-shot events, deterministic shutdown, multi-owner concurrency, and deletion of the multi-session Runtime.
 - [x] **P5-A — ModelDriver:** one direct Model, checked Kernel-derived configuration snapshot, strict stream assembler/tool grammar, panic conversion, effective deadline/cancellation, delivery-safe retry, lossy bounded progress, and deterministic private tests.
-- [ ] **P4-C/P5-B — commands and execution:** final SessionHandle/commands, actor integration, turns, interactions, tools, context/compaction, and settlement through ModelDriver.
+- [x] **P5-B — ToolDriver and suspension protocol:** frozen-spec policy evaluation, approval and ToolInput one-shot suspension, panic-safe execution, child cancellation, semantic input/output bounds, canonical input-answer encoding, lossy progress, and deterministic ownership tests.
+- [ ] **P4-C/P5-C — commands and execution:** final SessionHandle/commands, turn runner, actor integration and durable commits, context/compaction, and terminal settlement through ModelDriver and ToolDriver.
 
 ## Current Maintenance Gates
 
