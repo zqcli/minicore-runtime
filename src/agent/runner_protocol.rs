@@ -8,8 +8,8 @@ use crate::conversation::{
 };
 use crate::error::DiagnosticSummary;
 use crate::ids::{ToolCallId, TurnId};
+use crate::interaction::{InteractionAnswer, InteractionKind};
 use crate::model::{ModelDriverProgress, Usage};
-use crate::session::{InteractionAnswer, InteractionKind};
 use crate::tools::{ToolName, ToolProgress as ToolProgressValue, ToolResultOutcome};
 
 pub(crate) struct TurnSuspension {
@@ -30,12 +30,6 @@ impl fmt::Debug for TurnSuspension {
             .field("kind", &self.kind)
             .finish_non_exhaustive()
     }
-}
-
-pub(crate) fn take_resume_for_actor(
-    suspension: TurnSuspension,
-) -> oneshot::Sender<Result<InteractionAnswer, SuspensionError>> {
-    suspension.resume
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -133,17 +127,6 @@ pub(crate) enum RunnerEvent {
     Finish {
         outcome: RunnerOutcome,
     },
-}
-
-pub(crate) fn take_commit_reply_for_actor(
-    event: RunnerEvent,
-) -> Option<oneshot::Sender<Result<CommitAck, RunnerCommitError>>> {
-    match event {
-        RunnerEvent::CommitAssistant { reply, .. }
-        | RunnerEvent::CommitToolResult { reply, .. }
-        | RunnerEvent::CommitSummary { reply, .. } => Some(reply),
-        RunnerEvent::Suspend { .. } | RunnerEvent::Finish { .. } => None,
-    }
 }
 
 impl fmt::Debug for RunnerEvent {

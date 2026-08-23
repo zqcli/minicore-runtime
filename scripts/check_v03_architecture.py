@@ -43,6 +43,9 @@ CANONICAL_PRODUCTION_DIRECTORIES = {
     "src/agent/tool_driver": {"support.rs"},
     "src/compaction/driver": set(),
     "src/model/driver": {"assembler.rs", "failure.rs"},
+    "src/session/actor": {
+        "commands.rs", "run.rs", "runner.rs", "settlement.rs", "supervisor.rs",
+    },
 }
 MODEL_DRIVER_ROLE_FILES = {"src/model/driver.rs"}
 TOOL_DRIVER_ROLE_FILES = {"src/agent/tool_driver.rs"}
@@ -51,7 +54,7 @@ CONTEXT_DRIVER_ROLE_FILES = {"src/context/driver.rs"}
 COMPACTION_DRIVER_ROLE_FILES = {"src/compaction/driver.rs"}
 PROMPT_BUILDER_ROLE_FILES = {"src/prompt/builder.rs"}
 TOOLSET_ROLE_FILES = {"src/tools/set.rs"}
-SESSION_BINDINGS_ROLE_FILES = {"src/session/bindings.rs"}
+SESSION_BINDINGS_ROLE_FILES = {"src/bindings.rs"}
 SESSION_RUNTIME_ROLE_FILES = {"src/session/runtime.rs"}
 TRANSITIONAL_PRIVATE_FILES = {
     "src/agent/legacy_context.rs",
@@ -60,6 +63,8 @@ TRANSITIONAL_PRIVATE_FILES = {
     "src/model/legacy_provider.rs",
     "src/model/legacy_registry.rs",
     "src/session/legacy_event.rs",
+    "src/session/legacy_actor.rs",
+    "src/session/legacy_command.rs",
     "src/session/legacy_event_stream.rs",
     "src/session/legacy_snapshot.rs",
     "src/session/legacy_state.rs",
@@ -91,10 +96,11 @@ FORBIDDEN_SYMBOLS = {
 FORBIDDEN_SYMBOL_EXEMPTIONS = {
     "ToolRegistry": {
         "src/agent/legacy_context.rs", "src/agent/mod.rs", "src/config.rs",
-        "src/session/actor.rs", "src/tools/registry.rs",
+        "src/session/legacy_actor.rs", "src/tools/registry.rs",
     },
     "InteractionClient": {
-        "src/agent/legacy_context.rs", "src/agent/mod.rs", "src/session/actor.rs", "src/tools/mod.rs",
+        "src/agent/legacy_context.rs", "src/agent/mod.rs", "src/session/legacy_actor.rs",
+        "src/tools/mod.rs",
     },
 }
 FORBIDDEN_IMPORTS = {
@@ -107,9 +113,10 @@ PORT_FILES = {
     "src/conversation/compaction_candidate.rs",
     "src/model/model.rs", "src/model/response.rs", "src/tools/tool.rs", "src/tools/set.rs",
     "src/tools/context.rs", "src/tools/input.rs", "src/tools/policy.rs", "src/tools/progress.rs", "src/tools/types.rs",
-    "src/context/provider.rs", "src/compaction/strategy.rs", "src/session/bindings.rs",
+    "src/context/provider.rs", "src/compaction/strategy.rs", "src/bindings.rs",
+    "src/interaction.rs",
     "src/session/event.rs", "src/session/event_stream.rs", "src/session/runtime.rs",
-    "src/session/runtime_actor.rs", "src/session/runtime_log.rs", "src/session/runtime_open.rs",
+    "src/session/runtime_log.rs", "src/session/runtime_open.rs",
     "src/session/state.rs",
     "src/session/turn_handle.rs",
     "src/storage/session_log.rs",
@@ -119,18 +126,24 @@ REQUIRED_FILES = {
     "src/agent/mod.rs", "src/agent/runner.rs", "src/agent/runner/compaction.rs",
     "src/agent/runner/diagnostics.rs",
     "src/agent/runner/support.rs", "src/agent/runner_protocol.rs", "src/agent/tool_driver.rs",
-    "src/agent/tool_driver/support.rs", "src/agent/turn_context.rs",
+    "src/agent/tool_driver/support.rs", "src/agent/turn_context.rs", "src/bindings.rs",
     "src/prompt/mod.rs", "src/prompt/builder.rs",
     "src/compaction/driver.rs",
-    "src/session/mod.rs", "src/session/runtime.rs", "src/session/runtime_actor.rs",
+    "src/session/mod.rs", "src/session/runtime.rs",
     "src/session/runtime_log.rs", "src/session/runtime_open.rs", "src/session/handle.rs",
+    "src/session/runtime_shutdown.rs",
+    "src/session/actor/commands.rs", "src/session/actor/lifecycle.rs",
+    "src/session/actor/run.rs",
+    "src/session/actor/runner.rs", "src/session/actor/settlement.rs",
+    "src/session/actor/supervisor.rs",
     "src/session/turn_handle.rs",
     "src/session/actor.rs", "src/session/command.rs",
     "src/session/state.rs", "src/session/event.rs", "src/session/event_stream.rs",
-    "src/session/interaction.rs", "src/session/bindings.rs", "src/session/transcript.rs",
+    "src/interaction.rs", "src/bindings.rs",
     "src/conversation/mod.rs", "src/conversation/compaction_candidate.rs", "src/conversation/entry.rs", "src/conversation/load.rs", "src/conversation/state.rs",
     "src/conversation/validator.rs", "src/conversation/projection.rs", "src/conversation/log.rs",
     "src/conversation/recovery.rs", "src/conversation/transcript.rs", "src/model/mod.rs", "src/model/model.rs", "src/model/driver.rs", "src/model/driver/assembler.rs", "src/model/response.rs", "src/model/types.rs",
+    "src/conversation/settlement.rs",
     "src/conversation/view.rs",
     "src/tools/mod.rs", "src/tools/tool.rs", "src/tools/context.rs", "src/tools/input.rs", "src/tools/policy.rs", "src/tools/progress.rs", "src/tools/set.rs", "src/tools/types.rs",
     "src/context/mod.rs", "src/context/provider.rs", "src/context/driver.rs",
@@ -141,7 +154,7 @@ PUBLIC_MODULES = {
     "compaction", "config", "context", "conversation", "error", "ids", "model", "session",
     "storage", "tools", "value",
 }
-PRIVATE_MODULES = {"agent", "prompt", "time", "workspace"}
+PRIVATE_MODULES = {"agent", "bindings", "interaction", "prompt", "time", "workspace"}
 ROOT_EXPORTS = {
     "value": {"BoundedText"},
     "config": {"CompactionConfig", "KernelConfig", "RetryPolicy", "SemanticLimits", "SessionManifest", "SessionSpec", "TurnOptions", "UserInput"},

@@ -13,14 +13,21 @@ use minicore_runtime::storage::{
 use minicore_runtime::value::BoundedText;
 
 mod data;
+mod gate;
+mod script;
 
 use data::{append_batch, current_head, validate_contiguous};
+pub use gate::ScriptGate;
+use script::{ScriptOutcome, run_script};
 
 #[derive(Clone, Debug)]
 pub enum Script {
     Continue,
     Error(SessionLogErrorKind),
     UnknownOutcome { committed: bool },
+    GateContinue(ScriptGate),
+    GateError(ScriptGate, SessionLogErrorKind),
+    GateUnknownOutcome(ScriptGate, bool),
     Delay(Duration),
     Panic,
 }
@@ -251,27 +258,6 @@ impl Drop for ActiveOperation {
         state.active_mutable_operations = state.active_mutable_operations.saturating_sub(1);
         drop(state);
         self.operation_notify.notify_waiters();
-    }
-}
-
-#[derive(Clone, Copy)]
-enum ScriptOutcome {
-    Continue,
-    Error(SessionLogErrorKind),
-    UnknownOutcome { committed: bool },
-}
-
-async fn run_script(script: Option<Script>) -> ScriptOutcome {
-    match script {
-        None => ScriptOutcome::Continue,
-        Some(Script::Continue) => ScriptOutcome::Continue,
-        Some(Script::Error(kind)) => ScriptOutcome::Error(kind),
-        Some(Script::UnknownOutcome { committed }) => ScriptOutcome::UnknownOutcome { committed },
-        Some(Script::Delay(duration)) => {
-            tokio::time::sleep(duration).await;
-            ScriptOutcome::Continue
-        }
-        Some(Script::Panic) => panic!("scripted fake SessionLog panic"),
     }
 }
 

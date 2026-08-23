@@ -8,6 +8,7 @@ This document describes the current v0.3 reset slice. The former v0.2 multi-sess
 Host
  ├── session::SessionRuntime { exactly one loaded Session }
  │   ├── session::SessionRuntimeOptions
+ │   ├── session::SessionHandle { bounded commands + watch state }
  │   ├── storage::SessionLog { exactly one owned adapter }
  │   ├── session::SessionEventStream { taken once }
  │   └── root cancellation + one owner JoinHandle
@@ -53,7 +54,7 @@ ConversationValidator permits a Summary while a Turn is active only when `throug
 
 `agent::turn_context`, `agent::runner_protocol`, and `agent::runner` are the private P5-E1/P5-E2 Turn module. TurnRunnerRequest contains exact identity, full SessionSpec, the durable effective tool-round cap, immutable SessionBindings, one canonical active ConversationView, cancellation/deadline, checked Kernel snapshots, and bounded critical/progress senders. Enabled compaction freezes one CompactionDriver plus trigger/target values; the explicit external strategy timeout is the Kernel context timeout because compaction is context shaping, still capped by the absolute Turn deadline. Cancellation-first Turn control is checked at preparation/loop/proactive/forced/attempt entry, around overflow interpretation, and immediately after successful Context return and final Prompt construction. Before Context each model round, known fixed-input pressure at or above the trigger can make one best-effort attempt per acknowledged head. Prompt ContextOverflow requires one successful proposal and exact Summary acknowledgement, then retries the same model round from remaining-budget and Context construction; a second overflow fails without a loop. Configured or adapter compaction failures are skipped proactively and become a Compaction diagnostic when forced.
 
-`RunnerEvent::CommitSummary` carries the validated `snapshot_head`, a checked SummaryDraft, and one move-owned reply. TurnRunner rechecks its local head before send and accepts only a canonical one-entry prefix extension whose final Summary exactly matches the draft and whose active Turn execution is unchanged. Summary send/ack failures use the same critical taxonomy as Assistant/Tool commits: stale or invalid acknowledgement is SessionBusy/Internal, degradation and durability failures retain their Storage diagnostics, and runtime closure remains RuntimeTerminated/Internal. The future P4-C actor is the sole append authority and must compare its current confirmed head to `snapshot_head` before appending; the temporary ownership anchor only consumes the reply field. No Model or Context call after a Summary acknowledgement uses the old view.
+`RunnerEvent::CommitSummary` carries the validated `snapshot_head`, a checked SummaryDraft, and one move-owned reply. SessionActor rejects a stale snapshot before append. After any attempted Assistant, ToolResult, or Summary append failure, ActiveTurn stores the first diagnostic/unknown flag, publishes Degraded health, cancels the exact Turn, and replies with the matching RunnerCommitError. Runner exit consumes that latch without constructing settlement drafts, appending a terminal, or emitting TurnFinished.
 
 ## State, Event, And Turn Foundation
 
@@ -71,9 +72,9 @@ Before owner spawn and before any await, OpenGuard attempts cleanup-watcher spaw
 
 Create ordering is kernel → custom-limit spec → bindings → manifest → initialize/zero head → fresh instance → validated Idle/Healthy state and bounded events → ready. Load ordering is manifest/expected identity → bindings → identity-bound proof → paged replay/semantic validation → atomic restart repair → fresh instance → confirmed head/last terminal state → ready. No first snapshot event is emitted.
 
-After ready, the idle owner task holds ConversationLog, kernel/spec/bindings lifetime evidence, state sender, InternalEventSink, and root cancellation. P4-B adds no ordinary command mailbox and no fake SessionHandle. Cancellation first publishes Closing to state, then closes ConversationLog, drops state/event senders, and returns a typed task exit.
+After ready, SessionActor owns ConversationLog, immutable kernel/spec/bindings, the bounded command receiver, state sender, InternalEventSink, root cancellation, and at most one tracked active runner. Root cancellation is selected before critical traffic, runner exit, commands, and lossy progress. A normal active shutdown settles one shutdown terminal; a commit/settlement durability failure while Closing suppresses terminal settlement, remains the shutdown primary, and does not suppress the mandatory close attempt.
 
-Successful SessionRuntime retains the configured Handle. `shutdown(self)` first cancels, then enters that Handle only long enough to construct the timeout future; the enter guard is dropped before any await, so a non-Tokio executor can poll shutdown without a caller-runtime timer. Unexpected construction panic aborts and awaits the same owner task and returns ActorTerminated. Normal timeout still aborts and awaits that task before Timeout. Drop only cancels; if neither timer-capable runtime is actively driven, graceful close is not guaranteed.
+Successful SessionRuntime retains the configured Handle. `shutdown(self)` first cancels, then enters that Handle only long enough to construct the timeout future. During actor panic cleanup the runner JoinHandle remains inside ActiveTurn until its await completes; outer timeout abort therefore drops the actor while it still owns and aborts the runner. A deterministic pending-runner Drop probe verifies no detached runner remains when shutdown returns Timeout.
 
 Core catches the host-controlled panic boundaries: Model descriptor access, SessionLog future construction and polling, and the post-ready actor loop. These become typed failures and preserve their specified close attempts. Arbitrary Core allocation or invariant panics after ownership transfer are not a recoverable API error boundary and may skip graceful close, as may destruction of all timer-capable runtimes. Core deliberately does not add a shared-log worker solely to claim recovery from every possible internal panic.
 
@@ -89,7 +90,7 @@ Progress is synchronous and nonblocking. `ToolProgressSink::emit` validates `com
 
 `ToolPolicy` is an asynchronous `Send + Sync + 'static` Port. It receives an owned `ToolPolicyRequest`, so the exact checked invocation and captured spec cross the seam without borrowing actor/session internals. Decisions are exactly `Allow`, bounded `Deny`, or `RequireApproval`; approval answers are exactly `AllowOnce` or `Deny`. Policy and approval `Debug` output reports safe identities, counts, risks, and byte lengths while redacting arguments, reasons, and prompts.
 
-`session::PendingInteraction`, `InteractionKind`, and `InteractionAnswer` are process-local DTOs only. They validate answer-kind matching and delegate tool-input answer checks to the original checked request. They contain no serde representation, resume sender, callback, owner handle, Workspace, Store, or arbitrary continuation. The internal `TurnSuspension` owns the one-shot sender separately; TurnRunner now forwards that exact sender through RunnerEvent::Suspend, and the future P4-C actor will consume it exactly once without changing the public DTOs.
+`session::PendingInteraction`, `InteractionKind`, and `InteractionAnswer` are process-local DTOs only. Before publication, SessionActor requires the request to match the first canonical unresolved `(turn_id, tool_call_id, tool_name)` produced by a durable Assistant entry; later calls cannot suspend before earlier ToolResults are durable. It then stores the sole resume sender separately and publishes WaitingForInput before InteractionRequested. Wrong-phase or forged suspension traffic receives InvalidState without state/event mutation.
 
 ## Model Port
 
@@ -97,7 +98,7 @@ Progress is synchronous and nonblocking. `ToolProgressSink::emit` validates `com
 
 `ModelRequest` contains only checked messages, tools, limits, and reasoning. `ModelStream` emits bounded typed `ModelEvent` values for text, reasoning, tool-call grammar, usage, and finish. Event `Debug` output reports only safe identities and byte counts. `ModelError` reports `DeliveryState::{NotStarted, Started, Unknown}`, retryability, and an optional retry-after hint; retryable/hint combinations are rejected unless delivery is `NotStarted`.
 
-The old runner/context, batch Model gateway/provider lookup, Workspace, direct ConversationLog behavior, and old prompt/compaction implementation now live only under `agent::legacy`, `prompt::legacy`, and other `cfg(test)` migration modules. P5-A through P5-E2 now provide the final private drivers, ordinary TurnRunner, and compaction protocol. P4-C replaces the remaining legacy actor path with durable commit ownership and terminal settlement.
+The old runner/context, batch Model gateway/provider lookup, Workspace, old actor/commands, and old prompt/compaction implementation now live only under explicit `legacy_*` or `cfg(test)` migration modules. P4-C/P5 provide the final actor, handle, drivers, TurnRunner, compaction protocol, and settlement.
 
 ## Legacy Boundary
 
@@ -105,15 +106,15 @@ The test-only actor/runner/storage path uses `LegacyTool`, `LegacyToolContext`, 
 
 The test-only old actor uses `legacy_state.rs`, `legacy_event.rs`, `legacy_event_stream.rs`, and `legacy_snapshot.rs`. Their modules are gated with actor, command, and old transcript at `session/mod.rs`. Broadcast, first-snapshot delivery, resync, old commands, and legacy terminal behavior are absent from the production SessionRuntime graph.
 
-`agent/legacy_context.rs`, `agent/legacy_runner.rs`, `tools/legacy_context.rs`, `legacy_policy.rs`, `legacy_types.rs`, and `registry.rs` are staged private migration files. `legacy_policy.rs` retains the synchronous string-based decision flow only for the test-only old runner and is marked for P4-C/P6 deletion. Final `policy.rs` is the public typed Port and is part of the canonical Tool seam.
+`session/legacy_actor.rs`, `legacy_command.rs`, agent/tool legacy files, and registry/storage/workspace implementations are staged test-only P6 cleanup files. Final actor/command/policy files are canonical production modules.
 
 ## Deferred Execution
 
-The old top-level `runtime` directory, Runtime configuration/manager/error symbols, and legacy `SessionConfig` are physically removed. ToolRegistry, old actor/commands, legacy model lookup, workspace, and filesystem store remain test-only where P4-C/P5/P6/P7 unit evidence consumes them; SessionRuntime does not import or own them.
+The old top-level Runtime manager graph and legacy SessionConfig are removed. ToolRegistry, legacy actor/commands/model lookup, workspace, and filesystem store remain test-only P6/P7 evidence and are not reached by SessionRuntime.
 
 Concrete filesystem/process adapters and their tests were deleted in P3-B rather than replaced with defaults. Future concrete tools must be host-owned implementations of the public `Tool` Port, not reintroduced builtins or process policy modules.
 
-P5-E1/P5-E2 now supply ordinary Turn execution, proactive and forced compaction, and stale-head-checked Summary commit requests without direct append authority. P4-C will add the final SessionHandle, state watch access, commands, transcript routing, actor-owned append acknowledgements, suspension state, and durable terminal settlement. P4-B deliberately supports no submit path.
+P4-C/P5-E2 now supply the final SessionHandle, state watch, bounded commands, transcript routing, actor-owned acknowledgements and suspension state, ordinary Turn execution, compaction, and durable terminal settlement. P6 cleanup remains.
 
 ## Model Retry
 

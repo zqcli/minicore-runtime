@@ -16,7 +16,8 @@ MiniCore Runtime is an embeddable Rust 2024 single-session execution kernel. The
 - Crate-private P5-E1/P5-E2 `TurnRunner` context/model/tool/compaction loop with durable rounds, cancellation-first control checks, exact prefix acknowledgements, proactive best-effort compaction, one-shot forced overflow recovery, stale-head Summary commit requests using the ordinary critical commit taxonomy, ToolStarted-before-suspension ordering, sequential tools, and conservative usage on every outcome.
 - Public `SessionBindings` freezes one direct Model, ToolSet, and optional policy/context/compaction adapters, then validates them purely against `SessionSpec` and `SemanticLimits`.
 - Public process-local `SessionState`, bounded single-consumer `SessionEventStream`, and exact-turn `TurnHandle` foundations with redacted diagnostics and no snapshot/broadcast recovery protocol.
-- Public non-Clone `SessionRuntime` create/load/take-events/shutdown lifecycle with spawn-first OpenGuard cancellation, proof-gated replay/recovery, one durable log owner, and typed open/shutdown failures.
+- Public non-Clone `SessionRuntime` create/load/take-events/handle/shutdown lifecycle with spawn-first OpenGuard cancellation, proof-gated replay/recovery, one durable log owner, and typed open/shutdown failures.
+- Public cloneable `SessionHandle` with bounded submit/answer/transcript commands and watch state; SessionActor owns runner acknowledgements, durable unresolved-tool suspension proof, first-wins active commit failure latches, settlement, and shutdown durability propagation.
 - Crate-private legacy runner/session/storage execution seam, including exact legacy tool-result wire preservation.
 - Conversation, storage, and workspace implementations remain transitional internal slices while their v0.3 owners are migrated.
 - No concrete builtin, process adapter, model network adapter, default tool set, or network service is installed by the public seams.
@@ -80,7 +81,9 @@ Before spawning the owner or awaiting anything, OpenGuard installs cleanup watch
 
 Core isolates host-controlled panic boundaries: Model descriptor access, SessionLog future construction/polling, and the post-ready actor loop. Those paths return typed failures and retain their defined close behavior. Arbitrary Core allocation or invariant panics after ownership transfer are not a recoverable API error boundary and may skip graceful close, as may destruction of every runtime capable of driving cleanup. Core does not claim that every possible panic is converted into a close-complete error.
 
-P4-B intentionally has no public `handle()` or command mailbox. P5-E1/P5-E2 now provide the private TurnRunner protocol, ordinary execution, and stale-head Summary commit requests. P4-C will add the final SessionHandle/actor commands, consume those requests through the sole durable append owner, and settle durable Turn terminals.
+P4-C adds the final cloneable `SessionHandle`, bounded submit/answer/transcript commands, state watch access, actor-owned runner acknowledgements and interactions, durable terminal settlement, and `SessionRuntime::handle()`. The non-Clone SessionRuntime remains the shutdown/log/task owner; SessionHandle Drop has no lifecycle effect.
+
+The private integration test `post_ready_actor_panic_joins_pending_runner_before_close` creates a ready SessionRuntime, returns a TurnHandle, waits until the Model future is pending, triggers the keyed active-Turn actor panic, and proves runner/Model Drop precedes the sole log close. It also proves RuntimeTerminated Turn completion, legal event/state channel closure, and ActorTerminated shutdown without timeout or detached work.
 
 ## Public Modules
 
@@ -97,11 +100,11 @@ P4-B intentionally has no public `handle()` or command mailbox. P5-E1/P5-E2 now 
 | `storage` | `SessionLog` Port and storage DTOs |
 | `tools` | `Tool`, immutable `ToolSet`, async `ToolPolicy`, approval, invocation/context/progress/output DTOs |
 
-The old top-level `runtime` module, Runtime configuration/manager graph, loaded-session map, repository ownership, and legacy `SessionConfig` are deleted. The workspace/store implementation, synchronous legacy policy, old actor/commands/observation/transcript, and legacy model/tool lookup compile only under `cfg(test)` as migration evidence for their unit suites. They have no production caller or public surface and remain scheduled for P4-C/P5/P6/P7 deletion.
+The old top-level `runtime` module, Runtime configuration/manager graph, loaded-session map, repository ownership, and legacy `SessionConfig` are deleted. Legacy actor/command/observation/transcript, workspace/store implementation, synchronous policy, and legacy model/tool lookup compile only under `cfg(test)` as migration evidence and remain scheduled for P6/P7 deletion.
 
 ## Transitional Scope
 
-The removed v0.2 Runtime, concrete builtin/process/model adapters, and their integration tests are baseline evidence, not compatibility contracts. Focused P3-B through P4-B contracts cover Ports, bindings, state/events, TurnHandle primitives, create/load recovery ownership, cancellation, events, and shutdown. SessionHandle commands and execution remain deferred to P4-C/P5; this revision does not claim submit support.
+The removed v0.2 Runtime, concrete builtin/process/model adapters, and their integration tests are baseline evidence, not compatibility contracts. Focused P3-B through P5-E2/P4-C contracts cover Ports, bindings, state/events, SessionHandle/TurnHandle, create/load recovery, commands, runner integration, interactions, transcript, settlement, and shutdown.
 
 The former Runtime/model-network examples and root integration suites were removed with their public facades. The standalone `provider-gate/` package remains independent historical protocol evidence and does not establish a root-crate model adapter API.
 

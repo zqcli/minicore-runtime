@@ -26,6 +26,10 @@ The v0.2 public Tool/Runtime/concrete-adapter integration targets were deleted a
 - `tests/p1_dto.rs` covers checked public Tool DTOs, strict input answers, content-only output, and redacted debug surfaces.
 - Private module tests cover bounded progress delivery and legacy `{text,is_error}` output recovery.
 - The former root model registry, concrete adapter, transport, live-smoke, and Runtime-facade tests were deleted and retained only as v0.2 baseline history.
-- Final SessionHandle commands, actor-owned append/suspension acceptance, and durable terminal settlement remain deferred to P4-C. P4-B does not claim submit support.
+- `tests/session_handle_contract.rs` source-checks active commit latching, suspension proof ordering, panic runner ownership, and close-before-durability exit mapping.
+- `tests/session_runtime_turn_contract.rs` covers model-only order, exact-once Finish/Join settlement, known/unknown Assistant latches, degraded confirmed transcript, settlement failure, shutdown durability precedence, secondary close failure, and active-commit/shutdown races.
+- `tests/session_runtime_interaction_contract.rs` covers valid interactions, cancellation settlement, ToolResult commit latching, failed continuation suppression, and repeated answer/cancellation races.
+- `tests/session_runtime_command_contract.rs` covers pre-dequeue receiver loss, receiver loss during admitted User append, exact Backpressure, and no orphaned committed User.
+- `tests/session_runtime_compaction_commit_contract.rs` covers a production Summary append latch, no second Model call, and no terminal settlement. Private actor tests cover forged suspension phase/call/name rejection, failed resume sends, stale Summary pre-append rejection, and root/critical priority under command flood.
 
 The deleted `tests/p3_model_core.rs`, `tests/p3_openai_provider.rs`, `tests/p3_anthropic_provider.rs`, and `tests/p3_transport_surface.rs` are not compatibility contracts. Independent protocol evidence remains only in `provider-gate/`.

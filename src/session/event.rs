@@ -3,9 +3,9 @@ use crate::model::Usage;
 use crate::tools::{ToolName, ToolProgress, ToolResultOutcome};
 use crate::value::BoundedText;
 
-use super::interaction::PendingInteraction;
 use super::state::SessionHealth;
 use super::turn_handle::TurnOutcome;
+use crate::interaction::PendingInteraction;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputChannel {

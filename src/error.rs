@@ -3,6 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::ids::TurnId;
 use crate::value::BoundedText;
 
 mod operations;
@@ -179,6 +180,29 @@ pub enum EventStreamTakenError {
 
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum SessionError {
+    #[error("session is closed")]
+    Closed,
+    #[error("session is busy")]
+    Busy { active_turn: TurnId },
+    #[error("session durability is degraded")]
+    Degraded(DiagnosticSummary),
+    #[error("session command queue is full")]
+    Backpressure,
+    #[error("session input is invalid")]
+    InvalidInput(DiagnosticSummary),
+    #[error("session interaction was not found")]
+    InteractionNotFound,
+    #[error("session interaction answer kind does not match")]
+    InteractionKindMismatch,
+    #[error("session interaction was already resolved")]
+    InteractionAlreadyResolved,
+    #[error("session transcript is unavailable")]
+    TranscriptUnavailable(DiagnosticSummary),
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum TurnWaitError {
     #[error("turn durability outcome is unknown")]
     DurabilityUnknown(DiagnosticSummary),
@@ -188,10 +212,9 @@ pub enum TurnWaitError {
     RuntimeTerminated(DiagnosticSummary),
 }
 
-// P4-C/P5 deletion target: legacy actor command error, not the final SessionError.
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
-pub(crate) enum SessionError {
+pub(crate) enum LegacySessionError {
     #[error("session not found")]
     NotFound,
     #[error("session is already loaded")]

@@ -390,6 +390,38 @@ impl ConversationLog {
     pub(crate) fn projection(&self) -> PromptProjection {
         self.state.projection().clone()
     }
+    pub(crate) fn view(&self) -> super::ConversationView {
+        super::ConversationView::from_confirmed(
+            self.state.head(),
+            self.state.projection().entries().to_vec().into(),
+        )
+    }
+    pub(crate) fn settlement_drafts(
+        &self,
+        turn_id: TurnId,
+        terminal: TurnTerminal,
+        usage: Usage,
+    ) -> Option<Vec<UnsequencedEntry>> {
+        super::settlement::build_settlement(&self.state, turn_id, terminal, usage)
+    }
+    pub(crate) fn confirmed_turn_usage(&self, turn_id: TurnId) -> Usage {
+        super::settlement::confirmed_turn_usage(&self.state, turn_id)
+    }
+    pub(crate) fn is_next_unresolved_tool(
+        &self,
+        turn_id: TurnId,
+        tool_call_id: &ToolCallId,
+        tool_name: &ToolName,
+    ) -> bool {
+        self.state
+            .unresolved_tool_calls()
+            .first()
+            .is_some_and(|pending| {
+                pending.turn_id == turn_id
+                    && &pending.tool_call_id == tool_call_id
+                    && &pending.tool_name == tool_name
+            })
+    }
     pub(crate) fn recovery_plan(&self) -> Option<RecoveryPlan> {
         RecoveryPlan::from_state(&self.state)
     }

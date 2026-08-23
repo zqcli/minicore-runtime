@@ -1,142 +1,154 @@
+fn compact(source: &str) -> String {
+    source.split_whitespace().collect()
+}
+
 #[test]
-fn p6_session_actor_surface_is_private_and_owner_proof_free() {
-    let session = include_str!("../src/session/mod.rs");
-    assert!(session.contains("pub(crate) mod command;"));
-    assert!(session.contains("pub(crate) mod actor;"));
-    assert!(!session.contains("pub(crate) use actor::"));
-    assert!(!session.contains("pub(crate) use command::SessionHandle;"));
-    assert!(!session.contains("pub mod actor"));
-    assert!(!session.contains("pub mod command"));
+fn final_session_handle_commands_and_actor_are_canonical_and_legacy_is_quarantined() {
+    let module = include_str!("../src/session/mod.rs");
+    let compact_module = compact(module);
+    for required in [
+        "modactor;",
+        "modcommand;",
+        "modhandle;",
+        "pubusehandle::SessionHandle;",
+        "#[cfg(test)]pub(crate)modlegacy_actor;",
+        "#[cfg(test)]pub(crate)modlegacy_command;",
+    ] {
+        assert!(
+            compact_module.contains(required),
+            "session module misses {required}"
+        );
+    }
+    assert!(!module.contains("pub use legacy_actor"));
+    assert!(!module.contains("pub use legacy_command"));
 
     let command = include_str!("../src/session/command.rs");
-    let tools_context = include_str!("../src/tools/legacy_context.rs");
-    let tools_mod = include_str!("../src/tools/mod.rs");
-    assert!(tools_context.contains("pub(crate) fn claim_response"));
-    assert!(tools_context.contains("pub(crate) struct InteractionResponse"));
-    assert!(tools_context.contains("impl Drop for InteractionResponse"));
-    assert!(!tools_mod.contains("InteractionResponse"));
-    let actor = include_str!("../src/session/actor.rs");
-    assert!(actor.contains("P4-C/P5 deletion target"));
-    assert!(command.contains("P4-C/P5 deletion target"));
-    let production = actor
-        .split("#[cfg(test)]")
-        .next()
-        .expect("actor production section");
-    assert!(production.contains("JoinHandle<TurnTaskResult>"));
-    assert!(production.contains("runtime.spawn(run_turn(context))"));
-    assert!(production.contains("active.task.abort()"));
-    assert!(production.contains("(&mut active.task).await"));
-    assert!(production.contains("self.conversation.wait_idle().await"));
-    assert!(production.contains("self.refresh_projection().await;"));
-    assert!(production.contains("close_session(Some(error))"));
-    let abort = production.find("active.task.abort()").unwrap();
-    let wait_idle = production
-        .find("self.conversation.wait_idle().await")
-        .unwrap();
-    let refresh = production
-        .find("self.conversation.wait_idle().await;\n                    self.refresh_projection().await;")
-        .unwrap();
-    let finish = production
-        .find("self.finish_active(result, true).await")
-        .unwrap();
-    assert!(abort < wait_idle && wait_idle == refresh && refresh < finish);
-    assert!(production.contains("LegacySessionObservation"));
-    assert!(production.contains("CancelSlot"));
-    assert!(production.contains("cancel_slot.install(turn_id, cancellation.clone())"));
-    let slot_install = production
-        .find("cancel_slot.install(turn_id, cancellation.clone())")
-        .unwrap();
-    let final_close_check = production
-        .find("if close_won || self.close_requested.is_cancelled()")
-        .unwrap();
-    let spawn = production.find("runtime.spawn(run_turn(context))").unwrap();
-    assert!(slot_install < final_close_check && final_close_check < spawn);
-    assert!(production.contains("stored.usage()"));
-    assert!(production.contains("snapshot.usage()"));
-    assert!(
-        production.contains("self.refresh_projection().await;\n\n        let cancel_slot_owner")
-    );
-    assert!(production.lines().count() <= 1_200);
-
-    let command_enum = command
-        .split("pub(crate) enum SessionCommand")
-        .nth(1)
-        .and_then(|value| value.split("}\n\npub(crate) struct CancelSlot").next())
-        .expect("SessionCommand definition");
-    assert!(command_enum.contains("Submit"));
-    assert!(command_enum.contains("Answer"));
-    assert!(!command_enum.contains("Cancel"));
-    assert!(!command_enum.contains("Close"));
-    assert!(command.contains("try_send(SessionCommand::Submit"));
-    assert!(command.contains("try_send(SessionCommand::Answer"));
-    assert!(command.contains("close_requested.cancel()"));
-    assert!(command.contains("request_close(&self.close_requested)"));
-    assert!(command.contains("if let Some((_, cancellation)) = slot.as_ref()"));
-    assert!(command.contains("cancellation.cancel();"));
-    assert!(production.contains("request.claim_response()"));
-    assert!(
-        production.contains("self.close_requested.is_cancelled() || cancellation.is_cancelled()")
-    );
-    assert!(command.contains("CloseCompletion"));
-    assert!(command.contains("Option<Result<(), SessionError>>"));
-    assert!(!command.contains("watch<bool>"));
-    assert!(!command.contains("SessionCommand::Cancel"));
-    assert!(!command.contains("SessionCommand::Close"));
-
-    for source in [production, command] {
-        for forbidden in [
-            "crate::agent_session_lifecycle",
-            "crate::conversation_storage",
-            "crate::durable_state",
-            "crate::live_conversation",
-            "crate::session_execution",
-            "crate::session_ingress",
-            "crate::session_residency",
-            "crate::runtime",
-            "crate::runtime_task",
-            "crate::wire",
-            "crate::compaction::",
-            "crate::model_gateway",
-            "crate::turn_execution_context",
-            "SessionExecutor",
-            "SessionIngress",
-            "SessionResidency",
-            "owner-proof",
-            "OwnerProof",
-            "generation",
-            "epoch",
-            "permit",
-            "proof",
-            "tokio::spawn",
-            "spawn_blocking",
-            "allow(",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "forbidden P6 actor concept: {forbidden}"
-            );
-        }
+    let compact_command = compact(command);
+    for required in [
+        "pub(crate)enumSessionCommand{",
+        concat!(
+            "Submit{input:UserInput,options:TurnOptions,",
+            "reply:oneshot::Sender<Result<TurnHandle,SessionError>>,}"
+        ),
+        concat!(
+            "Answer{interaction_id:InteractionId,answer:InteractionAnswer,",
+            "reply:oneshot::Sender<Result<(),SessionError>>,}"
+        ),
+        concat!(
+            "Transcript{after:Option<ConversationSeq>,limit:usize,",
+            "reply:oneshot::Sender<Result<TranscriptPage,SessionError>>,}"
+        ),
+    ] {
+        assert!(
+            compact_command.contains(required),
+            "command shape misses {required}"
+        );
+    }
+    for forbidden in ["Cancel {", "Close {", "SessionLog", "CancellationToken"] {
+        assert!(!command.contains(forbidden));
     }
 
-    let conversation = include_str!("../src/storage/conversation.rs");
-    let support = include_str!("../src/storage/conversation/actor_support.rs");
-    let usage = include_str!("../src/storage/conversation/usage.rs");
-    assert!(conversation.contains("validate_user_text"));
-    assert!(support.contains("MAX_USER_TEXT_BYTES"));
-    assert!(support.contains("pub(crate) fn usage(&self)"));
-    assert!(usage.contains("usage_from_entries"));
-    let state = include_str!("../src/session/legacy_state.rs");
+    let handle = include_str!("../src/session/handle.rs");
+    let compact_handle = compact(handle);
+    for required in [
+        "#[derive(Clone)]pubstructSessionHandle{",
+        "session_id:SessionId,",
+        "instance_id:SessionInstanceId,",
+        "commands:mpsc::Sender<SessionCommand>,",
+        "state:watch::Receiver<SessionState>,",
+        "pubasyncfnsubmit(",
+        "pubasyncfnanswer(",
+        "pubasyncfntranscript(",
+        "self.commands.try_send(command)",
+        "TrySendError::Full(_)=>SessionError::Backpressure",
+        "TrySendError::Closed(_)=>SessionError::Closed",
+    ] {
+        assert!(
+            compact_handle.contains(required),
+            "handle misses {required}"
+        );
+    }
+    for forbidden in [
+        "SessionLog",
+        "JoinHandle",
+        "CancellationToken",
+        "shutdown",
+        "close(",
+        "impl Drop",
+    ] {
+        assert!(!handle.contains(forbidden), "handle owns {forbidden}");
+    }
+}
+
+#[test]
+fn actor_priority_submit_commit_and_settlement_order_are_source_locked() {
+    let actor = include_str!("../src/session/actor.rs");
+    let run = include_str!("../src/session/actor/run.rs");
+    let commands = include_str!("../src/session/actor/commands.rs");
+    let compact_commands = compact(commands);
+    let runner = include_str!("../src/session/actor/runner.rs");
+    let settlement = include_str!("../src/session/actor/settlement.rs");
+    let supervisor = include_str!("../src/session/actor/supervisor.rs");
+    for required in [
+        "pub(crate) struct SessionActor",
+        "conversation: ConversationLog",
+        "commands: mpsc::Receiver<SessionCommand>",
+        "state_tx: watch::Sender<SessionState>",
+        "events: InternalEventSink",
+        "root_cancel: CancellationToken",
+        "active: Option<ActiveTurn>",
+    ] {
+        assert!(actor.contains(required), "actor misses {required}");
+    }
+    let root = run.find("_ = root.cancelled()").unwrap();
+    let critical = run.find("event = active.critical.recv()").unwrap();
+    let exit = run.find("exit = await_runner(&mut active.runner)").unwrap();
+    let command = run.find("command = commands.recv()").unwrap();
+    let progress = run.find("progress = active.progress.recv()").unwrap();
+    assert!(root < critical && critical < exit && exit < command && command < progress);
+
+    let append = compact_commands
+        .find(".append_validated(vec![UnsequencedEntry::UserMessage")
+        .unwrap();
+    let running = compact_commands
+        .find("state.status=SessionStatus::Running")
+        .unwrap();
+    let reply = compact_commands.find("reply.send(Ok(handle))").unwrap();
+    let started = compact_commands.find("SessionEvent::TurnStarted").unwrap();
+    let spawn = compact_commands.find("tokio::spawn(asyncmove{").unwrap();
+    assert!(append < running && running < reply && reply < started && started < spawn);
+    let run_turn = compact_commands.find("run_turn(request).await").unwrap();
+    let install = compact_commands
+        .find(".install_abort(generation,runner.abort_handle())")
+        .unwrap();
+    assert!(spawn < run_turn && run_turn < install);
+
+    let stale = runner
+        .find("if self.conversation.head() != snapshot_head")
+        .unwrap();
+    let summary = runner
+        .find("self.commit_one(UnsequencedEntry::Summary(draft))")
+        .unwrap();
+    assert!(stale < summary);
+    assert!(runner.contains("append_validated(vec![draft]).await"));
+    assert!(runner.contains("conversation: self.conversation.view()"));
+
     assert_eq!(
-        state.matches("pub(crate) enum LegacySessionStatus").count(),
+        settlement.matches("append_validated(drafts).await").count(),
         1
     );
-    for variant in ["Idle", "Running", "WaitingForInput", "Closing"] {
-        assert!(state.contains(variant));
-    }
-    for removed in ["FollowUp", "Steer", "Queued", "Preparing", "Finishing"] {
-        assert!(
-            !state.contains(removed),
-            "legacy session state remains: {removed}"
-        );
+    let state = settlement.find("self.publish_state(state)").unwrap();
+    let complete = settlement
+        .find("active.completion.finish(outcome.clone())")
+        .unwrap();
+    let event = settlement.find("SessionEvent::TurnFinished").unwrap();
+    assert!(state < complete && complete < event);
+    assert!(supervisor.contains("AssertUnwindSafe(actor.run()).catch_unwind()"));
+    assert!(supervisor.contains("actor.close_after_panic().await"));
+
+    for source in [actor, run, commands, runner, settlement, supervisor] {
+        assert!(source.lines().count() < 500);
+        assert!(!source.contains("#[allow"));
+        assert!(!source.contains("#[expect"));
     }
 }

@@ -8,7 +8,7 @@ mod turn_context;
 pub(crate) use runner::run_turn;
 pub(crate) use runner_protocol::{
     CommitAck, RunnerCommitError, RunnerEvent, RunnerOutcome, RunnerProgress, SuspensionError,
-    TurnRunnerExit, TurnSuspension, take_commit_reply_for_actor, take_resume_for_actor,
+    TurnRunnerExit, TurnSuspension,
 };
 pub(crate) use tool_driver::{
     ToolDriver, ToolDriverBuildError, ToolDriverConfig, ToolDriverProgress, ToolDriverResult,
@@ -32,19 +32,9 @@ const _: () = {
     let _ = std::mem::size_of::<SuspensionError>();
     let _ = SuspensionError::stale_turn;
     let _ = std::mem::size_of::<TurnSuspension>();
-    let _ = take_resume_for_actor;
     let _ = std::mem::size_of::<CommitAck>();
     let _ = std::mem::size_of::<RunnerCommitError>();
-    // Temporary P4-C ownership anchors; the final actor replaces these references.
-    let _ = [
-        RunnerCommitError::Stale,
-        RunnerCommitError::Degraded,
-        RunnerCommitError::DurabilityUnavailable,
-        RunnerCommitError::DurabilityUnknown,
-        RunnerCommitError::RuntimeClosed,
-    ];
     let _ = std::mem::size_of::<RunnerEvent>();
-    let _ = take_commit_reply_for_actor;
     let _ = std::mem::size_of::<RunnerOutcome>();
     let _ = RunnerOutcome::usage;
     let _ = RunnerOutcome::diagnostic;

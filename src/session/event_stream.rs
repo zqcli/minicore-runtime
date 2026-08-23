@@ -114,7 +114,6 @@ impl InternalEventSink {
 }
 
 const _: () = {
-    // P4-B activation target: the actor will own this sink.
     let _ = std::mem::size_of::<InternalEventSink>();
     let _ = InternalEventSink::channel;
     let _ = InternalEventSink::try_emit;
