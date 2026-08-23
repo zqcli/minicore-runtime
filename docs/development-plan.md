@@ -17,7 +17,7 @@ P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is 
 - [x] **P8 — reset closure:** historical v0.2 source graph and archive baseline.
 
 - [x] **P3-B — Tool seam reset:** public `Tool`/`ToolSet`, checked invocation/context/progress/input/output DTOs, true legacy DTO split, concrete adapter deletion, and focused contract tests.
-- [ ] **P3-C — policy/approval:** typed policy and approval actor flow; not implemented in P3-B.
+- [x] **P3-C — policy/approval seam:** async typed `ToolPolicy`, checked approval DTOs, and process-local interaction values; actor suspension/consumption wiring remains deferred to the owner migration.
 - [ ] **P4/P5 — SessionRuntime acceptance:** owner/runtime integration and replacement end-to-end contract suite.
 
 ## Current Maintenance Gates

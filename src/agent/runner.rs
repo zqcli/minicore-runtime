@@ -15,9 +15,10 @@ use crate::model::{
 };
 use crate::prompt::{PromptError, append_validated_summary};
 use crate::storage::conversation::{ConversationError, NewConversationEntry};
+use crate::tools::legacy_policy::{LegacyToolContextView, LegacyToolDecision, LegacyToolRequest};
 use crate::tools::{
     LegacyTool, LegacyToolCallSummary, LegacyToolContext, LegacyToolError, LegacyToolOutput,
-    LegacyToolResultStatus, LegacyToolResultSummary, ToolContextView, ToolDecision, ToolRequest,
+    LegacyToolResultStatus, LegacyToolResultSummary,
 };
 
 pub(crate) const MAX_RUNNER_EVENT_CAPACITY: usize = 4_096;
@@ -687,13 +688,14 @@ async fn execute_one_tool(
     if !ctx.enabled_tools().contains(call.name()) {
         return failed_tool_execution();
     }
-    let request = ToolRequest::new(
+    let request = LegacyToolRequest::new(
         call.tool_call_id(),
         call.name(),
         call.arguments(),
         call.call_index(),
     );
-    let context_view = ToolContextView::new(ctx.session_id(), ctx.turn_id(), ctx.enabled_tools());
+    let context_view =
+        LegacyToolContextView::new(ctx.session_id(), ctx.turn_id(), ctx.enabled_tools());
     let decision = match catch_unwind(AssertUnwindSafe(|| {
         ctx.policy().decide(&request, &context_view)
     })) {
@@ -701,15 +703,15 @@ async fn execute_one_tool(
         Err(_) => return failed_tool_execution(),
     };
     match decision {
-        ToolDecision::Allow => execute_allowed_tool(ctx, call).await,
-        ToolDecision::Deny { reason } => Ok(ToolExecution {
+        LegacyToolDecision::Allow => execute_allowed_tool(ctx, call).await,
+        LegacyToolDecision::Deny { reason } => Ok(ToolExecution {
             output: LegacyToolOutput::failure(reason)
                 .or_else(|_| LegacyToolOutput::failure(TOOL_EXECUTION_DENIED_TEXT))
                 .map_err(|_| TurnFailure::Internal)?,
             status: LegacyToolResultStatus::Denied,
             cancelled: false,
         }),
-        ToolDecision::Ask { question, choices } => {
+        LegacyToolDecision::Ask { question, choices } => {
             let tool_context = LegacyToolContext::new(
                 ctx.session_id(),
                 ctx.turn_id(),

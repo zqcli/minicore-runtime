@@ -2,12 +2,14 @@ pub(crate) mod actor;
 pub(crate) mod command;
 mod event;
 pub(crate) mod event_stream;
+mod interaction;
 pub(crate) mod snapshot;
 mod state;
 pub(crate) mod transcript;
 
 pub(crate) use actor::{SessionActor, SessionActorDependencies};
 pub(crate) use command::SessionHandle;
+pub use interaction::{InteractionAnswer, InteractionKind, PendingInteraction};
 
 const _: () = {
     let _ = SessionActor::new;

@@ -1,6 +1,7 @@
 mod context;
 mod input;
 mod legacy_context;
+pub(crate) mod legacy_policy;
 pub(crate) mod legacy_types;
 mod policy;
 mod progress;
@@ -18,8 +19,9 @@ pub(crate) use legacy_types::{
     LegacyToolCallSummary, LegacyToolError, LegacyToolOutput, LegacyToolResultStatus,
     LegacyToolResultSummary, LegacyUserAnswer, LegacyUserQuestion,
 };
-pub(crate) use policy::{
-    AllowConfiguredTools, ToolContextView, ToolDecision, ToolPolicy, ToolRequest,
+pub use policy::{
+    ApprovalDecision, ApprovalRequest, ApprovalRisk, MAX_TOOL_POLICY_TEXT_BYTES, ToolDecision,
+    ToolPolicy, ToolPolicyError, ToolPolicyFuture, ToolPolicyRequest,
 };
 pub use progress::{ToolProgress, ToolProgressError, ToolProgressSink};
 pub(crate) use registry::LegacyTool;

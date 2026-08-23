@@ -131,10 +131,12 @@ def self_test() -> None:
             ("dependency-workspace-target-dev", "forbidden direct dependency reqwest", lambda root: (root / "Cargo.toml").write_text("[workspace.target.'cfg(unix)'.dev-dependencies]\nreqwest = \"1\"\n", encoding="utf-8")),
             ("dependency-workspace-target-build", "forbidden direct dependency reqwest", lambda root: (root / "Cargo.toml").write_text("[workspace.target.'cfg(unix)'.build-dependencies]\nreqwest = \"1\"\n", encoding="utf-8")),
             ("port-missing", "typed Port declaration missing or wrong kind", lambda root: (root / "src/tools/tool.rs").write_text("pub(crate) const _TOOL: () = ();\n", encoding="utf-8")),
+            ("policy-port-missing", "typed Port declaration missing or wrong kind", lambda root: (root / "src/tools/policy.rs").write_text("pub(crate) const _POLICY: () = ();\n", encoding="utf-8")),
             ("port-wrong-kind", "typed Port declaration missing or wrong kind", lambda root: (root / "src/tools/tool.rs").write_text("pub struct Tool {}\n", encoding="utf-8")),
             ("port-test-only", "typed Port declaration missing or wrong kind", lambda root: (root / "src/storage/session_log.rs").write_text("#[cfg(test)]\npub trait SessionLog {}\n", encoding="utf-8")),
             ("port-comment-string", "typed Port declaration missing or wrong kind", lambda root: (root / "src/model/model.rs").write_text("// pub trait Model {}\nlet x = \"pub trait Model {}\";\n", encoding="utf-8")),
             ("port-session-direction", "Port dependency violation", lambda root: (root / "src/tools/tool.rs").write_text("use crate::session::State;\npub trait Tool {}\n", encoding="utf-8")),
+            ("policy-port-session-direction", "Port dependency violation", lambda root: (root / "src/tools/policy.rs").write_text("use crate::session::State;\npub trait ToolPolicy {}\n", encoding="utf-8")),
             ("port-signature-direction", "Port dependency violation", lambda root: (root / "src/tools/tool.rs").write_text("pub trait Tool { fn state(&self) -> crate::session::State; }\n", encoding="utf-8")),
             ("port-nested-declaration", "typed Port declaration missing or wrong kind", lambda root: (root / "src/tools/tool.rs").write_text("mod nested { pub trait Tool {} }\n", encoding="utf-8")),
             ("port-agent-direction", "Port dependency violation", lambda root: (root / "src/context/provider.rs").write_text("use crate::agent::Runner;\npub trait ContextProvider {}\n", encoding="utf-8")),
@@ -275,6 +277,13 @@ def self_test() -> None:
         (legacy_roles / "src/model/gateway.rs").write_text("pub(crate) const _MODEL_GATEWAY: () = ();\n", encoding="utf-8")
         (legacy_roles / "src/tools/registry.rs").write_text("pub(crate) const _REGISTRY: () = ();\n", encoding="utf-8")
         assert not scan(legacy_roles), scan(legacy_roles)
+
+        transitional_policy = directory_path / "transitional-policy"
+        shutil.copytree(base, transitional_policy)
+        (transitional_policy / "src/tools/legacy_policy.rs").write_text(
+            "pub(crate) trait LegacyToolPolicy {}\n", encoding="utf-8"
+        )
+        assert not scan(transitional_policy), scan(transitional_policy)
 
         grouped = directory_path / "grouped-cycle"
         shutil.copytree(base, grouped)

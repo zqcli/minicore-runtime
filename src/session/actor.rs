@@ -28,10 +28,11 @@ use crate::storage::conversation::{
 };
 use crate::storage::store::StoredSessionConfig;
 use crate::tools::LegacyToolError as ToolError;
+use crate::tools::legacy_policy::LegacyToolPolicy;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{
     InteractionClient, InteractionReceiver, InteractionRequest, LegacyUserAnswer,
-    LegacyUserQuestion, ToolPolicy,
+    LegacyUserQuestion,
 };
 use crate::workspace::Workspace;
 
@@ -40,7 +41,7 @@ const MAX_CLOSE_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) struct SessionActorDependencies {
     pub(crate) model_gateway: ModelGateway,
     pub(crate) tool_registry: ToolRegistry,
-    pub(crate) tool_policy: Arc<dyn ToolPolicy>,
+    pub(crate) tool_policy: Arc<dyn LegacyToolPolicy>,
     pub(crate) coding_instructions: Arc<str>,
     pub(crate) retry_policy: RetryPolicy,
     pub(crate) timestamp_source: TimestampSource,
@@ -1058,7 +1059,10 @@ mod tests {
         StoredSessionConfig,
     };
     use crate::time::{Timestamp, TimestampError};
-    use crate::tools::AllowConfiguredTools;
+    use crate::tools::legacy_policy::{
+        LegacyAllowConfiguredTools, LegacyToolContextView, LegacyToolDecision, LegacyToolPolicy,
+        LegacyToolRequest,
+    };
     use crate::tools::registry::{LegacyToolFuture, ToolRegistry};
     use crate::tools::{LegacyTool, LegacyToolContext, LegacyToolOutput, ToolName, ToolSpec};
     use crate::workspace::{Workspace, WorkspaceAccess};
@@ -1159,13 +1163,13 @@ mod tests {
 
     struct AskPolicy;
 
-    impl crate::tools::ToolPolicy for AskPolicy {
+    impl LegacyToolPolicy for AskPolicy {
         fn decide(
             &self,
-            _request: &crate::tools::ToolRequest<'_>,
-            _ctx: &crate::tools::ToolContextView<'_>,
-        ) -> crate::tools::ToolDecision {
-            crate::tools::ToolDecision::ask("allow alpha?", None).unwrap()
+            _request: &LegacyToolRequest<'_>,
+            _ctx: &LegacyToolContextView<'_>,
+        ) -> LegacyToolDecision {
+            LegacyToolDecision::ask("allow alpha?", None).unwrap()
         }
     }
 
@@ -1270,7 +1274,7 @@ mod tests {
         SessionActorDependencies {
             model_gateway: gateway,
             tool_registry: ToolRegistry::builder().build(),
-            tool_policy: Arc::new(AllowConfiguredTools::new()),
+            tool_policy: Arc::new(LegacyAllowConfiguredTools::new()),
             coding_instructions: Arc::from("coding"),
             retry_policy: RetryPolicy::new(1, Duration::ZERO).unwrap(),
             timestamp_source,
@@ -1405,7 +1409,7 @@ mod tests {
     fn dependencies_with(
         gateway: ModelGateway,
         tool_registry: ToolRegistry,
-        tool_policy: Arc<dyn crate::tools::ToolPolicy>,
+        tool_policy: Arc<dyn LegacyToolPolicy>,
     ) -> SessionActorDependencies {
         SessionActorDependencies {
             model_gateway: gateway,
@@ -1590,7 +1594,11 @@ mod tests {
             config,
             Arc::clone(&log),
             Arc::clone(&workspace),
-            dependencies_with(gateway, registry, Arc::new(AllowConfiguredTools::new())),
+            dependencies_with(
+                gateway,
+                registry,
+                Arc::new(LegacyAllowConfiguredTools::new()),
+            ),
         )
         .await
         .unwrap();
@@ -3079,7 +3087,7 @@ mod tests {
         let mut dependencies = dependencies_with(
             gateway,
             registry_builder.build(),
-            Arc::new(AllowConfiguredTools::new()),
+            Arc::new(LegacyAllowConfiguredTools::new()),
         );
         dependencies.close_timeout = Duration::from_secs(30);
         let (handle, actor) = SessionActor::new(

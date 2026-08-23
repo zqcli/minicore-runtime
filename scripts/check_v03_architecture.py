@@ -33,15 +33,15 @@ CONCRETE_FILENAMES = {
 }
 CANONICAL_PRODUCTION_FILES = {
     "src/model": {"mod.rs", "model.rs", "driver.rs", "gateway.rs", "request.rs", "response.rs", "types.rs"},
-    "src/tools": {"mod.rs", "tool.rs", "set.rs", "context.rs", "input.rs", "progress.rs", "types.rs"},
+    "src/tools": {"mod.rs", "tool.rs", "set.rs", "context.rs", "input.rs", "policy.rs", "progress.rs", "types.rs"},
 }
 MODEL_DRIVER_ROLE_FILES = {"src/model/driver.rs", "src/model/gateway.rs"}
 TOOLSET_ROLE_FILES = {"src/tools/set.rs"}
 TRANSITIONAL_PRIVATE_FILES = {
     "src/tools/registry.rs",
     "src/tools/legacy_context.rs",
+    "src/tools/legacy_policy.rs",
     "src/tools/legacy_types.rs",
-    "src/tools/policy.rs",
 }
 ALLOWED_PORT_PATHS = {
     "src/compaction/strategy.rs", "src/context/provider.rs", "src/model/model.rs",
@@ -79,7 +79,7 @@ FORBIDDEN_IMPORTS = {
 FORBIDDEN_DEPENDENCIES = {"reqwest", "cap-std", "cap-primitives", "fs4"}
 PORT_FILES = {
     "src/model/model.rs", "src/tools/tool.rs", "src/tools/set.rs",
-    "src/tools/context.rs", "src/tools/input.rs", "src/tools/progress.rs", "src/tools/types.rs",
+    "src/tools/context.rs", "src/tools/input.rs", "src/tools/policy.rs", "src/tools/progress.rs", "src/tools/types.rs",
     "src/context/provider.rs", "src/compaction/strategy.rs", "src/storage/session_log.rs",
 }
 REQUIRED_FILES = {
@@ -94,7 +94,7 @@ REQUIRED_FILES = {
     "src/conversation/validator.rs", "src/conversation/projection.rs", "src/conversation/log.rs",
     "src/conversation/recovery.rs", "src/conversation/transcript.rs", "src/model/mod.rs", "src/model/model.rs", "src/model/types.rs",
     "src/conversation/view.rs",
-    "src/tools/mod.rs", "src/tools/tool.rs", "src/tools/context.rs", "src/tools/input.rs", "src/tools/progress.rs", "src/tools/set.rs", "src/tools/types.rs",
+    "src/tools/mod.rs", "src/tools/tool.rs", "src/tools/context.rs", "src/tools/input.rs", "src/tools/policy.rs", "src/tools/progress.rs", "src/tools/set.rs", "src/tools/types.rs",
     "src/context/mod.rs", "src/context/provider.rs",
     "src/compaction/mod.rs", "src/compaction/strategy.rs", "src/storage/mod.rs",
     "src/storage/session_log.rs",
@@ -115,6 +115,7 @@ ROOT_EXPORTS = {
 PORT_DECLARATIONS = {
     "src/model/model.rs": ("trait", "Model"),
     "src/tools/tool.rs": ("trait", "Tool"),
+    "src/tools/policy.rs": ("trait", "ToolPolicy"),
     "src/context/provider.rs": ("trait", "ContextProvider"),
     "src/compaction/strategy.rs": ("trait", "CompactionStrategy"),
     "src/storage/session_log.rs": ("trait", "SessionLog"),

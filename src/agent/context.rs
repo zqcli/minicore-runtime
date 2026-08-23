@@ -11,8 +11,9 @@ use crate::model::{ModelGateway, ModelLimits, ReasoningPreference};
 use crate::prompt::{Compactor, PromptBuildOptions, PromptBuilder};
 use crate::storage::conversation::ConversationLog;
 use crate::time::{Timestamp, TimestampError};
+use crate::tools::legacy_policy::LegacyToolPolicy;
 use crate::tools::registry::ToolRegistry;
-use crate::tools::{InteractionClient, ToolName, ToolPolicy, ToolSpec};
+use crate::tools::{InteractionClient, ToolName, ToolSpec};
 use crate::workspace::Workspace;
 
 use super::runner::RunnerEventSink;
@@ -41,7 +42,7 @@ pub(crate) struct TurnContextDependencies {
     pub(crate) compactor: Compactor,
     pub(crate) gateway: ModelGateway,
     pub(crate) tools: ToolRegistry,
-    pub(crate) policy: Arc<dyn ToolPolicy>,
+    pub(crate) policy: Arc<dyn LegacyToolPolicy>,
     pub(crate) workspace: Arc<Workspace>,
     pub(crate) conversation: Arc<ConversationLog>,
     pub(crate) interactions: InteractionClient,
@@ -59,7 +60,7 @@ pub(crate) struct TurnContext {
     compactor: Compactor,
     gateway: ModelGateway,
     tools: ToolRegistry,
-    policy: Arc<dyn ToolPolicy>,
+    policy: Arc<dyn LegacyToolPolicy>,
     enabled_tools: BTreeSet<ToolName>,
     tool_specs: Vec<ToolSpec>,
     max_tool_rounds: u8,
@@ -166,7 +167,7 @@ impl TurnContext {
         &self.tools
     }
 
-    pub(crate) const fn policy(&self) -> &Arc<dyn ToolPolicy> {
+    pub(crate) const fn policy(&self) -> &Arc<dyn LegacyToolPolicy> {
         &self.policy
     }
 

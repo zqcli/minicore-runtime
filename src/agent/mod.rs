@@ -56,11 +56,14 @@ mod tests {
         StoredSessionConfig,
     };
     use crate::time::{Timestamp, TimestampError};
+    use crate::tools::legacy_policy::{
+        LegacyAllowConfiguredTools, LegacyToolContextView, LegacyToolDecision, LegacyToolPolicy,
+        LegacyToolRequest,
+    };
     use crate::tools::registry::{LegacyToolFuture, ToolRegistry};
     use crate::tools::{
-        AllowConfiguredTools, InteractionClient, InteractionReceiver, LegacyTool,
-        LegacyToolContext, LegacyToolError, LegacyToolOutput, ToolDecision, ToolName, ToolPolicy,
-        ToolSpec,
+        InteractionClient, InteractionReceiver, LegacyTool, LegacyToolContext, LegacyToolError,
+        LegacyToolOutput, ToolName, ToolSpec,
     };
     use crate::workspace::{Workspace, WorkspaceAccess};
     use serde_json::{Value, json};
@@ -206,7 +209,7 @@ mod tests {
 
     struct HarnessOptions {
         registry: ToolRegistry,
-        policy: Arc<dyn ToolPolicy>,
+        policy: Arc<dyn LegacyToolPolicy>,
         enabled_tools: BTreeSet<ToolName>,
         max_tool_rounds: u8,
         cancellation: CancellationToken,
@@ -224,7 +227,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 registry: ToolRegistry::builder().build(),
-                policy: Arc::new(AllowConfiguredTools::new()),
+                policy: Arc::new(LegacyAllowConfiguredTools::new()),
                 enabled_tools: BTreeSet::new(),
                 max_tool_rounds: 4,
                 cancellation: CancellationToken::new(),
@@ -516,27 +519,27 @@ mod tests {
     }
 
     struct FixedPolicy {
-        decision: ToolDecision,
+        decision: LegacyToolDecision,
     }
 
-    impl ToolPolicy for FixedPolicy {
+    impl LegacyToolPolicy for FixedPolicy {
         fn decide(
             &self,
-            _request: &crate::tools::ToolRequest<'_>,
-            _ctx: &crate::tools::ToolContextView<'_>,
-        ) -> ToolDecision {
+            _request: &LegacyToolRequest<'_>,
+            _ctx: &LegacyToolContextView<'_>,
+        ) -> LegacyToolDecision {
             self.decision.clone()
         }
     }
 
     struct PanickingPolicy;
 
-    impl ToolPolicy for PanickingPolicy {
+    impl LegacyToolPolicy for PanickingPolicy {
         fn decide(
             &self,
-            _request: &crate::tools::ToolRequest<'_>,
-            _ctx: &crate::tools::ToolContextView<'_>,
-        ) -> ToolDecision {
+            _request: &LegacyToolRequest<'_>,
+            _ctx: &LegacyToolContextView<'_>,
+        ) -> LegacyToolDecision {
             panic!("test policy panic");
         }
     }
@@ -791,7 +794,7 @@ mod tests {
         deny_options.registry = registry.clone();
         deny_options.enabled_tools = enabled.clone();
         deny_options.policy = Arc::new(FixedPolicy {
-            decision: ToolDecision::deny("policy denied").unwrap(),
+            decision: LegacyToolDecision::deny("policy denied").unwrap(),
         });
         let (context, harness) = harness_with(
             vec![
@@ -833,7 +836,7 @@ mod tests {
         ask_options.registry = registry;
         ask_options.enabled_tools = enabled;
         ask_options.policy = Arc::new(FixedPolicy {
-            decision: ToolDecision::ask(
+            decision: LegacyToolDecision::ask(
                 "approve alpha",
                 Some(vec!["yes".to_owned(), "no".to_owned()]),
             )

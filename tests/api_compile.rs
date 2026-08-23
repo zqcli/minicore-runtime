@@ -20,14 +20,13 @@ mod v03_public_api_compile_contract {
     use minicore_runtime::ids::TurnId;
     use minicore_runtime::model::Model;
     use minicore_runtime::session::{
-        SessionEventEnvelope, SessionEventStream, SessionState, TurnOutcome,
+        InteractionAnswer, SessionEventEnvelope, SessionEventStream, SessionState, TurnOutcome,
     };
     use minicore_runtime::storage::SessionLog;
-    use minicore_runtime::tools::{Tool, ToolSet};
+    use minicore_runtime::tools::{ApprovalDecision, Tool, ToolInputAnswer, ToolPolicy, ToolSet};
     use minicore_runtime::{
-        ApprovalDecision, CompactionConfig, InteractionAnswer, InteractionId, KernelConfig,
-        SessionBindings, SessionHandle, SessionId, SessionRuntime, SessionRuntimeOptions,
-        SessionSpec, ToolInputAnswer, TurnHandle, TurnOptions, UserInput,
+        CompactionConfig, InteractionId, KernelConfig, SessionBindings, SessionHandle, SessionId,
+        SessionRuntime, SessionRuntimeOptions, SessionSpec, TurnHandle, TurnOptions, UserInput,
     };
 
     async fn compile_contract(
@@ -38,11 +37,13 @@ mod v03_public_api_compile_contract {
         model: Arc<dyn Model>,
         tools: ToolSet,
         tool: Arc<dyn Tool>,
+        policy: Arc<dyn ToolPolicy>,
         context: Arc<dyn ContextProvider>,
         compaction: Arc<dyn CompactionStrategy>,
         runtime: tokio::runtime::Handle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let bindings = SessionBindings::new(model, tools, None, Some(context), Some(compaction));
+        let bindings =
+            SessionBindings::new(model, tools, Some(policy), Some(context), Some(compaction));
         let options = SessionRuntimeOptions::new(
             KernelConfig::default_checked()?,
             bindings.clone(),
