@@ -452,7 +452,7 @@ fn stream_panic_and_cancellation_catching_live_only_in_internal_model_driver() {
 }
 
 #[test]
-fn model_module_has_no_public_legacy_or_concrete_adapter_exports() {
+fn model_module_has_no_legacy_or_concrete_adapter_exports() {
     let module = include_str!("../src/model/mod.rs");
     assert!(module.contains("#[path = \"model.rs\"]\nmod model_port;"));
     assert!(module.contains("mod driver;"));
@@ -460,7 +460,7 @@ fn model_module_has_no_public_legacy_or_concrete_adapter_exports() {
     assert!(!module.contains("pub mod driver;"));
     assert!(module.contains("pub use model_port::{Model, ModelCallContext, ModelDescriptor"));
     assert!(!module.contains("mod port;"));
-    assert!(module.contains("pub(crate) use legacy_gateway::LegacyModelGateway;"));
+    assert!(!module.contains("legacy_"));
     for forbidden in [
         "pub use legacy_",
         "pub use provider",

@@ -4,6 +4,7 @@ mod load;
 mod log;
 mod projection;
 mod recovery;
+pub(crate) mod session_log;
 mod settlement;
 mod state;
 pub mod transcript;

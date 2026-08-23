@@ -8,22 +8,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::ids::ToolCallId;
-#[cfg(test)]
-use crate::tools::LegacyToolOutput;
 pub(crate) use crate::tools::ToolSpec;
 use crate::tools::{ToolName, ToolOutput, ToolResultOutcome, validate_json_shape};
-
-#[cfg(test)]
-use super::response::ModelError;
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub(crate) enum LegacyModelIdentityError {
-    #[error("model identity must be 1..=128 bytes")]
-    InvalidLength,
-    #[error("model identity violates its stable symbolic grammar")]
-    InvalidGrammar,
-}
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ModelRefError {
@@ -146,93 +132,6 @@ fn valid_text(value: &str, maximum: usize) -> bool {
             .all(|character| !character.is_control() || matches!(character, '\n' | '\t'))
 }
 
-#[cfg(test)]
-macro_rules! model_identity {
-    ($name:ident, $allow_slash:literal) => {
-        #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub(crate) struct $name(Box<str>);
-
-        impl FromStr for $name {
-            type Err = LegacyModelIdentityError;
-
-            fn from_str(value: &str) -> Result<Self, Self::Err> {
-                if value.is_empty() || value.len() > 128 {
-                    return Err(LegacyModelIdentityError::InvalidLength);
-                }
-                let valid = value.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric()
-                        || matches!(byte, b'_' | b'-' | b'.' | b':')
-                        || ($allow_slash && byte == b'/')
-                });
-                if !valid {
-                    return Err(LegacyModelIdentityError::InvalidGrammar);
-                }
-                Ok(Self(value.into()))
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(&self.0)
-            }
-        }
-
-        impl fmt::Debug for $name {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                fmt::Display::fmt(self, formatter)
-            }
-        }
-
-        impl Serialize for $name {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: Serializer,
-            {
-                serializer.serialize_str(&self.0)
-            }
-        }
-
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where
-                D: Deserializer<'de>,
-            {
-                deserialize_from_str(deserializer)
-            }
-        }
-    };
-}
-
-#[cfg(test)]
-model_identity!(LegacyProviderId, false);
-#[cfg(test)]
-model_identity!(LegacyModelId, true);
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub(crate) struct LegacyModelSelection {
-    provider_id: LegacyProviderId,
-    model_id: LegacyModelId,
-}
-
-#[cfg(test)]
-impl LegacyModelSelection {
-    pub(crate) const fn new(provider_id: LegacyProviderId, model_id: LegacyModelId) -> Self {
-        Self {
-            provider_id,
-            model_id,
-        }
-    }
-
-    pub(crate) const fn provider_id(&self) -> &LegacyProviderId {
-        &self.provider_id
-    }
-
-    pub(crate) const fn model_id(&self) -> &LegacyModelId {
-        &self.model_id
-    }
-}
-
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
@@ -290,71 +189,6 @@ impl<'de> Deserialize<'de> for ModelLimits {
         let value = ModelLimitsWire::deserialize(deserializer)?;
         Self::new(value.context_window_tokens, value.max_output_tokens)
             .map_err(serde::de::Error::custom)
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Eq, PartialEq)]
-pub(crate) struct LegacyModelDescriptor {
-    selection: LegacyModelSelection,
-    api_model_name: Box<str>,
-    limits: ModelLimits,
-    supported_reasoning: BTreeSet<ReasoningPreference>,
-}
-
-#[cfg(test)]
-impl LegacyModelDescriptor {
-    #[cfg(test)]
-    pub(crate) fn new(
-        selection: LegacyModelSelection,
-        api_model_name: impl Into<String>,
-        limits: ModelLimits,
-        supported_reasoning: BTreeSet<ReasoningPreference>,
-    ) -> Result<Self, ModelError> {
-        let api_model_name = api_model_name.into();
-        if api_model_name.is_empty()
-            || api_model_name.len() > 256
-            || api_model_name
-                .bytes()
-                .any(|byte| !(0x21..=0x7e).contains(&byte) || matches!(byte, b'"' | b'\\'))
-            || supported_reasoning.is_empty()
-        {
-            return Err(ModelError::InvalidRequest);
-        }
-        Ok(Self {
-            selection,
-            api_model_name: api_model_name.into_boxed_str(),
-            limits,
-            supported_reasoning,
-        })
-    }
-
-    pub(crate) const fn selection(&self) -> &LegacyModelSelection {
-        &self.selection
-    }
-
-    pub(crate) const fn limits(&self) -> &ModelLimits {
-        &self.limits
-    }
-
-    pub(crate) fn api_model_name(&self) -> &str {
-        &self.api_model_name
-    }
-
-    pub(crate) fn supports_reasoning(&self, preference: ReasoningPreference) -> bool {
-        self.supported_reasoning.contains(&preference)
-    }
-}
-
-#[cfg(test)]
-impl fmt::Debug for LegacyModelDescriptor {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("LegacyModelDescriptor")
-            .field("selection", &self.selection)
-            .field("limits", &self.limits)
-            .field("supported_reasoning", &self.supported_reasoning)
-            .finish()
     }
 }
 
@@ -733,24 +567,6 @@ impl ModelMessage {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn legacy_tool(
-        tool_call_id: ToolCallId,
-        output: LegacyToolOutput,
-    ) -> Result<Self, ModelValueError> {
-        let outcome = if output.is_error() {
-            ToolResultOutcome::Failed
-        } else {
-            ToolResultOutcome::Success
-        };
-        let output = ToolOutput::new(output.text()).map_err(|_| ModelValueError::InvalidText)?;
-        Ok(Self::Tool {
-            tool_call_id,
-            output,
-            outcome,
-        })
-    }
-
     pub fn validate(&self) -> Result<(), ModelValueError> {
         match self {
             Self::System(text) | Self::User(text) => {
@@ -1044,13 +860,6 @@ impl<'de> Deserialize<'de> for ModelResponse {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum LegacyModelEvent {
-    TextDelta { delta: String },
-    ReasoningDelta { delta: String },
-}
-
 fn validate_tool_call_order(parts: &[AssistantPart]) -> Result<(), ModelValueError> {
     let mut ids = BTreeSet::new();
     let mut indices = BTreeSet::new();
@@ -1127,33 +936,4 @@ fn validate_request_tools(tools: &[ToolSpec]) -> Result<(), ModelValueError> {
         previous = Some(tool.name());
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ModelMessage;
-    use crate::ids::ToolCallId;
-    use crate::tools::{LegacyToolOutput, ToolResultOutcome};
-
-    #[test]
-    fn legacy_tool_message_maps_failure_to_public_outcome_wire() {
-        let message = ModelMessage::legacy_tool(
-            ToolCallId::new("call-legacy").unwrap(),
-            LegacyToolOutput::failure("failed").unwrap(),
-        )
-        .unwrap();
-        let value = serde_json::to_value(&message).unwrap();
-        assert_eq!(value["content"]["output"]["content"], "failed");
-        assert_eq!(value["content"]["outcome"], "failed");
-        assert!(value["content"].get("text").is_none());
-        assert!(value["content"]["output"].get("is_error").is_none());
-        let decoded: ModelMessage = serde_json::from_value(value).unwrap();
-        assert!(matches!(
-            decoded,
-            ModelMessage::Tool {
-                outcome: ToolResultOutcome::Failed,
-                ..
-            }
-        ));
-    }
 }

@@ -14,18 +14,13 @@ pub mod storage;
 mod time;
 pub mod tools;
 pub mod value;
-#[cfg(test)]
-mod workspace;
 
 pub use config::{
-    CompactionConfig, ConfigError, KernelConfig, RetryPolicy, RetryPolicyError, SemanticLimits,
-    SessionManifest, SessionSpec, TurnOptions, UserInput,
+    CompactionConfig, KernelConfig, RetryPolicy, SemanticLimits, SessionManifest, SessionSpec,
+    TurnOptions, UserInput,
 };
 pub use conversation::{ConversationEntry, ConversationSeq, TranscriptPage, TurnTerminal};
-pub use error::{PublicErrorCode, PublicErrorSummary};
-pub use ids::{
-    IdError, InteractionId, SessionId, SessionInstanceId, ToolCallId, ToolCallIdError, TurnId,
-};
+pub use ids::{InteractionId, SessionId, SessionInstanceId, ToolCallId, TurnId};
 pub use session::{
     InteractionAnswer, InteractionKind, PendingInteraction, SessionBindings, SessionEvent,
     SessionEventEnvelope, SessionEventStream, SessionHandle, SessionHealth, SessionRuntime,

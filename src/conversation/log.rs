@@ -6,9 +6,9 @@ use std::time::Duration;
 use futures_util::FutureExt;
 
 use crate::config::{KernelConfig, SessionManifest};
+use crate::error::{SessionLogError, SessionLogErrorKind};
 use crate::ids::{SessionId, ToolCallId, TurnId};
 use crate::model::{ModelFinishReason, ModelRef, ToolCall, Usage};
-use crate::storage::{AppendReceipt, LogFuture, SessionLog, SessionLogError, SessionLogErrorKind};
 use crate::time::{Timestamp, TimestampError};
 use crate::tools::{ToolName, ToolResultOutcome};
 use crate::value::BoundedText;
@@ -20,6 +20,7 @@ use super::entry::{
 use super::load::PendingConversationLoad;
 use super::projection::PromptProjection;
 use super::recovery::RecoveryPlan;
+use super::session_log::{AppendReceipt, LogFuture, SessionLog};
 use super::state::ConversationState;
 use super::transcript::{TranscriptPage, valid_page_contract};
 use super::validator::ConversationValidationError;

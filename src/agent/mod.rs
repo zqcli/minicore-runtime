@@ -1,5 +1,3 @@
-#[cfg(test)]
-mod legacy;
 mod runner;
 mod runner_protocol;
 mod tool_driver;
@@ -16,16 +14,6 @@ pub(crate) use tool_driver::{
 pub(crate) use turn_context::{
     TurnRunnerControl, TurnRunnerIdentity, TurnRunnerKernel, TurnRunnerRequest,
     TurnRunnerRequestError,
-};
-
-#[cfg(test)]
-pub(crate) use legacy::{
-    MAX_RUNNER_EVENT_CAPACITY as LEGACY_MAX_RUNNER_EVENT_CAPACITY,
-    RunnerEvent as LegacyRunnerEvent, RunnerEventSink as LegacyRunnerEventSink,
-    TimestampSource as LegacyTimestampSource, TurnContext as LegacyTurnContext,
-    TurnContextDependencies as LegacyTurnContextDependencies,
-    TurnContextError as LegacyTurnContextError, TurnFailure as LegacyTurnFailure,
-    TurnTaskResult as LegacyTurnTaskResult, run_turn as legacy_run_turn,
 };
 
 const _: () = {

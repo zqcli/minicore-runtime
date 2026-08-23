@@ -1,14 +1,6 @@
 mod builder;
-#[cfg(test)]
-mod legacy;
 
 pub(crate) use builder::{KERNEL_INVARIANT, PromptBuilder, PromptError};
-
-#[cfg(test)]
-pub(crate) use legacy::{
-    CompactionConfig, Compactor, PromptBuildOptions, PromptBuilder as LegacyPromptBuilder,
-    PromptError as LegacyPromptError, append_validated_summary,
-};
 
 const _: () = {
     let _ = KERNEL_INVARIANT;

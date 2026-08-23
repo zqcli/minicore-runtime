@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::storage::ConversationPage;
+use super::session_log::ConversationPage;
 
 use super::entry::{ConversationEntry, ConversationSeq};
 

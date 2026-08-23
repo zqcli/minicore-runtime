@@ -430,15 +430,7 @@ fn event_variants_envelope_and_stream_surface_are_exact() {
     }
     let session = include_str!("../src/session/mod.rs");
     assert!(session.contains("pub use event_stream::SessionEventStream;"));
-    for legacy in [
-        "pub(crate) mod legacy_event;",
-        "pub(crate) mod legacy_event_stream;",
-        "pub(crate) mod legacy_snapshot;",
-        "pub(crate) mod legacy_state;",
-    ] {
-        assert!(session.contains(legacy));
-    }
-    assert!(!session.contains("pub use legacy_"));
+    assert!(!session.contains("legacy_"));
     for final_source in [
         include_str!("../src/session/state.rs"),
         event_source,

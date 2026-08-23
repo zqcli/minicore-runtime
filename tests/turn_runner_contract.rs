@@ -459,16 +459,3 @@ fn tool_driver_started_progress_is_execution_only_and_lifecycle_typed() {
     assert!(support.contains("ToolDriverProgress::Update"));
     assert!(driver.lines().count() < 500);
 }
-
-#[test]
-fn legacy_runner_files_are_physical_test_only_migration_evidence() {
-    let legacy = include_str!("../src/agent/legacy.rs");
-    for required in [
-        "#[path = \"legacy_context.rs\"]\nmod context;",
-        "#[path = \"legacy_runner.rs\"]\nmod runner;",
-    ] {
-        assert!(legacy.contains(required));
-    }
-    assert!(include_str!("../src/agent/legacy_context.rs").starts_with("#![cfg(test)]"));
-    assert!(include_str!("../src/agent/legacy_runner.rs").starts_with("#![cfg(test)]"));
-}

@@ -30,14 +30,7 @@ def markdown_files() -> list[Path]:
         if SKIP_PARTS.intersection(parts) or "archive" in parts:
             continue
         current.append(path)
-    # The pre-reset tree is intentionally stale. Existing v2 ADR/review prose is
-    # also historical and remains unchanged; fixture Markdown remains checked.
-    archived_v2 = [
-        path
-        for path in (ROOT / "docs/archive/v2").rglob("*.md")
-        if "pre-reset" not in relative_parts(path)
-    ]
-    return sorted({*current, *archived_v2})
+    return sorted(current)
 
 
 def link_targets(text: str) -> list[str]:
@@ -211,11 +204,8 @@ def current_authority_files() -> list[Path]:
         ROOT / "docs/README.md",
         ROOT / "docs/architecture.md",
         ROOT / "docs/development-plan.md",
-        ROOT / "docs/migration-v0.1-v0.2.md",
-        ROOT / "docs/release-v0.2-core-reset.md",
         ROOT / "docs/modules/README.md",
         ROOT / "docs/adr/README.md",
-        *sorted((ROOT / "docs/formats").glob("*.md")),
         *sorted((ROOT / "docs/adr").glob("020[0-3]-*.md")),
     ]
 
@@ -308,7 +298,6 @@ def check_current_status() -> list[str]:
         "Steer",
         "FollowUp",
         "Fork",
-        "Archive",
         "src/agent_session_lifecycle.rs",
         "src/compaction.rs",
         "src/conversation_storage.rs",
@@ -366,7 +355,7 @@ def main() -> int:
         print("\n".join(errors), file=sys.stderr)
         return 1
 
-    print("current/archive-v2 Markdown, ADR index, and status checks passed")
+    print("current Markdown, ADR index, and status checks passed")
     return 0
 
 
