@@ -97,6 +97,7 @@ REQUIRED_FILES = {
     "src/runtime/runtime_impl.rs",
     "src/runtime/session_manager.rs",
     "src/session/actor.rs",
+    "src/session/bindings.rs",
     "src/session/command.rs",
     "src/session/event.rs",
     "src/session/event_stream.rs",
@@ -220,6 +221,7 @@ EXPECTED_ROOT_EXPORTS = {
         "ToolCallIdError",
         "TurnId",
     },
+    "session": {"SessionBindings"},
     "storage": {"AppendReceipt", "ConversationPage", "SessionLog", "SessionLogError"},
     "value": {"BoundedText"},
 }
@@ -304,6 +306,7 @@ EXPECTED_MODULE_VISIBILITY = {
     "src/runtime/mod.rs": {"runtime_impl": "private", "session_manager": "private"},
     "src/session/mod.rs": {
         "actor": "crate",
+        "bindings": "private",
         "command": "crate",
         "event": "private",
         "event_stream": "crate",

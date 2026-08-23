@@ -1,4 +1,5 @@
 pub(crate) mod actor;
+mod bindings;
 pub(crate) mod command;
 mod event;
 pub(crate) mod event_stream;
@@ -8,6 +9,7 @@ mod state;
 pub(crate) mod transcript;
 
 pub(crate) use actor::{SessionActor, SessionActorDependencies};
+pub use bindings::{SessionBindingError, SessionBindings};
 pub(crate) use command::SessionHandle;
 pub use interaction::{InteractionAnswer, InteractionKind, PendingInteraction};
 

@@ -6,20 +6,27 @@ This document describes the current v0.3 reset slice. The former v0.2 Runtime/se
 
 ```text
 Host
- ├── model::Model
- │       └── ModelStream { typed events }
- ├── tools::ToolSet ── Arc<dyn tools::Tool>
- │       └── ToolContext { cancellation, deadline, progress }
- ├── tools::ToolPolicy
- │       └── ToolPolicyRequest { invocation, spec, cancellation, deadline }
- ├── context::ContextProvider
- ├── compaction::CompactionStrategy
+ ├── session::SessionBindings
+ │   ├── model::Model
+ │   │   └── ModelStream { typed events }
+ │   ├── tools::ToolSet ── Arc<dyn tools::Tool>
+ │   │   └── ToolContext { cancellation, deadline, progress }
+ │   ├── tools::ToolPolicy
+ │   │   └── ToolPolicyRequest { invocation, spec, cancellation, deadline }
+ │   ├── context::ContextProvider
+ │   └── compaction::CompactionStrategy
  └── storage::SessionLog
 ```
 
 The public Tool seam is host-neutral. A Tool receives a checked `ToolInvocation` and a context containing only cancellation, deadline, and synchronous best-effort progress. Workspace roots, process capabilities, RPC clients, credentials, policy decisions, and runtime/session handles are not fields of `ToolContext`.
 
-`ToolSetBuilder` is the only mutable phase. Registration captures a checked `ToolSpec`, validates its public fields, and records the first duplicate name, spec panic, or invalid-spec mutation; `build()` returns that error or a frozen immutable set. `specs_for` deterministically returns only registered enabled specs and omits unknown names; SessionBindings validation owns unknown-enabled rejection in the next migration phase. Cloned sets share the same `Arc` tool values and support concurrent execution. There is no public `ToolRegistry`, no default concrete adapter set, and no builtin/process implementation in `src/tools`.
+`ToolSetBuilder` is the only mutable phase. Registration captures a checked `ToolSpec`, validates its public fields, and records the first duplicate name, spec panic, or invalid-spec mutation; `build()` returns that error or a frozen immutable set. `specs_for` deterministically returns only registered enabled specs and omits unknown names; `SessionBindings::validate` rejects unknown enabled names and checks every frozen spec against semantic budgets. Cloned sets share the same `Arc` tool values and support concurrent execution. There is no public `ToolRegistry`, no default concrete adapter set, and no builtin/process implementation in `src/tools`.
+
+## Session Bindings
+
+`session::SessionBindings` is the immutable adapter bundle for one future loaded session. Its exact fields are one direct Model, one ToolSet, and optional ToolPolicy, ContextProvider, and CompactionStrategy values. It contains no Clock, runtime/task handle, log, store, workspace, owner, or metadata. Construction installs no defaults.
+
+Validation is pure and does not invoke adapter futures. The only adapter call is `Model::descriptor`, cloned inside `catch_unwind`; a panic becomes the payload-free `ModelPanicked` error. Validation then checks limits/specs, descriptor integrity and compatibility, enabled tool support/policy/registration, all frozen ToolSpec semantic budgets, and compaction strategy presence. Disabled compaction permits a strategy without invoking it, and optional context is never invoked.
 
 ## Checked DTOs
 
@@ -55,7 +62,7 @@ The old `runtime` and `workspace` modules are private in `src/lib.rs`; `Runtime`
 
 Concrete filesystem/process adapters and their tests were deleted in P3-B rather than replaced with defaults. Future concrete tools must be host-owned implementations of the public `Tool` Port, not reintroduced builtins or process policy modules.
 
-P4/P5 will introduce the SessionRuntime owner and its acceptance contract. The typed P3-C seam does not yet wire policy suspension or interaction consumption into the transitional actor/runner.
+P4/P5 will introduce the SessionRuntime owner and its acceptance contract. P4 must validate bindings against the loaded manifest before constructing `LoadCompatibilityValidated` and finishing replay. P3-E does not expose that proof or wire the transitional actor.
 
 ## Model Retry
 
@@ -63,4 +70,4 @@ The final retry contract is explicit: `retryable == true` and `delivery == NotSt
 
 ## Dependency Direction
 
-Public Ports do not import Runtime, SessionHandle, Workspace, Store, registry lookup, direct I/O, or fanout. The final Model, Tool, and ToolPolicy files are adapter-neutral and remain below the 500-line Port limit. Transitional private owners may still depend on the old graph until their scheduled phase, but no new public alias or wrapper may be added.
+Public Ports and SessionBindings do not import Runtime, SessionHandle, Workspace, Store, registry lookup, direct I/O, or fanout. The final Model, Tool, ToolPolicy, and SessionBindings files remain below the 500-line limit. Transitional private owners may still depend on the old graph until their scheduled phase, but no new public alias or wrapper may be added.

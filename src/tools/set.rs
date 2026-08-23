@@ -53,6 +53,10 @@ impl ToolSet {
             .filter_map(|name| self.specs.get(name).cloned())
             .collect()
     }
+
+    pub(crate) fn frozen_specs(&self) -> impl ExactSizeIterator<Item = &ToolSpec> {
+        self.specs.values()
+    }
 }
 
 impl ToolSetBuilder {

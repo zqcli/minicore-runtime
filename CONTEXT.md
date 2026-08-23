@@ -1,7 +1,7 @@
 # Current Implementation Context
 
-> Transitional v0.2 checkpoint. P3-D has removed public registries and concrete
-> model/tool adapters; the current public Port boundaries are
+> Transitional v0.2 checkpoint. P3-E has added pure immutable SessionBindings
+> after removing public registries and concrete model/tool adapters; current seams are
 > described by the v0.3 README and architecture/module map.
 
 ## Checkpoint
@@ -20,7 +20,7 @@ The crate is Rust 2024 with Rust 1.85 as its MSRV. The default build is offline.
 - `prompt`: private prompt assembly and compaction planning.
 - `agent`: private turn runner, model/tool ordering, retries, cancellation, and compaction integration.
 - `storage`: private durable session configuration, timestamps, root lock, store worker, conversation log, replay, repair, and transcript source.
-- `session`: actor, mailbox, observation, terminal/lifecycle orchestration, snapshots, events, and public transcript projection.
+- `session`: public immutable SessionBindings plus private actor, mailbox, observation, terminal/lifecycle orchestration, snapshots, events, and transcript projection.
 - `runtime`: public orchestration and session residency manager.
 
 The public root exposes canonical `config`, `error`, `event`, `ids`, `model`, `session`, `tools`, and typed Port modules. `agent`, `prompt`, `runtime`, `storage`, and `workspace` remain private. Storage workers, legacy lookup, actor commands, and prompt internals are not public extension seams.
@@ -34,7 +34,7 @@ The public root exposes canonical `config`, `error`, `event`, `ids`, `model`, `s
 - A response to an interaction has one first-winner claim. The actor persists the interaction before resuming model work.
 - A terminal outcome is persisted by the actor. Cancellation, denial, failure, and close are never represented as successful completion.
 - Model tool-call indexes are ordered within each response round. Tool results are matched by checked call identifiers.
-- Final sessions bind one `Arc<dyn Model>` directly; legacy lookup remains private only for old actor tests.
+- `SessionBindings` binds one `Arc<dyn Model>` directly and purely validates it with frozen tools and optional adapters; legacy lookup remains private only for old actor tests.
 - Only explicitly retryable `NotStarted` model failures may use the configured logical retry policy.
 - Compaction appends a summary at a checked boundary. It never rewrites source history or invents an incomplete tool exchange.
 - Snapshots publish before event delivery. A lagged subscriber must resynchronize from a fresh snapshot/subscription baseline.

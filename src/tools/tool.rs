@@ -9,11 +9,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::ids::{SessionId, SessionInstanceId, ToolCallId, TurnId};
-use crate::value::{BoundedText, MAX_TEXT_BYTES};
+use crate::value::{BoundedText, MAX_JSON_BYTES, MAX_TEXT_BYTES, validate_json_size};
 
 use super::context::ToolContext;
 use super::input::ToolInputRequest;
 use super::types::{ToolError, ToolName, ToolValueError, valid_text, validate_json_shape};
+
+const MAX_TOOL_DESCRIPTION_BYTES: usize = 4_096;
 
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ToolSpec {
@@ -53,8 +55,9 @@ impl ToolSpec {
         description: impl AsRef<str>,
         input_schema: Value,
     ) -> Result<Self, ToolValueError> {
-        let description = BoundedText::new_with_max_bytes(description.as_ref(), 4_096)
-            .map_err(|_| ToolValueError::InvalidText)?;
+        let description =
+            BoundedText::new_with_max_bytes(description.as_ref(), MAX_TOOL_DESCRIPTION_BYTES)
+                .map_err(|_| ToolValueError::InvalidText)?;
         let spec = Self {
             name,
             description,
@@ -65,10 +68,34 @@ impl ToolSpec {
     }
 
     pub fn validate(&self) -> Result<(), ToolValueError> {
-        if !valid_text(self.description.as_str(), 4_096, false) {
+        self.validate_with_budgets(MAX_TOOL_DESCRIPTION_BYTES, MAX_JSON_BYTES)
+    }
+
+    pub(crate) fn validate_for_bindings(
+        &self,
+        max_name_bytes: usize,
+        max_schema_bytes: usize,
+    ) -> Result<(), ToolValueError> {
+        if self.name.as_str().len() > max_name_bytes {
             return Err(ToolValueError::InvalidText);
         }
-        if !self.input_schema.is_object() || !validate_json_shape(&self.input_schema) {
+        self.validate_with_budgets(
+            max_schema_bytes.min(MAX_TOOL_DESCRIPTION_BYTES),
+            max_schema_bytes,
+        )
+    }
+
+    fn validate_with_budgets(
+        &self,
+        max_description_bytes: usize,
+        max_schema_bytes: usize,
+    ) -> Result<(), ToolValueError> {
+        if !valid_text(self.description.as_str(), max_description_bytes, false) {
+            return Err(ToolValueError::InvalidText);
+        }
+        if !self.input_schema.is_object()
+            || validate_json_size(&self.input_schema, max_schema_bytes).is_err()
+        {
             return Err(ToolValueError::InvalidSchema);
         }
         Ok(())

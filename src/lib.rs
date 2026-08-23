@@ -26,5 +26,6 @@ pub use event::SessionEventKind;
 pub use ids::{
     IdError, InteractionId, SessionId, SessionInstanceId, ToolCallId, ToolCallIdError, TurnId,
 };
+pub use session::SessionBindings;
 pub use storage::{AppendReceipt, ConversationPage, SessionLog, SessionLogError};
 pub use value::BoundedText;
