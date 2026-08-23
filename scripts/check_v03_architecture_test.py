@@ -57,6 +57,12 @@ def make_fixture(root: Path) -> None:
     (root / "src/agent/tool_driver.rs").write_text(
         "pub(crate) const _TOOL_DRIVER: () = ();\n", encoding="utf-8"
     )
+    (root / "src/context/driver.rs").write_text(
+        "pub(crate) const _CONTEXT_DRIVER: () = ();\n", encoding="utf-8"
+    )
+    (root / "src/prompt/builder.rs").write_text(
+        "pub(crate) const _PROMPT_BUILDER: () = ();\n", encoding="utf-8"
+    )
     (root / "src/tools/set.rs").write_text("pub struct ToolSet {}\n", encoding="utf-8")
     (root / "src/session/bindings.rs").write_text(
         "pub struct SessionBindings {}\n", encoding="utf-8"
@@ -95,6 +101,8 @@ def self_test() -> None:
             ("adapter", "forbidden production storage implementation", lambda root: (root / "src/storage/conversation_jsonl.rs").write_text("", encoding="utf-8")),
             ("model-missing-driver-role", "missing required production role: model driver", lambda root: (root / "src/model/driver.rs").unlink()),
             ("agent-missing-tool-driver-role", "missing required production role: tool driver", lambda root: (root / "src/agent/tool_driver.rs").unlink()),
+            ("context-missing-driver-role", "missing required production role: context driver", lambda root: (root / "src/context/driver.rs").unlink()),
+            ("prompt-missing-builder-role", "missing required production role: prompt builder", lambda root: (root / "src/prompt/builder.rs").unlink()),
             ("tools-missing-toolset-role", "missing required production role: tools ToolSet", lambda root: (root / "src/tools/set.rs").unlink()),
             ("session-missing-runtime-role", "missing required production role: session runtime owner", lambda root: (root / "src/session/runtime.rs").unlink()),
             ("model-gateway-file", "forbidden production src/model path", lambda root: (root / "src/model/gateway.rs").write_text("pub(crate) const _MODEL_GATEWAY: () = ();\n", encoding="utf-8")),

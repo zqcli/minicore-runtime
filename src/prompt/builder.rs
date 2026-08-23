@@ -1,215 +1,292 @@
 use std::fmt;
 use std::sync::Arc;
 
-use serde_json::to_vec;
 use thiserror::Error;
 
-use crate::model::{
-    LegacyModelSelection, ModelLimits, ModelMessage, ModelRequest, ReasoningPreference,
-};
-use crate::storage::conversation::PromptConversationView;
-use crate::tools::{ToolName, ToolSpec};
+use crate::config::{SemanticLimits, SessionSpec};
+use crate::context::{ContextBlock, ContextBundle, ContextSlot};
+use crate::conversation::{ConversationEntry, ConversationView, PromptConversationProjection};
+use crate::model::{AssistantPart, ModelLimits, ModelMessage, ModelRequest, ReasoningContent};
+use crate::tools::{ToolOutput, ToolSpec};
 
-pub(crate) const MAX_PROMPT_TEXT_BYTES: usize = 262_144;
-pub(crate) const MAX_SUMMARY_TEXT_BYTES: usize = 65_536;
+pub(crate) const KERNEL_INVARIANT: &str = concat!(
+    "Honor message roles and the tool-call protocol. ",
+    "Use only declared tools and match every tool result to its call."
+);
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum PromptError {
-    #[error("prompt text is invalid")]
-    InvalidText,
-    #[error("prompt tools are not strictly sorted and unique")]
+    #[error("prompt builder configuration is invalid")]
+    InvalidConfiguration,
+    #[error("conversation projection is invalid")]
+    InvalidConversation,
+    #[error("context projection is invalid")]
+    InvalidContext,
+    #[error("prompt tools are invalid")]
     InvalidTools,
+    #[error("prompt serialization failed")]
+    Serialization,
     #[error("prompt token estimate overflowed")]
     TokenOverflow,
     #[error("prompt exceeds the model context window")]
     ContextOverflow,
-    #[error("prompt request is invalid")]
-    InvalidRequest,
-    #[error("prompt serialization failed")]
-    Serialization,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 pub(crate) struct PromptBuilder {
-    system_prompt: Arc<str>,
-    coding_instructions: Arc<str>,
+    spec: SessionSpec,
+    tools: Arc<[ToolSpec]>,
+    limits: SemanticLimits,
 }
 
 impl fmt::Debug for PromptBuilder {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PromptBuilder")
-            .field("system_prompt_bytes", &self.system_prompt.len())
-            .field("coding_instructions_bytes", &self.coding_instructions.len())
+            .field("model", &self.spec.model)
+            .field("system_prompt_bytes", &self.spec.system_prompt.byte_len())
+            .field("reasoning", &self.spec.reasoning)
+            .field("tool_count", &self.tools.len())
             .finish()
     }
 }
 
 impl PromptBuilder {
     pub(crate) fn new(
-        system_prompt: impl Into<String>,
-        coding_instructions: impl Into<String>,
+        spec: &SessionSpec,
+        tools: Vec<ToolSpec>,
+        limits: SemanticLimits,
     ) -> Result<Self, PromptError> {
-        let system_prompt = system_prompt.into();
-        let coding_instructions = coding_instructions.into();
-        if !valid_text(&system_prompt, true) || !valid_text(&coding_instructions, false) {
-            return Err(PromptError::InvalidText);
+        limits
+            .validate()
+            .map_err(|_| PromptError::InvalidConfiguration)?;
+        if spec.enabled_tools.len() > limits.max_tool_count
+            || spec
+                .enabled_tools
+                .iter()
+                .any(|name| name.as_str().len() > limits.max_tool_name_bytes)
+        {
+            return Err(PromptError::InvalidTools);
         }
+        if spec.validate(&limits).is_err()
+            || (!spec.system_prompt.is_empty()
+                && ModelMessage::system(spec.system_prompt.as_str()).is_err())
+            || ModelMessage::system(KERNEL_INVARIANT).is_err()
+        {
+            return Err(PromptError::InvalidConfiguration);
+        }
+        validate_tools(&tools, spec, &limits)?;
         Ok(Self {
-            system_prompt: system_prompt.into(),
-            coding_instructions: coding_instructions.into(),
+            spec: spec.clone(),
+            tools: tools.into(),
+            limits,
         })
+    }
+
+    pub(crate) fn remaining_context_budget(
+        &self,
+        conversation: &ConversationView,
+        model_limits: ModelLimits,
+    ) -> Result<u64, PromptError> {
+        let messages =
+            self.compose_messages(conversation, &ContextBundle { blocks: Vec::new() })?;
+        let request = self.request(messages, model_limits)?;
+        let estimated = estimate_request(&request)?;
+        let Some(window) = model_limits.context_window_tokens() else {
+            return Ok(u64::MAX);
+        };
+        remaining_budget(estimated, u64::from(window), model_limits)
     }
 
     pub(crate) fn build(
         &self,
-        conversation: &PromptConversationView,
-        tools: &[ToolSpec],
-        options: PromptBuildOptions,
+        conversation: &ConversationView,
+        context: &ContextBundle,
+        model_limits: ModelLimits,
     ) -> Result<ModelRequest, PromptError> {
-        self.build_parts(
-            conversation.latest_summary().map(|summary| summary.text()),
-            conversation.messages(),
-            tools,
-            &options,
-        )
-    }
-
-    pub(super) fn build_parts(
-        &self,
-        latest_summary: Option<&str>,
-        conversation_messages: &[ModelMessage],
-        tools: &[ToolSpec],
-        options: &PromptBuildOptions,
-    ) -> Result<ModelRequest, PromptError> {
-        let messages = self.compose_messages(latest_summary, conversation_messages)?;
-        validate_tools(tools)?;
-        let estimated_input = estimate_serialized(&messages, tools)?;
-        check_context(estimated_input, options.limits)?;
-        ModelRequest::new(messages, tools.to_vec(), options.limits, options.reasoning)
-            .map_err(|_| PromptError::InvalidRequest)
-    }
-
-    pub(super) fn estimate_parts(
-        &self,
-        latest_summary: Option<&str>,
-        conversation_messages: &[ModelMessage],
-        tools: &[ToolSpec],
-    ) -> Result<u64, PromptError> {
-        let messages = self.compose_messages(latest_summary, conversation_messages)?;
-        validate_tools(tools)?;
-        estimate_serialized(&messages, tools)
+        let messages = self.compose_messages(conversation, context)?;
+        let request = self.request(messages, model_limits)?;
+        let estimated = estimate_request(&request)?;
+        if let Some(window) = model_limits.context_window_tokens() {
+            let _ = remaining_budget(estimated, u64::from(window), model_limits)?;
+        }
+        Ok(request)
     }
 
     fn compose_messages(
         &self,
-        latest_summary: Option<&str>,
-        conversation_messages: &[ModelMessage],
+        conversation: &ConversationView,
+        context: &ContextBundle,
     ) -> Result<Vec<ModelMessage>, PromptError> {
+        let sorted_context = context
+            .clone()
+            .validate_and_sort(&self.limits)
+            .map_err(|_| PromptError::InvalidContext)?;
+        if &sorted_context != context {
+            return Err(PromptError::InvalidContext);
+        }
+        let projection = conversation
+            .validated_prompt_projection(&self.spec, &self.limits)
+            .map_err(|_| PromptError::InvalidConversation)?;
+        let projected = project_conversation(&projection)?;
         let mut messages = Vec::with_capacity(
-            usize::from(!self.system_prompt.is_empty())
-                .saturating_add(2)
-                .saturating_add(conversation_messages.len()),
+            2usize
+                .saturating_add(sorted_context.blocks.len())
+                .saturating_add(projected.len()),
         );
-        if !self.system_prompt.is_empty() {
-            messages.push(
-                ModelMessage::system(self.system_prompt.to_string())
-                    .map_err(|_| PromptError::InvalidRequest)?,
-            );
-        }
         messages.push(
-            ModelMessage::system(self.coding_instructions.to_string())
-                .map_err(|_| PromptError::InvalidRequest)?,
+            ModelMessage::system(KERNEL_INVARIANT)
+                .map_err(|_| PromptError::InvalidConfiguration)?,
         );
-        if let Some(summary) = latest_summary {
+        if !self.spec.system_prompt.is_empty() {
             messages.push(
-                ModelMessage::user(summary.to_owned()).map_err(|_| PromptError::InvalidText)?,
+                ModelMessage::system(self.spec.system_prompt.as_str())
+                    .map_err(|_| PromptError::InvalidConfiguration)?,
             );
         }
-        messages.extend(conversation_messages.iter().cloned());
+        for block in &sorted_context.blocks {
+            messages.push(format_context_block(block)?);
+        }
+        messages.extend(projected);
         Ok(messages)
     }
+
+    fn request(
+        &self,
+        messages: Vec<ModelMessage>,
+        model_limits: ModelLimits,
+    ) -> Result<ModelRequest, PromptError> {
+        ModelRequest::new(
+            messages,
+            self.tools.to_vec(),
+            model_limits,
+            self.spec.reasoning,
+        )
+        .map_err(|_| PromptError::InvalidConversation)
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PromptBuildOptions {
-    selection: LegacyModelSelection,
-    limits: ModelLimits,
-    reasoning: ReasoningPreference,
-}
-
-impl PromptBuildOptions {
-    pub(crate) const fn new(
-        selection: LegacyModelSelection,
-        limits: ModelLimits,
-        reasoning: ReasoningPreference,
-    ) -> Self {
-        Self {
-            selection,
-            limits,
-            reasoning,
+fn project_conversation(
+    projection: &PromptConversationProjection,
+) -> Result<Vec<ModelMessage>, PromptError> {
+    let mut messages = Vec::new();
+    if let Some(summary) = projection.selected_summary() {
+        messages.push(
+            ModelMessage::system(summary.summary.as_str())
+                .map_err(|_| PromptError::InvalidConversation)?,
+        );
+    }
+    for entry in projection.entries() {
+        match entry {
+            ConversationEntry::UserMessage(entry) => {
+                messages.push(
+                    ModelMessage::user(entry.input.text.as_str())
+                        .map_err(|_| PromptError::InvalidConversation)?,
+                );
+            }
+            ConversationEntry::AssistantMessage(entry) => {
+                messages.push(project_assistant(entry)?);
+            }
+            ConversationEntry::ToolResult(entry) => {
+                let output = ToolOutput::new(entry.content.as_str())
+                    .map_err(|_| PromptError::InvalidConversation)?;
+                messages.push(
+                    ModelMessage::tool_with_outcome(
+                        entry.tool_call_id.clone(),
+                        output,
+                        entry.outcome,
+                    )
+                    .map_err(|_| PromptError::InvalidConversation)?,
+                );
+            }
+            ConversationEntry::Summary(_) | ConversationEntry::TurnTerminal(_) => {}
         }
     }
-
-    pub(crate) const fn selection(&self) -> &LegacyModelSelection {
-        &self.selection
-    }
-
-    pub(crate) const fn limits(&self) -> ModelLimits {
-        self.limits
-    }
-
-    pub(crate) const fn reasoning(&self) -> ReasoningPreference {
-        self.reasoning
-    }
+    Ok(messages)
 }
 
-fn valid_text(value: &str, allow_empty: bool) -> bool {
-    (allow_empty || !value.is_empty())
-        && value.len() <= MAX_PROMPT_TEXT_BYTES
-        && value
-            .chars()
-            .all(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+fn project_assistant(
+    entry: &crate::conversation::AssistantMessageEntry,
+) -> Result<ModelMessage, PromptError> {
+    let mut parts = Vec::with_capacity(
+        usize::from(entry.reasoning.is_some())
+            .saturating_add(usize::from(entry.text.is_some()))
+            .saturating_add(entry.tool_calls.len()),
+    );
+    if let Some(reasoning) = &entry.reasoning {
+        parts.push(AssistantPart::Reasoning(
+            ReasoningContent::new(Some(reasoning.as_str().to_owned()), None, None, None)
+                .map_err(|_| PromptError::InvalidConversation)?,
+        ));
+    }
+    if let Some(text) = &entry.text {
+        parts.push(AssistantPart::Text(text.as_str().to_owned()));
+    }
+    for call in &entry.tool_calls {
+        parts.push(AssistantPart::ToolCall(call.clone()));
+    }
+    ModelMessage::assistant(parts).map_err(|_| PromptError::InvalidConversation)
 }
 
-fn validate_tools(tools: &[ToolSpec]) -> Result<(), PromptError> {
-    let mut previous: Option<&ToolName> = None;
-    for tool in tools {
-        if previous.is_some_and(|previous| previous >= tool.name()) {
+fn validate_tools(
+    tools: &[ToolSpec],
+    spec: &SessionSpec,
+    limits: &SemanticLimits,
+) -> Result<(), PromptError> {
+    if tools.len() != spec.enabled_tools.len() || tools.len() > limits.max_tool_count {
+        return Err(PromptError::InvalidTools);
+    }
+    for (tool, enabled) in tools.iter().zip(&spec.enabled_tools) {
+        if tool.name() != enabled
+            || tool
+                .validate_for_bindings(limits.max_tool_name_bytes, limits.max_tool_schema_bytes)
+                .is_err()
+        {
             return Err(PromptError::InvalidTools);
         }
-        previous = Some(tool.name());
     }
     Ok(())
 }
 
-pub(super) fn estimate_serialized(
-    messages: &[ModelMessage],
-    tools: &[ToolSpec],
-) -> Result<u64, PromptError> {
-    let message_bytes = to_vec(messages)
+fn format_context_block(block: &ContextBlock) -> Result<ModelMessage, PromptError> {
+    let slot = match block.slot {
+        ContextSlot::ProjectInstructions => "project_instructions",
+        ContextSlot::RetrievedKnowledge => "retrieved_knowledge",
+        ContextSlot::TurnContext => "turn_context",
+    };
+    ModelMessage::system(format!(
+        "[minicore-context slot={slot} source={}]\n{}",
+        block.source,
+        block.content.as_str(),
+    ))
+    .map_err(|_| PromptError::InvalidContext)
+}
+
+fn estimate_request(request: &ModelRequest) -> Result<u64, PromptError> {
+    let bytes = serde_json::to_vec(request)
         .map_err(|_| PromptError::Serialization)?
         .len();
-    let tool_bytes = to_vec(tools).map_err(|_| PromptError::Serialization)?.len();
-    let total_bytes = message_bytes
-        .checked_add(tool_bytes)
-        .ok_or(PromptError::TokenOverflow)?;
-    let rounded = total_bytes
-        .checked_add(3)
-        .ok_or(PromptError::TokenOverflow)?;
+    estimate_tokens(bytes)
+}
+
+fn estimate_tokens(bytes: usize) -> Result<u64, PromptError> {
+    let rounded = bytes.checked_add(3).ok_or(PromptError::TokenOverflow)?;
     u64::try_from(rounded / 4).map_err(|_| PromptError::TokenOverflow)
 }
 
-fn check_context(estimated_input: u64, limits: ModelLimits) -> Result<(), PromptError> {
-    let Some(context_window) = limits.context_window_tokens() else {
-        return Ok(());
-    };
-    let reserved = limits.max_output_tokens().map(u64::from).unwrap_or(0);
-    let required = estimated_input
-        .checked_add(reserved)
-        .ok_or(PromptError::TokenOverflow)?;
-    if required > u64::from(context_window) {
-        return Err(PromptError::ContextOverflow);
-    }
-    Ok(())
+fn remaining_budget(
+    estimated: u64,
+    context_window: u64,
+    limits: ModelLimits,
+) -> Result<u64, PromptError> {
+    let output = limits.max_output_tokens().map(u64::from).unwrap_or(0);
+    let available = context_window
+        .checked_sub(output)
+        .ok_or(PromptError::ContextOverflow)?;
+    available
+        .checked_sub(estimated)
+        .ok_or(PromptError::ContextOverflow)
 }
+
+#[cfg(test)]
+mod tests;

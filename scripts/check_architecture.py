@@ -37,11 +37,13 @@ REQUIRED_DIRS = {
     "src/compaction",
     "src/conversation",
     "src/context",
+    "src/context/driver",
     "src/error",
     "src/model",
     "src/model/driver",
     "src/model/driver/tests",
     "src/prompt",
+    "src/prompt/builder",
     "src/session",
     "src/session/legacy_event_stream",
     "src/session/runtime",
@@ -89,9 +91,15 @@ REQUIRED_FILES = {
     "src/conversation/transcript.rs",
     "src/conversation/validator.rs",
     "src/conversation/view.rs",
+    "src/conversation/view/tests.rs",
     "src/compaction/mod.rs",
     "src/compaction/strategy.rs",
     "src/context/mod.rs",
+    "src/context/driver.rs",
+    "src/context/driver/tests.rs",
+    "src/context/driver/tests/behavior.rs",
+    "src/context/driver/tests/concurrency.rs",
+    "src/context/driver/tests/validation.rs",
     "src/context/provider.rs",
     "src/conversation/validator/tests.rs",
     "src/error.rs",
@@ -115,7 +123,14 @@ REQUIRED_FILES = {
     "src/model/response.rs",
     "src/model/types.rs",
     "src/prompt/builder.rs",
-    "src/prompt/compaction.rs",
+    "src/prompt/builder/tests.rs",
+    "src/prompt/builder/tests/ordering.rs",
+    "src/prompt/builder/tests/projection.rs",
+    "src/prompt/builder/tests/tools.rs",
+    "src/prompt/builder/tests/validation_budget.rs",
+    "src/prompt/legacy.rs",
+    "src/prompt/legacy_builder.rs",
+    "src/prompt/legacy_compaction.rs",
     "src/prompt/mod.rs",
     "src/session/actor.rs",
     "src/session/bindings.rs",
@@ -364,8 +379,15 @@ EXPECTED_MODULE_VISIBILITY = {
         "validator": "private",
         "view": "private",
     },
+    "src/conversation/view.rs": {"tests": "private"},
     "src/compaction/mod.rs": {"strategy": "private"},
-    "src/context/mod.rs": {"provider": "private"},
+    "src/context/mod.rs": {"driver": "private", "provider": "private"},
+    "src/context/driver.rs": {"tests": "private"},
+    "src/context/driver/tests.rs": {
+        "behavior": "private",
+        "concurrency": "private",
+        "validation": "private",
+    },
     "src/error.rs": {"operations": "private"},
     "src/model/mod.rs": {
         "driver": "private",
@@ -376,7 +398,15 @@ EXPECTED_MODULE_VISIBILITY = {
         "response": "private",
         "types": "private",
     },
-    "src/prompt/mod.rs": {"builder": "private", "compaction": "private"},
+    "src/prompt/mod.rs": {"builder": "private", "legacy": "private"},
+    "src/prompt/builder.rs": {"tests": "private"},
+    "src/prompt/builder/tests.rs": {
+        "ordering": "private",
+        "projection": "private",
+        "tools": "private",
+        "validation_budget": "private",
+    },
+    "src/prompt/legacy.rs": {"builder": "private", "compaction": "private"},
     "src/model/driver.rs": {"assembler": "private", "tests": "private"},
     "src/model/driver/tests.rs": {
         "assembly": "private",
@@ -434,6 +464,9 @@ EXPECTED_MODULE_VISIBILITY = {
 }
 
 EXPECTED_TEST_ONLY_MODULES = {
+    "src/conversation/view.rs": {"tests"},
+    "src/context/driver.rs": {"tests"},
+    "src/context/driver/tests.rs": {"behavior", "concurrency", "validation"},
     "src/agent/mod.rs": {"legacy"},
     "src/agent/tool_driver.rs": {"tests"},
     "src/agent/tool_driver/tests.rs": {
@@ -454,6 +487,14 @@ EXPECTED_TEST_ONLY_MODULES = {
         "settlement",
     },
     "src/model/mod.rs": {"legacy_gateway", "legacy_provider", "legacy_registry"},
+    "src/prompt/mod.rs": {"legacy"},
+    "src/prompt/builder.rs": {"tests"},
+    "src/prompt/builder/tests.rs": {
+        "ordering",
+        "projection",
+        "tools",
+        "validation_budget",
+    },
     "src/session/mod.rs": {
         "actor",
         "command",
@@ -552,6 +593,8 @@ def check_source_tokens(sources: Dict[str, str]) -> List[str]:
         allowed_model_port = '#[path = "model.rs"]\nmod model_port;'
         allowed_legacy_context = '#[path = "context.rs"]\nmod context;'
         allowed_legacy_runner = '#[path = "runner.rs"]\nmod runner;'
+        allowed_prompt_builder = '#[path = "legacy_builder.rs"]\nmod builder;'
+        allowed_prompt_compaction = '#[path = "legacy_compaction.rs"]\nmod compaction;'
         if "#[path" in text and not (
             path == "src/model/mod.rs"
             and text.count("#[path") == 1
@@ -561,6 +604,11 @@ def check_source_tokens(sources: Dict[str, str]) -> List[str]:
             and text.count("#[path") == 2
             and allowed_legacy_context in text
             and allowed_legacy_runner in text
+        ) and not (
+            path == "src/prompt/legacy.rs"
+            and text.count("#[path") == 2
+            and allowed_prompt_builder in text
+            and allowed_prompt_compaction in text
         ):
             errors.append(f"{path}: #[path] module aliases are forbidden")
         for token in FORBIDDEN_SOURCE_TOKENS:
@@ -760,14 +808,14 @@ def check_public_surface(sources: Dict[str, str]) -> List[str]:
             "src/lib.rs: public modules mismatch: "
             f"expected={sorted(EXPECTED_PUBLIC_MODULES)} actual={sorted(public_modules)}"
         )
-    if private_modules != {"agent", "time"}:
+    if private_modules != {"agent", "prompt", "time"}:
         errors.append(
             "src/lib.rs: private modules mismatch: "
-            f"expected=['agent', 'time'] actual={sorted(private_modules)}"
+            f"expected=['agent', 'prompt', 'time'] actual={sorted(private_modules)}"
         )
     raw_lib_declarations = parse_mod_declarations(lib)
     test_modules = cfg_test_spans(lib)[1]
-    expected_test_modules = {"prompt", "workspace"}
+    expected_test_modules = {"workspace"}
     if test_modules != expected_test_modules or any(
         raw_lib_declarations.get(name) != "private" for name in expected_test_modules
     ):

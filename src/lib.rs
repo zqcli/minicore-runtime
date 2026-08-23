@@ -6,7 +6,6 @@ pub mod conversation;
 pub mod error;
 pub mod ids;
 pub mod model;
-#[cfg(test)]
 mod prompt;
 pub mod session;
 pub mod storage;
