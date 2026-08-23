@@ -36,6 +36,8 @@ REQUIRED_DIRS = {
     "src/agent",
     "src/agent/runner",
     "src/agent/runner/tests",
+    "src/agent/runner/tests/compaction",
+    "src/agent/runner/tests/compaction_control",
     "src/compaction",
     "src/compaction/driver",
     "src/conversation",
@@ -65,10 +67,17 @@ REQUIRED_FILES = {
     "src/agent/legacy_runner.rs",
     "src/agent/mod.rs",
     "src/agent/runner.rs",
+    "src/agent/runner/compaction.rs",
     "src/agent/runner/diagnostics.rs",
     "src/agent/runner/support.rs",
     "src/agent/runner/tests.rs",
     "src/agent/runner/tests/acknowledgements.rs",
+    "src/agent/runner/tests/compaction.rs",
+    "src/agent/runner/tests/compaction/usage.rs",
+    "src/agent/runner/tests/compaction_acknowledgements.rs",
+    "src/agent/runner/tests/compaction_control.rs",
+    "src/agent/runner/tests/compaction_control/priority.rs",
+    "src/agent/runner/tests/compaction_support.rs",
     "src/agent/runner/tests/control.rs",
     "src/agent/runner/tests/deadline_provenance.rs",
     "src/agent/runner/tests/interactions.rs",
@@ -110,6 +119,7 @@ REQUIRED_FILES = {
     "src/conversation/state.rs",
     "src/conversation/transcript.rs",
     "src/conversation/validator.rs",
+    "src/conversation/validator/tests/summary.rs",
     "src/conversation/view.rs",
     "src/conversation/view/tests.rs",
     "src/conversation/view/tests/compaction.rs",
@@ -119,6 +129,7 @@ REQUIRED_FILES = {
     "src/compaction/driver/tests/basic.rs",
     "src/compaction/driver/tests/cancellation.rs",
     "src/compaction/driver/tests/concurrency.rs",
+    "src/compaction/driver/tests/deadline.rs",
     "src/compaction/driver/tests/validation.rs",
     "src/compaction/strategy.rs",
     "src/context/mod.rs",
@@ -392,11 +403,17 @@ EXPECTED_MODULE_VISIBILITY = {
     },
     "src/agent/legacy.rs": {"context": "private", "runner": "private"},
     "src/agent/runner.rs": {
+        "compaction": "private",
         "diagnostics": "private",
         "support": "private",
         "tests": "private",
     },
     "src/agent/runner/tests.rs": {
+        "acknowledgements": "private",
+        "compaction": "private",
+        "compaction_acknowledgements": "private",
+        "compaction_control": "private",
+        "compaction_support": "private",
         "control": "private",
         "deadline_provenance": "private",
         "interactions": "private",
@@ -404,6 +421,8 @@ EXPECTED_MODULE_VISIBILITY = {
         "tools": "private",
         "usage_errors": "private",
     },
+    "src/agent/runner/tests/compaction.rs": {"usage": "private"},
+    "src/agent/runner/tests/compaction_control.rs": {"priority": "private"},
     "src/agent/tool_driver.rs": {"support": "private", "tests": "private"},
     "src/agent/tool_driver/tests.rs": {
         "approval": "private",
@@ -427,12 +446,14 @@ EXPECTED_MODULE_VISIBILITY = {
     },
     "src/conversation/view.rs": {"tests": "private"},
     "src/conversation/view/tests.rs": {"compaction": "private"},
+    "src/conversation/validator/tests.rs": {"summary": "private"},
     "src/compaction/mod.rs": {"driver": "private", "strategy": "private"},
     "src/compaction/driver.rs": {"tests": "private"},
     "src/compaction/driver/tests.rs": {
         "basic": "private",
         "cancellation": "private",
         "concurrency": "private",
+        "deadline": "private",
         "validation": "private",
     },
     "src/context/mod.rs": {"driver": "private", "provider": "private"},
@@ -526,6 +547,11 @@ EXPECTED_MODULE_VISIBILITY = {
 EXPECTED_TEST_ONLY_MODULES = {
     "src/agent/runner.rs": {"tests"},
     "src/agent/runner/tests.rs": {
+        "acknowledgements",
+        "compaction",
+        "compaction_acknowledgements",
+        "compaction_control",
+        "compaction_support",
         "control",
         "deadline_provenance",
         "interactions",
@@ -533,13 +559,17 @@ EXPECTED_TEST_ONLY_MODULES = {
         "tools",
         "usage_errors",
     },
+    "src/agent/runner/tests/compaction.rs": {"usage"},
+    "src/agent/runner/tests/compaction_control.rs": {"priority"},
     "src/conversation/view.rs": {"tests"},
     "src/conversation/view/tests.rs": {"compaction"},
+    "src/conversation/validator/tests.rs": {"summary"},
     "src/compaction/driver.rs": {"tests"},
     "src/compaction/driver/tests.rs": {
         "basic",
         "cancellation",
         "concurrency",
+        "deadline",
         "validation",
     },
     "src/context/driver.rs": {"tests"},
@@ -1601,8 +1631,8 @@ def check_sizes_and_graph(
             f"  {count:6d} {path}"
             for path, count in sorted(file_counts.items(), key=lambda item: (-item[1], item[0]))
         )
-    if source_total > 44_000:
-        errors.append(f"src Rust total exceeds 44,000 lines: {source_total}")
+    if source_total > 46_000:
+        errors.append(f"src Rust total exceeds 46,000 lines: {source_total}")
     if production_total > 25_000:
         errors.append(f"production Rust total exceeds 25,000 lines: {production_total}")
 

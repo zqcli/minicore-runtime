@@ -71,8 +71,6 @@ pub(crate) enum ConversationValidationError {
     TerminalWithPendingTools,
     #[error("completed conversation turn is missing its final assistant")]
     MissingFinalAssistant,
-    #[error("conversation summary cannot be written during a turn")]
-    SummaryDuringActiveTurn,
     #[error("conversation summary boundary is invalid")]
     SummaryInvalidBoundary,
     #[error("conversation summary boundary does not advance")]
@@ -343,9 +341,6 @@ impl ConversationValidator {
     }
 
     fn apply_summary(&mut self, entry: &SummaryEntry) -> Result<(), ConversationValidationError> {
-        if self.active_turn.is_some() {
-            return Err(ConversationValidationError::SummaryDuringActiveTurn);
-        }
         if !self.valid_nonempty_text(&entry.summary, self.limits.max_model_text_bytes_per_round) {
             return Err(ConversationValidationError::InvalidSummary);
         }

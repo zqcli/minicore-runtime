@@ -45,6 +45,14 @@ use crate::value::BoundedText;
 #[cfg(test)]
 mod acknowledgements;
 #[cfg(test)]
+mod compaction;
+#[cfg(test)]
+mod compaction_acknowledgements;
+#[cfg(test)]
+mod compaction_control;
+#[cfg(test)]
+mod compaction_support;
+#[cfg(test)]
 mod control;
 #[cfg(test)]
 mod deadline_provenance;

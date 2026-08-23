@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::SemanticLimits;
 use crate::conversation::{ConversationEntry, ConversationSeq};
 use crate::ids::{SessionId, TurnId};
-use crate::time::effective_deadline;
+use crate::time::{DeadlineSource, EffectiveDeadline, effective_deadline};
 use crate::value::BoundedText;
 
 use super::{
@@ -25,7 +25,37 @@ pub(crate) struct CompactionDriver {
     max_summary_bytes: usize,
 }
 
-/// P5-E2 actor code must require current_head == snapshot_head before CommitSummary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CompactionDriverFailure {
+    error: CompactionError,
+    deadline_source: Option<DeadlineSource>,
+}
+
+impl CompactionDriverFailure {
+    pub(crate) const fn error(self) -> CompactionError {
+        self.error
+    }
+
+    pub(crate) const fn deadline_source(self) -> Option<DeadlineSource> {
+        self.deadline_source
+    }
+
+    const fn ordinary(error: CompactionError) -> Self {
+        Self {
+            error,
+            deadline_source: None,
+        }
+    }
+
+    const fn deadline(source: DeadlineSource) -> Self {
+        Self {
+            error: CompactionError::DeadlineExceeded,
+            deadline_source: Some(source),
+        }
+    }
+}
+
+/// P4-C actor code must require current_head == snapshot_head before CommitSummary.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ValidatedCompactionProposal {
     snapshot_head: ConversationSeq,
@@ -88,24 +118,50 @@ impl CompactionDriver {
         turn_deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<ValidatedCompactionProposal, CompactionError> {
+        self.run_detailed(
+            session_id,
+            turn_id,
+            candidate,
+            target_tokens,
+            turn_deadline,
+            cancellation,
+        )
+        .await
+        .map_err(CompactionDriverFailure::error)
+    }
+
+    pub(crate) async fn run_detailed(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        candidate: CompactionCandidate,
+        target_tokens: u64,
+        turn_deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<ValidatedCompactionProposal, CompactionDriverFailure> {
+        let deadline = effective_deadline(turn_deadline, self.timeout)
+            .map_err(|_| CompactionDriverFailure::ordinary(CompactionError::DeadlineExceeded))?;
+        check_control(&cancellation, &deadline)?;
         if target_tokens == 0 {
-            return Err(CompactionError::InvalidRequest);
+            return Err(CompactionDriverFailure::ordinary(
+                CompactionError::InvalidRequest,
+            ));
         }
-        let has_newer_completed_boundary = validate_candidate(&candidate)?;
+        let has_newer_completed_boundary =
+            validate_candidate(&candidate).map_err(CompactionDriverFailure::ordinary)?;
+        #[cfg(test)]
+        tests::pause_after_candidate(turn_id).await;
+        check_control(&cancellation, &deadline)?;
         if !has_newer_completed_boundary {
-            return Err(CompactionError::Unavailable);
+            return Err(CompactionDriverFailure::ordinary(
+                CompactionError::Unavailable,
+            ));
         }
         let Some(strategy) = self.strategy.as_ref() else {
-            return Err(CompactionError::Unavailable);
+            return Err(CompactionDriverFailure::ordinary(
+                CompactionError::Unavailable,
+            ));
         };
-        if cancellation.is_cancelled() {
-            return Err(CompactionError::Cancelled);
-        }
-        let deadline = effective_deadline(turn_deadline, self.timeout)
-            .map_err(|_| CompactionError::DeadlineExceeded)?;
-        if TokioInstant::now() >= deadline.tokio() {
-            return Err(CompactionError::DeadlineExceeded);
-        }
 
         let child_cancellation = cancellation.child_token();
         let request = CompactionRequest {
@@ -120,7 +176,7 @@ impl CompactionDriver {
             Ok(future) => future,
             Err(_) => {
                 child_cancellation.cancel();
-                return Err(CompactionError::Internal);
+                return Err(CompactionDriverFailure::ordinary(CompactionError::Internal));
             }
         };
         let future = AssertUnwindSafe(future).catch_unwind();
@@ -129,20 +185,36 @@ impl CompactionDriver {
             biased;
             _ = cancellation.cancelled() => {
                 child_cancellation.cancel();
-                return Err(CompactionError::Cancelled);
+                return Err(CompactionDriverFailure::ordinary(CompactionError::Cancelled));
             }
             _ = tokio::time::sleep_until(deadline.tokio()) => {
                 child_cancellation.cancel();
-                return Err(CompactionError::DeadlineExceeded);
+                return Err(CompactionDriverFailure::deadline(deadline.source()));
             }
             result = &mut future => result,
         };
         child_cancellation.cancel();
         match result {
-            Ok(Ok(proposal)) => validate_proposal(candidate, proposal, self.max_summary_bytes),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(CompactionError::Internal),
+            Ok(Ok(proposal)) => validate_proposal(candidate, proposal, self.max_summary_bytes)
+                .map_err(CompactionDriverFailure::ordinary),
+            Ok(Err(error)) => Err(CompactionDriverFailure::ordinary(error)),
+            Err(_) => Err(CompactionDriverFailure::ordinary(CompactionError::Internal)),
         }
+    }
+}
+
+fn check_control(
+    cancellation: &CancellationToken,
+    deadline: &EffectiveDeadline,
+) -> Result<(), CompactionDriverFailure> {
+    if cancellation.is_cancelled() {
+        Err(CompactionDriverFailure::ordinary(
+            CompactionError::Cancelled,
+        ))
+    } else if TokioInstant::now() >= deadline.tokio() {
+        Err(CompactionDriverFailure::deadline(deadline.source()))
+    } else {
+        Ok(())
     }
 }
 

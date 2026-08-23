@@ -2,7 +2,7 @@
 
 ## Status
 
-P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is in progress: P3-B through P4-B expose the final Port/bindings/state/event/TurnHandle foundations and the real single-session create/load/shutdown owner. P5-A through P5-E1 now complete the private drivers, canonical prompt/compaction proofs, and ordinary no-compaction TurnRunner; P4-C SessionHandle/actor ownership and P5-E2 compaction integration remain deferred.
+P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is in progress: P3-B through P4-B expose the final Port/bindings/state/event/TurnHandle foundations and the real single-session create/load/shutdown owner. P5-A through P5-E2 now complete the private drivers, canonical prompt/compaction proofs, ordinary TurnRunner, and stale-head Summary protocol; P4-C SessionHandle/actor ownership and durable settlement remain deferred.
 
 ## Completed Foundations
 
@@ -27,7 +27,8 @@ P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is 
 - [x] **P5-C — ContextDriver and final PromptBuilder:** one-provider deadline/cancellation/panic isolation, canonical context validation, conversation-owned validated latest-summary proof, stable prompt protocol/order, exact frozen tools, exact final-request serialization, and output-reserved context budgeting.
 - [x] **P5-D — CompactionDriver and canonical candidate proof:** full-view canonical validation, immutable candidates with sorted completed boundaries, one-strategy deadline/panic isolation, child cancellation, bounded proposal validation, and stale-head proof results without commit authority.
 - [x] **P5-E1 — ordinary TurnRunner:** durable rounds, final driver construction, exact prefix acknowledgements, shared Turn/Port deadline provenance, detailed Context/Model failure routing, Tool Turn-deadline control exits versus configured-timeout ordinary results, sequential tools, all-outcome usage, bounded panic fallback, and no compaction authority.
-- [ ] **P4-C/P5-E2 — actor and compaction integration:** final SessionHandle/commands, actor-owned durable commits and suspension state, CompactionDriver invocation, stale-head-checked Summary commits, and terminal settlement.
+- [x] **P5-E2 — compaction integration:** active-Turn-safe prior-boundary Summary semantics, cancellation/deadline-first detailed CompactionDriver provenance with post-candidate recheck before strategy availability, proactive best-effort compaction with exact trigger/head suppression, one-shot forced overflow recovery, exact stale-head Summary requests/acknowledgements using the ordinary critical commit taxonomy, nonzero usage retention, and no direct append authority.
+- [ ] **P4-C — actor and handle integration:** final SessionHandle/commands, actor-owned durable commits and suspension state, transcript routing, Summary append after exact head comparison, and durable terminal settlement.
 
 ## Current Maintenance Gates
 

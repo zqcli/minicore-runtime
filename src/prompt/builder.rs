@@ -98,6 +98,16 @@ impl PromptBuilder {
         remaining_budget(estimated, u64::from(window), model_limits)
     }
 
+    pub(crate) fn estimated_fixed_input_tokens(
+        &self,
+        conversation: &ConversationView,
+        model_limits: ModelLimits,
+    ) -> Result<u64, PromptError> {
+        let messages =
+            self.compose_messages(conversation, &ContextBundle { blocks: Vec::new() })?;
+        estimate_request(&self.request(messages, model_limits)?)
+    }
+
     pub(crate) fn build(
         &self,
         conversation: &ConversationView,

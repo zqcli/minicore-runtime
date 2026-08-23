@@ -59,6 +59,57 @@ fn candidate_retains_active_turn_and_sorted_completed_boundaries() {
 }
 
 #[test]
+fn active_turn_summary_keeps_the_current_turn_in_the_prompt_projection() {
+    let prior = TurnId::new().unwrap();
+    let active = TurnId::new().unwrap();
+    let conversation = view(vec![
+        user(1, prior, 4),
+        assistant(
+            2,
+            prior,
+            Some("prior answer"),
+            Vec::new(),
+            ModelFinishReason::Stop,
+        ),
+        terminal(3, prior),
+        user(4, active, 1),
+        summary(5, 3, "summary after active user"),
+    ]);
+    let projection = conversation
+        .validated_prompt_projection(&spec(), &SemanticLimits::default())
+        .unwrap();
+    assert_eq!(projection.active_turn_id(), Some(active));
+    assert_eq!(projection.entries(), &conversation.entries()[3..5]);
+    assert_eq!(
+        projection
+            .entries()
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                ConversationEntry::UserMessage(entry) if entry.turn_id == active
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        projection
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry, ConversationEntry::Summary(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        projection.selected_summary().unwrap().seq,
+        ConversationSeq::new(5)
+    );
+    assert_eq!(
+        projection.active_turn_execution().unwrap().max_tool_rounds,
+        1
+    );
+}
+
+#[test]
 fn malformed_compaction_views_return_exact_canonical_errors() {
     let turn = TurnId::new().unwrap();
     assert_eq!(
