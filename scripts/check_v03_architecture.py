@@ -40,11 +40,13 @@ CANONICAL_PRODUCTION_FILES = {
 }
 CANONICAL_PRODUCTION_DIRECTORIES = {
     "src/agent/tool_driver": {"support.rs"},
+    "src/compaction/driver": set(),
     "src/model/driver": {"assembler.rs"},
 }
 MODEL_DRIVER_ROLE_FILES = {"src/model/driver.rs"}
 TOOL_DRIVER_ROLE_FILES = {"src/agent/tool_driver.rs"}
 CONTEXT_DRIVER_ROLE_FILES = {"src/context/driver.rs"}
+COMPACTION_DRIVER_ROLE_FILES = {"src/compaction/driver.rs"}
 PROMPT_BUILDER_ROLE_FILES = {"src/prompt/builder.rs"}
 TOOLSET_ROLE_FILES = {"src/tools/set.rs"}
 SESSION_BINDINGS_ROLE_FILES = {"src/session/bindings.rs"}
@@ -98,6 +100,7 @@ FORBIDDEN_IMPORTS = {
 }
 FORBIDDEN_DEPENDENCIES = {"reqwest", "cap-std", "cap-primitives", "fs4"}
 PORT_FILES = {
+    "src/conversation/compaction_candidate.rs",
     "src/model/model.rs", "src/model/response.rs", "src/tools/tool.rs", "src/tools/set.rs",
     "src/tools/context.rs", "src/tools/input.rs", "src/tools/policy.rs", "src/tools/progress.rs", "src/tools/types.rs",
     "src/context/provider.rs", "src/compaction/strategy.rs", "src/session/bindings.rs",
@@ -112,13 +115,14 @@ REQUIRED_FILES = {
     "src/agent/mod.rs", "src/agent/runner_protocol.rs", "src/agent/tool_driver.rs",
     "src/agent/tool_driver/support.rs",
     "src/prompt/mod.rs", "src/prompt/builder.rs",
+    "src/compaction/driver.rs",
     "src/session/mod.rs", "src/session/runtime.rs", "src/session/runtime_actor.rs",
     "src/session/runtime_log.rs", "src/session/runtime_open.rs", "src/session/handle.rs",
     "src/session/turn_handle.rs",
     "src/session/actor.rs", "src/session/command.rs",
     "src/session/state.rs", "src/session/event.rs", "src/session/event_stream.rs",
     "src/session/interaction.rs", "src/session/bindings.rs", "src/session/transcript.rs",
-    "src/conversation/mod.rs", "src/conversation/entry.rs", "src/conversation/load.rs", "src/conversation/state.rs",
+    "src/conversation/mod.rs", "src/conversation/compaction_candidate.rs", "src/conversation/entry.rs", "src/conversation/load.rs", "src/conversation/state.rs",
     "src/conversation/validator.rs", "src/conversation/projection.rs", "src/conversation/log.rs",
     "src/conversation/recovery.rs", "src/conversation/transcript.rs", "src/model/mod.rs", "src/model/model.rs", "src/model/driver.rs", "src/model/driver/assembler.rs", "src/model/response.rs", "src/model/types.rs",
     "src/conversation/view.rs",
@@ -983,6 +987,7 @@ def responsibility_errors(views: dict[str, tuple[str, int]]) -> list[str]:
         ("model driver", MODEL_DRIVER_ROLE_FILES),
         ("tool driver", TOOL_DRIVER_ROLE_FILES),
         ("context driver", CONTEXT_DRIVER_ROLE_FILES),
+        ("compaction driver", COMPACTION_DRIVER_ROLE_FILES),
         ("prompt builder", PROMPT_BUILDER_ROLE_FILES),
         ("tools ToolSet", TOOLSET_ROLE_FILES),
         ("session bindings", SESSION_BINDINGS_ROLE_FILES),

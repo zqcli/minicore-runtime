@@ -45,6 +45,10 @@ Validation is pure and does not invoke adapter futures. The only adapter call is
 
 `prompt::builder` is the private final P5-C prompt module. Its immutable constructor captures the full SessionSpec, exact already-selected frozen ToolSpecs, and semantic limits. The fixed kernel invariant contains protocol facts only. Prompt order is kernel invariant, optional session system prompt, sorted ProjectInstructions, RetrievedKnowledge, TurnContext blocks, then the conversation-owned validated projection. Context headers include fixed slot and ContextSourceId fields inside System messages. The selected SummaryEntry becomes a System message containing exactly its checked summary text, with no metadata prefix, and entries through its boundary are suppressed; later user/assistant/tool-result entries are mapped while summaries and terminals are omitted. PromptBuilder contains no second durable-history validator. It first constructs the exact checked ModelRequest, serializes that same request including limits and reasoning, rounds compact JSON bytes by four, and reserves max output tokens before reporting remaining context or returning the unchanged request. The builder invokes no provider, model, tool, log, workspace, store, or owner.
 
+`ConversationView::validated_compaction_candidate` shares the same fresh ConversationState and whole-view candidate validation as the prompt proof. ConversationState constructs the immutable CompactionCandidate from all confirmed projection entries, the exact snapshot head, the validator-owned latest summary boundary, and the validator's sorted terminal-boundary set. An active current turn remains visible to a strategy but never becomes a completed boundary. Conversation owns this proof DTO physically; `compaction` publicly reexports it through the unchanged Port path without creating a reverse dependency.
+
+`compaction::driver` is the private P5-D strategy-execution module. It binds zero or one immutable CompactionStrategy, a checked timeout, and the max summary byte snapshot. A run requires a positive target and at least one completed boundary newer than the latest summary, computes the earlier Turn/configured deadline, passes a scoped child cancellation token, isolates construction and polling panics, preserves typed strategy errors, and cancels the child before dropping an interrupted future. Proposals must contain safe nonempty bounded text and select an exact newer completed boundary no greater than the candidate head. Success returns only a crate-private ValidatedCompactionProposal containing snapshot head, selected boundary, and summary. P5-E actor code must compare current head to snapshot head before committing Summary; the driver cannot commit, append, spawn, retry, or invoke unrelated adapters.
+
 ## State, Event, And Turn Foundation
 
 `session::SessionState` replaces the final heavy snapshot concept with one process-local current-state value. `SessionStatus` is exactly Idle, Running, WaitingForInput, or Closing. Validation centralizes active-turn/pending-interaction shape and prevents an active Turn from also being the latest durable terminal. `SessionHealth::Degraded` carries a checked `DiagnosticSummary`; its Debug reports message bytes rather than message content.
@@ -79,7 +83,7 @@ Progress is synchronous and nonblocking. `ToolProgressSink::emit` validates `com
 
 `ToolPolicy` is an asynchronous `Send + Sync + 'static` Port. It receives an owned `ToolPolicyRequest`, so the exact checked invocation and captured spec cross the seam without borrowing actor/session internals. Decisions are exactly `Allow`, bounded `Deny`, or `RequireApproval`; approval answers are exactly `AllowOnce` or `Deny`. Policy and approval `Debug` output reports safe identities, counts, risks, and byte lengths while redacting arguments, reasons, and prompts.
 
-`session::PendingInteraction`, `InteractionKind`, and `InteractionAnswer` are process-local DTOs only. They validate answer-kind matching and delegate tool-input answer checks to the original checked request. They contain no serde representation, resume sender, callback, owner handle, Workspace, Store, or arbitrary continuation. The internal `TurnSuspension` owns the one-shot sender separately; P5-D actor state will consume it exactly once without changing the public DTOs.
+`session::PendingInteraction`, `InteractionKind`, and `InteractionAnswer` are process-local DTOs only. They validate answer-kind matching and delegate tool-input answer checks to the original checked request. They contain no serde representation, resume sender, callback, owner handle, Workspace, Store, or arbitrary continuation. The internal `TurnSuspension` owns the one-shot sender separately; P5-E actor state will consume it exactly once without changing the public DTOs.
 
 ## Model Port
 
@@ -87,7 +91,7 @@ Progress is synchronous and nonblocking. `ToolProgressSink::emit` validates `com
 
 `ModelRequest` contains only checked messages, tools, limits, and reasoning. `ModelStream` emits bounded typed `ModelEvent` values for text, reasoning, tool-call grammar, usage, and finish. Event `Debug` output reports only safe identities and byte counts. `ModelError` reports `DeliveryState::{NotStarted, Started, Unknown}`, retryability, and an optional retry-after hint; retryable/hint combinations are rejected unless delivery is `NotStarted`.
 
-The old runner/context, batch Model gateway/provider lookup, Workspace, direct ConversationLog behavior, and old prompt/compaction implementation now live only under `agent::legacy`, `prompt::legacy`, and other `cfg(test)` migration modules. P5-A ModelDriver, P5-B ToolDriver/suspension protocol, and P5-C ContextDriver/final PromptBuilder are complete. P5-D replaces the legacy runner path with final compaction, actor commit routing, and durable settlement.
+The old runner/context, batch Model gateway/provider lookup, Workspace, direct ConversationLog behavior, and old prompt/compaction implementation now live only under `agent::legacy`, `prompt::legacy`, and other `cfg(test)` migration modules. P5-A ModelDriver, P5-B ToolDriver/suspension protocol, P5-C ContextDriver/final PromptBuilder, and P5-D CompactionDriver/canonical candidate proof are complete. P5-E replaces the legacy runner path with actor commit routing and durable settlement.
 
 ## Legacy Boundary
 
@@ -95,7 +99,7 @@ The test-only actor/runner/storage path uses `LegacyTool`, `LegacyToolContext`, 
 
 The test-only old actor uses `legacy_state.rs`, `legacy_event.rs`, `legacy_event_stream.rs`, and `legacy_snapshot.rs`. Their modules are gated with actor, command, and old transcript at `session/mod.rs`. Broadcast, first-snapshot delivery, resync, old commands, and legacy terminal behavior are absent from the production SessionRuntime graph.
 
-`legacy_context.rs`, `legacy_policy.rs`, `legacy_types.rs`, and `registry.rs` are staged private migration files. `legacy_policy.rs` retains the synchronous string-based decision flow only for the test-only old runner and is marked for P5-D/P6 deletion. Final `policy.rs` is the public typed Port and is part of the canonical Tool seam.
+`legacy_context.rs`, `legacy_policy.rs`, `legacy_types.rs`, and `registry.rs` are staged private migration files. `legacy_policy.rs` retains the synchronous string-based decision flow only for the test-only old runner and is marked for P5-E/P6 deletion. Final `policy.rs` is the public typed Port and is part of the canonical Tool seam.
 
 ## Deferred Execution
 
@@ -103,7 +107,7 @@ The old top-level `runtime` directory, Runtime configuration/manager/error symbo
 
 Concrete filesystem/process adapters and their tests were deleted in P3-B rather than replaced with defaults. Future concrete tools must be host-owned implementations of the public `Tool` Port, not reintroduced builtins or process policy modules.
 
-P4-C will add the final SessionHandle, state watch access, commands, and transcript routing. P5-D will replace the old actor/runner with TurnHandle, the completed ModelDriver, ToolDriver, ContextDriver, and PromptBuilder, plus final compaction, actor commit/suspension routing, and settlement wiring. P4-B deliberately supports no submit path.
+P4-C will add the final SessionHandle, state watch access, commands, and transcript routing. P5-E will replace the old actor/runner with TurnHandle, the completed ModelDriver, ToolDriver, ContextDriver, PromptBuilder, and CompactionDriver, plus stale-head-checked summary commits, actor commit/suspension routing, and settlement wiring. P4-B deliberately supports no submit path.
 
 ## Model Retry
 

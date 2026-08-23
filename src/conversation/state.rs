@@ -1,6 +1,7 @@
 use crate::config::{SemanticLimits, SessionSpec};
 use crate::ids::TurnId;
 
+use super::compaction_candidate::CompactionCandidate;
 use super::entry::{ConversationEntry, ConversationSeq};
 use super::projection::PromptProjection;
 use super::validator::{ConversationValidationError, ConversationValidator, PendingToolCall};
@@ -63,6 +64,23 @@ impl ConversationState {
 
     pub(crate) fn projection(&self) -> &PromptProjection {
         &self.projection
+    }
+
+    pub(crate) fn compaction_candidate(&self) -> CompactionCandidate {
+        let entries = self.projection.entries().to_vec().into();
+        let completed_boundaries = self
+            .validator
+            .terminal_boundaries()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .into();
+        CompactionCandidate::from_confirmed(
+            entries,
+            self.head,
+            self.validator.latest_summary_through(),
+            completed_boundaries,
+        )
     }
 
     pub(crate) const fn active_turn_id(&self) -> Option<TurnId> {

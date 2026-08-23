@@ -60,6 +60,9 @@ def make_fixture(root: Path) -> None:
     (root / "src/context/driver.rs").write_text(
         "pub(crate) const _CONTEXT_DRIVER: () = ();\n", encoding="utf-8"
     )
+    (root / "src/compaction/driver.rs").write_text(
+        "pub(crate) const _COMPACTION_DRIVER: () = ();\n", encoding="utf-8"
+    )
     (root / "src/prompt/builder.rs").write_text(
         "pub(crate) const _PROMPT_BUILDER: () = ();\n", encoding="utf-8"
     )
@@ -102,6 +105,7 @@ def self_test() -> None:
             ("model-missing-driver-role", "missing required production role: model driver", lambda root: (root / "src/model/driver.rs").unlink()),
             ("agent-missing-tool-driver-role", "missing required production role: tool driver", lambda root: (root / "src/agent/tool_driver.rs").unlink()),
             ("context-missing-driver-role", "missing required production role: context driver", lambda root: (root / "src/context/driver.rs").unlink()),
+            ("compaction-missing-driver-role", "missing required production role: compaction driver", lambda root: (root / "src/compaction/driver.rs").unlink()),
             ("prompt-missing-builder-role", "missing required production role: prompt builder", lambda root: (root / "src/prompt/builder.rs").unlink()),
             ("tools-missing-toolset-role", "missing required production role: tools ToolSet", lambda root: (root / "src/tools/set.rs").unlink()),
             ("session-missing-runtime-role", "missing required production role: session runtime owner", lambda root: (root / "src/session/runtime.rs").unlink()),

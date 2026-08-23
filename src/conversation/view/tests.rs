@@ -15,6 +15,9 @@ use crate::time::Timestamp;
 use crate::tools::ToolResultOutcome;
 use crate::value::BoundedText;
 
+#[cfg(test)]
+mod compaction;
+
 fn timestamp() -> Timestamp {
     "2026-08-19T12:34:56.789Z".parse().unwrap()
 }
