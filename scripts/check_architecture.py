@@ -55,8 +55,19 @@ REQUIRED_DIRS = {
 
 REQUIRED_FILES = {
     "src/agent/context.rs",
+    "src/agent/legacy.rs",
     "src/agent/mod.rs",
     "src/agent/runner.rs",
+    "src/agent/runner_protocol.rs",
+    "src/agent/tool_driver.rs",
+    "src/agent/tool_driver/support.rs",
+    "src/agent/tool_driver/tests.rs",
+    "src/agent/tool_driver/tests/approval.rs",
+    "src/agent/tool_driver/tests/basic.rs",
+    "src/agent/tool_driver/tests/concurrency.rs",
+    "src/agent/tool_driver/tests/execution.rs",
+    "src/agent/tool_driver/tests/input_progress.rs",
+    "src/agent/tool_driver/tests/policy.rs",
     "src/config.rs",
     "src/config/kernel.rs",
     "src/config/retry.rs",
@@ -317,17 +328,31 @@ DIRECT_DEP_CONSUMERS = {
     ],
     "tokio": [("src/session/runtime.rs", "use tokio::runtime::Handle;")],
     "tokio-util": [
-        ("src/agent/context.rs", "use tokio_util::sync::CancellationToken;"),
+        ("src/agent/tool_driver.rs", "use tokio_util::sync::CancellationToken;"),
     ],
     "fs4": [("src/storage/store.rs", "use fs4::fs_std::FileExt;")],
-    "futures-util": [("src/agent/runner.rs", "use futures_util::FutureExt;")],
+    "futures-util": [("src/agent/tool_driver.rs", "use futures_util::FutureExt;")],
 }
 
 REMOVED_DEPENDENCIES = ("base64", "regex-syntax", "same-file", "file-id", "reqwest")
 FORBIDDEN_MANIFEST_TOKENS = ("heavy-tests", "raw_value", "arbitrary_precision")
 
 EXPECTED_MODULE_VISIBILITY = {
-    "src/agent/mod.rs": {"context": "private", "runner": "private"},
+    "src/agent/mod.rs": {
+        "legacy": "private",
+        "runner_protocol": "private",
+        "tool_driver": "private",
+    },
+    "src/agent/legacy.rs": {"context": "private", "runner": "private"},
+    "src/agent/tool_driver.rs": {"support": "private", "tests": "private"},
+    "src/agent/tool_driver/tests.rs": {
+        "approval": "private",
+        "basic": "private",
+        "concurrency": "private",
+        "execution": "private",
+        "input_progress": "private",
+        "policy": "private",
+    },
     "src/conversation/mod.rs": {
         "entry": "private",
         "load": "private",
@@ -409,6 +434,16 @@ EXPECTED_MODULE_VISIBILITY = {
 }
 
 EXPECTED_TEST_ONLY_MODULES = {
+    "src/agent/mod.rs": {"legacy"},
+    "src/agent/tool_driver.rs": {"tests"},
+    "src/agent/tool_driver/tests.rs": {
+        "approval",
+        "basic",
+        "concurrency",
+        "execution",
+        "input_progress",
+        "policy",
+    },
     "src/model/driver.rs": {"tests"},
     "src/model/driver/tests.rs": {
         "assembly",
@@ -515,10 +550,17 @@ def check_source_tokens(sources: Dict[str, str]) -> List[str]:
     for path in sorted(sources):
         text = sources[path]
         allowed_model_port = '#[path = "model.rs"]\nmod model_port;'
+        allowed_legacy_context = '#[path = "context.rs"]\nmod context;'
+        allowed_legacy_runner = '#[path = "runner.rs"]\nmod runner;'
         if "#[path" in text and not (
             path == "src/model/mod.rs"
             and text.count("#[path") == 1
             and allowed_model_port in text
+        ) and not (
+            path == "src/agent/legacy.rs"
+            and text.count("#[path") == 2
+            and allowed_legacy_context in text
+            and allowed_legacy_runner in text
         ):
             errors.append(f"{path}: #[path] module aliases are forbidden")
         for token in FORBIDDEN_SOURCE_TOKENS:
@@ -718,14 +760,14 @@ def check_public_surface(sources: Dict[str, str]) -> List[str]:
             "src/lib.rs: public modules mismatch: "
             f"expected={sorted(EXPECTED_PUBLIC_MODULES)} actual={sorted(public_modules)}"
         )
-    if private_modules != {"time"}:
+    if private_modules != {"agent", "time"}:
         errors.append(
             "src/lib.rs: private modules mismatch: "
-            f"expected=['time'] actual={sorted(private_modules)}"
+            f"expected=['agent', 'time'] actual={sorted(private_modules)}"
         )
     raw_lib_declarations = parse_mod_declarations(lib)
     test_modules = cfg_test_spans(lib)[1]
-    expected_test_modules = {"agent", "prompt", "workspace"}
+    expected_test_modules = {"prompt", "workspace"}
     if test_modules != expected_test_modules or any(
         raw_lib_declarations.get(name) != "private" for name in expected_test_modules
     ):
@@ -1248,6 +1290,8 @@ def child_module_path(path: str, name: str) -> str:
 def test_only_paths(sources: Dict[str, str]) -> Set[str]:
     result: Set[str] = set()
     for path in sorted(sources):
+        if re.match(r"\s*#!\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]", sources[path]):
+            result.add(path)
         _, modules = cfg_test_spans(sources[path])
         for module in modules:
             candidate = child_module_path(path, module)

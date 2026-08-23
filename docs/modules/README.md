@@ -4,7 +4,7 @@ This page maps the current v0.3 source graph. The v0.2 multi-session Runtime is 
 
 ## Root Surface
 
-`src/lib.rs` keeps the checked DTO, Port, and single-session owner modules public. There is no top-level `runtime` module. `agent`, `prompt`, workspace, old storage implementations, actor/commands/observation/transcript, and legacy model/tool execution modules are `cfg(test)` at their owning declarations and absent from production compilation.
+`src/lib.rs` keeps the checked DTO, Port, and single-session owner modules public. There is no top-level `runtime` module. `agent` is an unconditional private module containing only the P5-B ToolDriver/suspension slice in production. Prompt, workspace, old storage implementations, actor/commands/observation/transcript, the legacy agent runner, and legacy model/tool execution modules are `cfg(test)` at their owning declarations and absent from production compilation.
 
 | Module | Current responsibility |
 | --- | --- |
@@ -54,7 +54,8 @@ Workspace capability ownership remains a private transitional implementation det
 ## Other Owners
 
 - `config` owns checked kernel/session-spec values. RuntimeConfig/Builder and legacy SessionConfig are deleted.
-- `model` owns the final direct Port, shared DTOs, and private P5-A `ModelDriver`; legacy lookup remains test-only until P5-B replaces the old runner path.
+- `model` owns the final direct Port, shared DTOs, and private P5-A `ModelDriver`; legacy lookup remains test-only until P5-C replaces the old runner path.
+- `agent` owns the private P5-B `ToolDriver` and `TurnSuspension` protocol. The old context/runner and their unit evidence live only under `agent::legacy`; the final turn runner remains P5-C.
 - `conversation` owns confirmed state, durable append coordination, replay/recovery, transcript projection, and proof-gated load completion.
 - `storage` owns the current private filesystem store and exposes only the `SessionLog` Port to future v0.3 owners.
 - `session` owns the final single-session lifecycle plus bindings/state/event/TurnHandle primitives; SessionHandle/commands remain P4-C and execution remains P5.
@@ -67,6 +68,7 @@ src/
 ├── conversation/{entry.rs,load.rs,log.rs,projection.rs,recovery.rs,state.rs,transcript.rs,validator.rs,view.rs}
 ├── context/{mod.rs,provider.rs}
 ├── compaction/{mod.rs,strategy.rs}
+├── agent/{mod.rs,runner_protocol.rs,tool_driver.rs,tool_driver/support.rs,legacy.rs,...test-only context/runner}
 ├── model/{driver.rs,driver/assembler.rs,legacy_gateway.rs,legacy_provider.rs,legacy_registry.rs,mod.rs,model.rs,response.rs,types.rs}
 ├── error/{operations.rs}
 ├── session/{bindings.rs,event.rs,event_stream.rs,interaction.rs,runtime.rs,runtime_open.rs,runtime_actor.rs,runtime_log.rs,state.rs,turn_handle.rs,...legacy files}
@@ -82,6 +84,7 @@ Concrete `src/tools/builtins/**` and `src/tools/process.rs` adapters were delete
 - `tests/tool_policy_interaction_contract.rs` covers the final async policy Port, checked approvals, process-local interactions, matching answers, and source boundaries.
 - `tests/model_port_contract.rs` covers the direct Model trait/start/stream contract, descriptor/context/request neutrality, event grammar, error delivery/retry invariants, redaction, and shared concurrency.
 - `tests/model_driver_contract.rs` protects the private driver role and public isolation; private driver tests cover assembly, malformed streams, limits, panic/cancellation/deadline behavior, retry, progress loss, drop probes, and concurrency.
+- `tests/tool_driver_contract.rs` protects the private ToolDriver/suspension role, forbidden owner dependencies, legacy quarantine, narrow frozen-spec/progress capabilities, file bounds, and unchanged public surfaces; behavioral tests live under `src/agent/tool_driver/tests/`.
 - `tests/session_bindings_contract.rs` covers exact bindings shape, pure validation, descriptor panic isolation, compatibility failures, frozen ToolSpec limits, optional adapter non-invocation, and P4 load ordering.
 - `tests/session_state_event_contract.rs` covers exact state/event shapes, legal and illegal state matrices, diagnostic/event redaction, envelopes, and the single-consumer stream source contract; sink behavior is tested in `event_stream.rs`.
 - `tests/turn_handle_contract.rs` covers the public exact-Turn surface and safe wait errors; mutex/cancellation/completion races are tested in `turn_handle.rs` beside the private publisher.

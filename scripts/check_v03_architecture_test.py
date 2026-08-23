@@ -54,6 +54,9 @@ def make_fixture(root: Path) -> None:
     (root / "src/model/driver.rs").write_text(
         "pub(crate) const _MODEL_DRIVER: () = ();\n", encoding="utf-8"
     )
+    (root / "src/agent/tool_driver.rs").write_text(
+        "pub(crate) const _TOOL_DRIVER: () = ();\n", encoding="utf-8"
+    )
     (root / "src/tools/set.rs").write_text("pub struct ToolSet {}\n", encoding="utf-8")
     (root / "src/session/bindings.rs").write_text(
         "pub struct SessionBindings {}\n", encoding="utf-8"
@@ -91,9 +94,11 @@ def self_test() -> None:
             ("path", "forbidden production path", lambda root: (root / "src/runtime.rs").write_text("", encoding="utf-8")),
             ("adapter", "forbidden production storage implementation", lambda root: (root / "src/storage/conversation_jsonl.rs").write_text("", encoding="utf-8")),
             ("model-missing-driver-role", "missing required production role: model driver", lambda root: (root / "src/model/driver.rs").unlink()),
+            ("agent-missing-tool-driver-role", "missing required production role: tool driver", lambda root: (root / "src/agent/tool_driver.rs").unlink()),
             ("tools-missing-toolset-role", "missing required production role: tools ToolSet", lambda root: (root / "src/tools/set.rs").unlink()),
             ("session-missing-runtime-role", "missing required production role: session runtime owner", lambda root: (root / "src/session/runtime.rs").unlink()),
             ("model-gateway-file", "forbidden production src/model path", lambda root: (root / "src/model/gateway.rs").write_text("pub(crate) const _MODEL_GATEWAY: () = ();\n", encoding="utf-8")),
+            ("agent-extra-file", "forbidden production src/agent path", lambda root: (root / "src/agent/manager.rs").write_text("pub struct Manager;\n", encoding="utf-8")),
             ("model-extra-file", "forbidden production src/model path", lambda root: (root / "src/model/legacy.rs").write_text("pub struct Legacy;\n", encoding="utf-8")),
             ("model-driver-extra-production", "forbidden production src/model path", lambda root: (root / "src/model/driver/network.rs").write_text("pub struct Network;\n", encoding="utf-8")),
             ("model-empty-file", "forbidden production src/model path", lambda root: (root / "src/model/legacy.rs").write_text("", encoding="utf-8")),
@@ -168,9 +173,9 @@ def self_test() -> None:
             ("total-size", "production Rust exceeds", lambda root: [
                 (root / "src" / f"extra_{index}.rs").write_text("x\n" * MAX_FILE, encoding="utf-8") for index in range(17)
             ]),
-            ("missing-agent", "missing required production file: src/agent/runner.rs", lambda root: (root / "src/agent/runner.rs").unlink()),
+            ("missing-agent", "missing required production file: src/agent/tool_driver.rs", lambda root: (root / "src/agent/tool_driver.rs").unlink()),
             ("missing-prompt", "missing required production file: src/prompt/builder.rs", lambda root: (root / "src/prompt/builder.rs").unlink()),
-            ("required-directory", "required production path is a directory", lambda root: (root / "src/agent/runner.rs").unlink() or (root / "src/agent/runner.rs").mkdir()),
+            ("required-directory", "required production path is a directory", lambda root: (root / "src/agent/tool_driver.rs").unlink() or (root / "src/agent/tool_driver.rs").mkdir()),
             ("invalid-utf8", "unreadable production source", lambda root: (root / "src/value.rs").write_bytes(b"pub(crate) const _BAD: &[u8] = b'" + bytes([255]) + b"';\n")),
             ("missing-export", "missing root export: value::BoundedText", lambda root: (root / "src/lib.rs").write_text("", encoding="utf-8")),
             ("alias", "root export alias is forbidden", lambda root: (root / "src/lib.rs").write_text("pub use value::BoundedText as Text;\n", encoding="utf-8")),
@@ -304,19 +309,19 @@ def self_test() -> None:
 
         grouped = directory_path / "grouped-cycle"
         shutil.copytree(base, grouped)
-        (grouped / "src/agent/runner.rs").write_text("use crate::{conversation::Entry, value::Value};\n", encoding="utf-8")
+        (grouped / "src/agent/tool_driver.rs").write_text("use crate::{conversation::Entry, value::Value};\n", encoding="utf-8")
         (grouped / "src/conversation/entry.rs").write_text("use crate::agent::Runner;\n", encoding="utf-8")
         expect_failure(grouped, "module cycle")
 
         qualified = directory_path / "qualified-cycle"
         shutil.copytree(base, qualified)
-        (qualified / "src/agent/runner.rs").write_text("fn edge() { let _: Option<crate::conversation::Entry> = None; }\n", encoding="utf-8")
+        (qualified / "src/agent/tool_driver.rs").write_text("fn edge() { let _: Option<crate::conversation::Entry> = None; }\n", encoding="utf-8")
         (qualified / "src/conversation/entry.rs").write_text("fn edge() { let _: Option<crate::agent::Runner> = None; }\n", encoding="utf-8")
         expect_failure(qualified, "module cycle")
 
         qualified_masked = directory_path / "qualified-masked"
         shutil.copytree(base, qualified_masked)
-        (qualified_masked / "src/agent/runner.rs").write_text("// crate::conversation::Entry\nlet _ = \"crate::conversation::Entry\";\n", encoding="utf-8")
+        (qualified_masked / "src/agent/tool_driver.rs").write_text("// crate::conversation::Entry\nlet _ = \"crate::conversation::Entry\";\n", encoding="utf-8")
         assert not scan(qualified_masked), scan(qualified_masked)
 
         super_valid = directory_path / "super-valid"

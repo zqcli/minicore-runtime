@@ -35,6 +35,17 @@ pub enum ToolInputAnswer {
     Choice { index: usize },
 }
 
+#[derive(Serialize)]
+struct CanonicalTextResult<'a> {
+    answer: &'a str,
+}
+
+#[derive(Serialize)]
+struct CanonicalChoiceResult<'a> {
+    choice_index: usize,
+    choice: &'a str,
+}
+
 impl<'de> Deserialize<'de> for ToolInputRequest {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -147,6 +158,29 @@ impl ToolInputAnswer {
             _ => Err(ToolValueError::InvalidAnswer),
         }
     }
+
+    pub(crate) fn encode_result(
+        &self,
+        request: &ToolInputRequest,
+    ) -> Result<String, ToolValueError> {
+        self.validate(request)?;
+        let result = match self {
+            Self::Text(answer) => serde_json::to_string(&CanonicalTextResult {
+                answer: answer.as_str(),
+            }),
+            Self::Choice { index } => {
+                let choice = request
+                    .choices()
+                    .get(*index)
+                    .ok_or(ToolValueError::InvalidAnswer)?;
+                serde_json::to_string(&CanonicalChoiceResult {
+                    choice_index: *index,
+                    choice: choice.as_str(),
+                })
+            }
+        };
+        result.map_err(|_| ToolValueError::InvalidAnswer)
+    }
 }
 
 fn valid_input_text(value: &str, maximum: usize, allow_empty: bool) -> bool {
@@ -161,4 +195,14 @@ fn validate_answer_text(value: &str) -> Result<(), ToolValueError> {
     } else {
         Err(ToolValueError::InvalidAnswer)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn canonical_result_struct_uses_stable_json_escaping() {
+    let encoded = serde_json::to_string(&CanonicalTextResult {
+        answer: "quote\" slash\\ newline\n tab\t",
+    })
+    .unwrap();
+    assert_eq!(encoded, r#"{"answer":"quote\" slash\\ newline\n tab\t"}"#);
 }

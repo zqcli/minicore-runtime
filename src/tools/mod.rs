@@ -29,6 +29,7 @@ pub use policy::{
     ApprovalDecision, ApprovalRequest, ApprovalRisk, MAX_TOOL_POLICY_TEXT_BYTES, ToolDecision,
     ToolPolicy, ToolPolicyError, ToolPolicyFuture, ToolPolicyRequest,
 };
+pub(crate) use progress::ToolProgressEmitter;
 pub use progress::{ToolProgress, ToolProgressError, ToolProgressSink};
 #[cfg(test)]
 pub(crate) use registry::LegacyTool;
