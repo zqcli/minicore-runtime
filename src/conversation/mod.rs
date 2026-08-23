@@ -1,3 +1,4 @@
+pub(crate) mod compaction_candidate;
 mod entry;
 mod load;
 mod log;
@@ -24,6 +25,7 @@ const _: () = {
     let _ = LoadCompatibilityValidated::after_session_bindings_validation;
     let _ = view::ConversationView::from_confirmed;
     let _ = view::ConversationView::validated_prompt_projection;
+    let _ = view::ConversationView::validated_compaction_candidate;
     let _ = log::UnsequencedEntry::UserMessage;
     let _ = log::UnsequencedEntry::AssistantMessage;
     let _ = log::UnsequencedEntry::Summary;

@@ -11,7 +11,7 @@ This page maps the current v0.3 source graph. The v0.2 multi-session Runtime is 
 | `config` | Kernel limits, session specs, manifests, retry policy, and checked configuration values |
 | `conversation` | Canonical conversation entries, proof-gated loading, replay/recovery, transcript, and read-only views |
 | `context` | Typed `ContextProvider` Port, validated context DTOs, and private ContextDriver |
-| `compaction` | Typed `CompactionStrategy` Port and immutable candidates/proposals |
+| `compaction` | Typed `CompactionStrategy` Port, immutable candidates/proposals, and private CompactionDriver |
 | `error` | Redacted diagnostics plus typed log/open/shutdown/turn errors |
 | `ids` | Checked identifiers, including `ContextSourceId` |
 | `model` | Final direct streaming `Model` Port and shared checked DTOs plus private legacy runner lookup |
@@ -55,10 +55,11 @@ Workspace capability ownership remains a private transitional implementation det
 ## Other Owners
 
 - `config` owns checked kernel/session-spec values. RuntimeConfig/Builder and legacy SessionConfig are deleted.
-- `model` owns the final direct Port, shared DTOs, and private P5-A `ModelDriver`; legacy lookup remains test-only until P5-D replaces the old runner path.
-- `agent` owns the private P5-B `ToolDriver` and `TurnSuspension` protocol. The old context/runner and their unit evidence live only under `agent::legacy`; the final turn runner remains P5-D.
+- `model` owns the final direct Port, shared DTOs, and private P5-A `ModelDriver`; legacy lookup remains test-only until P5-E replaces the old runner path.
+- `agent` owns the private P5-B `ToolDriver` and `TurnSuspension` protocol. The old context/runner and their unit evidence live only under `agent::legacy`; the final turn runner remains P5-E.
 - `context` owns the public ContextProvider seam and private P5-C `ContextDriver`; `prompt` owns the private final P5-C PromptBuilder. The old prompt builder/compactor and tests live under `prompt::legacy` only.
-- `conversation` owns confirmed state, durable append coordination, replay/recovery, transcript projection, proof-gated load completion, and the canonical validated prompt-history projection proof.
+- `conversation` owns confirmed state, durable append coordination, replay/recovery, transcript projection, proof-gated load completion, the canonical prompt-history proof, and the physical CompactionCandidate proof DTO.
+- `compaction` owns the public strategy seam and private P5-D CompactionDriver. The driver returns a stale-head proof but has no Summary commit authority.
 - `storage` owns the current private filesystem store and exposes only the `SessionLog` Port to future v0.3 owners.
 - `session` owns the final single-session lifecycle plus bindings/state/event/TurnHandle primitives; SessionHandle/commands remain P4-C and execution remains P5.
 
@@ -67,9 +68,9 @@ Workspace capability ownership remains a private transitional implementation det
 ```text
 src/
 ├── config.rs
-├── conversation/{entry.rs,load.rs,log.rs,projection.rs,recovery.rs,state.rs,transcript.rs,validator.rs,view.rs,view/tests.rs}
+├── conversation/{compaction_candidate.rs,entry.rs,load.rs,log.rs,projection.rs,recovery.rs,state.rs,transcript.rs,validator.rs,view.rs,view/tests/...}
 ├── context/{mod.rs,provider.rs}
-├── compaction/{mod.rs,strategy.rs}
+├── compaction/{mod.rs,strategy.rs,driver.rs,driver/tests/...}
 ├── agent/{mod.rs,runner_protocol.rs,tool_driver.rs,tool_driver/support.rs,legacy.rs,...test-only context/runner}
 ├── context/{mod.rs,provider.rs,driver.rs,driver/tests/...}
 ├── model/{driver.rs,driver/assembler.rs,legacy_gateway.rs,legacy_provider.rs,legacy_registry.rs,mod.rs,model.rs,response.rs,types.rs}
@@ -90,6 +91,7 @@ Concrete `src/tools/builtins/**` and `src/tools/process.rs` adapters were delete
 - `tests/model_driver_contract.rs` protects the private driver role and public isolation; private driver tests cover assembly, malformed streams, limits, panic/cancellation/deadline behavior, retry, progress loss, drop probes, and concurrency.
 - `tests/tool_driver_contract.rs` protects the private ToolDriver/suspension role, forbidden owner dependencies, legacy quarantine, narrow frozen-spec/progress capabilities, file bounds, and unchanged public surfaces; behavioral tests live under `src/agent/tool_driver/tests/`.
 - `tests/context_prompt_driver_contract.rs` protects the private ContextDriver/final PromptBuilder roles, conversation-owned canonical proof, exact final-request estimation, owner-neutral dependencies, legacy prompt quarantine, file bounds, and unchanged public surfaces; behavioral tests live beside the private modules and ConversationView proof.
+- `tests/compaction_driver_contract.rs` protects the private CompactionDriver role, conversation-owned canonical candidate, stale-head proof without commit authority, owner-neutral dependencies, public Port stability, and file bounds; behavioral tests live beside the driver and ConversationView proof.
 - `tests/session_bindings_contract.rs` covers exact bindings shape, pure validation, descriptor panic isolation, compatibility failures, frozen ToolSpec limits, optional adapter non-invocation, and P4 load ordering.
 - `tests/session_state_event_contract.rs` covers exact state/event shapes, legal and illegal state matrices, diagnostic/event redaction, envelopes, and the single-consumer stream source contract; sink behavior is tested in `event_stream.rs`.
 - `tests/turn_handle_contract.rs` covers the public exact-Turn surface and safe wait errors; mutex/cancellation/completion races are tested in `turn_handle.rs` beside the private publisher.
@@ -98,7 +100,7 @@ Concrete `src/tools/builtins/**` and `src/tools/process.rs` adapters were delete
 - Private `src/tools/progress.rs` tests cover synchronous bounded `try_send` behavior.
 - Private `src/tools/legacy_types.rs` tests prove legacy failure output wire round-trip.
 - Removed v0.2 model registry, transport, concrete adapter, Runtime smoke, and Runtime surface tests are baseline evidence, not compatibility contracts.
-- SessionHandle command/actor execution acceptance remains deferred to P4-C/P5.
+- SessionHandle command/actor execution acceptance remains deferred to P4-C/P5-E.
 
 ## Boundary Rules
 

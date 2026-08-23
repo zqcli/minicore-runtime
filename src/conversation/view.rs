@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::config::{SemanticLimits, SessionSpec};
 
+use super::compaction_candidate::CompactionCandidate;
 use super::entry::{ConversationEntry, ConversationSeq, SummaryEntry};
 use super::state::ConversationState;
 use super::validator::ConversationValidationError;
@@ -86,11 +87,7 @@ impl ConversationView {
         spec: &SessionSpec,
         limits: &SemanticLimits,
     ) -> Result<PromptConversationProjection, ConversationValidationError> {
-        let state =
-            ConversationState::new(spec.clone(), limits.clone())?.candidate(self.entries())?;
-        if state.head() != self.head {
-            return Err(ConversationValidationError::SequenceGap);
-        }
+        let state = self.validated_state(spec, limits)?;
         let selected_summary = state.projection().latest_summary().cloned();
         let through = selected_summary.as_ref().map(|summary| summary.through);
         let entries = state
@@ -105,6 +102,27 @@ impl ConversationView {
             entries: entries.into(),
             head: state.head(),
         })
+    }
+
+    pub(crate) fn validated_compaction_candidate(
+        &self,
+        spec: &SessionSpec,
+        limits: &SemanticLimits,
+    ) -> Result<CompactionCandidate, ConversationValidationError> {
+        Ok(self.validated_state(spec, limits)?.compaction_candidate())
+    }
+
+    fn validated_state(
+        &self,
+        spec: &SessionSpec,
+        limits: &SemanticLimits,
+    ) -> Result<ConversationState, ConversationValidationError> {
+        let state =
+            ConversationState::new(spec.clone(), limits.clone())?.candidate(self.entries())?;
+        if state.head() != self.head {
+            return Err(ConversationValidationError::SequenceGap);
+        }
+        Ok(state)
     }
 }
 

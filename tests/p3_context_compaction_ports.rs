@@ -290,6 +290,7 @@ fn p3_ports_are_module_qualified_and_do_not_pull_owner_handles_or_adapters() {
 
     for source in [
         include_str!("../src/context/provider.rs"),
+        include_str!("../src/conversation/compaction_candidate.rs"),
         include_str!("../src/compaction/strategy.rs"),
     ] {
         for forbidden in [
