@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use tokio::sync::{Barrier, Notify};
 use tokio_util::sync::CancellationToken;
@@ -17,6 +18,8 @@ use crate::value::BoundedText;
 mod behavior;
 #[cfg(test)]
 mod concurrency;
+#[cfg(test)]
+mod deadline;
 #[cfg(test)]
 mod validation;
 

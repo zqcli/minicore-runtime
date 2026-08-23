@@ -1,15 +1,46 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_util::FutureExt;
 use tokio::time::Instant as TokioInstant;
 
 use crate::config::SemanticLimits;
+use crate::time::{DeadlineSource, effective_deadline};
 
 use super::{ContextBundle, ContextError, ContextProvider, ContextRequest};
 
 const MAX_CONTEXT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ContextDriverFailure {
+    error: ContextError,
+    deadline_source: Option<DeadlineSource>,
+}
+
+impl ContextDriverFailure {
+    pub(crate) const fn error(self) -> ContextError {
+        self.error
+    }
+
+    pub(crate) const fn deadline_source(self) -> Option<DeadlineSource> {
+        self.deadline_source
+    }
+
+    const fn ordinary(error: ContextError) -> Self {
+        Self {
+            error,
+            deadline_source: None,
+        }
+    }
+
+    const fn deadline(source: DeadlineSource) -> Self {
+        Self {
+            error: ContextError::DeadlineExceeded,
+            deadline_source: Some(source),
+        }
+    }
+}
 
 pub(crate) struct ContextDriver {
     provider: Option<Arc<dyn ContextProvider>>,
@@ -38,50 +69,54 @@ impl ContextDriver {
 
     pub(crate) async fn provide(
         &self,
-        mut request: ContextRequest,
+        request: ContextRequest,
     ) -> Result<ContextBundle, ContextError> {
+        self.provide_detailed(request)
+            .await
+            .map_err(ContextDriverFailure::error)
+    }
+
+    pub(crate) async fn provide_detailed(
+        &self,
+        mut request: ContextRequest,
+    ) -> Result<ContextBundle, ContextDriverFailure> {
         let Some(provider) = self.provider.as_ref() else {
-            return ContextBundle { blocks: Vec::new() }.validate_and_sort(&self.limits);
+            return ContextBundle { blocks: Vec::new() }
+                .validate_and_sort(&self.limits)
+                .map_err(ContextDriverFailure::ordinary);
         };
         let cancellation = request.cancellation.clone();
         if cancellation.is_cancelled() {
-            return Err(ContextError::Cancelled);
+            return Err(ContextDriverFailure::ordinary(ContextError::Cancelled));
         }
-        let (deadline, adapter_deadline) =
-            effective_deadline(request.deadline, self.context_timeout)?;
-        if TokioInstant::now() >= deadline {
-            return Err(ContextError::DeadlineExceeded);
+        let deadline = effective_deadline(request.deadline, self.context_timeout)
+            .map_err(|_| ContextDriverFailure::ordinary(ContextError::Internal))?;
+        if TokioInstant::now() >= deadline.tokio() {
+            return Err(ContextDriverFailure::deadline(deadline.source()));
         }
-        request.deadline = adapter_deadline;
+        request.deadline = deadline.standard();
         let future = catch_unwind(AssertUnwindSafe(|| provider.provide(request)))
-            .map_err(|_| ContextError::Internal)?;
+            .map_err(|_| ContextDriverFailure::ordinary(ContextError::Internal))?;
         let future = AssertUnwindSafe(future).catch_unwind();
         tokio::pin!(future);
         let result = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Err(ContextError::Cancelled),
-            _ = tokio::time::sleep_until(deadline) => {
-                return Err(ContextError::DeadlineExceeded);
+            _ = cancellation.cancelled() => {
+                return Err(ContextDriverFailure::ordinary(ContextError::Cancelled));
+            }
+            _ = tokio::time::sleep_until(deadline.tokio()) => {
+                return Err(ContextDriverFailure::deadline(deadline.source()));
             }
             result = &mut future => result,
         };
         match result {
-            Ok(Ok(bundle)) => bundle.validate_and_sort(&self.limits),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(ContextError::Internal),
+            Ok(Ok(bundle)) => bundle
+                .validate_and_sort(&self.limits)
+                .map_err(ContextDriverFailure::ordinary),
+            Ok(Err(error)) => Err(ContextDriverFailure::ordinary(error)),
+            Err(_) => Err(ContextDriverFailure::ordinary(ContextError::Internal)),
         }
     }
-}
-
-fn effective_deadline(
-    request_deadline: Instant,
-    timeout: Duration,
-) -> Result<(TokioInstant, Instant), ContextError> {
-    let configured = TokioInstant::now()
-        .checked_add(timeout)
-        .ok_or(ContextError::DeadlineExceeded)?;
-    let deadline = TokioInstant::from_std(request_deadline).min(configured);
-    Ok((deadline, deadline.into_std()))
 }
 
 #[cfg(test)]

@@ -10,7 +10,6 @@ mod validator;
 mod view;
 
 const _: () = {
-    // Temporary compile anchor; RunnerProtocol draft construction will replace it.
     let _ = std::mem::size_of::<log::ConversationLog>();
     let _ = log::ConversationLog::initialize;
     let _ = log::ConversationLog::begin_load;
@@ -33,8 +32,8 @@ const _: () = {
 
 pub(crate) use load::{LoadCompatibilityValidated, close_unopened_log};
 pub(crate) use log::{
-    ConversationCloseOutcome, ConversationCommitError, ConversationCommitErrorKind,
-    ConversationLog, TimestampSource,
+    AssistantMessageDraft, ConversationCloseOutcome, ConversationCommitError,
+    ConversationCommitErrorKind, ConversationLog, TimestampSource, ToolResultDraft,
 };
 pub(crate) use view::PromptConversationProjection;
 

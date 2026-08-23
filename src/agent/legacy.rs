@@ -1,8 +1,8 @@
 #![cfg(test)]
 
-#[path = "context.rs"]
+#[path = "legacy_context.rs"]
 mod context;
-#[path = "runner.rs"]
+#[path = "legacy_runner.rs"]
 mod runner;
 
 pub(crate) use context::{
@@ -570,7 +570,7 @@ mod tests {
 
     #[test]
     fn ordinary_retry_keeps_one_request_arc_until_gateway_boundary() {
-        let source = include_str!("runner.rs");
+        let source = include_str!("legacy_runner.rs");
         assert!(source.contains("request: Arc<crate::model::ModelRequest>"));
         assert!(source.contains("Arc::clone(&request)"));
         assert!(source.contains("(*request).clone()"));

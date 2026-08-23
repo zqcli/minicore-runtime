@@ -12,7 +12,8 @@ MiniCore Runtime is an embeddable Rust 2024 single-session execution kernel. The
 - Crate-private `ModelDriver` with strict stream assembly, panic isolation, overall deadlines, cancellation, delivery-safe retry, lossy delta progress, and checked tool-call grammar.
 - Crate-private `ToolDriver` and one-shot suspension protocol with frozen-spec policy decisions, approval/input interactions, panic-safe execution, child cancellation, bounded outputs, and lossy progress.
 - Crate-private `ContextDriver` plus the final deterministic `PromptBuilder`, with one-provider deadline/panic isolation, canonical context sorting, validator-proved latest-summary conversation projection, exact frozen tools, stable context headers, and exact serialized-request output-reserved budgeting.
-- Crate-private `CompactionDriver` with conversation-owned canonical candidates, completed-boundary-only proposals, strategy deadline/panic isolation, scoped child cancellation, bounded summaries, and stale-head proof results; runner/actor wiring remains P5-E.
+- Crate-private `CompactionDriver` with conversation-owned canonical candidates, completed-boundary-only proposals, strategy deadline/panic isolation, scoped child cancellation, bounded summaries, and stale-head proof results; TurnRunner integration remains P5-E2.
+- Crate-private P5-E1 `TurnRunner` ordinary context/model/tool loop with durable rounds, exact prefix acknowledgements, shared Turn-versus-Port deadline provenance, ToolStarted-before-suspension ordering, sequential tools, and conservative usage on every outcome; compaction settlement remains P5-E2.
 - Public `SessionBindings` freezes one direct Model, ToolSet, and optional policy/context/compaction adapters, then validates them purely against `SessionSpec` and `SemanticLimits`.
 - Public process-local `SessionState`, bounded single-consumer `SessionEventStream`, and exact-turn `TurnHandle` foundations with redacted diagnostics and no snapshot/broadcast recovery protocol.
 - Public non-Clone `SessionRuntime` create/load/take-events/shutdown lifecycle with spawn-first OpenGuard cancellation, proof-gated replay/recovery, one durable log owner, and typed open/shutdown failures.
@@ -79,7 +80,7 @@ Before spawning the owner or awaiting anything, OpenGuard installs cleanup watch
 
 Core isolates host-controlled panic boundaries: Model descriptor access, SessionLog future construction/polling, and the post-ready actor loop. Those paths return typed failures and retain their defined close behavior. Arbitrary Core allocation or invariant panics after ownership transfer are not a recoverable API error boundary and may skip graceful close, as may destruction of every runtime capable of driving cleanup. Core does not claim that every possible panic is converted into a close-complete error.
 
-P4-B intentionally has no public `handle()` or command mailbox. P4-C will add the final SessionHandle and commands; P5-E will wire the completed ModelDriver, ToolDriver, ContextDriver, PromptBuilder, and CompactionDriver into the turn runner, actor commits, stale-head-checked summary commits, and terminal settlement.
+P4-B intentionally has no public `handle()` or command mailbox. P5-E1 now provides the private ordinary TurnRunner protocol and loop without compaction. P4-C will add the final SessionHandle/actor commands, and P5-E2 will integrate CompactionDriver with stale-head-checked summary commits and terminal settlement.
 
 ## Public Modules
 

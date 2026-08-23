@@ -322,7 +322,7 @@ async fn progress_is_lossy_for_accepted_full_closed_and_invalid_values() {
     let driver = driver(Arc::clone(&tool), Some(policy_port(&policy)), config());
     let (suspensions, _suspension_rx) = mpsc::channel(1);
 
-    let (progress, mut progress_rx) = mpsc::channel(1);
+    let (progress, mut progress_rx) = mpsc::channel(2);
     let result = driver
         .run(
             invocation("search", 76, json!({})),
@@ -336,12 +336,17 @@ async fn progress_is_lossy_for_accepted_full_closed_and_invalid_values() {
     assert_eq!(result.outcome, ToolResultOutcome::Success);
     assert!(matches!(
         progress_rx.try_recv(),
-        Ok(ToolDriverProgress { tool_call_id, progress })
+        Ok(ToolDriverProgress::Started { tool_call_id, tool_name })
+            if tool_call_id == call_id(76) && tool_name.as_str() == "search"
+    ));
+    assert!(matches!(
+        progress_rx.try_recv(),
+        Ok(ToolDriverProgress::Update { tool_call_id, progress })
             if tool_call_id == call_id(76) && progress == valid
     ));
 
     progress
-        .try_send(ToolDriverProgress {
+        .try_send(ToolDriverProgress::Update {
             tool_call_id: call_id(99),
             progress: valid.clone(),
         })
@@ -357,7 +362,7 @@ async fn progress_is_lossy_for_accepted_full_closed_and_invalid_values() {
         .await
         .unwrap();
     assert_outcome(&result, ToolResultOutcome::Success, "full");
-    assert_eq!(progress_rx.try_recv().unwrap().tool_call_id, call_id(99));
+    assert_eq!(progress_rx.try_recv().unwrap().tool_call_id(), &call_id(99));
 
     let (closed, closed_rx) = mpsc::channel(1);
     drop(closed_rx);
@@ -373,7 +378,7 @@ async fn progress_is_lossy_for_accepted_full_closed_and_invalid_values() {
         .unwrap();
     assert_outcome(&result, ToolResultOutcome::Success, "closed");
 
-    let (progress, mut progress_rx) = mpsc::channel(1);
+    let (progress, mut progress_rx) = mpsc::channel(2);
     let result = driver
         .run(
             invocation("search", 79, json!({})),
@@ -385,5 +390,9 @@ async fn progress_is_lossy_for_accepted_full_closed_and_invalid_values() {
         .await
         .unwrap();
     assert_outcome(&result, ToolResultOutcome::Success, "invalid");
+    assert!(matches!(
+        progress_rx.try_recv(),
+        Ok(ToolDriverProgress::Started { tool_call_id, .. }) if tool_call_id == call_id(79)
+    ));
     assert!(progress_rx.try_recv().is_err());
 }

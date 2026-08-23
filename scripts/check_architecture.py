@@ -34,6 +34,8 @@ CANONICAL_TOPS = (
 
 REQUIRED_DIRS = {
     "src/agent",
+    "src/agent/runner",
+    "src/agent/runner/tests",
     "src/compaction",
     "src/compaction/driver",
     "src/conversation",
@@ -58,10 +60,24 @@ REQUIRED_DIRS = {
 }
 
 REQUIRED_FILES = {
-    "src/agent/context.rs",
     "src/agent/legacy.rs",
+    "src/agent/legacy_context.rs",
+    "src/agent/legacy_runner.rs",
     "src/agent/mod.rs",
     "src/agent/runner.rs",
+    "src/agent/runner/diagnostics.rs",
+    "src/agent/runner/support.rs",
+    "src/agent/runner/tests.rs",
+    "src/agent/runner/tests/acknowledgements.rs",
+    "src/agent/runner/tests/control.rs",
+    "src/agent/runner/tests/deadline_provenance.rs",
+    "src/agent/runner/tests/interactions.rs",
+    "src/agent/runner/tests/model_only.rs",
+    "src/agent/runner/tests/panic.rs",
+    "src/agent/runner/tests/panic_support.rs",
+    "src/agent/runner/tests/request_validation.rs",
+    "src/agent/runner/tests/tools.rs",
+    "src/agent/runner/tests/usage_errors.rs",
     "src/agent/runner_protocol.rs",
     "src/agent/tool_driver.rs",
     "src/agent/tool_driver/support.rs",
@@ -72,6 +88,7 @@ REQUIRED_FILES = {
     "src/agent/tool_driver/tests/execution.rs",
     "src/agent/tool_driver/tests/input_progress.rs",
     "src/agent/tool_driver/tests/policy.rs",
+    "src/agent/turn_context.rs",
     "src/config.rs",
     "src/config/kernel.rs",
     "src/config/retry.rs",
@@ -109,6 +126,7 @@ REQUIRED_FILES = {
     "src/context/driver/tests.rs",
     "src/context/driver/tests/behavior.rs",
     "src/context/driver/tests/concurrency.rs",
+    "src/context/driver/tests/deadline.rs",
     "src/context/driver/tests/validation.rs",
     "src/context/provider.rs",
     "src/conversation/validator/tests.rs",
@@ -121,9 +139,11 @@ REQUIRED_FILES = {
     "src/model/legacy_registry.rs",
     "src/model/driver.rs",
     "src/model/driver/assembler.rs",
+    "src/model/driver/failure.rs",
     "src/model/driver/tests.rs",
     "src/model/driver/tests/assembly.rs",
     "src/model/driver/tests/cancellation.rs",
+    "src/model/driver/tests/deadline.rs",
     "src/model/driver/tests/preflight_progress.rs",
     "src/model/driver/tests/retry.rs",
     "src/model/driver/tests/semantics.rs",
@@ -365,10 +385,25 @@ FORBIDDEN_MANIFEST_TOKENS = ("heavy-tests", "raw_value", "arbitrary_precision")
 EXPECTED_MODULE_VISIBILITY = {
     "src/agent/mod.rs": {
         "legacy": "private",
+        "runner": "private",
         "runner_protocol": "private",
         "tool_driver": "private",
+        "turn_context": "private",
     },
     "src/agent/legacy.rs": {"context": "private", "runner": "private"},
+    "src/agent/runner.rs": {
+        "diagnostics": "private",
+        "support": "private",
+        "tests": "private",
+    },
+    "src/agent/runner/tests.rs": {
+        "control": "private",
+        "deadline_provenance": "private",
+        "interactions": "private",
+        "model_only": "private",
+        "tools": "private",
+        "usage_errors": "private",
+    },
     "src/agent/tool_driver.rs": {"support": "private", "tests": "private"},
     "src/agent/tool_driver/tests.rs": {
         "approval": "private",
@@ -405,6 +440,7 @@ EXPECTED_MODULE_VISIBILITY = {
     "src/context/driver/tests.rs": {
         "behavior": "private",
         "concurrency": "private",
+        "deadline": "private",
         "validation": "private",
     },
     "src/error.rs": {"operations": "private"},
@@ -426,10 +462,15 @@ EXPECTED_MODULE_VISIBILITY = {
         "validation_budget": "private",
     },
     "src/prompt/legacy.rs": {"builder": "private", "compaction": "private"},
-    "src/model/driver.rs": {"assembler": "private", "tests": "private"},
+    "src/model/driver.rs": {
+        "assembler": "private",
+        "failure": "private",
+        "tests": "private",
+    },
     "src/model/driver/tests.rs": {
         "assembly": "private",
         "cancellation": "private",
+        "deadline": "private",
         "preflight_progress": "private",
         "retry": "private",
         "semantics": "private",
@@ -483,6 +524,15 @@ EXPECTED_MODULE_VISIBILITY = {
 }
 
 EXPECTED_TEST_ONLY_MODULES = {
+    "src/agent/runner.rs": {"tests"},
+    "src/agent/runner/tests.rs": {
+        "control",
+        "deadline_provenance",
+        "interactions",
+        "model_only",
+        "tools",
+        "usage_errors",
+    },
     "src/conversation/view.rs": {"tests"},
     "src/conversation/view/tests.rs": {"compaction"},
     "src/compaction/driver.rs": {"tests"},
@@ -493,7 +543,7 @@ EXPECTED_TEST_ONLY_MODULES = {
         "validation",
     },
     "src/context/driver.rs": {"tests"},
-    "src/context/driver/tests.rs": {"behavior", "concurrency", "validation"},
+    "src/context/driver/tests.rs": {"behavior", "concurrency", "deadline", "validation"},
     "src/agent/mod.rs": {"legacy"},
     "src/agent/tool_driver.rs": {"tests"},
     "src/agent/tool_driver/tests.rs": {
@@ -508,6 +558,7 @@ EXPECTED_TEST_ONLY_MODULES = {
     "src/model/driver/tests.rs": {
         "assembly",
         "cancellation",
+        "deadline",
         "preflight_progress",
         "retry",
         "semantics",
@@ -618,8 +669,8 @@ def check_source_tokens(sources: Dict[str, str]) -> List[str]:
     for path in sorted(sources):
         text = sources[path]
         allowed_model_port = '#[path = "model.rs"]\nmod model_port;'
-        allowed_legacy_context = '#[path = "context.rs"]\nmod context;'
-        allowed_legacy_runner = '#[path = "runner.rs"]\nmod runner;'
+        allowed_legacy_context = '#[path = "legacy_context.rs"]\nmod context;'
+        allowed_legacy_runner = '#[path = "legacy_runner.rs"]\nmod runner;'
         allowed_prompt_builder = '#[path = "legacy_builder.rs"]\nmod builder;'
         allowed_prompt_compaction = '#[path = "legacy_compaction.rs"]\nmod compaction;'
         if "#[path" in text and not (
@@ -1550,8 +1601,8 @@ def check_sizes_and_graph(
             f"  {count:6d} {path}"
             for path, count in sorted(file_counts.items(), key=lambda item: (-item[1], item[0]))
         )
-    if source_total > 40_000:
-        errors.append(f"src Rust total exceeds 40,000 lines: {source_total}")
+    if source_total > 44_000:
+        errors.append(f"src Rust total exceeds 44,000 lines: {source_total}")
     if production_total > 25_000:
         errors.append(f"production Rust total exceeds 25,000 lines: {production_total}")
 

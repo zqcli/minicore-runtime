@@ -25,6 +25,8 @@ mod assembly;
 #[cfg(test)]
 mod cancellation;
 #[cfg(test)]
+mod deadline;
+#[cfg(test)]
 mod preflight_progress;
 #[cfg(test)]
 mod retry;

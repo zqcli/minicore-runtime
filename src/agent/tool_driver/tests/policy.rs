@@ -30,7 +30,7 @@ async fn policy_construction_poll_error_and_invalid_decisions_are_safe_denials()
         );
         let policy = ScriptPolicy::new(vec![behavior]);
         let driver = driver(Arc::clone(&tool), Some(policy_port(&policy)), config());
-        let (suspensions, mut suspension_rx, progress, _progress_rx) = channels();
+        let (suspensions, mut suspension_rx, progress, mut progress_rx) = channels();
         let result = driver
             .run(
                 invocation("search", 20 + index as u8, json!({})),
@@ -45,6 +45,7 @@ async fn policy_construction_poll_error_and_invalid_decisions_are_safe_denials()
         assert_outcome(&result, ToolResultOutcome::Denied, "tool denied");
         assert_eq!(tool.calls(), 0);
         assert!(suspension_rx.try_recv().is_err());
+        assert!(progress_rx.try_recv().is_err());
     }
 }
 
@@ -78,7 +79,7 @@ async fn cancellation_before_policy_call_is_cancelled_without_invocation() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn expired_policy_deadline_denies_without_calling_policy() {
+async fn expired_turn_deadline_is_control_failure_without_calling_policy() {
     let tool = ScriptTool::new("search", Vec::new());
     let policy = allow_policy();
     let driver = driver(Arc::clone(&tool), Some(policy_port(&policy)), config());
@@ -91,16 +92,15 @@ async fn expired_policy_deadline_denies_without_calling_policy() {
             &suspensions,
             &progress,
         )
-        .await
-        .unwrap();
+        .await;
 
-    assert_outcome(&result, ToolResultOutcome::Denied, "tool denied");
+    assert_eq!(result, Err(SuspensionError::DeadlineExceeded));
     assert_eq!(policy.calls(), 0);
     assert_eq!(tool.calls(), 0);
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn policy_timeout_cancels_child_before_drop_and_denies() {
+async fn configured_policy_timeout_cancels_child_before_drop_and_denies() {
     let probe = OperationProbe::shared();
     let tool = ScriptTool::new("search", Vec::new());
     let policy = ScriptPolicy::new(vec![PolicyBehavior::Pending(Arc::clone(&probe))]);
@@ -122,6 +122,41 @@ async fn policy_timeout_cancels_child_before_drop_and_denies() {
     let result = run.await.unwrap().unwrap();
 
     assert_outcome(&result, ToolResultOutcome::Denied, "tool denied");
+    assert!(probe.dropped.load(Ordering::SeqCst));
+    assert!(probe.cancelled_before_drop.load(Ordering::SeqCst));
+    assert_eq!(tool.calls(), 0);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn earlier_turn_deadline_during_policy_is_exact_control_failure() {
+    let probe = OperationProbe::shared();
+    let tool = ScriptTool::new("search", Vec::new());
+    let policy = ScriptPolicy::new(vec![PolicyBehavior::Pending(Arc::clone(&probe))]);
+    let driver = driver(
+        Arc::clone(&tool),
+        Some(policy_port(&policy)),
+        config_with(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            MAX_JSON_BYTES,
+            BoundedText::MAX_BYTES,
+        ),
+    );
+    let (suspensions, _suspension_rx, progress, _progress_rx) = channels();
+    let run = tokio::spawn(async move {
+        driver
+            .run(
+                invocation("search", 34, json!({})),
+                deadline_after(Duration::from_secs(4)),
+                CancellationToken::new(),
+                &suspensions,
+                &progress,
+            )
+            .await
+    });
+    probe.wait_polled().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(run.await.unwrap(), Err(SuspensionError::DeadlineExceeded));
     assert!(probe.dropped.load(Ordering::SeqCst));
     assert!(probe.cancelled_before_drop.load(Ordering::SeqCst));
     assert_eq!(tool.calls(), 0);

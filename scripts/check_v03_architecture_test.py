@@ -57,6 +57,9 @@ def make_fixture(root: Path) -> None:
     (root / "src/agent/tool_driver.rs").write_text(
         "pub(crate) const _TOOL_DRIVER: () = ();\n", encoding="utf-8"
     )
+    (root / "src/agent/runner.rs").write_text(
+        "pub(crate) const _TURN_RUNNER: () = ();\n", encoding="utf-8"
+    )
     (root / "src/context/driver.rs").write_text(
         "pub(crate) const _CONTEXT_DRIVER: () = ();\n", encoding="utf-8"
     )
@@ -104,6 +107,7 @@ def self_test() -> None:
             ("adapter", "forbidden production storage implementation", lambda root: (root / "src/storage/conversation_jsonl.rs").write_text("", encoding="utf-8")),
             ("model-missing-driver-role", "missing required production role: model driver", lambda root: (root / "src/model/driver.rs").unlink()),
             ("agent-missing-tool-driver-role", "missing required production role: tool driver", lambda root: (root / "src/agent/tool_driver.rs").unlink()),
+            ("agent-missing-turn-runner-role", "missing required production role: turn runner", lambda root: (root / "src/agent/runner.rs").unlink()),
             ("context-missing-driver-role", "missing required production role: context driver", lambda root: (root / "src/context/driver.rs").unlink()),
             ("compaction-missing-driver-role", "missing required production role: compaction driver", lambda root: (root / "src/compaction/driver.rs").unlink()),
             ("prompt-missing-builder-role", "missing required production role: prompt builder", lambda root: (root / "src/prompt/builder.rs").unlink()),
