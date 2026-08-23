@@ -5,7 +5,6 @@ fn canonical_modules_keep_only_the_current_root_facade() {
         "pub mod config;",
         "pub mod conversation;",
         "pub mod error;",
-        "pub mod event;",
         "pub mod ids;",
         "pub mod model;",
         "pub mod session;",
@@ -23,6 +22,8 @@ fn canonical_modules_keep_only_the_current_root_facade() {
     assert!(lib.contains("mod prompt;"));
     assert!(lib.contains("pub mod compaction;"));
     assert!(lib.contains("pub mod context;"));
+    assert!(!lib.contains("pub mod event;"));
+    assert!(!lib.contains("SessionEventKind"));
     assert!(!lib.contains("pub mod runtime;"));
     assert!(!lib.contains("pub mod workspace;"));
     assert!(!lib.contains("pub use workspace"));

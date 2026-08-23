@@ -1,3 +1,5 @@
+// P4-B/P5 deletion target: remove after final SessionState actor wiring.
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -7,7 +9,7 @@ use crate::model::Usage;
 use crate::tools::LegacyUserQuestion;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum SnapshotShapeError {
+pub(crate) enum LegacySnapshotShapeError {
     #[error("idle session snapshot cannot have an active turn")]
     IdleHasActiveTurn,
     #[error("idle session snapshot cannot have a pending question")]
@@ -29,11 +31,11 @@ pub enum SnapshotShapeError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TurnSummary {
+pub(crate) struct LegacyTurnSummary {
     pub turn_id: TurnId,
 }
 
-impl TurnSummary {
+impl LegacyTurnSummary {
     pub const fn new(turn_id: TurnId) -> Self {
         Self { turn_id }
     }
@@ -41,46 +43,42 @@ impl TurnSummary {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", content = "data", rename_all = "snake_case")]
-pub enum TurnOutcome {
+pub(crate) enum LegacyTurnOutcome {
     Completed,
     Cancelled,
     Failed { error: PublicErrorSummary },
 }
 
-pub type TerminalOutcome = TurnOutcome;
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TurnTerminal {
+pub(crate) struct LegacyTurnTerminal {
     pub turn_id: TurnId,
-    pub outcome: TurnOutcome,
+    pub outcome: LegacyTurnOutcome,
 }
 
-impl TurnTerminal {
-    pub const fn new(turn_id: TurnId, outcome: TurnOutcome) -> Self {
+impl LegacyTurnTerminal {
+    pub const fn new(turn_id: TurnId, outcome: LegacyTurnOutcome) -> Self {
         Self { turn_id, outcome }
     }
 
     pub const fn completed(turn_id: TurnId) -> Self {
-        Self::new(turn_id, TurnOutcome::Completed)
+        Self::new(turn_id, LegacyTurnOutcome::Completed)
     }
 
     pub const fn cancelled(turn_id: TurnId) -> Self {
-        Self::new(turn_id, TurnOutcome::Cancelled)
+        Self::new(turn_id, LegacyTurnOutcome::Cancelled)
     }
 }
 
-pub type TurnTerminalSummary = TurnTerminal;
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotHistory {
+pub(crate) struct LegacySnapshotHistory {
     pub last_error: Option<PublicErrorSummary>,
-    pub last_terminal: Option<TurnTerminal>,
+    pub last_terminal: Option<LegacyTurnTerminal>,
 }
 
-impl SnapshotHistory {
+impl LegacySnapshotHistory {
     pub const fn new(
         last_error: Option<PublicErrorSummary>,
-        last_terminal: Option<TurnTerminal>,
+        last_terminal: Option<LegacyTurnTerminal>,
     ) -> Self {
         Self {
             last_error,
@@ -90,39 +88,39 @@ impl SnapshotHistory {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct SessionSnapshot {
+pub(crate) struct LegacySessionSnapshot {
     session_id: SessionId,
-    status: super::state::SessionStatus,
-    active_turn: Option<TurnSummary>,
+    status: super::legacy_state::LegacySessionStatus,
+    active_turn: Option<LegacyTurnSummary>,
     pending_question: Option<LegacyUserQuestion>,
     usage: Usage,
     last_error: Option<PublicErrorSummary>,
-    last_terminal: Option<TurnTerminal>,
+    last_terminal: Option<LegacyTurnTerminal>,
     conversation_seq: u64,
 }
 
 #[derive(Deserialize)]
-struct SessionSnapshotWire {
+struct LegacySessionSnapshotWire {
     session_id: SessionId,
-    status: super::state::SessionStatus,
-    active_turn: Option<TurnSummary>,
+    status: super::legacy_state::LegacySessionStatus,
+    active_turn: Option<LegacyTurnSummary>,
     pending_question: Option<LegacyUserQuestion>,
     usage: Usage,
     last_error: Option<PublicErrorSummary>,
-    last_terminal: Option<TurnTerminal>,
+    last_terminal: Option<LegacyTurnTerminal>,
     conversation_seq: u64,
 }
 
-impl SessionSnapshot {
+impl LegacySessionSnapshot {
     pub fn new(
         session_id: SessionId,
-        status: super::state::SessionStatus,
-        active_turn: Option<TurnSummary>,
+        status: super::legacy_state::LegacySessionStatus,
+        active_turn: Option<LegacyTurnSummary>,
         pending_question: Option<LegacyUserQuestion>,
         usage: Usage,
-        history: SnapshotHistory,
+        history: LegacySnapshotHistory,
         conversation_seq: u64,
-    ) -> Result<Self, SnapshotShapeError> {
+    ) -> Result<Self, LegacySnapshotShapeError> {
         let snapshot = Self {
             session_id,
             status,
@@ -137,47 +135,47 @@ impl SessionSnapshot {
         Ok(snapshot)
     }
 
-    pub fn validate(&self) -> Result<(), SnapshotShapeError> {
+    pub fn validate(&self) -> Result<(), LegacySnapshotShapeError> {
         match self.status {
-            super::state::SessionStatus::Idle => {
+            super::legacy_state::LegacySessionStatus::Idle => {
                 if self.active_turn.is_some() {
-                    return Err(SnapshotShapeError::IdleHasActiveTurn);
+                    return Err(LegacySnapshotShapeError::IdleHasActiveTurn);
                 }
                 if self.pending_question.is_some() {
-                    return Err(SnapshotShapeError::IdleHasPendingQuestion);
+                    return Err(LegacySnapshotShapeError::IdleHasPendingQuestion);
                 }
             }
-            super::state::SessionStatus::Running { turn_id } => {
+            super::legacy_state::LegacySessionStatus::Running { turn_id } => {
                 let Some(active_turn) = self.active_turn else {
-                    return Err(SnapshotShapeError::RunningMissingActiveTurn);
+                    return Err(LegacySnapshotShapeError::RunningMissingActiveTurn);
                 };
                 if active_turn.turn_id != turn_id {
-                    return Err(SnapshotShapeError::ActiveTurnMismatch);
+                    return Err(LegacySnapshotShapeError::ActiveTurnMismatch);
                 }
                 if self.pending_question.is_some() {
-                    return Err(SnapshotShapeError::RunningHasPendingQuestion);
+                    return Err(LegacySnapshotShapeError::RunningHasPendingQuestion);
                 }
             }
-            super::state::SessionStatus::WaitingForInput {
+            super::legacy_state::LegacySessionStatus::WaitingForInput {
                 turn_id,
                 interaction_id,
             } => {
                 let Some(active_turn) = self.active_turn else {
-                    return Err(SnapshotShapeError::WaitingMissingActiveTurn);
+                    return Err(LegacySnapshotShapeError::WaitingMissingActiveTurn);
                 };
                 if active_turn.turn_id != turn_id {
-                    return Err(SnapshotShapeError::ActiveTurnMismatch);
+                    return Err(LegacySnapshotShapeError::ActiveTurnMismatch);
                 }
                 let Some(question) = self.pending_question.as_ref() else {
-                    return Err(SnapshotShapeError::WaitingMissingQuestion);
+                    return Err(LegacySnapshotShapeError::WaitingMissingQuestion);
                 };
                 if question.interaction_id() != interaction_id {
-                    return Err(SnapshotShapeError::WaitingQuestionMismatch);
+                    return Err(LegacySnapshotShapeError::WaitingQuestionMismatch);
                 }
             }
-            super::state::SessionStatus::Closing => {
+            super::legacy_state::LegacySessionStatus::Closing => {
                 if self.pending_question.is_some() {
-                    return Err(SnapshotShapeError::ClosingHasPendingQuestion);
+                    return Err(LegacySnapshotShapeError::ClosingHasPendingQuestion);
                 }
             }
         }
@@ -188,11 +186,11 @@ impl SessionSnapshot {
         self.session_id
     }
 
-    pub const fn status(&self) -> super::state::SessionStatus {
+    pub const fn status(&self) -> super::legacy_state::LegacySessionStatus {
         self.status
     }
 
-    pub const fn active_turn(&self) -> Option<&TurnSummary> {
+    pub const fn active_turn(&self) -> Option<&LegacyTurnSummary> {
         self.active_turn.as_ref()
     }
 
@@ -204,7 +202,7 @@ impl SessionSnapshot {
         self.last_error.as_ref()
     }
 
-    pub const fn last_terminal(&self) -> Option<&TurnTerminal> {
+    pub const fn last_terminal(&self) -> Option<&LegacyTurnTerminal> {
         self.last_terminal.as_ref()
     }
 
@@ -214,25 +212,25 @@ impl SessionSnapshot {
 }
 
 #[cfg(test)]
-impl SessionSnapshot {
+impl LegacySessionSnapshot {
     pub(crate) const fn usage(&self) -> &Usage {
         &self.usage
     }
 }
 
-impl<'de> Deserialize<'de> for SessionSnapshot {
+impl<'de> Deserialize<'de> for LegacySessionSnapshot {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let value = SessionSnapshotWire::deserialize(deserializer)?;
+        let value = LegacySessionSnapshotWire::deserialize(deserializer)?;
         Self::new(
             value.session_id,
             value.status,
             value.active_turn,
             value.pending_question,
             value.usage,
-            SnapshotHistory::new(value.last_error, value.last_terminal),
+            LegacySnapshotHistory::new(value.last_error, value.last_terminal),
             value.conversation_seq,
         )
         .map_err(serde::de::Error::custom)
@@ -241,17 +239,15 @@ impl<'de> Deserialize<'de> for SessionSnapshot {
 
 const _: () = {
     // P6 deletion target: remove with the legacy session snapshot surface.
-    let _ = std::mem::size_of::<TerminalOutcome>();
-    let _ = std::mem::size_of::<TurnTerminalSummary>();
-    let _: fn(TurnId) -> TurnTerminal = TurnTerminal::completed;
-    let _: fn(&SessionSnapshot) -> SessionId = SessionSnapshot::session_id;
-    let _: for<'a> fn(&'a SessionSnapshot) -> Option<&'a TurnSummary> =
-        SessionSnapshot::active_turn;
-    let _: for<'a> fn(&'a SessionSnapshot) -> Option<&'a LegacyUserQuestion> =
-        SessionSnapshot::pending_question;
-    let _: for<'a> fn(&'a SessionSnapshot) -> Option<&'a PublicErrorSummary> =
-        SessionSnapshot::last_error;
-    let _: for<'a> fn(&'a SessionSnapshot) -> Option<&'a TurnTerminal> =
-        SessionSnapshot::last_terminal;
-    let _: fn(&SessionSnapshot) -> u64 = SessionSnapshot::conversation_seq;
+    let _: fn(TurnId) -> LegacyTurnTerminal = LegacyTurnTerminal::completed;
+    let _: fn(&LegacySessionSnapshot) -> SessionId = LegacySessionSnapshot::session_id;
+    let _: for<'a> fn(&'a LegacySessionSnapshot) -> Option<&'a LegacyTurnSummary> =
+        LegacySessionSnapshot::active_turn;
+    let _: for<'a> fn(&'a LegacySessionSnapshot) -> Option<&'a LegacyUserQuestion> =
+        LegacySessionSnapshot::pending_question;
+    let _: for<'a> fn(&'a LegacySessionSnapshot) -> Option<&'a PublicErrorSummary> =
+        LegacySessionSnapshot::last_error;
+    let _: for<'a> fn(&'a LegacySessionSnapshot) -> Option<&'a LegacyTurnTerminal> =
+        LegacySessionSnapshot::last_terminal;
+    let _: fn(&LegacySessionSnapshot) -> u64 = LegacySessionSnapshot::conversation_seq;
 };

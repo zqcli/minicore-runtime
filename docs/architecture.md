@@ -28,6 +28,14 @@ The public Tool seam is host-neutral. A Tool receives a checked `ToolInvocation`
 
 Validation is pure and does not invoke adapter futures. The only adapter call is `Model::descriptor`, cloned inside `catch_unwind`; a panic becomes the payload-free `ModelPanicked` error. Validation then checks limits/specs, descriptor integrity and compatibility, enabled tool support/policy/registration, all frozen ToolSpec semantic budgets, and compaction strategy presence. Disabled compaction permits a strategy without invoking it, and optional context is never invoked.
 
+## State, Event, And Turn Foundation
+
+`session::SessionState` replaces the final heavy snapshot concept with one process-local current-state value. `SessionStatus` is exactly Idle, Running, WaitingForInput, or Closing. Validation centralizes active-turn/pending-interaction shape and prevents an active Turn from also being the latest durable terminal. `SessionHealth::Degraded` carries a checked `DiagnosticSummary`; its Debug reports message bytes rather than message content.
+
+`session::SessionEventStream` owns one bounded mpsc receiver. It has no Clone, snapshot, subscribe, broadcast, cursor, revision, epoch, gap, or resync interface. The crate-private `InternalEventSink` uses `try_send`; full queues increment a saturating loss count, and a later event first attempts an `EventsDropped` marker. State and TurnHandle remain authoritative when best-effort events are lost.
+
+`session::TurnHandle` contains only stable identities plus shared cancellation/completion state. One mutex orders cancel and completion, cancellation tokens carry only the exact-Turn signal, and Notify wakes all waiters after first-wins settlement. Successful wait results contain the confirmed durable `conversation::TurnTerminal` and Usage. Unknown/unavailable durability and actor termination remain typed diagnostic errors.
+
 ## Checked DTOs
 
 `ToolInvocation` accepts only bounded object-shaped JSON arguments and redacts arguments from `Debug`. `ToolSpec` exposes the exact public fields `name`, `description`, and `input_schema`, while its constructor and strict unknown-field deserializer enforce their bounds. Public `ToolOutput` contains only `content: BoundedText`, serializes as `{ "content": "..." }`, and never exposes a failure-status bit.
@@ -52,7 +60,9 @@ The current private runner still consumes batch `ModelResponse` through `LegacyM
 
 ## Legacy Boundary
 
-The old actor/runner/storage path uses private `LegacyTool`, `LegacyToolContext`, and `legacy_types` DTOs. `LegacyToolOutput` deliberately preserves the old `{ "text": ..., "is_error": ... }` JSON shape. Prompt-facing `ModelMessage::Tool` uses only public `ToolOutput` plus `ToolResultOutcome`; the crate-private conversion maps the legacy status bit before provider encoding, while physical conversation entries retain the legacy DTO.
+The old actor/runner/storage path uses private `LegacyTool`, `LegacyToolContext`, and `legacy_types` DTOs. `LegacyToolOutput` deliberately preserves the old `{ "text": ..., "is_error": ... }` JSON shape. Prompt-facing `ModelMessage::Tool` uses only public `ToolOutput` plus `ToolResultOutcome`; the crate-private conversion maps the legacy status bit before provider encoding, while physical conversation entries retain the old DTO.
+
+The old actor still uses `legacy_state.rs`, `legacy_event.rs`, `legacy_event_stream.rs`, and `legacy_snapshot.rs`. Their types are explicitly `Legacy*`, crate-private, and not reexported. Broadcast, first-snapshot delivery, resync, and legacy terminal DTO behavior remain there only until P4-B/P5 rewires the actor to the final foundation.
 
 `legacy_context.rs`, `legacy_policy.rs`, `legacy_types.rs`, and `registry.rs` are staged private migration files. `legacy_policy.rs` retains the synchronous string-based decision flow only for the old runner and is marked for P5/P6 deletion. Final `policy.rs` is the public typed Port and is part of the canonical Tool seam.
 
@@ -62,7 +72,7 @@ The old `runtime` and `workspace` modules are private in `src/lib.rs`; `Runtime`
 
 Concrete filesystem/process adapters and their tests were deleted in P3-B rather than replaced with defaults. Future concrete tools must be host-owned implementations of the public `Tool` Port, not reintroduced builtins or process policy modules.
 
-P4/P5 will introduce the SessionRuntime owner and its acceptance contract. P4 must validate bindings against the loaded manifest before constructing `LoadCompatibilityValidated` and finishing replay. P3-E does not expose that proof or wire the transitional actor.
+P4-B/P5 will introduce the SessionRuntime owner and wire the final actor contract. P4 must validate bindings against the loaded manifest before constructing `LoadCompatibilityValidated` and finishing replay. P4-A does not expose that proof or connect final handles/events to the transitional actor.
 
 ## Model Retry
 

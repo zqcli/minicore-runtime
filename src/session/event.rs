@@ -1,62 +1,87 @@
-use serde::{Deserialize, Serialize};
+use crate::ids::{InteractionId, SessionId, SessionInstanceId, ToolCallId, TurnId};
+use crate::model::Usage;
+use crate::tools::{ToolName, ToolProgress, ToolResultOutcome};
+use crate::value::BoundedText;
 
-use crate::event::SessionEventKind;
-use crate::ids::TurnId;
-use crate::tools::{LegacyToolCallSummary, LegacyToolResultSummary, LegacyUserQuestion};
+use super::interaction::PendingInteraction;
+use super::state::SessionHealth;
+use super::turn_handle::TurnOutcome;
 
-use super::snapshot::{SessionSnapshot, TurnOutcome};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputChannel {
+    Text,
+    Reasoning,
+}
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub(crate) enum SessionEvent {
-    Snapshot(SessionSnapshot),
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolResultSummary {
+    pub outcome: ToolResultOutcome,
+    pub content_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InteractionResolutionSummary {
+    Approved,
+    Denied,
+    InputProvided,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionEvent {
     TurnStarted {
         turn_id: TurnId,
     },
-    TextDelta {
+    ModelStarted {
         turn_id: TurnId,
-        delta: String,
+        round: u16,
     },
-    ReasoningDelta {
+    OutputDelta {
         turn_id: TurnId,
-        delta: String,
+        channel: OutputChannel,
+        delta: BoundedText,
+    },
+    ModelFinished {
+        turn_id: TurnId,
+        round: u16,
+        usage: Usage,
     },
     ToolStarted {
         turn_id: TurnId,
-        call: LegacyToolCallSummary,
+        tool_call_id: ToolCallId,
+        tool_name: ToolName,
+    },
+    ToolProgress {
+        turn_id: TurnId,
+        tool_call_id: ToolCallId,
+        progress: ToolProgress,
     },
     ToolFinished {
         turn_id: TurnId,
-        result: LegacyToolResultSummary,
+        tool_call_id: ToolCallId,
+        result: ToolResultSummary,
     },
-    InputRequested {
-        turn_id: TurnId,
-        question: LegacyUserQuestion,
+    InteractionRequested {
+        interaction: PendingInteraction,
+    },
+    InteractionResolved {
+        interaction_id: InteractionId,
+        resolution: InteractionResolutionSummary,
+    },
+    HealthChanged {
+        health: SessionHealth,
     },
     TurnFinished {
         turn_id: TurnId,
         outcome: TurnOutcome,
     },
-    ResyncRequired,
-    Closed,
+    EventsDropped {
+        count: u64,
+    },
 }
 
-impl SessionEvent {
-    pub(crate) const fn kind(&self) -> SessionEventKind {
-        match self {
-            Self::Snapshot(_) => SessionEventKind::Snapshot,
-            Self::TurnStarted { .. } => SessionEventKind::TurnStarted,
-            Self::TextDelta { .. } => SessionEventKind::TextDelta,
-            Self::ReasoningDelta { .. } => SessionEventKind::ReasoningDelta,
-            Self::ToolStarted { .. } => SessionEventKind::ToolStarted,
-            Self::ToolFinished { .. } => SessionEventKind::ToolFinished,
-            Self::InputRequested { .. } => SessionEventKind::InputRequested,
-            Self::TurnFinished { .. } => SessionEventKind::TurnFinished,
-            Self::ResyncRequired => SessionEventKind::ResyncRequired,
-            Self::Closed => SessionEventKind::Closed,
-        }
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionEventEnvelope {
+    pub session_id: SessionId,
+    pub instance_id: SessionInstanceId,
+    pub event: SessionEvent,
 }
-
-// P6 deletion target: remove with the legacy session event surface.
-const _: for<'a> fn(&'a SessionEvent) -> SessionEventKind = SessionEvent::kind;

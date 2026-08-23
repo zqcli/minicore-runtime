@@ -4,7 +4,6 @@ pub mod config;
 pub mod context;
 pub mod conversation;
 pub mod error;
-pub mod event;
 pub mod ids;
 pub mod model;
 mod prompt;
@@ -22,10 +21,13 @@ pub use config::{
 };
 pub use conversation::{ConversationEntry, ConversationSeq, TranscriptPage, TurnTerminal};
 pub use error::{PublicErrorCode, PublicErrorSummary};
-pub use event::SessionEventKind;
 pub use ids::{
     IdError, InteractionId, SessionId, SessionInstanceId, ToolCallId, ToolCallIdError, TurnId,
 };
-pub use session::SessionBindings;
+pub use session::{
+    InteractionAnswer, InteractionKind, PendingInteraction, SessionBindings, SessionEvent,
+    SessionEventEnvelope, SessionEventStream, SessionHealth, SessionState, SessionStatus,
+    TurnHandle, TurnOutcome,
+};
 pub use storage::{AppendReceipt, ConversationPage, SessionLog, SessionLogError};
 pub use value::BoundedText;
