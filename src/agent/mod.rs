@@ -56,9 +56,10 @@ mod tests {
         StoredSessionConfig,
     };
     use crate::time::{Timestamp, TimestampError};
+    use crate::tools::registry::{LegacyToolFuture, ToolRegistry};
     use crate::tools::{
-        AllowConfiguredTools, InteractionClient, InteractionReceiver, Tool, ToolContext,
-        ToolDecision, ToolError, ToolFuture, ToolName, ToolOutput, ToolPolicy, ToolRegistry,
+        AllowConfiguredTools, InteractionClient, InteractionReceiver, LegacyTool,
+        LegacyToolContext, LegacyToolError, LegacyToolOutput, ToolDecision, ToolName, ToolPolicy,
         ToolSpec,
     };
     use crate::workspace::{Workspace, WorkspaceAccess};
@@ -423,12 +424,16 @@ mod tests {
         }
     }
 
-    impl Tool for TestTool {
+    impl LegacyTool for TestTool {
         fn spec(&self) -> ToolSpec {
             self.spec.clone()
         }
 
-        fn execute<'a>(&'a self, _ctx: ToolContext<'a>, _args: Value) -> ToolFuture<'a> {
+        fn execute<'a>(
+            &'a self,
+            _ctx: LegacyToolContext<'a>,
+            _args: Value,
+        ) -> LegacyToolFuture<'a> {
             self.order
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -441,17 +446,18 @@ mod tests {
             }
             match &self.behavior {
                 ToolBehavior::Success(text) => {
-                    let output = ToolOutput::success(text.clone()).unwrap();
+                    let output = LegacyToolOutput::success(text.clone()).unwrap();
                     Box::pin(async move { Ok(output) })
                 }
                 ToolBehavior::Failure(text) => {
-                    let output = ToolOutput::failure(text.clone()).unwrap();
+                    let output = LegacyToolOutput::failure(text.clone()).unwrap();
                     Box::pin(async move { Ok(output) })
                 }
-                ToolBehavior::Error => Box::pin(async { Err(ToolError::Internal) }),
+                ToolBehavior::Error => Box::pin(async { Err(LegacyToolError::Internal) }),
                 ToolBehavior::CancelThenSuccess(token) => {
                     let token = token.clone();
-                    let output = ToolOutput::success("completed before cancellation").unwrap();
+                    let output =
+                        LegacyToolOutput::success("completed before cancellation").unwrap();
                     Box::pin(async move {
                         token.cancel();
                         Ok(output)
@@ -604,7 +610,7 @@ mod tests {
             )),
             Err(RunnerEventSendError::InvalidEvent)
         ));
-        let call = crate::tools::ToolCallSummary::new(
+        let call = crate::tools::LegacyToolCallSummary::new(
             crate::ids::ToolCallId::new("call").unwrap(),
             "tool".parse().unwrap(),
             0,
@@ -637,9 +643,9 @@ mod tests {
         drop(receiver);
         assert_eq!(
             sink.try_publish_tool(RunnerEvent::ToolFinished(
-                crate::tools::ToolResultSummary::new(
+                crate::tools::LegacyToolResultSummary::new(
                     crate::ids::ToolCallId::new("call").unwrap(),
-                    crate::tools::ToolResultStatus::Failed,
+                    crate::tools::LegacyToolResultStatus::Failed,
                 )
                 .unwrap(),
             )),
@@ -858,7 +864,7 @@ mod tests {
             Some(["yes".to_owned(), "no".to_owned()].as_slice())
         );
         request
-            .respond(crate::tools::UserAnswer::new("ALLOW").unwrap())
+            .respond(crate::tools::LegacyUserAnswer::new("ALLOW").unwrap())
             .unwrap();
         assert!(matches!(task.await, TurnTaskResult::Completed { .. }));
         assert_eq!(
@@ -992,7 +998,7 @@ mod tests {
         assert!(matches!(
             second,
             RunnerEvent::ToolFinished(ref summary)
-                if summary.status() == crate::tools::ToolResultStatus::Failed
+                if summary.status() == crate::tools::LegacyToolResultStatus::Failed
         ));
         let snapshot = harness.log.snapshot().await;
         let result = serde_json::to_value(&*snapshot.entries()[2]).unwrap();

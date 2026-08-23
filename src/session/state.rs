@@ -28,3 +28,9 @@ impl SessionStatus {
         matches!(self, Self::Idle)
     }
 }
+
+const _: () = {
+    // P6 deletion target: remove with the legacy session status surface.
+    let _: fn(SessionStatus) -> Option<TurnId> = SessionStatus::turn_id;
+    let _: fn(SessionStatus) -> bool = SessionStatus::is_idle;
+};

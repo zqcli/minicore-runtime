@@ -12,23 +12,24 @@ use crate::config::{RetryPolicy, RuntimeConfig, SessionConfig};
 use crate::error::{RuntimeError, SessionError};
 use crate::ids::{InteractionId, SessionId, TurnId};
 use crate::model::{ModelGateway, ModelSelection, ReasoningPreference};
-use crate::session::SessionSnapshot;
 use crate::session::actor::{SessionActor, SessionActorDependencies};
 use crate::session::event_stream::SessionEventStream;
+use crate::session::snapshot::SessionSnapshot;
 use crate::session::transcript::TranscriptPage;
 use crate::storage::conversation::{ConversationError, ConversationLog};
 use crate::storage::store::{SessionStore, StoreError, StoredSessionConfig};
 use crate::time::Timestamp;
-use crate::tools::{AllowConfiguredTools, ToolName, ToolPolicy, ToolRegistry, UserAnswer};
+use crate::tools::registry::ToolRegistry;
+use crate::tools::{AllowConfiguredTools, LegacyUserAnswer, ToolName, ToolPolicy};
 use crate::workspace::{Workspace, WorkspaceAccess, WorkspaceError};
 
 use super::session_manager::{JoinOnce, LoadedSessionId, ManagedSession, SessionManager};
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-pub struct SessionSummary {
-    pub session_id: SessionId,
-    pub model: ModelSelection,
-    pub loaded: bool,
+pub(crate) struct SessionSummary {
+    pub(crate) session_id: SessionId,
+    pub(crate) model: ModelSelection,
+    pub(crate) loaded: bool,
 }
 
 /// A typed P7 runtime owner.
@@ -36,7 +37,7 @@ pub struct SessionSummary {
 /// Call [`Runtime::shutdown`] explicitly to observe cleanup. Dropping the last
 /// clone starts the same asynchronous shutdown path and retains active actor or
 /// shutdown owners when needed.
-pub struct Runtime {
+pub(crate) struct Runtime {
     inner: Arc<RuntimeInner>,
 }
 
@@ -64,7 +65,7 @@ impl fmt::Debug for Runtime {
 }
 
 impl Runtime {
-    pub async fn open(config: RuntimeConfig, runtime: Handle) -> Result<Self, RuntimeError> {
+    pub(crate) async fn open(config: RuntimeConfig, runtime: Handle) -> Result<Self, RuntimeError> {
         let store = SessionStore::open(config.data_dir().to_owned())
             .await
             .map_err(map_open_error)?;
@@ -88,7 +89,10 @@ impl Runtime {
         })
     }
 
-    pub async fn create_session(&self, config: SessionConfig) -> Result<SessionId, SessionError> {
+    pub(crate) async fn create_session(
+        &self,
+        config: SessionConfig,
+    ) -> Result<SessionId, SessionError> {
         if self.inner.closing.is_cancelled() {
             return Err(SessionError::Closing);
         }
@@ -112,7 +116,7 @@ impl Runtime {
         Ok(id)
     }
 
-    pub async fn load_session(&self, id: SessionId) -> Result<(), SessionError> {
+    pub(crate) async fn load_session(&self, id: SessionId) -> Result<(), SessionError> {
         let mut reservation = self.inner.manager.begin_load(id)?;
         let managed = self
             .prepare_session(id, reservation.loaded_session_id())
@@ -123,7 +127,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn close_session(&self, id: SessionId) -> Result<(), SessionError> {
+    pub(crate) async fn close_session(&self, id: SessionId) -> Result<(), SessionError> {
         let Some(session) = self.inner.manager.get(id) else {
             return Err(SessionError::NotFound);
         };
@@ -132,7 +136,7 @@ impl Runtime {
         result
     }
 
-    pub async fn delete_session(&self, id: SessionId) -> Result<(), SessionError> {
+    pub(crate) async fn delete_session(&self, id: SessionId) -> Result<(), SessionError> {
         let reservation = match self.inner.manager.begin_load(id) {
             Ok(reservation) => reservation,
             Err(SessionError::AlreadyLoaded) => return Err(SessionError::Busy),
@@ -148,7 +152,7 @@ impl Runtime {
         result
     }
 
-    pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, SessionError> {
+    pub(crate) async fn list_sessions(&self) -> Result<Vec<SessionSummary>, SessionError> {
         if self.inner.closing.is_cancelled() || self.inner.manager.is_closing() {
             return Err(SessionError::Closing);
         }
@@ -182,32 +186,36 @@ impl Runtime {
         Ok(summaries)
     }
 
-    pub async fn submit(&self, id: SessionId, input: String) -> Result<TurnId, SessionError> {
+    pub(crate) async fn submit(
+        &self,
+        id: SessionId,
+        input: String,
+    ) -> Result<TurnId, SessionError> {
         self.loaded(id)?.handle.submit(input).await
     }
 
-    pub async fn answer(
+    pub(crate) async fn answer(
         &self,
         id: SessionId,
         interaction_id: InteractionId,
-        answer: UserAnswer,
+        answer: LegacyUserAnswer,
     ) -> Result<(), SessionError> {
         self.loaded(id)?.handle.answer(interaction_id, answer).await
     }
 
-    pub fn cancel(&self, id: SessionId) -> Result<(), SessionError> {
+    pub(crate) fn cancel(&self, id: SessionId) -> Result<(), SessionError> {
         self.loaded(id)?.handle.cancel()
     }
 
-    pub fn snapshot(&self, id: SessionId) -> Result<SessionSnapshot, SessionError> {
+    pub(crate) fn snapshot(&self, id: SessionId) -> Result<SessionSnapshot, SessionError> {
         Ok(self.loaded(id)?.handle.snapshot())
     }
 
-    pub fn subscribe(&self, id: SessionId) -> Result<SessionEventStream, SessionError> {
+    pub(crate) fn subscribe(&self, id: SessionId) -> Result<SessionEventStream, SessionError> {
         self.loaded(id)?.handle.subscribe()
     }
 
-    pub async fn transcript(
+    pub(crate) async fn transcript(
         &self,
         id: SessionId,
         after_seq: Option<u64>,
@@ -242,7 +250,7 @@ impl Runtime {
         }
     }
 
-    pub async fn shutdown(&self) -> Result<(), RuntimeError> {
+    pub(crate) async fn shutdown(&self) -> Result<(), RuntimeError> {
         self.inner.start_shutdown_sync();
         self.inner.shutdown.join().await
     }

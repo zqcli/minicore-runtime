@@ -23,7 +23,7 @@ use super::super::types::{
     ToolCall, ToolSpec, Usage,
 };
 use crate::ids::ToolCallId;
-use crate::tools::ToolName;
+use crate::tools::{ToolName, ToolResultOutcome};
 
 const MAX_REQUEST_BYTES: usize = 1_048_576;
 const MAX_JSON_BYTES: usize = 65_536;
@@ -534,13 +534,17 @@ fn encode_message(message: &ModelMessage, messages: &mut Vec<Value>) {
         ModelMessage::Tool {
             tool_call_id,
             output,
+            outcome,
         } => messages.push(json!({
             "role": "user",
             "content": [{
                 "type": "tool_result",
                 "tool_use_id": tool_call_id.to_string(),
-                "content": [{"type": "text", "text": output.text()}],
-                "is_error": output.is_error(),
+                "content": [{"type": "text", "text": output.content().as_str()}],
+                "is_error": !matches!(
+                    *outcome,
+                    ToolResultOutcome::Success | ToolResultOutcome::InputProvided
+                ),
             }],
         })),
         ModelMessage::System(_) => {}
@@ -1221,5 +1225,26 @@ impl UsageState {
                 .with_cache_read_tokens(self.cache_read_tokens)
                 .with_cache_write_tokens(self.cache_write_tokens)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_message;
+    use crate::ids::ToolCallId;
+    use crate::model::ModelMessage;
+    use crate::tools::LegacyToolOutput;
+
+    #[test]
+    fn legacy_failed_output_is_encoded_as_anthropic_error_result() {
+        let message = ModelMessage::legacy_tool(
+            ToolCallId::new("call-anthropic").unwrap(),
+            LegacyToolOutput::failure("failed").unwrap(),
+        )
+        .unwrap();
+        let mut messages = Vec::new();
+        encode_message(&message, &mut messages);
+        assert_eq!(messages[0]["content"][0]["content"][0]["text"], "failed");
+        assert_eq!(messages[0]["content"][0]["is_error"], true);
     }
 }

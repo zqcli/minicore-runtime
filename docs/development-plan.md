@@ -2,19 +2,23 @@
 
 ## Status
 
-P0 through P9 are complete. The current v0.2 core, public surface, persistence behavior, provider/tool ownership, fixture archival, documentation authority, dependency lockfile, and static architecture gate are implemented. The final result is recorded in the [v0.2 Core Reset release-readiness note](release-v0.2-core-reset.md).
+P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is in progress: P3-B exposes the final Tool/ToolSet seam, removes the old public Runtime/ToolRegistry facade, and deletes concrete builtin/process adapters. P4/P5 SessionRuntime acceptance and the remaining provider/model/workspace migration are still deferred.
 
 ## Completed Foundations
 
 - [x] **P0 — baseline and contract:** repository baseline, scope, checked DTO direction, and deterministic acceptance inventory.
 - [x] **P1 — public values:** checked IDs, configuration values, errors, events, model/session/tool DTOs, serde constructors, and redacted diagnostics.
-- [x] **P2 — tool core:** immutable registry, policy decisions, interaction client, builtins, cancellation, duplicate/unknown handling, and bounded tool values.
+- [x] **P2 — tool core:** historical private registry/policy/interaction implementation retained only for migration.
 - [x] **P3 — model core:** provider registry, gateway resolution, checked model requests/responses, bounded event sinks, delivery-aware errors, transport drains, SSE parsing, and retry hints.
 - [x] **P4 — storage:** worker-owned root lock, atomic session create, bounded CRUD, exact session JSON, append-only conversation JSONL, replay, repair, usage, transcript, and degradation behavior.
 - [x] **P5 — prompt and compaction:** terminal-aware prompt projection, serialized-byte estimation, current-turn preservation, stale-safe summary append, and context-overflow recovery.
 - [x] **P6 — turn execution:** private prompt/turn runner, ordered model/tool rounds, interaction claim, cancellation linearization, truthful terminal settlement, and one session mailbox.
-- [x] **P7 — runtime:** typed open/create/load/close/delete/list/submit/answer/cancel/snapshot/subscribe/transcript/shutdown APIs, residency admission, restart behavior, and explicit cleanup ownership.
-- [x] **P8 — reset closure:** canonical source graph, public root surface, legacy production deletion, archived historical fixtures, current M12 ownership, and active AT-20 source audit.
+- [x] **P7 — runtime:** historical private lifecycle implementation retained only for migration; no public Runtime facade remains.
+- [x] **P8 — reset closure:** historical v0.2 source graph and archive baseline.
+
+- [x] **P3-B — Tool seam reset:** public `Tool`/`ToolSet`, checked invocation/context/progress/input/output DTOs, true legacy DTO split, concrete adapter deletion, and focused contract tests.
+- [ ] **P3-C — policy/approval:** typed policy and approval actor flow; not implemented in P3-B.
+- [ ] **P4/P5 — SessionRuntime acceptance:** owner/runtime integration and replacement end-to-end contract suite.
 
 ## Current Maintenance Gates
 
@@ -36,7 +40,7 @@ The two live provider smoke cases remain explicit opt-in and ignored. They are e
 - [x] **P9-01 manifest cleanup:** remove empty crate features and unused direct dependencies without hand-editing the lockfile.
 - [x] **P9-02 documentation authority:** archive pre-reset prose, establish current source-accurate docs, and reduce the checker to current authority plus selected evidence.
 - [x] **P9-03 automated quality gates:** enforce the canonical source graph, public root surface, direct dependency policy, production size/function limits, and an all-singleton module DAG through `scripts/check_architecture.py`.
-- [x] **P9-04 dependency convergence:** regenerate and review `Cargo.lock` remotely with Rust 1.85 and stable Cargo, then validate the locked graph without changing the package version.
+- [x] **P9-04 dependency convergence:** regenerate and review `Cargo.lock` remotely with Rust 1.85 and stable Cargo; the subsequent v0.3 package bump updates only the root package entry.
 - [x] **P9-05 scope closure:** admit no optional non-core work; host adapters, additional process hardening, provider installation policy, migration tooling, and package publication remain separate decisions with separate owners and evidence.
 
 ## Non-Core Limits
@@ -85,7 +89,7 @@ Before changing a provider or builtin, confirm:
 
 The final P9 gate ran on the approved Rust 1.85 toolchain and stable toolchain without changing source behavior. It included current Markdown/ADR validation, format, locked all-target tests, Clippy, the provider-gate package, MSRV checks, locked documentation generation, Cargo metadata resolution, and the active acceptance matrix. Native macOS and Windows all-target plus provider-gate jobs also passed in [GitHub Actions run 32434427759](https://github.com/zqcli/minicore-runtime/actions/runs/32434427759). Live provider smokes remain explicit opt-in and are not part of the default release result.
 
-Dependency lockfile regeneration was committed separately after P9-01 manifest cleanup. Rust 1.85 and stable Cargo produced byte-identical lockfiles. Review confirmed a stable 199-package graph with 20 compatible patch-version updates, no package entry added or removed, and green locked gates. The crate package metadata remains at `0.1.0`; a package version or publication change requires a separate decision.
+Dependency lockfile regeneration was committed separately after P9-01 manifest cleanup. Rust 1.85 and stable Cargo produced byte-identical lockfiles. Review confirmed a stable 199-package graph with 20 compatible patch-version updates, no package entry added or removed, and green locked gates. The current v0.3 package metadata is `0.3.0`; publication remains a separate decision.
 
 The P9 documentation reset is complete: current authority has no stale pre-reset contract, the archive boundary is explicit, and the checker validates the current files.
 

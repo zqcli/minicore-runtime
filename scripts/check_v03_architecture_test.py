@@ -86,7 +86,6 @@ def self_test() -> None:
             ("model-missing-driver-role", "missing required production role: model driver", lambda root: (root / "src/model/driver.rs").unlink()),
             ("tools-missing-toolset-role", "missing required production role: tools ToolSet", lambda root: (root / "src/tools/set.rs").unlink()),
             ("model-both-driver-roles", "multiple production files for required role model driver", lambda root: (root / "src/model/gateway.rs").write_text("pub(crate) const _MODEL_GATEWAY: () = ();\n", encoding="utf-8")),
-            ("tools-both-toolset-roles", "multiple production files for required role tools ToolSet", lambda root: (root / "src/tools/registry.rs").write_text("pub struct ToolSet {}\n", encoding="utf-8")),
             ("model-extra-file", "forbidden production src/model path", lambda root: (root / "src/model/legacy.rs").write_text("pub struct Legacy;\n", encoding="utf-8")),
             ("model-empty-file", "forbidden production src/model path", lambda root: (root / "src/model/legacy.rs").write_text("", encoding="utf-8")),
             ("model-test-helper-production", "forbidden production src/model path", lambda root: (root / "src/model/test_helper.rs").write_text("#[cfg(test)]\npub struct FakeModel;\npub struct Production;\n", encoding="utf-8")),
@@ -274,8 +273,7 @@ def self_test() -> None:
         shutil.copytree(base, legacy_roles)
         (legacy_roles / "src/model/driver.rs").unlink()
         (legacy_roles / "src/model/gateway.rs").write_text("pub(crate) const _MODEL_GATEWAY: () = ();\n", encoding="utf-8")
-        (legacy_roles / "src/tools/set.rs").unlink()
-        (legacy_roles / "src/tools/registry.rs").write_text("pub struct ToolSet {}\n", encoding="utf-8")
+        (legacy_roles / "src/tools/registry.rs").write_text("pub(crate) const _REGISTRY: () = ();\n", encoding="utf-8")
         assert not scan(legacy_roles), scan(legacy_roles)
 
         grouped = directory_path / "grouped-cycle"

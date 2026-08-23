@@ -19,9 +19,6 @@ pub enum IdError {
     EntropyUnavailable,
 }
 
-pub type IdGenerationError = IdError;
-pub type RuntimeIdError = IdError;
-
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolCallIdError {
     #[error("tool call ID must be 1..=256 bytes")]
@@ -159,11 +156,11 @@ macro_rules! runtime_id {
         pub struct $name([u8; 16]);
 
         impl $name {
-            pub fn new() -> Result<Self, IdGenerationError> {
+            pub fn new() -> Result<Self, IdError> {
                 Self::generate()
             }
 
-            pub fn generate() -> Result<Self, IdGenerationError> {
+            pub fn generate() -> Result<Self, IdError> {
                 random_nonzero_bytes().map(Self)
             }
 

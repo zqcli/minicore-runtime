@@ -8,7 +8,8 @@ use thiserror::Error;
 
 use crate::model::{ModelSelection, ProviderRegistry};
 pub use crate::time::{Timestamp, TimestampError};
-use crate::tools::{ToolName, ToolRegistry};
+use crate::tools::ToolName;
+use crate::tools::registry::ToolRegistry;
 
 mod kernel;
 mod retry;
@@ -54,7 +55,7 @@ struct RuntimeConfigParts {
 }
 
 #[derive(Clone)]
-pub struct RuntimeConfig {
+pub(crate) struct RuntimeConfig {
     data_dir: PathBuf,
     provider_registry: ProviderRegistry,
     tool_registry: ToolRegistry,
@@ -84,7 +85,7 @@ impl fmt::Debug for RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    pub fn new(
+    pub(crate) fn new(
         data_dir: PathBuf,
         provider_registry: ProviderRegistry,
         tool_registry: ToolRegistry,
@@ -104,7 +105,7 @@ impl RuntimeConfig {
         })
     }
 
-    pub fn with_defaults(
+    pub(crate) fn with_defaults(
         data_dir: PathBuf,
         provider_registry: ProviderRegistry,
         tool_registry: ToolRegistry,
@@ -120,7 +121,7 @@ impl RuntimeConfig {
         )
     }
 
-    pub fn builder(
+    pub(crate) fn builder(
         data_dir: PathBuf,
         provider_registry: ProviderRegistry,
         tool_registry: ToolRegistry,
@@ -201,7 +202,7 @@ impl RuntimeConfig {
     }
 }
 
-pub struct RuntimeConfigBuilder {
+pub(crate) struct RuntimeConfigBuilder {
     data_dir: PathBuf,
     provider_registry: ProviderRegistry,
     tool_registry: ToolRegistry,
@@ -214,12 +215,12 @@ pub struct RuntimeConfigBuilder {
 }
 
 impl RuntimeConfigBuilder {
-    pub fn shutdown_timeout(mut self, value: Duration) -> Self {
+    pub(crate) fn shutdown_timeout(mut self, value: Duration) -> Self {
         self.shutdown_timeout = value;
         self
     }
 
-    pub fn capacities(
+    pub(crate) fn capacities(
         mut self,
         event_capacity: usize,
         command_capacity: usize,
@@ -231,7 +232,7 @@ impl RuntimeConfigBuilder {
         self
     }
 
-    pub fn build(self) -> Result<RuntimeConfig, ConfigError> {
+    pub(crate) fn build(self) -> Result<RuntimeConfig, ConfigError> {
         RuntimeConfig::from_parts(RuntimeConfigParts {
             data_dir: self.data_dir,
             provider_registry: self.provider_registry,
@@ -247,7 +248,7 @@ impl RuntimeConfigBuilder {
 }
 
 #[derive(Clone)]
-pub struct SessionConfig {
+pub(crate) struct SessionConfig {
     workspace_root: PathBuf,
     model: ModelSelection,
     system_prompt: String,
@@ -273,7 +274,7 @@ impl fmt::Debug for SessionConfig {
 }
 
 impl SessionConfig {
-    pub fn new(
+    pub(crate) fn new(
         workspace_root: PathBuf,
         model: ModelSelection,
         system_prompt: impl Into<String>,
@@ -304,31 +305,31 @@ impl SessionConfig {
         })
     }
 
-    pub fn workspace_root(&self) -> &Path {
+    pub(crate) fn workspace_root(&self) -> &Path {
         &self.workspace_root
     }
 
-    pub const fn model(&self) -> &ModelSelection {
+    pub(crate) const fn model(&self) -> &ModelSelection {
         &self.model
     }
 
-    pub fn system_prompt(&self) -> &str {
+    pub(crate) fn system_prompt(&self) -> &str {
         &self.system_prompt
     }
 
-    pub fn enabled_tools(&self) -> &BTreeSet<ToolName> {
+    pub(crate) fn enabled_tools(&self) -> &BTreeSet<ToolName> {
         &self.enabled_tools
     }
 
-    pub const fn compaction_trigger_tokens(&self) -> u64 {
+    pub(crate) const fn compaction_trigger_tokens(&self) -> u64 {
         self.compaction_trigger_tokens
     }
 
-    pub const fn compaction_target_tokens(&self) -> u64 {
+    pub(crate) const fn compaction_target_tokens(&self) -> u64 {
         self.compaction_target_tokens
     }
 
-    pub const fn max_tool_rounds(&self) -> u8 {
+    pub(crate) const fn max_tool_rounds(&self) -> u8 {
         self.max_tool_rounds
     }
 }
@@ -363,8 +364,42 @@ fn validate_text(value: &str, allow_empty: bool) -> Result<(), ConfigError> {
     }
 }
 
+type SessionConfigConstructor = fn(
+    PathBuf,
+    ModelSelection,
+    String,
+    BTreeSet<ToolName>,
+    u64,
+    u64,
+    u8,
+) -> Result<SessionConfig, ConfigError>;
+
 const _: () = {
+    // P4/P7 deletion target: remove with the legacy Runtime/Session config path.
+    let _ = std::mem::size_of::<RuntimeConfigParts>();
     let _ = std::mem::size_of::<RuntimeConfig>();
+    let _: fn(
+        PathBuf,
+        ProviderRegistry,
+        ToolRegistry,
+        String,
+        RetryPolicy,
+    ) -> Result<RuntimeConfig, ConfigError> = RuntimeConfig::new;
+    let _: fn(
+        PathBuf,
+        ProviderRegistry,
+        ToolRegistry,
+        String,
+        RetryPolicy,
+    ) -> Result<RuntimeConfig, ConfigError> = RuntimeConfig::with_defaults;
+    let _: fn(RuntimeConfigParts) -> Result<RuntimeConfig, ConfigError> = RuntimeConfig::from_parts;
+    let _ = std::mem::size_of::<RuntimeConfigBuilder>();
+    let _: fn(RuntimeConfigBuilder, Duration) -> RuntimeConfigBuilder =
+        RuntimeConfigBuilder::shutdown_timeout;
+    let _: fn(RuntimeConfigBuilder, usize, usize, usize) -> RuntimeConfigBuilder =
+        RuntimeConfigBuilder::capacities;
+    let _: fn(RuntimeConfigBuilder) -> Result<RuntimeConfig, ConfigError> =
+        RuntimeConfigBuilder::build;
     let _ = std::mem::size_of::<SessionConfig>();
     let _: fn(
         PathBuf,
@@ -373,4 +408,5 @@ const _: () = {
         String,
         RetryPolicy,
     ) -> RuntimeConfigBuilder = RuntimeConfig::builder;
+    let _: SessionConfigConstructor = SessionConfig::new;
 };

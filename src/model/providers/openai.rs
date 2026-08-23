@@ -17,6 +17,7 @@ use super::super::types::{
     ModelFinishReason, ModelMessage, ModelRequest, ModelResponse, ProviderItemId, ReasoningContent,
     ReasoningPreference, ToolCall, ToolSpec, Usage,
 };
+use crate::tools::ToolResultOutcome;
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde_json::{Map, Value, json};
@@ -439,11 +440,17 @@ fn encode_input(messages: &[ModelMessage]) -> Vec<Value> {
             ModelMessage::Tool {
                 tool_call_id,
                 output,
+                outcome,
             } => input.push(json!({
                 "type": "function_call_output",
                 "call_id": tool_call_id.to_string(),
-                "output": output.text(),
-                "status": "completed",
+                "output": output.content().as_str(),
+                "status": match *outcome {
+                    ToolResultOutcome::Success | ToolResultOutcome::InputProvided => "completed",
+                    ToolResultOutcome::Failed
+                    | ToolResultOutcome::Denied
+                    | ToolResultOutcome::Cancelled => "failed",
+                },
             })),
         }
     }
@@ -1138,5 +1145,25 @@ fn optional_u64(
             .as_u64()
             .map(Some)
             .ok_or_else(|| invalid_provider_response(delivery)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_input;
+    use crate::ids::ToolCallId;
+    use crate::model::ModelMessage;
+    use crate::tools::LegacyToolOutput;
+
+    #[test]
+    fn legacy_failed_output_is_encoded_as_failed_function_result() {
+        let message = ModelMessage::legacy_tool(
+            ToolCallId::new("call-openai").unwrap(),
+            LegacyToolOutput::failure("failed").unwrap(),
+        )
+        .unwrap();
+        let wire = encode_input(&[message]);
+        assert_eq!(wire[0]["output"], "failed");
+        assert_eq!(wire[0]["status"], "failed");
     }
 }

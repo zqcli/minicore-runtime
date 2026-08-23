@@ -158,7 +158,7 @@ fn project_messages(
 ) -> Result<Arc<[ModelMessage]>, ConversationError> {
     let mut messages = Vec::new();
     let mut pending_calls = Vec::<ToolCallId>::new();
-    let mut pending_results = BTreeMap::<ToolCallId, ToolOutput>::new();
+    let mut pending_results = BTreeMap::<ToolCallId, LegacyToolOutput>::new();
     for entry in state
         .entries
         .iter()
@@ -203,7 +203,7 @@ fn project_messages(
                         break;
                     };
                     messages.push(
-                        ModelMessage::tool(call_id, output)
+                        ModelMessage::legacy_tool(call_id, output)
                             .map_err(|_| ConversationError::Corrupt)?,
                     );
                     pending_calls.remove(0);

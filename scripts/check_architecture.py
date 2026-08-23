@@ -11,8 +11,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
-# Source gates enumerate only the canonical src tree and the active acceptance
-# source; they never traverse .git, target, provider-gate target, or docs/archive.
+# Source gates enumerate only the canonical src tree; they never traverse .git,
+# target, provider-gate target, or docs/archive.
 
 CANONICAL_TOPS = (
     "agent",
@@ -47,7 +47,6 @@ REQUIRED_DIRS = {
     "src/storage",
     "src/storage/conversation",
     "src/tools",
-    "src/tools/builtins",
     "src/workspace",
 }
 
@@ -118,18 +117,16 @@ REQUIRED_FILES = {
     "src/storage/session_log.rs",
     "src/storage/store.rs",
     "src/time.rs",
-    "src/tools/builtins/ask_user.rs",
-    "src/tools/builtins/list_directory.rs",
-    "src/tools/builtins/mod.rs",
-    "src/tools/builtins/path_args.rs",
-    "src/tools/builtins/read_file.rs",
-    "src/tools/builtins/run_command.rs",
-    "src/tools/builtins/write_file.rs",
     "src/tools/context.rs",
+    "src/tools/input.rs",
+    "src/tools/legacy_context.rs",
+    "src/tools/legacy_types.rs",
     "src/tools/mod.rs",
     "src/tools/policy.rs",
-    "src/tools/process.rs",
+    "src/tools/progress.rs",
     "src/tools/registry.rs",
+    "src/tools/set.rs",
+    "src/tools/tool.rs",
     "src/tools/types.rs",
     "src/value.rs",
     "src/workspace/mod.rs",
@@ -196,52 +193,6 @@ FORBIDDEN_SOURCE_TOKENS = (
     "FollowUp",
 )
 
-EXPECTED_ACCEPTANCE_CASES = (
-    "AT-01 Model-only Turn",
-    "AT-02 Read file",
-    "AT-03 Edit file",
-    "AT-04 Run tests",
-    "AT-05 Multi-round tools",
-    "AT-06 Ask user",
-    "AT-07 Cancel model",
-    "AT-08 Cancel process",
-    "AT-09 Runtime restart",
-    "AT-10 Partial JSONL",
-    "AT-11 Compaction",
-    "AT-12 Workspace security",
-    "AT-13 Provider conformance",
-    "AT-14 Session isolation",
-    "AT-15 Event lag",
-    "AT-16 Busy rule",
-    "AT-17 Close",
-    "AT-18 Custom Tool",
-    "AT-19 Secret env",
-    "AT-20 No legacy coupling",
-)
-
-EXPECTED_ACCEPTANCE_FUNCTIONS = (
-    "at_01_model_only_turn",
-    "at_02_read_file",
-    "at_03_edit_file",
-    "at_04_run_tests",
-    "at_05_multi_round_tools",
-    "at_06_ask_user",
-    "at_07_cancel_model",
-    "at_08_cancel_process",
-    "at_09_runtime_restart",
-    "at_10_partial_jsonl",
-    "at_11_compaction",
-    "at_12_workspace_security",
-    "at_13_provider_conformance",
-    "at_14_session_isolation",
-    "at_15_event_lag",
-    "at_16_busy_rule",
-    "at_17_close",
-    "at_18_custom_tool",
-    "at_19_secret_env",
-    "at_20_no_legacy_coupling",
-)
-
 EXPECTED_ROOT_EXPORTS = {
     "config": {
         "ConfigError",
@@ -249,10 +200,7 @@ EXPECTED_ROOT_EXPORTS = {
         "KernelConfig",
         "RetryPolicy",
         "RetryPolicyError",
-        "RuntimeConfig",
-        "RuntimeConfigBuilder",
         "SemanticLimits",
-        "SessionConfig",
         "SessionManifest",
         "SessionSpec",
         "TurnOptions",
@@ -262,35 +210,16 @@ EXPECTED_ROOT_EXPORTS = {
     "error": {
         "PublicErrorCode",
         "PublicErrorSummary",
-        "RuntimeError",
-        "SessionError",
     },
     "event": {"SessionEventKind"},
     "ids": {
         "IdError",
-        "IdGenerationError",
         "InteractionId",
-        "RuntimeIdError",
         "SessionId",
         "SessionInstanceId",
         "ToolCallId",
         "ToolCallIdError",
         "TurnId",
-    },
-    "runtime": {"Runtime", "SessionSummary"},
-    "session": {
-        "SessionEvent",
-        "SessionEventStream",
-        "SessionSnapshot",
-        "SessionStatus",
-        "SnapshotHistory",
-        "SnapshotShapeError",
-        "TerminalOutcome",
-        "TranscriptEntry",
-        "TranscriptToolCall",
-        "TurnOutcome",
-        "TurnSummary",
-        "TurnTerminalSummary",
     },
     "storage": {"AppendReceipt", "ConversationPage", "SessionLog", "SessionLogError"},
     "value": {"BoundedText"},
@@ -305,12 +234,10 @@ EXPECTED_PUBLIC_MODULES = {
     "event",
     "ids",
     "model",
-    "runtime",
     "session",
     "storage",
     "tools",
     "value",
-    "workspace",
 }
 
 EXPECTED_DIRECT_DEPENDENCIES = {
@@ -384,7 +311,7 @@ EXPECTED_MODULE_VISIBILITY = {
         "command": "crate",
         "event": "private",
         "event_stream": "crate",
-        "snapshot": "private",
+        "snapshot": "crate",
         "state": "private",
         "transcript": "crate",
     },
@@ -401,20 +328,16 @@ EXPECTED_MODULE_VISIBILITY = {
         "usage": "private",
     },
     "src/tools/mod.rs": {
-        "builtins": "private",
         "context": "private",
+        "input": "private",
+        "legacy_context": "private",
+        "legacy_types": "crate",
         "policy": "private",
-        "process": "private",
-        "registry": "private",
+        "progress": "private",
+        "registry": "crate",
+        "set": "private",
+        "tool": "private",
         "types": "private",
-    },
-    "src/tools/builtins/mod.rs": {
-        "ask_user": "private",
-        "list_directory": "private",
-        "path_args": "private",
-        "read_file": "private",
-        "run_command": "private",
-        "write_file": "private",
     },
     "src/workspace/mod.rs": {"path": "private", "root": "private"},
 }
@@ -509,45 +432,6 @@ def check_source_tokens(sources: Dict[str, str]) -> List[str]:
             if re.search(r"(?:^|[\s,])(?:clippy::)?dead_code(?:$|[\s,])", attribute.group(1)):
                 line = text.count("\n", 0, attribute.start()) + 1
                 errors.append(f"{path}:{line}: dead_code allow is forbidden")
-    return errors
-
-
-def check_acceptance_surface() -> List[str]:
-    path = ROOT / "tests/v2_acceptance.rs"
-    errors: List[str] = []
-    if not path.is_file():
-        return ["missing acceptance source: tests/v2_acceptance.rs"]
-    text = read_utf8(path, errors)
-    if text is None:
-        return errors
-    if re.search(r"#\s*\[\s*ignore\b", text):
-        errors.append("tests/v2_acceptance.rs: acceptance tests must not use #[ignore]")
-
-    for case in EXPECTED_ACCEPTANCE_CASES:
-        count = text.count('"' + case + '"')
-        if count != 1:
-            errors.append(
-                f"tests/v2_acceptance.rs: {case!r} must occur exactly once, found {count}"
-            )
-
-    found_functions = Counter(
-        match.group(1)
-        for match in FUNCTION_RE.finditer(text)
-        if match.group(1).startswith("at_")
-    )
-    expected_functions = set(EXPECTED_ACCEPTANCE_FUNCTIONS)
-    for name in EXPECTED_ACCEPTANCE_FUNCTIONS:
-        if found_functions[name] != 1:
-            errors.append(
-                f"tests/v2_acceptance.rs: {name} must occur exactly once, "
-                f"found {found_functions[name]}"
-            )
-    unexpected = sorted(set(found_functions) - expected_functions)
-    if unexpected:
-        errors.append(
-            "tests/v2_acceptance.rs: unexpected acceptance functions: "
-            + ", ".join(unexpected)
-        )
     return errors
 
 
@@ -708,10 +592,10 @@ def check_public_surface(sources: Dict[str, str]) -> List[str]:
             "src/lib.rs: public modules mismatch: "
             f"expected={sorted(EXPECTED_PUBLIC_MODULES)} actual={sorted(public_modules)}"
         )
-    if private_modules != {"agent", "prompt", "time"}:
+    if private_modules != {"agent", "prompt", "runtime", "time", "workspace"}:
         errors.append(
             "src/lib.rs: private modules mismatch: "
-            f"expected=['agent', 'prompt', 'time'] actual={sorted(private_modules)}"
+            f"expected=['agent', 'prompt', 'runtime', 'time', 'workspace'] actual={sorted(private_modules)}"
         )
     if other_visibility:
         errors.append(f"src/lib.rs: unsupported module visibility: {other_visibility}")
@@ -753,8 +637,6 @@ def check_public_surface(sources: Dict[str, str]) -> List[str]:
     session_mod = mask_rust(strip_test_items(sources.get("src/session/mod.rs", "")))
     storage_mod = mask_rust(strip_test_items(sources.get("src/storage/mod.rs", "")))
     tools_declarations = parse_mod_declarations(tools_mod)
-    if tools_declarations.get("builtins") != "private":
-        errors.append("src/tools/mod.rs: builtins must remain private")
     session_declarations = parse_mod_declarations(session_mod)
     if session_declarations.get("actor") != "crate":
         errors.append("src/session/mod.rs: actor must be crate-private")
@@ -1688,7 +1570,6 @@ def main() -> int:
     source_paths = set(sources)
     errors.extend(check_source_paths(source_paths))
     errors.extend(check_source_tokens(sources))
-    errors.extend(check_acceptance_surface())
     errors.extend(check_public_surface(sources))
     dependency_errors, direct_dependencies = check_dependencies(sources)
     errors.extend(dependency_errors)

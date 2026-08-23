@@ -27,9 +27,11 @@ use crate::storage::conversation::{
     ConversationError, ConversationHealth, ConversationLog, NewConversationEntry, StoredTurnOutcome,
 };
 use crate::storage::store::StoredSessionConfig;
+use crate::tools::LegacyToolError as ToolError;
+use crate::tools::registry::ToolRegistry;
 use crate::tools::{
-    InteractionClient, InteractionReceiver, InteractionRequest, ToolError, ToolPolicy,
-    ToolRegistry, UserAnswer, UserQuestion,
+    InteractionClient, InteractionReceiver, InteractionRequest, LegacyUserAnswer,
+    LegacyUserQuestion, ToolPolicy,
 };
 use crate::workspace::Workspace;
 
@@ -68,7 +70,7 @@ struct ActiveTurn {
 struct PendingInteraction {
     turn_id: TurnId,
     interaction_id: InteractionId,
-    question: UserQuestion,
+    question: LegacyUserQuestion,
     request: Option<InteractionRequest>,
 }
 
@@ -505,7 +507,7 @@ impl SessionActor {
     async fn handle_answer(
         &mut self,
         interaction_id: InteractionId,
-        answer: UserAnswer,
+        answer: LegacyUserAnswer,
     ) -> Result<(), SessionError> {
         let Some(pending) = self.pending.as_ref() else {
             return Err(SessionError::InteractionMismatch);
@@ -1056,8 +1058,9 @@ mod tests {
         StoredSessionConfig,
     };
     use crate::time::{Timestamp, TimestampError};
-    use crate::tools::{AllowConfiguredTools, ToolRegistry};
-    use crate::tools::{Tool, ToolContext, ToolFuture, ToolName, ToolOutput, ToolSpec};
+    use crate::tools::AllowConfiguredTools;
+    use crate::tools::registry::{LegacyToolFuture, ToolRegistry};
+    use crate::tools::{LegacyTool, LegacyToolContext, LegacyToolOutput, ToolName, ToolSpec};
     use crate::workspace::{Workspace, WorkspaceAccess};
     use serde_json::json;
 
@@ -1170,32 +1173,33 @@ mod tests {
         name: ToolName,
     }
 
-    impl Tool for BlockingTool {
+    impl LegacyTool for BlockingTool {
         fn spec(&self) -> ToolSpec {
             ToolSpec::new(self.name.clone(), "blocking tool", json!({})).unwrap()
         }
 
         fn execute<'a>(
             &'a self,
-            _ctx: ToolContext<'a>,
+            _ctx: LegacyToolContext<'a>,
             _args: serde_json::Value,
-        ) -> ToolFuture<'a> {
+        ) -> LegacyToolFuture<'a> {
             Box::pin(async {
-                std::future::pending::<Result<ToolOutput, crate::tools::ToolError>>().await
+                std::future::pending::<Result<LegacyToolOutput, crate::tools::LegacyToolError>>()
+                    .await
             })
         }
     }
 
-    impl Tool for TestTool {
+    impl LegacyTool for TestTool {
         fn spec(&self) -> ToolSpec {
             ToolSpec::new(self.name.clone(), "test tool", json!({})).unwrap()
         }
 
         fn execute<'a>(
             &'a self,
-            _ctx: ToolContext<'a>,
+            _ctx: LegacyToolContext<'a>,
             _args: serde_json::Value,
-        ) -> ToolFuture<'a> {
+        ) -> LegacyToolFuture<'a> {
             let order = Arc::clone(&self.order);
             let name = self.name.to_string();
             Box::pin(async move {
@@ -1203,7 +1207,7 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push(name);
-                ToolOutput::success("ok").map_err(|_| crate::tools::ToolError::Internal)
+                LegacyToolOutput::success("ok").map_err(|_| crate::tools::LegacyToolError::Internal)
             })
         }
     }
@@ -1700,7 +1704,7 @@ mod tests {
             } if waiting_turn == turn_id && waiting_interaction == interaction_id
         ));
         let wrong = crate::ids::InteractionId::new().unwrap();
-        let wrong_answer = crate::tools::UserAnswer::new("allow").unwrap();
+        let wrong_answer = crate::tools::LegacyUserAnswer::new("allow").unwrap();
         assert_eq!(
             handle.answer(wrong, wrong_answer).await,
             Err(crate::error::SessionError::InteractionMismatch)
@@ -1712,7 +1716,7 @@ mod tests {
         handle
             .answer(
                 interaction_id,
-                crate::tools::UserAnswer::new("allow").unwrap(),
+                crate::tools::LegacyUserAnswer::new("allow").unwrap(),
             )
             .await
             .unwrap();
@@ -1799,7 +1803,7 @@ mod tests {
             handle
                 .answer(
                     interaction_id,
-                    crate::tools::UserAnswer::new("allow").unwrap(),
+                    crate::tools::LegacyUserAnswer::new("allow").unwrap(),
                 )
                 .await,
             Err(crate::error::SessionError::InteractionMismatch)
@@ -1945,7 +1949,7 @@ mod tests {
             handle
                 .answer(
                     interaction_id,
-                    crate::tools::UserAnswer::new("allow").unwrap(),
+                    crate::tools::LegacyUserAnswer::new("allow").unwrap(),
                 )
                 .await,
             Err(crate::error::SessionError::Closing)
@@ -2018,7 +2022,7 @@ mod tests {
         handle
             .answer(
                 interaction_id,
-                crate::tools::UserAnswer::new("allow").unwrap(),
+                crate::tools::LegacyUserAnswer::new("allow").unwrap(),
             )
             .await
             .unwrap();
@@ -2115,7 +2119,7 @@ mod tests {
                 handle
                     .answer(
                         interaction_id,
-                        crate::tools::UserAnswer::new("allow").unwrap(),
+                        crate::tools::LegacyUserAnswer::new("allow").unwrap(),
                     )
                     .await
             }
@@ -2213,7 +2217,7 @@ mod tests {
                 handle
                     .answer(
                         interaction_id,
-                        crate::tools::UserAnswer::new("allow").unwrap(),
+                        crate::tools::LegacyUserAnswer::new("allow").unwrap(),
                     )
                     .await
             }
@@ -2299,7 +2303,7 @@ mod tests {
             handle
                 .answer(
                     interaction_id,
-                    crate::tools::UserAnswer::new("allow").unwrap(),
+                    crate::tools::LegacyUserAnswer::new("allow").unwrap(),
                 )
                 .await,
             Err(crate::error::SessionError::Internal)
@@ -2378,7 +2382,7 @@ mod tests {
             answer_handle
                 .answer(
                     interaction_id,
-                    crate::tools::UserAnswer::new("allow").unwrap(),
+                    crate::tools::LegacyUserAnswer::new("allow").unwrap(),
                 )
                 .await
         });
@@ -2646,7 +2650,10 @@ mod tests {
         ));
         loop {
             if let SessionEvent::ToolFinished { result, .. } = stream.recv().await.unwrap() {
-                assert_eq!(result.status(), crate::tools::ToolResultStatus::Cancelled);
+                assert_eq!(
+                    result.status(),
+                    crate::tools::LegacyToolResultStatus::Cancelled
+                );
                 break;
             }
         }
@@ -2770,7 +2777,7 @@ mod tests {
             handle
                 .answer(
                     crate::ids::InteractionId::new().unwrap(),
-                    crate::tools::UserAnswer::new("late").unwrap(),
+                    crate::tools::LegacyUserAnswer::new("late").unwrap(),
                 )
                 .await,
             Err(crate::error::SessionError::Closing)

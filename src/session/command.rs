@@ -9,7 +9,7 @@ use super::snapshot::SessionSnapshot;
 use crate::error::SessionError;
 use crate::ids::{InteractionId, TurnId};
 use crate::storage::conversation::validate_user_text;
-use crate::tools::UserAnswer;
+use crate::tools::LegacyUserAnswer;
 
 pub(crate) const MAX_COMMAND_CAPACITY: usize = 4_096;
 
@@ -53,7 +53,7 @@ pub(crate) enum SessionCommand {
     },
     Answer {
         interaction_id: InteractionId,
-        answer: UserAnswer,
+        answer: LegacyUserAnswer,
         reply: oneshot::Sender<Result<(), SessionError>>,
     },
 }
@@ -160,7 +160,7 @@ impl SessionHandle {
     pub(crate) async fn answer(
         &self,
         interaction_id: InteractionId,
-        answer: UserAnswer,
+        answer: LegacyUserAnswer,
     ) -> Result<(), SessionError> {
         if self.close_requested.is_cancelled() {
             return Err(SessionError::Closing);

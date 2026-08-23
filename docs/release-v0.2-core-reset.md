@@ -1,8 +1,12 @@
 # v0.2 Core Reset Release Readiness
 
-This note closes the implementation and verification milestone for the MiniCore Runtime v0.2 Core Reset from baseline `5088bc254548b3e80e87179898ebb7abbea52c7d`. It records the current source and durable contracts; it does not reopen the archived pre-reset design.
+> Historical v0.2 release record. Its Runtime, registry, and v0.2 public-surface
+> descriptions are transitional evidence; the breaking v0.3 P3-B surface is
+> authoritative in the root README and current architecture/module map.
 
-The milestone name is v0.2 Core Reset. The crate package metadata remains at version `0.1.0`; changing or publishing the package version is a separate release decision and was not part of P9 dependency convergence.
+This note records the implementation and verification milestone for the MiniCore Runtime v0.2 Core Reset from baseline `5088bc254548b3e80e87179898ebb7abbea52c7d`. It records the historical source and durable contracts; it does not reopen the archived pre-reset design.
+
+The milestone name is v0.2 Core Reset. At that historical milestone the crate package metadata was `0.1.0`; the current breaking v0.3 package is version `0.3.0`.
 
 ## Source Graph
 
@@ -12,7 +16,7 @@ The architecture gate requires the exact canonical file graph, rejects legacy so
 
 ## Public Surface
 
-The public root modules are exactly `config`, `error`, `event`, `ids`, `model`, `runtime`, `session`, `tools`, and `workspace`. Root convenience reexports are limited to the checked configuration, public error, event, identifier, runtime, and session values declared in [`src/lib.rs`](../src/lib.rs). Private actor, prompt, transport, conversation, store, and worker owners are not root extension seams.
+The historical v0.2 root modules included `config`, `error`, `event`, `ids`, `model`, `runtime`, `session`, `tools`, and `workspace`. In the current v0.3 slice, `runtime` and `workspace` are private migration modules; root convenience reexports are limited to the current checked DTOs, Ports, identifiers, errors, and storage contract declared in [`src/lib.rs`](../src/lib.rs).
 
 The host-facing entry point is `Runtime::open(config, tokio::runtime::Handle)`. Session operations use typed values and errors for create, load, close, delete, list, submit, answer, cancel, snapshot, subscribe, transcript, and shutdown. No v0.1 Wire/API compatibility wrapper is compiled.
 

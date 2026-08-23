@@ -2,7 +2,7 @@ pub(crate) mod actor;
 pub(crate) mod command;
 mod event;
 pub(crate) mod event_stream;
-mod snapshot;
+pub(crate) mod snapshot;
 mod state;
 pub(crate) mod transcript;
 
@@ -15,12 +15,3 @@ const _: () = {
     let _ = std::mem::size_of::<SessionActorDependencies>();
     let _ = std::mem::size_of::<SessionHandle>();
 };
-
-pub use event::SessionEvent;
-pub use event_stream::SessionEventStream;
-pub use snapshot::{
-    SessionSnapshot, SnapshotHistory, SnapshotShapeError, TerminalOutcome, TurnOutcome,
-    TurnSummary, TurnTerminal, TurnTerminalSummary,
-};
-pub use state::SessionStatus;
-pub use transcript::{TranscriptEntry, TranscriptPage, TranscriptToolCall};

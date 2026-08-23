@@ -2,6 +2,9 @@
 
 状态：Accepted
 
+> Transitional v0.2 record. Provider retry behavior remains internal migration
+> evidence while the v0.3 owner Ports are introduced.
+
 日期：2026-08-20
 
 ## Context

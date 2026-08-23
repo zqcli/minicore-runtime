@@ -137,7 +137,7 @@ impl<'de> Deserialize<'de> for DiagnosticSummary {
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
-pub enum RuntimeError {
+pub(crate) enum RuntimeError {
     #[error("invalid runtime configuration")]
     InvalidConfiguration,
     #[error("runtime is closing")]
@@ -147,7 +147,7 @@ pub enum RuntimeError {
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
-pub enum SessionError {
+pub(crate) enum SessionError {
     #[error("session not found")]
     NotFound,
     #[error("session is already loaded")]

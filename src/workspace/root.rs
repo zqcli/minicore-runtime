@@ -19,13 +19,13 @@ const TEMP_NAME_ATTEMPTS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkspaceAccess {
+pub(crate) enum WorkspaceAccess {
     ReadOnly,
     ReadWrite,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum WorkspaceError {
+pub(crate) enum WorkspaceError {
     #[error("workspace root is unavailable")]
     RootUnavailable,
     #[error("workspace root is not a directory")]
@@ -66,7 +66,7 @@ pub enum WorkspaceError {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DirectoryEntryKind {
+pub(crate) enum DirectoryEntryKind {
     File,
     Directory,
     Symlink,
@@ -74,7 +74,7 @@ pub enum DirectoryEntryKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct DirectoryEntry {
+pub(crate) struct DirectoryEntry {
     name: String,
     kind: DirectoryEntryKind,
 }
@@ -123,7 +123,7 @@ struct WorkerExitGuard {
 /// Tokio tasks. Filesystem wall-clock completion is not a timeout guarantee.
 /// [`Workspace::shutdown`] closes admission and joins the worker.
 #[derive(Clone)]
-pub struct Workspace {
+pub(crate) struct Workspace {
     inner: Arc<WorkspaceInner>,
     access: WorkspaceAccess,
 }
@@ -687,6 +687,16 @@ fn map_command_cwd_error(error: std::io::Error) -> WorkspaceError {
         _ => WorkspaceError::Io,
     }
 }
+
+const _: () = {
+    // P7 deletion target: remove with the private legacy Workspace implementation.
+    let _ = DirectoryEntry::name;
+    let _ = DirectoryEntry::kind;
+    let _ = Workspace::command_cwd;
+    let _ = Workspace::read_text;
+    let _ = Workspace::list;
+    let _ = Workspace::write_text;
+};
 
 #[cfg(test)]
 mod tests {

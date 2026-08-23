@@ -1,5 +1,9 @@
 # v0.1 to v0.2 Migration
 
+> Historical migration record. The v0.3 reset is breaking and does not add a
+> compatibility wrapper; P3-B specifically removes the public Runtime and
+> ToolRegistry facades.
+
 ## Status
 
 This is the final breaking migration guide for the v0.2 core. P8 reset closure is complete: the current crate contains the typed Runtime graph, the historical pre-reset authority is archived, and the acceptance architecture gate is active. The typed `Runtime` replaces the removed platform command/query surface. There are no compatibility wrappers or root aliases for the removed surface.

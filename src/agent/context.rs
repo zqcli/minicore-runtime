@@ -11,7 +11,8 @@ use crate::model::{ModelGateway, ModelLimits, ReasoningPreference};
 use crate::prompt::{Compactor, PromptBuildOptions, PromptBuilder};
 use crate::storage::conversation::ConversationLog;
 use crate::time::{Timestamp, TimestampError};
-use crate::tools::{InteractionClient, ToolName, ToolPolicy, ToolRegistry, ToolSpec};
+use crate::tools::registry::ToolRegistry;
+use crate::tools::{InteractionClient, ToolName, ToolPolicy, ToolSpec};
 use crate::workspace::Workspace;
 
 use super::runner::RunnerEventSink;

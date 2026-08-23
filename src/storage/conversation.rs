@@ -13,7 +13,7 @@ use super::store::{SessionRegistration, SessionStore, StoreError};
 use crate::ids::{InteractionId, SessionId, ToolCallId, TurnId};
 use crate::model::{AssistantPart, ModelMessage, ModelResponse, ReasoningContent, ToolCall, Usage};
 use crate::time::Timestamp;
-use crate::tools::{ToolOutput, UserAnswer, UserQuestion};
+use crate::tools::{LegacyToolOutput, LegacyUserAnswer, LegacyUserQuestion};
 
 mod actor_support;
 pub(crate) use actor_support::validate_user_text;
@@ -145,14 +145,14 @@ pub(crate) enum NewConversationEntry {
         turn_id: TurnId,
         timestamp: Timestamp,
         call_id: ToolCallId,
-        result: ToolOutput,
+        result: LegacyToolOutput,
     },
     Interaction {
         turn_id: TurnId,
         timestamp: Timestamp,
         interaction_id: InteractionId,
-        question: UserQuestion,
-        answer: UserAnswer,
+        question: LegacyUserQuestion,
+        answer: LegacyUserAnswer,
     },
     Summary {
         timestamp: Timestamp,
@@ -192,14 +192,14 @@ enum NewConversationEntryWire {
         turn_id: TurnId,
         timestamp: Timestamp,
         call_id: ToolCallId,
-        result: ToolOutput,
+        result: LegacyToolOutput,
     },
     Interaction {
         turn_id: TurnId,
         timestamp: Timestamp,
         interaction_id: InteractionId,
-        question: UserQuestion,
-        answer: UserAnswer,
+        question: LegacyUserQuestion,
+        answer: LegacyUserAnswer,
     },
     Summary {
         timestamp: Timestamp,
@@ -313,15 +313,15 @@ pub(crate) enum ConversationEntry {
         turn_id: TurnId,
         timestamp: Timestamp,
         call_id: ToolCallId,
-        result: ToolOutput,
+        result: LegacyToolOutput,
     },
     Interaction {
         seq: u64,
         turn_id: TurnId,
         timestamp: Timestamp,
         interaction_id: InteractionId,
-        question: UserQuestion,
-        answer: UserAnswer,
+        question: LegacyUserQuestion,
+        answer: LegacyUserAnswer,
     },
     Summary {
         seq: u64,
@@ -366,15 +366,15 @@ enum ConversationEntryWire {
         turn_id: TurnId,
         timestamp: Timestamp,
         call_id: ToolCallId,
-        result: ToolOutput,
+        result: LegacyToolOutput,
     },
     Interaction {
         seq: u64,
         turn_id: TurnId,
         timestamp: Timestamp,
         interaction_id: InteractionId,
-        question: UserQuestion,
-        answer: UserAnswer,
+        question: LegacyUserQuestion,
+        answer: LegacyUserAnswer,
     },
     Summary {
         seq: u64,
@@ -979,7 +979,7 @@ impl ConversationState {
             .map_or(0, |summary| summary.through_seq);
         let mut messages = Vec::new();
         let mut pending_calls = Vec::<ToolCallId>::new();
-        let mut pending_results = BTreeMap::<ToolCallId, ToolOutput>::new();
+        let mut pending_results = BTreeMap::<ToolCallId, LegacyToolOutput>::new();
         for entry in self
             .entries
             .iter()
@@ -1025,7 +1025,7 @@ impl ConversationState {
                             break;
                         };
                         messages.push(
-                            ModelMessage::tool(call_id, output)
+                            ModelMessage::legacy_tool(call_id, output)
                                 .map_err(|_| ConversationError::Corrupt)?,
                         );
                         pending_calls.remove(0);
@@ -1365,7 +1365,7 @@ fn open_sync(
             .iter()
             .filter(|call| !exchange.resolved.contains(call.tool_call_id()))
         {
-            let result = ToolOutput::failure(RESTART_CANCELLED_TEXT).map_err(|_| {
+            let result = LegacyToolOutput::failure(RESTART_CANCELLED_TEXT).map_err(|_| {
                 StoreError::ConversationCorrupt {
                     line: repair_line,
                     offset: repair_offset,
@@ -1716,7 +1716,7 @@ mod tests {
             turn_id,
             timestamp: timestamp(),
             call_id: call_id.clone(),
-            result: ToolOutput::success("ok").unwrap(),
+            result: LegacyToolOutput::success("ok").unwrap(),
         }
         .into_entry(1)
         .unwrap();
@@ -1731,8 +1731,8 @@ mod tests {
             turn_id,
             timestamp: timestamp(),
             interaction_id,
-            question: UserQuestion::new(interaction_id, "Choose one", None).unwrap(),
-            answer: UserAnswer::new("one").unwrap(),
+            question: LegacyUserQuestion::new(interaction_id, "Choose one", None).unwrap(),
+            answer: LegacyUserAnswer::new("one").unwrap(),
         }
         .into_entry(2)
         .unwrap();
@@ -1741,6 +1741,158 @@ mod tests {
         assert!(interaction_value.get("resolution").is_none());
         assert!(interaction_value.get("question").is_some());
         assert!(interaction_value.get("answer").is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_failed_tool_output_survives_append_and_reload() {
+        let (store, log, root, id) = opened().await;
+        let turn_id = TurnId::new().unwrap();
+        let call_id = ToolCallId::new("call-legacy-failure").unwrap();
+        log.append(user(turn_id, "run the tool")).await.unwrap();
+        log.append(assistant(
+            turn_id,
+            response(
+                vec![AssistantPart::ToolCall(call(0, "call-legacy-failure"))],
+                None,
+            ),
+        ))
+        .await
+        .unwrap();
+        log.append(NewConversationEntry::ToolResult {
+            turn_id,
+            timestamp: timestamp(),
+            call_id,
+            result: LegacyToolOutput::failure("legacy failure").unwrap(),
+        })
+        .await
+        .unwrap();
+        log.append(terminal(turn_id, StoredTurnOutcome::Failed))
+            .await
+            .unwrap();
+
+        let file = root
+            .join("sessions")
+            .join(id.to_string())
+            .join("conversation.jsonl");
+        let physical = fs::read_to_string(&file).unwrap();
+        assert!(physical.contains("\"is_error\":true"));
+
+        log.close().await.unwrap();
+        store.shutdown().await.unwrap();
+        let reopened_store = SessionStore::open(root.clone()).await.unwrap();
+        let reopened = ConversationLog::open(&reopened_store, id).await.unwrap();
+        let snapshot = reopened.snapshot().await;
+        let result = snapshot
+            .entries()
+            .iter()
+            .find_map(|entry| match entry.as_ref() {
+                ConversationEntry::ToolResult { result, .. } => Some(result),
+                _ => None,
+            })
+            .expect("reloaded legacy tool result");
+        assert!(result.is_error());
+        assert_eq!(result.text(), "legacy failure");
+        cleanup(&reopened_store, &reopened, root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_sentinel_with_false_error_bit_is_rejected_on_reopen() {
+        let turn_id = TurnId::new().unwrap();
+        let assistant_entry = assistant(
+            turn_id,
+            response(
+                vec![AssistantPart::ToolCall(call(0, "call-false-restart"))],
+                None,
+            ),
+        )
+        .into_entry(1)
+        .unwrap();
+        let assistant_line = encoded(&assistant_entry);
+        let mut false_result = serde_json::to_vec(&json!({
+            "type": "tool_result",
+            "seq": 2,
+            "turn_id": turn_id,
+            "timestamp": timestamp(),
+            "call_id": "call-false-restart",
+            "result": {
+                "text": RESTART_CANCELLED_TEXT,
+                "is_error": false
+            }
+        }))
+        .unwrap();
+        false_result.push(b'\n');
+        expect_open_error(
+            [assistant_line.clone(), false_result].concat(),
+            ConversationError::CorruptAt {
+                line: 2,
+                offset: assistant_line.len() as u64,
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_restart_failure_sentinel_round_trips_on_reopen() {
+        let (store, log, root, id) = opened().await;
+        let turn_id = TurnId::new().unwrap();
+        log.close().await.unwrap();
+        store.shutdown().await.unwrap();
+        let file = root
+            .join("sessions")
+            .join(id.to_string())
+            .join("conversation.jsonl");
+        let assistant_entry = assistant(
+            turn_id,
+            response(
+                vec![AssistantPart::ToolCall(call(0, "call-explicit-restart"))],
+                None,
+            ),
+        )
+        .into_entry(1)
+        .unwrap();
+        let result_entry = ConversationEntry::ToolResult {
+            seq: 2,
+            turn_id,
+            timestamp: timestamp(),
+            call_id: ToolCallId::new("call-explicit-restart").unwrap(),
+            result: LegacyToolOutput::failure(RESTART_CANCELLED_TEXT).unwrap(),
+        };
+        let terminal_entry = ConversationEntry::TurnTerminal {
+            seq: 3,
+            turn_id,
+            timestamp: timestamp(),
+            outcome: StoredTurnOutcome::CancelledByRestart,
+        };
+        fs::write(
+            &file,
+            [
+                encoded(&assistant_entry),
+                encoded(&result_entry),
+                encoded(&terminal_entry),
+            ]
+            .concat(),
+        )
+        .unwrap();
+
+        let reopened_store = SessionStore::open(root.clone()).await.unwrap();
+        let reopened = ConversationLog::open(&reopened_store, id).await.unwrap();
+        let snapshot = reopened.snapshot().await;
+        let result = snapshot
+            .entries()
+            .iter()
+            .find_map(|entry| match entry.as_ref() {
+                ConversationEntry::ToolResult { result, .. } => Some(result),
+                _ => None,
+            })
+            .expect("explicit restart repair result");
+        assert_eq!(result.text(), RESTART_CANCELLED_TEXT);
+        assert!(result.is_error());
+        assert!(
+            fs::read_to_string(&file)
+                .unwrap()
+                .contains("\"is_error\":true")
+        );
+        cleanup(&reopened_store, &reopened, root).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1971,7 +2123,7 @@ mod tests {
             turn_id,
             timestamp: timestamp(),
             call_id: second.tool_call_id().clone(),
-            result: ToolOutput::success("second").unwrap(),
+            result: LegacyToolOutput::success("second").unwrap(),
         })
         .await
         .unwrap();
@@ -1979,7 +2131,7 @@ mod tests {
             turn_id,
             timestamp: timestamp(),
             call_id: first.tool_call_id().clone(),
-            result: ToolOutput::success("first").unwrap(),
+            result: LegacyToolOutput::success("first").unwrap(),
         })
         .await
         .unwrap();
@@ -2073,7 +2225,7 @@ mod tests {
             turn_id,
             timestamp: timestamp(),
             call_id: second.tool_call_id().clone(),
-            result: ToolOutput::success("second").unwrap(),
+            result: LegacyToolOutput::success("second").unwrap(),
         })
         .await
         .unwrap();
@@ -2081,7 +2233,7 @@ mod tests {
             turn_id,
             timestamp: timestamp(),
             call_id: first.tool_call_id().clone(),
-            result: ToolOutput::success("first").unwrap(),
+            result: LegacyToolOutput::success("first").unwrap(),
         })
         .await
         .unwrap();
@@ -2099,7 +2251,7 @@ mod tests {
                 turn_id,
                 timestamp: timestamp(),
                 call_id: first.tool_call_id().clone(),
-                result: ToolOutput::success("late").unwrap(),
+                result: LegacyToolOutput::success("late").unwrap(),
             })
             .await
             .is_err()
@@ -2176,7 +2328,7 @@ mod tests {
             turn_id,
             timestamp: timestamp(),
             call_id: first.tool_call_id().clone(),
-            result: ToolOutput::failure(RESTART_CANCELLED_TEXT).unwrap(),
+            result: LegacyToolOutput::failure(RESTART_CANCELLED_TEXT).unwrap(),
         };
         fs::write(
             &file,
@@ -2236,14 +2388,14 @@ mod tests {
             turn_id,
             timestamp: timestamp(),
             call_id: first.tool_call_id().clone(),
-            result: ToolOutput::failure(RESTART_CANCELLED_TEXT).unwrap(),
+            result: LegacyToolOutput::failure(RESTART_CANCELLED_TEXT).unwrap(),
         };
         let second_repair = ConversationEntry::ToolResult {
             seq: 3,
             turn_id,
             timestamp: timestamp(),
             call_id: second.tool_call_id().clone(),
-            result: ToolOutput::failure(RESTART_CANCELLED_TEXT).unwrap(),
+            result: LegacyToolOutput::failure(RESTART_CANCELLED_TEXT).unwrap(),
         };
         fs::write(
             &file,
@@ -2291,7 +2443,7 @@ mod tests {
             turn_id,
             timestamp: timestamp(),
             call_id: first.tool_call_id().clone(),
-            result: ToolOutput::failure(RESTART_CANCELLED_TEXT).unwrap(),
+            result: LegacyToolOutput::failure(RESTART_CANCELLED_TEXT).unwrap(),
         };
         let unrelated = ConversationEntry::User {
             seq: 3,
@@ -2329,14 +2481,14 @@ mod tests {
         let (store, log, root, id) = opened().await;
         let turn_id = TurnId::new().unwrap();
         let interaction_id = InteractionId::new().unwrap();
-        let question = UserQuestion::new(interaction_id, "Choose one", None).unwrap();
+        let question = LegacyUserQuestion::new(interaction_id, "Choose one", None).unwrap();
         log.append(user(turn_id, "question")).await.unwrap();
         log.append(NewConversationEntry::Interaction {
             turn_id,
             timestamp: timestamp(),
             interaction_id,
             question: question.clone(),
-            answer: UserAnswer::new("one").unwrap(),
+            answer: LegacyUserAnswer::new("one").unwrap(),
         })
         .await
         .unwrap();
@@ -2478,7 +2630,7 @@ mod tests {
         let (store, log, root, id) = opened().await;
         let turn_id = TurnId::new().unwrap();
         let interaction_id = InteractionId::new().unwrap();
-        let question = UserQuestion::new(interaction_id, "Allow tool?", None).unwrap();
+        let question = LegacyUserQuestion::new(interaction_id, "Allow tool?", None).unwrap();
         log.append(user(turn_id, "question")).await.unwrap();
         log.append(assistant(
             turn_id,
@@ -2491,7 +2643,7 @@ mod tests {
             timestamp: timestamp(),
             interaction_id,
             question,
-            answer: UserAnswer::new("no").unwrap(),
+            answer: LegacyUserAnswer::new("no").unwrap(),
         })
         .await
         .unwrap();
@@ -2605,7 +2757,7 @@ mod tests {
             turn_id: TurnId::new().unwrap(),
             timestamp: timestamp(),
             call_id: ToolCallId::new("orphan").unwrap(),
-            result: ToolOutput::success("orphan").unwrap(),
+            result: LegacyToolOutput::success("orphan").unwrap(),
         };
         let orphan_line = encoded(&orphan);
         expect_open_error(

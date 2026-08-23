@@ -1,8 +1,12 @@
 # Current Implementation Context
 
+> Transitional v0.2 checkpoint. P3-B has removed the public Runtime/ToolRegistry
+> facade and concrete tool adapters; the current public tool boundary is
+> described by the v0.3 README and architecture/module map.
+
 ## Checkpoint
 
-This repository is the v0.2 typed runtime core. The current authority is the source tree and the documents linked from [docs/README.md](docs/README.md). Pre-reset design material is historical and lives under `docs/archive/v2/pre-reset/`.
+This repository retains the v0.2 typed runtime core as migration evidence. The current authority is the source tree and the documents linked from [docs/README.md](docs/README.md). Pre-reset design material is historical and lives under `docs/archive/v2/pre-reset/`.
 
 The crate is Rust 2024 with Rust 1.85 as its MSRV. The default build is offline. Provider installation, credentials, endpoint selection, and the Tokio runtime handle are host responsibilities.
 
@@ -19,7 +23,7 @@ The crate is Rust 2024 with Rust 1.85 as its MSRV. The default build is offline.
 - `session`: actor, mailbox, observation, terminal/lifecycle orchestration, snapshots, events, and public transcript projection.
 - `runtime`: public orchestration and session residency manager.
 
-The public root exposes canonical `config`, `error`, `event`, `ids`, `model`, `runtime`, `session`, `tools`, and `workspace` modules. `agent`, `prompt`, and `storage` remain private. Storage workers, provider transport, actor commands, and prompt internals are not public extension seams.
+The public root exposes canonical `config`, `error`, `event`, `ids`, `model`, `session`, `tools`, and typed Port modules. `agent`, `prompt`, `runtime`, `storage`, and `workspace` remain private. Storage workers, provider transport, actor commands, and prompt internals are not public extension seams.
 
 ## Core Invariants
 

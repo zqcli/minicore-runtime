@@ -2,6 +2,9 @@
 
 状态：Accepted
 
+> Transitional v0.2 record. P3-B deletes the concrete builtin/process adapters;
+> this document preserves their historical authority analysis only.
+
 日期：2026-08-20
 
 ## Context
