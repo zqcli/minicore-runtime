@@ -16,8 +16,8 @@ use crate::model::{
 use crate::prompt::{PromptError, append_validated_summary};
 use crate::storage::conversation::{ConversationError, NewConversationEntry};
 use crate::tools::{
-    ToolCallSummary, ToolContext, ToolContextView, ToolDecision, ToolError, ToolOutput,
-    ToolRequest, ToolResultStatus, ToolResultSummary,
+    LegacyTool, LegacyToolCallSummary, LegacyToolContext, LegacyToolError, LegacyToolOutput,
+    LegacyToolResultStatus, LegacyToolResultSummary, ToolContextView, ToolDecision, ToolRequest,
 };
 
 pub(crate) const MAX_RUNNER_EVENT_CAPACITY: usize = 4_096;
@@ -30,8 +30,8 @@ const TOOL_EXECUTION_DENIED_TEXT: &str = "tool execution denied";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RunnerEvent {
     Model(ModelEvent),
-    ToolStarted(ToolCallSummary),
-    ToolFinished(ToolResultSummary),
+    ToolStarted(LegacyToolCallSummary),
+    ToolFinished(LegacyToolResultSummary),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -192,8 +192,8 @@ struct ModelAttempt {
 }
 
 struct ToolExecution {
-    output: ToolOutput,
-    status: ToolResultStatus,
+    output: LegacyToolOutput,
+    status: LegacyToolResultStatus,
     cancelled: bool,
 }
 
@@ -312,9 +312,14 @@ async fn run_turn_inner(ctx: &TurnContext) -> Flow {
         }
 
         if tool_rounds >= ctx.max_tool_rounds() {
-            if append_fixed_results(ctx, &calls, TOOL_ROUND_LIMIT_TEXT, ToolResultStatus::Failed)
-                .await
-                .is_err()
+            if append_fixed_results(
+                ctx,
+                &calls,
+                TOOL_ROUND_LIMIT_TEXT,
+                LegacyToolResultStatus::Failed,
+            )
+            .await
+            .is_err()
             {
                 return Flow::Failed(TurnFailure::Conversation);
             }
@@ -628,14 +633,14 @@ async fn execute_tool_round(ctx: &TurnContext, calls: &[ToolCall]) -> Flow {
 
 async fn append_remaining_cancelled(ctx: &TurnContext, calls: &[ToolCall]) -> Flow {
     for call in calls {
-        let output = match ToolOutput::failure(CANCELLED_TEXT) {
+        let output = match LegacyToolOutput::failure(CANCELLED_TEXT) {
             Ok(output) => output,
             Err(_) => return Flow::Failed(TurnFailure::Internal),
         };
         if append_tool_result(ctx, call, output).await.is_err() {
             return Flow::Failed(TurnFailure::Conversation);
         }
-        publish_tool_finished(ctx, call, ToolResultStatus::Cancelled);
+        publish_tool_finished(ctx, call, LegacyToolResultStatus::Cancelled);
     }
     Flow::Cancelled
 }
@@ -644,10 +649,10 @@ async fn append_fixed_results(
     ctx: &TurnContext,
     calls: &[ToolCall],
     text: &str,
-    status: ToolResultStatus,
+    status: LegacyToolResultStatus,
 ) -> Result<(), ()> {
     for call in calls {
-        let output = ToolOutput::failure(text).map_err(|_| ())?;
+        let output = LegacyToolOutput::failure(text).map_err(|_| ())?;
         append_tool_result(ctx, call, output)
             .await
             .map_err(|_| ())?;
@@ -659,7 +664,7 @@ async fn append_fixed_results(
 async fn append_tool_result(
     ctx: &TurnContext,
     call: &ToolCall,
-    output: ToolOutput,
+    output: LegacyToolOutput,
 ) -> Result<(), ConversationError> {
     let timestamp = ctx
         .timestamp()
@@ -698,14 +703,14 @@ async fn execute_one_tool(
     match decision {
         ToolDecision::Allow => execute_allowed_tool(ctx, call).await,
         ToolDecision::Deny { reason } => Ok(ToolExecution {
-            output: ToolOutput::failure(reason)
-                .or_else(|_| ToolOutput::failure(TOOL_EXECUTION_DENIED_TEXT))
+            output: LegacyToolOutput::failure(reason)
+                .or_else(|_| LegacyToolOutput::failure(TOOL_EXECUTION_DENIED_TEXT))
                 .map_err(|_| TurnFailure::Internal)?,
-            status: ToolResultStatus::Denied,
+            status: LegacyToolResultStatus::Denied,
             cancelled: false,
         }),
         ToolDecision::Ask { question, choices } => {
-            let tool_context = ToolContext::new(
+            let tool_context = LegacyToolContext::new(
                 ctx.session_id(),
                 ctx.turn_id(),
                 ctx.workspace(),
@@ -720,13 +725,13 @@ async fn execute_one_tool(
                 {
                     execute_allowed_tool(ctx, call).await
                 }
-                Err(ToolError::Cancelled) if ctx.cancellation().is_cancelled() => {
+                Err(LegacyToolError::Cancelled) if ctx.cancellation().is_cancelled() => {
                     cancelled_tool_execution()
                 }
                 Ok(_) | Err(_) => Ok(ToolExecution {
-                    output: ToolOutput::failure(TOOL_EXECUTION_DENIED_TEXT)
+                    output: LegacyToolOutput::failure(TOOL_EXECUTION_DENIED_TEXT)
                         .map_err(|_| TurnFailure::Internal)?,
-                    status: ToolResultStatus::Denied,
+                    status: LegacyToolResultStatus::Denied,
                     cancelled: false,
                 }),
             }
@@ -744,7 +749,7 @@ async fn execute_allowed_tool(
     if ctx.cancellation().is_cancelled() {
         return cancelled_tool_execution();
     }
-    let tool_context = ToolContext::new(
+    let tool_context = LegacyToolContext::new(
         ctx.session_id(),
         ctx.turn_id(),
         ctx.workspace(),
@@ -764,9 +769,9 @@ async fn execute_allowed_tool(
     match result {
         Some(Ok(output)) => {
             let status = if output.is_error() {
-                ToolResultStatus::Failed
+                LegacyToolResultStatus::Failed
             } else {
-                ToolResultStatus::Succeeded
+                LegacyToolResultStatus::Succeeded
             };
             Ok(ToolExecution {
                 output,
@@ -774,7 +779,7 @@ async fn execute_allowed_tool(
                 cancelled: false,
             })
         }
-        Some(Err(ToolError::Cancelled)) if ctx.cancellation().is_cancelled() => {
+        Some(Err(LegacyToolError::Cancelled)) if ctx.cancellation().is_cancelled() => {
             cancelled_tool_execution()
         }
         Some(Err(_)) | None => failed_tool_execution(),
@@ -782,7 +787,7 @@ async fn execute_allowed_tool(
 }
 
 fn publish_tool_started(ctx: &TurnContext, call: &ToolCall) {
-    if let Ok(summary) = ToolCallSummary::new(
+    if let Ok(summary) = LegacyToolCallSummary::new(
         call.tool_call_id().clone(),
         call.name().clone(),
         call.call_index(),
@@ -793,8 +798,8 @@ fn publish_tool_started(ctx: &TurnContext, call: &ToolCall) {
     }
 }
 
-fn publish_tool_finished(ctx: &TurnContext, call: &ToolCall, status: ToolResultStatus) {
-    if let Ok(summary) = ToolResultSummary::new(call.tool_call_id().clone(), status) {
+fn publish_tool_finished(ctx: &TurnContext, call: &ToolCall, status: LegacyToolResultStatus) {
+    if let Ok(summary) = LegacyToolResultSummary::new(call.tool_call_id().clone(), status) {
         let _ = ctx
             .events()
             .try_publish_tool(RunnerEvent::ToolFinished(summary));
@@ -803,17 +808,17 @@ fn publish_tool_finished(ctx: &TurnContext, call: &ToolCall, status: ToolResultS
 
 fn failed_tool_execution() -> Result<ToolExecution, TurnFailure> {
     Ok(ToolExecution {
-        output: ToolOutput::failure(TOOL_EXECUTION_FAILED_TEXT)
+        output: LegacyToolOutput::failure(TOOL_EXECUTION_FAILED_TEXT)
             .map_err(|_| TurnFailure::Internal)?,
-        status: ToolResultStatus::Failed,
+        status: LegacyToolResultStatus::Failed,
         cancelled: false,
     })
 }
 
 fn cancelled_tool_execution() -> Result<ToolExecution, TurnFailure> {
     Ok(ToolExecution {
-        output: ToolOutput::failure(CANCELLED_TEXT).map_err(|_| TurnFailure::Internal)?,
-        status: ToolResultStatus::Cancelled,
+        output: LegacyToolOutput::failure(CANCELLED_TEXT).map_err(|_| TurnFailure::Internal)?,
+        status: LegacyToolResultStatus::Cancelled,
         cancelled: true,
     })
 }
@@ -823,8 +828,8 @@ const _: () = {
     let _ = std::mem::size_of::<RunnerEventSink>();
     let _ = std::mem::size_of::<TurnFailure>();
     let _ = std::mem::size_of::<TurnTaskResult>();
-    let _: fn(ToolCallSummary) -> RunnerEvent = RunnerEvent::ToolStarted;
-    let _: fn(ToolResultSummary) -> RunnerEvent = RunnerEvent::ToolFinished;
+    let _: fn(LegacyToolCallSummary) -> RunnerEvent = RunnerEvent::ToolStarted;
+    let _: fn(LegacyToolResultSummary) -> RunnerEvent = RunnerEvent::ToolFinished;
     let _ = RunnerEventSink::channel;
     let _ = RunnerEventSink::try_publish_model;
     let _ = RunnerEventSink::try_publish_tool;

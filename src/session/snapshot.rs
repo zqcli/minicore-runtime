@@ -4,7 +4,7 @@ use thiserror::Error;
 use crate::error::PublicErrorSummary;
 use crate::ids::{SessionId, TurnId};
 use crate::model::Usage;
-use crate::tools::UserQuestion;
+use crate::tools::LegacyUserQuestion;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum SnapshotShapeError {
@@ -94,7 +94,7 @@ pub struct SessionSnapshot {
     session_id: SessionId,
     status: super::state::SessionStatus,
     active_turn: Option<TurnSummary>,
-    pending_question: Option<UserQuestion>,
+    pending_question: Option<LegacyUserQuestion>,
     usage: Usage,
     last_error: Option<PublicErrorSummary>,
     last_terminal: Option<TurnTerminal>,
@@ -106,7 +106,7 @@ struct SessionSnapshotWire {
     session_id: SessionId,
     status: super::state::SessionStatus,
     active_turn: Option<TurnSummary>,
-    pending_question: Option<UserQuestion>,
+    pending_question: Option<LegacyUserQuestion>,
     usage: Usage,
     last_error: Option<PublicErrorSummary>,
     last_terminal: Option<TurnTerminal>,
@@ -118,7 +118,7 @@ impl SessionSnapshot {
         session_id: SessionId,
         status: super::state::SessionStatus,
         active_turn: Option<TurnSummary>,
-        pending_question: Option<UserQuestion>,
+        pending_question: Option<LegacyUserQuestion>,
         usage: Usage,
         history: SnapshotHistory,
         conversation_seq: u64,
@@ -196,12 +196,8 @@ impl SessionSnapshot {
         self.active_turn.as_ref()
     }
 
-    pub const fn pending_question(&self) -> Option<&UserQuestion> {
+    pub(crate) const fn pending_question(&self) -> Option<&LegacyUserQuestion> {
         self.pending_question.as_ref()
-    }
-
-    pub const fn usage(&self) -> &Usage {
-        &self.usage
     }
 
     pub const fn last_error(&self) -> Option<&PublicErrorSummary> {
@@ -214,6 +210,13 @@ impl SessionSnapshot {
 
     pub const fn conversation_seq(&self) -> u64 {
         self.conversation_seq
+    }
+}
+
+#[cfg(test)]
+impl SessionSnapshot {
+    pub(crate) const fn usage(&self) -> &Usage {
+        &self.usage
     }
 }
 
@@ -235,3 +238,20 @@ impl<'de> Deserialize<'de> for SessionSnapshot {
         .map_err(serde::de::Error::custom)
     }
 }
+
+const _: () = {
+    // P6 deletion target: remove with the legacy session snapshot surface.
+    let _ = std::mem::size_of::<TerminalOutcome>();
+    let _ = std::mem::size_of::<TurnTerminalSummary>();
+    let _: fn(TurnId) -> TurnTerminal = TurnTerminal::completed;
+    let _: fn(&SessionSnapshot) -> SessionId = SessionSnapshot::session_id;
+    let _: for<'a> fn(&'a SessionSnapshot) -> Option<&'a TurnSummary> =
+        SessionSnapshot::active_turn;
+    let _: for<'a> fn(&'a SessionSnapshot) -> Option<&'a LegacyUserQuestion> =
+        SessionSnapshot::pending_question;
+    let _: for<'a> fn(&'a SessionSnapshot) -> Option<&'a PublicErrorSummary> =
+        SessionSnapshot::last_error;
+    let _: for<'a> fn(&'a SessionSnapshot) -> Option<&'a TurnTerminal> =
+        SessionSnapshot::last_terminal;
+    let _: fn(&SessionSnapshot) -> u64 = SessionSnapshot::conversation_seq;
+};

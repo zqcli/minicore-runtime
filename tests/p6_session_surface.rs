@@ -9,7 +9,7 @@ fn p6_session_actor_surface_is_private_and_owner_proof_free() {
     assert!(!session.contains("pub mod command"));
 
     let command = include_str!("../src/session/command.rs");
-    let tools_context = include_str!("../src/tools/context.rs");
+    let tools_context = include_str!("../src/tools/legacy_context.rs");
     let tools_mod = include_str!("../src/tools/mod.rs");
     assert!(tools_context.contains("pub(crate) fn claim_response"));
     assert!(tools_context.contains("pub(crate) struct InteractionResponse"));

@@ -15,7 +15,7 @@ use minicore_runtime::model::{
     ProviderRegistryBuilder, ReasoningContent, ReasoningPreference, ToolCall,
     fixed_credential_source,
 };
-use minicore_runtime::tools::{ToolName, ToolOutput, ToolSpec};
+use minicore_runtime::tools::{ToolName, ToolOutput, ToolResultOutcome, ToolSpec};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -329,9 +329,10 @@ async fn openai_provider_replays_reasoning_and_tool_items_without_private_artifa
                 AssistantPart::ToolCall(call.clone()),
             ])
             .unwrap(),
-            ModelMessage::tool(
+            ModelMessage::tool_with_outcome(
                 call.tool_call_id().clone(),
-                ToolOutput::success("exact output").unwrap(),
+                ToolOutput::new("exact output").unwrap(),
+                ToolResultOutcome::Success,
             )
             .unwrap(),
             ModelMessage::user("continue").unwrap(),

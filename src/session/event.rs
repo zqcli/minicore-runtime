@@ -2,13 +2,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::SessionEventKind;
 use crate::ids::TurnId;
-use crate::tools::{ToolCallSummary, ToolResultSummary, UserQuestion};
+use crate::tools::{LegacyToolCallSummary, LegacyToolResultSummary, LegacyUserQuestion};
 
 use super::snapshot::{SessionSnapshot, TurnOutcome};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum SessionEvent {
+pub(crate) enum SessionEvent {
     Snapshot(SessionSnapshot),
     TurnStarted {
         turn_id: TurnId,
@@ -23,15 +23,15 @@ pub enum SessionEvent {
     },
     ToolStarted {
         turn_id: TurnId,
-        call: ToolCallSummary,
+        call: LegacyToolCallSummary,
     },
     ToolFinished {
         turn_id: TurnId,
-        result: ToolResultSummary,
+        result: LegacyToolResultSummary,
     },
     InputRequested {
         turn_id: TurnId,
-        question: UserQuestion,
+        question: LegacyUserQuestion,
     },
     TurnFinished {
         turn_id: TurnId,
@@ -42,7 +42,7 @@ pub enum SessionEvent {
 }
 
 impl SessionEvent {
-    pub const fn kind(&self) -> SessionEventKind {
+    pub(crate) const fn kind(&self) -> SessionEventKind {
         match self {
             Self::Snapshot(_) => SessionEventKind::Snapshot,
             Self::TurnStarted { .. } => SessionEventKind::TurnStarted,
@@ -57,3 +57,6 @@ impl SessionEvent {
         }
     }
 }
+
+// P6 deletion target: remove with the legacy session event surface.
+const _: for<'a> fn(&'a SessionEvent) -> SessionEventKind = SessionEvent::kind;

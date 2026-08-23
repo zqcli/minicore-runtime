@@ -180,7 +180,7 @@ impl Drop for SessionObservation {
     }
 }
 
-pub struct SessionEventStream {
+pub(crate) struct SessionEventStream {
     observation: Arc<ObservationInner>,
     initial: Option<SessionSnapshot>,
     pending_resync_snapshot: Option<SessionSnapshot>,
@@ -190,11 +190,11 @@ pub struct SessionEventStream {
 }
 
 impl SessionEventStream {
-    pub fn snapshot(&self) -> SessionSnapshot {
+    pub(crate) fn snapshot(&self) -> SessionSnapshot {
         self.observation.snapshot_tx.borrow().clone()
     }
 
-    pub async fn recv(&mut self) -> Option<SessionEvent> {
+    pub(crate) async fn recv(&mut self) -> Option<SessionEvent> {
         if self.closed {
             return None;
         }

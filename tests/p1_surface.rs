@@ -1,56 +1,5 @@
-use minicore_runtime::{InteractionId, SessionEventKind, SessionStatus, TranscriptPage, TurnId};
-
-const P1_SOURCES: &[&str] = &[
-    include_str!("../src/ids.rs"),
-    include_str!("../src/error.rs"),
-    include_str!("../src/event.rs"),
-    include_str!("../src/config/retry.rs"),
-    include_str!("../src/model/mod.rs"),
-    include_str!("../src/model/types.rs"),
-    include_str!("../src/conversation/mod.rs"),
-    include_str!("../src/conversation/entry.rs"),
-    include_str!("../src/tools/mod.rs"),
-    include_str!("../src/tools/types.rs"),
-    include_str!("../src/storage/mod.rs"),
-    include_str!("../src/storage/session_log.rs"),
-    include_str!("../src/session/mod.rs"),
-    include_str!("../src/session/state.rs"),
-    include_str!("../src/session/snapshot.rs"),
-    include_str!("../src/session/event.rs"),
-];
-
-fn root_use_block<'a>(lib: &'a str, module: &str) -> Option<&'a str> {
-    let marker = format!("pub use {module}::{{");
-    let start = lib.find(&marker)?;
-    let end = lib[start..].find("};")? + start + 2;
-    Some(&lib[start..end])
-}
-
-fn assert_root_exports(lib: &str, module: &str, symbols: &[&str]) {
-    let block = root_use_block(lib, module).expect("stable root export block is present");
-    for &symbol in symbols {
-        assert!(
-            block.contains(symbol),
-            "missing {module} root export: {symbol}"
-        );
-    }
-}
-
 #[test]
-fn p1_sources_have_no_legacy_imports_or_new_dead_code_suppression() {
-    for source in P1_SOURCES {
-        assert!(!source.contains("crate::wire"));
-        assert!(!source.contains("crate::model_gateway"));
-        assert!(!source.contains("crate::session_execution"));
-        assert!(!source.contains("crate::session_residency"));
-        assert!(!source.contains("allow(dead_code"));
-        assert!(!source.contains("allow(\n    dead_code"));
-        assert!(!source.contains("::*"));
-    }
-}
-
-#[test]
-fn canonical_modules_have_explicit_root_exports() {
+fn canonical_modules_keep_only_the_current_root_facade() {
     let lib = include_str!("../src/lib.rs");
     for declaration in [
         "pub mod config;",
@@ -59,163 +8,90 @@ fn canonical_modules_have_explicit_root_exports() {
         "pub mod event;",
         "pub mod ids;",
         "pub mod model;",
-        "pub mod runtime;",
         "pub mod session;",
+        "pub mod storage;",
         "pub mod tools;",
-        "pub mod workspace;",
+        "mod workspace;",
     ] {
         assert!(
             lib.contains(declaration),
             "missing canonical module: {declaration}"
         );
     }
+    assert!(lib.contains("mod runtime;"));
     assert!(lib.contains("mod agent;"));
     assert!(lib.contains("mod prompt;"));
-    assert!(lib.contains("pub mod storage;"));
-    assert!(!lib.contains("#[path ="));
-    assert!(!lib.contains("_v2"));
-    assert_root_exports(
-        lib,
-        "config",
-        &[
-            "ConfigError",
-            "RetryPolicy",
-            "RetryPolicyError",
-            "RuntimeConfig",
-            "RuntimeConfigBuilder",
-            "SessionConfig",
-        ],
-    );
-    assert_root_exports(
-        lib,
-        "error",
-        &[
-            "PublicErrorCode",
-            "PublicErrorSummary",
-            "RuntimeError",
-            "SessionError",
-        ],
-    );
-    assert_root_exports(
-        lib,
-        "ids",
-        &[
-            "IdError",
-            "IdGenerationError",
-            "InteractionId",
-            "RuntimeIdError",
-            "SessionId",
-            "ToolCallId",
-            "ToolCallIdError",
-            "TurnId",
-        ],
-    );
-    assert_root_exports(lib, "runtime", &["Runtime", "SessionSummary"]);
-    assert_root_exports(
-        lib,
-        "session",
-        &[
-            "SessionEvent",
-            "SessionEventStream",
-            "SessionSnapshot",
-            "SessionStatus",
-            "SnapshotHistory",
-            "SnapshotShapeError",
-            "TerminalOutcome",
-            "TranscriptEntry",
-            "TranscriptToolCall",
-            "TurnOutcome",
-            "TurnSummary",
-            "TurnTerminalSummary",
-        ],
-    );
-    assert_root_exports(
-        lib,
-        "conversation",
-        &[
-            "ConversationEntry",
-            "ConversationSeq",
-            "TranscriptPage",
-            "TurnTerminal",
-        ],
-    );
-    assert_root_exports(
-        lib,
-        "storage",
-        &[
-            "AppendReceipt",
-            "ConversationPage",
-            "SessionLog",
-            "SessionLogError",
-        ],
-    );
-    let conversation_exports = root_use_block(lib, "conversation").unwrap();
-    let session_exports = root_use_block(lib, "session").unwrap();
-    assert!(!session_exports.contains("TranscriptPage"));
-    let _: Option<TranscriptPage> = None;
-    for symbol in [
-        "AssistantMessageEntry",
-        "SummaryEntry",
-        "ToolResultEntry",
-        "UserMessageEntry",
+    assert!(lib.contains("pub mod compaction;"));
+    assert!(lib.contains("pub mod context;"));
+    assert!(!lib.contains("pub mod runtime;"));
+    assert!(!lib.contains("pub mod workspace;"));
+    assert!(!lib.contains("pub use workspace"));
+    assert!(!include_str!("../src/workspace/mod.rs").contains("pub use "));
+    for removed in [
+        "RuntimeConfig",
+        "RuntimeConfigBuilder",
+        "SessionConfig",
+        "Runtime,",
+        "SessionSummary",
     ] {
-        assert!(!conversation_exports.contains(symbol));
+        assert!(
+            !lib.contains(removed),
+            "legacy root export remains: {removed}"
+        );
     }
-    let storage_exports = root_use_block(lib, "storage").unwrap();
-    for symbol in ["LogFuture", "SessionLogErrorKind", "SessionStore"] {
-        assert!(!storage_exports.contains(symbol));
-    }
-    assert!(root_use_block(lib, "model").is_none());
-    assert!(root_use_block(lib, "tools").is_none());
-    assert!(root_use_block(lib, "workspace").is_none());
-    assert!(lib.contains("pub use event::SessionEventKind;"));
-    let storage = include_str!("../src/storage/mod.rs");
-    assert!(storage.contains("mod session_log;"));
-    assert!(storage.contains("pub(crate) mod store;"));
-    assert!(!storage.contains("pub mod store;"));
-    let config = include_str!("../src/config.rs");
-    assert!(config.contains("mod retry;"));
-    assert!(config.contains("pub use retry::{RetryPolicy, RetryPolicyError};"));
-    let agent = include_str!("../src/agent/mod.rs");
-    assert!(!agent.contains("pub use context::{RetryPolicy"));
-    assert!(!include_str!("../src/model/mod.rs").contains("pub mod types"));
-    assert!(!include_str!("../src/session/mod.rs").contains("pub mod snapshot"));
-    assert!(!include_str!("../src/tools/mod.rs").contains("pub mod types"));
+    assert!(!lib.contains("pub use runtime"));
+    assert!(!include_str!("../src/tools/mod.rs").contains("pub use registry"));
 }
 
 #[test]
-fn root_event_is_a_leaf_and_session_event_kind_is_the_public_event_catalog() {
-    let root_event = include_str!("../src/event.rs");
-    assert!(root_event.contains("enum SessionEventKind"));
-    assert!(!root_event.contains("SessionEvent {"));
-    assert!(!root_event.contains("use crate::"));
-    assert!(!root_event.contains("EventDelivery"));
-    let model_types = include_str!("../src/model/types.rs");
-    assert!(!model_types.contains("Completed { response"));
-    assert!(!model_types.contains("ToolCall { call"));
-    assert!(
-        P1_SOURCES
-            .iter()
-            .any(|source| source.contains("enum SessionEvent"))
-    );
-    assert_eq!(SessionEventKind::Snapshot, SessionEventKind::Snapshot);
+fn model_and_tool_errors_keep_the_public_legacy_split() {
+    let model = include_str!("../src/model/types.rs");
+    let public_model = model
+        .split("pub enum ModelMessage")
+        .nth(1)
+        .and_then(|tail| tail.split("#[derive(Deserialize)]").next())
+        .expect("public ModelMessage definition");
+    assert!(public_model.contains("output: ToolOutput"));
+    assert!(public_model.contains("outcome: ToolResultOutcome"));
+    assert!(!public_model.contains("LegacyToolOutput"));
+
+    let tool_errors = include_str!("../src/tools/types.rs");
+    for legacy_variant in [
+        "UnknownTool",
+        "DuplicateTool",
+        "InteractionClosed",
+        "InteractionBusy",
+        "InvalidInteraction",
+    ] {
+        assert!(!tool_errors.contains(legacy_variant));
+    }
+    assert!(include_str!("../src/tools/legacy_types.rs").contains("enum LegacyToolError"));
 }
 
 #[test]
-fn session_status_has_exactly_the_four_p1_states() {
-    let turn_id = TurnId::new().unwrap();
-    let interaction_id = InteractionId::new().unwrap();
-    let states = [
-        SessionStatus::Idle,
-        SessionStatus::Running { turn_id },
-        SessionStatus::WaitingForInput {
-            turn_id,
-            interaction_id,
-        },
-        SessionStatus::Closing,
-    ];
-    assert!(matches!(states[0], SessionStatus::Idle));
-    assert!(matches!(states[1], SessionStatus::Running { .. }));
-    assert!(matches!(states[2], SessionStatus::WaitingForInput { .. }));
-    assert!(matches!(states[3], SessionStatus::Closing));
+fn source_has_no_legacy_imports_or_new_dead_code_suppression() {
+    for source in [
+        include_str!("../src/lib.rs"),
+        include_str!("../src/tools/tool.rs"),
+        include_str!("../src/tools/set.rs"),
+        include_str!("../src/tools/context.rs"),
+        include_str!("../src/tools/input.rs"),
+    ] {
+        for forbidden in [
+            "crate::wire",
+            "crate::runtime",
+            "allow(dead_code",
+            "allow(\n    dead_code",
+            "::*",
+            "ToolRegistry",
+            "LegacyTool",
+            "Workspace",
+            "SessionHandle",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "forbidden final surface token: {forbidden}"
+            );
+        }
+    }
 }

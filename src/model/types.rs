@@ -10,7 +10,9 @@ use thiserror::Error;
 
 use crate::ids::ToolCallId;
 pub(crate) use crate::tools::ToolSpec;
-use crate::tools::{ToolName, ToolOutput, validate_json_shape};
+use crate::tools::{
+    LegacyToolOutput, ToolName, ToolOutput, ToolResultOutcome, validate_json_shape,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ModelIdentityError {
@@ -966,10 +968,12 @@ pub enum ModelMessage {
     Tool {
         tool_call_id: ToolCallId,
         output: ToolOutput,
+        outcome: ToolResultOutcome,
     },
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "role", content = "content", rename_all = "snake_case")]
 enum ModelMessageWire {
     System(String),
@@ -978,6 +982,7 @@ enum ModelMessageWire {
     Tool {
         tool_call_id: ToolCallId,
         output: ToolOutput,
+        outcome: ToolResultOutcome,
     },
 }
 
@@ -1004,10 +1009,32 @@ impl ModelMessage {
         Ok(message)
     }
 
-    pub fn tool(tool_call_id: ToolCallId, output: ToolOutput) -> Result<Self, ModelValueError> {
+    pub fn tool_with_outcome(
+        tool_call_id: ToolCallId,
+        output: ToolOutput,
+        outcome: ToolResultOutcome,
+    ) -> Result<Self, ModelValueError> {
         Ok(Self::Tool {
             tool_call_id,
             output,
+            outcome,
+        })
+    }
+
+    pub(crate) fn legacy_tool(
+        tool_call_id: ToolCallId,
+        output: LegacyToolOutput,
+    ) -> Result<Self, ModelValueError> {
+        let outcome = if output.is_error() {
+            ToolResultOutcome::Failed
+        } else {
+            ToolResultOutcome::Success
+        };
+        let output = ToolOutput::new(output.text()).map_err(|_| ModelValueError::InvalidText)?;
+        Ok(Self::Tool {
+            tool_call_id,
+            output,
+            outcome,
         })
     }
 
@@ -1043,9 +1070,11 @@ impl<'de> Deserialize<'de> for ModelMessage {
             ModelMessageWire::Tool {
                 tool_call_id,
                 output,
+                outcome,
             } => Self::Tool {
                 tool_call_id,
                 output,
+                outcome,
             },
         };
         value.validate().map_err(serde::de::Error::custom)?;
@@ -1369,5 +1398,34 @@ fn validate_tool_exchange(messages: &[ModelMessage]) -> Result<(), ModelValueErr
         Ok(())
     } else {
         Err(ModelValueError::IncompleteToolExchange)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelMessage;
+    use crate::ids::ToolCallId;
+    use crate::tools::{LegacyToolOutput, ToolResultOutcome};
+
+    #[test]
+    fn legacy_tool_message_maps_failure_to_public_outcome_wire() {
+        let message = ModelMessage::legacy_tool(
+            ToolCallId::new("call-legacy").unwrap(),
+            LegacyToolOutput::failure("failed").unwrap(),
+        )
+        .unwrap();
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value["content"]["output"]["content"], "failed");
+        assert_eq!(value["content"]["outcome"], "failed");
+        assert!(value["content"].get("text").is_none());
+        assert!(value["content"]["output"].get("is_error").is_none());
+        let decoded: ModelMessage = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            decoded,
+            ModelMessage::Tool {
+                outcome: ToolResultOutcome::Failed,
+                ..
+            }
+        ));
     }
 }

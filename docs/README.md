@@ -1,6 +1,10 @@
 # Documentation Authority
 
-The current v0.2 documentation follows this order:
+> The pages below retain the v0.2 reset record as transitional migration
+> evidence. The current v0.3 P3-B public Tool/ToolSet boundary is documented in
+> the root README, `docs/architecture.md`, and `docs/modules/README.md`.
+
+The transitional v0.2 documentation follows this order:
 
 1. [Architecture](architecture.md) for dependency direction, owners, lifecycle, and cross-module invariants.
 2. [Canonical module map](modules/README.md) for source ownership and public/private boundaries.

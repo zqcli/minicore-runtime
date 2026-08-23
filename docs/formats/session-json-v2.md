@@ -1,5 +1,7 @@
 # Session JSON v2
 
+> Transitional v0.2 persistence format retained for the legacy storage path.
+
 This document is the current durable session configuration contract implemented by [`src/storage/store.rs`](../../src/storage/store.rs). The store writes one `session.json` per session directory and rejects unknown fields, duplicate enabled tools, unsupported format versions, invalid paths, invalid text, and values outside the bounds below.
 
 ## Layout

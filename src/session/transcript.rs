@@ -203,8 +203,7 @@ impl ConversationEntry {
 }
 
 const _: () = {
-    let _ = std::mem::size_of::<TranscriptEntry>();
-    let _ = std::mem::size_of::<TranscriptPage>();
-    let _ = std::mem::size_of::<TranscriptToolCall>();
-    let _ = TranscriptPage::new;
+    // P6 deletion target: remove with the legacy session transcript surface.
+    let _: for<'a> fn(&'a TranscriptPage) -> &'a [TranscriptEntry] = TranscriptPage::entries;
+    let _: fn(&TranscriptPage) -> Option<u64> = TranscriptPage::next_after_seq;
 };

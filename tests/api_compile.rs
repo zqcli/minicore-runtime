@@ -23,7 +23,7 @@ mod v03_public_api_compile_contract {
         SessionEventEnvelope, SessionEventStream, SessionState, TurnOutcome,
     };
     use minicore_runtime::storage::SessionLog;
-    use minicore_runtime::tools::{Tool, ToolPolicy, ToolSet};
+    use minicore_runtime::tools::{Tool, ToolSet};
     use minicore_runtime::{
         ApprovalDecision, CompactionConfig, InteractionAnswer, InteractionId, KernelConfig,
         SessionBindings, SessionHandle, SessionId, SessionRuntime, SessionRuntimeOptions,
@@ -38,13 +38,11 @@ mod v03_public_api_compile_contract {
         model: Arc<dyn Model>,
         tools: ToolSet,
         tool: Arc<dyn Tool>,
-        policy: Arc<dyn ToolPolicy>,
         context: Arc<dyn ContextProvider>,
         compaction: Arc<dyn CompactionStrategy>,
         runtime: tokio::runtime::Handle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let bindings =
-            SessionBindings::new(model, tools, Some(policy), Some(context), Some(compaction));
+        let bindings = SessionBindings::new(model, tools, None, Some(context), Some(compaction));
         let options = SessionRuntimeOptions::new(
             KernelConfig::default_checked()?,
             bindings.clone(),

@@ -14,7 +14,7 @@ const MAX_CHOICE_BYTES: usize = 1_024;
 const MAX_CHOICES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum ToolPolicyError {
+pub(crate) enum ToolPolicyError {
     #[error("tool policy text is empty, unsafe, or exceeds its limit")]
     InvalidText,
     #[error("tool policy choices are invalid")]
@@ -42,7 +42,7 @@ fn validate_choices(choices: Option<&[String]>) -> Result<(), ToolPolicyError> {
     Ok(())
 }
 
-pub struct ToolRequest<'a> {
+pub(crate) struct ToolRequest<'a> {
     tool_call_id: &'a ToolCallId,
     tool_name: &'a ToolName,
     arguments: &'a Value,
@@ -50,7 +50,7 @@ pub struct ToolRequest<'a> {
 }
 
 impl<'a> ToolRequest<'a> {
-    pub const fn new(
+    pub(crate) const fn new(
         tool_call_id: &'a ToolCallId,
         tool_name: &'a ToolName,
         arguments: &'a Value,
@@ -64,31 +64,31 @@ impl<'a> ToolRequest<'a> {
         }
     }
 
-    pub const fn tool_call_id(&self) -> &ToolCallId {
+    pub(crate) const fn tool_call_id(&self) -> &ToolCallId {
         self.tool_call_id
     }
 
-    pub const fn tool_name(&self) -> &ToolName {
+    pub(crate) const fn tool_name(&self) -> &ToolName {
         self.tool_name
     }
 
-    pub const fn arguments(&self) -> &Value {
+    pub(crate) const fn arguments(&self) -> &Value {
         self.arguments
     }
 
-    pub const fn call_index(&self) -> u32 {
+    pub(crate) const fn call_index(&self) -> u32 {
         self.call_index
     }
 }
 
-pub struct ToolContextView<'a> {
+pub(crate) struct ToolContextView<'a> {
     session_id: SessionId,
     turn_id: TurnId,
     enabled_tools: &'a BTreeSet<ToolName>,
 }
 
 impl<'a> ToolContextView<'a> {
-    pub const fn new(
+    pub(crate) const fn new(
         session_id: SessionId,
         turn_id: TurnId,
         enabled_tools: &'a BTreeSet<ToolName>,
@@ -100,22 +100,22 @@ impl<'a> ToolContextView<'a> {
         }
     }
 
-    pub const fn session_id(&self) -> SessionId {
+    pub(crate) const fn session_id(&self) -> SessionId {
         self.session_id
     }
 
-    pub const fn turn_id(&self) -> TurnId {
+    pub(crate) const fn turn_id(&self) -> TurnId {
         self.turn_id
     }
 
-    pub const fn enabled_tools(&self) -> &BTreeSet<ToolName> {
+    pub(crate) const fn enabled_tools(&self) -> &BTreeSet<ToolName> {
         self.enabled_tools
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "decision", content = "data", rename_all = "snake_case")]
-pub enum ToolDecision {
+pub(crate) enum ToolDecision {
     Allow,
     Deny {
         reason: String,
@@ -140,7 +140,7 @@ enum ToolDecisionWire {
 }
 
 impl ToolDecision {
-    pub fn deny(reason: impl Into<String>) -> Result<Self, ToolPolicyError> {
+    pub(crate) fn deny(reason: impl Into<String>) -> Result<Self, ToolPolicyError> {
         let decision = Self::Deny {
             reason: reason.into(),
         };
@@ -148,7 +148,7 @@ impl ToolDecision {
         Ok(decision)
     }
 
-    pub fn ask(
+    pub(crate) fn ask(
         question: impl Into<String>,
         choices: Option<Vec<String>>,
     ) -> Result<Self, ToolPolicyError> {
@@ -160,7 +160,7 @@ impl ToolDecision {
         Ok(decision)
     }
 
-    pub fn validate(&self) -> Result<(), ToolPolicyError> {
+    pub(crate) fn validate(&self) -> Result<(), ToolPolicyError> {
         match self {
             Self::Allow => Ok(()),
             Self::Deny { reason } => {
@@ -195,15 +195,15 @@ impl<'de> Deserialize<'de> for ToolDecision {
     }
 }
 
-pub trait ToolPolicy: Send + Sync {
+pub(crate) trait ToolPolicy: Send + Sync {
     fn decide(&self, request: &ToolRequest<'_>, ctx: &ToolContextView<'_>) -> ToolDecision;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct AllowConfiguredTools;
+pub(crate) struct AllowConfiguredTools;
 
 impl AllowConfiguredTools {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self
     }
 }
@@ -219,3 +219,15 @@ impl ToolPolicy for AllowConfiguredTools {
         }
     }
 }
+
+const _: () = {
+    // P4/P6 deletion target: remove when typed approval replaces legacy policy DTOs.
+    let _ = ToolRequest::tool_call_id;
+    let _ = ToolRequest::arguments;
+    let _ = ToolRequest::call_index;
+    let _ = ToolContextView::session_id;
+    let _ = ToolContextView::turn_id;
+    let _: fn(String) -> Result<ToolDecision, ToolPolicyError> = ToolDecision::deny;
+    let _: fn(String, Option<Vec<String>>) -> Result<ToolDecision, ToolPolicyError> =
+        ToolDecision::ask;
+};

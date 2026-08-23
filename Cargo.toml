@@ -1,6 +1,6 @@
 [package]
 name = "minicore-runtime"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -9,8 +9,7 @@ description = "Embeddable MiniCore agent runtime"
 [dependencies]
 # Production Workspace capability layer for the single configured root. Pinned exactly;
 # `default-features = false` keeps the dependency surface explicit. Workspace file
-# operations resolve through the captured root `Dir`. `run_command` receives only a
-# pre-validated host cwd; child processes retain ambient host authority and are not sandboxed.
+# operations resolve through the captured root `Dir`.
 cap-std = { version = "=4.0.2", default-features = false }
 # The exact cap-primitives crate behind cap-std, pinned identically, for the typed
 # final-component no-follow option (`FollowSymlinks::No`) of the write target's create open.
@@ -20,7 +19,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 thiserror = "2.0.12"
 time = { version = "0.3.41", features = ["parsing"] }
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time", "process", "io-util"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
 fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
 futures-util = "0.3.33"

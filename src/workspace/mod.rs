@@ -1,5 +1,5 @@
 mod path;
 mod root;
 
-pub use path::{RelativePath, RelativePathError};
-pub use root::{DirectoryEntry, DirectoryEntryKind, Workspace, WorkspaceAccess, WorkspaceError};
+pub(crate) use path::RelativePath;
+pub(crate) use root::{Workspace, WorkspaceAccess, WorkspaceError};

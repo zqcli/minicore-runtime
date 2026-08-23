@@ -15,7 +15,7 @@ use minicore_runtime::model::{
     ModelMessage, ModelRequest, ModelResponse, ModelSelection, ProviderRegistryBuilder,
     ReasoningContent, ReasoningPreference, ToolCall, fixed_credential_source,
 };
-use minicore_runtime::tools::{ToolName, ToolOutput, ToolSpec};
+use minicore_runtime::tools::{ToolName, ToolOutput, ToolResultOutcome, ToolSpec};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -647,9 +647,10 @@ async fn request_replay_preserves_ordered_tools_results_and_thinking_rules() {
                 AssistantPart::ToolCall(call.clone()),
             ])
             .unwrap(),
-            ModelMessage::tool(
+            ModelMessage::tool_with_outcome(
                 call.tool_call_id().clone(),
-                ToolOutput::failure("not found").unwrap(),
+                ToolOutput::new("not found").unwrap(),
+                ToolResultOutcome::Failed,
             )
             .unwrap(),
             ModelMessage::user("continue").unwrap(),

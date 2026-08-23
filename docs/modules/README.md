@@ -1,166 +1,76 @@
 # Canonical Module Map
 
-This page maps the current source graph. It is intentionally narrower than the historical design archive: every listed owner is compiled by the public crate, and every unlisted implementation file is private or removed.
+This page maps the current v0.3 source graph. The v0.2 Runtime, concrete tool adapters, and public policy facade are transitional implementation history, not public extension points.
 
 ## Root Surface
 
-`src/lib.rs` declares these public modules:
+`src/lib.rs` keeps the checked DTO and Port modules public. The `runtime` module and old Runtime/configuration facade are private. `agent`, `prompt`, `storage` implementation details, and the legacy tool execution modules are crate-private or private.
 
-| Module | Surface |
+| Module | Current responsibility |
 | --- | --- |
-| `config` | Checked runtime/session configuration and retry policy |
-| `error` | Runtime/session errors and public error summaries |
-| `event` | Session event-kind catalog |
-| `ids` | Checked identifiers |
-| `model` | Provider and model contracts |
-| `runtime` | Runtime orchestration and session summaries |
-| `session` | Session observation, outcomes, transcript DTOs, actor, and lifecycle orchestration |
-| `tools` | Tool contracts, policy, interaction, process policy, and builtins |
-| `workspace` | Capability-backed root and relative filesystem operations |
+| `config` | Kernel limits, session specs, manifests, retry policy, and checked configuration values |
+| `conversation` | Canonical conversation entries, proof-gated loading, replay/recovery, transcript, and read-only views |
+| `context` | Typed `ContextProvider` Port and validated context DTOs |
+| `compaction` | Typed `CompactionStrategy` Port and immutable candidates/proposals |
+| `error` | Checked public error summaries and internal session errors |
+| `event` | Stable event-kind values |
+| `ids` | Checked identifiers, including `ContextSourceId` |
+| `model` | Transitional model/provider implementation used by the current internal runner |
+| `session` | Transitional actor/session implementation; its old observation facade is not a v0.3 public contract |
+| `storage` | `SessionLog` Port and private durable store implementation |
+| `tools` | Final public `Tool`/`ToolSet` execution seam plus private legacy runner scaffolding |
 
-The root also reexports stable DTOs and operations. `agent`, `prompt`, `storage`, and `time` are private modules. There are no path-based compatibility declarations.
+## Tools
 
-## Ownership and Dependencies
+The final P3-B seam is `tools::Tool`, `tools::ToolSet`, `tools::ToolInvocation`, `tools::ToolContext`, `tools::ToolOutput`, `tools::ToolInputRequest`, and progress DTOs. `ToolContext` contains only cancellation, deadline, and a synchronous nonblocking progress sink. Workspace, process, RPC, credential, and policy authorities remain outside the public Tool context.
 
-### `config`
+`ToolSet` is mutable only during `ToolSetBuilder` registration. Registration returns the builder and records the first duplicate, spec-panic, or invalid-spec error; `build()` emits that error or freezes the tool and spec maps. `specs_for` deterministically omits unknown enabled names; SessionBindings validation owns unknown-enabled rejection in the next migration phase. Cloned sets share immutable `Arc` state and can dispatch the same `Arc<dyn Tool>` concurrently. There is no public ToolRegistry facade and no default concrete tool set.
 
-- Source: [`src/config.rs`](../../src/config.rs)
-- Owns `RuntimeConfig`, `RuntimeConfigBuilder`, `SessionConfig`, and checked bounds.
-- Depends on model selection/registry, tool names/registry, checked session constructors, and the private time seam.
-- Does not open files, providers, actors, or processes.
+`src/tools/legacy_context.rs` and `src/tools/legacy_types.rs` are private staged migration scaffolding for the old actor/runner/storage path. They are scheduled for P3-C/P6 deletion or replacement. `ToolPolicy` is also intentionally crate-private in this revision; the typed policy/approval actor flow belongs to P3-C.
 
-### `time`
+Legacy physical storage persists separately as `LegacyToolOutput { text, is_error }`. Public `ToolOutput` is content-only and pairs with `ToolResultOutcome` in `ModelMessage::Tool`; the crate-private prompt conversion maps legacy status before provider encoding, while conversation storage retains the old DTO until that path is deleted.
 
-- Source: [`src/time.rs`](../../src/time.rs)
-- Private root owner of canonical UTC RFC3339-millisecond `Timestamp` values, validation, errors, and serde behavior.
-- The config module reexports `Timestamp` and `TimestampError` as the public seam; storage consumes the types but does not own timestamp behavior.
+## Model
 
-### `model`
+The current model/provider implementation remains transitional and private-by-ownership even though the `model` module is retained for migration evidence. Provider adapters own their wire encoding and bounded transport behavior; P3-B does not treat them as a Runtime facade.
 
-- Sources: [`src/model/mod.rs`](../../src/model/mod.rs), [`gateway.rs`](../../src/model/gateway.rs), [`provider.rs`](../../src/model/provider.rs), [`registry.rs`](../../src/model/registry.rs), [`types.rs`](../../src/model/types.rs), [`transport.rs`](../../src/model/transport.rs), and [`providers/`](../../src/model/providers/).
-- Owns `ModelGateway`, `ModelProvider`, `ProviderRegistry`, descriptors, selections, request/response values, opaque credentials, event sinks, delivery state, and provider errors.
-- The registry freezes provider descriptors and resolves a selection only from its own immutable maps.
-- Providers own protocol encoding, SSE parsing, terminal proof, usage normalization, endpoint policy, and provider-native error mapping.
-- Transport owns bounded response drains, no-redirect/no-retry client policy, cancellation-aware reads, and retry-after parsing.
-- Depends on `serde_json`, `reqwest`, `futures-util`, and Tokio cancellation primitives; it does not depend on session actors or storage.
+## Workspace
 
-### `tools`
+Workspace capability ownership remains a private transitional implementation detail. `workspace` is not a public root module, and the public Tool seam does not pass a workspace or process handle through `ToolContext`.
 
-- Sources: [`src/tools/mod.rs`](../../src/tools/mod.rs), [`registry.rs`](../../src/tools/registry.rs), [`types.rs`](../../src/tools/types.rs), [`policy.rs`](../../src/tools/policy.rs), [`context.rs`](../../src/tools/context.rs), [`process.rs`](../../src/tools/process.rs), and [`builtins/`](../../src/tools/builtins/).
-- Owns the immutable tool registry, tool descriptions, tool result values, user-question values, interaction client, policy decisions, and process policy.
-- Builtins own their schemas, argument validation, execution mapping, bounded output, and fixed result text.
-- `ToolContext` supplies the current workspace, cancellation token, and interaction bridge. Tools do not own session state or provider selection.
-- The registry is frozen before a runtime opens. Session configuration only selects names already present in that registry.
+## Other Owners
 
-### `workspace`
-
-- Sources: [`src/workspace/mod.rs`](../../src/workspace/mod.rs), [`path.rs`](../../src/workspace/path.rs), and [`root.rs`](../../src/workspace/root.rs).
-- Owns one configured root capability, access mode, relative paths, directory-entry projection, bounded I/O, final-component checks, and owner-tracked shutdown.
-- `Workspace::open` captures the single root capability. File and directory operations resolve relative to that capability; they do not re-open ambient paths.
-- The workspace worker joins admitted blocking operations before shutdown completes. Production `SessionActor` ownership awaits `Workspace::shutdown()` during close; the `Workspace` Drop fallback may block synchronously and is not preferred. Explicit Runtime shutdown waits for all session actors and observes their workspace shutdowns.
-- Depends on cap-std/cap-primitives for capability and no-follow operations, not on Runtime or session residency.
-
-### `prompt`
-
-- Sources: [`src/prompt/mod.rs`](../../src/prompt/mod.rs), [`builder.rs`](../../src/prompt/builder.rs), and [`compaction.rs`](../../src/prompt/compaction.rs).
-- Private owner of prompt message assembly, coding instructions, serialized-byte estimation, compaction planning, and validated summaries.
-- Consumes model/tool values and storage-owned conversation projections. It does not write the conversation file or publish session events.
-
-### `agent`
-
-- Sources: [`src/agent/mod.rs`](../../src/agent/mod.rs), [`context.rs`](../../src/agent/context.rs), and [`runner.rs`](../../src/agent/runner.rs).
-- Private owner of one model/tool turn, tool-round ordering, interaction requests, delivery-aware logical retry, cancellation, and compaction requests.
-- It returns turn work/results to the session actor; it does not own terminal persistence.
-
-### `storage`
-
-- Sources: [`src/storage/mod.rs`](../../src/storage/mod.rs), [`store.rs`](../../src/storage/store.rs), [`conversation.rs`](../../src/storage/conversation.rs), [`conversation/`](../../src/storage/conversation/), and test-only `compaction_visibility.rs`.
-- Private owner of checked session configuration, the root lock, session namespace, append-only conversation records, replay/repair, prompt projections, compaction boundaries, usage aggregation, and transcript source entries.
-- Depends on model, tools, identifiers, cap-std, and the filesystem worker; it does not depend on session, agent, prompt, or Runtime owners.
-
-### `session`
-
-- Sources: [`src/session/mod.rs`](../../src/session/mod.rs), [`actor.rs`](../../src/session/actor.rs), [`command.rs`](../../src/session/command.rs), [`event.rs`](../../src/session/event.rs), [`event_stream.rs`](../../src/session/event_stream.rs), [`snapshot.rs`](../../src/session/snapshot.rs), [`state.rs`](../../src/session/state.rs), and [`transcript.rs`](../../src/session/transcript.rs).
-- The actor owns admission, mailbox ordering, terminal settlement, interaction persistence, snapshot publication, and close completion.
-- Session coordinates the storage-owned conversation log and publishes its public observation/transcript projections; it does not own storage workers or durable formats.
-- Snapshot and event modules expose observation; the actor and storage modules remain crate-private.
-- Session depends on model, tools, workspace, prompt, agent, and storage internals without creating peer actors.
-
-### `runtime`
-
-- Sources: [`src/runtime/mod.rs`](../../src/runtime/mod.rs), [`runtime_impl.rs`](../../src/runtime/runtime_impl.rs), and [`session_manager.rs`](../../src/runtime/session_manager.rs).
-- Owns public lifecycle admission, loaded-session residency, create/load/close/delete/list orchestration, public method error mapping, and runtime shutdown ownership.
-- It contains one manager state boundary for loaded, loading, and closing sessions. It does not duplicate the session actor mailbox.
-- Runtime opens the session store and carries a model/tool/workspace configuration into prepared sessions; session actors own per-session work after admission.
-
-## Public and Private Boundary
-
-Public values are checked at construction and are safe to serialize or display. Provider credentials, model endpoint details, workspace roots in debug output, and internal actor/store details are redacted or private.
-
-The public transcript contains `User`, `Assistant`, `ToolResult`, `Interaction`, `Summary`, and `Terminal` projections. The interaction entry is durable transcript evidence but is intentionally absent from model prompt messages.
-
-The canonical graph has no public transport protocol module, no second runtime owner, no compatibility aliases, and no alternate source tree. New functionality should deepen an existing owner before adding a module.
+- `config` owns checked kernel/session-spec values. `RuntimeConfig`, `RuntimeConfigBuilder`, and `SessionConfig` remain crate-private transitional values.
+- `model` owns the current internal provider gateway and protocol adapters. Provider integration tests are transitional evidence and do not establish a Runtime facade.
+- `conversation` owns confirmed state, durable append coordination, replay/recovery, transcript projection, and proof-gated load completion.
+- `storage` owns the current private filesystem store and exposes only the `SessionLog` Port to future v0.3 owners.
+- `session` and `runtime` retain old actor/lifecycle implementation only so the migration can proceed in later phases; neither is the P3-B public extension seam.
 
 ## File Inventory
 
-The compiled current graph is intentionally small:
-
 ```text
 src/
-├── agent/{context.rs,mod.rs,runner.rs}
 ├── config.rs
-├── error.rs
-├── event.rs
-├── ids.rs
+├── conversation/{entry.rs,load.rs,log.rs,projection.rs,recovery.rs,state.rs,transcript.rs,validator.rs,view.rs}
+├── context/{mod.rs,provider.rs}
+├── compaction/{mod.rs,strategy.rs}
 ├── model/{gateway.rs,mod.rs,provider.rs,registry.rs,transport.rs,types.rs}
-│   └── providers/{anthropic.rs,mod.rs,openai.rs}
-├── prompt/{builder.rs,compaction.rs,mod.rs}
-├── runtime/{mod.rs,runtime_impl.rs,session_manager.rs}
 ├── session/{actor.rs,command.rs,event.rs,event_stream.rs,mod.rs,snapshot.rs,state.rs,transcript.rs}
-├── storage/{compaction_visibility.rs,conversation.rs,mod.rs,store.rs}
-│   └── conversation/{actor_support.rs,codec.rs,compaction.rs,usage.rs}
-├── time.rs
-├── tools/{context.rs,mod.rs,policy.rs,process.rs,registry.rs,types.rs}
-│   └── builtins/{ask_user.rs,list_directory.rs,path_args.rs,read_file.rs,run_command.rs,write_file.rs}
-└── workspace/{mod.rs,path.rs,root.rs}
+├── storage/{mod.rs,session_log.rs,...private implementation files}
+└── tools/{context.rs,input.rs,legacy_context.rs,legacy_types.rs,mod.rs,policy.rs,progress.rs,registry.rs,set.rs,tool.rs,types.rs}
 ```
 
-The graph above names the current owners, not an archival compatibility layout. The `src/storage` files are private lower modules declared from the crate root; session, agent, and prompt consume their interfaces without creating a reverse storage-to-session edge. The `src/model/transport.rs` module is crate-private even though model provider types are public. The `src/prompt`, `src/agent`, and `src/storage` directories are private implementation modules declared from the crate root.
+Concrete `src/tools/builtins/**` and `src/tools/process.rs` adapters were deleted in P3-B. They must not return as canonical files or as a default registration path.
+
+## Test Migration
+
+- `tests/tool_set_contract.rs` is the focused P3-B replacement for removed v0.2 Tool/Registry/concrete-adapter integration tests.
+- `tests/p1_dto.rs` covers the final checked Tool DTOs and input-answer validation.
+- Private `src/tools/progress.rs` tests cover synchronous bounded `try_send` behavior.
+- Private `src/tools/legacy_types.rs` tests prove legacy failure output wire round-trip.
+- The removed v0.2 Runtime/provider smoke and Runtime surface tests are baseline evidence, not a complete replacement claim.
+- SessionRuntime acceptance coverage is deferred to P4/P5.
 
 ## Boundary Rules
 
-- A public DTO must have a checked constructor or a checked deserializer before it reaches Runtime or a worker.
-- A registry is mutable only during its builder phase; the value passed into Runtime is immutable.
-- An owner may expose a narrow typed operation, but it must not expose its internal queue, worker handle, raw path, credential, or actor channel.
-- A blocking operation must have a named owner and a join/settlement path. Dropping a caller cannot detach it.
-- A public error must preserve the authoritative owner and must not leak secret or host-specific diagnostic material.
-- A new event must be derived from a published snapshot fact and must remain bounded.
-- A persistence change must specify field order, byte limits, replay behavior, repair behavior, and migration behavior before source changes.
-
-## Test Seams
-
-- `tests/p1_*` cover checked IDs, public DTOs, and root/module surface.
-- `tests/p2_*` cover registry/policy behavior and capability-relative builtin/workspace behavior.
-- `tests/p3_*` cover model gateway, provider protocol mapping, SSE, transport, delivery, and retry behavior.
-- `tests/p4_*` cover conversation and store bytes, replay, repair, lock ownership, and degradation.
-- `tests/p5_*` cover prompt/compaction boundaries and deterministic estimation.
-- `tests/p6_*` cover turn runner and session actor ownership/cancellation.
-- `tests/p7_*` cover Runtime lifecycle, restart, close, shutdown, process policy, and public surface.
-- `tests/v2_acceptance.rs` covers the active end-to-end matrix and the source graph audit.
-- `provider-gate/` is a separate stable-only evidence package for provider SDK behavior; it is not a production dependency.
-
-A test that needs a private owner should use an existing crate-private seam or a focused module test. It should not resurrect a public transport or lifecycle type solely to reach an assertion.
-
-## Change Checklist
-
-When adding a module, record its owner and its dependency direction.
-
-When adding a public type, add a checked constructor, a redacted Debug form where needed, and a surface test.
-
-When adding a worker, record who starts it, who cancels it, who joins it, and which result is authoritative.
-
-When adding a durable field, update both the source serializer and the current format document.
-
-When adding a tool, specify its input schema, access boundary, cancellation result, output bound, and registry name.
-
-When adding a provider behavior, keep endpoint, credential, protocol, delivery, and retry evidence in the model owner.
+A public DTO has a checked constructor or strict deserializer. Public Debug implementations redact payloads. A Port does not depend on Workspace, SessionHandle, Runtime, Store, Model, provider lookup, direct I/O, or fanout. Transitional owners may use private legacy seams until their scheduled migration phase, but they cannot be reintroduced through public aliases.

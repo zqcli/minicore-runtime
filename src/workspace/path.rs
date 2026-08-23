@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum RelativePathError {
+pub(crate) enum RelativePathError {
     #[error("relative path is too long")]
     TooLong,
     #[error("relative path has too many segments")]
@@ -29,7 +29,7 @@ pub enum RelativePathError {
 }
 
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct RelativePath(Box<str>);
+pub(crate) struct RelativePath(Box<str>);
 
 impl RelativePath {
     pub const MAX_BYTES: usize = 4_096;
@@ -174,3 +174,6 @@ fn has_platform_prefix(value: &str) -> bool {
     let bytes = first_segment.as_bytes();
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
+
+// P7 deletion target: remove with the private legacy Workspace implementation.
+const _: fn(String) -> Result<RelativePath, RelativePathError> = RelativePath::new;
