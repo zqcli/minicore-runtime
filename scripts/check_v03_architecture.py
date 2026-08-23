@@ -38,6 +38,7 @@ CANONICAL_PRODUCTION_FILES = {
 MODEL_DRIVER_ROLE_FILES = {"src/model/driver.rs"}
 TOOLSET_ROLE_FILES = {"src/tools/set.rs"}
 SESSION_BINDINGS_ROLE_FILES = {"src/session/bindings.rs"}
+SESSION_RUNTIME_ROLE_FILES = {"src/session/runtime.rs"}
 TRANSITIONAL_PRIVATE_FILES = {
     "src/model/legacy_gateway.rs",
     "src/model/legacy_provider.rs",
@@ -74,7 +75,7 @@ FORBIDDEN_SYMBOLS = {
 FORBIDDEN_SYMBOL_EXEMPTIONS = {
     "ToolRegistry": {
         "src/agent/context.rs", "src/agent/mod.rs", "src/config.rs",
-        "src/runtime/runtime_impl.rs", "src/session/actor.rs", "src/tools/registry.rs",
+        "src/session/actor.rs", "src/tools/registry.rs",
     },
     "InteractionClient": {
         "src/agent/context.rs", "src/agent/mod.rs", "src/session/actor.rs", "src/tools/mod.rs",
@@ -90,16 +91,20 @@ PORT_FILES = {
     "src/model/model.rs", "src/model/response.rs", "src/tools/tool.rs", "src/tools/set.rs",
     "src/tools/context.rs", "src/tools/input.rs", "src/tools/policy.rs", "src/tools/progress.rs", "src/tools/types.rs",
     "src/context/provider.rs", "src/compaction/strategy.rs", "src/session/bindings.rs",
-    "src/session/event.rs", "src/session/event_stream.rs", "src/session/state.rs",
+    "src/session/event.rs", "src/session/event_stream.rs", "src/session/runtime.rs",
+    "src/session/runtime_actor.rs", "src/session/runtime_log.rs", "src/session/runtime_open.rs",
+    "src/session/state.rs",
     "src/session/turn_handle.rs",
     "src/storage/session_log.rs",
 }
 REQUIRED_FILES = {
-    "src/lib.rs", "src/config.rs", "src/error.rs", "src/ids.rs", "src/value.rs", "src/time.rs",
+    "src/lib.rs", "src/config.rs", "src/error.rs", "src/error/operations.rs", "src/ids.rs", "src/value.rs", "src/time.rs",
     "src/agent/mod.rs", "src/agent/runner.rs", "src/agent/runner_protocol.rs",
     "src/agent/turn_context.rs", "src/agent/retry.rs", "src/prompt/mod.rs", "src/prompt/builder.rs",
-    "src/session/mod.rs", "src/session/runtime.rs", "src/session/handle.rs",
-    "src/session/turn_handle.rs", "src/session/actor.rs", "src/session/command.rs",
+    "src/session/mod.rs", "src/session/runtime.rs", "src/session/runtime_actor.rs",
+    "src/session/runtime_log.rs", "src/session/runtime_open.rs", "src/session/handle.rs",
+    "src/session/turn_handle.rs",
+    "src/session/actor.rs", "src/session/command.rs",
     "src/session/state.rs", "src/session/event.rs", "src/session/event_stream.rs",
     "src/session/interaction.rs", "src/session/bindings.rs", "src/session/transcript.rs",
     "src/conversation/mod.rs", "src/conversation/entry.rs", "src/conversation/load.rs", "src/conversation/state.rs",
@@ -115,7 +120,7 @@ PUBLIC_MODULES = {
     "compaction", "config", "context", "conversation", "error", "ids", "model", "session",
     "storage", "tools", "value",
 }
-PRIVATE_MODULES = {"agent", "prompt", "runtime", "time", "workspace"}
+PRIVATE_MODULES = {"agent", "prompt", "time", "workspace"}
 ROOT_EXPORTS = {
     "value": {"BoundedText"},
     "config": {"CompactionConfig", "KernelConfig", "RetryPolicy", "SemanticLimits", "SessionManifest", "SessionSpec", "TurnOptions", "UserInput"},
@@ -916,6 +921,23 @@ def port_declaration_errors(views: dict[str, tuple[str, int]]) -> list[str]:
         kind, name = ("struct", "SessionBindings")
         if not top_level_declaration(mask_rust(views[relative][0]), kind, name):
             errors.append(f"typed Port declaration missing or wrong kind: {relative} {kind} {name}")
+    runtime_paths = sorted(
+        relative for relative in SESSION_RUNTIME_ROLE_FILES
+        if relative in views and mask_rust(views[relative][0]).strip()
+    )
+    if len(runtime_paths) != 1:
+        errors.append(
+            "SessionRuntime owner role requires exactly one production file: "
+            f"expected={sorted(SESSION_RUNTIME_ROLE_FILES)} actual={runtime_paths}"
+        )
+    else:
+        relative = runtime_paths[0]
+        masked = mask_rust(views[relative][0])
+        for name in ("SessionRuntime", "SessionRuntimeOptions"):
+            if not top_level_declaration(masked, "struct", name):
+                errors.append(
+                    f"SessionRuntime declaration missing or wrong kind: {relative} struct {name}"
+                )
     return errors
 
 
@@ -925,6 +947,7 @@ def responsibility_errors(views: dict[str, tuple[str, int]]) -> list[str]:
         ("model driver", MODEL_DRIVER_ROLE_FILES),
         ("tools ToolSet", TOOLSET_ROLE_FILES),
         ("session bindings", SESSION_BINDINGS_ROLE_FILES),
+        ("session runtime owner", SESSION_RUNTIME_ROLE_FILES),
     )
     for label, candidates in role_groups:
         actual = sorted(

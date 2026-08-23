@@ -24,7 +24,6 @@ CANONICAL_TOPS = (
     "ids",
     "model",
     "prompt",
-    "runtime",
     "session",
     "storage",
     "time",
@@ -38,11 +37,14 @@ REQUIRED_DIRS = {
     "src/compaction",
     "src/conversation",
     "src/context",
+    "src/error",
     "src/model",
     "src/prompt",
-    "src/runtime",
     "src/session",
     "src/session/legacy_event_stream",
+    "src/session/runtime",
+    "src/session/runtime_actor",
+    "src/session/runtime_open",
     "src/storage",
     "src/storage/conversation",
     "src/tools",
@@ -80,6 +82,7 @@ REQUIRED_FILES = {
     "src/context/provider.rs",
     "src/conversation/validator/tests.rs",
     "src/error.rs",
+    "src/error/operations.rs",
     "src/ids.rs",
     "src/lib.rs",
     "src/model/legacy_gateway.rs",
@@ -92,9 +95,6 @@ REQUIRED_FILES = {
     "src/prompt/builder.rs",
     "src/prompt/compaction.rs",
     "src/prompt/mod.rs",
-    "src/runtime/mod.rs",
-    "src/runtime/runtime_impl.rs",
-    "src/runtime/session_manager.rs",
     "src/session/actor.rs",
     "src/session/bindings.rs",
     "src/session/command.rs",
@@ -107,6 +107,13 @@ REQUIRED_FILES = {
     "src/session/legacy_snapshot.rs",
     "src/session/legacy_state.rs",
     "src/session/mod.rs",
+    "src/session/runtime.rs",
+    "src/session/runtime/tests.rs",
+    "src/session/runtime_actor.rs",
+    "src/session/runtime_actor/tests.rs",
+    "src/session/runtime_log.rs",
+    "src/session/runtime_open.rs",
+    "src/session/runtime_open/tests.rs",
     "src/session/state.rs",
     "src/session/transcript.rs",
     "src/session/turn_handle.rs",
@@ -172,6 +179,18 @@ LEGACY_SOURCE_PATHS = {
     "src/workspace_v2",
 }
 
+FORBIDDEN_PRODUCTION_SYMBOLS = (
+    "Runtime",
+    "RuntimeClient",
+    "RuntimeConfig",
+    "RuntimeConfigBuilder",
+    "RuntimeError",
+    "RuntimeInner",
+    "RuntimeSupervisor",
+    "SessionManager",
+    "SessionSummary",
+)
+
 FORBIDDEN_SOURCE_TOKENS = (
     "crate::wire",
     "mod wire",
@@ -233,6 +252,8 @@ EXPECTED_ROOT_EXPORTS = {
         "SessionEventEnvelope",
         "SessionEventStream",
         "SessionHealth",
+        "SessionRuntime",
+        "SessionRuntimeOptions",
         "SessionState",
         "SessionStatus",
         "TurnHandle",
@@ -283,7 +304,7 @@ DIRECT_DEP_CONSUMERS = {
         ("src/time.rs", "use ::time::OffsetDateTime;"),
         ("src/time.rs", "use ::time::format_description::well_known::Rfc3339;"),
     ],
-    "tokio": [("src/runtime/runtime_impl.rs", "use tokio::runtime::Handle;")],
+    "tokio": [("src/session/runtime.rs", "use tokio::runtime::Handle;")],
     "tokio-util": [
         ("src/agent/context.rs", "use tokio_util::sync::CancellationToken;"),
     ],
@@ -309,16 +330,16 @@ EXPECTED_MODULE_VISIBILITY = {
     },
     "src/compaction/mod.rs": {"strategy": "private"},
     "src/context/mod.rs": {"provider": "private"},
+    "src/error.rs": {"operations": "private"},
     "src/model/mod.rs": {
         "legacy_gateway": "private",
         "legacy_provider": "crate",
-        "legacy_registry": "private",
+        "legacy_registry": "crate",
         "model_port": "private",
         "response": "private",
         "types": "private",
     },
     "src/prompt/mod.rs": {"builder": "private", "compaction": "private"},
-    "src/runtime/mod.rs": {"runtime_impl": "private", "session_manager": "private"},
     "src/session/mod.rs": {
         "actor": "crate",
         "bindings": "private",
@@ -330,6 +351,10 @@ EXPECTED_MODULE_VISIBILITY = {
         "legacy_event_stream": "crate",
         "legacy_snapshot": "crate",
         "legacy_state": "crate",
+        "runtime": "private",
+        "runtime_actor": "private",
+        "runtime_log": "private",
+        "runtime_open": "private",
         "state": "private",
         "transcript": "crate",
         "turn_handle": "private",
@@ -359,7 +384,22 @@ EXPECTED_MODULE_VISIBILITY = {
         "tool": "private",
         "types": "private",
     },
-    "src/workspace/mod.rs": {"path": "private", "root": "private"},
+    "src/workspace/mod.rs": {"path": "private", "root": "crate"},
+}
+
+EXPECTED_TEST_ONLY_MODULES = {
+    "src/model/mod.rs": {"legacy_gateway", "legacy_provider", "legacy_registry"},
+    "src/session/mod.rs": {
+        "actor",
+        "command",
+        "legacy_event",
+        "legacy_event_stream",
+        "legacy_snapshot",
+        "legacy_state",
+        "transcript",
+    },
+    "src/storage/mod.rs": {"compaction_visibility", "conversation", "store"},
+    "src/tools/mod.rs": {"legacy_context", "legacy_policy", "legacy_types", "registry"},
 }
 
 FUNCTION_RE = re.compile(
@@ -377,6 +417,7 @@ DELETED_TOP_MODULES = {
     "live_conversation",
     "model_gateway",
     "prompt_v2",
+    "runtime",
     "runtime_interface",
     "runtime_task",
     "session_execution",
@@ -453,6 +494,28 @@ def check_source_tokens(sources: Dict[str, str]) -> List[str]:
         for token in FORBIDDEN_SOURCE_TOKENS:
             if token in text:
                 errors.append(f"{path}: forbidden source token {token}")
+        production = mask_rust(strip_test_items(text))
+        for symbol in FORBIDDEN_PRODUCTION_SYMBOLS:
+            if re.search(rf"\b{re.escape(symbol)}\b", production):
+                errors.append(f"{path}: forbidden production symbol {symbol}")
+        if path in {
+            "src/session/runtime.rs",
+            "src/session/runtime_actor.rs",
+            "src/session/runtime_log.rs",
+            "src/session/runtime_open.rs",
+        }:
+            for forbidden in (
+                "HashMap",
+                "BTreeMap",
+                "SessionManager",
+                "SessionHandle",
+                "Workspace",
+                "SessionStore",
+                "Serialize",
+                "Deserialize",
+            ):
+                if re.search(rf"\b{re.escape(forbidden)}\b", production):
+                    errors.append(f"{path}: forbidden SessionRuntime owner token {forbidden}")
         for attribute in ALLOW_ATTRIBUTE_RE.finditer(text):
             if re.search(r"(?:^|[\s,])(?:clippy::)?dead_code(?:$|[\s,])", attribute.group(1)):
                 line = text.count("\n", 0, attribute.start()) + 1
@@ -581,6 +644,14 @@ def check_module_visibility(sources: Dict[str, str]) -> List[str]:
                 f"expected={expected_production} actual={actual}"
             )
         raw = parse_mod_declarations(text)
+        expected_test_modules = EXPECTED_TEST_ONLY_MODULES.get(path, set())
+        actual_test_modules = test_modules & set(expected)
+        if actual_test_modules != expected_test_modules:
+            errors.append(
+                f"{path}: test-only modules mismatch: "
+                f"expected={sorted(expected_test_modules)} "
+                f"actual={sorted(actual_test_modules)}"
+            )
         for name in sorted(test_modules & set(expected)):
             if raw.get(name) != expected[name]:
                 errors.append(
@@ -617,10 +688,20 @@ def check_public_surface(sources: Dict[str, str]) -> List[str]:
             "src/lib.rs: public modules mismatch: "
             f"expected={sorted(EXPECTED_PUBLIC_MODULES)} actual={sorted(public_modules)}"
         )
-    if private_modules != {"agent", "prompt", "runtime", "time", "workspace"}:
+    if private_modules != {"time"}:
         errors.append(
             "src/lib.rs: private modules mismatch: "
-            f"expected=['agent', 'prompt', 'runtime', 'time', 'workspace'] actual={sorted(private_modules)}"
+            f"expected=['time'] actual={sorted(private_modules)}"
+        )
+    raw_lib_declarations = parse_mod_declarations(lib)
+    test_modules = cfg_test_spans(lib)[1]
+    expected_test_modules = {"agent", "prompt", "workspace"}
+    if test_modules != expected_test_modules or any(
+        raw_lib_declarations.get(name) != "private" for name in expected_test_modules
+    ):
+        errors.append(
+            "src/lib.rs: test-only private modules mismatch: "
+            f"expected={sorted(expected_test_modules)} actual={sorted(test_modules)}"
         )
     if other_visibility:
         errors.append(f"src/lib.rs: unsupported module visibility: {other_visibility}")
@@ -663,11 +744,11 @@ def check_public_surface(sources: Dict[str, str]) -> List[str]:
     storage_mod = mask_rust(strip_test_items(sources.get("src/storage/mod.rs", "")))
     tools_declarations = parse_mod_declarations(tools_mod)
     session_declarations = parse_mod_declarations(session_mod)
-    if session_declarations.get("actor") != "crate":
-        errors.append("src/session/mod.rs: actor must be crate-private")
+    if "actor" in session_declarations:
+        errors.append("src/session/mod.rs: actor must be test-only")
     storage_declarations = parse_mod_declarations(storage_mod)
-    if storage_declarations.get("store") != "crate":
-        errors.append("src/storage/mod.rs: store must be crate-private")
+    if "store" in storage_declarations:
+        errors.append("src/storage/mod.rs: store must be test-only")
     actor_source = mask_rust(strip_test_items(sources.get("src/session/actor.rs", "")))
     store_source = mask_rust(strip_test_items(sources.get("src/storage/store.rs", "")))
     crate_struct = r"(?m)^\s*pub\s*\(\s*crate\s*\)\s+struct\s+{}\b"

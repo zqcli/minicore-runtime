@@ -1,4 +1,4 @@
-mod support;
+pub mod support;
 
 // P2-A boundary: the legacy storage::conversation actor path remains
 // transitional until P2-C/P6; this Port accepts only conversation module DTOs.
@@ -424,8 +424,10 @@ async fn fake_session_log_scripts_cover_atomic_failures_unknown_outcomes_and_pan
     panic_log.script_append(Script::Panic);
     let panic_task =
         tokio::spawn(async move { panic_log.append(ConversationSeq::new(2), vec![next]).await });
-    let panic_result = panic_task.await.unwrap_err();
-    assert!(panic_result.is_panic());
+    assert!(matches!(
+        panic_task.await,
+        Err(ref error) if error.is_panic()
+    ));
     assert_eq!(panic_inspection.entries(), initial);
     assert_eq!(panic_inspection.max_concurrent_mutable_operations(), 1);
 }

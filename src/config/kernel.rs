@@ -62,7 +62,7 @@ impl KernelConfig {
         if !bounded_capacity(self.command_capacity)
             || !bounded_capacity(self.runner_capacity)
             || !bounded_capacity(self.event_capacity)
-            || !valid_timeout(self.shutdown_timeout, super::MAX_RUNTIME_SHUTDOWN_TIMEOUT)
+            || !valid_timeout(self.shutdown_timeout, super::MAX_KERNEL_SHUTDOWN_TIMEOUT)
             || !valid_timeout(self.model_call_timeout, MAX_KERNEL_PORT_TIMEOUT)
             || !valid_timeout(self.tool_call_timeout, MAX_KERNEL_PORT_TIMEOUT)
             || !valid_timeout(self.policy_timeout, MAX_KERNEL_PORT_TIMEOUT)

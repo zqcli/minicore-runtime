@@ -3,8 +3,8 @@ fn p6_session_actor_surface_is_private_and_owner_proof_free() {
     let session = include_str!("../src/session/mod.rs");
     assert!(session.contains("pub(crate) mod command;"));
     assert!(session.contains("pub(crate) mod actor;"));
-    assert!(session.contains("pub(crate) use actor::"));
-    assert!(session.contains("pub(crate) use command::SessionHandle;"));
+    assert!(!session.contains("pub(crate) use actor::"));
+    assert!(!session.contains("pub(crate) use command::SessionHandle;"));
     assert!(!session.contains("pub mod actor"));
     assert!(!session.contains("pub mod command"));
 
@@ -16,6 +16,8 @@ fn p6_session_actor_surface_is_private_and_owner_proof_free() {
     assert!(tools_context.contains("impl Drop for InteractionResponse"));
     assert!(!tools_mod.contains("InteractionResponse"));
     let actor = include_str!("../src/session/actor.rs");
+    assert!(actor.contains("P4-C/P5 deletion target"));
+    assert!(command.contains("P4-C/P5 deletion target"));
     let production = actor
         .split("#[cfg(test)]")
         .next()

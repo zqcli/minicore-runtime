@@ -1,3 +1,4 @@
+#[cfg(test)]
 mod agent;
 pub mod compaction;
 pub mod config;
@@ -6,13 +7,14 @@ pub mod conversation;
 pub mod error;
 pub mod ids;
 pub mod model;
+#[cfg(test)]
 mod prompt;
-mod runtime;
 pub mod session;
 pub mod storage;
 mod time;
 pub mod tools;
 pub mod value;
+#[cfg(test)]
 mod workspace;
 
 pub use config::{
@@ -26,8 +28,8 @@ pub use ids::{
 };
 pub use session::{
     InteractionAnswer, InteractionKind, PendingInteraction, SessionBindings, SessionEvent,
-    SessionEventEnvelope, SessionEventStream, SessionHealth, SessionState, SessionStatus,
-    TurnHandle, TurnOutcome,
+    SessionEventEnvelope, SessionEventStream, SessionHealth, SessionRuntime, SessionRuntimeOptions,
+    SessionState, SessionStatus, TurnHandle, TurnOutcome,
 };
 pub use storage::{AppendReceipt, ConversationPage, SessionLog, SessionLogError};
 pub use value::BoundedText;

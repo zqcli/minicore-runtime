@@ -17,7 +17,7 @@ fn canonical_modules_keep_only_the_current_root_facade() {
             "missing canonical module: {declaration}"
         );
     }
-    assert!(lib.contains("mod runtime;"));
+    assert!(!lib.contains("mod runtime;"));
     assert!(lib.contains("mod agent;"));
     assert!(lib.contains("mod prompt;"));
     assert!(lib.contains("pub mod compaction;"));
@@ -32,7 +32,6 @@ fn canonical_modules_keep_only_the_current_root_facade() {
         "RuntimeConfig",
         "RuntimeConfigBuilder",
         "SessionConfig",
-        "Runtime,",
         "SessionSummary",
     ] {
         assert!(
@@ -40,6 +39,16 @@ fn canonical_modules_keep_only_the_current_root_facade() {
             "legacy root export remains: {removed}"
         );
     }
+    let compact = lib.split_whitespace().collect::<Vec<_>>().join("");
+    let session_exports = compact
+        .split_once("pubusesession::{")
+        .and_then(|(_, rest)| rest.split_once("};"))
+        .map(|(exports, _)| exports)
+        .unwrap();
+    let session_exports = session_exports.split(',').collect::<Vec<_>>();
+    assert!(!session_exports.contains(&"Runtime"));
+    assert!(session_exports.contains(&"SessionRuntime"));
+    assert!(session_exports.contains(&"SessionRuntimeOptions"));
     assert!(!lib.contains("pub use runtime"));
     assert!(!include_str!("../src/tools/mod.rs").contains("pub use registry"));
 }

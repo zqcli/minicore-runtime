@@ -1,3 +1,5 @@
+// P4-C/P5 deletion target: private legacy actor scaffolding, not SessionRuntime ownership.
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1066,11 +1068,11 @@ mod tests {
     use crate::config::RetryPolicy;
     use crate::ids::{SessionId, TurnId};
     use crate::model::legacy_provider::{LegacyModelFuture, LegacyModelProvider};
+    use crate::model::legacy_registry::LegacyProviderRegistry;
     use crate::model::{
         AssistantPart, LegacyModelCallContext, LegacyModelDescriptor, LegacyModelEvent,
-        LegacyModelGateway, LegacyModelSelection, LegacyProviderId, LegacyProviderRegistry,
-        ModelError, ModelFinishReason, ModelLimits, ModelRequest, ModelResponse,
-        ReasoningPreference, Usage,
+        LegacyModelGateway, LegacyModelSelection, LegacyProviderId, ModelError, ModelFinishReason,
+        ModelLimits, ModelRequest, ModelResponse, ReasoningPreference, Usage,
     };
     use crate::storage::conversation::{
         ConversationEntry, ConversationLog, NewConversationEntry, StoredTurnOutcome,
@@ -1086,7 +1088,8 @@ mod tests {
     };
     use crate::tools::registry::{LegacyToolFuture, ToolRegistry};
     use crate::tools::{LegacyTool, LegacyToolContext, LegacyToolOutput, ToolName, ToolSpec};
-    use crate::workspace::{Workspace, WorkspaceAccess};
+    use crate::workspace::Workspace;
+    use crate::workspace::root::WorkspaceAccess;
     use serde_json::json;
 
     fn timestamp() -> Timestamp {
@@ -1309,7 +1312,9 @@ mod tests {
             timestamp_source,
             runtime: tokio::runtime::Handle::current(),
             close_timeout: Duration::from_secs(30),
-            command_capacity: crate::config::DEFAULT_COMMAND_CAPACITY,
+            command_capacity: crate::config::KernelConfig::default_checked()
+                .unwrap()
+                .command_capacity,
             event_capacity: 8,
             runner_event_capacity: 8,
         }
@@ -1453,7 +1458,9 @@ mod tests {
             timestamp_source,
             runtime: tokio::runtime::Handle::current(),
             close_timeout: Duration::from_secs(30),
-            command_capacity: crate::config::DEFAULT_COMMAND_CAPACITY,
+            command_capacity: crate::config::KernelConfig::default_checked()
+                .unwrap()
+                .command_capacity,
             event_capacity: 8,
             runner_event_capacity: 8,
         }

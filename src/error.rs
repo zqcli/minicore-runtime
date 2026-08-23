@@ -5,6 +5,13 @@ use thiserror::Error;
 
 use crate::value::BoundedText;
 
+mod operations;
+
+pub use operations::{
+    SessionLogError, SessionLogErrorKind, SessionOpenError, SessionOpenErrorKind,
+    SessionShutdownError,
+};
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicErrorCode {
@@ -124,6 +131,20 @@ impl DiagnosticSummary {
             retryable,
         }
     }
+
+    pub(crate) fn bounded_static(
+        code: DiagnosticCode,
+        category: DiagnosticCategory,
+        message: &'static str,
+        retryable: bool,
+    ) -> Self {
+        Self::new(
+            code,
+            category,
+            BoundedText::new(message).expect("static diagnostic must fit BoundedText"),
+            retryable,
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -167,16 +188,8 @@ pub enum TurnWaitError {
     RuntimeTerminated(DiagnosticSummary),
 }
 
-#[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
-pub(crate) enum RuntimeError {
-    #[error("invalid runtime configuration")]
-    InvalidConfiguration,
-    #[error("runtime is closing")]
-    Closing,
-    #[error("runtime internal failure")]
-    Internal,
-}
-
+// P4-C/P5 deletion target: legacy actor command error, not the final SessionError.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
 pub(crate) enum SessionError {
     #[error("session not found")]

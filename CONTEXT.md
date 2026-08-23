@@ -1,114 +1,80 @@
 # Current Implementation Context
 
-> Transitional v0.2 checkpoint. P4-A adds final state/event/TurnHandle foundations
-> after pure SessionBindings; current seams are
-> described by the v0.3 README and architecture/module map.
+> P4-B checkpoint of the breaking v0.3 single-session runtime refactor. The
+> multi-session Runtime has been deleted. `SessionRuntime` now owns create/load,
+> durable log lifetime, root cancellation, events, and deterministic shutdown;
+> final SessionHandle/commands and turn execution remain P4-C/P5 work.
 
 ## Checkpoint
 
-This repository retains the v0.2 typed runtime core as migration evidence. The current authority is the source tree and the documents linked from [docs/README.md](docs/README.md). Pre-reset design material is historical and lives under `docs/archive/v2/pre-reset/`.
-
-The crate is Rust 2024 with Rust 1.85 as its MSRV. The default build is offline. External model networking and the Tokio runtime handle are host responsibilities.
+The crate is Rust 2024 with Rust 1.85 as its MSRV. Concrete storage acquisition, model networking, tools, workspaces, credentials, and management of multiple loaded sessions are Host responsibilities. Current authority is the source tree plus the documents linked from [docs/README.md](docs/README.md); v0.2 material is historical evidence.
 
 ## Ownership Map
 
-- `config`: checked `RuntimeConfig`, `SessionConfig`, `RetryPolicy`, paths, text, capacities, and bounds.
-- `ids`: checked session, turn, interaction, and tool-call identifiers.
-- `model`: direct streaming `Model` Port, checked descriptors/contexts/requests/events/errors, shared response DTOs, and private legacy batch lookup.
-- `tools`: immutable `ToolSet`, async policy Port, interaction/tool DTOs, and private legacy runner scaffolding.
-- `workspace`: one capability-backed root, relative-path validation, bounded file operations, directory enumeration, and workspace shutdown.
-- `prompt`: private prompt assembly and compaction planning.
-- `agent`: private turn runner, model/tool ordering, retries, cancellation, and compaction integration.
-- `storage`: private durable session configuration, timestamps, root lock, store worker, conversation log, replay, repair, and transcript source.
-- `session`: public bindings/interactions/lightweight state/bounded events/exact TurnHandle plus private legacy actor, mailbox, observation, snapshot, and transcript implementation.
-- `runtime`: public orchestration and session residency manager.
+- `session::SessionRuntime`: unique owner of one created or loaded Session, one `ConversationLog`, one root cancellation domain, one state sender, one bounded event sink, and one actor JoinHandle.
+- `session::SessionRuntimeOptions`: checked `KernelConfig`, immutable `SessionBindings`, and the Host-selected Tokio `Handle` used to spawn the whole open lifecycle.
+- `conversation`: canonical entries, semantic validation, proof-gated load, paged replay, restart repair, append coordination, confirmed projection, transcript, and close classification.
+- `storage::SessionLog`: the only public persistence Port. Host code acquires one exclusive adapter and passes ownership into `SessionRuntime::create/load`.
+- `session`: public bindings/interactions/state/events/TurnHandle plus the P4-B owner. Old actor/command/observation files remain private P4-C/P5 scaffolding only.
+- `model`, `tools`, `context`, `compaction`: host-neutral Ports and checked DTOs bound immutably for the loaded lifetime.
+- `agent`, `prompt`, `workspace`, the old filesystem store, and legacy actor/model/tool observation graph: `cfg(test)` migration evidence only; none is present in the production library graph or owned by SessionRuntime.
 
-The public root exposes canonical `compaction`, `config`, `context`, `conversation`, `error`, `ids`, `model`, `session`, `storage`, `tools`, and `value` modules. `agent`, `prompt`, `runtime`, `time`, and `workspace` remain private. Storage workers, legacy lookup, actor commands, and prompt internals are not public extension seams.
+The public root exposes `compaction`, `config`, `context`, `conversation`, `error`, `ids`, `model`, `session`, `storage`, `tools`, and `value`. There is no top-level `runtime` module, multi-session manager, loaded-session map, repository, or shutdown-all owner.
 
-## Core Invariants
+## SessionRuntime Contract
 
-- The transitional `Runtime` owns one storage root plus private legacy model/tool/observation collections until P4-B/P5 replace it.
-- One loaded session coordinates one storage-owned conversation log, one actor, one bounded command mailbox, one workspace, and one active turn at most.
-- Session states are exactly `Idle`, `Running`, `WaitingForInput`, and `Closing`.
-- Submit and answer use the same bounded mailbox. Cancellation is an out-of-band request and never waits behind normal work.
-- A response to an interaction has one first-winner claim. The actor persists the interaction before resuming model work.
-- A terminal outcome is persisted by the actor. Cancellation, denial, failure, and close are never represented as successful completion.
-- Model tool-call indexes are ordered within each response round. Tool results are matched by checked call identifiers.
-- `SessionBindings` binds one `Arc<dyn Model>` directly and purely validates it with frozen tools and optional adapters; legacy lookup remains private only for old actor tests.
-- Only explicitly retryable `NotStarted` model failures may use the configured logical retry policy.
-- Compaction appends a summary at a checked boundary. It never rewrites source history or invents an incomplete tool exchange.
-- Snapshots publish before event delivery. A lagged subscriber must resynchronize from a fresh snapshot/subscription baseline.
-- `Runtime::shutdown()` starts one owner-tracked cleanup operation and returns its authoritative result. `Drop` may start it but cannot report the result.
+`SessionRuntimeOptions::new(kernel, bindings, task_runtime)` validates the kernel before any log is accepted. Its Debug reports only capacities, timeouts, tool count, and optional-adapter presence.
 
-## Public API
+`SessionRuntime::create(session_id, spec, log, options)` spawns the complete open lifecycle on the supplied Tokio Handle, then performs:
 
-`Runtime::open(config, handle)` is asynchronous and returns `RuntimeError`. This is private migration implementation; final P4 bindings will carry one direct model and immutable tool set.
+```text
+kernel validation
+→ custom-limit SessionSpec validation
+→ SessionBindings compatibility validation
+→ SessionManifest construction/validation
+→ SessionLog initialize with zero-head proof
+→ new SessionInstanceId
+→ Idle + Healthy state and bounded event channels
+→ ready handshake
+→ idle owner loop
+```
 
-The private legacy Runtime methods retained for actor migration are:
+`SessionRuntime::load(expected_session_id, log, options)` performs:
 
-- `create_session(SessionConfig) -> Result<SessionId, SessionError>`
-- `load_session(SessionId) -> Result<(), SessionError>`
-- `close_session(SessionId) -> Result<(), SessionError>`
-- `delete_session(SessionId) -> Result<(), SessionError>`
-- `list_sessions() -> Result<Vec<SessionSummary>, SessionError>`
-- `submit(SessionId, String) -> Result<TurnId, SessionError>`
-- `answer(SessionId, InteractionId, UserAnswer) -> Result<(), SessionError>`
-- `cancel(SessionId) -> Result<(), SessionError>`
-- `snapshot(SessionId) -> Result<LegacySessionSnapshot, SessionError>`
-- `subscribe(SessionId) -> Result<LegacySessionEventStream, SessionError>`
-- `transcript(SessionId, Option<u64>, usize) -> Result<TranscriptPage, SessionError>`
-- `shutdown() -> Result<(), RuntimeError>`
+```text
+load/validate manifest and expected SessionId
+→ bindings validation
+→ pending-load compatibility proof
+→ paged replay and semantic validation
+→ atomic restart repair when needed
+→ new SessionInstanceId
+→ confirmed-head/last-terminal state rehydration
+→ ready handshake
+→ idle owner loop
+```
 
-`SessionError` is authoritative for session admission, lifecycle, interaction, observation, and transcript operations. It distinguishes not found, already loaded, busy, closing, interaction mismatch, invalid input, unavailable, and internal failure. `RuntimeError` is reserved for invalid runtime configuration, closing, and runtime internal failure.
+No SessionHandle, command sender, fake submit path, or first-snapshot event is exposed in P4-B. `take_events` transfers the one bounded receiver exactly once.
 
-## Persistence
+## Cancellation And Shutdown
 
-A runtime data directory contains `runtime.lock` and a `sessions/` directory. Each session directory is named by its checked `ses_` identifier and contains exactly `session.json` and `conversation.jsonl`.
+Before owner spawn and before any await, `OpenGuard` synchronously installs cleanup watchers on both the configured and current Tokio runtimes. Each captures only `SharedOpenPayload`, root cancellation, and a `payload_claimed` signal. Before entering the single-take cleanup path, a watcher panic-safely constructs and drops a zero-duration sleep in its current execution context; a no-time fallback exits `None` without taking the log. `run_open` signals claim immediately after its successful take. Owner spawn panic, pre-poll Join failure, ready-channel loss, and caller cancellation share this path.
 
-The store worker bootstraps the directory, owns the exclusive root lock, removes orphan temporary creation directories, and serializes filesystem work. Session creation writes `session.json` and an empty conversation file in a temporary directory, flushes/synchronizes them, and atomically renames the directory into the session namespace.
+`SessionRuntime::shutdown(self)` cancels out of band, waits for state `Closing`, log close, sender drops, and task completion. If `shutdown_timeout` expires, it aborts and awaits that same JoinHandle before returning `SessionShutdownError::Timeout`. Known close failure, unknown durability, timeout, and task termination remain distinct typed errors.
 
-The session JSON format is version 2. It stores checked configuration and has a one-megabyte bounded serialized size. Conversation JSONL is append-only, one complete semantic entry per newline, with a one-megabyte line bound, a one-gigabyte file bound, and a one-million complete-entry bound. A final incomplete tail is repaired by truncation. A complete malformed or semantically inconsistent line reports located corruption and is not silently skipped.
+`SessionRuntimeOptions::new` synchronously validates that `task_runtime` has an enabled Tokio time driver by entering it and constructing then dropping a zero-duration sleep under `catch_unwind`. The runtime must remain timer-enabled, alive, and actively driven throughout create, load, and shutdown. Successful SessionRuntime retains the Handle; shutdown constructs its timeout under a short panic-isolated `enter()` scope, drops that scope before await, and can then be polled by a non-Tokio executor. Unexpected timeout-construction panic cancels, aborts, and awaits the same owner task before returning ActorTerminated.
 
-Restart recovery appends failure ToolResult entries for unresolved calls and a `CancelledByRestart` terminal entry using the fixed text `cancelled by restart`. Existing source entries remain in the file. Transcript paging projects all six durable conversation variants, including non-model-visible interaction entries.
+Model descriptor access, SessionLog future construction and polling, and the post-ready actor loop are explicit host-controlled panic boundaries. They are caught and mapped to typed failures; actor-loop panic attempts one bounded close. Arbitrary Core allocation or invariant panics after ownership transfer are not a recoverable API boundary and may skip graceful close, just like destruction of all runtimes capable of driving cleanup. This is an intentional engineering boundary, not a claim that any panic closes safely.
 
-## Safety
+## Error Boundary
 
-Workspace access starts from one configured absolute root. File and directory tools use captured capability-relative paths, reject lexical escape and symlink escape, respect `ReadOnly` versus `ReadWrite`, and bound bytes, entries, names, and output. Workspace shutdown closes admission and joins its owner-tracked worker.
+`SessionOpenError` is a redacted struct with public `SessionOpenErrorKind`. It preserves invalid configuration, invalid manifest, SessionId mismatch, binding mismatch, typed log failure, recovery uncertainty, and owner-start failure. Failed-open close information is a secondary bounded diagnostic and never replaces the primary error.
 
-The process tool is deliberately different: it starts one direct child with structured arguments and a validated ambient host cwd. It never invokes a shell. `ProcessPolicy` controls enabled state, executable allowlist, inherited environment allowlist, timeout, stdout bound, and stderr bound. The child environment is cleared before explicitly permitted values are added. The runtime does not claim an OS process sandbox or process-tree cleanup guarantee.
+`SessionShutdownError` is non-exhaustive and distinguishes Timeout, Durability, LogClose, and ActorTerminated. Diagnostics use bounded static text; raw adapter sources, paths, credentials, prompts, and response bodies are not retained.
 
-Host Model adapters own external networking and cleanup. Core errors carry `NotStarted`, `Started`, or `Unknown` delivery state so the future ModelDriver cannot blindly retry an operation that may already have started.
+## Deferred Work
+
+P4-C will replace the private legacy actor/command scaffolding with the final cloneable SessionHandle, state watch access, bounded submit/answer commands, and transcript routing. P5 will wire TurnHandle completion, ModelDriver, tools, policy/interactions, context, compaction, and terminal settlement. The current owner is deliberately idle: it proves lifecycle and durable ownership without fake execution.
 
 ## Verification
 
-Deterministic gates are offline:
-
-- `cargo fmt --all -- --check`
-- `cargo test --all-targets --locked`
-- `cargo clippy --all-targets --all-features --locked -- -D warnings`
-- `cargo test --locked --manifest-path provider-gate/Cargo.toml --all-targets`
-- `./scripts/check.sh`
-- `./scripts/check-msrv.sh`
-- `cargo test --locked --test v2_acceptance`
-
-Root concrete model/live-network tests were removed in P3-D. The independent provider-gate package remains deterministic historical evidence; no network access is required by root tests.
-
-## Intentional Limits
-
-- There is no model registry or default adapter catalog.
-- There is no shell command interface.
-- There is no process-tree sandbox claim.
-- There is no automatic migration from the historical Store V1 layout; migration is an explicit offline host operation.
-- There is no compatibility wrapper for the removed public surface.
-- There is no detached task ownership: blocking workers, actor joins, provider futures, and shutdown work remain owner-tracked.
-- Current docs describe the v0.2 core. Historical design rationale remains available only for reference under the pre-reset archive.
-
-## Evidence Map
-
-- Public surface: `src/lib.rs`, `src/config.rs`, `src/error.rs`, `src/runtime/runtime_impl.rs`.
-- Model contract: `src/model/model.rs`, `src/model/response.rs`, `src/model/types.rs`, and `tests/model_port_contract.rs`.
-- Tool contract: `src/tools/tool.rs`, `src/tools/set.rs`, `src/tools/policy.rs`, and their focused contract tests.
-- Storage contract: `src/storage/store.rs`, `src/storage/conversation.rs`, `src/storage/conversation/codec.rs`, and `src/session/transcript.rs`.
-- Lifecycle contract: `src/session/actor.rs`, `src/session/command.rs`, and `src/runtime/session_manager.rs`.
-- Acceptance contract: focused v0.3 Port and P4-A foundation tests now; owner/runtime acceptance remains deferred to P4-B/P5.
-- Documentation validation: `scripts/check_docs.py` checks current authority plus selected non-pre-reset evidence.
+Local work for this phase uses Python architecture/docs/source checks and `git diff --check`. Rust build, tests, Clippy, rustdoc, and rustfmt validation are run remotely by the project workflow. The focused owner evidence is `tests/session_runtime_owner_contract.rs`, private runtime/actor unit tests, and the deterministic `FakeSessionLog` operation-admission controls.

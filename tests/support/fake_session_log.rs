@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use tokio::sync::Notify;
+
 use minicore_runtime::config::SessionManifest;
 use minicore_runtime::conversation::{ConversationEntry, ConversationSeq};
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
@@ -10,8 +12,13 @@ use minicore_runtime::storage::{
 };
 use minicore_runtime::value::BoundedText;
 
+mod data;
+
+use data::{append_batch, current_head, validate_contiguous};
+
 #[derive(Clone, Debug)]
 pub enum Script {
+    Continue,
     Error(SessionLogErrorKind),
     UnknownOutcome { committed: bool },
     Delay(Duration),
@@ -62,6 +69,7 @@ struct State {
 #[derive(Clone)]
 pub struct InspectionHandle {
     state: Arc<Mutex<State>>,
+    operation_notify: Arc<Notify>,
 }
 
 impl InspectionHandle {
@@ -85,19 +93,49 @@ impl InspectionHandle {
         lock_state(&self.state).max_concurrent_mutable_operations
     }
 
+    pub fn active_mutable_operations(&self) -> usize {
+        lock_state(&self.state).active_mutable_operations
+    }
+
     pub fn head(&self) -> ConversationSeq {
         current_head(&lock_state(&self.state))
+    }
+
+    pub async fn wait_for_operation_count(&self, count: usize) {
+        loop {
+            let notified = self.operation_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if lock_state(&self.state).operations.len() >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn wait_for_idle(&self) {
+        loop {
+            let notified = self.operation_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if lock_state(&self.state).active_mutable_operations == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
 pub struct FakeSessionLog {
     state: Arc<Mutex<State>>,
+    operation_notify: Arc<Notify>,
 }
 
 impl Default for FakeSessionLog {
     fn default() -> Self {
         Self {
             state: Arc::new(Mutex::new(State::default())),
+            operation_notify: Arc::new(Notify::new()),
         }
     }
 }
@@ -123,6 +161,7 @@ impl FakeSessionLog {
     pub fn inspection(&self) -> InspectionHandle {
         InspectionHandle {
             state: Arc::clone(&self.state),
+            operation_notify: Arc::clone(&self.operation_notify),
         }
     }
 
@@ -171,6 +210,7 @@ enum ScriptQueue {
 
 fn begin_operation(
     state: &Arc<Mutex<State>>,
+    operation_notify: &Arc<Notify>,
     operation: Operation,
     queue: ScriptQueue,
 ) -> (Arc<Mutex<State>>, Option<Script>, ActiveOperation) {
@@ -191,21 +231,26 @@ fn begin_operation(
         ScriptQueue::Close => inner.close_scripts.pop_front(),
     };
     drop(inner);
+    operation_notify.notify_waiters();
     let owned_state = Arc::clone(state);
     let active = ActiveOperation {
         state: Arc::clone(&owned_state),
+        operation_notify: Arc::clone(operation_notify),
     };
     (owned_state, script, active)
 }
 
 struct ActiveOperation {
     state: Arc<Mutex<State>>,
+    operation_notify: Arc<Notify>,
 }
 
 impl Drop for ActiveOperation {
     fn drop(&mut self) {
         let mut state = lock_state(&self.state);
         state.active_mutable_operations = state.active_mutable_operations.saturating_sub(1);
+        drop(state);
+        self.operation_notify.notify_waiters();
     }
 }
 
@@ -219,6 +264,7 @@ enum ScriptOutcome {
 async fn run_script(script: Option<Script>) -> ScriptOutcome {
     match script {
         None => ScriptOutcome::Continue,
+        Some(Script::Continue) => ScriptOutcome::Continue,
         Some(Script::Error(kind)) => ScriptOutcome::Error(kind),
         Some(Script::UnknownOutcome { committed }) => ScriptOutcome::UnknownOutcome { committed },
         Some(Script::Delay(duration)) => {
@@ -249,83 +295,14 @@ fn error(kind: SessionLogErrorKind) -> SessionLogError {
     )
 }
 
-fn current_head(state: &State) -> ConversationSeq {
-    state
-        .entries
-        .last()
-        .map(ConversationEntry::seq)
-        .unwrap_or(ConversationSeq::ZERO)
-}
-
-fn validate_contiguous(entries: &[ConversationEntry]) -> Result<(), FakeSessionLogInitError> {
-    if let Some(first) = entries.first() {
-        let expected = ConversationSeq::new(1);
-        if first.seq() != expected {
-            return Err(FakeSessionLogInitError::NonContiguous {
-                expected,
-                actual: first.seq(),
-            });
-        }
-    }
-    for pair in entries.windows(2) {
-        let expected = pair[0]
-            .seq()
-            .next()
-            .ok_or(FakeSessionLogInitError::SequenceOverflow)?;
-        if pair[1].seq() != expected {
-            return Err(FakeSessionLogInitError::NonContiguous {
-                expected,
-                actual: pair[1].seq(),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn append_batch(
-    state: &mut State,
-    expected_head: ConversationSeq,
-    entries: Vec<ConversationEntry>,
-) -> Result<AppendReceipt, SessionLogErrorKind> {
-    if state.closed {
-        return Err(SessionLogErrorKind::Closed);
-    }
-    if state.corrupt {
-        return Err(SessionLogErrorKind::Corrupt);
-    }
-    if state.manifest.is_none() {
-        return Err(SessionLogErrorKind::NotInitialized);
-    }
-    if expected_head != current_head(state) {
-        return Err(SessionLogErrorKind::Conflict);
-    }
-    if entries.is_empty() {
-        return Err(SessionLogErrorKind::Internal);
-    }
-    let first_expected = expected_head.next().ok_or(SessionLogErrorKind::Internal)?;
-    let contiguous = entries.first().is_some_and(|entry| {
-        entry.seq() == first_expected
-            && entries
-                .windows(2)
-                .all(|pair| Some(pair[1].seq()) == pair[0].seq().next())
-    });
-    if !contiguous {
-        return Err(SessionLogErrorKind::Conflict);
-    }
-    let appended = entries.len();
-    let new_head = entries.last().map(ConversationEntry::seq).unwrap();
-    state.entries.extend(entries);
-    Ok(AppendReceipt {
-        previous_head: expected_head,
-        new_head,
-        appended,
-    })
-}
-
 impl SessionLog for FakeSessionLog {
     fn initialize<'a>(&'a mut self, manifest: SessionManifest) -> LogFuture<'a, ConversationSeq> {
-        let (state, script, active) =
-            begin_operation(&self.state, Operation::Initialize, ScriptQueue::Initialize);
+        let (state, script, active) = begin_operation(
+            &self.state,
+            &self.operation_notify,
+            Operation::Initialize,
+            ScriptQueue::Initialize,
+        );
         Box::pin(async move {
             let _active = active;
             match run_script(script).await {
@@ -353,6 +330,7 @@ impl SessionLog for FakeSessionLog {
     fn load_manifest<'a>(&'a mut self) -> LogFuture<'a, SessionManifest> {
         let (state, script, active) = begin_operation(
             &self.state,
+            &self.operation_notify,
             Operation::LoadManifest,
             ScriptQueue::LoadManifest,
         );
@@ -387,6 +365,7 @@ impl SessionLog for FakeSessionLog {
     ) -> LogFuture<'a, ConversationPage> {
         let (state, script, active) = begin_operation(
             &self.state,
+            &self.operation_notify,
             Operation::ReadPage { after, limit },
             ScriptQueue::Read,
         );
@@ -440,6 +419,7 @@ impl SessionLog for FakeSessionLog {
         let operation_entries = entries.clone();
         let (state, script, active) = begin_operation(
             &self.state,
+            &self.operation_notify,
             Operation::Append {
                 expected_head,
                 entries: operation_entries,
@@ -466,8 +446,12 @@ impl SessionLog for FakeSessionLog {
     }
 
     fn close<'a>(&'a mut self) -> LogFuture<'a, ()> {
-        let (state, script, active) =
-            begin_operation(&self.state, Operation::Close, ScriptQueue::Close);
+        let (state, script, active) = begin_operation(
+            &self.state,
+            &self.operation_notify,
+            Operation::Close,
+            ScriptQueue::Close,
+        );
         Box::pin(async move {
             let _active = active;
             match run_script(script).await {

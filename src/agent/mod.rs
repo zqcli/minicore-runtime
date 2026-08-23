@@ -45,11 +45,12 @@ mod tests {
     use crate::config::RetryPolicy;
     use crate::ids::{SessionId, TurnId};
     use crate::model::legacy_provider::{LegacyModelFuture, LegacyModelProvider};
+    use crate::model::legacy_registry::LegacyProviderRegistry;
     use crate::model::{
         AssistantPart, LegacyModelCallContext, LegacyModelDescriptor, LegacyModelEvent,
         LegacyModelEventSink, LegacyModelGateway, LegacyModelSelection, LegacyProviderId,
-        LegacyProviderRegistry, ModelError, ModelFinishReason, ModelLimits, ModelRequest,
-        ModelResponse, ReasoningPreference, Usage,
+        ModelError, ModelFinishReason, ModelLimits, ModelRequest, ModelResponse,
+        ReasoningPreference, Usage,
     };
     use crate::prompt::CompactionConfig;
     use crate::storage::conversation::{ConversationLog, NewConversationEntry};
@@ -67,7 +68,8 @@ mod tests {
         InteractionClient, InteractionReceiver, LegacyTool, LegacyToolContext, LegacyToolError,
         LegacyToolOutput, ToolName, ToolSpec,
     };
-    use crate::workspace::{Workspace, WorkspaceAccess};
+    use crate::workspace::Workspace;
+    use crate::workspace::root::WorkspaceAccess;
     use serde_json::{Value, json};
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;

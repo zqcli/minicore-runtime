@@ -1,10 +1,10 @@
 # Canonical Module Map
 
-This page maps the current v0.3 source graph. The v0.2 Runtime, concrete tool adapters, and public policy facade are transitional implementation history, not public extension points.
+This page maps the current v0.3 source graph. The v0.2 multi-session Runtime is deleted; concrete adapters and the remaining old actor/command/provider/workspace files are migration history, not public extension points.
 
 ## Root Surface
 
-`src/lib.rs` keeps the checked DTO and Port modules public. The `runtime` module and old Runtime/configuration facade are private. `agent`, `prompt`, `storage` implementation details, and the legacy tool execution modules are crate-private or private.
+`src/lib.rs` keeps the checked DTO, Port, and single-session owner modules public. There is no top-level `runtime` module. `agent`, `prompt`, workspace, old storage implementations, actor/commands/observation/transcript, and legacy model/tool execution modules are `cfg(test)` at their owning declarations and absent from production compilation.
 
 | Module | Current responsibility |
 | --- | --- |
@@ -12,10 +12,10 @@ This page maps the current v0.3 source graph. The v0.2 Runtime, concrete tool ad
 | `conversation` | Canonical conversation entries, proof-gated loading, replay/recovery, transcript, and read-only views |
 | `context` | Typed `ContextProvider` Port and validated context DTOs |
 | `compaction` | Typed `CompactionStrategy` Port and immutable candidates/proposals |
-| `error` | Checked public error summaries and internal session errors |
+| `error` | Redacted diagnostics plus typed log/open/shutdown/turn errors |
 | `ids` | Checked identifiers, including `ContextSourceId` |
 | `model` | Final direct streaming `Model` Port and shared checked DTOs plus private legacy runner lookup |
-| `session` | Public bindings/interactions/state/events/TurnHandle foundation plus explicitly private legacy actor observation implementation |
+| `session` | Public single-session owner, bindings/interactions/state/events/TurnHandle foundation, plus explicitly private legacy execution scaffolding |
 | `storage` | `SessionLog` Port and private durable store implementation |
 | `tools` | Final public `Tool`/`ToolSet` execution seam plus private legacy runner scaffolding |
 
@@ -33,7 +33,11 @@ The final execution seam is `tools::Tool`, `tools::ToolSet`, `tools::ToolInvocat
 
 `src/session/state.rs`, `event.rs`, `event_stream.rs`, and `turn_handle.rs` own the final P4-A foundation. State is process-local and invariant-checked; EventStream is one bounded mpsc receiver with crate-private lossy publication; TurnHandle provides exact cancellation and first-wins durable completion. None contains actor, log, Workspace, snapshot recovery, broadcast, or serde capabilities.
 
-`src/session/legacy_state.rs`, `legacy_event.rs`, `legacy_event_stream.rs`, and `legacy_snapshot.rs` preserve the old actor behavior under explicit `Legacy*` names. They are crate-private P4-B/P5 deletion targets and have no public aliases or reexports.
+`src/session/runtime.rs` owns the exact public P4-B surface and OpenGuard/JoinHandle discipline. `runtime_open.rs` sequences create/load, compatibility proof, replay/repair, ready, and failed-open cleanup. `runtime_actor.rs` owns the idle log/state/event lifetime and close barrier. `runtime_log.rs` adds only cancellation-at-operation-entry and delegates all timeout/panic/close classification to ConversationLog helpers. Every file is below 500 lines.
+
+`src/error/operations.rs` owns SessionLogError, struct-plus-kind SessionOpenError, and non-exhaustive SessionShutdownError. Public diagnostics contain bounded static messages; SessionOpenError preserves primary log/identity distinctions and records failed-open close failure only as a secondary diagnostic.
+
+`src/session/legacy_state.rs`, `legacy_event.rs`, `legacy_event_stream.rs`, and `legacy_snapshot.rs` preserve old observation tests under explicit `Legacy*` names. `actor.rs` and `command.rs` are marked P4-C/P5 deletion scaffolding. None is reached by SessionRuntime or publicly reexported.
 
 Legacy physical storage persists separately as `LegacyToolOutput { text, is_error }`. Public `ToolOutput` is content-only and pairs with `ToolResultOutcome` in `ModelMessage::Tool`; the crate-private prompt conversion maps legacy status before provider encoding, while conversation storage retains the old DTO until that path is deleted.
 
@@ -49,11 +53,11 @@ Workspace capability ownership remains a private transitional implementation det
 
 ## Other Owners
 
-- `config` owns checked kernel/session-spec values. `RuntimeConfig`, `RuntimeConfigBuilder`, and `SessionConfig` remain crate-private transitional values.
+- `config` owns checked kernel/session-spec values. RuntimeConfig/Builder and legacy SessionConfig are deleted.
 - `model` owns the final direct Port and shared DTOs; legacy lookup remains private only until `ModelDriver` replaces the old runner path.
 - `conversation` owns confirmed state, durable append coordination, replay/recovery, transcript projection, and proof-gated load completion.
 - `storage` owns the current private filesystem store and exposes only the `SessionLog` Port to future v0.3 owners.
-- `session` owns final bindings/state/event/TurnHandle primitives while its old actor/lifecycle implementation remains transitional; `runtime` remains private until P4-B.
+- `session` owns the final single-session lifecycle plus bindings/state/event/TurnHandle primitives; SessionHandle/commands remain P4-C and execution remains P5.
 
 ## File Inventory
 
@@ -64,7 +68,8 @@ src/
 ├── context/{mod.rs,provider.rs}
 ├── compaction/{mod.rs,strategy.rs}
 ├── model/{legacy_gateway.rs,legacy_provider.rs,legacy_registry.rs,mod.rs,model.rs,response.rs,types.rs}
-├── session/{bindings.rs,event.rs,event_stream.rs,interaction.rs,state.rs,turn_handle.rs,...legacy and owner files}
+├── error/{operations.rs}
+├── session/{bindings.rs,event.rs,event_stream.rs,interaction.rs,runtime.rs,runtime_open.rs,runtime_actor.rs,runtime_log.rs,state.rs,turn_handle.rs,...legacy files}
 ├── storage/{mod.rs,session_log.rs,...private implementation files}
 └── tools/{context.rs,input.rs,legacy_context.rs,legacy_policy.rs,legacy_types.rs,mod.rs,policy.rs,progress.rs,registry.rs,set.rs,tool.rs,types.rs}
 ```
@@ -79,11 +84,12 @@ Concrete `src/tools/builtins/**` and `src/tools/process.rs` adapters were delete
 - `tests/session_bindings_contract.rs` covers exact bindings shape, pure validation, descriptor panic isolation, compatibility failures, frozen ToolSpec limits, optional adapter non-invocation, and P4 load ordering.
 - `tests/session_state_event_contract.rs` covers exact state/event shapes, legal and illegal state matrices, diagnostic/event redaction, envelopes, and the single-consumer stream source contract; sink behavior is tested in `event_stream.rs`.
 - `tests/turn_handle_contract.rs` covers the public exact-Turn surface and safe wait errors; mutex/cancellation/completion races are tested in `turn_handle.rs` beside the private publisher.
+- `tests/session_runtime_owner_contract.rs` covers options, create/load order, repair-before-ready, error preservation, one-shot events, explicit/Drop shutdown, open cancellation, timeout abort+await, stopped task runtimes, and independent concurrent owners using FakeSessionLog.
 - `tests/p1_dto.rs` covers the final checked Tool DTOs and input-answer validation.
 - Private `src/tools/progress.rs` tests cover synchronous bounded `try_send` behavior.
 - Private `src/tools/legacy_types.rs` tests prove legacy failure output wire round-trip.
 - Removed v0.2 model registry, transport, concrete adapter, Runtime smoke, and Runtime surface tests are baseline evidence, not compatibility contracts.
-- SessionRuntime and actor-wiring acceptance coverage is deferred to P4-B/P5.
+- SessionHandle command/actor execution acceptance remains deferred to P4-C/P5.
 
 ## Boundary Rules
 

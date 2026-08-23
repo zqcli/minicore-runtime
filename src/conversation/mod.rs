@@ -28,7 +28,11 @@ const _: () = {
     let _ = log::UnsequencedEntry::Summary;
 };
 
-pub(crate) use load::LoadCompatibilityValidated;
+pub(crate) use load::{LoadCompatibilityValidated, close_unopened_log};
+pub(crate) use log::{
+    ConversationCloseOutcome, ConversationCommitError, ConversationCommitErrorKind,
+    ConversationLog, TimestampSource,
+};
 
 pub use entry::{
     AssistantMessageEntry, ConversationEntry, ConversationSeq, SummaryEntry, ToolResultEntry,
