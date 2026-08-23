@@ -13,8 +13,8 @@ fn canonical_agent_module_is_private_unconditional_and_legacy_is_test_only() {
     assert!(module.contains("pub(crate) use tool_driver::{"));
 
     let legacy = include_str!("../src/agent/legacy.rs");
-    assert!(legacy.contains("#[path = \"context.rs\"]\nmod context;"));
-    assert!(legacy.contains("#[path = \"runner.rs\"]\nmod runner;"));
+    assert!(legacy.contains("#[path = \"legacy_context.rs\"]\nmod context;"));
+    assert!(legacy.contains("#[path = \"legacy_runner.rs\"]\nmod runner;"));
 }
 
 #[test]
@@ -26,10 +26,8 @@ fn runner_protocol_is_exact_redacted_and_continuation_free() {
         "pub(crate) tool_call_id: ToolCallId",
         "pub(crate) tool_name: ToolName",
         "pub(crate) kind: InteractionKind",
-        "oneshot::Sender<Result<InteractionAnswer, SuspensionError>>",
-        "pub(crate) fn take_resume_for_actor(",
+        "pub(crate) resume: oneshot::Sender<Result<InteractionAnswer, SuspensionError>>",
         "suspension: TurnSuspension",
-        "suspension.resume",
         "Cancelled",
         "DeadlineExceeded",
         "StaleTurn",
@@ -40,7 +38,7 @@ fn runner_protocol_is_exact_redacted_and_continuation_free() {
     }
     let suspension = protocol
         .split_once("pub(crate) struct TurnSuspension {")
-        .and_then(|(_, tail)| tail.split_once("}\n\n// P4-C actor wiring"))
+        .and_then(|(_, tail)| tail.split_once("}\n\nimpl fmt::Debug"))
         .map(|(body, _)| body)
         .unwrap();
     assert_eq!(
@@ -68,6 +66,8 @@ fn runner_protocol_is_exact_redacted_and_continuation_free() {
         .map(|(body, _)| body)
         .unwrap();
     assert!(!debug.contains(".field(\"resume\""));
+    assert!(protocol.contains("pub(crate) fn take_resume_for_actor("));
+    assert!(protocol.contains("pub(crate) fn take_commit_reply_for_actor("));
     for forbidden in [
         "serde",
         "Serialize",
@@ -100,12 +100,18 @@ fn tool_driver_owns_only_policy_tool_suspension_and_progress_execution() {
     for required in [
         "pub(crate) struct ToolDriver",
         "pub(crate) struct ToolDriverConfig",
-        "pub(crate) struct ToolDriverProgress",
+        "pub(crate) enum ToolDriverProgress",
+        "Started {",
+        "Update {",
         "pub(crate) struct ToolDriverResult",
         "pub(crate) async fn run(",
         ") -> Result<ToolDriverResult, SuspensionError>",
         "effective_deadline(turn_deadline, self.config.policy_timeout)",
         "effective_deadline(turn_deadline, self.config.tool_timeout)",
+        "DeadlineSource::Turn => PolicyResolution::DeadlineExceeded",
+        "DeadlineSource::Port => PolicyResolution::Denied",
+        "DeadlineSource::Turn => ExecutionResolution::DeadlineExceeded",
+        "DeadlineSource::Port => ExecutionResolution::Failed",
         "catch_unwind(AssertUnwindSafe(|| policy.decide(request)))",
         "catch_unwind(AssertUnwindSafe(|| tool.execute(invocation, context)))",
         "child.cancel();",
@@ -123,6 +129,7 @@ fn tool_driver_owns_only_policy_tool_suspension_and_progress_execution() {
     }
     assert!(!driver.contains("tool.spec()"));
     assert!(!driver.contains("fn suspension_failure"));
+    assert!(!driver.contains("fn effective_deadline("));
     for forbidden in [
         "SessionHandle",
         "SessionRuntime",

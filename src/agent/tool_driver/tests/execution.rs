@@ -7,6 +7,7 @@ async fn tool_construction_poll_and_typed_errors_are_safe_failures() {
         ToolBehavior::FuturePanic,
         ToolBehavior::Error(ToolError::Failed),
         ToolBehavior::Error(ToolError::Cancelled),
+        ToolBehavior::Error(ToolError::TimedOut),
     ];
     for (index, behavior) in behaviors.into_iter().enumerate() {
         let tool = ScriptTool::new("search", vec![behavior]);
@@ -30,7 +31,7 @@ async fn tool_construction_poll_and_typed_errors_are_safe_failures() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn tool_timeout_cancels_child_before_dropping_future() {
+async fn configured_tool_timeout_cancels_child_before_dropping_future() {
     let probe = OperationProbe::shared();
     let tool = ScriptTool::new("search", vec![ToolBehavior::Pending(Arc::clone(&probe))]);
     let policy = allow_policy();
@@ -52,6 +53,41 @@ async fn tool_timeout_cancels_child_before_dropping_future() {
     let result = run.await.unwrap().unwrap();
 
     assert_eq!(result.outcome, ToolResultOutcome::Failed);
+    assert!(probe.dropped.load(Ordering::SeqCst));
+    assert!(probe.cancelled_before_drop.load(Ordering::SeqCst));
+    assert_eq!(tool.calls(), 1);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn earlier_turn_deadline_during_tool_is_exact_control_failure() {
+    let probe = OperationProbe::shared();
+    let tool = ScriptTool::new("search", vec![ToolBehavior::Pending(Arc::clone(&probe))]);
+    let policy = allow_policy();
+    let driver = driver(
+        Arc::clone(&tool),
+        Some(policy_port(&policy)),
+        config_with(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            MAX_JSON_BYTES,
+            BoundedText::MAX_BYTES,
+        ),
+    );
+    let (suspensions, _suspension_rx, progress, _progress_rx) = channels();
+    let run = tokio::spawn(async move {
+        driver
+            .run(
+                invocation("search", 69, json!({})),
+                deadline_after(Duration::from_secs(4)),
+                CancellationToken::new(),
+                &suspensions,
+                &progress,
+            )
+            .await
+    });
+    probe.wait_polled().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(run.await.unwrap(), Err(SuspensionError::DeadlineExceeded));
     assert!(probe.dropped.load(Ordering::SeqCst));
     assert!(probe.cancelled_before_drop.load(Ordering::SeqCst));
     assert_eq!(tool.calls(), 1);

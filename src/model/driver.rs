@@ -1,11 +1,12 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::Instant as TokioInstant;
 
+use crate::time::{DeadlineSource, effective_deadline};
 use crate::tools::ToolName;
 use crate::value::{BoundedText, MAX_JSON_BYTES};
 
@@ -16,8 +17,10 @@ use super::response::{DeliveryState, ModelError, ModelErrorKind};
 use super::types::{ModelRequest, ModelResponse};
 
 mod assembler;
+mod failure;
 
 use assembler::Assembler;
+pub(crate) use failure::ModelDriverFailure;
 
 const MAX_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -169,39 +172,58 @@ impl ModelDriver {
         context: ModelCallContext,
         progress: &mpsc::Sender<ModelDriverProgress>,
     ) -> Result<ModelResponse, ModelError> {
-        let (deadline, adapter_deadline) = self.effective_deadline(context.deadline)?;
+        self.run_detailed(request, context, progress)
+            .await
+            .map_err(ModelDriverFailure::error)
+    }
+
+    pub(crate) async fn run_detailed(
+        &self,
+        request: ModelRequest,
+        context: ModelCallContext,
+        progress: &mpsc::Sender<ModelDriverProgress>,
+    ) -> Result<ModelResponse, ModelDriverFailure> {
+        let deadline = effective_deadline(context.deadline, self.model_call_timeout)
+            .map_err(|_| ModelDriverFailure::ordinary(ModelError::InvalidRequest))?;
         if context.cancellation.is_cancelled() {
-            return Err(generated_error(
+            return Err(ModelDriverFailure::ordinary(generated_error(
                 ModelErrorKind::Cancelled,
                 DeliveryState::NotStarted,
+            )));
+        }
+        if TokioInstant::now() >= deadline.tokio() {
+            return Err(ModelDriverFailure::deadline(
+                generated_error(ModelErrorKind::Timeout, DeliveryState::NotStarted),
+                deadline.source(),
             ));
         }
-        if TokioInstant::now() >= deadline {
-            return Err(generated_error(
-                ModelErrorKind::Timeout,
-                DeliveryState::NotStarted,
-            ));
-        }
-        self.validate_request(&request)?;
+        self.validate_request(&request)
+            .map_err(ModelDriverFailure::ordinary)?;
 
         let max_attempts = self.retry_policy.max_attempts;
         for attempt in 0..max_attempts {
             if context.cancellation.is_cancelled() {
-                return Err(generated_error(
+                return Err(ModelDriverFailure::ordinary(generated_error(
                     ModelErrorKind::Cancelled,
                     DeliveryState::NotStarted,
-                ));
+                )));
             }
-            if TokioInstant::now() >= deadline {
-                return Err(generated_error(
-                    ModelErrorKind::Timeout,
-                    DeliveryState::NotStarted,
+            if TokioInstant::now() >= deadline.tokio() {
+                return Err(ModelDriverFailure::deadline(
+                    generated_error(ModelErrorKind::Timeout, DeliveryState::NotStarted),
+                    deadline.source(),
                 ));
             }
             let mut attempt_context = context.clone();
-            attempt_context.deadline = adapter_deadline;
+            attempt_context.deadline = deadline.standard();
             match self
-                .run_attempt(request.clone(), attempt_context, deadline, progress)
+                .run_attempt(
+                    request.clone(),
+                    attempt_context,
+                    deadline.tokio(),
+                    deadline.source(),
+                    progress,
+                )
                 .await
             {
                 Ok(response) => return Ok(response),
@@ -215,28 +237,17 @@ impl ModelDriver {
                         .retry_policy
                         .delay_for_retry(attempt, failure.error.retry_after())
                     else {
-                        return Err(failure.error);
+                        return Err(failure.into_driver_failure());
                     };
-                    if !retry_fits(deadline, delay) {
-                        return Err(failure.error);
+                    if !retry_fits(deadline.tokio(), delay) {
+                        return Err(failure.into_driver_failure());
                     }
-                    wait_for_retry(&context, deadline, delay).await?;
+                    wait_for_retry(&context, deadline.tokio(), deadline.source(), delay).await?;
                 }
-                Err(failure) => return Err(failure.error),
+                Err(failure) => return Err(failure.into_driver_failure()),
             }
         }
-        Err(ModelError::Internal)
-    }
-
-    fn effective_deadline(
-        &self,
-        context_deadline: Instant,
-    ) -> Result<(TokioInstant, Instant), ModelError> {
-        let configured = TokioInstant::now()
-            .checked_add(self.model_call_timeout)
-            .ok_or(ModelError::InvalidRequest)?;
-        let deadline = TokioInstant::from_std(context_deadline).min(configured);
-        Ok((deadline, deadline.into_std()))
+        Err(ModelDriverFailure::ordinary(ModelError::Internal))
     }
 
     fn validate_request(&self, request: &ModelRequest) -> Result<(), ModelError> {
@@ -278,6 +289,7 @@ impl ModelDriver {
         request: ModelRequest,
         context: ModelCallContext,
         deadline: TokioInstant,
+        deadline_source: DeadlineSource,
         progress: &mpsc::Sender<ModelDriverProgress>,
     ) -> Result<ModelResponse, AttemptFailure> {
         let cancellation = context.cancellation.clone();
@@ -296,9 +308,10 @@ impl ModelDriver {
                 ));
             }
             _ = tokio::time::sleep_until(deadline) => {
-                return Err(AttemptFailure::new(
+                return Err(AttemptFailure::deadline(
                     generated_error(ModelErrorKind::Timeout, DeliveryState::Unknown),
                     false,
+                    deadline_source,
                 ));
             }
             result = &mut start => match result {
@@ -325,12 +338,13 @@ impl ModelDriver {
                     ));
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    return Err(AttemptFailure::new(
+                    return Err(AttemptFailure::deadline(
                         generated_error(
                             ModelErrorKind::Timeout,
                             observed_delivery(assembler.observed_event),
                         ),
                         assembler.observed_event,
+                        deadline_source,
                     ));
                 }
                 result = &mut next => result,
@@ -369,6 +383,7 @@ impl ModelDriver {
 struct AttemptFailure {
     error: ModelError,
     observed_event: bool,
+    deadline_source: Option<DeadlineSource>,
 }
 
 impl AttemptFailure {
@@ -376,6 +391,22 @@ impl AttemptFailure {
         Self {
             error,
             observed_event,
+            deadline_source: None,
+        }
+    }
+
+    fn deadline(error: ModelError, observed_event: bool, source: DeadlineSource) -> Self {
+        Self {
+            error,
+            observed_event,
+            deadline_source: Some(source),
+        }
+    }
+
+    fn into_driver_failure(self) -> ModelDriverFailure {
+        ModelDriverFailure {
+            error: self.error,
+            deadline_source: self.deadline_source,
         }
     }
 }
@@ -409,20 +440,21 @@ fn retry_fits(deadline: TokioInstant, delay: Duration) -> bool {
 async fn wait_for_retry(
     context: &ModelCallContext,
     deadline: TokioInstant,
+    deadline_source: DeadlineSource,
     delay: Duration,
-) -> Result<(), ModelError> {
+) -> Result<(), ModelDriverFailure> {
     let retry_at = TokioInstant::now()
         .checked_add(delay)
-        .ok_or(ModelError::InvalidRequest)?;
+        .ok_or_else(|| ModelDriverFailure::ordinary(ModelError::InvalidRequest))?;
     tokio::select! {
         biased;
-        _ = context.cancellation.cancelled() => Err(generated_error(
+        _ = context.cancellation.cancelled() => Err(ModelDriverFailure::ordinary(generated_error(
             ModelErrorKind::Cancelled,
             DeliveryState::NotStarted,
-        )),
-        _ = tokio::time::sleep_until(deadline) => Err(generated_error(
-            ModelErrorKind::Timeout,
-            DeliveryState::NotStarted,
+        ))),
+        _ = tokio::time::sleep_until(deadline) => Err(ModelDriverFailure::deadline(
+            generated_error(ModelErrorKind::Timeout, DeliveryState::NotStarted),
+            deadline_source,
         )),
         _ = tokio::time::sleep_until(retry_at) => Ok(()),
     }

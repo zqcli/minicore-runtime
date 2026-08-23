@@ -9,19 +9,21 @@ fn agent_execution_surface_is_private_and_legacy_runner_is_test_only() {
 
     let module = include_str!("../src/agent/mod.rs");
     let legacy = include_str!("../src/agent/legacy.rs");
-    let context = include_str!("../src/agent/context.rs");
+    let context = include_str!("../src/agent/legacy_context.rs");
     assert!(context.contains("type TimestampSource = fn()"));
     assert!(!context.contains("dyn Fn"));
     assert!(context.contains("!(1..=64).contains"));
     assert!(module.contains("mod runner_protocol;"));
+    assert!(module.contains("mod runner;"));
     assert!(module.contains("mod tool_driver;"));
+    assert!(module.contains("mod turn_context;"));
     assert!(module.contains("#[cfg(test)]\nmod legacy;"));
     assert!(legacy.contains("pub(crate) use context::{"));
     assert!(legacy.contains("pub(crate) use runner::{"));
-    assert!(legacy.contains("#[path = \"context.rs\"]\nmod context;"));
-    assert!(legacy.contains("#[path = \"runner.rs\"]\nmod runner;"));
+    assert!(legacy.contains("#[path = \"legacy_context.rs\"]\nmod context;"));
+    assert!(legacy.contains("#[path = \"legacy_runner.rs\"]\nmod runner;"));
     assert!(context.starts_with("#![cfg(test)]"));
-    let runner = include_str!("../src/agent/runner.rs");
+    let runner = include_str!("../src/agent/legacy_runner.rs");
     for required in [
         "TimestampSource",
         "RetryPolicy",

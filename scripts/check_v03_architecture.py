@@ -32,19 +32,21 @@ CONCRETE_FILENAMES = {
     "process.rs", "builtins.rs",
 }
 CANONICAL_PRODUCTION_FILES = {
-    "src/agent": {"mod.rs", "runner_protocol.rs", "tool_driver.rs"},
+    "src/agent": {"mod.rs", "runner.rs", "runner_protocol.rs", "tool_driver.rs", "turn_context.rs"},
     "src/context": {"mod.rs", "provider.rs", "driver.rs"},
     "src/model": {"mod.rs", "model.rs", "driver.rs", "request.rs", "response.rs", "types.rs"},
     "src/prompt": {"mod.rs", "builder.rs"},
     "src/tools": {"mod.rs", "tool.rs", "set.rs", "context.rs", "input.rs", "policy.rs", "progress.rs", "types.rs"},
 }
 CANONICAL_PRODUCTION_DIRECTORIES = {
+    "src/agent/runner": {"diagnostics.rs", "support.rs"},
     "src/agent/tool_driver": {"support.rs"},
     "src/compaction/driver": set(),
-    "src/model/driver": {"assembler.rs"},
+    "src/model/driver": {"assembler.rs", "failure.rs"},
 }
 MODEL_DRIVER_ROLE_FILES = {"src/model/driver.rs"}
 TOOL_DRIVER_ROLE_FILES = {"src/agent/tool_driver.rs"}
+TURN_RUNNER_ROLE_FILES = {"src/agent/runner.rs"}
 CONTEXT_DRIVER_ROLE_FILES = {"src/context/driver.rs"}
 COMPACTION_DRIVER_ROLE_FILES = {"src/compaction/driver.rs"}
 PROMPT_BUILDER_ROLE_FILES = {"src/prompt/builder.rs"}
@@ -52,6 +54,8 @@ TOOLSET_ROLE_FILES = {"src/tools/set.rs"}
 SESSION_BINDINGS_ROLE_FILES = {"src/session/bindings.rs"}
 SESSION_RUNTIME_ROLE_FILES = {"src/session/runtime.rs"}
 TRANSITIONAL_PRIVATE_FILES = {
+    "src/agent/legacy_context.rs",
+    "src/agent/legacy_runner.rs",
     "src/model/legacy_gateway.rs",
     "src/model/legacy_provider.rs",
     "src/model/legacy_registry.rs",
@@ -86,11 +90,11 @@ FORBIDDEN_SYMBOLS = {
 # the public tools module and final canonical role inventory.
 FORBIDDEN_SYMBOL_EXEMPTIONS = {
     "ToolRegistry": {
-        "src/agent/context.rs", "src/agent/mod.rs", "src/config.rs",
+        "src/agent/legacy_context.rs", "src/agent/mod.rs", "src/config.rs",
         "src/session/actor.rs", "src/tools/registry.rs",
     },
     "InteractionClient": {
-        "src/agent/context.rs", "src/agent/mod.rs", "src/session/actor.rs", "src/tools/mod.rs",
+        "src/agent/legacy_context.rs", "src/agent/mod.rs", "src/session/actor.rs", "src/tools/mod.rs",
     },
 }
 FORBIDDEN_IMPORTS = {
@@ -112,8 +116,9 @@ PORT_FILES = {
 }
 REQUIRED_FILES = {
     "src/lib.rs", "src/config.rs", "src/error.rs", "src/error/operations.rs", "src/ids.rs", "src/value.rs", "src/time.rs",
-    "src/agent/mod.rs", "src/agent/runner_protocol.rs", "src/agent/tool_driver.rs",
-    "src/agent/tool_driver/support.rs",
+    "src/agent/mod.rs", "src/agent/runner.rs", "src/agent/runner/diagnostics.rs",
+    "src/agent/runner/support.rs", "src/agent/runner_protocol.rs", "src/agent/tool_driver.rs",
+    "src/agent/tool_driver/support.rs", "src/agent/turn_context.rs",
     "src/prompt/mod.rs", "src/prompt/builder.rs",
     "src/compaction/driver.rs",
     "src/session/mod.rs", "src/session/runtime.rs", "src/session/runtime_actor.rs",
@@ -986,6 +991,7 @@ def responsibility_errors(views: dict[str, tuple[str, int]]) -> list[str]:
     role_groups = (
         ("model driver", MODEL_DRIVER_ROLE_FILES),
         ("tool driver", TOOL_DRIVER_ROLE_FILES),
+        ("turn runner", TURN_RUNNER_ROLE_FILES),
         ("context driver", CONTEXT_DRIVER_ROLE_FILES),
         ("compaction driver", COMPACTION_DRIVER_ROLE_FILES),
         ("prompt builder", PROMPT_BUILDER_ROLE_FILES),

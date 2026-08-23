@@ -31,7 +31,7 @@ async fn approval_suspends_exact_identity_then_allow_once_executes_exactly_once(
     let policy = approval_policy(Some(Arc::clone(&policy_dropped)));
     let driver = driver(Arc::clone(&tool), Some(policy_port(&policy)), config());
     let expected = invocation("search", 40, json!({"query": "rust"}));
-    let (suspensions, mut suspension_rx, progress, _progress_rx) = channels();
+    let (suspensions, mut suspension_rx, progress, mut progress_rx) = channels();
     let run = tokio::spawn({
         let expected = expected.clone();
         async move {
@@ -63,6 +63,12 @@ async fn approval_suspends_exact_identity_then_allow_once_executes_exactly_once(
     assert_outcome(&result, ToolResultOutcome::Success, "approved");
     assert_eq!(tool.calls(), 1);
     assert_eq!(tool.invocations(), vec![expected]);
+    assert!(matches!(
+        progress_rx.try_recv(),
+        Ok(ToolDriverProgress::Started { tool_call_id, tool_name })
+            if tool_call_id == call_id(40) && tool_name.as_str() == "search"
+    ));
+    assert!(progress_rx.try_recv().is_err());
 }
 
 #[tokio::test(flavor = "current_thread")]

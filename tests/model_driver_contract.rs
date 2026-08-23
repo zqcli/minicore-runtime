@@ -9,8 +9,11 @@ fn canonical_driver_is_private_bounded_and_adapter_neutral() {
     assert!(!module.contains("pub use driver"));
 
     let driver = include_str!("../src/model/driver.rs");
+    let failure = include_str!("../src/model/driver/failure.rs");
+    let implementation = format!("{driver}\n{failure}");
     for required in [
         "pub(crate) struct ModelDriver",
+        "pub(crate) struct ModelDriverFailure",
         "pub(crate) enum ModelDriverProgress",
         "model: Arc<dyn Model>",
         "model_call_timeout: Duration",
@@ -18,13 +21,20 @@ fn canonical_driver_is_private_bounded_and_adapter_neutral() {
         "limits: SemanticLimitsSnapshot",
         "pub(crate) fn new(",
         "pub(crate) async fn run(",
+        "pub(crate) async fn run_detailed(",
+        "effective_deadline(context.deadline, self.model_call_timeout)",
+        "deadline_source: Option<DeadlineSource>",
         "try_send(progress_event)",
         "AssertUnwindSafe(start).catch_unwind()",
         "AssertUnwindSafe(stream.next()).catch_unwind()",
         "error.delivery() == DeliveryState::NotStarted",
     ] {
-        assert!(driver.contains(required), "driver misses {required}");
+        assert!(
+            implementation.contains(required),
+            "driver misses {required}"
+        );
     }
+    assert!(!driver.contains("fn effective_deadline("));
     for forbidden in [
         "SessionHandle",
         "SessionRuntime",
@@ -45,10 +55,14 @@ fn canonical_driver_is_private_bounded_and_adapter_neutral() {
         "ServiceLocator",
         "tokio::spawn",
     ] {
-        assert!(!driver.contains(forbidden), "driver contains {forbidden}");
+        assert!(
+            !implementation.contains(forbidden),
+            "driver contains {forbidden}"
+        );
     }
     let lines = driver.lines().count();
     assert!(lines < 500, "canonical driver has {lines} lines");
+    assert!(failure.lines().count() < 500);
     let progress = driver
         .split_once("pub(crate) enum ModelDriverProgress {")
         .and_then(|(_, rest)| rest.split_once('}'))
@@ -85,6 +99,7 @@ fn public_model_port_remains_free_of_driver_implementation() {
 
     let root = include_str!("../src/lib.rs");
     assert!(!root.contains("ModelDriver"));
+    assert!(!root.contains("ModelDriverFailure"));
     assert!(!root.contains("ModelDriverProgress"));
 }
 

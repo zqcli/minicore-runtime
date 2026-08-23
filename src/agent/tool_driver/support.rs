@@ -1,17 +1,45 @@
 use tokio::sync::mpsc;
 
 use crate::ids::ToolCallId;
-use crate::tools::{ToolProgress, ToolProgressEmitter, ToolProgressSink};
+use crate::tools::{
+    ToolDecision, ToolExecutionOutcome, ToolProgress, ToolProgressEmitter, ToolProgressSink,
+};
 
 use super::{ToolDriverProgress, ToolDriverResult};
 
+pub(super) enum PolicyResolution {
+    Decision(ToolDecision),
+    Denied,
+    Cancelled,
+    DeadlineExceeded,
+}
+
+pub(super) enum ExecutionResolution {
+    Outcome(ToolExecutionOutcome),
+    Failed,
+    Cancelled,
+    DeadlineExceeded,
+}
+
 impl ToolDriverProgress {
     pub(crate) const fn tool_call_id(&self) -> &ToolCallId {
-        &self.tool_call_id
+        match self {
+            Self::Started { tool_call_id, .. } | Self::Update { tool_call_id, .. } => tool_call_id,
+        }
     }
 
-    pub(crate) const fn progress(&self) -> &ToolProgress {
-        &self.progress
+    pub(crate) const fn tool_name(&self) -> Option<&crate::tools::ToolName> {
+        match self {
+            Self::Started { tool_name, .. } => Some(tool_name),
+            Self::Update { .. } => None,
+        }
+    }
+
+    pub(crate) const fn progress(&self) -> Option<&ToolProgress> {
+        match self {
+            Self::Update { progress, .. } => Some(progress),
+            Self::Started { .. } => None,
+        }
     }
 }
 
@@ -43,7 +71,7 @@ struct DriverProgressEmitter {
 impl ToolProgressEmitter for DriverProgressEmitter {
     fn emit(&self, progress: ToolProgress) -> bool {
         self.sender
-            .try_send(ToolDriverProgress {
+            .try_send(ToolDriverProgress::Update {
                 tool_call_id: self.tool_call_id.clone(),
                 progress,
             })

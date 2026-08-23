@@ -19,6 +19,6 @@ Automatic retry requires `retryable == true`, `delivery == NotStarted`, no seman
 
 ## Consequences
 
-The core never silently replays a request. Host adapters own their external protocol and cleanup; `ModelDriver` owns strict stream assembly, panic conversion, retry timing, one effective deadline, cancellation, and lossy delta progress; P5-E session execution will own final durable settlement. An unknown outcome becomes a truthful terminal error rather than an optimistic retry.
+The core never silently replays a request. Host adapters own their external protocol and cleanup; `ModelDriver` owns strict stream assembly, panic conversion, retry timing, one shared effective deadline with exact Turn/Port provenance, cancellation, and lossy delta progress. Its legacy internal `run` wrapper preserves ModelError-only callers, while P5-E1 TurnRunner consumes `run_detailed`: Core Turn timeout becomes budget exhaustion and configured or adapter Model timeout remains ModelTimeout. P4-C/P5-E2 will own final durable settlement. An unknown outcome becomes a truthful terminal error rather than an optimistic retry.
 
 See [architecture](../architecture.md#model-retry), [model module ownership](../modules/README.md#model), [`src/model/model.rs`](../../src/model/model.rs), and [`src/model/driver.rs`](../../src/model/driver.rs).

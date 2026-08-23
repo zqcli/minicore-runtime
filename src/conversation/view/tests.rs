@@ -145,6 +145,11 @@ fn projection_selects_latest_summary_and_accepts_lower_active_turn_round_limit()
         .validated_prompt_projection(&spec(), &SemanticLimits::default())
         .unwrap();
     assert_eq!(projection.head, ConversationSeq::new(5));
+    assert_eq!(projection.active_turn_id(), Some(current));
+    assert_eq!(
+        projection.active_turn_execution().unwrap().max_tool_rounds,
+        1
+    );
     assert_eq!(
         projection.selected_summary().unwrap().seq,
         ConversationSeq::new(4)
@@ -157,7 +162,11 @@ fn projection_selects_latest_summary_and_accepts_lower_active_turn_round_limit()
             .collect::<Vec<_>>(),
         [ConversationSeq::new(4), ConversationSeq::new(5)]
     );
-    assert!(!format!("{projection:?}").contains("sensitive summary content"));
+    let debug = format!("{projection:?}");
+    assert!(debug.contains("model:v1"));
+    assert!(debug.contains("active_turn_max_tool_rounds: Some(1)"));
+    assert!(!debug.contains("sensitive summary content"));
+    assert!(!debug.contains("question"));
 }
 
 #[test]

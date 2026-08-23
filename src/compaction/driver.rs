@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::SemanticLimits;
 use crate::conversation::{ConversationEntry, ConversationSeq};
 use crate::ids::{SessionId, TurnId};
+use crate::time::effective_deadline;
 use crate::value::BoundedText;
 
 use super::{
@@ -24,7 +25,7 @@ pub(crate) struct CompactionDriver {
     max_summary_bytes: usize,
 }
 
-/// P5-E actor code must require current_head == snapshot_head before CommitSummary.
+/// P5-E2 actor code must require current_head == snapshot_head before CommitSummary.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ValidatedCompactionProposal {
     snapshot_head: ConversationSeq,
@@ -100,8 +101,9 @@ impl CompactionDriver {
         if cancellation.is_cancelled() {
             return Err(CompactionError::Cancelled);
         }
-        let (deadline, strategy_deadline) = effective_deadline(turn_deadline, self.timeout)?;
-        if TokioInstant::now() >= deadline {
+        let deadline = effective_deadline(turn_deadline, self.timeout)
+            .map_err(|_| CompactionError::DeadlineExceeded)?;
+        if TokioInstant::now() >= deadline.tokio() {
             return Err(CompactionError::DeadlineExceeded);
         }
 
@@ -112,7 +114,7 @@ impl CompactionDriver {
             candidate: candidate.clone(),
             target_tokens,
             cancellation: child_cancellation.clone(),
-            deadline: strategy_deadline,
+            deadline: deadline.standard(),
         };
         let future = match catch_unwind(AssertUnwindSafe(|| strategy.compact(request))) {
             Ok(future) => future,
@@ -129,7 +131,7 @@ impl CompactionDriver {
                 child_cancellation.cancel();
                 return Err(CompactionError::Cancelled);
             }
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = tokio::time::sleep_until(deadline.tokio()) => {
                 child_cancellation.cancel();
                 return Err(CompactionError::DeadlineExceeded);
             }
@@ -236,17 +238,6 @@ fn valid_summary(summary: &BoundedText, maximum: usize) -> bool {
             .as_str()
             .chars()
             .all(|character| !character.is_control() || matches!(character, '\n' | '\t'))
-}
-
-fn effective_deadline(
-    turn_deadline: Instant,
-    timeout: Duration,
-) -> Result<(TokioInstant, Instant), CompactionError> {
-    let configured = TokioInstant::now()
-        .checked_add(timeout)
-        .ok_or(CompactionError::DeadlineExceeded)?;
-    let deadline = TokioInstant::from_std(turn_deadline).min(configured);
-    Ok((deadline, deadline.into_std()))
 }
 
 #[cfg(test)]

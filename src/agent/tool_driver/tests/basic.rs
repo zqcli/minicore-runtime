@@ -9,7 +9,7 @@ async fn allow_executes_once_with_exact_invocation_and_frozen_policy_spec() {
     );
     let policy = allow_policy();
     let driver = driver(Arc::clone(&tool), Some(policy_port(&policy)), config());
-    let (suspensions, _suspension_rx, progress, _progress_rx) = channels();
+    let (suspensions, _suspension_rx, progress, mut progress_rx) = channels();
     let turn_deadline = deadline_after(Duration::from_secs(2));
     let result = driver
         .run(
@@ -33,6 +33,12 @@ async fn allow_executes_once_with_exact_invocation_and_frozen_policy_spec() {
     assert_eq!(tool.deadlines(), vec![turn_deadline]);
     assert_eq!(tool.spec_calls(), 1);
     assert_eq!(tool.spec().description().as_str(), "mutated spec");
+    assert!(matches!(
+        progress_rx.try_recv(),
+        Ok(ToolDriverProgress::Started { tool_call_id, tool_name })
+            if tool_call_id == call_id(1) && tool_name.as_str() == "search"
+    ));
+    assert!(progress_rx.try_recv().is_err());
 }
 
 #[test]

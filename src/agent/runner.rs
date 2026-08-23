@@ -1,833 +1,298 @@
-#![cfg(test)]
-
-use std::fmt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::panic::AssertUnwindSafe;
 
 use futures_util::FutureExt;
-use thiserror::Error;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
+use tokio::time::Instant as TokioInstant;
 
-use super::context::TurnContext;
-use crate::model::{
-    DeliveryState, LegacyModelCallContext, LegacyModelEvent, ModelError, ModelErrorKind,
-    ModelFinishReason, ModelResponse, ToolCall, Usage,
+use crate::context::ContextRequest;
+use crate::conversation::ToolResultDraft;
+use crate::model::{ModelCallContext, ModelDriverFailure, ModelResponse};
+use crate::tools::ToolInvocation;
+
+use super::runner_protocol::{RunnerEvent, RunnerOutcome, RunnerProgress, TurnRunnerExit};
+use super::tool_driver::ToolDriverResult;
+use super::turn_context::{TurnRunnerContext, TurnRunnerRequest, TurnRunnerRequestError};
+
+mod diagnostics;
+mod support;
+
+use diagnostics::{
+    budget_exceeded, context_failure, critical_failure, internal_failure, model_failure,
+    prompt_failure, request_failure,
 };
-use crate::prompt::{LegacyPromptError as PromptError, append_validated_summary};
-use crate::storage::conversation::{ConversationError, NewConversationEntry};
-use crate::tools::legacy_policy::{LegacyToolContextView, LegacyToolDecision, LegacyToolRequest};
-use crate::tools::{
-    LegacyTool, LegacyToolCallSummary, LegacyToolContext, LegacyToolError, LegacyToolOutput,
-    LegacyToolResultStatus, LegacyToolResultSummary,
+use support::{
+    CriticalFailure, FinishControl, UsageAccumulator, assistant_draft, commit_assistant,
+    commit_tool_result, finish_outcome, model_progress, progress, send_critical,
+    send_critical_for_context, tool_progress, validate_assistant_ack, validate_tool_ack,
 };
 
-pub(crate) const MAX_RUNNER_EVENT_CAPACITY: usize = 4_096;
-const MODEL_EVENT_CAPACITY: usize = 64;
-const TOOL_ROUND_LIMIT_TEXT: &str = "tool round limit reached";
-const CANCELLED_TEXT: &str = "cancelled";
-const TOOL_EXECUTION_FAILED_TEXT: &str = "tool execution failed";
-const TOOL_EXECUTION_DENIED_TEXT: &str = "tool execution denied";
+const LOCAL_PROGRESS_CAPACITY: usize = 64;
+const LOCAL_SUSPENSION_CAPACITY: usize = 1;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RunnerEvent {
-    Model(LegacyModelEvent),
-    ToolStarted(LegacyToolCallSummary),
-    ToolFinished(LegacyToolResultSummary),
-}
-
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub(crate) enum RunnerEventSendError {
-    #[error("runner event is invalid")]
-    InvalidEvent,
-    #[error("runner event channel is full")]
-    Full,
-    #[error("runner event channel is closed")]
-    Closed,
-}
-
-struct RunnerEventState {
-    active: bool,
-    sender: Option<mpsc::Sender<RunnerEvent>>,
-}
-
-struct RunnerEventInner {
-    state: Mutex<RunnerEventState>,
-}
-
-#[derive(Clone)]
-pub(crate) struct RunnerEventSink {
-    inner: Arc<RunnerEventInner>,
-}
-
-impl RunnerEventSink {
-    pub(crate) fn channel(
-        capacity: usize,
-    ) -> Result<(Self, mpsc::Receiver<RunnerEvent>), RunnerEventSendError> {
-        if capacity == 0 || capacity > MAX_RUNNER_EVENT_CAPACITY {
-            return Err(RunnerEventSendError::InvalidEvent);
-        }
-        let (sender, receiver) = mpsc::channel(capacity);
-        Ok((
-            Self {
-                inner: Arc::new(RunnerEventInner {
-                    state: Mutex::new(RunnerEventState {
-                        active: true,
-                        sender: Some(sender),
-                    }),
-                }),
-            },
-            receiver,
-        ))
-    }
-
-    pub(crate) fn try_publish_model(&self, event: RunnerEvent) -> bool {
-        let RunnerEvent::Model(event) = event else {
-            return false;
-        };
-        if !valid_model_event(&event) {
-            return false;
-        }
-        self.try_send(RunnerEvent::Model(event)).is_ok()
-    }
-
-    pub(crate) fn try_publish_tool(&self, event: RunnerEvent) -> Result<(), RunnerEventSendError> {
-        match event {
-            RunnerEvent::ToolStarted(call) => self.try_send(RunnerEvent::ToolStarted(call)),
-            RunnerEvent::ToolFinished(result) => self.try_send(RunnerEvent::ToolFinished(result)),
-            RunnerEvent::Model(_) => Err(RunnerEventSendError::InvalidEvent),
-        }
-    }
-
-    fn try_send(&self, event: RunnerEvent) -> Result<(), RunnerEventSendError> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !state.active {
-            return Err(RunnerEventSendError::Closed);
-        }
-        let Some(sender) = state.sender.as_ref() else {
-            state.active = false;
-            return Err(RunnerEventSendError::Closed);
-        };
-        match sender.try_send(event) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(RunnerEventSendError::Full),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                state.active = false;
-                state.sender = None;
-                Err(RunnerEventSendError::Closed)
-            }
-        }
-    }
-}
-
-fn valid_model_event(event: &LegacyModelEvent) -> bool {
-    let delta = match event {
-        LegacyModelEvent::TextDelta { delta } | LegacyModelEvent::ReasoningDelta { delta } => delta,
+pub(crate) async fn run_turn(request: TurnRunnerRequest) -> TurnRunnerExit {
+    let finish = FinishControl {
+        sender: request.critical_tx.clone(),
+        cancellation: request.cancellation.clone(),
+        deadline: request.deadline,
     };
-    !delta.is_empty()
-        && delta.len() <= 64 * 1024
-        && delta
-            .chars()
-            .all(|character| !character.is_control() || matches!(character, '\n' | '\t'))
-}
-
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub(crate) enum TurnFailure {
-    #[error("turn model operation failed")]
-    Model,
-    #[error("turn conversation operation failed")]
-    Conversation,
-    #[error("turn compaction operation failed")]
-    Compaction,
-    #[error("turn response is invalid")]
-    InvalidResponse,
-    #[error("turn tool round limit was reached")]
-    ToolRoundLimit,
-    #[error("turn tool operation failed")]
-    Tool,
-    #[error("turn timestamp operation failed")]
-    Timestamp,
-    #[error("turn operation failed internally")]
-    Internal,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) enum TurnTaskResult {
-    Completed { usage: Usage },
-    Cancelled { usage: Usage },
-    Failed { failure: TurnFailure, usage: Usage },
-}
-
-impl fmt::Debug for TurnTaskResult {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Completed { .. } => formatter.write_str("TurnTaskResult::Completed"),
-            Self::Cancelled { .. } => formatter.write_str("TurnTaskResult::Cancelled"),
-            Self::Failed { failure, .. } => formatter
-                .debug_tuple("TurnTaskResult::Failed")
-                .field(failure)
-                .finish(),
-        }
-    }
-}
-
-enum Flow {
-    Completed,
-    Cancelled,
-    Failed(TurnFailure),
-}
-
-enum CallFlow<T> {
-    Value(T),
-    ContextOverflow,
-    Cancelled,
-    Failed(TurnFailure),
-}
-
-struct ModelAttempt {
-    result: Result<ModelResponse, ModelError>,
-    observed_event: bool,
-}
-
-struct ToolExecution {
-    output: LegacyToolOutput,
-    status: LegacyToolResultStatus,
-    cancelled: bool,
-}
-
-enum ValidatedDisposition {
-    Final,
-    ToolRound(Vec<ToolCall>),
-}
-
-fn validate_response(response: &ModelResponse) -> Result<ValidatedDisposition, TurnFailure> {
-    let mut calls = Vec::new();
-    let mut expected_index = 0_u32;
-    for part in response.parts() {
-        if let Some(call) = part.as_tool_call() {
-            debug_assert_eq!(call.call_index(), expected_index);
-            if call.call_index() != expected_index {
-                return Err(TurnFailure::InvalidResponse);
-            }
-            expected_index = expected_index
-                .checked_add(1)
-                .ok_or(TurnFailure::InvalidResponse)?;
-            calls.push(call.clone());
-        }
-    }
-    match response.finish_reason() {
-        ModelFinishReason::Stop | ModelFinishReason::Refused if calls.is_empty() => {
-            Ok(ValidatedDisposition::Final)
-        }
-        ModelFinishReason::ToolCalls | ModelFinishReason::Unknown if !calls.is_empty() => {
-            Ok(ValidatedDisposition::ToolRound(calls))
-        }
-        ModelFinishReason::Unknown if calls.is_empty() => Ok(ValidatedDisposition::Final),
-        _ => Err(TurnFailure::InvalidResponse),
-    }
-}
-
-pub(crate) async fn run_turn(ctx: TurnContext) -> TurnTaskResult {
-    let flow = run_turn_inner(&ctx).await;
-    let usage = ctx.conversation().usage().await;
-    match flow {
-        Flow::Completed => TurnTaskResult::Completed { usage },
-        Flow::Cancelled => TurnTaskResult::Cancelled { usage },
-        Flow::Failed(failure) => TurnTaskResult::Failed { failure, usage },
-    }
-}
-
-async fn run_turn_inner(ctx: &TurnContext) -> Flow {
-    let mut tool_rounds = 0_u8;
-    loop {
-        if ctx.cancellation().is_cancelled() {
-            return Flow::Cancelled;
-        }
-        let mut forced_recovery = false;
-        let response = loop {
-            let request = match build_ordinary_request(ctx).await {
-                CallFlow::Value(request) => request,
-                CallFlow::ContextOverflow if !forced_recovery => {
-                    match force_compaction(ctx).await {
-                        CallFlow::Value(()) => forced_recovery = true,
-                        CallFlow::Cancelled => return Flow::Cancelled,
-                        CallFlow::Failed(failure) => return Flow::Failed(failure),
-                        CallFlow::ContextOverflow => {
-                            return Flow::Failed(TurnFailure::Compaction);
-                        }
-                    }
-                    continue;
-                }
-                CallFlow::ContextOverflow => return Flow::Failed(TurnFailure::Compaction),
-                CallFlow::Cancelled => return Flow::Cancelled,
-                CallFlow::Failed(failure) => return Flow::Failed(failure),
-            };
-            match ordinary_model_call(ctx, Arc::new(request)).await {
-                CallFlow::Value(response) => break response,
-                CallFlow::ContextOverflow if !forced_recovery => {
-                    match force_compaction(ctx).await {
-                        CallFlow::Value(()) => forced_recovery = true,
-                        CallFlow::Cancelled => return Flow::Cancelled,
-                        CallFlow::Failed(failure) => return Flow::Failed(failure),
-                        CallFlow::ContextOverflow => {
-                            return Flow::Failed(TurnFailure::Compaction);
-                        }
-                    }
-                }
-                CallFlow::ContextOverflow => return Flow::Failed(TurnFailure::Compaction),
-                CallFlow::Cancelled => return Flow::Cancelled,
-                CallFlow::Failed(failure) => return Flow::Failed(failure),
-            }
-        };
-        let disposition = match validate_response(&response) {
-            Ok(disposition) => disposition,
-            Err(failure) => return Flow::Failed(failure),
-        };
-        if ctx.cancellation().is_cancelled() {
-            return Flow::Cancelled;
-        }
-        let timestamp = match ctx.timestamp() {
-            Ok(timestamp) => timestamp,
-            Err(_) => return Flow::Failed(TurnFailure::Timestamp),
-        };
-        let assistant = match NewConversationEntry::assistant_from_response(
-            ctx.turn_id(),
-            timestamp,
-            &response,
-        ) {
-            Ok(entry) => entry,
-            Err(_) => return Flow::Failed(TurnFailure::InvalidResponse),
-        };
-        if ctx.conversation().append(assistant).await.is_err() {
-            return Flow::Failed(TurnFailure::Conversation);
-        }
-        let calls = match disposition {
-            ValidatedDisposition::Final => return Flow::Completed,
-            ValidatedDisposition::ToolRound(calls) => calls,
-        };
-        if ctx.cancellation().is_cancelled() {
-            return append_remaining_cancelled(ctx, &calls).await;
-        }
-
-        if tool_rounds >= ctx.max_tool_rounds() {
-            if append_fixed_results(
-                ctx,
-                &calls,
-                TOOL_ROUND_LIMIT_TEXT,
-                LegacyToolResultStatus::Failed,
+    let task = async move {
+        let mut context = TurnRunnerContext::new(request)?;
+        Ok::<RunnerOutcome, TurnRunnerRequestError>(run_ordinary_loop(&mut context).await)
+    };
+    match AssertUnwindSafe(task).catch_unwind().await {
+        Ok(Ok(outcome)) => finish_outcome(&finish, outcome).await,
+        Ok(Err(error)) => finish_outcome(&finish, request_failure(error)).await,
+        Err(_) => {
+            let _ = send_critical(
+                &finish,
+                RunnerEvent::Finish {
+                    outcome: internal_failure(
+                        "turn runner panicked",
+                        crate::model::Usage::default(),
+                    ),
+                },
             )
-            .await
-            .is_err()
-            {
-                return Flow::Failed(TurnFailure::Conversation);
-            }
-            return Flow::Failed(TurnFailure::ToolRoundLimit);
-        }
-        tool_rounds = tool_rounds.saturating_add(1);
-        match execute_tool_round(ctx, &calls).await {
-            Flow::Completed => {}
-            Flow::Cancelled => return Flow::Cancelled,
-            Flow::Failed(failure) => return Flow::Failed(failure),
+            .await;
+            TurnRunnerExit::Panicked
         }
     }
 }
 
-async fn build_ordinary_request(ctx: &TurnContext) -> CallFlow<crate::model::ModelRequest> {
-    let mut stale_replan = false;
+async fn run_ordinary_loop(context: &mut TurnRunnerContext) -> RunnerOutcome {
+    let mut model_round = 0_u16;
+    let mut tool_round = 0_u16;
+    let mut usage = UsageAccumulator::default();
+    #[cfg(test)]
+    if tests::take_scripted_turn_panic(context.turn_id) {
+        panic!("scripted turn runner panic after context creation");
+    }
     loop {
-        if ctx.cancellation().is_cancelled() {
-            return CallFlow::Cancelled;
+        if context.cancellation.is_cancelled() {
+            return RunnerOutcome::Cancelled {
+                usage: usage.current(),
+            };
         }
-        let view = match ctx.conversation().compaction_view().await {
-            Ok(view) => view,
-            Err(_) => return CallFlow::Failed(TurnFailure::Compaction),
-        };
-        let plan = match ctx.compactor().plan(
-            ctx.prompt_builder(),
-            &view,
-            ctx.tool_specs(),
-            ctx.prompt_options().clone(),
-        ) {
-            Ok(plan) => plan,
-            Err(_) => return CallFlow::Failed(TurnFailure::Compaction),
-        };
-        let Some(plan) = plan else {
-            return build_fresh_prompt(ctx).await;
-        };
-        if ctx.cancellation().is_cancelled() {
-            return CallFlow::Cancelled;
+        if TokioInstant::now() >= TokioInstant::from_std(context.deadline) {
+            return budget_exceeded(usage.current());
         }
-        let response = match summary_model_call(ctx, plan.clone_request()).await {
-            CallFlow::Value(response) => response,
-            CallFlow::ContextOverflow => return CallFlow::Failed(TurnFailure::Compaction),
-            CallFlow::Cancelled => return CallFlow::Cancelled,
-            CallFlow::Failed(failure) => return CallFlow::Failed(failure),
-        };
-        let summary = match plan.validate_summary(&response) {
-            Ok(summary) => summary,
-            Err(_) => return CallFlow::Failed(TurnFailure::Compaction),
-        };
-        if ctx.cancellation().is_cancelled() {
-            return CallFlow::Cancelled;
-        }
-        let timestamp = match ctx.timestamp() {
-            Ok(timestamp) => timestamp,
-            Err(_) => return CallFlow::Failed(TurnFailure::Timestamp),
-        };
-        match append_validated_summary(ctx.conversation(), &plan, timestamp, &summary).await {
-            Ok(_) => return build_fresh_prompt(ctx).await,
-            Err(crate::storage::conversation::ConversationError::Stale) if !stale_replan => {
-                stale_replan = true;
-            }
-            Err(_) => return CallFlow::Failed(TurnFailure::Compaction),
-        }
-    }
-}
 
-async fn force_compaction(ctx: &TurnContext) -> CallFlow<()> {
-    if ctx.cancellation().is_cancelled() {
-        return CallFlow::Cancelled;
-    }
-    let view = match ctx.conversation().compaction_view().await {
-        Ok(view) => view,
-        Err(_) => return CallFlow::Failed(TurnFailure::Compaction),
-    };
-    let plan = match ctx.compactor().plan_after_context_overflow(
-        ctx.prompt_builder(),
-        &view,
-        ctx.tool_specs(),
-        ctx.prompt_options().clone(),
-    ) {
-        Ok(plan) => plan,
-        Err(_) => return CallFlow::Failed(TurnFailure::Compaction),
-    };
-    let response = match summary_model_call(ctx, plan.clone_request()).await {
-        CallFlow::Value(response) => response,
-        CallFlow::Cancelled => return CallFlow::Cancelled,
-        CallFlow::ContextOverflow | CallFlow::Failed(_) => {
-            return CallFlow::Failed(TurnFailure::Compaction);
-        }
-    };
-    let summary = match plan.validate_summary(&response) {
-        Ok(summary) => summary,
-        Err(_) => return CallFlow::Failed(TurnFailure::Compaction),
-    };
-    if ctx.cancellation().is_cancelled() {
-        return CallFlow::Cancelled;
-    }
-    let timestamp = match ctx.timestamp() {
-        Ok(timestamp) => timestamp,
-        Err(_) => return CallFlow::Failed(TurnFailure::Timestamp),
-    };
-    match append_validated_summary(ctx.conversation(), &plan, timestamp, &summary).await {
-        Ok(_) => {
-            if ctx.cancellation().is_cancelled() {
-                CallFlow::Cancelled
-            } else {
-                CallFlow::Value(())
-            }
-        }
-        Err(_) => CallFlow::Failed(TurnFailure::Compaction),
-    }
-}
-
-async fn build_fresh_prompt(ctx: &TurnContext) -> CallFlow<crate::model::ModelRequest> {
-    if ctx.cancellation().is_cancelled() {
-        return CallFlow::Cancelled;
-    }
-    let view = match ctx.conversation().prompt_view().await {
-        Ok(view) => view,
-        Err(_) => return CallFlow::Failed(TurnFailure::Conversation),
-    };
-    ctx.prompt_builder()
-        .build(&view, ctx.tool_specs(), ctx.prompt_options().clone())
-        .map_or_else(
-            |error| {
-                if matches!(error, PromptError::ContextOverflow) {
-                    CallFlow::ContextOverflow
-                } else {
-                    CallFlow::Failed(TurnFailure::Compaction)
-                }
-            },
-            CallFlow::Value,
-        )
-}
-
-async fn ordinary_model_call(
-    ctx: &TurnContext,
-    request: Arc<crate::model::ModelRequest>,
-) -> CallFlow<ModelResponse> {
-    let max_attempts = ctx.retry_policy().max_attempts();
-    for attempt in 0..max_attempts {
-        if ctx.cancellation().is_cancelled() {
-            return CallFlow::Cancelled;
-        }
-        let attempt_result = generate_once(ctx, Arc::clone(&request), true).await;
-        match attempt_result.result {
-            Ok(response) => return CallFlow::Value(response),
-            Err(error)
-                if is_retryable(&error)
-                    && !attempt_result.observed_event
-                    && attempt + 1 < max_attempts =>
-            {
-                let Some(delay) = ctx
-                    .retry_policy()
-                    .delay_for_retry(attempt, error.retry_after())
-                else {
-                    return CallFlow::Failed(TurnFailure::Model);
-                };
-                if !wait_for_retry(ctx.cancellation(), delay).await {
-                    return CallFlow::Cancelled;
-                }
-            }
-            Err(error)
-                if error.kind() == ModelErrorKind::Cancelled
-                    && ctx.cancellation().is_cancelled() =>
-            {
-                return CallFlow::Cancelled;
-            }
-            Err(error) if error.kind() == ModelErrorKind::ContextOverflow => {
-                return CallFlow::ContextOverflow;
-            }
-            Err(_) => return CallFlow::Failed(TurnFailure::Model),
-        }
-    }
-    CallFlow::Failed(TurnFailure::Model)
-}
-
-async fn summary_model_call(
-    ctx: &TurnContext,
-    request: crate::model::ModelRequest,
-) -> CallFlow<ModelResponse> {
-    match generate_once(ctx, Arc::new(request), false).await.result {
-        Ok(response) => CallFlow::Value(response),
-        Err(error)
-            if error.kind() == ModelErrorKind::Cancelled && ctx.cancellation().is_cancelled() =>
+        let remaining = match context
+            .prompt
+            .remaining_context_budget(&context.conversation, context.model_limits)
         {
-            CallFlow::Cancelled
+            Ok(remaining) => remaining,
+            Err(error) => return prompt_failure(error, usage.current()),
+        };
+        let context_bundle = match context
+            .context
+            .provide_detailed(ContextRequest {
+                session_id: context.session_id,
+                instance_id: context.instance_id,
+                turn_id: context.turn_id,
+                model_round,
+                conversation: context.conversation.clone(),
+                remaining_context_budget: remaining,
+                cancellation: context.cancellation.clone(),
+                deadline: context.deadline,
+            })
+            .await
+        {
+            Ok(bundle) => bundle,
+            Err(error) => return context_failure(error, usage.current()),
+        };
+        let request =
+            match context
+                .prompt
+                .build(&context.conversation, &context_bundle, context.model_limits)
+            {
+                Ok(request) => request,
+                Err(error) => return prompt_failure(error, usage.current()),
+            };
+
+        progress(context, RunnerProgress::ModelStarted { model_round });
+        let response = match run_model(context, request, model_round).await {
+            Ok(response) => response,
+            Err(error) => return model_failure(error, usage.current()),
+        };
+        let round_usage = response.usage().copied().unwrap_or_default();
+        if usage.add(round_usage).is_err() {
+            return internal_failure("turn usage overflowed", usage.current());
         }
-        Err(_) => CallFlow::Failed(TurnFailure::Model),
+        progress(
+            context,
+            RunnerProgress::ModelFinished {
+                model_round,
+                usage: round_usage,
+            },
+        );
+
+        let (draft, tool_calls) = match assistant_draft(context, &response) {
+            Ok(value) => value,
+            Err(()) => {
+                return internal_failure("model response projection failed", usage.current());
+            }
+        };
+        let previous_head = context.conversation.head();
+        let acknowledgement = match commit_assistant(context, draft.clone()).await {
+            Ok(acknowledgement) => acknowledgement,
+            Err(error) => return critical_failure(error, usage.current()),
+        };
+        let conversation =
+            match validate_assistant_ack(context, previous_head, &draft, acknowledgement) {
+                Ok(conversation) => conversation,
+                Err(error) => return critical_failure(error, usage.current()),
+            };
+        context.conversation = conversation;
+
+        if tool_calls.is_empty() {
+            return RunnerOutcome::Completed {
+                usage: usage.finish(),
+            };
+        }
+        if tool_round >= context.effective_max_tool_rounds {
+            return budget_exceeded(usage.current());
+        }
+
+        for call in tool_calls {
+            let invocation = match ToolInvocation::new(
+                context.session_id,
+                context.instance_id,
+                context.turn_id,
+                call.tool_call_id().clone(),
+                call.name().clone(),
+                call.arguments().clone(),
+            ) {
+                Ok(invocation) => invocation,
+                Err(_) => {
+                    return internal_failure("tool invocation projection failed", usage.current());
+                }
+            };
+            let result = match run_tool(context, invocation).await {
+                Ok(result) => result,
+                Err(error) => return critical_failure(error, usage.current()),
+            };
+            let draft = ToolResultDraft {
+                turn_id: context.turn_id,
+                tool_call_id: call.tool_call_id().clone(),
+                tool_name: call.name().clone(),
+                outcome: result.outcome(),
+                content: result.output().content().clone(),
+            };
+            let previous_head = context.conversation.head();
+            let acknowledgement = match commit_tool_result(context, draft.clone()).await {
+                Ok(acknowledgement) => acknowledgement,
+                Err(error) => return critical_failure(error, usage.current()),
+            };
+            let conversation =
+                match validate_tool_ack(context, previous_head, &draft, acknowledgement) {
+                    Ok(conversation) => conversation,
+                    Err(error) => return critical_failure(error, usage.current()),
+                };
+            context.conversation = conversation;
+            progress(
+                context,
+                RunnerProgress::ToolFinished {
+                    tool_call_id: draft.tool_call_id,
+                    tool_name: draft.tool_name,
+                    outcome: draft.outcome,
+                    content_bytes: draft.content.byte_len(),
+                },
+            );
+        }
+        tool_round = match tool_round.checked_add(1) {
+            Some(value) => value,
+            None => return internal_failure("tool round overflowed", usage.current()),
+        };
+        model_round = match model_round.checked_add(1) {
+            Some(value) => value,
+            None => return internal_failure("model round overflowed", usage.current()),
+        };
     }
 }
 
-async fn generate_once(
-    ctx: &TurnContext,
-    request: Arc<crate::model::ModelRequest>,
-    forward_events: bool,
-) -> ModelAttempt {
-    let (model_events, mut receiver) =
-        match crate::model::LegacyModelEventSink::channel(MODEL_EVENT_CAPACITY) {
-            Ok(value) => value,
-            Err(error) => {
-                return ModelAttempt {
-                    result: Err(error),
-                    observed_event: false,
-                };
-            }
-        };
-    let call_context =
-        match LegacyModelCallContext::new(ctx.cancellation().clone(), model_events.clone()) {
-            Ok(context) => context,
-            Err(error) => {
-                return ModelAttempt {
-                    result: Err(error),
-                    observed_event: false,
-                };
-            }
-        };
-    let mut generation = Box::pin(ctx.gateway().generate(
-        ctx.prompt_options().selection(),
-        (*request).clone(),
-        call_context.clone(),
-    ));
-    let mut receiver_open = true;
-    let mut observed_event = false;
-    let result = loop {
-        if receiver_open {
+async fn run_model(
+    context: &TurnRunnerContext,
+    request: crate::model::ModelRequest,
+    model_round: u16,
+) -> Result<ModelResponse, ModelDriverFailure> {
+    let (progress_tx, mut progress_rx) = mpsc::channel(LOCAL_PROGRESS_CAPACITY);
+    let result = {
+        let run = context.model.run_detailed(
+            request,
+            ModelCallContext::new(
+                context.session_id,
+                context.instance_id,
+                context.turn_id,
+                model_round,
+                context.cancellation.clone(),
+                context.deadline,
+            ),
+            &progress_tx,
+        );
+        tokio::pin!(run);
+        loop {
             tokio::select! {
                 biased;
-                event = receiver.recv() => match event {
-                    Some(event) => {
-                        observed_event = true;
-                        if forward_events {
-                            let _ = ctx.events().try_publish_model(RunnerEvent::Model(event));
-                        }
-                    }
-                    None => receiver_open = false,
+                result = &mut run => break result,
+                value = progress_rx.recv() => match value {
+                    Some(value) => model_progress(context, model_round, value),
+                    None => continue,
+                }
+            }
+        }
+    };
+    drop(progress_tx);
+    while let Ok(value) = progress_rx.try_recv() {
+        model_progress(context, model_round, value);
+    }
+    result
+}
+
+async fn run_tool(
+    context: &TurnRunnerContext,
+    invocation: ToolInvocation,
+) -> Result<ToolDriverResult, CriticalFailure> {
+    let (suspension_tx, mut suspension_rx) = mpsc::channel(LOCAL_SUSPENSION_CAPACITY);
+    let (progress_tx, mut progress_rx) = mpsc::channel(LOCAL_PROGRESS_CAPACITY);
+    let result = {
+        let run = context.tools.run(
+            invocation,
+            context.deadline,
+            context.cancellation.clone(),
+            &suspension_tx,
+            &progress_tx,
+        );
+        tokio::pin!(run);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut run => break result.map_err(CriticalFailure::Suspension),
+                value = progress_rx.recv() => match value {
+                    Some(value) => tool_progress(context, value),
+                    None => continue,
                 },
-                result = &mut generation => break result,
-            }
-        } else {
-            break generation.await;
-        }
-    };
-    let accepted = result.is_ok();
-    if !accepted && !receiver.is_empty() {
-        observed_event = true;
-    }
-    call_context.close();
-    drop(model_events);
-    if accepted {
-        while let Ok(event) = receiver.try_recv() {
-            observed_event = true;
-            if forward_events {
-                let _ = ctx.events().try_publish_model(RunnerEvent::Model(event));
-            }
-        }
-    }
-    ModelAttempt {
-        result,
-        observed_event,
-    }
-}
-
-fn is_retryable(error: &ModelError) -> bool {
-    error.retryable() && error.delivery() == DeliveryState::NotStarted
-}
-
-async fn wait_for_retry(cancellation: &CancellationToken, delay: Duration) -> bool {
-    if delay.is_zero() {
-        return !cancellation.is_cancelled();
-    }
-    tokio::select! {
-        _ = cancellation.cancelled() => false,
-        _ = tokio::time::sleep(delay) => true,
-    }
-}
-
-async fn execute_tool_round(ctx: &TurnContext, calls: &[ToolCall]) -> Flow {
-    for (index, call) in calls.iter().enumerate() {
-        if ctx.cancellation().is_cancelled() {
-            return append_remaining_cancelled(ctx, &calls[index..]).await;
-        }
-        let execution = execute_one_tool(ctx, call).await;
-        let execution = match execution {
-            Ok(execution) => execution,
-            Err(failure) => return Flow::Failed(failure),
-        };
-        let status = execution.status;
-        let cancelled = execution.cancelled;
-        if append_tool_result(ctx, call, execution.output)
-            .await
-            .is_err()
-        {
-            return Flow::Failed(TurnFailure::Conversation);
-        }
-        publish_tool_finished(ctx, call, status);
-        if cancelled || ctx.cancellation().is_cancelled() {
-            return append_remaining_cancelled(ctx, &calls[index + 1..]).await;
-        }
-    }
-    Flow::Completed
-}
-
-async fn append_remaining_cancelled(ctx: &TurnContext, calls: &[ToolCall]) -> Flow {
-    for call in calls {
-        let output = match LegacyToolOutput::failure(CANCELLED_TEXT) {
-            Ok(output) => output,
-            Err(_) => return Flow::Failed(TurnFailure::Internal),
-        };
-        if append_tool_result(ctx, call, output).await.is_err() {
-            return Flow::Failed(TurnFailure::Conversation);
-        }
-        publish_tool_finished(ctx, call, LegacyToolResultStatus::Cancelled);
-    }
-    Flow::Cancelled
-}
-
-async fn append_fixed_results(
-    ctx: &TurnContext,
-    calls: &[ToolCall],
-    text: &str,
-    status: LegacyToolResultStatus,
-) -> Result<(), ()> {
-    for call in calls {
-        let output = LegacyToolOutput::failure(text).map_err(|_| ())?;
-        append_tool_result(ctx, call, output)
-            .await
-            .map_err(|_| ())?;
-        publish_tool_finished(ctx, call, status);
-    }
-    Ok(())
-}
-
-async fn append_tool_result(
-    ctx: &TurnContext,
-    call: &ToolCall,
-    output: LegacyToolOutput,
-) -> Result<(), ConversationError> {
-    let timestamp = ctx
-        .timestamp()
-        .map_err(|_| ConversationError::InvalidEntry)?;
-    ctx.conversation()
-        .append(NewConversationEntry::ToolResult {
-            turn_id: ctx.turn_id(),
-            timestamp,
-            call_id: call.tool_call_id().clone(),
-            result: output,
-        })
-        .await
-        .map(|_| ())
-}
-
-async fn execute_one_tool(
-    ctx: &TurnContext,
-    call: &ToolCall,
-) -> Result<ToolExecution, TurnFailure> {
-    if !ctx.enabled_tools().contains(call.name()) {
-        return failed_tool_execution();
-    }
-    let request = LegacyToolRequest::new(
-        call.tool_call_id(),
-        call.name(),
-        call.arguments(),
-        call.call_index(),
-    );
-    let context_view =
-        LegacyToolContextView::new(ctx.session_id(), ctx.turn_id(), ctx.enabled_tools());
-    let decision = match catch_unwind(AssertUnwindSafe(|| {
-        ctx.policy().decide(&request, &context_view)
-    })) {
-        Ok(decision) => decision,
-        Err(_) => return failed_tool_execution(),
-    };
-    match decision {
-        LegacyToolDecision::Allow => execute_allowed_tool(ctx, call).await,
-        LegacyToolDecision::Deny { reason } => Ok(ToolExecution {
-            output: LegacyToolOutput::failure(reason)
-                .or_else(|_| LegacyToolOutput::failure(TOOL_EXECUTION_DENIED_TEXT))
-                .map_err(|_| TurnFailure::Internal)?,
-            status: LegacyToolResultStatus::Denied,
-            cancelled: false,
-        }),
-        LegacyToolDecision::Ask { question, choices } => {
-            let tool_context = LegacyToolContext::new(
-                ctx.session_id(),
-                ctx.turn_id(),
-                ctx.workspace(),
-                ctx.cancellation().clone(),
-                ctx.interactions(),
-            )
-            .map_err(|_| TurnFailure::Tool)?;
-            match tool_context.ask_user(question, choices).await {
-                Ok(answer)
-                    if answer.text().trim().eq_ignore_ascii_case("yes")
-                        || answer.text().trim().eq_ignore_ascii_case("allow") =>
-                {
-                    execute_allowed_tool(ctx, call).await
+                value = suspension_rx.recv() => match value {
+                    Some(suspension) => {
+                        while let Ok(value) = progress_rx.try_recv() {
+                            tool_progress(context, value);
+                        }
+                        send_critical_for_context(
+                            context,
+                            RunnerEvent::Suspend { suspension },
+                        ).await?;
+                    }
+                    None => continue,
                 }
-                Err(LegacyToolError::Cancelled) if ctx.cancellation().is_cancelled() => {
-                    cancelled_tool_execution()
-                }
-                Ok(_) | Err(_) => Ok(ToolExecution {
-                    output: LegacyToolOutput::failure(TOOL_EXECUTION_DENIED_TEXT)
-                        .map_err(|_| TurnFailure::Internal)?,
-                    status: LegacyToolResultStatus::Denied,
-                    cancelled: false,
-                }),
             }
         }
-    }
-}
-
-async fn execute_allowed_tool(
-    ctx: &TurnContext,
-    call: &ToolCall,
-) -> Result<ToolExecution, TurnFailure> {
-    let Some(tool) = ctx.tools().get(call.name()) else {
-        return failed_tool_execution();
     };
-    if ctx.cancellation().is_cancelled() {
-        return cancelled_tool_execution();
+    drop(suspension_tx);
+    drop(progress_tx);
+    while let Ok(value) = progress_rx.try_recv() {
+        tool_progress(context, value);
     }
-    let tool_context = LegacyToolContext::new(
-        ctx.session_id(),
-        ctx.turn_id(),
-        ctx.workspace(),
-        ctx.cancellation().clone(),
-        ctx.interactions(),
-    )
-    .map_err(|_| TurnFailure::Tool)?;
-    let future = catch_unwind(AssertUnwindSafe(|| {
-        tool.execute(tool_context, call.arguments().clone())
-    }));
-    let future = match future {
-        Ok(future) => future,
-        Err(_) => return failed_tool_execution(),
-    };
-    publish_tool_started(ctx, call);
-    let result = AssertUnwindSafe(future).catch_unwind().await.ok();
-    match result {
-        Some(Ok(output)) => {
-            let status = if output.is_error() {
-                LegacyToolResultStatus::Failed
-            } else {
-                LegacyToolResultStatus::Succeeded
-            };
-            Ok(ToolExecution {
-                output,
-                status,
-                cancelled: false,
-            })
-        }
-        Some(Err(LegacyToolError::Cancelled)) if ctx.cancellation().is_cancelled() => {
-            cancelled_tool_execution()
-        }
-        Some(Err(_)) | None => failed_tool_execution(),
-    }
+    result
 }
 
-fn publish_tool_started(ctx: &TurnContext, call: &ToolCall) {
-    if let Ok(summary) = LegacyToolCallSummary::new(
-        call.tool_call_id().clone(),
-        call.name().clone(),
-        call.call_index(),
-    ) {
-        let _ = ctx
-            .events()
-            .try_publish_tool(RunnerEvent::ToolStarted(summary));
-    }
-}
-
-fn publish_tool_finished(ctx: &TurnContext, call: &ToolCall, status: LegacyToolResultStatus) {
-    if let Ok(summary) = LegacyToolResultSummary::new(call.tool_call_id().clone(), status) {
-        let _ = ctx
-            .events()
-            .try_publish_tool(RunnerEvent::ToolFinished(summary));
-    }
-}
-
-fn failed_tool_execution() -> Result<ToolExecution, TurnFailure> {
-    Ok(ToolExecution {
-        output: LegacyToolOutput::failure(TOOL_EXECUTION_FAILED_TEXT)
-            .map_err(|_| TurnFailure::Internal)?,
-        status: LegacyToolResultStatus::Failed,
-        cancelled: false,
-    })
-}
-
-fn cancelled_tool_execution() -> Result<ToolExecution, TurnFailure> {
-    Ok(ToolExecution {
-        output: LegacyToolOutput::failure(CANCELLED_TEXT).map_err(|_| TurnFailure::Internal)?,
-        status: LegacyToolResultStatus::Cancelled,
-        cancelled: true,
-    })
-}
-
-const _: () = {
-    let _ = std::mem::size_of::<RunnerEvent>();
-    let _ = std::mem::size_of::<RunnerEventSink>();
-    let _ = std::mem::size_of::<TurnFailure>();
-    let _ = std::mem::size_of::<TurnTaskResult>();
-    let _: fn(LegacyToolCallSummary) -> RunnerEvent = RunnerEvent::ToolStarted;
-    let _: fn(LegacyToolResultSummary) -> RunnerEvent = RunnerEvent::ToolFinished;
-    let _ = RunnerEventSink::channel;
-    let _ = RunnerEventSink::try_publish_model;
-    let _ = RunnerEventSink::try_publish_tool;
-    let _ = run_turn;
-};
+#[cfg(test)]
+mod tests;

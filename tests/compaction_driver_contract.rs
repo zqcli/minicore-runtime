@@ -12,7 +12,9 @@ fn compaction_driver_is_private_single_strategy_and_owner_neutral() {
         "pub(crate) struct CompactionDriver",
         "strategy: Option<Arc<dyn CompactionStrategy>>",
         "pub(crate) async fn run(",
-        "effective_deadline(turn_deadline, self.timeout)?",
+        "effective_deadline(turn_deadline, self.timeout)",
+        "deadline.standard()",
+        "deadline.tokio()",
         "catch_unwind(AssertUnwindSafe(|| strategy.compact(request)))",
         "AssertUnwindSafe(future).catch_unwind()",
         "let child_cancellation = cancellation.child_token();",
@@ -45,6 +47,7 @@ fn compaction_driver_is_private_single_strategy_and_owner_neutral() {
         driver.matches("for entry in candidate.entries()").count(),
         1
     );
+    assert!(!driver.contains("fn effective_deadline("));
     for removed in [
         "fn is_terminal_boundary(",
         "candidate.entries().iter().any(",

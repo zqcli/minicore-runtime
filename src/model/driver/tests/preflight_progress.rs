@@ -34,26 +34,6 @@ fn constructor_catches_descriptor_panic_and_rejects_invalid_descriptor() {
     assert_eq!(error.kind(), ModelErrorKind::InvalidRequest);
 }
 
-#[test]
-fn effective_deadline_is_the_minimum_of_context_and_model_timeout() {
-    let model = ScriptModel::new(descriptor(), Vec::new());
-    let config = KernelConfig {
-        model_call_timeout: Duration::from_secs(5),
-        ..KernelConfig::default_checked().unwrap()
-    };
-    let driver = model.driver(&config);
-
-    let short = Instant::now() + Duration::from_secs(2);
-    let (_, adapter_deadline) = driver.effective_deadline(short).unwrap();
-    assert_eq!(adapter_deadline, short);
-
-    let long = Instant::now() + Duration::from_secs(30);
-    let before = Instant::now();
-    let (_, adapter_deadline) = driver.effective_deadline(long).unwrap();
-    assert!(adapter_deadline < long);
-    assert!(adapter_deadline >= before + Duration::from_secs(5));
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn preflight_rejects_reasoning_tools_context_and_mutated_tool_specs_before_start() {
     let mut no_reasoning = descriptor();

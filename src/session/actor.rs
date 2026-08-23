@@ -18,8 +18,10 @@ use super::legacy_snapshot::{
 };
 use super::legacy_state::LegacySessionStatus;
 use crate::agent::{
-    RunnerEvent, RunnerEventSink, TimestampSource, TurnContext, TurnContextDependencies,
-    TurnFailure, TurnTaskResult, run_turn,
+    LegacyRunnerEvent as RunnerEvent, LegacyRunnerEventSink as RunnerEventSink,
+    LegacyTimestampSource as TimestampSource, LegacyTurnContext as TurnContext,
+    LegacyTurnContextDependencies as TurnContextDependencies, LegacyTurnFailure as TurnFailure,
+    LegacyTurnTaskResult as TurnTaskResult, legacy_run_turn as run_turn,
 };
 use crate::config::RetryPolicy;
 use crate::error::{PublicErrorCode, PublicErrorSummary, SessionError};
@@ -123,7 +125,8 @@ impl SessionActorDependencies {
         }
         if !(1..=super::command::MAX_COMMAND_CAPACITY).contains(&self.command_capacity)
             || !(1..=super::legacy_event_stream::MAX_EVENT_CAPACITY).contains(&self.event_capacity)
-            || !(1..=crate::agent::MAX_RUNNER_EVENT_CAPACITY).contains(&self.runner_event_capacity)
+            || !(1..=crate::agent::LEGACY_MAX_RUNNER_EVENT_CAPACITY)
+                .contains(&self.runner_event_capacity)
         {
             return Err(SessionError::InvalidInput);
         }
@@ -442,10 +445,10 @@ impl SessionActor {
             },
         )
         .map_err(|error| match error {
-            crate::agent::TurnContextError::ModelUnavailable => SessionError::Unavailable,
-            crate::agent::TurnContextError::InvalidModelConfiguration
-            | crate::agent::TurnContextError::UnknownTool
-            | crate::agent::TurnContextError::InvalidToolRounds => SessionError::InvalidInput,
+            crate::agent::LegacyTurnContextError::ModelUnavailable => SessionError::Unavailable,
+            crate::agent::LegacyTurnContextError::InvalidModelConfiguration
+            | crate::agent::LegacyTurnContextError::UnknownTool
+            | crate::agent::LegacyTurnContextError::InvalidToolRounds => SessionError::InvalidInput,
         })
     }
 
