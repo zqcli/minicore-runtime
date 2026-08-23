@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::Poll;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
 use super::*;
 use crate::config::{CompactionConfig, SessionManifest};
@@ -12,6 +14,9 @@ use crate::model::{
 use crate::storage::{AppendReceipt, ConversationPage, LogFuture};
 use crate::tools::ToolSet;
 use crate::value::BoundedText;
+
+#[cfg(test)]
+mod post_ready_panic;
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(super) enum PayloadPanicPoint {
@@ -47,13 +52,15 @@ fn payload_panic_scripts() -> &'static PayloadPanicScripts {
 }
 
 #[test]
-fn owner_source_has_exact_fields_and_no_manager_handle_or_serde() {
+fn owner_source_has_exact_fields_final_handle_and_no_manager_or_serde() {
     let source = include_str!("../runtime.rs");
     assert!(!source.contains("#[derive(Clone)]\npub struct SessionRuntime"));
     assert!(!source.contains("#[derive(Clone)]\npub struct SessionRuntimeOptions"));
     for required in [
         "`task_runtime` must be timer-enabled, alive, and actively driven",
         "task_runtime: Handle",
+        "handle: SessionHandle",
+        "pub fn handle(&self) -> SessionHandle",
         "owner_task: Option<JoinHandle<SessionActorExit>>",
         "cleanup_watchers: Vec<JoinHandle<Option<SessionOpenError>>>",
         "self.owner_task.as_mut()",
@@ -69,11 +76,9 @@ fn owner_source_has_exact_fields_and_no_manager_handle_or_serde() {
         assert!(source.contains(required), "owner source misses {required}");
     }
     for forbidden in [
-        "pub fn handle(",
         "HashMap",
         "BTreeMap",
         "SessionManager",
-        "SessionHandle",
         "Serialize",
         "Deserialize",
     ] {
@@ -150,7 +155,8 @@ fn owner_source_has_exact_fields_and_no_manager_handle_or_serde() {
         .find("Err(SessionShutdownError::timeout())")
         .unwrap();
     assert!(abort < await_abort && await_abort < timeout);
-    let timeout_constructor = source
+    let shutdown_source = include_str!("../runtime_shutdown.rs");
+    let timeout_constructor = shutdown_source
         .split_once("fn construct_shutdown_timeout")
         .and_then(|(_, rest)| rest.split_once("pub(super) fn map_actor_exit"))
         .map(|(body, _)| body)
@@ -186,6 +192,10 @@ fn actor_exit_mapping_keeps_open_failure_distinct_from_successful_close() {
     assert!(matches!(
         map_actor_exit(SessionActorExit::Panicked),
         Err(SessionShutdownError::ActorTerminated(_))
+    ));
+    assert!(matches!(
+        map_actor_exit(SessionActorExit::DurabilityFailed { close_error: None }),
+        Err(SessionShutdownError::Durability(_))
     ));
 }
 
@@ -362,6 +372,75 @@ async fn cancelling_while_join_is_pending_leaves_owner_task_to_self_clean() {
     drop(guard);
     let permit = completed.acquire_owned().await.unwrap();
     permit.forget();
+}
+
+struct PendingRunnerDrop {
+    dropped: Arc<AtomicBool>,
+    started: Arc<tokio::sync::Semaphore>,
+    announced: bool,
+}
+
+impl Future for PendingRunnerDrop {
+    type Output = crate::agent::TurnRunnerExit;
+
+    fn poll(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+        if !self.announced {
+            self.announced = true;
+            self.started.add_permits(1);
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for PendingRunnerDrop {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shutdown_timeout_drops_panic_cleanup_runner_before_returning() {
+    let mut fixture: super::super::actor::tests::ActorFixture =
+        super::super::actor::tests::actor_fixture(false).await;
+    let dropped = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    fixture.install_runner(PendingRunnerDrop {
+        dropped: Arc::clone(&dropped),
+        started: Arc::clone(&started),
+        announced: false,
+    });
+    let session_id = fixture.ready.handle.session_id();
+    let instance_id = fixture.ready.handle.instance_id();
+    let handle = fixture.ready.handle.clone();
+    let owner_cancel = fixture.root_cancel();
+    let runner_lifecycle = fixture.runner_lifecycle();
+    let events = fixture.ready.events;
+    let mut actor = fixture.actor;
+    let task = tokio::spawn(async move { actor.close_after_panic().await });
+    let runtime = SessionRuntime {
+        session_id,
+        instance_id,
+        handle,
+        events: Some(events),
+        owner_cancel,
+        task: Some(task),
+        runner_lifecycle,
+        task_runtime: Handle::current(),
+        shutdown_timeout: std::time::Duration::from_millis(1),
+    };
+    let permit = started.acquire_owned().await.unwrap();
+    permit.forget();
+    let mut shutdown = Box::pin(runtime.shutdown());
+    assert!(matches!(
+        futures_util::poll!(shutdown.as_mut()),
+        Poll::Pending
+    ));
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    assert!(matches!(
+        shutdown.await,
+        Err(SessionShutdownError::Timeout(_))
+    ));
+    assert!(dropped.load(Ordering::SeqCst));
 }
 
 #[test]

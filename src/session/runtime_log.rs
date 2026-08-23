@@ -130,11 +130,7 @@ impl SessionLog for OpenCancellationLog {
         expected_head: ConversationSeq,
         entries: Vec<ConversationEntry>,
     ) -> LogFuture<'a, AppendReceipt> {
-        if self.cancel.is_cancelled() {
-            Self::cancelled()
-        } else {
-            self.inner.append(expected_head, entries)
-        }
+        self.inner.append(expected_head, entries)
     }
 
     fn close<'a>(&'a mut self) -> LogFuture<'a, ()> {

@@ -1,12 +1,9 @@
 //! Future v0.3 public API compile contract.
 //!
-//! P4-B now implements the real single-session owner lifecycle. This module
-//! remains disabled only until P4-C/P5 add the final SessionHandle, commands,
-//! actor, and runner surface. Activation is only removing `cfg(any())`; the
-//! contract must compile against the direct v0.3 API, never a compatibility
-//! alias or wrapper.
+//! P4-C exposes the final single-session handle, command actor, and runner
+//! integration. This contract compiles against the direct v0.3 API, never a
+//! compatibility alias or wrapper.
 
-#[cfg(any())]
 mod v03_public_api_compile_contract {
     use std::sync::Arc;
 
@@ -32,7 +29,7 @@ mod v03_public_api_compile_contract {
         SessionRuntime, SessionRuntimeOptions, SessionSpec, TurnHandle, TurnOptions, UserInput,
     };
 
-    async fn compile_contract(
+    struct CompileInputs {
         session_id: SessionId,
         spec: SessionSpec,
         create_log: Box<dyn SessionLog>,
@@ -46,7 +43,26 @@ mod v03_public_api_compile_contract {
         context: Arc<dyn ContextProvider>,
         compaction: Arc<dyn CompactionStrategy>,
         runtime: tokio::runtime::Handle,
+    }
+
+    async fn compile_contract(
+        inputs: CompileInputs,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let CompileInputs {
+            session_id,
+            spec,
+            create_log,
+            load_log,
+            model,
+            model_request,
+            model_context,
+            tools,
+            tool,
+            policy,
+            context,
+            compaction,
+            runtime,
+        } = inputs;
         let _descriptor: &ModelDescriptor = model.descriptor();
         let start: ModelStartFuture<'_> = model.start(model_request, model_context);
         drop(start);

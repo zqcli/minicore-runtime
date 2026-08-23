@@ -9,15 +9,16 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{KernelConfig, SessionSpec};
-use crate::conversation::ConversationCommitErrorKind;
 use crate::error::{EventStreamTakenError, SessionOpenError, SessionShutdownError};
 use crate::ids::{SessionId, SessionInstanceId};
-use crate::storage::{SessionLog, SessionLogErrorKind};
+use crate::storage::SessionLog;
 
-use super::bindings::SessionBindings;
+use super::actor::{RunnerLifecycle, SessionActorExit};
 use super::event_stream::SessionEventStream;
-use super::runtime_actor::SessionActorExit;
+use super::handle::SessionHandle;
 use super::runtime_open::{OpenPayload, OpenReady, OpenRequest, SharedOpenPayload, run_open};
+use super::runtime_shutdown::{construct_shutdown_timeout, map_actor_exit};
+use crate::bindings::SessionBindings;
 
 pub struct SessionRuntimeOptions {
     kernel: KernelConfig,
@@ -95,9 +96,11 @@ impl fmt::Debug for SessionRuntimeOptions {
 pub struct SessionRuntime {
     session_id: SessionId,
     instance_id: SessionInstanceId,
+    handle: SessionHandle,
     events: Option<SessionEventStream>,
     owner_cancel: CancellationToken,
     task: Option<JoinHandle<SessionActorExit>>,
+    runner_lifecycle: RunnerLifecycle,
     task_runtime: Handle,
     shutdown_timeout: Duration,
 }
@@ -135,6 +138,10 @@ impl SessionRuntime {
         self.instance_id
     }
 
+    pub fn handle(&self) -> SessionHandle {
+        self.handle.clone()
+    }
+
     pub fn take_events(&mut self) -> Result<SessionEventStream, EventStreamTakenError> {
         self.events
             .take()
@@ -157,15 +164,20 @@ impl SessionRuntime {
             Err(()) => {
                 task.abort();
                 let _ = task.await;
+                self.runner_lifecycle.abort_and_wait().await;
                 return Err(SessionShutdownError::actor_terminated());
             }
         };
         match timeout.await {
             Ok(Ok(exit)) => map_actor_exit(exit),
-            Ok(Err(_)) => Err(SessionShutdownError::actor_terminated()),
+            Ok(Err(_)) => {
+                self.runner_lifecycle.abort_and_wait().await;
+                Err(SessionShutdownError::actor_terminated())
+            }
             Err(_) => {
                 task.abort();
                 let _ = task.await;
+                self.runner_lifecycle.abort_and_wait().await;
                 Err(SessionShutdownError::timeout())
             }
         }
@@ -212,7 +224,9 @@ impl SessionRuntime {
             Ok(Ok(OpenReady {
                 session_id,
                 instance_id,
+                handle,
                 events,
+                runner_lifecycle,
             })) => {
                 if guard.await_watchers().await.is_some() {
                     return Err(SessionOpenError::actor_start_failed());
@@ -223,9 +237,11 @@ impl SessionRuntime {
                 Ok(Self {
                     session_id,
                     instance_id,
+                    handle,
                     events: Some(events),
                     owner_cancel,
                     task: Some(task),
+                    runner_lifecycle,
                     task_runtime,
                     shutdown_timeout,
                 })
@@ -415,45 +431,6 @@ fn current_runtime_has_timer() -> bool {
         drop(tokio::time::sleep(Duration::ZERO));
     }))
     .is_ok()
-}
-
-fn construct_shutdown_timeout<'a>(
-    runtime: &Handle,
-    timeout: Duration,
-    task: &'a mut JoinHandle<SessionActorExit>,
-) -> Result<tokio::time::Timeout<&'a mut JoinHandle<SessionActorExit>>, ()> {
-    catch_unwind(AssertUnwindSafe(|| {
-        let _entered = runtime.enter();
-        tokio::time::timeout(timeout, task)
-    }))
-    .map_err(|_| ())
-}
-
-pub(super) fn map_actor_exit(exit: SessionActorExit) -> Result<(), SessionShutdownError> {
-    match exit {
-        SessionActorExit::Closed => Ok(()),
-        SessionActorExit::OpenFailed | SessionActorExit::Panicked => {
-            Err(SessionShutdownError::actor_terminated())
-        }
-        SessionActorExit::PanicCloseFailed(error) => {
-            let _close_kind = error.kind();
-            Err(SessionShutdownError::actor_terminated())
-        }
-        SessionActorExit::CloseFailed(error)
-            if error.kind() == ConversationCommitErrorKind::DurabilityUnknown =>
-        {
-            Err(SessionShutdownError::durability())
-        }
-        SessionActorExit::CloseFailed(error) => match error.kind() {
-            ConversationCommitErrorKind::Log(kind) => Err(SessionShutdownError::log_close(kind)),
-            ConversationCommitErrorKind::DurabilityUnknown => {
-                Err(SessionShutdownError::durability())
-            }
-            _ => Err(SessionShutdownError::log_close(
-                SessionLogErrorKind::Internal,
-            )),
-        },
-    }
 }
 
 #[cfg(test)]

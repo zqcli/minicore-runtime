@@ -47,6 +47,7 @@ fn canonical_modules_keep_only_the_current_root_facade() {
         .unwrap();
     let session_exports = session_exports.split(',').collect::<Vec<_>>();
     assert!(!session_exports.contains(&"Runtime"));
+    assert!(session_exports.contains(&"SessionHandle"));
     assert!(session_exports.contains(&"SessionRuntime"));
     assert!(session_exports.contains(&"SessionRuntimeOptions"));
     assert!(!lib.contains("pub use runtime"));
@@ -96,7 +97,6 @@ fn source_has_no_legacy_imports_or_new_dead_code_suppression() {
             "ToolRegistry",
             "LegacyTool",
             "Workspace",
-            "SessionHandle",
         ] {
             assert!(
                 !source.contains(forbidden),

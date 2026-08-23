@@ -13,12 +13,12 @@ use crate::error::{SessionLogErrorKind, SessionOpenError};
 use crate::ids::{SessionId, SessionInstanceId};
 use crate::storage::SessionLog;
 
-use super::bindings::SessionBindingError;
+use super::actor::{ActorReady, SessionActor, SessionActorExit, run_session_actor};
 use super::runtime::{SessionRuntimeOptions, SessionRuntimeParts};
-use super::runtime_actor::{IdleOwnerChannels, IdleSessionOwner, SessionActorExit, run_idle_owner};
 use super::runtime_log::{
     cancellable_log, close_raw, synthetic_log_error, timestamp_source, with_secondary,
 };
+use crate::bindings::SessionBindingError;
 
 const FAILED_OPEN_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -66,14 +66,16 @@ impl OpenPayload {
 pub(super) struct OpenReady {
     pub(super) session_id: SessionId,
     pub(super) instance_id: SessionInstanceId,
+    pub(super) handle: super::SessionHandle,
     pub(super) events: super::SessionEventStream,
+    pub(super) runner_lifecycle: super::actor::RunnerLifecycle,
 }
 
 struct PreparedOwner {
     session_id: SessionId,
     instance_id: SessionInstanceId,
-    owner: IdleSessionOwner,
-    channels: IdleOwnerChannels,
+    actor: SessionActor,
+    ready: ActorReady,
 }
 
 pub(super) async fn run_open(
@@ -111,28 +113,33 @@ pub(super) async fn run_open(
     let PreparedOwner {
         session_id,
         instance_id,
-        mut owner,
-        channels,
+        mut actor,
+        ready: actor_ready,
     } = prepared;
     if owner_cancel.is_cancelled() {
-        let _ = owner.close_before_ready().await;
+        let _ = actor.close_before_ready().await;
         return SessionActorExit::OpenFailed;
     }
-    let IdleOwnerChannels { state, events } = channels;
-    drop(state);
+    let ActorReady {
+        handle,
+        events,
+        runner_lifecycle,
+    } = actor_ready;
     if ready
         .send(Ok(OpenReady {
             session_id,
             instance_id,
+            handle,
             events,
+            runner_lifecycle,
         }))
         .is_err()
     {
         owner_cancel.cancel();
-        let _ = owner.close_before_ready().await;
+        let _ = actor.close_before_ready().await;
         return SessionActorExit::OpenFailed;
     }
-    run_idle_owner(&mut owner, owner_cancel).await
+    run_session_actor(&mut actor).await
 }
 
 async fn prepare(
@@ -225,7 +232,7 @@ async fn prepare_create(
             secondary,
         ));
     }
-    build_owner(session_id, spec, conversation, parts).await
+    build_owner(session_id, spec, conversation, parts, owner_cancel).await
 }
 
 async fn prepare_load(
@@ -277,7 +284,7 @@ async fn prepare_load(
             secondary,
         ));
     }
-    build_owner(session_id, spec, conversation, parts).await
+    build_owner(session_id, spec, conversation, parts, owner_cancel).await
 }
 
 async fn build_owner(
@@ -285,6 +292,7 @@ async fn build_owner(
     spec: SessionSpec,
     mut conversation: ConversationLog,
     parts: SessionRuntimeParts,
+    owner_cancel: &CancellationToken,
 ) -> Result<PreparedOwner, SessionOpenError> {
     let instance_id = match SessionInstanceId::new() {
         Ok(instance_id) => instance_id,
@@ -296,13 +304,14 @@ async fn build_owner(
             ));
         }
     };
-    let (owner, channels) = match IdleSessionOwner::new(
+    let (actor, ready) = match SessionActor::new(
         conversation,
         parts.kernel,
         parts.bindings,
         spec,
         session_id,
         instance_id,
+        owner_cancel.clone(),
     ) {
         Ok(owner) => owner,
         Err(mut failure) => {
@@ -316,8 +325,8 @@ async fn build_owner(
     Ok(PreparedOwner {
         session_id,
         instance_id,
-        owner,
-        channels,
+        actor,
+        ready,
     })
 }
 

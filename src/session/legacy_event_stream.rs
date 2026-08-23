@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, watch};
 use super::legacy_event::LegacySessionEvent;
 use super::legacy_snapshot::LegacySessionSnapshot;
 use super::legacy_state::LegacySessionStatus;
-use crate::error::SessionError;
+use crate::error::LegacySessionError;
 
 pub(crate) const MAX_EVENT_CAPACITY: usize = 4_096;
 
@@ -44,11 +44,13 @@ impl LegacySessionObservation {
     pub(crate) fn new(
         initial: LegacySessionSnapshot,
         event_capacity: usize,
-    ) -> Result<Self, SessionError> {
+    ) -> Result<Self, LegacySessionError> {
         if event_capacity == 0 || event_capacity > MAX_EVENT_CAPACITY {
-            return Err(SessionError::InvalidInput);
+            return Err(LegacySessionError::InvalidInput);
         }
-        initial.validate().map_err(|_| SessionError::InvalidInput)?;
+        initial
+            .validate()
+            .map_err(|_| LegacySessionError::InvalidInput)?;
         let (snapshot_tx, _) = watch::channel(initial);
         let (event_tx, _) = broadcast::channel(event_capacity);
         Ok(Self {
@@ -70,7 +72,7 @@ impl LegacySessionObservation {
     pub(crate) fn publish_snapshot(
         &self,
         snapshot: LegacySessionSnapshot,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(), LegacySessionError> {
         self.publish(snapshot, None)
     }
 
@@ -78,17 +80,17 @@ impl LegacySessionObservation {
         &self,
         snapshot: LegacySessionSnapshot,
         event: Option<LegacySessionEvent>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(), LegacySessionError> {
         snapshot
             .validate()
-            .map_err(|_| SessionError::InvalidInput)?;
+            .map_err(|_| LegacySessionError::InvalidInput)?;
         let state = self
             .inner
             .gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.closed {
-            return Err(SessionError::Closing);
+            return Err(LegacySessionError::Closing);
         }
         if event.as_ref().is_some_and(|event| {
             matches!(
@@ -98,7 +100,7 @@ impl LegacySessionObservation {
                     | LegacySessionEvent::Closed
             )
         }) {
-            return Err(SessionError::InvalidInput);
+            return Err(LegacySessionError::InvalidInput);
         }
         self.inner.snapshot_tx.send_replace(snapshot);
         if let Some(event) = event {
@@ -109,20 +111,20 @@ impl LegacySessionObservation {
         Ok(())
     }
 
-    pub(crate) fn close(&self, snapshot: LegacySessionSnapshot) -> Result<(), SessionError> {
+    pub(crate) fn close(&self, snapshot: LegacySessionSnapshot) -> Result<(), LegacySessionError> {
         if snapshot.status() != LegacySessionStatus::Closing {
-            return Err(SessionError::InvalidInput);
+            return Err(LegacySessionError::InvalidInput);
         }
         snapshot
             .validate()
-            .map_err(|_| SessionError::InvalidInput)?;
+            .map_err(|_| LegacySessionError::InvalidInput)?;
         let mut state = self
             .inner
             .gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.closed {
-            return Err(SessionError::Closing);
+            return Err(LegacySessionError::Closing);
         }
         self.inner.snapshot_tx.send_replace(snapshot);
         if let Some(sender) = state.event_tx.as_ref() {
@@ -132,19 +134,19 @@ impl LegacySessionObservation {
         Ok(())
     }
 
-    pub(crate) fn subscribe(&self) -> Result<LegacySessionEventStream, SessionError> {
+    pub(crate) fn subscribe(&self) -> Result<LegacySessionEventStream, LegacySessionError> {
         let state = self
             .inner
             .gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.closed {
-            return Err(SessionError::Closing);
+            return Err(LegacySessionError::Closing);
         }
         let events = state
             .event_tx
             .as_ref()
-            .ok_or(SessionError::Closing)?
+            .ok_or(LegacySessionError::Closing)?
             .subscribe();
         let initial = self.inner.snapshot_tx.borrow().clone();
         Ok(LegacySessionEventStream {

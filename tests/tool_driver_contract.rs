@@ -66,8 +66,10 @@ fn runner_protocol_is_exact_redacted_and_continuation_free() {
         .map(|(body, _)| body)
         .unwrap();
     assert!(!debug.contains(".field(\"resume\""));
-    assert!(protocol.contains("pub(crate) fn take_resume_for_actor("));
-    assert!(protocol.contains("pub(crate) fn take_commit_reply_for_actor("));
+    assert!(!protocol.contains("take_resume_for_actor"));
+    assert!(!protocol.contains("take_commit_reply_for_actor"));
+    let actor = include_str!("../src/session/actor/runner.rs");
+    assert!(actor.contains("let TurnSuspension {"));
     for forbidden in [
         "serde",
         "Serialize",

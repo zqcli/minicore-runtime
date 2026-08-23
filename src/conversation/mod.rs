@@ -4,6 +4,7 @@ mod load;
 mod log;
 mod projection;
 mod recovery;
+mod settlement;
 mod state;
 pub mod transcript;
 mod validator;
@@ -34,6 +35,7 @@ pub(crate) use load::{LoadCompatibilityValidated, close_unopened_log};
 pub(crate) use log::{
     AssistantMessageDraft, ConversationCloseOutcome, ConversationCommitError,
     ConversationCommitErrorKind, ConversationLog, SummaryDraft, TimestampSource, ToolResultDraft,
+    UnsequencedEntry, UserMessageDraft,
 };
 pub(crate) use view::PromptConversationProjection;
 

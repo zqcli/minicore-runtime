@@ -30,15 +30,15 @@ async fn observation_rejects_zero_capacity_and_delivers_first_snapshot_then_even
     let initial = snapshot(session_id, 0, LegacySessionStatus::Idle);
     assert!(matches!(
         LegacySessionObservation::new(initial.clone(), 0),
-        Err(SessionError::InvalidInput)
+        Err(LegacySessionError::InvalidInput)
     ));
     assert!(matches!(
         LegacySessionObservation::new(initial.clone(), MAX_EVENT_CAPACITY + 1),
-        Err(SessionError::InvalidInput)
+        Err(LegacySessionError::InvalidInput)
     ));
     assert!(matches!(
         LegacySessionObservation::new(initial.clone(), usize::MAX),
-        Err(SessionError::InvalidInput)
+        Err(LegacySessionError::InvalidInput)
     ));
     let exact_capacity =
         LegacySessionObservation::new(initial.clone(), MAX_EVENT_CAPACITY).unwrap();
@@ -51,7 +51,7 @@ async fn observation_rejects_zero_capacity_and_delivers_first_snapshot_then_even
     ] {
         assert!(matches!(
             observation.publish(initial.clone(), Some(event)),
-            Err(SessionError::InvalidInput)
+            Err(LegacySessionError::InvalidInput)
         ));
     }
     let mut stream = observation.subscribe().unwrap();
@@ -198,7 +198,7 @@ async fn close_delivers_closed_once_then_eof_and_rejects_future_publish() {
     let observation = LegacySessionObservation::new(initial, 4).unwrap();
     assert!(matches!(
         observation.close(snapshot(session_id, 1, LegacySessionStatus::Idle)),
-        Err(SessionError::InvalidInput)
+        Err(LegacySessionError::InvalidInput)
     ));
     let mut stream = observation.subscribe().unwrap();
     assert!(matches!(
@@ -212,11 +212,11 @@ async fn close_delivers_closed_once_then_eof_and_rejects_future_publish() {
     assert_eq!(stream.recv().await, None);
     assert_eq!(
         observation.close(closing.clone()),
-        Err(SessionError::Closing)
+        Err(LegacySessionError::Closing)
     );
     assert_eq!(
         observation.publish_snapshot(closing),
-        Err(SessionError::Closing)
+        Err(LegacySessionError::Closing)
     );
 }
 

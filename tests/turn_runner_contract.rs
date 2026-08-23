@@ -184,8 +184,11 @@ fn runner_protocol_has_exact_critical_ack_outcome_and_progress_roles() {
             "runner protocol misses compact shape {required}"
         );
     }
-    assert!(protocol.contains("pub(crate) fn take_resume_for_actor("));
-    assert!(protocol.contains("pub(crate) fn take_commit_reply_for_actor("));
+    assert!(!protocol.contains("take_resume_for_actor"));
+    assert!(!protocol.contains("take_commit_reply_for_actor"));
+    let actor = include_str!("../src/session/actor/runner.rs");
+    assert!(actor.contains("let TurnSuspension {"));
+    assert!(actor.contains("RunnerEvent::CommitSummary"));
     assert!(!protocol.contains("serde"));
     assert!(!protocol.contains("reply: Box"));
 }
@@ -193,9 +196,10 @@ fn runner_protocol_has_exact_critical_ack_outcome_and_progress_roles() {
 #[test]
 fn summary_commit_is_stale_head_checked_redacted_and_actor_owned() {
     let protocol = include_str!("../src/agent/runner_protocol.rs");
+    let compact_protocol = compact(protocol);
     let runner_compaction = include_str!("../src/agent/runner/compaction.rs");
     let support = include_str!("../src/agent/runner/support.rs");
-    let actor_evidence = include_str!("../src/agent/runner/tests/compaction_support.rs");
+    let actor_evidence = include_str!("../src/session/actor/runner.rs");
     for required in [
         "let snapshot_head = proposal.snapshot_head();",
         "context.conversation.head() != snapshot_head",
@@ -218,12 +222,17 @@ fn summary_commit_is_stale_head_checked_redacted_and_actor_owned() {
             .count()
             >= 10
     );
+    let summary_variant = concat!(
+        "CommitSummary{snapshot_head:ConversationSeq,draft:SummaryDraft,",
+        "reply:oneshot::Sender<Result<CommitAck,RunnerCommitError>>,}"
+    );
+    assert!(
+        compact_protocol.contains(summary_variant),
+        "summary protocol misses compact shape {summary_variant}"
+    );
     for required in [
-        "RunnerEvent::CommitSummary {",
-        "snapshot_head,",
         ".field(\"through\", &draft.through)",
         ".field(\"summary_bytes\", &draft.summary.byte_len())",
-        "RunnerEvent::CommitSummary { reply, .. } => Some(reply)",
     ] {
         assert!(
             protocol.contains(required),
@@ -245,9 +254,11 @@ fn summary_commit_is_stale_head_checked_redacted_and_actor_owned() {
         assert!(support.contains(required), "summary ack misses {required}");
     }
     let stale = actor_evidence
-        .find("if conversation.head() != snapshot_head")
+        .find("if self.conversation.head() != snapshot_head")
         .unwrap();
-    let append = actor_evidence.find("entries.push(").unwrap();
+    let append = actor_evidence
+        .find("self.commit_one(UnsequencedEntry::Summary(draft))")
+        .unwrap();
     assert!(stale < append);
     assert!(actor_evidence.contains("return Err(RunnerCommitError::Stale)"));
 }

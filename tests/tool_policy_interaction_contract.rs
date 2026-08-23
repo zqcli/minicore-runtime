@@ -331,7 +331,7 @@ fn interaction_answers_validate_kind_and_delegate_exact_tool_input_rules() {
 #[test]
 fn policy_and_interaction_sources_are_process_local_and_owner_neutral() {
     let policy = include_str!("../src/tools/policy.rs");
-    let interaction = include_str!("../src/session/interaction.rs");
+    let interaction = include_str!("../src/interaction.rs");
     let tools = include_str!("../src/tools/mod.rs");
     let legacy = include_str!("../src/tools/legacy_policy.rs");
 

@@ -16,12 +16,14 @@ SRC = ROOT / "src"
 
 CANONICAL_TOPS = (
     "agent",
+    "bindings",
     "compaction",
     "config",
     "conversation",
     "context",
     "error",
     "ids",
+    "interaction",
     "model",
     "prompt",
     "session",
@@ -51,9 +53,9 @@ REQUIRED_DIRS = {
     "src/prompt",
     "src/prompt/builder",
     "src/session",
+    "src/session/actor",
     "src/session/legacy_event_stream",
     "src/session/runtime",
-    "src/session/runtime_actor",
     "src/session/runtime_open",
     "src/storage",
     "src/storage/conversation",
@@ -98,6 +100,7 @@ REQUIRED_FILES = {
     "src/agent/tool_driver/tests/input_progress.rs",
     "src/agent/tool_driver/tests/policy.rs",
     "src/agent/turn_context.rs",
+    "src/bindings.rs",
     "src/config.rs",
     "src/config/kernel.rs",
     "src/config/retry.rs",
@@ -116,6 +119,7 @@ REQUIRED_FILES = {
     "src/conversation/mod.rs",
     "src/conversation/projection.rs",
     "src/conversation/recovery.rs",
+    "src/conversation/settlement.rs",
     "src/conversation/state.rs",
     "src/conversation/transcript.rs",
     "src/conversation/validator.rs",
@@ -144,6 +148,7 @@ REQUIRED_FILES = {
     "src/error.rs",
     "src/error/operations.rs",
     "src/ids.rs",
+    "src/interaction.rs",
     "src/lib.rs",
     "src/model/legacy_gateway.rs",
     "src/model/legacy_provider.rs",
@@ -174,11 +179,23 @@ REQUIRED_FILES = {
     "src/prompt/legacy_compaction.rs",
     "src/prompt/mod.rs",
     "src/session/actor.rs",
-    "src/session/bindings.rs",
+    "src/session/actor/commands.rs",
+    "src/session/actor/lifecycle.rs",
+    "src/session/actor/run.rs",
+    "src/session/actor/runner.rs",
+    "src/session/actor/settlement.rs",
+    "src/session/actor/supervisor.rs",
+    "src/session/actor/tests.rs",
+    "src/session/actor/tests/scheduling.rs",
+    "src/session/actor/tests/summary.rs",
+    "src/session/actor/tests/support.rs",
+    "src/session/actor/tests/suspension.rs",
     "src/session/command.rs",
     "src/session/event.rs",
     "src/session/event_stream.rs",
-    "src/session/interaction.rs",
+    "src/session/handle.rs",
+    "src/session/legacy_actor.rs",
+    "src/session/legacy_command.rs",
     "src/session/legacy_event.rs",
     "src/session/legacy_event_stream.rs",
     "src/session/legacy_event_stream/tests.rs",
@@ -187,11 +204,11 @@ REQUIRED_FILES = {
     "src/session/mod.rs",
     "src/session/runtime.rs",
     "src/session/runtime/tests.rs",
-    "src/session/runtime_actor.rs",
-    "src/session/runtime_actor/tests.rs",
+    "src/session/runtime/tests/post_ready_panic.rs",
     "src/session/runtime_log.rs",
     "src/session/runtime_open.rs",
     "src/session/runtime_open/tests.rs",
+    "src/session/runtime_shutdown.rs",
     "src/session/state.rs",
     "src/session/transcript.rs",
     "src/session/turn_handle.rs",
@@ -329,6 +346,7 @@ EXPECTED_ROOT_EXPORTS = {
         "SessionEvent",
         "SessionEventEnvelope",
         "SessionEventStream",
+        "SessionHandle",
         "SessionHealth",
         "SessionRuntime",
         "SessionRuntimeOptions",
@@ -408,6 +426,13 @@ EXPECTED_MODULE_VISIBILITY = {
         "support": "private",
         "tests": "private",
     },
+    "src/session/actor/tests.rs": {
+        "scheduling": "private",
+        "summary": "private",
+        "support": "private",
+        "suspension": "private",
+    },
+    "src/session/runtime/tests.rs": {"post_ready_panic": "private"},
     "src/agent/runner/tests.rs": {
         "acknowledgements": "private",
         "compaction": "private",
@@ -439,6 +464,7 @@ EXPECTED_MODULE_VISIBILITY = {
         "log": "private",
         "projection": "private",
         "recovery": "private",
+        "settlement": "private",
         "state": "private",
         "transcript": "public",
         "validator": "private",
@@ -498,23 +524,33 @@ EXPECTED_MODULE_VISIBILITY = {
         "settlement": "private",
     },
     "src/session/mod.rs": {
-        "actor": "crate",
-        "bindings": "private",
-        "command": "crate",
+        "actor": "private",
+        "command": "private",
         "event": "private",
         "event_stream": "private",
-        "interaction": "private",
+        "handle": "private",
+        "legacy_actor": "crate",
+        "legacy_command": "crate",
         "legacy_event": "crate",
         "legacy_event_stream": "crate",
         "legacy_snapshot": "crate",
         "legacy_state": "crate",
         "runtime": "private",
-        "runtime_actor": "private",
         "runtime_log": "private",
         "runtime_open": "private",
+        "runtime_shutdown": "private",
         "state": "private",
         "transcript": "crate",
         "turn_handle": "private",
+    },
+    "src/session/actor.rs": {
+        "commands": "private",
+        "lifecycle": "private",
+        "run": "private",
+        "runner": "private",
+        "settlement": "private",
+        "supervisor": "private",
+        "tests": "crate",
     },
     "src/storage/mod.rs": {
         "conversation": "crate",
@@ -604,14 +640,17 @@ EXPECTED_TEST_ONLY_MODULES = {
         "validation_budget",
     },
     "src/session/mod.rs": {
-        "actor",
-        "command",
+        "legacy_actor",
+        "legacy_command",
         "legacy_event",
         "legacy_event_stream",
         "legacy_snapshot",
         "legacy_state",
         "transcript",
     },
+    "src/session/actor.rs": {"tests"},
+    "src/session/actor/tests.rs": {"scheduling", "summary", "support", "suspension"},
+    "src/session/runtime/tests.rs": {"post_ready_panic"},
     "src/storage/mod.rs": {"compaction_visibility", "conversation", "store"},
     "src/tools/mod.rs": {"legacy_context", "legacy_policy", "legacy_types", "registry"},
 }
@@ -728,7 +767,6 @@ def check_source_tokens(sources: Dict[str, str]) -> List[str]:
                 errors.append(f"{path}: forbidden production symbol {symbol}")
         if path in {
             "src/session/runtime.rs",
-            "src/session/runtime_actor.rs",
             "src/session/runtime_log.rs",
             "src/session/runtime_open.rs",
         }:
@@ -736,7 +774,6 @@ def check_source_tokens(sources: Dict[str, str]) -> List[str]:
                 "HashMap",
                 "BTreeMap",
                 "SessionManager",
-                "SessionHandle",
                 "Workspace",
                 "SessionStore",
                 "Serialize",
@@ -916,10 +953,11 @@ def check_public_surface(sources: Dict[str, str]) -> List[str]:
             "src/lib.rs: public modules mismatch: "
             f"expected={sorted(EXPECTED_PUBLIC_MODULES)} actual={sorted(public_modules)}"
         )
-    if private_modules != {"agent", "prompt", "time"}:
+    expected_private_modules = {"agent", "bindings", "interaction", "prompt", "time"}
+    if private_modules != expected_private_modules:
         errors.append(
             "src/lib.rs: private modules mismatch: "
-            f"expected=['agent', 'prompt', 'time'] actual={sorted(private_modules)}"
+            f"expected={sorted(expected_private_modules)} actual={sorted(private_modules)}"
         )
     raw_lib_declarations = parse_mod_declarations(lib)
     test_modules = cfg_test_spans(lib)[1]
@@ -972,8 +1010,6 @@ def check_public_surface(sources: Dict[str, str]) -> List[str]:
     storage_mod = mask_rust(strip_test_items(sources.get("src/storage/mod.rs", "")))
     tools_declarations = parse_mod_declarations(tools_mod)
     session_declarations = parse_mod_declarations(session_mod)
-    if "actor" in session_declarations:
-        errors.append("src/session/mod.rs: actor must be test-only")
     storage_declarations = parse_mod_declarations(storage_mod)
     if "store" in storage_declarations:
         errors.append("src/storage/mod.rs: store must be test-only")
@@ -1631,8 +1667,8 @@ def check_sizes_and_graph(
             f"  {count:6d} {path}"
             for path, count in sorted(file_counts.items(), key=lambda item: (-item[1], item[0]))
         )
-    if source_total > 46_000:
-        errors.append(f"src Rust total exceeds 46,000 lines: {source_total}")
+    if source_total > 48_250:
+        errors.append(f"src Rust total exceeds 48,250 lines: {source_total}")
     if production_total > 25_000:
         errors.append(f"production Rust total exceeds 25,000 lines: {production_total}")
 

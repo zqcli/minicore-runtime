@@ -264,7 +264,7 @@ impl SessionShutdownError {
         Self::Durability(DiagnosticSummary::bounded_static(
             DiagnosticCode::LogUnknownOutcome,
             DiagnosticCategory::Storage,
-            "session log close durability is uncertain",
+            "session shutdown did not reach durable completion",
             false,
         ))
     }
@@ -311,7 +311,7 @@ impl fmt::Display for SessionShutdownError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Timeout(_) => "session shutdown timed out",
-            Self::Durability(_) => "session shutdown durability is uncertain",
+            Self::Durability(_) => "session shutdown durability failed",
             Self::LogClose(_) => "session log close failed during shutdown",
             Self::ActorTerminated(_) => "session owner task terminated unexpectedly",
         })

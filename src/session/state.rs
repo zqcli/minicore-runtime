@@ -4,8 +4,8 @@ use crate::conversation::ConversationSeq;
 use crate::error::DiagnosticSummary;
 use crate::ids::{SessionId, SessionInstanceId, TurnId};
 
-use super::interaction::PendingInteraction;
 use super::turn_handle::TurnOutcome;
+use crate::interaction::PendingInteraction;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionStatus {

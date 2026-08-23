@@ -1,10 +1,12 @@
 mod agent;
+mod bindings;
 pub mod compaction;
 pub mod config;
 pub mod context;
 pub mod conversation;
 pub mod error;
 pub mod ids;
+mod interaction;
 pub mod model;
 mod prompt;
 pub mod session;
@@ -26,8 +28,8 @@ pub use ids::{
 };
 pub use session::{
     InteractionAnswer, InteractionKind, PendingInteraction, SessionBindings, SessionEvent,
-    SessionEventEnvelope, SessionEventStream, SessionHealth, SessionRuntime, SessionRuntimeOptions,
-    SessionState, SessionStatus, TurnHandle, TurnOutcome,
+    SessionEventEnvelope, SessionEventStream, SessionHandle, SessionHealth, SessionRuntime,
+    SessionRuntimeOptions, SessionState, SessionStatus, TurnHandle, TurnOutcome,
 };
 pub use storage::{AppendReceipt, ConversationPage, SessionLog, SessionLogError};
 pub use value::BoundedText;

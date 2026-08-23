@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
-use crate::session::{InteractionAnswer, InteractionKind};
+use crate::interaction::{InteractionAnswer, InteractionKind};
 use crate::time::{DeadlineSource, effective_deadline};
 use crate::tools::{
     ApprovalDecision, Tool, ToolContext, ToolDecision, ToolExecutionOutcome, ToolInputRequest,

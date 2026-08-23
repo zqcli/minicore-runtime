@@ -6,6 +6,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::bindings::{SessionBindingError, SessionBindings};
 use crate::compaction::CompactionDriver;
 use crate::config::{CompactionConfig, KernelConfig, SemanticLimits, SessionSpec};
 use crate::context::{ContextDriver, ContextError};
@@ -15,7 +16,6 @@ use crate::model::{
     ModelDriver, ModelDriverConfig, ModelError, ModelLimits, SemanticLimitsSnapshot,
 };
 use crate::prompt::{PromptBuilder, PromptError};
-use crate::session::{SessionBindingError, SessionBindings};
 
 use super::runner_protocol::{RunnerEvent, RunnerProgress};
 use super::tool_driver::{ToolDriver, ToolDriverBuildError, ToolDriverConfig};

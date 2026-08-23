@@ -166,7 +166,6 @@ impl TurnInner {
 }
 
 const _: () = {
-    // P4-B activation target: the actor will create and settle exact Turn handles.
     let _ = std::mem::size_of::<TurnCompletion>();
     let _ = TurnHandle::new;
     let _ = TurnCompletion::finish;

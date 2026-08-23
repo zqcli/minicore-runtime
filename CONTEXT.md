@@ -3,7 +3,7 @@
 > P4-B checkpoint of the breaking v0.3 single-session runtime refactor. The
 > multi-session Runtime has been deleted. `SessionRuntime` now owns create/load,
 > durable log lifetime, root cancellation, events, and deterministic shutdown;
-> final SessionHandle/commands and actor-owned durable settlement remain P4-C work.
+> final SessionHandle/commands and actor-owned durable settlement are integrated.
 
 ## Checkpoint
 
@@ -11,11 +11,12 @@ The crate is Rust 2024 with Rust 1.85 as its MSRV. Concrete storage acquisition,
 
 ## Ownership Map
 
-- `session::SessionRuntime`: unique owner of one created or loaded Session, one `ConversationLog`, one root cancellation domain, one state sender, one bounded event sink, and one actor JoinHandle.
+- `session::SessionRuntime`: unique non-Clone owner of one created or loaded Session, root cancellation, event-stream take, actor JoinHandle, and shutdown barrier; `handle()` returns the cloneable command/watch facade.
+- `session::SessionActor`: sole owner of ConversationLog mutation, bounded commands, state/event publication, one active runner, interaction resume sender, durable settlement, and close ordering.
 - `session::SessionRuntimeOptions`: checked `KernelConfig`, immutable `SessionBindings`, and the Host-selected Tokio `Handle` used to spawn the whole open lifecycle.
 - `conversation`: canonical entries, semantic validation, proof-gated load, paged replay, restart repair, append coordination, confirmed projection, canonical prompt-history and compaction-candidate proofs, transcript, and close classification.
 - `storage::SessionLog`: the only public persistence Port. Host code acquires one exclusive adapter and passes ownership into `SessionRuntime::create/load`.
-- `session`: public bindings/interactions/state/events/TurnHandle plus the P4-B owner. Old actor/command/observation files remain private P4-C/P5 scaffolding only.
+- `session`: public SessionHandle/bindings/interactions/state/events/TurnHandle plus the single-session owner and final command/runner/settlement actor. Legacy actor/command/observation files are test-only P6 cleanup evidence.
 - `model`, `tools`, `context`, `compaction`: host-neutral Ports and checked DTOs bound immutably for the loaded lifetime. Their private drivers share one crate-private deadline selector whose equal-deadline rule conservatively chooses the Turn source.
 - `model::driver`: private P5-A execution module binding one direct Model, a checked Kernel-derived timeout/retry/semantic snapshot, strict stream assembly, and best-effort delta progress; no session/log/tool-execution authority.
 - `agent::tool_driver` and `agent::runner_protocol`: private P5-B execution modules owning frozen-spec policy evaluation, typed approval/input suspension, panic-safe Tool execution, child cancellation, output bounds, and lossy progress. They never append, spawn, or own SessionRuntime/log authority.
@@ -40,8 +41,8 @@ kernel validation
 → SessionLog initialize with zero-head proof
 → new SessionInstanceId
 → Idle + Healthy state and bounded event channels
-→ ready handshake
-→ idle owner loop
+→ ready handshake with SessionHandle
+→ final command/runner/settlement actor loop
 ```
 
 `SessionRuntime::load(expected_session_id, log, options)` performs:
@@ -54,21 +55,21 @@ load/validate manifest and expected SessionId
 → atomic restart repair when needed
 → new SessionInstanceId
 → confirmed-head/last-terminal state rehydration
-→ ready handshake
-→ idle owner loop
+→ ready handshake with SessionHandle
+→ final command/runner/settlement actor loop
 ```
 
-No SessionHandle, command sender, fake submit path, or first-snapshot event is exposed in P4-B. `take_events` transfers the one bounded receiver exactly once.
+`take_events` transfers the one bounded receiver exactly once. SessionHandle clones only IDs, the bounded command sender, and watch state; it owns no log, task, or shutdown authority.
 
 ## Cancellation And Shutdown
 
 Before owner spawn and before any await, `OpenGuard` synchronously installs cleanup watchers on both the configured and current Tokio runtimes. Each captures only `SharedOpenPayload`, root cancellation, and a `payload_claimed` signal. Before entering the single-take cleanup path, a watcher panic-safely constructs and drops a zero-duration sleep in its current execution context; a no-time fallback exits `None` without taking the log. `run_open` signals claim immediately after its successful take. Owner spawn panic, pre-poll Join failure, ready-channel loss, and caller cancellation share this path.
 
-`SessionRuntime::shutdown(self)` cancels out of band, waits for state `Closing`, log close, sender drops, and task completion. If `shutdown_timeout` expires, it aborts and awaits that same JoinHandle before returning `SessionShutdownError::Timeout`. Known close failure, unknown durability, timeout, and task termination remain distinct typed errors.
+`SessionRuntime::shutdown(self)` cancels out of band, waits for state `Closing`, active Turn resolution, log close, sender drops, and task completion. Active commit or settlement durability failure while Closing remains the primary `SessionShutdownError::Durability`; close is still attempted exactly once and any close failure is secondary internal evidence. If `shutdown_timeout` expires, shutdown aborts and awaits the same owner task before returning Timeout.
 
 `SessionRuntimeOptions::new` synchronously validates that `task_runtime` has an enabled Tokio time driver by entering it and constructing then dropping a zero-duration sleep under `catch_unwind`. The runtime must remain timer-enabled, alive, and actively driven throughout create, load, and shutdown. Successful SessionRuntime retains the Handle; shutdown constructs its timeout under a short panic-isolated `enter()` scope, drops that scope before await, and can then be polled by a non-Tokio executor. Unexpected timeout-construction panic cancels, aborts, and awaits the same owner task before returning ActorTerminated.
 
-Model descriptor access, SessionLog future construction and polling, and the post-ready actor loop are explicit host-controlled panic boundaries. They are caught and mapped to typed failures; actor-loop panic attempts one bounded close. TurnRunner catches its task panic, attempts one bounded Internal Finish, and returns Panicked; the deterministic test-only injection occurs before execution and therefore carries default usage. A later arbitrary Core panic cannot safely recover the in-memory usage accumulator, so the future P4-C actor must derive panic-fallback usage from the confirmed conversation before durable terminal settlement. Arbitrary Core allocation or invariant panics after ownership transfer remain outside the close-complete API boundary.
+Model descriptor access, SessionLog future construction and polling, and the post-ready actor loop are explicit host-controlled panic boundaries. During panic cleanup the active runner JoinHandle stays installed while awaited; if the outer shutdown timeout aborts cleanup, ActiveTurn Drop still owns and aborts the runner. Deterministic Drop-probe evidence checks the runner future is dropped before shutdown returns. Panic cleanup then resolves the Turn waiter and attempts one close.
 
 ## Error Boundary
 
@@ -78,7 +79,7 @@ Model descriptor access, SessionLog future construction and polling, and the pos
 
 ## Deferred Work
 
-P4-C will replace the private legacy actor/command scaffolding with the final cloneable SessionHandle, state watch access, bounded submit/answer commands, transcript routing, actor-owned Summary append, and durable terminal settlement. P5-A through P5-E2 now provide independently tested drivers, canonical prompt/compaction proofs, ordinary execution, proactive and forced compaction, and the exact stale-head Summary commit protocol. The current SessionRuntime owner remains deliberately idle.
+P4-C is complete: SessionRuntime exposes one cloneable SessionHandle backed by a bounded actor mailbox and watch state; the actor owns User/Assistant/Tool/Summary/terminal commits, interaction resume senders, transcript serialization, runner progress, settlement, and shutdown sequencing. P6 removes the remaining test-only legacy actor/storage/workspace/dependency graph.
 
 ## Verification
 

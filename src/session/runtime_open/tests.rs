@@ -5,10 +5,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use super::super::bindings::SessionBindings;
+use super::super::actor::SessionActorExit;
 use super::super::runtime::SessionRuntimeOptions;
-use super::super::runtime_actor::SessionActorExit;
 use super::{OpenPayload, OpenRequest, run_open};
+use crate::bindings::SessionBindings;
 use crate::config::{CompactionConfig, KernelConfig, SessionManifest, SessionSpec};
 use crate::conversation::{ConversationEntry, ConversationSeq};
 use crate::error::{
@@ -41,7 +41,7 @@ fn load_orders_manifest_binding_proof_replay_repair_and_ready() {
         .unwrap();
     let finish = prepare_load.find(".finish(proof)").unwrap();
     let build = prepare_load
-        .find("build_owner(session_id,spec,conversation,parts).await")
+        .find("build_owner(session_id,spec,conversation,parts,owner_cancel).await")
         .unwrap();
     assert!(begin < validate && validate < proof && proof < finish && finish < build);
 
@@ -76,7 +76,7 @@ fn owner_signals_payload_claim_before_any_open_work_or_await() {
 
 #[test]
 fn host_controlled_panic_boundaries_remain_isolated() {
-    let bindings = include_str!("../bindings.rs");
+    let bindings = include_str!("../../bindings.rs");
     assert!(
         bindings.contains("catch_unwind(AssertUnwindSafe(|| self.model.descriptor().clone()))")
     );
@@ -89,10 +89,10 @@ fn host_controlled_panic_boundaries_remain_isolated() {
     assert!(operation.contains("catch_unwind(AssertUnwindSafe(operation))"));
     assert!(operation.contains("AssertUnwindSafe(future).catch_unwind()"));
 
-    let actor = include_str!("../runtime_actor.rs");
-    assert!(actor.contains("AssertUnwindSafe(owner.run(owner_cancel))"));
-    assert!(actor.contains(".catch_unwind()"));
-    assert!(actor.contains("owner.close_after_panic().await"));
+    let supervisor = include_str!("../actor/supervisor.rs");
+    assert!(supervisor.contains("AssertUnwindSafe(actor.run())"));
+    assert!(supervisor.contains(".catch_unwind()"));
+    assert!(supervisor.contains("actor.close_after_panic().await"));
 }
 
 struct TestModel(ModelDescriptor);

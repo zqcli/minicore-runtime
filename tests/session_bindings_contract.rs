@@ -81,7 +81,7 @@ fn surface_is_exact_clone_send_sync_and_redacted() {
     assert!(!debug.contains("host:model"));
     assert_eq!(calls.descriptor.load(Ordering::SeqCst), 0);
 
-    let source = include_str!("../src/session/bindings.rs");
+    let source = include_str!("../src/bindings.rs");
     let fields = source
         .split_once("pub struct SessionBindings")
         .and_then(|(_, tail)| tail.split_once('}'))
@@ -127,7 +127,7 @@ fn surface_is_exact_clone_send_sync_and_redacted() {
     }
     assert!(
         include_str!("../src/session/mod.rs")
-            .contains("pub use bindings::{SessionBindingError, SessionBindings};")
+            .contains("pub use crate::bindings::{SessionBindingError, SessionBindings};")
     );
     let root = include_str!("../src/lib.rs")
         .split_whitespace()
@@ -456,5 +456,5 @@ fn p4_load_contract_orders_binding_validation_before_proof_and_finish() {
     let finish = source.find("pending.finish(proof)").unwrap();
     assert!(validate < proof && proof < finish);
     assert!(source.contains("pub(crate) struct LoadCompatibilityValidated"));
-    assert!(!include_str!("../src/session/bindings.rs").contains("LoadCompatibilityValidated"));
+    assert!(!include_str!("../src/bindings.rs").contains("LoadCompatibilityValidated"));
 }
