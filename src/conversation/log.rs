@@ -397,6 +397,21 @@ impl ConversationLog {
         self.state.head()
     }
 
+    pub(crate) fn last_terminal(&self) -> Option<TurnTerminalEntry> {
+        self.state
+            .projection()
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                ConversationEntry::TurnTerminal(terminal) => Some(terminal.clone()),
+                ConversationEntry::UserMessage(_)
+                | ConversationEntry::AssistantMessage(_)
+                | ConversationEntry::ToolResult(_)
+                | ConversationEntry::Summary(_) => None,
+            })
+    }
+
     pub(crate) async fn transcript(
         &mut self,
         after: Option<ConversationSeq>,
@@ -493,6 +508,10 @@ impl ConversationLog {
             OperationOutcome::Timeout => Some(ConversationCloseOutcome::Timeout),
             OperationOutcome::Panic => Some(ConversationCloseOutcome::Panic),
         }
+    }
+
+    pub(crate) async fn close_after_open_failure(&mut self) -> Option<ConversationCloseOutcome> {
+        self.close_for_load().await
     }
 
     fn mark_durability_unknown(

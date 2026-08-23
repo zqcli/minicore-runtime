@@ -1,11 +1,16 @@
 # Current Architecture
 
-This document describes the current v0.3 reset slice. The former v0.2 Runtime/session/provider graph remains compiled only as private migration scaffolding where later phases still need it; it is not a public compatibility facade.
+This document describes the current v0.3 reset slice. The former v0.2 multi-session Runtime and SessionManager are deleted. The remaining old actor/command/provider/workspace/storage graph is gated at owning module declarations with `cfg(test)`: it compiles for legacy unit evidence, not in the production library and not as a compatibility facade.
 
 ## Public Spine
 
 ```text
 Host
+ ├── session::SessionRuntime { exactly one loaded Session }
+ │   ├── session::SessionRuntimeOptions
+ │   ├── storage::SessionLog { exactly one owned adapter }
+ │   ├── session::SessionEventStream { taken once }
+ │   └── root cancellation + one owner JoinHandle
  ├── session::SessionBindings
  │   ├── model::Model
  │   │   └── ModelStream { typed events }
@@ -17,6 +22,8 @@ Host
  │   └── compaction::CompactionStrategy
  └── storage::SessionLog
 ```
+
+The Host obtains one exclusive SessionLog and calls `SessionRuntime::create` or `load`. Managing `HashMap<SessionId, SessionRuntime>`, list/delete policy, writer leases, global rate limits, and shutdown-all belongs outside Core.
 
 The public Tool seam is host-neutral. A Tool receives a checked `ToolInvocation` and a context containing only cancellation, deadline, and synchronous best-effort progress. Workspace roots, process capabilities, RPC clients, credentials, policy decisions, and runtime/session handles are not fields of `ToolContext`.
 
@@ -35,6 +42,20 @@ Validation is pure and does not invoke adapter futures. The only adapter call is
 `session::SessionEventStream` owns one bounded mpsc receiver. It has no Clone, snapshot, subscribe, broadcast, cursor, revision, epoch, gap, or resync interface. The crate-private `InternalEventSink` uses `try_send`; full queues increment a saturating loss count, and a later event first attempts an `EventsDropped` marker. State and TurnHandle remain authoritative when best-effort events are lost.
 
 `session::TurnHandle` contains only stable identities plus shared cancellation/completion state. One mutex orders cancel and completion, cancellation tokens carry only the exact-Turn signal, and Notify wakes all waiters after first-wins settlement. Successful wait results contain the confirmed durable `conversation::TurnTerminal` and Usage. Unknown/unavailable durability and actor termination remain typed diagnostic errors.
+
+## SessionRuntime Ownership
+
+`SessionRuntimeOptions` contains exactly a checked KernelConfig, immutable SessionBindings, and Tokio Handle. Construction enters the supplied Handle inside `catch_unwind`, constructs and drops a zero-duration sleep, and rejects a missing time driver without executing or blocking. The timer-enabled runtime must remain alive and actively driven during create, load, and shutdown. A non-Tokio caller is valid when that configured runtime is driven; a live but undriven current-thread runtime cannot provide progress.
+
+Before owner spawn and before any await, OpenGuard attempts cleanup-watcher spawns on the configured Handle and `Handle::try_current()`. Each watcher captures the single-take payload, owner cancellation, and payload-claimed token. On first poll it panic-safely constructs and drops a zero-duration sleep in its executing runtime; without a time driver it exits before taking payload ownership. `run_open` signals claim immediately after its take. Watcher handles are retained and polled by mutable reference; after one returns a close result, loser handles may detach because the shared payload is empty and their tasks are finite under active runtime progress.
+
+Create ordering is kernel → custom-limit spec → bindings → manifest → initialize/zero head → fresh instance → validated Idle/Healthy state and bounded events → ready. Load ordering is manifest/expected identity → bindings → identity-bound proof → paged replay/semantic validation → atomic restart repair → fresh instance → confirmed head/last terminal state → ready. No first snapshot event is emitted.
+
+After ready, the idle owner task holds ConversationLog, kernel/spec/bindings lifetime evidence, state sender, InternalEventSink, and root cancellation. P4-B adds no ordinary command mailbox and no fake SessionHandle. Cancellation first publishes Closing to state, then closes ConversationLog, drops state/event senders, and returns a typed task exit.
+
+Successful SessionRuntime retains the configured Handle. `shutdown(self)` first cancels, then enters that Handle only long enough to construct the timeout future; the enter guard is dropped before any await, so a non-Tokio executor can poll shutdown without a caller-runtime timer. Unexpected construction panic aborts and awaits the same owner task and returns ActorTerminated. Normal timeout still aborts and awaits that task before Timeout. Drop only cancels; if neither timer-capable runtime is actively driven, graceful close is not guaranteed.
+
+Core catches the host-controlled panic boundaries: Model descriptor access, SessionLog future construction and polling, and the post-ready actor loop. These become typed failures and preserve their specified close attempts. Arbitrary Core allocation or invariant panics after ownership transfer are not a recoverable API error boundary and may skip graceful close, as may destruction of all timer-capable runtimes. Core deliberately does not add a shared-log worker solely to claim recovery from every possible internal panic.
 
 ## Checked DTOs
 
@@ -56,23 +77,23 @@ Progress is synchronous and nonblocking. `ToolProgressSink::emit` validates `com
 
 `ModelRequest` contains only checked messages, tools, limits, and reasoning. `ModelStream` emits bounded typed `ModelEvent` values for text, reasoning, tool-call grammar, usage, and finish. Event `Debug` output reports only safe identities and byte counts. `ModelError` reports `DeliveryState::{NotStarted, Started, Unknown}`, retryability, and an optional retry-after hint; retryable/hint combinations are rejected unless delivery is `NotStarted`.
 
-The current private runner still consumes batch `ModelResponse` through `LegacyModelGateway`, `LegacyModelProvider`, and `LegacyProviderRegistry`. Those files preserve old actor tests without exposing provider lookup. P5 will replace them with an internal `ModelDriver` that assembles streams, catches start/stream poll panics as `Panicked`, applies cancellation/deadlines, and owns delivery-safe retry.
+The test-only runner still consumes batch `ModelResponse` through `LegacyModelGateway`, `LegacyModelProvider`, and `LegacyProviderRegistry`. Those files preserve old unit evidence without entering the production graph or exposing provider lookup. P5 will replace them with an internal `ModelDriver` that assembles streams, catches start/stream poll panics as `Panicked`, applies cancellation/deadlines, and owns delivery-safe retry.
 
 ## Legacy Boundary
 
-The old actor/runner/storage path uses private `LegacyTool`, `LegacyToolContext`, and `legacy_types` DTOs. `LegacyToolOutput` deliberately preserves the old `{ "text": ..., "is_error": ... }` JSON shape. Prompt-facing `ModelMessage::Tool` uses only public `ToolOutput` plus `ToolResultOutcome`; the crate-private conversion maps the legacy status bit before provider encoding, while physical conversation entries retain the old DTO.
+The test-only actor/runner/storage path uses `LegacyTool`, `LegacyToolContext`, and `legacy_types` DTOs. `LegacyToolOutput` deliberately preserves the old `{ "text": ..., "is_error": ... }` JSON shape for legacy unit tests. Production `ModelMessage::Tool` uses only public `ToolOutput` plus `ToolResultOutcome`; the legacy conversion itself is `cfg(test)`.
 
-The old actor still uses `legacy_state.rs`, `legacy_event.rs`, `legacy_event_stream.rs`, and `legacy_snapshot.rs`. Their types are explicitly `Legacy*`, crate-private, and not reexported. Broadcast, first-snapshot delivery, resync, and legacy terminal DTO behavior remain there only until P4-B/P5 rewires the actor to the final foundation.
+The test-only old actor uses `legacy_state.rs`, `legacy_event.rs`, `legacy_event_stream.rs`, and `legacy_snapshot.rs`. Their modules are gated with actor, command, and old transcript at `session/mod.rs`. Broadcast, first-snapshot delivery, resync, old commands, and legacy terminal behavior are absent from the production SessionRuntime graph.
 
 `legacy_context.rs`, `legacy_policy.rs`, `legacy_types.rs`, and `registry.rs` are staged private migration files. `legacy_policy.rs` retains the synchronous string-based decision flow only for the old runner and is marked for P5/P6 deletion. Final `policy.rs` is the public typed Port and is part of the canonical Tool seam.
 
-## Deferred Owners
+## Deferred Execution
 
-The old `runtime` and `workspace` modules are private in `src/lib.rs`; `Runtime`, `RuntimeConfig`, `RuntimeConfigBuilder`, `SessionConfig`, `SessionSummary`, `RuntimeError`, `ToolRegistry`, and `ToolRegistryBuilder` are crate-private or removed from root/module exports. The old actor/session/storage/legacy-model/workspace implementation remains only for migration work through P6.
+The old top-level `runtime` directory, Runtime configuration/manager/error symbols, and legacy `SessionConfig` are physically removed. ToolRegistry, old actor/commands, legacy model lookup, workspace, and filesystem store remain test-only where P4-C/P5/P6/P7 unit evidence consumes them; SessionRuntime does not import or own them.
 
 Concrete filesystem/process adapters and their tests were deleted in P3-B rather than replaced with defaults. Future concrete tools must be host-owned implementations of the public `Tool` Port, not reintroduced builtins or process policy modules.
 
-P4-B/P5 will introduce the SessionRuntime owner and wire the final actor contract. P4 must validate bindings against the loaded manifest before constructing `LoadCompatibilityValidated` and finishing replay. P4-A does not expose that proof or connect final handles/events to the transitional actor.
+P4-C will add the final SessionHandle, state watch access, commands, and transcript routing. P5 will replace the old actor/runner with TurnHandle, ModelDriver, policy/interaction, tool, context, compaction, and settlement wiring. P4-B deliberately supports no submit path.
 
 ## Model Retry
 
@@ -80,4 +101,4 @@ The final retry contract is explicit: `retryable == true` and `delivery == NotSt
 
 ## Dependency Direction
 
-Public Ports and SessionBindings do not import Runtime, SessionHandle, Workspace, Store, registry lookup, direct I/O, or fanout. The final Model, Tool, ToolPolicy, and SessionBindings files remain below the 500-line limit. Transitional private owners may still depend on the old graph until their scheduled phase, but no new public alias or wrapper may be added.
+Public Ports and SessionBindings do not import SessionRuntime, SessionHandle, Workspace, Store, registry lookup, direct I/O, or fanout. SessionRuntime depends only on checked config/bindings, ConversationLog, SessionLog, IDs, Tokio ownership primitives, state, and events. Owner/Port/DTO files remain below 500 lines, and the module DAG remains all singleton SCCs.

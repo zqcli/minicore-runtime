@@ -1,9 +1,10 @@
 //! Future v0.3 public API compile contract.
 //!
-//! This module is intentionally disabled until P4/P5 implement the owner,
+//! P4-B now implements the real single-session owner lifecycle. This module
+//! remains disabled only until P4-C/P5 add the final SessionHandle, commands,
 //! actor, and runner surface. Activation is only removing `cfg(any())`; the
-//! contract must compile against the direct v0.3 API, never a v0.2 alias or
-//! compatibility wrapper.
+//! contract must compile against the direct v0.3 API, never a compatibility
+//! alias or wrapper.
 
 #[cfg(any())]
 mod v03_public_api_compile_contract {

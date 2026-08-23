@@ -19,7 +19,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 
-use crate::config::{ConfigError, SessionConfig};
 use crate::ids::SessionId;
 use crate::model::{LegacyModelId, LegacyModelSelection, LegacyProviderId};
 use crate::time::Timestamp;
@@ -198,34 +197,6 @@ impl fmt::Debug for StoredSessionConfig {
 }
 
 impl StoredSessionConfig {
-    pub(crate) fn from_session_config(
-        session_id: SessionId,
-        timestamp: Timestamp,
-        config: &SessionConfig,
-    ) -> Result<Self, ConfigError> {
-        let compaction = StoredCompactionConfig::new(
-            config.compaction_trigger_tokens(),
-            config.compaction_target_tokens(),
-        )
-        .map_err(|_| ConfigError::InvalidBounds)?;
-        let execution = StoredExecutionConfig::new(
-            config.enabled_tools().clone(),
-            compaction,
-            config.max_tool_rounds(),
-        )
-        .map_err(|_| ConfigError::InvalidBounds)?;
-        Self::new(
-            session_id,
-            timestamp.clone(),
-            timestamp,
-            config.workspace_root().to_owned(),
-            StoredModelConfig::new(config.model().clone()),
-            config.system_prompt().to_owned(),
-            execution,
-        )
-        .map_err(|_| ConfigError::InvalidBounds)
-    }
-
     pub(crate) fn new(
         session_id: SessionId,
         created_at: Timestamp,

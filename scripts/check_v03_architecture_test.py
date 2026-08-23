@@ -58,6 +58,10 @@ def make_fixture(root: Path) -> None:
     (root / "src/session/bindings.rs").write_text(
         "pub struct SessionBindings {}\n", encoding="utf-8"
     )
+    (root / "src/session/runtime.rs").write_text(
+        "pub struct SessionRuntime {}\npub struct SessionRuntimeOptions {}\n",
+        encoding="utf-8",
+    )
 
 
 def expect_failure(root: Path, needle: str) -> None:
@@ -88,6 +92,7 @@ def self_test() -> None:
             ("adapter", "forbidden production storage implementation", lambda root: (root / "src/storage/conversation_jsonl.rs").write_text("", encoding="utf-8")),
             ("model-missing-driver-role", "missing required production role: model driver", lambda root: (root / "src/model/driver.rs").unlink()),
             ("tools-missing-toolset-role", "missing required production role: tools ToolSet", lambda root: (root / "src/tools/set.rs").unlink()),
+            ("session-missing-runtime-role", "missing required production role: session runtime owner", lambda root: (root / "src/session/runtime.rs").unlink()),
             ("model-gateway-file", "forbidden production src/model path", lambda root: (root / "src/model/gateway.rs").write_text("pub(crate) const _MODEL_GATEWAY: () = ();\n", encoding="utf-8")),
             ("model-extra-file", "forbidden production src/model path", lambda root: (root / "src/model/legacy.rs").write_text("pub struct Legacy;\n", encoding="utf-8")),
             ("model-empty-file", "forbidden production src/model path", lambda root: (root / "src/model/legacy.rs").write_text("", encoding="utf-8")),

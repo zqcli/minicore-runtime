@@ -262,3 +262,10 @@ pub(super) async fn close_owned(
         OperationOutcome::Panic => Some(ConversationCloseOutcome::Panic),
     }
 }
+
+pub(crate) async fn close_unopened_log(
+    inner: Box<dyn SessionLog>,
+    timeout: Duration,
+) -> Option<ConversationCloseOutcome> {
+    close_owned(inner, timeout).await
+}

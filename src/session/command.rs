@@ -1,3 +1,5 @@
+// P4-C/P5 deletion target: private legacy commands and handle scaffolding.
+
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -177,10 +179,6 @@ impl SessionHandle {
                 mpsc::error::TrySendError::Closed(_) => SessionError::Closing,
             })?;
         receiver.await.map_err(|_| SessionError::Closing)?
-    }
-
-    pub(crate) fn request_close(&self) {
-        self.cancel.request_close(&self.close_requested);
     }
 
     pub(crate) fn cancel(&self) -> Result<(), SessionError> {

@@ -8,14 +8,15 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::ids::ToolCallId;
+#[cfg(test)]
+use crate::tools::LegacyToolOutput;
 pub(crate) use crate::tools::ToolSpec;
-use crate::tools::{
-    LegacyToolOutput, ToolName, ToolOutput, ToolResultOutcome, validate_json_shape,
-};
+use crate::tools::{ToolName, ToolOutput, ToolResultOutcome, validate_json_shape};
 
 #[cfg(test)]
 use super::response::ModelError;
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum LegacyModelIdentityError {
     #[error("model identity must be 1..=128 bytes")]
@@ -145,6 +146,7 @@ fn valid_text(value: &str, maximum: usize) -> bool {
             .all(|character| !character.is_control() || matches!(character, '\n' | '\t'))
 }
 
+#[cfg(test)]
 macro_rules! model_identity {
     ($name:ident, $allow_slash:literal) => {
         #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -201,15 +203,19 @@ macro_rules! model_identity {
     };
 }
 
+#[cfg(test)]
 model_identity!(LegacyProviderId, false);
+#[cfg(test)]
 model_identity!(LegacyModelId, true);
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub(crate) struct LegacyModelSelection {
     provider_id: LegacyProviderId,
     model_id: LegacyModelId,
 }
 
+#[cfg(test)]
 impl LegacyModelSelection {
     pub(crate) const fn new(provider_id: LegacyProviderId, model_id: LegacyModelId) -> Self {
         Self {
@@ -287,6 +293,7 @@ impl<'de> Deserialize<'de> for ModelLimits {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct LegacyModelDescriptor {
     selection: LegacyModelSelection,
@@ -295,6 +302,7 @@ pub(crate) struct LegacyModelDescriptor {
     supported_reasoning: BTreeSet<ReasoningPreference>,
 }
 
+#[cfg(test)]
 impl LegacyModelDescriptor {
     #[cfg(test)]
     pub(crate) fn new(
@@ -338,6 +346,7 @@ impl LegacyModelDescriptor {
     }
 }
 
+#[cfg(test)]
 impl fmt::Debug for LegacyModelDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -724,6 +733,7 @@ impl ModelMessage {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn legacy_tool(
         tool_call_id: ToolCallId,
         output: LegacyToolOutput,
@@ -1034,21 +1044,12 @@ impl<'de> Deserialize<'de> for ModelResponse {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LegacyModelEvent {
     TextDelta { delta: String },
     ReasoningDelta { delta: String },
 }
-
-fn legacy_model_event_compile_anchor(delta: String, reasoning: bool) -> LegacyModelEvent {
-    if reasoning {
-        LegacyModelEvent::ReasoningDelta { delta }
-    } else {
-        LegacyModelEvent::TextDelta { delta }
-    }
-}
-
-const _: fn(String, bool) -> LegacyModelEvent = legacy_model_event_compile_anchor;
 
 fn validate_tool_call_order(parts: &[AssistantPart]) -> Result<(), ModelValueError> {
     let mut ids = BTreeSet::new();

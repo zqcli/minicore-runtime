@@ -1,7 +1,7 @@
 # Documentation Authority
 
 > The pages below retain the v0.2 reset record as transitional migration
-> evidence. The current v0.3 P4-A Port/bindings/state/event/TurnHandle seams are documented
+> evidence. The current v0.3 P4-B Port/bindings/state/event/TurnHandle and SessionRuntime owner seams are documented
 > in the root README, `docs/architecture.md`, and `docs/modules/README.md`.
 
 The transitional v0.2 documentation follows this order:

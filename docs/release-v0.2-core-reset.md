@@ -1,7 +1,7 @@
 # v0.2 Core Reset Release Readiness
 
 > Historical v0.2 release record. Its Runtime, registry, and v0.2 public-surface
-> descriptions are transitional evidence; the breaking v0.3 P4-A surface is
+> descriptions are transitional evidence; the breaking v0.3 P4-B surface is
 > authoritative in the root README and current architecture/module map.
 
 This note records the implementation and verification milestone for the MiniCore Runtime v0.2 Core Reset from baseline `5088bc254548b3e80e87179898ebb7abbea52c7d`. It records the historical source and durable contracts; it does not reopen the archived pre-reset design.
@@ -10,15 +10,15 @@ The milestone name is v0.2 Core Reset. At that historical milestone the crate pa
 
 ## Source Graph
 
-The current transitional production crate contains 86 Rust source files and approximately 17.8k production lines. Its canonical top-level owners are `agent`, `compaction`, `config`, `context`, `conversation`, `error`, `ids`, `model`, `prompt`, `runtime`, `session`, `storage`, `time`, `tools`, `value`, and `workspace`. The production module dependency graph is a DAG: every module SCC is a singleton, with no accepted multi-module cycle.
+The current transitional production crate keeps the canonical top-level owners `agent`, `compaction`, `config`, `context`, `conversation`, `error`, `ids`, `model`, `prompt`, `session`, `storage`, `time`, `tools`, `value`, and `workspace`. The old top-level runtime owner is deleted. The production module dependency graph is a DAG: every module SCC is a singleton, with no accepted multi-module cycle.
 
 The architecture gate requires the exact canonical file graph, rejects legacy source paths and migration aliases, checks owner-crossing imports, limits production file and function size, and freezes the direct dependency set. The current direct dependencies are `cap-primitives`, `cap-std`, `fs4`, `futures-util`, `getrandom`, `serde`, `serde_json`, `thiserror`, `time`, `tokio`, and `tokio-util`; the root `reqwest` dependency was removed with concrete model adapters in P3-D.
 
 ## Public Surface
 
-The historical v0.2 root modules included `config`, `error`, `event`, `ids`, `model`, `runtime`, `session`, `tools`, and `workspace`. In the current v0.3 slice, `runtime` and `workspace` are private migration modules; root convenience reexports are limited to the current checked DTOs, Ports, identifiers, errors, and storage contract declared in [`src/lib.rs`](../src/lib.rs).
+The historical v0.2 root modules included `config`, `error`, `event`, `ids`, `model`, `runtime`, `session`, `tools`, and `workspace`. In the current v0.3 slice, the top-level runtime module is deleted and workspace remains private; root convenience reexports include the checked DTOs, Ports, SessionRuntime owner, identifiers, errors, and storage contract declared in [`src/lib.rs`](../src/lib.rs).
 
-The host-facing entry point is `Runtime::open(config, tokio::runtime::Handle)`. Session operations use typed values and errors for create, load, close, delete, list, submit, answer, cancel, snapshot, subscribe, transcript, and shutdown. No v0.1 Wire/API compatibility wrapper is compiled.
+At the historical v0.2 milestone, the host-facing entry point was `Runtime::open(config, tokio::runtime::Handle)`, with typed multi-session operations. P4-B deletes that implementation; the current owner is one `SessionRuntime` per created or loaded Session, and no compatibility wrapper is compiled.
 
 ## Persistence Formats
 

@@ -69,6 +69,10 @@ async fn two_phase_load_exposes_manifest_before_replay_and_abort_closes_once() {
     let proof = bindings_validated(&pending);
     let log = pending.finish(proof).await.unwrap();
     assert_eq!(log.head(), ConversationSeq::new(3));
+    let last_terminal = log.last_terminal().unwrap();
+    assert_eq!(last_terminal.seq, ConversationSeq::new(3));
+    assert_eq!(last_terminal.turn_id, turn_id(2));
+    assert_eq!(last_terminal.terminal, TurnTerminal::CancelledByRestart);
     assert_eq!(repair_audit.read_calls.load(Ordering::SeqCst), 2);
     assert_eq!(repair_audit.append_calls.load(Ordering::SeqCst), 1);
     assert_eq!(repair_audit.close_calls.load(Ordering::SeqCst), 0);

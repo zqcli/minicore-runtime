@@ -2,7 +2,8 @@
 
 > Historical migration record. The v0.3 reset is breaking and does not add a
 > compatibility wrapper. P3-B removes the public Runtime/ToolRegistry facade;
-> P3-D removes model registries, concrete network adapters, and transport APIs.
+> P3-D removes model registries, concrete network adapters, and transport APIs;
+> P4-B deletes the remaining private multi-session Runtime implementation.
 
 ## Status
 

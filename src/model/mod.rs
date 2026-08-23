@@ -1,6 +1,9 @@
+#[cfg(test)]
 mod legacy_gateway;
+#[cfg(test)]
 pub(crate) mod legacy_provider;
-mod legacy_registry;
+#[cfg(test)]
+pub(crate) mod legacy_registry;
 #[path = "model.rs"]
 mod model_port;
 mod response;
@@ -17,19 +20,11 @@ pub use types::{
     ReasoningPreference, ToolCall, Usage,
 };
 
+#[cfg(test)]
 pub(crate) use legacy_gateway::LegacyModelGateway;
+#[cfg(test)]
 pub(crate) use legacy_provider::{LegacyModelCallContext, LegacyModelEventSink};
-pub(crate) use legacy_registry::{
-    LegacyProviderRegistry, LegacyProviderRegistryBuilder, LegacyResolvedModel,
-};
+#[cfg(test)]
 pub(crate) use types::{
-    LegacyModelDescriptor, LegacyModelEvent, LegacyModelId, LegacyModelIdentityError,
-    LegacyModelSelection, LegacyProviderId,
-};
-
-const _: () = {
-    // P5/P6 deletion target: remove with crate-private legacy model exports.
-    let _ = std::mem::size_of::<LegacyProviderRegistryBuilder>();
-    let _ = std::mem::size_of::<LegacyResolvedModel>();
-    let _ = std::mem::size_of::<LegacyModelIdentityError>();
+    LegacyModelDescriptor, LegacyModelEvent, LegacyModelId, LegacyModelSelection, LegacyProviderId,
 };

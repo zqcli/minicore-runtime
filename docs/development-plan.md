@@ -2,7 +2,7 @@
 
 ## Status
 
-P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is in progress: P3-B through P4-A expose the final Port/bindings/state/event/TurnHandle foundations while isolating old implementations under `Legacy*`. P4-B/P5 SessionRuntime, actor, ModelDriver, and remaining workspace migration are still deferred.
+P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is in progress: P3-B through P4-B expose the final Port/bindings/state/event/TurnHandle foundations and the real single-session create/load/shutdown owner. P4-C/P5 SessionHandle, actor execution, ModelDriver, and remaining workspace migration are still deferred.
 
 ## Completed Foundations
 
@@ -13,7 +13,7 @@ P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is 
 - [x] **P4 — storage:** worker-owned root lock, atomic session create, bounded CRUD, exact session JSON, append-only conversation JSONL, replay, repair, usage, transcript, and degradation behavior.
 - [x] **P5 — prompt and compaction:** terminal-aware prompt projection, serialized-byte estimation, current-turn preservation, stale-safe summary append, and context-overflow recovery.
 - [x] **P6 — turn execution:** private prompt/turn runner, ordered model/tool rounds, interaction claim, cancellation linearization, truthful terminal settlement, and one session mailbox.
-- [x] **P7 — runtime:** historical private lifecycle implementation retained only for migration; no public Runtime facade remains.
+- [x] **P7 — historical runtime:** the old public facade was removed; P4-B now physically deletes its remaining private multi-session owner implementation.
 - [x] **P8 — reset closure:** historical v0.2 source graph and archive baseline.
 
 - [x] **P3-B — Tool seam reset:** public `Tool`/`ToolSet`, checked invocation/context/progress/input/output DTOs, true legacy DTO split, concrete adapter deletion, and focused contract tests.
@@ -21,7 +21,8 @@ P0 through P9 describe the historical v0.2 reset. The current v0.3 migration is 
 - [x] **P3-D — direct Model Port:** host-neutral streaming `Model`, checked descriptors/contexts/events/errors/requests, private `Legacy*` runner lookup, concrete adapter/transport deletion, and focused contract coverage.
 - [x] **P3-E — SessionBindings:** exact immutable Port bundle, pure spec/limits/model/tool/compaction validation, descriptor panic isolation, frozen ToolSpec semantic budgets, root export, and focused contract coverage.
 - [x] **P4-A — state/event/TurnHandle foundation:** lightweight invariant-checked state, redacted diagnostics, exact event DTOs, bounded single-consumer lossy stream, exact-Turn cancellation/completion, and physical legacy observation split.
-- [ ] **P4-B/P5 — SessionRuntime acceptance:** owner/actor integration and replacement end-to-end contract suite.
+- [x] **P4-B — SessionRuntime owner lifecycle:** spawn-first OpenGuard, create/load validation and recovery, one log/state/event owner, typed open/shutdown errors, cancellation cleanup, one-shot events, deterministic shutdown, multi-owner concurrency, and deletion of the multi-session Runtime.
+- [ ] **P4-C/P5 — commands and execution:** final SessionHandle/commands, actor integration, ModelDriver, turns, interactions, tools, context/compaction, and settlement.
 
 ## Current Maintenance Gates
 
@@ -48,7 +49,7 @@ Historical live-network smoke cases are not root-crate targets. The standalone p
 
 ## Non-Core Limits
 
-The core does not install a provider by default, expose a shell command language, claim an OS process-tree sandbox, or automatically migrate historical storage. It does not provide a server, CLI, GUI, ambient credential lookup, generic schema ecosystem, or compatibility wrapper. These are separate host/product decisions and must not silently expand the Runtime contract.
+The core does not install a provider by default, expose a shell command language, claim an OS process-tree sandbox, or automatically migrate historical storage. It does not provide a server, CLI, GUI, ambient credential lookup, generic schema ecosystem, multi-session supervisor, repository, or compatibility wrapper. These are separate host/product decisions and must not silently expand the SessionRuntime contract.
 
 A future change must identify its owner, public/private boundary, failure authority, cancellation owner, persistence effect, and deterministic test seam before implementation. Documentation changes should update the current authority first and leave historical material under the archive.
 
@@ -69,7 +70,7 @@ Before changing a session operation, confirm:
 - cancellation has an identified linearization point;
 - every durable barrier has a truthful completion result;
 - close and shutdown join all owner-tracked work;
-- snapshot publication and event delivery remain ordered.
+- authoritative state updates precede best-effort event delivery.
 
 Before changing persistence, confirm:
 
