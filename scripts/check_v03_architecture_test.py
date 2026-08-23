@@ -55,6 +55,9 @@ def make_fixture(root: Path) -> None:
         "pub(crate) const _MODEL_DRIVER: () = ();\n", encoding="utf-8"
     )
     (root / "src/tools/set.rs").write_text("pub struct ToolSet {}\n", encoding="utf-8")
+    (root / "src/session/bindings.rs").write_text(
+        "pub struct SessionBindings {}\n", encoding="utf-8"
+    )
 
 
 def expect_failure(root: Path, needle: str) -> None:
@@ -132,11 +135,13 @@ def self_test() -> None:
             ("dependency-workspace-target-build", "forbidden direct dependency reqwest", lambda root: (root / "Cargo.toml").write_text("[workspace.target.'cfg(unix)'.build-dependencies]\nreqwest = \"1\"\n", encoding="utf-8")),
             ("port-missing", "typed Port declaration missing or wrong kind", lambda root: (root / "src/tools/tool.rs").write_text("pub(crate) const _TOOL: () = ();\n", encoding="utf-8")),
             ("policy-port-missing", "typed Port declaration missing or wrong kind", lambda root: (root / "src/tools/policy.rs").write_text("pub(crate) const _POLICY: () = ();\n", encoding="utf-8")),
+            ("bindings-role-missing", "typed Port declaration missing or wrong kind", lambda root: (root / "src/session/bindings.rs").write_text("pub(crate) const _BINDINGS: () = ();\n", encoding="utf-8")),
             ("port-wrong-kind", "typed Port declaration missing or wrong kind", lambda root: (root / "src/tools/tool.rs").write_text("pub struct Tool {}\n", encoding="utf-8")),
             ("port-test-only", "typed Port declaration missing or wrong kind", lambda root: (root / "src/storage/session_log.rs").write_text("#[cfg(test)]\npub trait SessionLog {}\n", encoding="utf-8")),
             ("port-comment-string", "typed Port declaration missing or wrong kind", lambda root: (root / "src/model/model.rs").write_text("// pub trait Model {}\nlet x = \"pub trait Model {}\";\n", encoding="utf-8")),
             ("port-session-direction", "Port dependency violation", lambda root: (root / "src/tools/tool.rs").write_text("use crate::session::State;\npub trait Tool {}\n", encoding="utf-8")),
             ("policy-port-session-direction", "Port dependency violation", lambda root: (root / "src/tools/policy.rs").write_text("use crate::session::State;\npub trait ToolPolicy {}\n", encoding="utf-8")),
+            ("bindings-runtime-direction", "Port dependency violation", lambda root: (root / "src/session/bindings.rs").write_text("use crate::runtime::Inner;\npub struct SessionBindings {}\n", encoding="utf-8")),
             ("port-signature-direction", "Port dependency violation", lambda root: (root / "src/tools/tool.rs").write_text("pub trait Tool { fn state(&self) -> crate::session::State; }\n", encoding="utf-8")),
             ("port-nested-declaration", "typed Port declaration missing or wrong kind", lambda root: (root / "src/tools/tool.rs").write_text("mod nested { pub trait Tool {} }\n", encoding="utf-8")),
             ("port-agent-direction", "Port dependency violation", lambda root: (root / "src/context/provider.rs").write_text("use crate::agent::Runner;\npub trait ContextProvider {}\n", encoding="utf-8")),

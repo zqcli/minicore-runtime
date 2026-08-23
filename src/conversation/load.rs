@@ -19,8 +19,11 @@ use super::transcript::valid_page_contract;
 pub(crate) struct LoadCompatibilityValidated(Arc<()>);
 
 impl LoadCompatibilityValidated {
-    // P4 calls this only after SessionBindings validation. OpenGuard owns
-    // cancellation/drop cleanup there; this proof does not perform cleanup.
+    // P4 load flow contract, in order:
+    // bindings.validate(&pending.manifest().spec, limits),
+    // LoadCompatibilityValidated::after_session_bindings_validation(&pending),
+    // pending.finish(proof). OpenGuard owns cancellation/drop cleanup there;
+    // this proof does not perform cleanup.
     pub(crate) fn after_session_bindings_validation(pending: &PendingConversationLoad) -> Self {
         Self(Arc::clone(&pending.proof_key))
     }

@@ -49,7 +49,7 @@ mod v03_public_api_compile_contract {
         let _descriptor: &ModelDescriptor = model.descriptor();
         let start: ModelStartFuture<'_> = model.start(model_request, model_context);
         drop(start);
-        let bindings =
+        let bindings: SessionBindings =
             SessionBindings::new(model, tools, Some(policy), Some(context), Some(compaction));
         let options = SessionRuntimeOptions::new(
             KernelConfig::default_checked()?,

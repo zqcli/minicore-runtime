@@ -9,6 +9,7 @@ MiniCore Runtime is an embeddable Rust 2024 core for typed, bounded session exec
 - `ToolSet` registration is explicit, deterministic, duplicate-safe, and panic-safe while freezing tool specs for shared cloned sets.
 - Typed context and compaction Ports with immutable DTOs.
 - Public direct `model::Model` streaming Port with checked descriptors, contexts, requests, events, delivery-aware errors, cancellation, and deadlines.
+- Public `SessionBindings` freezes one direct Model, ToolSet, and optional policy/context/compaction adapters, then validates them purely against `SessionSpec` and `SemanticLimits`.
 - Crate-private legacy runner/session/storage execution seam, including exact legacy tool-result wire preservation.
 - Conversation, storage, and workspace implementations remain transitional internal slices while their v0.3 owners are migrated.
 - No concrete builtin, process adapter, model network adapter, default tool set, or network service is installed by the public seams.
@@ -42,9 +43,13 @@ fn install_tools(host_tool: impl Tool + 'static) -> Result<ToolSet, Box<dyn std:
 }
 ```
 
-`ToolContext` contains only cancellation, deadline, and nonblocking progress. `ToolInvocation` validates object-shaped JSON arguments and redacts them from `Debug`. `ToolSet::specs_for` returns deterministic registered specs and omits unknown names; invalid public-field mutations are rejected during `build()`; SessionBindings validation owns unknown-enabled rejection in the next migration phase. `ToolOutput` serializes as `{ "content": "..." }`; `ModelMessage::Tool` carries its public `ToolResultOutcome`, while legacy `{ "text": "...", "is_error": ... }` values belong only to physical private storage.
+`ToolContext` contains only cancellation, deadline, and nonblocking progress. `ToolInvocation` validates object-shaped JSON arguments and redacts them from `Debug`. `ToolSet::specs_for` returns deterministic registered specs and omits unknown names; invalid public-field mutations are rejected during `build()`, while `SessionBindings::validate` rejects unknown enabled tools and enforces semantic ToolSpec budgets. `ToolOutput` serializes as `{ "content": "..." }`; `ModelMessage::Tool` carries its public `ToolResultOutcome`, while legacy `{ "text": "...", "is_error": ... }` values belong only to physical private storage.
 
 `ToolPolicy` is an asynchronous host Port over an owned, checked `ToolPolicyRequest`. Decisions are exactly `Allow`, bounded `Deny`, or `RequireApproval`; approval answers are typed `AllowOnce`/`Deny`. Process-local `session::PendingInteraction` values pair approval and tool-input requests with matching typed answers without carrying resume senders, callbacks, owner handles, or durable state.
+
+## Session Bindings
+
+`SessionBindings::new` accepts exactly one `Arc<dyn Model>`, an immutable `ToolSet`, and optional `ToolPolicy`, `ContextProvider`, and `CompactionStrategy` adapters. It installs no default policy or adapter. `validate` is pure: it checks limits/specs, catches descriptor panics, matches model identity/reasoning/tool support, rejects missing enabled tools or policy, validates every frozen ToolSpec against semantic count/name/description/compact-schema budgets, and requires a strategy only when compaction is enabled. It never starts a Model, Tool, policy, context provider, or compaction future.
 
 ## Typed Model API
 
@@ -64,6 +69,7 @@ Stream events are typed text/reasoning deltas, tool-call boundaries, usage, and 
 | `event` | Stable event-kind values |
 | `ids` | Checked session, instance, turn, interaction, tool-call, and context-source identifiers |
 | `model` | Direct streaming `Model` Port, checked descriptor/context/request/events, and delivery-aware errors |
+| `session` | Process-local interactions and pure immutable `SessionBindings`; SessionRuntime ownership remains deferred |
 | `storage` | `SessionLog` Port and storage DTOs |
 | `tools` | `Tool`, immutable `ToolSet`, async `ToolPolicy`, approval, invocation/context/progress/output DTOs |
 
@@ -71,13 +77,13 @@ The old `runtime` and `workspace` modules, `RuntimeConfig`, `SessionConfig`, `Se
 
 ## Transitional Scope
 
-The removed v0.2 Runtime, concrete builtin/process/model adapters, and their integration tests are baseline evidence for the reset, not current extension contracts. `tests/tool_set_contract.rs`, `tests/tool_policy_interaction_contract.rs`, and `tests/model_port_contract.rs` are the focused P3-B/P3-C/P3-D replacements. SessionRuntime acceptance coverage is intentionally deferred to P4/P5; this revision does not claim that the full replacement is complete.
+The removed v0.2 Runtime, concrete builtin/process/model adapters, and their integration tests are baseline evidence for the reset, not current extension contracts. Focused P3-B/P3-C/P3-D/P3-E contracts cover ToolSet, policy/interactions, Model, and SessionBindings. SessionRuntime acceptance coverage is intentionally deferred to P4/P5; this revision does not claim that the full replacement is complete.
 
 The former Runtime/model-network examples and root integration suites were removed with their public facades. The standalone `provider-gate/` package remains independent historical protocol evidence and does not establish a root-crate model adapter API.
 
 ## Testing
 
-The deterministic offline checks are Python/docs/diff/architecture checks. Rust validation for this phase is intentionally run remotely by the project workflow; no local Rust build or test command is part of the current P3-D review.
+The deterministic offline checks are Python/docs/diff/architecture checks. Rust validation for this phase is intentionally run remotely by the project workflow; no local Rust build or test command is part of the current P3-E review.
 
 ```bash
 python3 scripts/check_architecture.py

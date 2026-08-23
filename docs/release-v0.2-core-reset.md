@@ -1,7 +1,7 @@
 # v0.2 Core Reset Release Readiness
 
 > Historical v0.2 release record. Its Runtime, registry, and v0.2 public-surface
-> descriptions are transitional evidence; the breaking v0.3 P3-D surface is
+> descriptions are transitional evidence; the breaking v0.3 P3-E surface is
 > authoritative in the root README and current architecture/module map.
 
 This note records the implementation and verification milestone for the MiniCore Runtime v0.2 Core Reset from baseline `5088bc254548b3e80e87179898ebb7abbea52c7d`. It records the historical source and durable contracts; it does not reopen the archived pre-reset design.

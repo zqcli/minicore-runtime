@@ -4,13 +4,14 @@
 
 M12 tests必须保持offline和deterministic：不得使用external DNS/network、真实credential、ambient provider config、sleep、timeout-based absence proof、blind yield polling或unjoined server thread。Rig只存在于声明Rust 1.88并拥有独立lockfile的`provider-gate/` evidence package；root dependency/lockfile、production `src/`和public DTO不得出现Rig。`./scripts/check.sh`运行主crate与evidence package；`./scripts/check-msrv.sh`用真实Rust 1.85运行主crate全部targets。
 
-## P3 Tool, Policy, And Model Test Migration
+## P3 Tool, Policy, Model, And Bindings Test Migration
 
 The v0.2 public Tool/Runtime/concrete-adapter integration targets were deleted as part of the v0.3 reset. Their source and behavior remain historical baseline evidence; they are not compatibility contracts.
 
 - `tests/tool_set_contract.rs` is the focused P3-B replacement for the public `Tool`/`ToolSet` execution seam; `ToolSetBuilder` reports duplicate/spec-panic/invalid-spec failures from `build()` and `specs_for` omits unknown names.
 - `tests/tool_policy_interaction_contract.rs` is the focused P3-C contract for the async `ToolPolicy` Port, checked approval decisions, process-local interaction DTOs, answer-kind validation, and redacted Debug surfaces.
 - `tests/model_port_contract.rs` is the focused P3-D contract for direct `Model::start`, typed streams, checked descriptors/contexts/requests/events, delivery-safe errors, redaction, and shared concurrency.
+- `tests/session_bindings_contract.rs` is the focused P3-E contract for exact immutable bindings, pure compatibility validation, descriptor panic isolation, frozen ToolSpec semantic limits, optional adapter non-invocation, and P4 load ordering.
 - `tests/p2_workspace.rs` was deleted after its v0.2 baseline coverage was recorded; workspace remains private migration implementation, not a public v0.3 module.
 - `tests/p1_dto.rs` covers checked public Tool DTOs, strict input answers, content-only output, and redacted debug surfaces.
 - Private module tests cover bounded progress delivery and legacy `{text,is_error}` output recovery.

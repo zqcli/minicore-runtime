@@ -37,6 +37,7 @@ CANONICAL_PRODUCTION_FILES = {
 }
 MODEL_DRIVER_ROLE_FILES = {"src/model/driver.rs"}
 TOOLSET_ROLE_FILES = {"src/tools/set.rs"}
+SESSION_BINDINGS_ROLE_FILES = {"src/session/bindings.rs"}
 TRANSITIONAL_PRIVATE_FILES = {
     "src/model/legacy_gateway.rs",
     "src/model/legacy_provider.rs",
@@ -84,7 +85,8 @@ FORBIDDEN_DEPENDENCIES = {"reqwest", "cap-std", "cap-primitives", "fs4"}
 PORT_FILES = {
     "src/model/model.rs", "src/model/response.rs", "src/tools/tool.rs", "src/tools/set.rs",
     "src/tools/context.rs", "src/tools/input.rs", "src/tools/policy.rs", "src/tools/progress.rs", "src/tools/types.rs",
-    "src/context/provider.rs", "src/compaction/strategy.rs", "src/storage/session_log.rs",
+    "src/context/provider.rs", "src/compaction/strategy.rs", "src/session/bindings.rs",
+    "src/storage/session_log.rs",
 }
 REQUIRED_FILES = {
     "src/lib.rs", "src/config.rs", "src/error.rs", "src/ids.rs", "src/value.rs", "src/time.rs",
@@ -894,6 +896,20 @@ def port_declaration_errors(views: dict[str, tuple[str, int]]) -> list[str]:
         kind, name = ("struct", "ToolSet")
         if not top_level_declaration(mask_rust(views[relative][0]), kind, name):
             errors.append(f"typed Port declaration missing or wrong kind: {relative} {kind} {name}")
+    bindings_paths = sorted(
+        relative for relative in SESSION_BINDINGS_ROLE_FILES
+        if relative in views and mask_rust(views[relative][0]).strip()
+    )
+    if len(bindings_paths) != 1:
+        errors.append(
+            "typed Port SessionBindings role requires exactly one production file: "
+            f"expected={sorted(SESSION_BINDINGS_ROLE_FILES)} actual={bindings_paths}"
+        )
+    else:
+        relative = bindings_paths[0]
+        kind, name = ("struct", "SessionBindings")
+        if not top_level_declaration(mask_rust(views[relative][0]), kind, name):
+            errors.append(f"typed Port declaration missing or wrong kind: {relative} {kind} {name}")
     return errors
 
 
@@ -902,6 +918,7 @@ def responsibility_errors(views: dict[str, tuple[str, int]]) -> list[str]:
     role_groups = (
         ("model driver", MODEL_DRIVER_ROLE_FILES),
         ("tools ToolSet", TOOLSET_ROLE_FILES),
+        ("session bindings", SESSION_BINDINGS_ROLE_FILES),
     )
     for label, candidates in role_groups:
         actual = sorted(
@@ -922,7 +939,7 @@ def port_direction_errors(root: Path, views: dict[str, tuple[str, int]]) -> list
         if module_components(root / relative, root)
     }
     errors: list[str] = []
-    port_paths = set(PORT_DECLARATIONS) | TOOLSET_ROLE_FILES
+    port_paths = set(PORT_DECLARATIONS) | TOOLSET_ROLE_FILES | SESSION_BINDINGS_ROLE_FILES
     for relative in sorted(port_paths):
         if relative not in views:
             continue

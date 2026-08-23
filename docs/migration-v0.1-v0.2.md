@@ -54,7 +54,7 @@ The current public methods have these exact call styles and result types:
 
 `RuntimeError` describes runtime configuration, closing, and runtime-internal failures. `SessionError` describes session existence, residency, busy/closing state, invalid input, interaction mismatch, unavailability, and session-internal failures.
 
-The historical v0.2 registry-based construction example was removed in P3-D. Current v0.3 hosts bind one checked `Arc<dyn Model>` and an immutable `ToolSet` through the future `SessionBindings` owner; network adapter configuration is outside this crate.
+The historical v0.2 registry-based construction example was removed in P3-D. Current v0.3 hosts bind one checked `Arc<dyn Model>` and an immutable `ToolSet` through `SessionBindings`; network adapter configuration is outside this crate.
 
 Session configuration selects a workspace root, model selection, system prompt, enabled tool names, compaction trigger/target, and maximum tool rounds. The selected names must already exist in the immutable `ToolRegistry`.
 
@@ -139,7 +139,7 @@ The old caller should not translate every failure into a generic transport error
 
 ## Host Configuration Direction
 
-Current v0.3 host construction is module-qualified and direct: build a checked `Model` implementation, immutable `ToolSet`, optional `ToolPolicy`/context/compaction adapters, and a `SessionLog`; P4 will bind them through `SessionBindings`. No registry, resolver, builtin set, or network configuration enters the core interface.
+Current v0.3 host construction is module-qualified and direct: build a checked `Model` implementation, immutable `ToolSet`, optional `ToolPolicy`/context/compaction adapters, and a `SessionLog`; `SessionBindings` validates the adapters now, while P4 will attach them to the loaded owner. No registry, resolver, builtin set, or network configuration enters the core interface.
 
 ## Tool Behavior Checklist
 
