@@ -19,8 +19,9 @@ use crate::session::transcript::TranscriptPage;
 use crate::storage::conversation::{ConversationError, ConversationLog};
 use crate::storage::store::{SessionStore, StoreError, StoredSessionConfig};
 use crate::time::Timestamp;
+use crate::tools::legacy_policy::{LegacyAllowConfiguredTools, LegacyToolPolicy};
 use crate::tools::registry::ToolRegistry;
-use crate::tools::{AllowConfiguredTools, LegacyUserAnswer, ToolName, ToolPolicy};
+use crate::tools::{LegacyUserAnswer, ToolName};
 use crate::workspace::{Workspace, WorkspaceAccess, WorkspaceError};
 
 use super::session_manager::{JoinOnce, LoadedSessionId, ManagedSession, SessionManager};
@@ -45,7 +46,7 @@ struct RuntimeInner {
     store: Arc<SessionStore>,
     gateway: ModelGateway,
     tools: ToolRegistry,
-    policy: Arc<dyn ToolPolicy>,
+    policy: Arc<dyn LegacyToolPolicy>,
     coding_instructions: Arc<str>,
     retry_policy: RetryPolicy,
     runtime: Handle,
@@ -74,7 +75,7 @@ impl Runtime {
                 store: Arc::new(store),
                 gateway: ModelGateway::new(config.provider_registry()),
                 tools: config.tool_registry(),
-                policy: Arc::new(AllowConfiguredTools::new()),
+                policy: Arc::new(LegacyAllowConfiguredTools::new()),
                 coding_instructions: config.coding_instructions(),
                 retry_policy: config.retry_policy(),
                 runtime,

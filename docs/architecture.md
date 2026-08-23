@@ -8,6 +8,8 @@ This document describes the current v0.3 reset slice. The former v0.2 Runtime/se
 Host
  ├── tools::ToolSet ── Arc<dyn tools::Tool>
  │       └── ToolContext { cancellation, deadline, progress }
+ ├── tools::ToolPolicy
+ │       └── ToolPolicyRequest { invocation, spec, cancellation, deadline }
  ├── context::ContextProvider
  ├── compaction::CompactionStrategy
  └── storage::SessionLog
@@ -25,11 +27,17 @@ Input requests have bounded prompt/choice text and an explicit answer kind. Text
 
 Progress is synchronous and nonblocking. `ToolProgressSink::emit` validates `completed <= total` and delegates to a private emitter using `try_send`-style semantics. Full, closed, invalid, and no-op sinks return `false` without waiting.
 
+## Policy And Interaction
+
+`ToolPolicy` is an asynchronous `Send + Sync + 'static` Port. It receives an owned `ToolPolicyRequest`, so the exact checked invocation and captured spec cross the seam without borrowing actor/session internals. Decisions are exactly `Allow`, bounded `Deny`, or `RequireApproval`; approval answers are exactly `AllowOnce` or `Deny`. Policy and approval `Debug` output reports safe identities, counts, risks, and byte lengths while redacting arguments, reasons, and prompts.
+
+`session::PendingInteraction`, `InteractionKind`, and `InteractionAnswer` are process-local DTOs only. They validate answer-kind matching and delegate tool-input answer checks to the original checked request. They contain no serde representation, resume sender, callback, owner handle, Workspace, Store, or arbitrary continuation. One-shot consumption remains a future actor responsibility rather than DTO state.
+
 ## Legacy Boundary
 
 The old actor/runner/storage path uses private `LegacyTool`, `LegacyToolContext`, and `legacy_types` DTOs. `LegacyToolOutput` deliberately preserves the old `{ "text": ..., "is_error": ... }` JSON shape. Prompt-facing `ModelMessage::Tool` uses only public `ToolOutput` plus `ToolResultOutcome`; the crate-private conversion maps the legacy status bit before provider encoding, while physical conversation entries retain the legacy DTO.
 
-`legacy_context.rs`, `legacy_types.rs`, `registry.rs`, and `policy.rs` are staged private migration files. The legacy policy/approval flow is explicitly outside P3-B and remains a P3-C target. These files are not final public Tool Ports and are not canonical final ToolSet roles.
+`legacy_context.rs`, `legacy_policy.rs`, `legacy_types.rs`, and `registry.rs` are staged private migration files. `legacy_policy.rs` retains the synchronous string-based decision flow only for the old runner and is marked for P5/P6 deletion. Final `policy.rs` is the public typed Port and is part of the canonical Tool seam.
 
 ## Deferred Owners
 
@@ -37,7 +45,7 @@ The old `runtime` and `workspace` modules are private in `src/lib.rs`; `Runtime`
 
 Concrete filesystem/process adapters and their tests were deleted in P3-B rather than replaced with defaults. Future concrete tools must be host-owned implementations of the public `Tool` Port, not reintroduced builtins or process policy modules.
 
-P4/P5 will introduce the SessionRuntime owner and its acceptance contract. P3-B does not claim complete replacement of the old runtime lifecycle or provider integration tests.
+P4/P5 will introduce the SessionRuntime owner and its acceptance contract. The typed P3-C seam does not yet wire policy suspension or interaction consumption into the transitional actor/runner.
 
 ## Provider Retry
 
@@ -45,4 +53,4 @@ Provider retry behavior remains owned by the transitional model/agent implementa
 
 ## Dependency Direction
 
-Public Ports do not import Runtime, SessionHandle, Workspace, Store, Model, provider lookup, direct I/O, or fanout. The final Tool files are adapter-neutral and remain below the 500-line Port limit. Transitional private owners may still depend on the old graph until their scheduled phase, but no new public alias or wrapper may be added.
+Public Ports do not import Runtime, SessionHandle, Workspace, Store, Model, provider lookup, direct I/O, or fanout. The final Tool and ToolPolicy files are adapter-neutral and remain below the 500-line Port limit. Transitional private owners may still depend on the old graph until their scheduled phase, but no new public alias or wrapper may be added.
