@@ -1,3 +1,4 @@
+mod driver;
 #[cfg(test)]
 mod legacy_gateway;
 #[cfg(test)]
@@ -20,6 +21,10 @@ pub use types::{
     ReasoningPreference, ToolCall, Usage,
 };
 
+pub(crate) use driver::{
+    ModelDriver, ModelDriverConfig, ModelDriverProgress, SemanticLimitsSnapshot,
+};
+
 #[cfg(test)]
 pub(crate) use legacy_gateway::LegacyModelGateway;
 #[cfg(test)]
@@ -27,4 +32,12 @@ pub(crate) use legacy_provider::{LegacyModelCallContext, LegacyModelEventSink};
 #[cfg(test)]
 pub(crate) use types::{
     LegacyModelDescriptor, LegacyModelEvent, LegacyModelId, LegacyModelSelection, LegacyProviderId,
+};
+
+const _: () = {
+    let _ = ModelDriverConfig::from_kernel_values;
+    let _ = SemanticLimitsSnapshot::from_kernel_values;
+    let _ = ModelDriver::new;
+    let _ = ModelDriver::run;
+    let _ = ModelDriverProgress::delta;
 };
