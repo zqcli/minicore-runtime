@@ -31,7 +31,7 @@ async fn finish_then_stream_error_is_not_success_or_retryable_after_observation(
 
     assert_eq!(error.kind(), ModelErrorKind::ProviderUnavailable);
     assert_eq!(error.delivery(), DeliveryState::Started);
-    assert!(!error.retryable());
+    assert_eq!(error.retry_hint(), &RetryHint::Never);
     assert_eq!(model.starts(), 1);
     assert!(dropped.dropped());
 }
@@ -111,7 +111,7 @@ async fn finish_then_pending_requires_eof_and_drops_on_cancel_or_observed_timeou
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn event_then_stream_poll_panic_is_unknown_dropped_and_never_retried() {
+async fn event_then_stream_poll_panic_is_started_dropped_and_never_retried() {
     let dropped = StreamProbe::shared();
     let model = ScriptModel::new(
         descriptor(),
@@ -140,8 +140,8 @@ async fn event_then_stream_poll_panic_is_unknown_dropped_and_never_retried() {
         Ok(ModelDriverProgress::TextDelta(delta)) if delta.as_str() == "observed"
     ));
     assert_eq!(error.kind(), ModelErrorKind::Panicked);
-    assert_eq!(error.delivery(), DeliveryState::Unknown);
-    assert!(!error.retryable());
+    assert_eq!(error.delivery(), DeliveryState::Started);
+    assert_eq!(error.retry_hint(), &RetryHint::Never);
     assert_eq!(model.starts(), 1);
     assert!(dropped.dropped());
 }

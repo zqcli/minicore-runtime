@@ -39,17 +39,25 @@ async fn not_started_errors_retry_with_exact_attempts_and_delays() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn excessive_retry_after_started_unknown_and_nonretryable_do_not_retry() {
+    let diag = DiagnosticSummary::new(
+        DiagnosticCode::ModelUnavailable,
+        DiagnosticCategory::Model,
+        BoundedText::new("test model error").unwrap(),
+        false,
+    );
     let cases = vec![
-        ModelError::detailed(
+        ModelError::not_started(
             ModelErrorKind::ProviderUnavailable,
-            DeliveryState::NotStarted,
-            true,
             Some(Duration::from_secs(31)),
-        )
-        .unwrap(),
-        generated_error(ModelErrorKind::ProviderUnavailable, DeliveryState::Started),
-        generated_error(ModelErrorKind::ProviderUnavailable, DeliveryState::Unknown),
-        ModelError::AuthRejected,
+            diag.clone(),
+        ),
+        ModelError::started(ModelErrorKind::ProviderUnavailable, diag.clone()),
+        ModelError::unknown(ModelErrorKind::ProviderUnavailable, diag.clone()),
+        ModelError::permanent(
+            ModelErrorKind::AuthRejected,
+            DeliveryState::NotStarted,
+            diag,
+        ),
     ];
     for error in cases {
         let expected = error.kind();
@@ -104,8 +112,7 @@ async fn semantic_event_blocks_retry_and_normalizes_lying_not_started_error() {
     assert!(progress_rx.try_recv().is_err());
     assert_eq!(error.kind(), ModelErrorKind::ProviderUnavailable);
     assert_eq!(error.delivery(), DeliveryState::Started);
-    assert!(!error.retryable());
-    assert_eq!(error.retry_after(), None);
+    assert_eq!(error.retry_hint(), &RetryHint::Never);
     assert_eq!(model.starts(), 1);
 }
 

@@ -148,7 +148,7 @@ The injectable Ports are direct `Model`, `Tool`/`ToolSet`, `ToolPolicy`, `Contex
 
 Each loaded session will bind one host-owned `Arc<dyn model::Model>` directly. `Model::start` receives a host-neutral checked `ModelRequest` and exact process-local `ModelCallContext`, then returns a typed `ModelStream`. Descriptors contain only a `ModelRef`, context window, supported reasoning set, and tool support. The core exposes no registry, resolver, endpoint, credential, or concrete network adapter.
 
-Stream events are typed text/reasoning deltas, tool-call boundaries, usage, and finish events. `DeliveryState` is exactly `NotStarted`, `Started`, or `Unknown`; automatic retry is only meaningful when an error is explicitly retryable and delivery is `NotStarted`. Stream assembly, panic catching, cancellation polling, and retry ownership remain the P5 `ModelDriver` cutover.
+Stream events are typed text/reasoning deltas, tool-call boundaries, usage, and finish events. `DeliveryState` is exactly `NotStarted`, `Started`, or `Unknown`; `ModelError` is a structured type with explicit constructors (`not_started`, `started`, `unknown`, `permanent`) and `RetryHint::{Never, Retryable}`. Automatic retry occurs strictly when delivery is `NotStarted` and `retry_hint` is `Retryable`. Stream assembly, panic catching, cancellation polling, and retry ownership remain the P5 `ModelDriver` cutover.
 
 ## State, Events, And Turns
 

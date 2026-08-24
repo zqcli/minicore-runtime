@@ -10,9 +10,10 @@ use minicore_runtime::context::{
     ContextBundle, ContextError, ContextFuture, ContextProvider, ContextRequest,
 };
 use minicore_runtime::conversation::{ConversationEntry, TurnTerminal};
+use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use minicore_runtime::model::{
-    Model, ModelCallContext, ModelDescriptor, ModelError, ModelRef, ModelStartFuture, ModelStream,
-    ReasoningPreference,
+    DeliveryState, Model, ModelCallContext, ModelDescriptor, ModelError, ModelErrorKind, ModelRef,
+    ModelStartFuture, ModelStream, ReasoningPreference,
 };
 use minicore_runtime::session::{SessionHealth, SessionStatus};
 use minicore_runtime::tools::ToolSet;
@@ -40,7 +41,19 @@ impl Model for ErrorModel {
         _context: ModelCallContext,
     ) -> ModelStartFuture<'a> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Err(ModelError::Unavailable) })
+        let diagnostic = DiagnosticSummary::new(
+            DiagnosticCode::ModelUnavailable,
+            DiagnosticCategory::Model,
+            BoundedText::new("model unavailable").unwrap(),
+            false,
+        );
+        Box::pin(async move {
+            Err(ModelError::permanent(
+                ModelErrorKind::Unavailable,
+                DeliveryState::NotStarted,
+                diagnostic,
+            ))
+        })
     }
 }
 

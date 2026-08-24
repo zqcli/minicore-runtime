@@ -27,10 +27,12 @@ use crate::conversation::{
     ConversationView, ToolResultDraft, ToolResultEntry, TurnExecutionRecord, UserInputRecord,
     UserMessageEntry,
 };
+use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::ids::{ContextSourceId, SessionId, SessionInstanceId, ToolCallId, TurnId};
 use crate::model::{
-    Model, ModelCallContext, ModelDescriptor, ModelError, ModelEvent, ModelFinishReason,
-    ModelMessage, ModelRef, ModelStartFuture, ModelStream, ReasoningPreference, Usage,
+    DeliveryState, Model, ModelCallContext, ModelDescriptor, ModelError, ModelErrorKind,
+    ModelEvent, ModelFinishReason, ModelMessage, ModelRef, ModelStartFuture, ModelStream,
+    ReasoningPreference, Usage,
 };
 use crate::session::{InteractionAnswer, SessionBindings};
 use crate::time::Timestamp;
@@ -207,14 +209,15 @@ fn session_bindings(
 ) -> SessionBindings {
     let mut builder = ToolSet::builder();
     for tool in tools {
-        let tool: Arc<dyn Tool> = tool;
-        builder.register_arc(tool);
+        builder.register_arc(tool as Arc<dyn Tool>);
     }
-    let context: Option<Arc<dyn ContextProvider>> = match context {
-        Some(value) => Some(value),
-        None => None,
-    };
-    SessionBindings::new(model, builder.build().unwrap(), policy, context, None)
+    SessionBindings::new(
+        model,
+        builder.build().unwrap(),
+        policy,
+        context.map(|value| value as Arc<dyn ContextProvider>),
+        None,
+    )
 }
 
 fn ack_assistant(
@@ -303,6 +306,26 @@ fn tool_events(calls: &[(u8, &str)], usage: Usage) -> Vec<Result<ModelEvent, Mod
     events
 }
 
+fn test_model_error(kind: ModelErrorKind) -> ModelError {
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::Internal,
+        DiagnosticCategory::Model,
+        BoundedText::new("test model error").unwrap(),
+        false,
+    );
+    ModelError::permanent(kind, DeliveryState::NotStarted, diagnostic)
+}
+
+fn retryable_not_started_model_error(kind: ModelErrorKind) -> ModelError {
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::Internal,
+        DiagnosticCategory::Model,
+        BoundedText::new("test retryable model error").unwrap(),
+        true,
+    );
+    ModelError::not_started(kind, None, diagnostic)
+}
+
 enum ModelBehavior {
     Events(Vec<Result<ModelEvent, ModelError>>),
     Error(ModelError),
@@ -367,7 +390,7 @@ impl Model for ScriptModel {
         lock(&self.requests).push((request, context));
         let behavior = lock(&self.behaviors)
             .pop_front()
-            .unwrap_or(ModelBehavior::Error(ModelError::Internal));
+            .unwrap_or_else(|| ModelBehavior::Error(test_model_error(ModelErrorKind::Internal)));
         Box::pin(async move {
             match behavior {
                 ModelBehavior::Events(events) => {

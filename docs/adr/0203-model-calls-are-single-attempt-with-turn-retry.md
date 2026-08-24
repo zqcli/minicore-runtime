@@ -13,9 +13,9 @@ A host Model adapter can fail before work starts, after work starts, or when the
 
 ## Decision
 
-Each `Model::start` call is one logical attempt. The adapter reports `DeliveryState` and a typed `ModelError`. The private `ModelDriver` owns logical retries using the checked Kernel-derived RetryPolicy snapshot: one through four total attempts, base delay no greater than 30 seconds, bounded exponential delay, and an optional retry-after hint.
+Each `Model::start` call is one logical attempt. The adapter reports `DeliveryState` and a structured `ModelError` with an explicit `RetryHint`. The private `ModelDriver` owns logical retries using the checked Kernel-derived RetryPolicy snapshot: one through four total attempts, base delay no greater than 30 seconds, bounded exponential delay, and an optional retry-after hint.
 
-Automatic retry requires `retryable == true`, `delivery == NotStarted`, no semantic event observed in the attempt, a remaining attempt, a valid delay, and remaining overall deadline. `Started` and `Unknown` are conservative non-retryable outcomes. A retry-after value above 30 seconds or beyond the remaining budget disables retry. An adapter claiming NotStarted after an event is normalized to Started and never retried.
+Automatic retry requires `delivery == DeliveryState::NotStarted`, `retry_hint == RetryHint::Retryable { .. }`, no semantic event observed in the attempt, a remaining attempt, a valid delay, and remaining overall deadline. `Started` and `Unknown` are conservative non-retryable outcomes with `RetryHint::Never`. A retry-after value above 30 seconds or beyond the remaining budget disables retry. An adapter claiming NotStarted after an event is normalized to Started and never retried.
 
 ## Consequences
 

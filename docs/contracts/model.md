@@ -51,18 +51,25 @@ Success requires a complete valid stream through EOF. Missing usage remains cons
 
 ## Delivery And Retry
 
-`DeliveryState` is exactly `NotStarted`, `Started`, or `Unknown`. Retry metadata is valid only with `NotStarted`.
+`DeliveryState` is exactly `NotStarted`, `Started`, or `Unknown`. `RetryHint` is either `Never` or `Retryable { retry_after: Option<Duration> }`. `ModelError` is a structured type created exclusively through explicit constructors:
+
+- `ModelError::not_started(kind, retry_after, diagnostic)`: sets `DeliveryState::NotStarted`, `RetryHint::Retryable`, and normalizes `diagnostic.retryable` to `true`;
+- `ModelError::started(kind, diagnostic)`: sets `DeliveryState::Started`, `RetryHint::Never`, and normalizes `diagnostic.retryable` to `false`;
+- `ModelError::unknown(kind, diagnostic)`: sets `DeliveryState::Unknown`, `RetryHint::Never`, and normalizes `diagnostic.retryable` to `false`;
+- `ModelError::permanent(kind, delivery, diagnostic)`: preserves explicit delivery with `RetryHint::Never`, and normalizes `diagnostic.retryable` to `false`.
+
+Wire deserialization strictly validates invariants with `#[serde(deny_unknown_fields)]`: deserializing `RetryHint::Retryable` requires `DeliveryState::NotStarted`, while `Started` or `Unknown` with `Retryable` is rejected. `RetryHint::Never` is accepted for all delivery states (including `NotStarted` as permanent). Deserialization normalizes `diagnostic.retryable` to match `retry_hint` (`true` for `Retryable`, `false` for `Never`).
 
 ModelDriver retries only when all are true:
 
-- the error is retryable;
-- delivery is `NotStarted`;
+- delivery is explicitly `NotStarted`;
+- `retry_hint` is `RetryHint::Retryable { .. }`;
 - no semantic event was observed in that attempt;
 - attempts remain;
 - retry delay is valid and fits the effective deadline;
 - cancellation has not fired.
 
-`Started` and `Unknown` are never retried. If an adapter claims `NotStarted` after an event, Core normalizes the attempt to `Started` and removes retry metadata. Retry sleep is cancellation- and deadline-aware.
+`Started` and `Unknown` are never retried. If an adapter claims `NotStarted` after an event, Core normalizes the attempt to `Started` and `RetryHint::Never`. Retry sleep is cancellation- and deadline-aware.
 
 ## Deadline, Cancellation, And Panic
 

@@ -2,7 +2,7 @@
 
 This matrix is generated from `scripts/acceptance_v03.json`. The mapping is reviewed traceability: the documentation checker validates exact identity, criterion/status/evidence equality, allowed gates, attributed non-ignored Rust tests in Cargo-enabled reachable library sources or direct integration targets, and the current Markdown authority inventory. It does not semantically prove behavior; the remote Rust gates execute the cited evidence.
 
-All functional criteria AT-K01 through AT-K85 passed on the remote Linux validation checkout. Cross-platform validation is complete with passing native macOS and Windows CI.
+All functional criteria AT-K01 through AT-K90 passed on the remote Linux validation checkout. Cross-platform validation is complete with passing native macOS and Windows CI.
 
 ## Validation Environment
 
@@ -159,6 +159,16 @@ All functional acceptance criteria passed on Linux, and native macOS and Windows
 | AT-K83 | Invalid caller transcript cursor or limit returns InvalidInput and preserves healthy session state. | Passed | [`tests/session_runtime_transcript_degraded_evidence.rs`](../tests/session_runtime_transcript_degraded_evidence.rs) — `transcript_caller_invalid_cursor_and_limit_return_invalid_input_and_remain_healthy` |
 | AT-K84 | A temporary Store Unavailable error during transcript reading returns a retryable error and preserves healthy session state. | Passed | [`tests/session_runtime_transcript_degraded_evidence.rs`](../tests/session_runtime_transcript_degraded_evidence.rs) — `transcript_temporary_store_unavailable_returns_retryable_and_remains_healthy`; [`tests/session_runtime_transcript_degraded_evidence.rs`](../tests/session_runtime_transcript_degraded_evidence.rs) — `transcript_store_closed_and_internal_preserve_healthy_session` |
 | AT-K85 | A degraded session permits state inspection, transcript read, and shutdown while rejecting turn submission. | Passed | [`tests/session_runtime_transcript_degraded_evidence.rs`](../tests/session_runtime_transcript_degraded_evidence.rs) — `degraded_session_permits_state_read_and_shutdown_while_rejecting_submit`; [`tests/session_runtime_transcript_degraded_evidence.rs`](../tests/session_runtime_transcript_degraded_evidence.rs) — `active_turn_transcript_conflict_degrades_cancels_and_prevents_settlement` |
+
+## Ports Cancellation And Panic
+
+| ID | Criterion | Status | Evidence |
+| --- | --- | --- | --- |
+| AT-K86 | Explicit NotStarted retryable ModelError triggers driver retry and succeeds on subsequent attempt. | Passed | [`tests/session_runtime_model_retry_evidence.rs`](../tests/session_runtime_model_retry_evidence.rs) — `model_retry_explicit_not_started_retries_and_succeeds` |
+| AT-K87 | Model timeout with Unknown delivery state is not automatically retried. | Passed | [`tests/session_runtime_model_retry_evidence.rs`](../tests/session_runtime_model_retry_evidence.rs) — `model_retry_unknown_timeout_does_not_retry` |
+| AT-K88 | Stream interruption with Started delivery state is not automatically retried. | Passed | [`tests/session_runtime_model_retry_evidence.rs`](../tests/session_runtime_model_retry_evidence.rs) — `model_retry_started_stream_interrupted_does_not_retry` |
+| AT-K89 | RateLimited ModelError retry behavior depends strictly on explicit delivery state and retry hint. | Passed | [`tests/session_runtime_model_retry_evidence.rs`](../tests/session_runtime_model_retry_evidence.rs) — `model_retry_rate_limited_retry_depends_on_explicit_delivery_and_hint` |
+| AT-K90 | Model retry backoff sleep responds promptly to cancellation without executing subsequent attempts. | Passed | [`tests/session_runtime_model_retry_evidence.rs`](../tests/session_runtime_model_retry_evidence.rs) — `model_retry_sleep_responds_to_cancellation` |
 
 ## Acceptance Conclusion
 

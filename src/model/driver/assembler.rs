@@ -1,10 +1,11 @@
 use serde_json::Value;
 
+use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::ids::ToolCallId;
 use crate::tools::{ToolName, ToolSpec};
-use crate::value::{MAX_JSON_BYTES, validate_json_size};
+use crate::value::{BoundedText, MAX_JSON_BYTES, validate_json_size};
 
-use super::super::response::{ModelError, ModelEvent};
+use super::super::response::{ModelError, ModelErrorKind, ModelEvent};
 use super::super::types::{
     AssistantPart, ModelFinishReason, ModelResponse, ReasoningContent, ToolCall, Usage,
 };
@@ -57,7 +58,7 @@ impl<'a> Assembler<'a> {
         event: ModelEvent,
     ) -> Result<Option<ModelDriverProgress>, ModelError> {
         if self.finish_reason.is_some() || event.validate().is_err() {
-            return Err(ModelError::InvalidProviderResponse);
+            return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
         }
         match event {
             ModelEvent::TextDelta { delta } => {
@@ -91,7 +92,7 @@ impl<'a> Assembler<'a> {
                     .iter()
                     .any(|tool| tool.name() == &tool_name)
                 {
-                    return Err(ModelError::UnexpectedToolCall);
+                    return Err(assembler_error(ModelErrorKind::UnexpectedToolCall));
                 }
                 if self.tools.len() >= self.limits.max_tool_count
                     || self
@@ -99,10 +100,10 @@ impl<'a> Assembler<'a> {
                         .iter()
                         .any(|tool| tool.tool_call_id == tool_call_id)
                 {
-                    return Err(ModelError::InvalidProviderResponse);
+                    return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
                 }
                 let call_index = u32::try_from(self.tools.len())
-                    .map_err(|_| ModelError::InvalidProviderResponse)?;
+                    .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
                 let index = self.tools.len();
                 self.tools.push(ToolAssembly {
                     tool_call_id,
@@ -120,7 +121,7 @@ impl<'a> Assembler<'a> {
             } => {
                 let tool = self.tool_mut(&tool_call_id)?;
                 if tool.arguments.is_some() {
-                    return Err(ModelError::InvalidProviderResponse);
+                    return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
                 }
                 append_bounded(&mut tool.arguments_text, delta.as_str(), MAX_JSON_BYTES)?;
                 Ok(None)
@@ -129,25 +130,25 @@ impl<'a> Assembler<'a> {
                 let maximum = self.limits.max_tool_input_bytes;
                 let tool = self.tool_mut(&tool_call_id)?;
                 if tool.arguments.is_some() || tool.arguments_text.is_empty() {
-                    return Err(ModelError::InvalidProviderResponse);
+                    return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
                 }
                 let arguments: Value = serde_json::from_str(&tool.arguments_text)
-                    .map_err(|_| ModelError::InvalidProviderResponse)?;
+                    .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
                 if !arguments.is_object() || validate_json_size(&arguments, maximum).is_err() {
-                    return Err(ModelError::InvalidProviderResponse);
+                    return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
                 }
                 tool.arguments = Some(arguments);
                 Ok(None)
             }
             ModelEvent::Usage { usage } => {
                 if self.usage.replace(usage).is_some() {
-                    return Err(ModelError::InvalidProviderResponse);
+                    return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
                 }
                 Ok(None)
             }
             ModelEvent::Finish { reason } => {
                 if self.tools.iter().any(|tool| tool.arguments.is_none()) {
-                    return Err(ModelError::InvalidProviderResponse);
+                    return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
                 }
                 self.finish_reason = Some(reason);
                 Ok(None)
@@ -156,7 +157,9 @@ impl<'a> Assembler<'a> {
     }
 
     pub(super) fn finish(self) -> Result<ModelResponse, ModelError> {
-        let reason = self.finish_reason.ok_or(ModelError::IncompleteResponse)?;
+        let reason = self
+            .finish_reason
+            .ok_or_else(|| assembler_error(ModelErrorKind::IncompleteResponse))?;
         let has_tools = !self.tools.is_empty();
         if (has_tools
             && !matches!(
@@ -165,14 +168,14 @@ impl<'a> Assembler<'a> {
             ))
             || (!has_tools && reason == ModelFinishReason::ToolCalls)
         {
-            return Err(ModelError::InvalidProviderResponse);
+            return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
         }
         if matches!(
             reason,
             ModelFinishReason::ContentFiltered | ModelFinishReason::Refused
         ) && self.text.is_empty()
         {
-            return Err(ModelError::InvalidProviderResponse);
+            return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
         }
         let mut parts = Vec::with_capacity(self.slots.len());
         for slot in self.slots {
@@ -181,48 +184,65 @@ impl<'a> Assembler<'a> {
                 PartSlot::Reasoning => {
                     let reasoning =
                         ReasoningContent::new(Some(self.reasoning.clone()), None, None, None)
-                            .map_err(|_| ModelError::InvalidProviderResponse)?;
+                            .map_err(|_| {
+                                assembler_error(ModelErrorKind::InvalidProviderResponse)
+                            })?;
                     parts.push(AssistantPart::Reasoning(reasoning));
                 }
                 PartSlot::Tool(index) => {
                     let tool = self
                         .tools
                         .get(index)
-                        .ok_or(ModelError::InvalidProviderResponse)?;
+                        .ok_or_else(|| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
                     let arguments = tool
                         .arguments
                         .clone()
-                        .ok_or(ModelError::InvalidProviderResponse)?;
+                        .ok_or_else(|| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
                     let call = ToolCall::new(
                         tool.tool_call_id.clone(),
                         tool.name.clone(),
                         arguments,
                         tool.call_index,
                     )
-                    .map_err(|_| ModelError::InvalidProviderResponse)?;
+                    .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
                     parts.push(AssistantPart::ToolCall(call));
                 }
             }
         }
         ModelResponse::new(parts, reason, Some(self.usage.unwrap_or_default()))
-            .map_err(|_| ModelError::InvalidProviderResponse)
+            .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))
     }
 
     fn tool_mut(&mut self, tool_call_id: &ToolCallId) -> Result<&mut ToolAssembly, ModelError> {
         self.tools
             .iter_mut()
             .find(|tool| &tool.tool_call_id == tool_call_id)
-            .ok_or(ModelError::InvalidProviderResponse)
+            .ok_or_else(|| assembler_error(ModelErrorKind::InvalidProviderResponse))
     }
+}
+
+fn assembler_error(kind: ModelErrorKind) -> ModelError {
+    let message = match kind {
+        ModelErrorKind::UnexpectedToolCall => "unexpected tool call in model response",
+        ModelErrorKind::IncompleteResponse => "incomplete model response",
+        _ => "invalid model provider response",
+    };
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::ModelMalformedResponse,
+        DiagnosticCategory::Model,
+        BoundedText::new(message).expect("static diagnostic must fit BoundedText"),
+        false,
+    );
+    ModelError::started(kind, diagnostic)
 }
 
 fn append_bounded(target: &mut String, delta: &str, maximum: usize) -> Result<(), ModelError> {
     let length = target
         .len()
         .checked_add(delta.len())
-        .ok_or(ModelError::InvalidProviderResponse)?;
+        .ok_or_else(|| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
     if length > maximum {
-        return Err(ModelError::InvalidProviderResponse);
+        return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
     }
     target.push_str(delta);
     Ok(())
