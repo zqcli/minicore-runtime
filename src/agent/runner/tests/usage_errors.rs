@@ -41,7 +41,9 @@ async fn context_model_and_prompt_failures_map_to_bounded_finish_diagnostics() {
         let model = ScriptModel::new(
             if case == "prompt" { 1 } else { 4_096 },
             if case == "model" {
-                vec![ModelBehavior::Error(ModelError::ContextOverflow)]
+                vec![ModelBehavior::Error(test_model_error(
+                    ModelErrorKind::ContextOverflow,
+                ))]
             } else {
                 vec![ModelBehavior::Events(final_events(
                     "unused",
@@ -88,9 +90,15 @@ async fn context_deadline_and_model_timeout_have_exact_failure_diagnostics() {
             4_096,
             if case == "model_timeout" {
                 vec![
-                    ModelBehavior::Error(ModelError::Timeout),
-                    ModelBehavior::Error(ModelError::Timeout),
-                    ModelBehavior::Error(ModelError::Timeout),
+                    ModelBehavior::Error(retryable_not_started_model_error(
+                        ModelErrorKind::Timeout,
+                    )),
+                    ModelBehavior::Error(retryable_not_started_model_error(
+                        ModelErrorKind::Timeout,
+                    )),
+                    ModelBehavior::Error(retryable_not_started_model_error(
+                        ModelErrorKind::Timeout,
+                    )),
                 ]
             } else {
                 Vec::new()
@@ -192,9 +200,15 @@ async fn model_and_context_failures_retain_usage_from_the_prior_round() {
             if case == "model" {
                 vec![
                     ModelBehavior::Events(tool_events(&[(31, "search")], prior_usage)),
-                    ModelBehavior::Error(ModelError::Timeout),
-                    ModelBehavior::Error(ModelError::Timeout),
-                    ModelBehavior::Error(ModelError::Timeout),
+                    ModelBehavior::Error(retryable_not_started_model_error(
+                        ModelErrorKind::Timeout,
+                    )),
+                    ModelBehavior::Error(retryable_not_started_model_error(
+                        ModelErrorKind::Timeout,
+                    )),
+                    ModelBehavior::Error(retryable_not_started_model_error(
+                        ModelErrorKind::Timeout,
+                    )),
                 ]
             } else {
                 vec![ModelBehavior::Events(tool_events(

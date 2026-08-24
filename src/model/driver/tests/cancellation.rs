@@ -206,7 +206,7 @@ async fn start_and_stream_panics_become_unknown_nonretryable_errors() {
             .unwrap_err();
         assert_eq!(error.kind(), ModelErrorKind::Panicked);
         assert_eq!(error.delivery(), DeliveryState::Unknown);
-        assert!(!error.retryable());
+        assert_eq!(error.retry_hint(), &RetryHint::Never);
         assert_eq!(model.starts(), 1);
     }
 
@@ -231,7 +231,7 @@ async fn start_and_stream_panics_become_unknown_nonretryable_errors() {
         .unwrap_err();
     assert_eq!(error.kind(), ModelErrorKind::Panicked);
     assert_eq!(error.delivery(), DeliveryState::Unknown);
-    assert!(!error.retryable());
+    assert_eq!(error.retry_hint(), &RetryHint::Never);
     assert_eq!(model.starts(), 1);
     assert!(dropped.dropped());
 }

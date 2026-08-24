@@ -6,8 +6,7 @@ mod types;
 
 pub use model_port::{Model, ModelCallContext, ModelDescriptor, ModelStartFuture, ModelStream};
 pub use response::{
-    DeliveryState, MAX_MODEL_EVENT_TEXT_BYTES, ModelError, ModelErrorDetails, ModelErrorKind,
-    ModelEvent,
+    DeliveryState, MAX_MODEL_EVENT_TEXT_BYTES, ModelError, ModelErrorKind, ModelEvent, RetryHint,
 };
 pub use types::{
     AssistantPart, ModelFinishReason, ModelLimits, ModelLimitsError, ModelMessage, ModelRef,

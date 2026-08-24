@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use futures_util::{StreamExt, stream};
 use minicore_runtime::ids::{SessionId, SessionInstanceId, ToolCallId, TurnId};
 use minicore_runtime::model::{
-    DeliveryState, MAX_MODEL_EVENT_TEXT_BYTES, Model, ModelCallContext, ModelDescriptor,
-    ModelError, ModelErrorKind, ModelEvent, ModelFinishReason, ModelLimits, ModelMessage, ModelRef,
-    ModelRequest, ModelStartFuture, ModelStream, ModelValueError, ReasoningPreference, Usage,
+    MAX_MODEL_EVENT_TEXT_BYTES, Model, ModelCallContext, ModelDescriptor, ModelEvent,
+    ModelFinishReason, ModelLimits, ModelMessage, ModelRef, ModelRequest, ModelStartFuture,
+    ModelStream, ModelValueError, ReasoningPreference, Usage,
 };
 use minicore_runtime::tools::{ToolName, ToolSpec};
 use minicore_runtime::value::BoundedText;
@@ -19,15 +19,12 @@ use tokio_util::sync::CancellationToken;
 fn session_id() -> SessionId {
     "ses_00000000000000000000000000000001".parse().unwrap()
 }
-
 fn instance_id() -> SessionInstanceId {
     "ins_00000000000000000000000000000001".parse().unwrap()
 }
-
 fn turn_id() -> TurnId {
     "trn_00000000000000000000000000000001".parse().unwrap()
 }
-
 fn call_id() -> ToolCallId {
     "call_00000000000000000000000000000001".parse().unwrap()
 }
@@ -72,14 +69,6 @@ fn context(cancellation: CancellationToken, deadline: Instant) -> ModelCallConte
         cancellation,
         deadline,
     )
-}
-
-fn delivery_name(delivery: DeliveryState) -> &'static str {
-    match delivery {
-        DeliveryState::NotStarted => "not_started",
-        DeliveryState::Started => "started",
-        DeliveryState::Unknown => "unknown",
-    }
 }
 
 fn event_name(event: &ModelEvent) -> &'static str {
@@ -153,10 +142,10 @@ async fn model_trait_start_future_and_stream_are_send_and_shareable() {
     });
     assert_eq!(model.descriptor(), &descriptor());
     let deadline = Instant::now() + Duration::from_secs(30);
-    let first =
-        assert_start_send(model.start(request(), context(CancellationToken::new(), deadline)));
-    let second =
-        assert_start_send(model.start(request(), context(CancellationToken::new(), deadline)));
+    let ctx1 = context(CancellationToken::new(), deadline);
+    let ctx2 = context(CancellationToken::new(), deadline);
+    let first = assert_start_send(model.start(request(), ctx1));
+    let second = assert_start_send(model.start(request(), ctx2));
     let (first, second) = tokio::join!(first, second);
     let mut first = assert_stream_send(first.unwrap());
     let mut second = assert_stream_send(second.unwrap());
@@ -292,7 +281,7 @@ fn stream_events_are_typed_bounded_complete_and_redacted() {
     assert!(ModelEvent::reasoning_delta("x".repeat(MAX_MODEL_EVENT_TEXT_BYTES)).is_ok());
     assert!(ModelEvent::reasoning_delta("x".repeat(MAX_MODEL_EVENT_TEXT_BYTES + 1)).is_err());
     assert!(
-        ModelEvent::tool_call_arguments_delta(call_id(), "x".repeat(MAX_MODEL_EVENT_TEXT_BYTES),)
+        ModelEvent::tool_call_arguments_delta(call_id(), "x".repeat(MAX_MODEL_EVENT_TEXT_BYTES))
             .is_ok()
     );
     assert!(
@@ -319,66 +308,6 @@ fn stream_events_are_typed_bounded_complete_and_redacted() {
     ] {
         assert!(!debug.contains(secret));
     }
-}
-
-#[test]
-fn model_errors_enforce_delivery_retry_and_panic_invariants() {
-    assert_eq!(delivery_name(DeliveryState::NotStarted), "not_started");
-    assert_eq!(delivery_name(DeliveryState::Started), "started");
-    assert_eq!(delivery_name(DeliveryState::Unknown), "unknown");
-    let retry = ModelError::detailed(
-        ModelErrorKind::RateLimited,
-        DeliveryState::NotStarted,
-        true,
-        Some(Duration::from_secs(2)),
-    )
-    .unwrap();
-    assert_eq!(retry.delivery(), DeliveryState::NotStarted);
-    assert!(retry.retryable());
-    assert_eq!(retry.retry_after(), Some(Duration::from_secs(2)));
-    assert!(
-        ModelError::detailed(
-            ModelErrorKind::RateLimited,
-            DeliveryState::Started,
-            true,
-            None,
-        )
-        .is_err()
-    );
-    assert!(
-        ModelError::detailed(
-            ModelErrorKind::RateLimited,
-            DeliveryState::Unknown,
-            true,
-            None,
-        )
-        .is_err()
-    );
-    assert!(
-        ModelError::detailed(
-            ModelErrorKind::RateLimited,
-            DeliveryState::NotStarted,
-            false,
-            Some(Duration::from_secs(1)),
-        )
-        .is_err()
-    );
-
-    assert_eq!(ModelError::Panicked.kind(), ModelErrorKind::Panicked);
-    assert_eq!(ModelError::Panicked.delivery(), DeliveryState::Unknown);
-    assert!(!ModelError::Panicked.retryable());
-    assert_eq!(ModelError::Panicked.retry_after(), None);
-    assert_eq!(
-        ModelError::StreamInterrupted.delivery(),
-        DeliveryState::Started
-    );
-    assert!(!ModelError::StreamInterrupted.retryable());
-    assert_eq!(
-        ModelError::ProviderUnavailable.delivery(),
-        DeliveryState::NotStarted
-    );
-    assert!(ModelError::ProviderUnavailable.retryable());
-    assert!(!format!("{:?}", ModelError::Internal).contains("secret"));
 }
 
 #[test]

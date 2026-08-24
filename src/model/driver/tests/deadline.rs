@@ -59,7 +59,7 @@ async fn pending_stream_reports_exact_turn_or_port_deadline_source() {
 async fn adapter_timeout_has_no_core_deadline_provenance() {
     let model = ScriptModel::new(
         descriptor(),
-        vec![Behavior::StartError(ModelError::Timeout)],
+        vec![Behavior::StartError(test_error(ModelErrorKind::Timeout))],
     );
     let driver = model.driver(&deadline_kernel(
         Duration::from_secs(5),
@@ -74,7 +74,7 @@ async fn adapter_timeout_has_no_core_deadline_provenance() {
         )
         .await
         .unwrap_err();
-    assert_eq!(failure.error(), ModelError::Timeout);
+    assert_eq!(failure.error().kind(), ModelErrorKind::Timeout);
     assert_eq!(failure.deadline_source(), None);
 }
 

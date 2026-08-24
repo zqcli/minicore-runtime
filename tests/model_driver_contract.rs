@@ -27,7 +27,9 @@ fn canonical_driver_is_private_bounded_and_adapter_neutral() {
         "try_send(progress_event)",
         "AssertUnwindSafe(start).catch_unwind()",
         "AssertUnwindSafe(stream.next()).catch_unwind()",
-        "error.delivery() == DeliveryState::NotStarted",
+        "evaluate_retry(",
+        "failure.error.delivery() != DeliveryState::NotStarted",
+        "RetryHint::Retryable { retry_after }",
     ] {
         assert!(
             implementation.contains(required),
@@ -111,8 +113,8 @@ fn assembler_uses_checked_dtos_and_centralized_json_validation() {
         "ToolCall::new(",
         "ReasoningContent::new(",
         "ModelResponse::new(",
-        "ModelError::IncompleteResponse",
-        "ModelError::UnexpectedToolCall",
+        "ModelErrorKind::IncompleteResponse",
+        "ModelErrorKind::UnexpectedToolCall",
         "ModelFinishReason::ToolCalls | ModelFinishReason::Unknown",
         "!has_tools && reason == ModelFinishReason::ToolCalls",
     ] {

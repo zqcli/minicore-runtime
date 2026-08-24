@@ -2,8 +2,8 @@ use std::fmt;
 use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize};
-use thiserror::Error;
 
+use crate::error::DiagnosticSummary;
 use crate::ids::ToolCallId;
 use crate::tools::ToolName;
 use crate::value::BoundedText;
@@ -42,32 +42,150 @@ pub enum ModelErrorKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct ModelErrorDetails {
-    kind: ModelErrorKind,
-    delivery: DeliveryState,
-    retryable: bool,
-    retry_after_ms: Option<u64>,
+#[serde(rename_all = "snake_case")]
+pub enum RetryHint {
+    Never,
+    Retryable {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after: Option<Duration>,
+    },
 }
 
-impl ModelErrorDetails {
-    fn new(
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetryableWire {
+    #[serde(default)]
+    retry_after: Option<Duration>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum RetryHintWire {
+    Never,
+    Retryable(RetryableWire),
+}
+
+impl<'de> Deserialize<'de> for RetryHint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = RetryHintWire::deserialize(deserializer)?;
+        match wire {
+            RetryHintWire::Never => Ok(Self::Never),
+            RetryHintWire::Retryable(RetryableWire { retry_after }) => {
+                Ok(Self::Retryable { retry_after })
+            }
+        }
+    }
+}
+
+/// Structured model error carrying explicit delivery state, retry hint, and diagnostic.
+///
+/// Deserialization strictly rejects unknown fields and rejects `RetryHint::Retryable`
+/// if `delivery` is not `DeliveryState::NotStarted`. In both constructors and
+/// deserialization, the inner `diagnostic.retryable` flag is automatically normalized
+/// to match `retry_hint` (`true` for `Retryable`, `false` for `Never`).
+#[derive(Clone, Eq, PartialEq, Serialize)]
+pub struct ModelError {
+    kind: ModelErrorKind,
+    delivery: DeliveryState,
+    retry_hint: RetryHint,
+    diagnostic: DiagnosticSummary,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelErrorWire {
+    kind: ModelErrorKind,
+    delivery: DeliveryState,
+    retry_hint: RetryHint,
+    diagnostic: DiagnosticSummary,
+}
+
+impl<'de> Deserialize<'de> for ModelError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ModelErrorWire::deserialize(deserializer)?;
+        match wire.retry_hint {
+            RetryHint::Retryable { .. } if wire.delivery != DeliveryState::NotStarted => {
+                Err(serde::de::Error::custom(
+                    "retryable model error requires delivery state NotStarted",
+                ))
+            }
+            RetryHint::Retryable { retry_after } => {
+                Ok(Self::not_started(wire.kind, retry_after, wire.diagnostic))
+            }
+            RetryHint::Never => Ok(Self::permanent(wire.kind, wire.delivery, wire.diagnostic)),
+        }
+    }
+}
+
+impl ModelError {
+    /// Constructs a retryable model error with `NotStarted` delivery state.
+    ///
+    /// The inner diagnostic summary's `retryable` flag is normalized to `true`
+    /// to remain strictly consistent with `RetryHint::Retryable`.
+    pub fn not_started(
+        kind: ModelErrorKind,
+        retry_after: Option<Duration>,
+        mut diagnostic: DiagnosticSummary,
+    ) -> Self {
+        diagnostic.retryable = true;
+        Self {
+            kind,
+            delivery: DeliveryState::NotStarted,
+            retry_hint: RetryHint::Retryable { retry_after },
+            diagnostic,
+        }
+    }
+
+    /// Constructs a non-retryable model error with `Started` delivery state.
+    ///
+    /// The inner diagnostic summary's `retryable` flag is normalized to `false`
+    /// to remain strictly consistent with `RetryHint::Never`.
+    pub fn started(kind: ModelErrorKind, mut diagnostic: DiagnosticSummary) -> Self {
+        diagnostic.retryable = false;
+        Self {
+            kind,
+            delivery: DeliveryState::Started,
+            retry_hint: RetryHint::Never,
+            diagnostic,
+        }
+    }
+
+    /// Constructs a non-retryable model error with `Unknown` delivery state.
+    ///
+    /// The inner diagnostic summary's `retryable` flag is normalized to `false`
+    /// to remain strictly consistent with `RetryHint::Never`.
+    pub fn unknown(kind: ModelErrorKind, mut diagnostic: DiagnosticSummary) -> Self {
+        diagnostic.retryable = false;
+        Self {
+            kind,
+            delivery: DeliveryState::Unknown,
+            retry_hint: RetryHint::Never,
+            diagnostic,
+        }
+    }
+
+    /// Constructs a permanent non-retryable model error with explicit delivery.
+    ///
+    /// The inner diagnostic summary's `retryable` flag is normalized to `false`
+    /// to remain strictly consistent with `RetryHint::Never`.
+    pub fn permanent(
         kind: ModelErrorKind,
         delivery: DeliveryState,
-        retryable: bool,
-        retry_after_ms: Option<u64>,
-    ) -> Result<Self, ModelError> {
-        if (retryable || retry_after_ms.is_some()) && delivery != DeliveryState::NotStarted {
-            return Err(ModelError::InvalidRequest);
-        }
-        if retry_after_ms.is_some() && !retryable {
-            return Err(ModelError::InvalidRequest);
-        }
-        Ok(Self {
+        mut diagnostic: DiagnosticSummary,
+    ) -> Self {
+        diagnostic.retryable = false;
+        Self {
             kind,
             delivery,
-            retryable,
-            retry_after_ms,
-        })
+            retry_hint: RetryHint::Never,
+            diagnostic,
+        }
     }
 
     pub const fn kind(&self) -> ModelErrorKind {
@@ -78,215 +196,38 @@ impl ModelErrorDetails {
         self.delivery
     }
 
-    pub const fn retryable(&self) -> bool {
-        self.retryable
+    pub const fn retry_hint(&self) -> &RetryHint {
+        &self.retry_hint
     }
 
-    pub const fn retry_after(&self) -> Option<Duration> {
-        match self.retry_after_ms {
-            Some(milliseconds) => Some(Duration::from_millis(milliseconds)),
-            None => None,
-        }
+    pub const fn diagnostic(&self) -> &DiagnosticSummary {
+        &self.diagnostic
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Serialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum ModelError {
-    #[error("model request is invalid")]
-    InvalidRequest,
-    #[error("model is unavailable")]
-    Unavailable,
-    #[error("model provider is unavailable")]
-    ProviderUnavailable,
-    #[error("model credentials are missing")]
-    AuthMissing,
-    #[error("model credentials were rejected")]
-    AuthRejected,
-    #[error("model provider rate limited the request")]
-    RateLimited,
-    #[error("model quota was exceeded")]
-    QuotaExceeded,
-    #[error("model request exceeds context limits")]
-    ContextOverflow,
-    #[error("model request timed out")]
-    Timeout,
-    #[error("model transport is unavailable")]
-    TransportUnavailable,
-    #[error("model request was cancelled")]
-    Cancelled,
-    #[error("model provider response is invalid")]
-    InvalidProviderResponse,
-    #[error("model response is incomplete")]
-    IncompleteResponse,
-    #[error("model stream was interrupted")]
-    StreamInterrupted,
-    #[error("model request outcome is unknown")]
-    RequestOutcomeUnknown,
-    #[error("model returned an unexpected tool call")]
-    UnexpectedToolCall,
-    #[error("model operation panicked")]
-    Panicked,
-    #[error("model operation failed internally")]
-    Internal,
-    #[error("model operation failed")]
-    Detailed(ModelErrorDetails),
-}
-
-#[derive(Deserialize)]
-#[serde(
-    tag = "type",
-    content = "data",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-enum ModelErrorWire {
-    InvalidRequest,
-    Unavailable,
-    ProviderUnavailable,
-    AuthMissing,
-    AuthRejected,
-    RateLimited,
-    QuotaExceeded,
-    ContextOverflow,
-    Timeout,
-    TransportUnavailable,
-    Cancelled,
-    InvalidProviderResponse,
-    IncompleteResponse,
-    StreamInterrupted,
-    RequestOutcomeUnknown,
-    UnexpectedToolCall,
-    Panicked,
-    Internal,
-    Detailed {
-        kind: ModelErrorKind,
-        delivery: DeliveryState,
-        retryable: bool,
-        retry_after_ms: Option<u64>,
-    },
-}
-
-impl ModelError {
-    pub fn detailed(
-        kind: ModelErrorKind,
-        delivery: DeliveryState,
-        retryable: bool,
-        retry_after: Option<Duration>,
-    ) -> Result<Self, Self> {
-        let retry_after_ms = retry_after
-            .map(|value| value.as_millis().try_into())
-            .transpose()
-            .map_err(|_| Self::InvalidRequest)?;
-        Ok(Self::Detailed(ModelErrorDetails::new(
-            kind,
-            delivery,
-            retryable,
-            retry_after_ms,
-        )?))
-    }
-
-    pub const fn kind(self) -> ModelErrorKind {
-        match self {
-            Self::InvalidRequest => ModelErrorKind::InvalidRequest,
-            Self::Unavailable => ModelErrorKind::Unavailable,
-            Self::ProviderUnavailable => ModelErrorKind::ProviderUnavailable,
-            Self::AuthMissing => ModelErrorKind::AuthMissing,
-            Self::AuthRejected => ModelErrorKind::AuthRejected,
-            Self::RateLimited => ModelErrorKind::RateLimited,
-            Self::QuotaExceeded => ModelErrorKind::QuotaExceeded,
-            Self::ContextOverflow => ModelErrorKind::ContextOverflow,
-            Self::Timeout => ModelErrorKind::Timeout,
-            Self::TransportUnavailable => ModelErrorKind::TransportUnavailable,
-            Self::Cancelled => ModelErrorKind::Cancelled,
-            Self::InvalidProviderResponse => ModelErrorKind::InvalidProviderResponse,
-            Self::IncompleteResponse => ModelErrorKind::IncompleteResponse,
-            Self::StreamInterrupted => ModelErrorKind::StreamInterrupted,
-            Self::RequestOutcomeUnknown => ModelErrorKind::RequestOutcomeUnknown,
-            Self::UnexpectedToolCall => ModelErrorKind::UnexpectedToolCall,
-            Self::Panicked => ModelErrorKind::Panicked,
-            Self::Internal => ModelErrorKind::Internal,
-            Self::Detailed(details) => details.kind(),
-        }
-    }
-
-    pub const fn delivery(&self) -> DeliveryState {
-        match self {
-            Self::Detailed(details) => details.delivery(),
-            Self::InvalidRequest
-            | Self::Unavailable
-            | Self::ProviderUnavailable
-            | Self::AuthMissing
-            | Self::AuthRejected
-            | Self::RateLimited
-            | Self::QuotaExceeded
-            | Self::ContextOverflow
-            | Self::Timeout
-            | Self::TransportUnavailable
-            | Self::Cancelled => DeliveryState::NotStarted,
-            Self::InvalidProviderResponse
-            | Self::IncompleteResponse
-            | Self::StreamInterrupted
-            | Self::UnexpectedToolCall => DeliveryState::Started,
-            Self::RequestOutcomeUnknown | Self::Panicked | Self::Internal => DeliveryState::Unknown,
-        }
-    }
-
-    pub const fn retryable(&self) -> bool {
-        match self {
-            Self::Detailed(details) => details.retryable(),
-            Self::ProviderUnavailable
-            | Self::RateLimited
-            | Self::Timeout
-            | Self::TransportUnavailable => true,
-            _ => false,
-        }
-    }
-
-    pub const fn retry_after(&self) -> Option<Duration> {
-        match self {
-            Self::Detailed(details) => details.retry_after(),
-            _ => None,
-        }
+impl fmt::Debug for ModelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelError")
+            .field("kind", &self.kind)
+            .field("delivery", &self.delivery)
+            .field("retry_hint", &self.retry_hint)
+            .field("diagnostic", &self.diagnostic)
+            .finish()
     }
 }
 
-impl<'de> Deserialize<'de> for ModelError {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Ok(match ModelErrorWire::deserialize(deserializer)? {
-            ModelErrorWire::InvalidRequest => Self::InvalidRequest,
-            ModelErrorWire::Unavailable => Self::Unavailable,
-            ModelErrorWire::ProviderUnavailable => Self::ProviderUnavailable,
-            ModelErrorWire::AuthMissing => Self::AuthMissing,
-            ModelErrorWire::AuthRejected => Self::AuthRejected,
-            ModelErrorWire::RateLimited => Self::RateLimited,
-            ModelErrorWire::QuotaExceeded => Self::QuotaExceeded,
-            ModelErrorWire::ContextOverflow => Self::ContextOverflow,
-            ModelErrorWire::Timeout => Self::Timeout,
-            ModelErrorWire::TransportUnavailable => Self::TransportUnavailable,
-            ModelErrorWire::Cancelled => Self::Cancelled,
-            ModelErrorWire::InvalidProviderResponse => Self::InvalidProviderResponse,
-            ModelErrorWire::IncompleteResponse => Self::IncompleteResponse,
-            ModelErrorWire::StreamInterrupted => Self::StreamInterrupted,
-            ModelErrorWire::RequestOutcomeUnknown => Self::RequestOutcomeUnknown,
-            ModelErrorWire::UnexpectedToolCall => Self::UnexpectedToolCall,
-            ModelErrorWire::Panicked => Self::Panicked,
-            ModelErrorWire::Internal => Self::Internal,
-            ModelErrorWire::Detailed {
-                kind,
-                delivery,
-                retryable,
-                retry_after_ms,
-            } => Self::Detailed(
-                ModelErrorDetails::new(kind, delivery, retryable, retry_after_ms)
-                    .map_err(serde::de::Error::custom)?,
-            ),
-        })
+impl fmt::Display for ModelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "model error: kind={:?}, delivery={:?}, retry_hint={:?}",
+            self.kind, self.delivery, self.retry_hint
+        )
     }
 }
+
+impl std::error::Error for ModelError {}
 
 pub const MAX_MODEL_EVENT_TEXT_BYTES: usize = 64 * 1024;
 

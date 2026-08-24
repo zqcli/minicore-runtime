@@ -6,6 +6,7 @@ The root test suite covers only the final v0.3 public surface and private execut
 
 - `p1_value.rs`, `p1_ids.rs`, `p1_kernel_config.rs`, `p1_session_spec.rs`, `p1_session_manifest.rs`, and `p1_dto.rs` cover checked values, identifiers, configuration, manifests, Model/Tool DTOs, serde strictness, and redacted Debug output.
 - `model_port_contract.rs` covers the direct streaming Model Port, descriptor/context/request/event grammar, delivery-aware errors, and shared concurrency.
+- `model_error_contract.rs` covers ModelError delivery and retry invariants, strict nested wire deserialization, unknown field rejection, and diagnostic normalization.
 - `tool_set_contract.rs` covers Tool, ToolSet construction, frozen specs, duplicate/panic handling, concurrent dispatch, and owner-neutral ToolContext.
 - `tool_policy_interaction_contract.rs` covers ToolPolicy, approval/input DTOs, process-local interactions, and redaction.
 - `p3_context_compaction_ports.rs` covers ContextProvider and CompactionStrategy Ports and checked DTOs.
@@ -45,4 +46,4 @@ The root test suite covers only the final v0.3 public surface and private execut
 
 The standalone `provider-gate/` package is deterministic historical protocol evidence and does not define a root-crate adapter API.
 
-The canonical criterion-by-criterion mapping is `scripts/acceptance_v03.json`; [docs/acceptance-v0.3.md](../docs/acceptance-v0.3.md) is generated from it. This is reviewed traceability, not semantic proof by the documentation checker: remote Rust gates execute the attributed tests. The mapping records AT-K01 through AT-K85, the remote Rust/doc environment, and the passing cross-platform CI matrix.
+The canonical criterion-by-criterion mapping is `scripts/acceptance_v03.json`; [docs/acceptance-v0.3.md](../docs/acceptance-v0.3.md) is generated from it. This is reviewed traceability, not semantic proof by the documentation checker: remote Rust gates execute the attributed tests. The mapping records AT-K01 through AT-K90, the remote Rust/doc environment, and the passing cross-platform CI matrix.

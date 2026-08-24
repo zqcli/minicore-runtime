@@ -77,7 +77,7 @@ See the [Conversation contract](contracts/conversation.md).
 
 ## Acceptance
 
-All functional criteria in [AT-K01 through AT-K85](acceptance-v0.3.md) are **Passed on Linux**. `scripts/acceptance_v03.json` is the canonical reviewed traceability mapping; the generated Markdown and attributed evidence are checker-enforced, while the remote Rust gates—not the documentation checker—execute and validate the cited behavior.
+All functional criteria in [AT-K01 through AT-K90](acceptance-v0.3.md) are **Passed on Linux**. `scripts/acceptance_v03.json` is the canonical reviewed traceability mapping; the generated Markdown and attributed evidence are checker-enforced, while the remote Rust gates—not the documentation checker—execute and validate the cited behavior.
 
 Validation environment:
 
@@ -113,8 +113,8 @@ The reviewed comparison uses baseline commit `2fd7104`. “cfg(test)-excluded pr
 
 | Metric | Baseline | Current | Change |
 | --- | ---: | ---: | ---: |
-| cfg(test)-excluded production LOC | 15,483 | 14,175 | -1,308 |
-| raw `src/**/*.rs` lines | 48,055 | 31,072 | -16,983 |
+| cfg(test)-excluded production LOC | 15,483 | 14,239 | -1,244 |
+| raw `src/**/*.rs` lines | 48,055 | 31,191 | -16,864 |
 | `src` Rust files | 174 | 143 | -31 |
 | files with production content | 83 | 77 | -6 |
 

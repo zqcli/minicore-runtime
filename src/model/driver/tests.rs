@@ -13,10 +13,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::config::{KernelConfig, RetryPolicy, SemanticLimits};
+use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::ids::{SessionId, SessionInstanceId, ToolCallId, TurnId};
 use crate::model::{
     AssistantPart, ModelFinishReason, ModelLimits, ModelMessage, ModelRef, ModelStartFuture,
-    ModelStream, ReasoningPreference, Usage,
+    ModelStream, ReasoningPreference, RetryHint, Usage,
 };
 use crate::tools::ToolSpec;
 
@@ -165,13 +166,23 @@ fn text_success(value: &str) -> Vec<Result<ModelEvent, ModelError>> {
 }
 
 fn retryable_error(retry_after: Option<Duration>) -> ModelError {
-    ModelError::detailed(
-        ModelErrorKind::ProviderUnavailable,
-        DeliveryState::NotStarted,
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::ModelUnavailable,
+        DiagnosticCategory::Model,
+        BoundedText::new("provider unavailable").unwrap(),
         true,
-        retry_after,
-    )
-    .unwrap()
+    );
+    ModelError::not_started(ModelErrorKind::ProviderUnavailable, retry_after, diagnostic)
+}
+
+fn test_error(kind: ModelErrorKind) -> ModelError {
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::Internal,
+        DiagnosticCategory::Model,
+        BoundedText::new("test model error").unwrap(),
+        false,
+    );
+    ModelError::permanent(kind, DeliveryState::NotStarted, diagnostic)
 }
 
 fn progress_channel() -> (

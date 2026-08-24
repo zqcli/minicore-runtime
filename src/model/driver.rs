@@ -21,6 +21,10 @@ mod failure;
 
 use assembler::Assembler;
 pub(crate) use failure::ModelDriverFailure;
+use failure::{
+    AttemptFailure, RetryPolicySnapshot, generated_error, normalize_after_event, observed_delivery,
+    wait_for_retry,
+};
 
 const MAX_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -30,12 +34,6 @@ pub(crate) struct ModelDriverConfig {
     model_call_timeout: Duration,
     retry_policy: RetryPolicySnapshot,
     limits: SemanticLimitsSnapshot,
-}
-
-#[derive(Clone, Copy)]
-struct RetryPolicySnapshot {
-    max_attempts: u8,
-    base_delay: Duration,
 }
 
 #[derive(Clone)]
@@ -57,10 +55,7 @@ impl ModelDriverConfig {
     ) -> Self {
         Self {
             model_call_timeout,
-            retry_policy: RetryPolicySnapshot {
-                max_attempts,
-                base_delay,
-            },
+            retry_policy: RetryPolicySnapshot::new(max_attempts, base_delay),
             limits,
         }
     }
@@ -92,26 +87,7 @@ impl SemanticLimitsSnapshot {
             max_model_reasoning_bytes_per_round,
         }
     }
-}
 
-impl RetryPolicySnapshot {
-    fn delay_for_retry(self, retry_index: u8, retry_after: Option<Duration>) -> Option<Duration> {
-        let mut exponential = self.base_delay;
-        for _ in 0..retry_index {
-            exponential = exponential
-                .checked_mul(2)
-                .unwrap_or(MAX_RETRY_DELAY)
-                .min(MAX_RETRY_DELAY);
-        }
-        match retry_after {
-            Some(value) if value > MAX_RETRY_DELAY => None,
-            Some(value) => Some(value.max(exponential)),
-            None => Some(exponential),
-        }
-    }
-}
-
-impl SemanticLimitsSnapshot {
     fn valid(&self) -> bool {
         (1..=4_096).contains(&self.max_tool_count)
             && (1..=64).contains(&self.max_tool_name_bytes)
@@ -150,13 +126,16 @@ impl ModelDriver {
         config: ModelDriverConfig,
     ) -> Result<Self, ModelError> {
         if !config.validate() {
-            return Err(ModelError::InvalidRequest);
+            return Err(generated_error(
+                ModelErrorKind::InvalidRequest,
+                DeliveryState::NotStarted,
+            ));
         }
         let descriptor = catch_unwind(AssertUnwindSafe(|| model.descriptor().clone()))
-            .map_err(|_| ModelError::Panicked)?;
-        descriptor
-            .validate()
-            .map_err(|_| ModelError::InvalidRequest)?;
+            .map_err(|_| generated_error(ModelErrorKind::Panicked, DeliveryState::NotStarted))?;
+        descriptor.validate().map_err(|_| {
+            generated_error(ModelErrorKind::InvalidRequest, DeliveryState::NotStarted)
+        })?;
         Ok(Self {
             model,
             descriptor,
@@ -174,7 +153,7 @@ impl ModelDriver {
     ) -> Result<ModelResponse, ModelError> {
         self.run_detailed(request, context, progress)
             .await
-            .map_err(ModelDriverFailure::error)
+            .map_err(ModelDriverFailure::into_error)
     }
 
     pub(crate) async fn run_detailed(
@@ -183,8 +162,13 @@ impl ModelDriver {
         context: ModelCallContext,
         progress: &mpsc::Sender<ModelDriverProgress>,
     ) -> Result<ModelResponse, ModelDriverFailure> {
-        let deadline = effective_deadline(context.deadline, self.model_call_timeout)
-            .map_err(|_| ModelDriverFailure::ordinary(ModelError::InvalidRequest))?;
+        let deadline =
+            effective_deadline(context.deadline, self.model_call_timeout).map_err(|_| {
+                ModelDriverFailure::ordinary(generated_error(
+                    ModelErrorKind::InvalidRequest,
+                    DeliveryState::NotStarted,
+                ))
+            })?;
         if context.cancellation.is_cancelled() {
             return Err(ModelDriverFailure::ordinary(generated_error(
                 ModelErrorKind::Cancelled,
@@ -227,47 +211,43 @@ impl ModelDriver {
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(failure)
-                    if attempt + 1 < max_attempts
-                        && !failure.observed_event
-                        && failure.error.retryable()
-                        && failure.error.delivery() == DeliveryState::NotStarted =>
-                {
-                    let Some(delay) = self
-                        .retry_policy
-                        .delay_for_retry(attempt, failure.error.retry_after())
-                    else {
-                        return Err(failure.into_driver_failure());
-                    };
-                    if !retry_fits(deadline.tokio(), delay) {
-                        return Err(failure.into_driver_failure());
+                Err(failure) => match self.retry_policy.evaluate_retry(
+                    attempt,
+                    max_attempts,
+                    &failure,
+                    deadline.tokio(),
+                ) {
+                    Some(delay) => {
+                        wait_for_retry(&context, deadline.tokio(), deadline.source(), delay)
+                            .await?;
                     }
-                    wait_for_retry(&context, deadline.tokio(), deadline.source(), delay).await?;
-                }
-                Err(failure) => return Err(failure.into_driver_failure()),
+                    None => return Err(failure.into_driver_failure()),
+                },
             }
         }
-        Err(ModelDriverFailure::ordinary(ModelError::Internal))
+        Err(ModelDriverFailure::ordinary(generated_error(
+            ModelErrorKind::Internal,
+            DeliveryState::NotStarted,
+        )))
     }
 
     fn validate_request(&self, request: &ModelRequest) -> Result<(), ModelError> {
-        self.descriptor
-            .validate()
-            .map_err(|_| ModelError::InvalidRequest)?;
+        let invalid = || generated_error(ModelErrorKind::InvalidRequest, DeliveryState::NotStarted);
+        self.descriptor.validate().map_err(|_| invalid())?;
         if !self.descriptor.supports_reasoning(request.reasoning()) {
-            return Err(ModelError::InvalidRequest);
+            return Err(invalid());
         }
         if request.tools().len() > self.limits.max_tool_count
             || (!request.tools().is_empty() && !self.descriptor.supports_tools)
         {
-            return Err(ModelError::InvalidRequest);
+            return Err(invalid());
         }
         if request
             .limits()
             .context_window_tokens()
             .is_some_and(|limit| u64::from(limit) > self.descriptor.context_window)
         {
-            return Err(ModelError::InvalidRequest);
+            return Err(invalid());
         }
         let mut previous: Option<&ToolName> = None;
         for tool in request.tools() {
@@ -275,9 +255,9 @@ impl ModelDriver {
                 self.limits.max_tool_name_bytes,
                 self.limits.max_tool_schema_bytes,
             )
-            .map_err(|_| ModelError::InvalidRequest)?;
+            .map_err(|_| invalid())?;
             if previous.is_some_and(|previous| previous >= tool.name()) {
-                return Err(ModelError::InvalidRequest);
+                return Err(invalid());
             }
             previous = Some(tool.name());
         }
@@ -296,7 +276,12 @@ impl ModelDriver {
         let start = catch_unwind(AssertUnwindSafe(|| {
             self.model.start(request.clone(), context)
         }))
-        .map_err(|_| AttemptFailure::new(ModelError::Panicked, false))?;
+        .map_err(|_| {
+            AttemptFailure::new(
+                generated_error(ModelErrorKind::Panicked, DeliveryState::Unknown),
+                false,
+            )
+        })?;
         let start = AssertUnwindSafe(start).catch_unwind();
         tokio::pin!(start);
         let stream = tokio::select! {
@@ -317,7 +302,10 @@ impl ModelDriver {
             result = &mut start => match result {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(error)) => return Err(AttemptFailure::new(error, false)),
-                Err(_) => return Err(AttemptFailure::new(ModelError::Panicked, false)),
+                Err(_) => return Err(AttemptFailure::new(
+                    generated_error(ModelErrorKind::Panicked, DeliveryState::Unknown),
+                    false,
+                )),
             }
         };
 
@@ -371,92 +359,15 @@ impl ModelDriver {
                 }
                 Err(_) => {
                     return Err(AttemptFailure::new(
-                        ModelError::Panicked,
+                        generated_error(
+                            ModelErrorKind::Panicked,
+                            observed_delivery(assembler.observed_event),
+                        ),
                         assembler.observed_event,
                     ));
                 }
             }
         }
-    }
-}
-
-struct AttemptFailure {
-    error: ModelError,
-    observed_event: bool,
-    deadline_source: Option<DeadlineSource>,
-}
-
-impl AttemptFailure {
-    fn new(error: ModelError, observed_event: bool) -> Self {
-        Self {
-            error,
-            observed_event,
-            deadline_source: None,
-        }
-    }
-
-    fn deadline(error: ModelError, observed_event: bool, source: DeadlineSource) -> Self {
-        Self {
-            error,
-            observed_event,
-            deadline_source: Some(source),
-        }
-    }
-
-    fn into_driver_failure(self) -> ModelDriverFailure {
-        ModelDriverFailure {
-            error: self.error,
-            deadline_source: self.deadline_source,
-        }
-    }
-}
-
-fn observed_delivery(observed_event: bool) -> DeliveryState {
-    if observed_event {
-        DeliveryState::Started
-    } else {
-        DeliveryState::Unknown
-    }
-}
-
-fn normalize_after_event(error: ModelError, observed_event: bool) -> ModelError {
-    if observed_event && error.delivery() == DeliveryState::NotStarted {
-        generated_error(error.kind(), DeliveryState::Started)
-    } else {
-        error
-    }
-}
-
-fn generated_error(kind: ModelErrorKind, delivery: DeliveryState) -> ModelError {
-    ModelError::detailed(kind, delivery, false, None).unwrap_or(ModelError::Internal)
-}
-
-fn retry_fits(deadline: TokioInstant, delay: Duration) -> bool {
-    TokioInstant::now()
-        .checked_add(delay)
-        .is_some_and(|retry_at| retry_at < deadline)
-}
-
-async fn wait_for_retry(
-    context: &ModelCallContext,
-    deadline: TokioInstant,
-    deadline_source: DeadlineSource,
-    delay: Duration,
-) -> Result<(), ModelDriverFailure> {
-    let retry_at = TokioInstant::now()
-        .checked_add(delay)
-        .ok_or_else(|| ModelDriverFailure::ordinary(ModelError::InvalidRequest))?;
-    tokio::select! {
-        biased;
-        _ = context.cancellation.cancelled() => Err(ModelDriverFailure::ordinary(generated_error(
-            ModelErrorKind::Cancelled,
-            DeliveryState::NotStarted,
-        ))),
-        _ = tokio::time::sleep_until(deadline) => Err(ModelDriverFailure::deadline(
-            generated_error(ModelErrorKind::Timeout, DeliveryState::NotStarted),
-            deadline_source,
-        )),
-        _ = tokio::time::sleep_until(retry_at) => Ok(()),
     }
 }
 
