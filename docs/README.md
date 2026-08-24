@@ -17,7 +17,7 @@ The exhaustive authority set is `README.md`, `CONTEXT.md`, `tests/README.md`, th
 
 The tracked root `minicore-runtime-v0.3-session-runtime-refactor-spec.md` is the sole explicitly allowed non-authority current Markdown file. It records the implementation specification and review baseline, but it does not override current source, contracts, acceptance mapping, migration, or release status. The checker classifies it separately from the current authority set. No other unlisted current Markdown is permitted.
 
-The final v0.3 architecture, regenerated lockfile, remote Rust gates, P8 documentation, Linux functional acceptance, and native macOS and Windows CI matrix ([run 32705101762](https://github.com/zqcli/minicore-runtime/actions/runs/32705101762)) are complete and ready for publication.
+The final v0.3 architecture, regenerated lockfile, remote Rust gates, P8 documentation, Linux functional acceptance, and native macOS and Windows CI matrix ([run 32755428283](https://github.com/zqcli/minicore-runtime/actions/runs/32755428283)) for commit `815494dad38c34c585dfeda3c0845ccc7c1fb7d0` are complete and validate review fixes AT-K01 through AT-K96. No package or tag release has occurred; release validation is complete and ready for publication.
 
 Core intentionally does not define a filesystem persistence format, workspace abstraction, provider installation format, or builtin/process adapter. Hosts implement those concerns behind the public Ports.
 

@@ -1,6 +1,6 @@
 # MiniCore Runtime v0.3 Release Note
 
-**Status:** v0.3 release validation complete and ready for publication. Linux functional acceptance, authoritative remote Rust gates, and the complete native macOS and Windows CI matrix passed. This is a validated release candidate, not a claim that a published crate release or release tag has already been issued.
+**Status:** v0.3 release validation complete and ready for publication. Linux functional acceptance, authoritative remote Rust gates, and the complete native macOS and Windows CI matrix passed. This is a validated release candidate; no package or tag release has occurred.
 
 ## Breaking Reset
 
@@ -96,9 +96,9 @@ Validation environment:
 - MSRV `rustc 1.85.0` and `cargo 1.85.0` with `scripts/check-msrv.sh` passing;
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked` passing;
 - authoritative architecture scanner passing with `production_files=143`;
-- GitHub Actions [run 32705101762](https://github.com/zqcli/minicore-runtime/actions/runs/32705101762) passed for commit `fd761011c6047c55c73213577e5cbb9b970a219c` across all four jobs (Rust stable Clippy quality gate, Rust 1.85.0 MSRV, `macos-latest`, and `windows-latest` with MSVC).
+- GitHub Actions [run 32755428283](https://github.com/zqcli/minicore-runtime/actions/runs/32755428283) passed for commit `815494dad38c34c585dfeda3c0845ccc7c1fb7d0` across all four jobs (Rust stable Clippy quality gate, Rust 1.85.0 MSRV, `macos-latest`, and `windows-latest` with MSVC), validating review fixes AT-K01 through AT-K96.
 
-Cross-platform validation is complete across Linux, macOS, and Windows. The repository is ready for publication.
+Cross-platform validation is complete across Linux, macOS, and Windows. No package or tag release has occurred; the repository is ready for publication.
 
 ## Dependency And Source Review
 

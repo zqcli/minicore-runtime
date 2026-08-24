@@ -104,7 +104,7 @@ The old top-level Runtime manager graph, legacy SessionConfig, ToolRegistry, act
 
 Concrete filesystem/process adapters and their tests were deleted in P3-B rather than replaced with defaults. Future concrete tools must be host-owned implementations of the public `Tool` Port, not reintroduced builtins or process policy modules.
 
-P4-C/P5-E2 supply the final SessionHandle, state watch, bounded commands, transcript routing, actor-owned acknowledgements and suspension state, ordinary Turn execution, compaction, and durable terminal settlement. The P6 cleanup graph, regenerated lockfile, remote Rust gates, P8 documentation, Linux functional acceptance, and native macOS and Windows CI are complete; release validation is ready for publication.
+P4-C/P5-E2 supply the final SessionHandle, state watch, bounded commands, transcript routing, actor-owned acknowledgements and suspension state, ordinary Turn execution, compaction, and durable terminal settlement. The P6 cleanup graph, regenerated lockfile, remote Rust gates, P8 documentation, Linux functional acceptance, and native macOS and Windows CI [run 32755428283](https://github.com/zqcli/minicore-runtime/actions/runs/32755428283) for commit `815494dad38c34c585dfeda3c0845ccc7c1fb7d0` are complete and validate review fixes AT-K01 through AT-K96; no package or tag release has occurred, and release validation is ready for publication.
 
 ## Model Retry
 

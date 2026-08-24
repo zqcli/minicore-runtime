@@ -76,7 +76,7 @@ Model descriptor access, SessionLog future construction and polling, and the pos
 
 ## Cleanup Status
 
-P4-C, P6, and P8 documentation/functional acceptance are complete: SessionRuntime exposes one cloneable SessionHandle backed by a bounded actor mailbox and watch state; the actor owns User/Assistant/Tool/Summary/terminal commits, interaction resume senders, transcript serialization, runner progress, settlement, and shutdown sequencing. No compatibility or legacy implementation graph remains. The lockfile was regenerated, remote Rust/doc gates passed, all AT-K functional rows passed on Linux, and GitHub Actions run 32705101762 passed across stable, MSRV, macOS, and Windows. Release validation is complete and ready for publication.
+P4-C, P6, and P8 documentation/functional acceptance are complete: SessionRuntime exposes one cloneable SessionHandle backed by a bounded actor mailbox and watch state; the actor owns User/Assistant/Tool/Summary/terminal commits, interaction resume senders, transcript serialization, runner progress, settlement, and shutdown sequencing. No compatibility or legacy implementation graph remains. The lockfile was regenerated, remote Rust/doc gates passed, all AT-K functional rows passed on Linux, and GitHub Actions [run 32755428283](https://github.com/zqcli/minicore-runtime/actions/runs/32755428283) for commit `815494dad38c34c585dfeda3c0845ccc7c1fb7d0` passed across stable, MSRV, macOS, and Windows, validating review fixes AT-K01 through AT-K96. No package or tag release has occurred; release validation is complete and ready for publication.
 
 ## Verification
 

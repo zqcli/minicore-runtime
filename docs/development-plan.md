@@ -6,7 +6,7 @@ The final v0.3 source architecture and P6 cleanup validation are complete: the s
 
 `Cargo.lock` was regenerated remotely from the cleaned manifest. The root lock now contains 37 package records; review found 39 removed records, no added records, and no retained-package version drift. The deleted dependencies are absent. Remote formatting and check commands passed, followed by the complete remote `scripts/check.sh` gate.
 
-P8 documentation and Linux functional acceptance are complete. The nine runtime contracts, Host-boundary guide, v0.2-to-v0.3 migration guide, README lifecycle example, AT-K01 through AT-K96 evidence matrix, and v0.3 release note are current authority. The native macOS and Windows CI matrix passed in GitHub Actions [run 32705101762](https://github.com/zqcli/minicore-runtime/actions/runs/32705101762); release validation is complete and ready for publication.
+P8 documentation and Linux functional acceptance are complete. The nine runtime contracts, Host-boundary guide, v0.2-to-v0.3 migration guide, README lifecycle example, AT-K01 through AT-K96 evidence matrix, and v0.3 release note are current authority. The native macOS and Windows CI matrix passed in GitHub Actions [run 32755428283](https://github.com/zqcli/minicore-runtime/actions/runs/32755428283) for commit `815494dad38c34c585dfeda3c0845ccc7c1fb7d0`, validating review fixes AT-K01 through AT-K96. No package or tag release has occurred; release validation is complete and ready for publication.
 
 ## Implemented Source Milestones
 
@@ -28,7 +28,7 @@ P8 documentation and Linux functional acceptance are complete. The nine runtime 
 - [x] Passed remote `scripts/check.sh` under its current toolchain. The script covers root formatting, locked all-target tests, warnings-denied all-target/all-feature Clippy, provider-gate formatting/tests/Clippy, documentation checks, architecture scanner self-tests/full gate, and diff checks.
 - [x] Observed 285 passing root library tests; the cleaned integration suites and provider-gate tests also passed. No aggregate test total is asserted here.
 
-The accurate status is: P6 source, lockfile, remote Rust/script gates, P8 documentation, Linux functional acceptance, and the native macOS and Windows CI matrix are complete; the repository is ready for publication.
+The accurate status is: P6 source, lockfile, remote Rust/script gates, P8 documentation, Linux functional acceptance, and the native macOS and Windows CI matrix are complete; no package or tag release has occurred, and the repository is ready for publication.
 
 ## Completed P8 Documentation And Acceptance
 
@@ -40,9 +40,9 @@ The accurate status is: P6 source, lockfile, remote Rust/script gates, P8 docume
 - [x] Added checker mutation evidence for unrelated Markdown mapping edits, stale unlisted current Markdown, and functions missing a Rust test attribute.
 - [x] Added `docs/release-v0.3.md` with D-01 through D-15, breaking changes, evidence, dependency/lock review, known limitations, and upgrade guidance.
 - [x] Recorded Linux functional acceptance, stable/MSRV commands, warnings-denied rustdoc, 285 root library tests, integration/provider suites, scanner output, and lock metrics.
-- [x] Obtain passing native macOS and Windows CI jobs before publication ([run 32705101762](https://github.com/zqcli/minicore-runtime/actions/runs/32705101762)).
+- [x] Obtain passing native macOS and Windows CI jobs before publication ([run 32755428283](https://github.com/zqcli/minicore-runtime/actions/runs/32755428283), commit `815494dad38c34c585dfeda3c0845ccc7c1fb7d0`).
 
-P8 documentation, functional acceptance, and native cross-platform CI are complete. The repository is a validated release candidate ready for publication.
+P8 documentation, functional acceptance, and native cross-platform CI are complete. The review fixes covered by AT-K01 through AT-K96 are validated; no package or tag release has occurred, and the repository is a validated release candidate ready for publication.
 
 ## Current Authority Inventory
 
@@ -87,7 +87,7 @@ Local work for this refactor uses only non-Rust checks:
 5. Python syntax, source-contract, path, UTF-8, newline, width, and size checks.
 6. `git diff --check` and verification that no unrelated files are staged or reverted.
 
-The completed P6/P8 evidence is recorded in `docs/acceptance-v0.3.md` and `docs/release-v0.3.md`. Native macOS and Windows CI results from GitHub Actions [run 32705101762](https://github.com/zqcli/minicore-runtime/actions/runs/32705101762) are recorded without inference, completing release validation.
+The completed P6/P8 evidence is recorded in `docs/acceptance-v0.3.md` and `docs/release-v0.3.md`. Native macOS and Windows CI results from GitHub Actions [run 32755428283](https://github.com/zqcli/minicore-runtime/actions/runs/32755428283) for commit `815494dad38c34c585dfeda3c0845ccc7c1fb7d0` are recorded without inference, validating review fixes AT-K01 through AT-K96 and completing release validation. No package or tag release has occurred.
 
 ## Non-Core Limits
 
