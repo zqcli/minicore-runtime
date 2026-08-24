@@ -6,7 +6,7 @@ The final v0.3 source architecture and P6 cleanup validation are complete: the s
 
 `Cargo.lock` was regenerated remotely from the cleaned manifest. The root lock now contains 37 package records; review found 39 removed records, no added records, and no retained-package version drift. The deleted dependencies are absent. Remote formatting and check commands passed, followed by the complete remote `scripts/check.sh` gate.
 
-P8 documentation and Linux functional acceptance are complete. The nine runtime contracts, Host-boundary guide, v0.2-to-v0.3 migration guide, README lifecycle example, AT-K01 through AT-K73 evidence matrix, and v0.3 release note are current authority. The native macOS and Windows CI matrix passed in GitHub Actions [run 32705101762](https://github.com/zqcli/minicore-runtime/actions/runs/32705101762); release validation is complete and ready for publication.
+P8 documentation and Linux functional acceptance are complete. The nine runtime contracts, Host-boundary guide, v0.2-to-v0.3 migration guide, README lifecycle example, AT-K01 through AT-K78 evidence matrix, and v0.3 release note are current authority. The native macOS and Windows CI matrix passed in GitHub Actions [run 32705101762](https://github.com/zqcli/minicore-runtime/actions/runs/32705101762); release validation is complete and ready for publication.
 
 ## Implemented Source Milestones
 
@@ -36,7 +36,7 @@ The accurate status is: P6 source, lockfile, remote Rust/script gates, P8 docume
 - [x] Added `docs/integration/host-boundary.md` covering Host collections, repository/lease ownership, storage/workspace capabilities, global limits, shared Ports, and shutdown-all.
 - [x] Added `docs/migrations/v0.2-to-v0.3.md` with exact breaking API/ownership mappings and an external storage migration checklist.
 - [x] Added the all-target `examples/session_runtime_lifecycle.rs`; README contains an exact synchronized copy whose failure path always shuts down and joins the event task before propagating errors.
-- [x] Added canonical `scripts/acceptance_v03.json` and generated `docs/acceptance-v0.3.md` with one Passed row and one-or-more attributed evidence entries for every AT-K criterion.
+- [x] Added canonical `scripts/acceptance_v03.json` and generated `docs/acceptance-v0.3.md` with one Passed row and one-or-more attributed evidence entries for every AT-K criterion (AT-K01 through AT-K78).
 - [x] Added checker mutation evidence for unrelated Markdown mapping edits, stale unlisted current Markdown, and functions missing a Rust test attribute.
 - [x] Added `docs/release-v0.3.md` with D-01 through D-15, breaking changes, evidence, dependency/lock review, known limitations, and upgrade guidance.
 - [x] Recorded Linux functional acceptance, stable/MSRV commands, warnings-denied rustdoc, 285 root library tests, integration/provider suites, scanner output, and lock metrics.

@@ -8,6 +8,11 @@ use crate::value::BoundedText;
 
 use super::{ConfigError, SemanticLimits};
 
+/// Maximum number of enabled tools permitted by absolute structural bounds.
+pub const ABSOLUTE_MAX_TOOL_COUNT: usize = 4_096;
+/// Maximum tool rounds per Turn permitted by absolute structural bounds.
+pub const ABSOLUTE_MAX_TOOL_ROUNDS: u16 = 1_024;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum CompactionConfig {
@@ -89,6 +94,11 @@ impl CompactionConfig {
     }
 }
 
+/// Checked specification for a Session.
+///
+/// Constructors and deserialization enforce absolute structural safety bounds.
+/// Runtime instance limits are enforced when opening a session via
+/// `SessionRuntime::create` or `SessionRuntime::load`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SessionSpec {
     pub model: ModelRef,
@@ -116,19 +126,22 @@ impl<'de> Deserialize<'de> for SessionSpec {
         D: serde::Deserializer<'de>,
     {
         let wire = SessionSpecWire::deserialize(deserializer)?;
-        Self::new(
-            wire.model,
-            wire.reasoning,
-            wire.system_prompt,
-            wire.enabled_tools,
-            wire.max_tool_rounds,
-            wire.compaction,
-        )
-        .map_err(serde::de::Error::custom)
+        let spec = Self {
+            model: wire.model,
+            reasoning: wire.reasoning,
+            system_prompt: wire.system_prompt,
+            enabled_tools: wire.enabled_tools,
+            max_tool_rounds: wire.max_tool_rounds,
+            compaction: wire.compaction,
+        };
+        spec.validate_structural()
+            .map_err(serde::de::Error::custom)?;
+        Ok(spec)
     }
 }
 
 impl SessionSpec {
+    /// Creates a new `SessionSpec` after validating absolute structural bounds.
     pub fn new(
         model: ModelRef,
         reasoning: ReasoningPreference,
@@ -145,12 +158,24 @@ impl SessionSpec {
             max_tool_rounds,
             compaction,
         };
-        spec.validate(&SemanticLimits::default())?;
+        spec.validate_structural()?;
         Ok(spec)
     }
 
+    /// Validates invariant structural safety bounds independently of instance limits.
+    pub fn validate_structural(&self) -> Result<(), ConfigError> {
+        if self.enabled_tools.len() > ABSOLUTE_MAX_TOOL_COUNT
+            || !(1..=ABSOLUTE_MAX_TOOL_ROUNDS).contains(&self.max_tool_rounds)
+        {
+            return Err(ConfigError::InvalidBounds);
+        }
+        self.compaction.validate()
+    }
+
+    /// Validates this specification against the provided runtime instance limits.
     pub fn validate(&self, limits: &SemanticLimits) -> Result<(), ConfigError> {
         limits.validate()?;
+        self.validate_structural()?;
         if self.system_prompt.byte_len() > limits.max_system_prompt_bytes
             || self.enabled_tools.len() > limits.max_tool_count
             || self

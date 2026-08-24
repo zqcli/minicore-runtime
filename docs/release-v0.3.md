@@ -42,6 +42,8 @@ The public owner/control surface is:
 
 Create initializes a checked v3 manifest and empty Conversation before readiness. Load validates manifest identity and immutable bindings, replays canonical pages, atomically repairs unfinished durable Turns, then returns a new SessionInstanceId.
 
+`SessionSpec` and `SessionManifest` constructors and Serde deserialization enforce absolute structural safety bounds, while the host-configured `KernelConfig.limits` serves as the sole instance limit enforced during `SessionRuntime::create`, `SessionRuntime::load`, and `SessionBindings::validate`.
+
 Runtime Drop is cancellation-only. `SessionRuntime::shutdown(self)` is the explicit durability barrier that cancels active work, settles where possible, closes the one SessionLog, and joins owner-tracked tasks.
 
 See the [SessionRuntime lifecycle contract](contracts/session-runtime-lifecycle.md), [state contract](contracts/session-state.md), [event contract](contracts/event-stream.md), and [cancellation contract](contracts/cancellation.md).
@@ -73,7 +75,7 @@ See the [Conversation contract](contracts/conversation.md).
 
 ## Acceptance
 
-All functional criteria in [AT-K01 through AT-K73](acceptance-v0.3.md) are **Passed on Linux**. `scripts/acceptance_v03.json` is the canonical reviewed traceability mapping; the generated Markdown and attributed evidence are checker-enforced, while the remote Rust gates—not the documentation checker—execute and validate the cited behavior.
+All functional criteria in [AT-K01 through AT-K78](acceptance-v0.3.md) are **Passed on Linux**. `scripts/acceptance_v03.json` is the canonical reviewed traceability mapping; the generated Markdown and attributed evidence are checker-enforced, while the remote Rust gates—not the documentation checker—execute and validate the cited behavior.
 
 Validation environment:
 
@@ -109,8 +111,8 @@ The reviewed comparison uses baseline commit `2fd7104`. “cfg(test)-excluded pr
 
 | Metric | Baseline | Current | Change |
 | --- | ---: | ---: | ---: |
-| cfg(test)-excluded production LOC | 15,483 | 13,918 | -1,565 |
-| raw `src/**/*.rs` lines | 48,055 | 30,815 | -17,240 |
+| cfg(test)-excluded production LOC | 15,483 | 13,965 | -1,518 |
+| raw `src/**/*.rs` lines | 48,055 | 30,862 | -17,193 |
 | `src` Rust files | 174 | 143 | -31 |
 | files with production content | 83 | 77 | -6 |
 

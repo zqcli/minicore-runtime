@@ -2,7 +2,7 @@
 
 This matrix is generated from `scripts/acceptance_v03.json`. The mapping is reviewed traceability: the documentation checker validates exact identity, criterion/status/evidence equality, allowed gates, attributed non-ignored Rust tests in Cargo-enabled reachable library sources or direct integration targets, and the current Markdown authority inventory. It does not semantically prove behavior; the remote Rust gates execute the cited evidence.
 
-All functional criteria AT-K01 through AT-K73 passed on the remote Linux validation checkout. Cross-platform validation is complete with passing native macOS and Windows CI.
+All functional criteria AT-K01 through AT-K78 passed on the remote Linux validation checkout. Cross-platform validation is complete with passing native macOS and Windows CI.
 
 ## Validation Environment
 
@@ -142,6 +142,11 @@ All functional acceptance criteria passed on Linux, and native macOS and Windows
 | AT-K71 | Settlement appends every missing ToolResult and the TurnTerminal in one atomic batch. | Passed | [`tests/session_runtime_restart_event_evidence.rs`](../tests/session_runtime_restart_event_evidence.rs) — `cancellation_settlement_appends_all_missing_results_and_terminal_atomically` |
 | AT-K72 | A known active Turn append failure degrades the Session, returns DurabilityUnavailable, and fabricates no terminal. | Passed | [`tests/session_runtime_turn_contract.rs`](../tests/session_runtime_turn_contract.rs) — `known_assistant_commit_failure_latches_without_settlement_append` |
 | AT-K73 | Event summaries contain no complete Tool output, arguments, interaction answer, or raw adapter error. | Passed | [`tests/event_summary_structure_contract.rs`](../tests/event_summary_structure_contract.rs) — `public_event_summaries_exclude_payloads_arguments_answers_and_raw_errors`; [`tests/session_state_event_contract.rs`](../tests/session_state_event_contract.rs) — `diagnostic_state_and_event_debug_are_payload_redacted` |
+| AT-K74 | A SessionSpec with enabled tools exceeding default limits can create a session under matching runtime limits. | Passed | [`tests/session_runtime_semantic_limits_evidence.rs`](../tests/session_runtime_semantic_limits_evidence.rs) — `create_with_custom_max_tool_count_allows_tools_exceeding_default_limit` |
+| AT-K75 | SessionManifest serde roundtrips without enforcing default semantic limits during deserialization. | Passed | [`tests/session_runtime_semantic_limits_evidence.rs`](../tests/session_runtime_semantic_limits_evidence.rs) — `session_manifest_serde_roundtrip_preserves_custom_tool_count_for_instance_validation` |
+| AT-K76 | A session created with custom limits can be shutdown and reloaded under matching runtime limits. | Passed | [`tests/session_runtime_semantic_limits_evidence.rs`](../tests/session_runtime_semantic_limits_evidence.rs) — `create_shutdown_load_roundtrip_with_custom_max_tool_count` |
+| AT-K77 | Narrower runtime limits reject creation before log initialization without spawning an owner. | Passed | [`tests/session_runtime_semantic_limits_evidence.rs`](../tests/session_runtime_semantic_limits_evidence.rs) — `narrower_instance_limits_reject_create_before_log_initialize` |
+| AT-K78 | SessionSpec and SessionManifest reject inputs exceeding absolute structural limits during construction and deserialization. | Passed | [`tests/session_runtime_semantic_limits_evidence.rs`](../tests/session_runtime_semantic_limits_evidence.rs) — `session_spec_and_manifest_enforce_absolute_structural_bounds` |
 
 ## Acceptance Conclusion
 
