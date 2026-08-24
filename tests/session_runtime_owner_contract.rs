@@ -14,8 +14,8 @@ use minicore_runtime::error::{
     EventStreamTakenError, SessionLogErrorKind, SessionOpenErrorKind, SessionShutdownError,
 };
 use minicore_runtime::{
-    BoundedText, KernelConfig, SemanticLimits, SessionId, SessionRuntime, SessionRuntimeOptions,
-    TurnId,
+    BoundedText, KernelConfig, SemanticLimits, SessionHealth, SessionId, SessionRuntime,
+    SessionRuntimeOptions, SessionStatus, TurnId,
 };
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -125,6 +125,14 @@ async fn create_initializes_zero_head_returns_no_snapshot_and_shutdown_is_a_barr
     assert_eq!(inspection.manifest().unwrap().session_id, session_id);
     assert_eq!(inspection.operations(), vec![Operation::Initialize]);
     assert_eq!(fixture.descriptor_calls.load(Ordering::SeqCst), 1);
+    let initial = owner.handle().state();
+    assert_eq!(initial.session_id, session_id);
+    assert_eq!(initial.instance_id, owner.instance_id());
+    assert_eq!(initial.status, SessionStatus::Idle);
+    assert_eq!(initial.health, SessionHealth::Healthy);
+    assert_eq!(initial.conversation_seq, ConversationSeq::ZERO);
+    assert!(initial.active_turn.is_none());
+    assert!(initial.pending_interaction.is_none());
 
     let mut events = owner.take_events().unwrap();
     assert_eq!(events.try_recv(), Err(TryRecvError::Empty));

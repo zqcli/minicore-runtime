@@ -1,6 +1,6 @@
 # MiniCore Runtime
 
-MiniCore Runtime is an embeddable Rust 2024 single-session execution kernel. The current v0.3 reset exposes host-neutral Model, Tool, policy, context, compaction, and storage Ports plus a real `SessionRuntime` owner. The former multi-session Runtime/configuration facade is physically deleted; Hosts manage multiple owners and acquire their SessionLog adapters outside the crate.
+MiniCore Runtime is an embeddable single-session Agent Execution Kernel. One `SessionRuntime` owns exactly one loaded Session. A Host manages multiple `SessionRuntime` instances and all concrete storage, model, tool, workspace, and product capabilities. The crate exposes host-neutral typed Ports and one durable Conversation owner; it does not provide a multi-session manager or concrete adapter catalog.
 
 ## Implemented Core
 
@@ -13,7 +13,7 @@ MiniCore Runtime is an embeddable Rust 2024 single-session execution kernel. The
 - Crate-private `ToolDriver` and one-shot suspension protocol with frozen-spec policy decisions, approval/input interactions, panic-safe execution, child cancellation, bounded outputs, and lossy progress.
 - Crate-private `ContextDriver` plus the final deterministic `PromptBuilder`, with one-provider deadline/panic isolation, canonical context sorting, validator-proved latest-summary conversation projection, exact frozen tools, stable context headers, and exact serialized-request output-reserved budgeting.
 - Crate-private `CompactionDriver` with conversation-owned canonical candidates, completed-boundary-only proposals, strategy deadline/panic isolation, scoped child cancellation, bounded summaries, exact Turn-versus-Port deadline provenance, and stale-head proof results.
-- Crate-private P5-E1/P5-E2 `TurnRunner` context/model/tool/compaction loop with durable rounds, cancellation-first control checks, exact prefix acknowledgements, proactive best-effort compaction, one-shot forced overflow recovery, stale-head Summary commit requests using the ordinary critical commit taxonomy, ToolStarted-before-suspension ordering, sequential tools, and conservative usage on every outcome.
+- Crate-private P5-E1/P5-E2 `TurnRunner` context/model/tool/compaction loop with durable rounds, cancellation-first control checks, exact prefix acknowledgements, proactive best-effort compaction, one-shot forced overflow recovery, stale-head Summary commit requests using the ordinary critical commit taxonomy, internal started-progress enqueue before suspension, sequential tools, and conservative usage on every outcome. Lossy public `ToolStarted` delivery has no ordering guarantee relative to a critical interaction suspension.
 - Public `SessionBindings` freezes one direct Model, ToolSet, and optional policy/context/compaction adapters, then validates them purely against `SessionSpec` and `SemanticLimits`.
 - Public process-local `SessionState`, bounded single-consumer `SessionEventStream`, and exact-turn `TurnHandle` foundations with redacted diagnostics and no snapshot/broadcast recovery protocol.
 - Public non-Clone `SessionRuntime` create/load/take-events/handle/shutdown lifecycle with spawn-first OpenGuard cancellation, proof-gated replay/recovery, one durable log owner, and typed open/shutdown failures.
@@ -22,7 +22,7 @@ MiniCore Runtime is an embeddable Rust 2024 single-session execution kernel. The
 
 ## Install and MSRV
 
-The crate targets Rust `1.85` and edition 2024. The final v0.3 architecture, regenerated lockfile, and remote P6 Rust/script gates are complete. P8 Host-boundary, migration, runtime-example, release-note documentation, and release acceptance are next.
+The crate targets Rust `1.85` and edition 2024. The v0.3 implementation, regenerated lockfile, remote Rust gates, P8 documentation, and Linux functional acceptance are complete. Publication remains blocked until the configured native macOS and Windows CI jobs pass.
 
 The host owns tool capabilities. A host implementation captures workspace, process, RPC, or other authority inside its `Tool` implementation rather than receiving those capabilities through `ToolContext`.
 
@@ -48,6 +48,91 @@ fn install_tools(host_tool: impl Tool + 'static) -> Result<ToolSet, Box<dyn std:
     Ok(tools)
 }
 ```
+
+## Host Integration
+
+A Host owns the collection of loaded sessions and all adapter acquisition. Multiple owners may share one Tokio runtime and shared `Arc` Ports while retaining independent state, cancellation, logs, and shutdown:
+
+```rust,ignore
+use std::collections::HashMap;
+
+use minicore_runtime::{SessionId, SessionRuntime};
+
+type LoadedSessions = HashMap<SessionId, SessionRuntime>;
+```
+
+Listing, deletion, writer leases, global limits, idle eviction, and shutdown-all belong to that Host collection. Core receives one already opened `Box<dyn SessionLog>` and one immutable `SessionBindings` bundle per loaded Session.
+
+The complete load/observe/submit/shutdown shape uses only current public API and Host-supplied placeholders:
+
+```rust,no_run
+use std::error::Error;
+
+use minicore_runtime::{
+    KernelConfig, SessionBindings, SessionEventEnvelope, SessionId, SessionLog, SessionRuntime,
+    SessionRuntimeOptions, TurnOptions, TurnOutcome, UserInput,
+};
+
+pub fn render_event(_envelope: SessionEventEnvelope) {}
+
+pub async fn run_loaded_session(
+    session_id: SessionId,
+    opened_log: Box<dyn SessionLog>,
+    bindings: SessionBindings,
+) -> Result<TurnOutcome, Box<dyn Error>> {
+    let options = SessionRuntimeOptions::new(
+        KernelConfig::default_checked()?,
+        bindings,
+        tokio::runtime::Handle::current(),
+    )?;
+    let mut session = SessionRuntime::load(session_id, opened_log, options).await?;
+
+    let events_result = session.take_events();
+    let handle = session.handle();
+    let state_watch = handle.watch_state();
+    let _initial_state = state_watch.borrow().clone();
+
+    let (event_task, turn_result) = match events_result {
+        Ok(mut events) => {
+            let event_task = tokio::spawn(async move {
+                while let Some(envelope) = events.recv().await {
+                    render_event(envelope);
+                }
+            });
+            let turn_result = match UserInput::text("Inspect the repository") {
+                Ok(input) => match handle.submit(input, TurnOptions::default()).await {
+                    Ok(turn) => turn
+                        .wait()
+                        .await
+                        .map_err(|error| Box::new(error) as Box<dyn Error>),
+                    Err(error) => Err(Box::new(error) as Box<dyn Error>),
+                },
+                Err(error) => Err(Box::new(error) as Box<dyn Error>),
+            };
+            (Some(event_task), turn_result)
+        }
+        Err(error) => (None, Err(Box::new(error) as Box<dyn Error>)),
+    };
+
+    let shutdown_result = session.shutdown().await;
+    let event_result = match event_task {
+        Some(task) => task
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn Error>),
+        None => Ok(()),
+    };
+
+    shutdown_result.map_err(|error| Box::new(error) as Box<dyn Error>)?;
+    event_result?;
+    turn_result
+}
+```
+
+After owner acquisition, the example captures event/submit/wait failures instead of returning early, always awaits `shutdown`, and then always joins the event task after shutdown closes the actor-owned stream. Error precedence is shutdown first, event-task join second, and the captured event/submit/wait result last. Runtime Drop sends cancellation but is not the durability barrier.
+
+The injectable Ports are direct `Model`, `Tool`/`ToolSet`, `ToolPolicy`, `ContextProvider`, `CompactionStrategy`, and `SessionLog`. Host decorators or composites may implement these traits; Core has no plugin manager, service locator, provider registry, or lifecycle hook bus.
+
+`SessionRuntime::load` validates the manifest and bindings, replays the canonical Conversation, and repairs an unfinished Turn before readiness by atomically appending cancelled results for unresolved calls followed by `CancelledByRestart`. It does not restore Model/Tool continuations, approval prompts, ToolInput waits, event cursors, or actor tasks.
 
 `ToolContext` contains only cancellation, deadline, and nonblocking progress. `ToolInvocation` validates object-shaped JSON arguments and redacts them from `Debug`. `ToolSet::specs_for` returns deterministic registered specs and omits unknown names; invalid public-field mutations are rejected during `build()`, while `SessionBindings::validate` rejects unknown enabled tools and enforces semantic ToolSpec budgets. `ToolOutput` serializes as `{ "content": "..." }`; `ModelMessage::Tool` carries its public `ToolResultOutcome`.
 
@@ -100,6 +185,10 @@ The private integration test `post_ready_actor_panic_joins_pending_runner_before
 
 The old top-level `runtime` module, manager graph, legacy execution graph, workspace implementation, filesystem store, provider lookup, and concrete tool/model adapters are physically absent. Hosts own adapter acquisition and any multi-session repository or supervisor.
 
+## Non-Goals
+
+Core does not list/delete Sessions, acquire writer leases, choose a persistence format, own a Workspace, start processes, install model providers or builtin tools, manage credentials, enforce process-global scheduling, replay events, restore in-memory interactions after restart, orchestrate remote agents, load plugins, or publish a multi-session shutdown API. These are deliberate Host/product boundaries, not hidden adapters.
+
 ## Breaking Scope
 
 The removed v0.2 Runtime, concrete builtin/process/model adapters, and their integration tests are baseline evidence, not compatibility contracts. Focused P3-B through P5-E2/P4-C contracts cover Ports, bindings, state/events, SessionHandle/TurnHandle, create/load recovery, commands, runner integration, interactions, transcript, settlement, and shutdown.
@@ -121,3 +210,5 @@ git diff --check
 ## Breaking Change
 
 This is a breaking v0.3 reset with no Runtime, ToolRegistry, builtin, process, or compatibility facade. Historical v0.2 design material remains under `docs/archive/v2/` and is not current public authority.
+
+Upgrade and release-candidate evidence: [v0.2-to-v0.3 migration](docs/migrations/v0.2-to-v0.3.md), [AT-K acceptance matrix](docs/acceptance-v0.3.md), and [v0.3 release note](docs/release-v0.3.md).

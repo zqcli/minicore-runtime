@@ -10,6 +10,7 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo fmt --manifest-path provider-gate/Cargo.toml -- --check
 cargo test --manifest-path provider-gate/Cargo.toml --all-targets --locked
 cargo clippy --manifest-path provider-gate/Cargo.toml --all-targets --locked -- -D warnings
+python3 scripts/check_docs.py --self-test
 python3 scripts/check_docs.py
 python3 scripts/check_v03_architecture.py --self-test
 python3 scripts/check_v03_architecture.py

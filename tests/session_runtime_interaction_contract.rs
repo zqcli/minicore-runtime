@@ -331,6 +331,10 @@ async fn cancelling_while_waiting_settles_missing_tool_result_once() {
             .count(),
         1
     );
+    let state = handle.state();
+    assert_eq!(state.status, SessionStatus::Idle);
+    assert!(state.pending_interaction.is_none());
+    assert!(state.active_turn.is_none());
     runtime.shutdown().await.unwrap();
 }
 
