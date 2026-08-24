@@ -7,6 +7,11 @@ use crate::value::BoundedText;
 
 use super::{ConfigError, SemanticLimits, SessionSpec, Timestamp};
 
+/// Checked v3 manifest for a Session.
+///
+/// Constructors and deserialization enforce structural bounds on the manifest and
+/// its inner `SessionSpec`. Runtime instance limits are enforced when opening
+/// a session via `SessionRuntime::create` or `SessionRuntime::load`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SessionManifest {
     pub format_version: u32,
@@ -18,8 +23,9 @@ pub struct SessionManifest {
 impl SessionManifest {
     pub const FORMAT_VERSION: u32 = 3;
 
+    /// Creates a new `SessionManifest` after validating structural bounds.
     pub fn new(session_id: SessionId, spec: SessionSpec) -> Result<Self, ConfigError> {
-        spec.validate(&SemanticLimits::default())?;
+        spec.validate_structural()?;
         let created_at = Timestamp::now_utc().map_err(|_| ConfigError::Timestamp)?;
         Ok(Self {
             format_version: Self::FORMAT_VERSION,
@@ -29,6 +35,15 @@ impl SessionManifest {
         })
     }
 
+    /// Validates manifest format version and inner specification structural bounds.
+    pub fn validate_structural(&self) -> Result<(), ConfigError> {
+        if self.format_version != Self::FORMAT_VERSION {
+            return Err(ConfigError::InvalidBounds);
+        }
+        self.spec.validate_structural()
+    }
+
+    /// Validates this manifest against the provided runtime instance limits.
     pub fn validate(&self, limits: &SemanticLimits) -> Result<(), ConfigError> {
         if self.format_version != Self::FORMAT_VERSION {
             return Err(ConfigError::InvalidBounds);
@@ -59,28 +74,32 @@ impl<'de> Deserialize<'de> for SessionManifest {
             spec: wire.spec,
         };
         manifest
-            .validate(&SemanticLimits::default())
+            .validate_structural()
             .map_err(serde::de::Error::custom)?;
         Ok(manifest)
     }
 }
 
+/// User input for a Turn.
+///
+/// Constructors enforce absolute structural bounds (`BoundedText::MAX_BYTES` and non-empty text).
+/// Runtime instance limits are enforced when submitting a turn via `SessionHandle::submit_turn`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UserInput {
     Text(BoundedText),
 }
 
 impl UserInput {
+    /// Creates text user input within absolute structural bounds.
     pub fn text(value: impl AsRef<str>) -> Result<Self, ConfigError> {
-        let text =
-            BoundedText::new_with_max_bytes(value, SemanticLimits::default().max_user_input_bytes)
-                .map_err(|_| ConfigError::InvalidText)?;
+        let text = BoundedText::new(value).map_err(|_| ConfigError::InvalidText)?;
         if text.is_empty() {
             return Err(ConfigError::InvalidText);
         }
         Ok(Self::Text(text))
     }
 
+    /// Validates user input against the provided runtime instance limits.
     pub fn validate(&self, limits: &SemanticLimits) -> Result<(), ConfigError> {
         limits.validate()?;
         match self {
@@ -93,6 +112,7 @@ impl UserInput {
         }
     }
 
+    /// Returns the input text as a string slice.
     pub fn as_text(&self) -> &str {
         match self {
             Self::Text(text) => text.as_str(),

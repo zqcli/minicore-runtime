@@ -12,7 +12,9 @@ mod session_spec;
 pub use kernel::{KernelConfig, SemanticLimits};
 pub use retry::{RetryPolicy, RetryPolicyError};
 pub use session::{SessionManifest, TurnOptions, UserInput};
-pub use session_spec::{CompactionConfig, SessionSpec};
+pub use session_spec::{
+    ABSOLUTE_MAX_TOOL_COUNT, ABSOLUTE_MAX_TOOL_ROUNDS, CompactionConfig, SessionSpec,
+};
 
 pub const MAX_KERNEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(300);
 

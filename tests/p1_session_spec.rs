@@ -205,7 +205,7 @@ fn session_spec_roundtrips_strictly_and_keeps_tool_order_deterministic() {
         .as_object()
         .expect("session spec is an object")
         .clone();
-    invalid.insert("max_tool_rounds".to_owned(), json!(65));
+    invalid.insert("max_tool_rounds".to_owned(), json!(1025));
     assert!(serde_json::from_value::<SessionSpec>(Value::Object(invalid)).is_err());
 
     let mut invalid = object
@@ -218,7 +218,7 @@ fn session_spec_roundtrips_strictly_and_keeps_tool_order_deterministic() {
     );
     assert!(serde_json::from_value::<SessionSpec>(Value::Object(invalid)).is_err());
 
-    let tool_values: Vec<String> = (0..65).map(|index| format!("tool{index}")).collect();
+    let tool_values: Vec<String> = (0..=4096).map(|index| format!("tool{index}")).collect();
     let mut invalid = object
         .as_object()
         .expect("session spec is an object")

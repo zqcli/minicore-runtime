@@ -63,6 +63,8 @@ type LoadedSessions = HashMap<SessionId, SessionRuntime>;
 
 Listing, deletion, writer leases, global limits, idle eviction, and shutdown-all belong to that Host collection. Core receives one already opened `Box<dyn SessionLog>` and one immutable `SessionBindings` bundle per loaded Session.
 
+`SessionSpec` and `SessionManifest` constructors and deserialization enforce absolute structural bounds, while `SessionRuntime::create` and `SessionRuntime::load` enforce the Host-configured `KernelConfig.limits`.
+
 The complete load/observe/submit/shutdown shape uses only current public API and Host-supplied placeholders:
 
 ```rust,no_run
