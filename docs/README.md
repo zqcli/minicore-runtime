@@ -15,9 +15,9 @@ The [current implementation context](../CONTEXT.md) is a short maintainer checkp
 
 The exhaustive authority set is `README.md`, `CONTEXT.md`, `tests/README.md`, this index, `architecture.md`, `modules/README.md`, `development-plan.md`, `acceptance-v0.3.md`, `release-v0.3.md`, both current ADRs plus their index, all nine files under `docs/contracts/`, `integration/host-boundary.md`, and `migrations/v0.2-to-v0.3.md`. The checker compares that set to every non-archive Markdown file.
 
-The root `minicore-runtime-v0.3-session-runtime-refactor-spec.md` is the sole explicitly allowed non-authority current Markdown file. It is untracked implementation input and **MUST NOT be committed**. The checker permits its presence or absence and does not inspect Git tracking; when present, it does not override source, contracts, acceptance mapping, migration, or release status. No other unlisted current Markdown is permitted.
+The tracked root `minicore-runtime-v0.3-session-runtime-refactor-spec.md` is the sole explicitly allowed non-authority current Markdown file. It records the implementation specification and review baseline, but it does not override current source, contracts, acceptance mapping, migration, or release status. The checker classifies it separately from the current authority set. No other unlisted current Markdown is permitted.
 
-The final v0.3 architecture, regenerated lockfile, remote Rust gates, P8 documentation, and Linux functional acceptance are complete. Native macOS and Windows jobs are configured but were not executed in this session, so release publication remains blocked on external CI.
+The final v0.3 architecture, regenerated lockfile, remote Rust gates, P8 documentation, Linux functional acceptance, and native macOS and Windows CI matrix ([run 32705101762](https://github.com/zqcli/minicore-runtime/actions/runs/32705101762)) are complete and ready for publication.
 
 Core intentionally does not define a filesystem persistence format, workspace abstraction, provider installation format, or builtin/process adapter. Hosts implement those concerns behind the public Ports.
 
