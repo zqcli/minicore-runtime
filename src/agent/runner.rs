@@ -16,7 +16,7 @@ mod compaction;
 mod diagnostics;
 mod support;
 
-use compaction::{CompactionState, prepare_model_request};
+use compaction::{CompactionState, PreparedModelRequest, prepare_model_request};
 use diagnostics::{
     budget_exceeded, critical_failure, internal_failure, model_failure, request_failure,
 };
@@ -81,8 +81,8 @@ async fn run_ordinary_loop(context: &mut TurnRunnerContext) -> RunnerOutcome {
             match prepare_model_request(context, model_round, usage.current(), &mut compaction)
                 .await
             {
-                Ok(request) => request,
-                Err(outcome) => return outcome,
+                PreparedModelRequest::Ready(request) => request,
+                PreparedModelRequest::Terminal(outcome) => return outcome,
             };
 
         progress(context, RunnerProgress::ModelStarted { model_round });

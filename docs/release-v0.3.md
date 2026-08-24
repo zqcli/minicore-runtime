@@ -108,8 +108,8 @@ The reviewed comparison uses baseline commit `2fd7104`. “cfg(test)-excluded pr
 
 | Metric | Baseline | Current | Change |
 | --- | ---: | ---: | ---: |
-| cfg(test)-excluded production LOC | 15,483 | 13,892 | -1,591 |
-| raw `src/**/*.rs` lines | 48,055 | 30,788 | -17,267 |
+| cfg(test)-excluded production LOC | 15,483 | 13,918 | -1,565 |
+| raw `src/**/*.rs` lines | 48,055 | 30,815 | -17,240 |
 | `src` Rust files | 174 | 143 | -31 |
 | files with production content | 83 | 77 | -6 |
 

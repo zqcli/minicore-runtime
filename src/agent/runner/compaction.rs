@@ -21,6 +21,11 @@ pub(super) struct CompactionState {
     proactive_heads: BTreeSet<ConversationSeq>,
 }
 
+pub(super) enum PreparedModelRequest {
+    Ready(ModelRequest),
+    Terminal(RunnerOutcome),
+}
+
 pub(super) enum CompactionAttempt {
     Applied,
     Skipped,
@@ -38,18 +43,18 @@ pub(super) async fn prepare_model_request(
     model_round: u16,
     usage: Usage,
     state: &mut CompactionState,
-) -> Result<ModelRequest, RunnerOutcome> {
+) -> PreparedModelRequest {
     if let Some(outcome) = turn_control_outcome(context, usage) {
-        return Err(outcome);
+        return PreparedModelRequest::Terminal(outcome);
     }
     if let CompactionAttempt::Terminal(outcome) = proactive(context, usage, state).await {
-        return Err(outcome);
+        return PreparedModelRequest::Terminal(outcome);
     }
 
     let mut forced_attempted = false;
     loop {
         if let Some(outcome) = turn_control_outcome(context, usage) {
-            return Err(outcome);
+            return PreparedModelRequest::Terminal(outcome);
         }
         let remaining = match context
             .prompt
@@ -58,22 +63,30 @@ pub(super) async fn prepare_model_request(
             Ok(remaining) => remaining,
             Err(PromptError::ContextOverflow) if !forced_attempted => {
                 if let Some(outcome) = turn_control_outcome(context, usage) {
-                    return Err(outcome);
+                    return PreparedModelRequest::Terminal(outcome);
                 }
                 forced_attempted = true;
                 match required(context, usage).await {
                     CompactionAttempt::Applied => continue,
-                    CompactionAttempt::Skipped => return Err(compaction_failure(usage)),
-                    CompactionAttempt::Terminal(outcome) => return Err(outcome),
+                    CompactionAttempt::Skipped => {
+                        return PreparedModelRequest::Terminal(compaction_failure(usage));
+                    }
+                    CompactionAttempt::Terminal(outcome) => {
+                        return PreparedModelRequest::Terminal(outcome);
+                    }
                 }
             }
             Err(PromptError::ContextOverflow) => {
-                return Err(turn_control_outcome(context, usage)
-                    .unwrap_or_else(|| compaction_failure(usage)));
+                return PreparedModelRequest::Terminal(
+                    turn_control_outcome(context, usage)
+                        .unwrap_or_else(|| compaction_failure(usage)),
+                );
             }
-            Err(error) => return Err(prompt_failure(error, usage)),
+            Err(error) => {
+                return PreparedModelRequest::Terminal(prompt_failure(error, usage));
+            }
         };
-        let context_bundle = context
+        let context_bundle = match context
             .context
             .provide_detailed(ContextRequest {
                 session_id: context.session_id,
@@ -86,9 +99,14 @@ pub(super) async fn prepare_model_request(
                 deadline: context.deadline,
             })
             .await
-            .map_err(|failure| context_failure(failure, usage))?;
+        {
+            Ok(context_bundle) => context_bundle,
+            Err(failure) => {
+                return PreparedModelRequest::Terminal(context_failure(failure, usage));
+            }
+        };
         if let Some(outcome) = turn_control_outcome(context, usage) {
-            return Err(outcome);
+            return PreparedModelRequest::Terminal(outcome);
         }
         match context
             .prompt
@@ -96,26 +114,34 @@ pub(super) async fn prepare_model_request(
         {
             Ok(request) => {
                 return match turn_control_outcome(context, usage) {
-                    Some(outcome) => Err(outcome),
-                    None => Ok(request),
+                    Some(outcome) => PreparedModelRequest::Terminal(outcome),
+                    None => PreparedModelRequest::Ready(request),
                 };
             }
             Err(PromptError::ContextOverflow) if !forced_attempted => {
                 if let Some(outcome) = turn_control_outcome(context, usage) {
-                    return Err(outcome);
+                    return PreparedModelRequest::Terminal(outcome);
                 }
                 forced_attempted = true;
                 match required(context, usage).await {
                     CompactionAttempt::Applied => continue,
-                    CompactionAttempt::Skipped => return Err(compaction_failure(usage)),
-                    CompactionAttempt::Terminal(outcome) => return Err(outcome),
+                    CompactionAttempt::Skipped => {
+                        return PreparedModelRequest::Terminal(compaction_failure(usage));
+                    }
+                    CompactionAttempt::Terminal(outcome) => {
+                        return PreparedModelRequest::Terminal(outcome);
+                    }
                 }
             }
             Err(PromptError::ContextOverflow) => {
-                return Err(turn_control_outcome(context, usage)
-                    .unwrap_or_else(|| compaction_failure(usage)));
+                return PreparedModelRequest::Terminal(
+                    turn_control_outcome(context, usage)
+                        .unwrap_or_else(|| compaction_failure(usage)),
+                );
             }
-            Err(error) => return Err(prompt_failure(error, usage)),
+            Err(error) => {
+                return PreparedModelRequest::Terminal(prompt_failure(error, usage));
+            }
         }
     }
 }
