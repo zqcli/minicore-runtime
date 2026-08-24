@@ -104,7 +104,7 @@ The old top-level Runtime manager graph, legacy SessionConfig, ToolRegistry, act
 
 Concrete filesystem/process adapters and their tests were deleted in P3-B rather than replaced with defaults. Future concrete tools must be host-owned implementations of the public `Tool` Port, not reintroduced builtins or process policy modules.
 
-P4-C/P5-E2 supply the final SessionHandle, state watch, bounded commands, transcript routing, actor-owned acknowledgements and suspension state, ordinary Turn execution, compaction, and durable terminal settlement. The P6 cleanup graph, regenerated lockfile, remote Rust gates, P8 documentation, and Linux functional acceptance are complete. Native macOS and Windows CI remain the publication blocker.
+P4-C/P5-E2 supply the final SessionHandle, state watch, bounded commands, transcript routing, actor-owned acknowledgements and suspension state, ordinary Turn execution, compaction, and durable terminal settlement. The P6 cleanup graph, regenerated lockfile, remote Rust gates, P8 documentation, Linux functional acceptance, and native macOS and Windows CI are complete; release validation is ready for publication.
 
 ## Model Retry
 

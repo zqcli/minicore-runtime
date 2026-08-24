@@ -1245,7 +1245,7 @@ def check_release_document() -> list[str]:
         if row not in text:
             errors.append(f"docs/release-v0.3.md: missing current metric row {row}")
     required = (
-        "v0.3 implementation complete; publication requires",
+        "v0.3 release validation complete and ready for publication",
         "There is no compatibility layer",
         "All functional criteria",
         "production_files=143",
@@ -1254,7 +1254,7 @@ def check_release_document() -> list[str]:
         f"baseline commit `{BASELINE_COMMIT}`",
         "production view used by the authoritative architecture scanner",
         "macOS and Windows",
-        "Publication is blocked until both pass",
+        "Cross-platform validation is complete across Linux, macOS, and Windows",
         "pending Interaction recovery across restart",
         "plugin ABI",
         "per-Turn model override or hot model swap",

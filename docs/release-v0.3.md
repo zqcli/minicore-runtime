@@ -1,6 +1,6 @@
 # MiniCore Runtime v0.3 Release Note
 
-**Status:** v0.3 implementation complete; publication requires the configured native macOS and Windows CI matrix. Linux functional acceptance and the documented Rust gates passed. This is a release candidate, not a claim that a cross-platform package has already been published.
+**Status:** v0.3 release validation complete and ready for publication. Linux functional acceptance, authoritative remote Rust gates, and the complete native macOS and Windows CI matrix passed. This is a validated release candidate, not a claim that a published crate release or release tag has already been issued.
 
 ## Breaking Reset
 
@@ -78,14 +78,15 @@ All functional criteria in [AT-K01 through AT-K73](acceptance-v0.3.md) are **Pas
 Validation environment:
 
 - remote Linux checkout: `/root/minicore-runtime-v03`;
-- stable `rustc 1.97.1` and `cargo 1.97.1`;
+- stable `rustc 1.98.0`, `cargo 1.98.0`, and `clippy 1.98.0`;
 - full `scripts/check.sh` pass;
 - 285 root library tests plus passing cleaned integration/provider-gate suites;
 - MSRV `rustc 1.85.0` and `cargo 1.85.0` with `scripts/check-msrv.sh` passing;
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked` passing;
-- authoritative architecture scanner passing with `production_files=143`.
+- authoritative architecture scanner passing with `production_files=143`;
+- GitHub Actions [run 32705101762](https://github.com/zqcli/minicore-runtime/actions/runs/32705101762) passed for commit `fd761011c6047c55c73213577e5cbb9b970a219c` across all four jobs (Rust stable Clippy quality gate, Rust 1.85.0 MSRV, `macos-latest`, and `windows-latest` with MSVC).
 
-The functional matrix ran on Linux. The native `macos-latest` and `windows-latest` jobs are configured in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) but were not executed in this session. Publication is blocked until both pass.
+Cross-platform validation is complete across Linux, macOS, and Windows. The repository is ready for publication.
 
 ## Dependency And Source Review
 

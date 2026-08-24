@@ -1,6 +1,6 @@
 # Current Implementation Context
 
-> Final v0.3 single-session release candidate after completed P6 validation and P8 documentation/Linux functional acceptance; native CI still blocks publication.
+> Final v0.3 single-session release candidate after completed P6 validation, P8 documentation, Linux functional acceptance, and passing native macOS/Windows CI; ready for publication.
 
 ## Checkpoint
 
@@ -76,7 +76,7 @@ Model descriptor access, SessionLog future construction and polling, and the pos
 
 ## Cleanup Status
 
-P4-C, P6, and P8 documentation/functional acceptance are complete: SessionRuntime exposes one cloneable SessionHandle backed by a bounded actor mailbox and watch state; the actor owns User/Assistant/Tool/Summary/terminal commits, interaction resume senders, transcript serialization, runner progress, settlement, and shutdown sequencing. No compatibility or legacy implementation graph remains. The lockfile was regenerated, remote Rust/doc gates passed, and all AT-K functional rows passed on Linux. Native macOS and Windows CI were not executed in this session and remain the publication blocker.
+P4-C, P6, and P8 documentation/functional acceptance are complete: SessionRuntime exposes one cloneable SessionHandle backed by a bounded actor mailbox and watch state; the actor owns User/Assistant/Tool/Summary/terminal commits, interaction resume senders, transcript serialization, runner progress, settlement, and shutdown sequencing. No compatibility or legacy implementation graph remains. The lockfile was regenerated, remote Rust/doc gates passed, all AT-K functional rows passed on Linux, and GitHub Actions run 32705101762 passed across stable, MSRV, macOS, and Windows. Release validation is complete and ready for publication.
 
 ## Verification
 
