@@ -1,7 +1,6 @@
 pub mod support;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use minicore_runtime::conversation::{ConversationSeq, TurnTerminal};
 use minicore_runtime::error::{
@@ -70,21 +69,16 @@ async fn transcript_store_corrupt_emits_health_changed_and_degrades_session() {
         other => panic!("expected TranscriptUnavailable with LogCorrupt, got: {other:?}"),
     }
 
-    let mut health_event_found = false;
-    while let Ok(Some(envelope)) =
-        tokio::time::timeout(Duration::from_millis(200), events.recv()).await
-    {
-        if let SessionEvent::HealthChanged { health } = envelope.event {
-            if matches!(health, SessionHealth::Degraded { .. }) {
-                health_event_found = true;
-                break;
-            }
+    let envelope = events
+        .recv()
+        .await
+        .expect("HealthChanged event must be emitted when degraded");
+    assert!(matches!(
+        envelope.event,
+        SessionEvent::HealthChanged {
+            health: SessionHealth::Degraded { .. }
         }
-    }
-    assert!(
-        health_event_found,
-        "HealthChanged event must be emitted when degraded"
-    );
+    ));
 
     let submit_error = handle
         .submit(UserInput::text("hello").unwrap(), TurnOptions::default())

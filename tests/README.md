@@ -46,4 +46,4 @@ The root test suite covers only the final v0.3 public surface and private execut
 
 The standalone `provider-gate/` package is deterministic historical protocol evidence and does not define a root-crate adapter API.
 
-The canonical criterion-by-criterion mapping is `scripts/acceptance_v03.json`; [docs/acceptance-v0.3.md](../docs/acceptance-v0.3.md) is generated from it. This is reviewed traceability, not semantic proof by the documentation checker: remote Rust gates execute the attributed tests. The mapping records AT-K01 through AT-K93, including the breaking event-stream cutover evidence, the remote Rust/doc environment, and the passing cross-platform CI matrix.
+The canonical criterion-by-criterion mapping is `scripts/acceptance_v03.json`; [docs/acceptance-v0.3.md](../docs/acceptance-v0.3.md) is generated from it. This is reviewed traceability, not semantic proof by the documentation checker: remote Rust gates execute the attributed tests. The mapping records AT-K01 through AT-K96, including event-stream ergonomics, must-use API warnings, the breaking event-stream cutover evidence, the remote Rust/doc environment, and the passing cross-platform CI matrix.

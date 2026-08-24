@@ -1,5 +1,8 @@
 use std::fmt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
+use futures_util::Stream;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -10,6 +13,10 @@ use super::event::{SessionEvent, SessionEventEnvelope};
 const MAX_EVENT_CAPACITY: usize = 4_096;
 
 /// The single-consumer, bounded, best-effort stream for live Session events.
+///
+/// Dropping `SessionEventStream` has no execution effect; it only closes the
+/// receiver and allows the actor to continue without a live consumer.
+#[must_use = "SessionEventStream must be consumed or intentionally dropped"]
 pub struct SessionEventStream {
     receiver: mpsc::Receiver<SessionEventEnvelope>,
 }
@@ -36,6 +43,14 @@ impl SessionEventStream {
 
     pub fn try_recv(&mut self) -> Result<SessionEventEnvelope, mpsc::error::TryRecvError> {
         self.receiver.try_recv()
+    }
+}
+
+impl Stream for SessionEventStream {
+    type Item = SessionEventEnvelope;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().receiver.poll_recv(context)
     }
 }
 

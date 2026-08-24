@@ -59,6 +59,32 @@ fn session_error_handle_and_runtime_surface_are_exact() {
     let root = include_str!("../src/lib.rs");
     assert!(root.contains("SessionEventStream, SessionHandle, SessionHealth"));
     assert!(!root.contains("pub mod runtime"));
+
+    let runtime_must_use = concat!(
+        "#[must_use = \"SessionRuntime owns a loaded session and should be retained ",
+        "until explicit shutdown\"]"
+    );
+    assert!(runtime.contains(runtime_must_use));
+    assert!(
+        runtime.contains("/// Dropping `SessionRuntime` only triggers best-effort cancellation.")
+    );
+    assert!(runtime.contains(
+        "/// Call `shutdown(self).await` for complete cleanup and the durability barrier."
+    ));
+    let turn = include_str!("../src/session/turn_handle.rs");
+    assert!(turn.contains(
+        "#[must_use = \"TurnHandle should be awaited, cancelled, or intentionally detached\"]"
+    ));
+    assert!(turn.contains("/// Dropping `TurnHandle` does not cancel the Turn."));
+    let event_stream = include_str!("../src/session/event_stream.rs");
+    assert!(event_stream.contains(
+        "#[must_use = \"SessionEventStream must be consumed or intentionally dropped\"]"
+    ));
+    let event_stream_drop_docs = concat!(
+        "/// Dropping `SessionEventStream` has no execution effect; it only ",
+        "closes the"
+    );
+    assert!(event_stream.contains(event_stream_drop_docs));
 }
 
 #[test]
