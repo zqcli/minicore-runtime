@@ -74,14 +74,22 @@ pub enum SessionEvent {
         turn_id: TurnId,
         outcome: TurnOutcome,
     },
-    EventsDropped {
-        count: u64,
-    },
 }
 
+/// A best-effort live event with the number of preceding events lost by the
+/// bounded event queue.
+///
+/// `dropped_before` is attached to the next successfully delivered event and
+/// is zero when no event was lost since the previous successful delivery. It
+/// is informational and is not a replay cursor or a durability guarantee.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionEventEnvelope {
+    /// The durable Session identity that produced this event.
     pub session_id: SessionId,
+    /// The loaded Session instance that produced this event.
     pub instance_id: SessionInstanceId,
+    /// The saturating count of events lost immediately before this event.
+    pub dropped_before: u64,
+    /// The redacted, typed live event.
     pub event: SessionEvent,
 }

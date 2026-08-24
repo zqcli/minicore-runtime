@@ -313,12 +313,16 @@ async fn dropped_interaction_and_turn_events_leave_state_wait_and_transcript_aut
         Some(ConversationEntry::TurnTerminal(entry))
             if entry.terminal == TurnTerminal::Completed
     ));
+    let mut delivered_event_count = 0;
     while let Ok(event) = events.try_recv() {
+        delivered_event_count += 1;
+        let _dropped_before: u64 = event.dropped_before;
         assert!(!matches!(
             event.event,
             SessionEvent::InteractionRequested { .. } | SessionEvent::TurnFinished { .. }
         ));
     }
+    assert!(delivered_event_count > 0);
     runtime.shutdown().await.unwrap();
 }
 

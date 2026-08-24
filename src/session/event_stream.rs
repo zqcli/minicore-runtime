@@ -9,6 +9,7 @@ use super::event::{SessionEvent, SessionEventEnvelope};
 
 const MAX_EVENT_CAPACITY: usize = 4_096;
 
+/// The single-consumer, bounded, best-effort stream for live Session events.
 pub struct SessionEventStream {
     receiver: mpsc::Receiver<SessionEventEnvelope>,
 }
@@ -24,8 +25,6 @@ pub(crate) struct InternalEventSink {
 pub(crate) enum InternalEventSinkError {
     #[error("event stream capacity is invalid")]
     InvalidCapacity,
-    #[error("events-dropped markers are owned by the internal event sink")]
-    MarkerReserved,
     #[error("event stream receiver is closed")]
     Closed,
 }
@@ -68,48 +67,28 @@ impl InternalEventSink {
     }
 
     pub(crate) fn try_emit(&mut self, event: SessionEvent) -> Result<(), InternalEventSinkError> {
-        if matches!(&event, SessionEvent::EventsDropped { .. }) {
-            return Err(InternalEventSinkError::MarkerReserved);
-        }
-        if self.sender.is_closed() {
-            return Err(InternalEventSinkError::Closed);
-        }
-        if self.dropped != 0 {
-            let marker = self.envelope(SessionEvent::EventsDropped {
-                count: self.dropped,
-            });
-            match self.sender.try_send(marker) {
-                Ok(()) => self.dropped = 0,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.record_drop();
-                    return Ok(());
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Err(InternalEventSinkError::Closed);
-                }
-            }
-        }
-        let envelope = self.envelope(event);
+        let dropped_before = self.dropped;
+        let envelope = self.envelope(event, dropped_before);
         match self.sender.try_send(envelope) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.dropped = 0;
+                Ok(())
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.record_drop();
+                self.dropped = dropped_before.saturating_add(1);
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(InternalEventSinkError::Closed),
         }
     }
 
-    fn envelope(&self, event: SessionEvent) -> SessionEventEnvelope {
+    fn envelope(&self, event: SessionEvent, dropped_before: u64) -> SessionEventEnvelope {
         SessionEventEnvelope {
             session_id: self.session_id,
             instance_id: self.instance_id,
+            dropped_before,
             event,
         }
-    }
-
-    fn record_drop(&mut self) {
-        self.dropped = self.dropped.saturating_add(1);
     }
 }
 
@@ -139,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_capacity_is_checked_and_stream_is_truly_bounded() {
+    fn channel_capacity_is_checked_and_closed_receiver_is_terminal() {
         let (session_id, instance_id) = ids();
         assert!(matches!(
             InternalEventSink::channel(session_id, instance_id, 0),
@@ -149,68 +128,95 @@ mod tests {
             InternalEventSink::channel(session_id, instance_id, MAX_EVENT_CAPACITY + 1),
             Err(InternalEventSinkError::InvalidCapacity)
         ));
+        let (mut sink, stream) = InternalEventSink::channel(session_id, instance_id, 1).unwrap();
+        assert_eq!(sink.try_emit(event(1)), Ok(()));
+        assert_eq!(sink.try_emit(event(2)), Ok(()));
+        assert_eq!(sink.dropped, 1);
+        drop(stream);
+        assert_eq!(sink.try_emit(event(1)), Err(InternalEventSinkError::Closed));
+        assert_eq!(sink.dropped, 1);
+        assert_eq!(sink.try_emit(event(2)), Err(InternalEventSinkError::Closed));
+        assert_eq!(sink.dropped, 1);
+    }
+
+    #[test]
+    fn capacity_one_recovers_ordinary_events_with_dropped_count() {
+        let (session_id, instance_id) = ids();
         let (mut sink, mut stream) =
             InternalEventSink::channel(session_id, instance_id, 1).unwrap();
         assert_eq!(sink.try_emit(event(1)), Ok(()));
         assert_eq!(sink.try_emit(event(2)), Ok(()));
-        assert_eq!(sink.dropped, 1);
-        assert!(matches!(
-            stream.try_recv().unwrap().event,
-            SessionEvent::ModelStarted { round: 1, .. }
-        ));
-    }
-
-    #[test]
-    fn full_marker_attempt_accumulates_then_precedes_the_next_ordinary_event() {
-        let (session_id, instance_id) = ids();
-        let (mut sink, mut stream) =
-            InternalEventSink::channel(session_id, instance_id, 2).unwrap();
-        sink.try_emit(event(1)).unwrap();
-        sink.try_emit(event(2)).unwrap();
-        sink.try_emit(event(3)).unwrap();
-        assert_eq!(sink.dropped, 1);
-
-        sink.try_emit(event(4)).unwrap();
-        assert_eq!(sink.dropped, 2);
+        assert_eq!(sink.try_emit(event(3)), Ok(()));
 
         let first = stream.try_recv().unwrap();
         assert_eq!(first.session_id, session_id);
         assert_eq!(first.instance_id, instance_id);
         assert_eq!(first.event, event(1));
+        assert_eq!(first.dropped_before, 0);
+
+        assert_eq!(sink.try_emit(event(4)), Ok(()));
+        let next = stream.try_recv().unwrap();
+        assert_eq!(next.session_id, session_id);
+        assert_eq!(next.instance_id, instance_id);
+        assert_eq!(next.event, event(4));
+        assert_eq!(next.dropped_before, 2);
+
+        assert_eq!(sink.try_emit(event(5)), Ok(()));
+        let third = stream.try_recv().unwrap();
+        assert_eq!(third.session_id, session_id);
+        assert_eq!(third.instance_id, instance_id);
+        assert_eq!(third.event, event(5));
+        assert_eq!(third.dropped_before, 0);
+    }
+
+    #[test]
+    fn cumulative_and_saturating_drop_counts_are_exact() {
+        let (session_id, instance_id) = ids();
+        let (mut sink, mut stream) =
+            InternalEventSink::channel(session_id, instance_id, 2).unwrap();
+        assert_eq!(sink.try_emit(event(1)), Ok(()));
+        assert_eq!(sink.try_emit(event(2)), Ok(()));
+
+        for i in 3..=7 {
+            assert_eq!(sink.try_emit(event(i)), Ok(()));
+        }
+
+        let first = stream.try_recv().unwrap();
+        assert_eq!(first.session_id, session_id);
+        assert_eq!(first.instance_id, instance_id);
+        assert_eq!(first.event, event(1));
+        assert_eq!(first.dropped_before, 0);
+
         let second = stream.try_recv().unwrap();
         assert_eq!(second.session_id, session_id);
         assert_eq!(second.instance_id, instance_id);
         assert_eq!(second.event, event(2));
+        assert_eq!(second.dropped_before, 0);
 
-        sink.try_emit(event(5)).unwrap();
-        let marker = stream.try_recv().unwrap();
-        assert_eq!(marker.session_id, session_id);
-        assert_eq!(marker.instance_id, instance_id);
-        assert_eq!(marker.event, SessionEvent::EventsDropped { count: 2 });
-        let ordinary = stream.try_recv().unwrap();
-        assert_eq!(ordinary.session_id, session_id);
-        assert_eq!(ordinary.instance_id, instance_id);
-        assert_eq!(ordinary.event, event(5));
-        assert_eq!(sink.dropped, 0);
-    }
+        assert_eq!(sink.try_emit(event(8)), Ok(()));
+        let next = stream.try_recv().unwrap();
+        assert_eq!(next.session_id, session_id);
+        assert_eq!(next.instance_id, instance_id);
+        assert_eq!(next.event, event(8));
+        assert_eq!(next.dropped_before, 5);
 
-    #[test]
-    fn marker_full_drops_current_and_closed_receiver_is_terminal() {
-        let (session_id, instance_id) = ids();
-        let (mut sink, mut stream) =
-            InternalEventSink::channel(session_id, instance_id, 1).unwrap();
-        sink.try_emit(event(1)).unwrap();
-        sink.try_emit(event(2)).unwrap();
-        sink.try_emit(event(3)).unwrap();
-        assert_eq!(sink.dropped, 2);
+        assert_eq!(sink.try_emit(event(9)), Ok(()));
+        let final_ev = stream.try_recv().unwrap();
+        assert_eq!(final_ev.session_id, session_id);
+        assert_eq!(final_ev.instance_id, instance_id);
+        assert_eq!(final_ev.event, event(9));
+        assert_eq!(final_ev.dropped_before, 0);
+
+        assert_eq!(sink.try_emit(event(10)), Ok(()));
+        assert_eq!(sink.try_emit(event(11)), Ok(()));
+        sink.dropped = u64::MAX;
+        assert_eq!(sink.try_emit(event(12)), Ok(()));
+        assert_eq!(sink.dropped, u64::MAX);
         let _ = stream.try_recv().unwrap();
-        assert_eq!(
-            sink.try_emit(SessionEvent::EventsDropped { count: 99 }),
-            Err(InternalEventSinkError::MarkerReserved)
-        );
-        drop(stream);
-        assert_eq!(sink.try_emit(event(4)), Err(InternalEventSinkError::Closed));
-        assert_eq!(sink.try_emit(event(5)), Err(InternalEventSinkError::Closed));
-        assert_eq!(sink.dropped, 2);
+        let _ = stream.try_recv().unwrap();
+        assert_eq!(sink.try_emit(event(13)), Ok(()));
+        let saturated = stream.try_recv().unwrap();
+        assert_eq!(saturated.event, event(13));
+        assert_eq!(saturated.dropped_before, u64::MAX);
     }
 }

@@ -154,7 +154,7 @@ Stream events are typed text/reasoning deltas, tool-call boundaries, usage, and 
 
 `SessionState` is the lightweight authoritative current-state DTO: four statuses, healthy/degraded health, exact active Turn and pending Interaction, confirmed conversation sequence, and the latest durable terminal outcome. Its validator rejects illegal status/turn/interaction combinations. It is process-local and has no serde representation.
 
-`SessionEventStream` is one bounded Tokio mpsc receiver and is not Clone. Internal publication is synchronous best effort: queue overflow drops the current event, counts losses, and attempts an `EventsDropped` marker before a later ordinary event. Events contain bounded deltas and summaries, never raw tool output, arguments, answers, or adapter errors.
+`SessionEventStream` is one bounded Tokio mpsc receiver and is not Clone. Internal publication is synchronous best effort: every event carries the accumulated `dropped_before` count, queue overflow drops only the current event and saturating-counts it, and a closed receiver returns without growing the count. Events contain bounded deltas and summaries, never raw tool output, arguments, answers, or adapter errors.
 
 `TurnHandle` is Clone + Send + Sync and controls one exact Turn. Cancellation and completion share one mutex linearization point; cancellation is first-request-only, completion is first-wins, multiple waiters receive the same durable outcome, and dropping handles does not cancel.
 
