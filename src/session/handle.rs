@@ -79,6 +79,22 @@ impl SessionHandle {
         receiver.await.map_err(|_| SessionError::Closed)?
     }
 
+    /// Fetches a paginated slice of committed conversation entries.
+    ///
+    /// # Errors
+    ///
+    /// - [`SessionError::InvalidInput`]: caller supplied an invalid cursor or limit. Session
+    ///   health remains unchanged.
+    /// - [`SessionError::TranscriptUnavailable`]:
+    ///   - Transient storage failures (`Unavailable` is retryable; `Internal` is not) preserve
+    ///     healthy session state.
+    ///   - Consistency failures (`Conflict`, `Corrupt`, `UnknownOutcome`, page contract
+    ///     violation, or projection mismatch) degrade session health to
+    ///     [`SessionHealth::Degraded`](crate::session::SessionHealth::Degraded). Any active turn is
+    ///     cancelled with no fabricated terminal, and subsequent `submit` or `answer` calls are
+    ///     rejected.
+    /// - [`SessionError::Closed`]: the underlying log or session actor is closed. Session health
+    ///   remains unchanged.
     pub async fn transcript(
         &self,
         after: Option<ConversationSeq>,

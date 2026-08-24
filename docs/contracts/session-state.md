@@ -41,7 +41,21 @@ A state is invalid if its active Turn is already recorded as `last_terminal`. Wa
 - `Healthy`;
 - `Degraded { diagnostic }`.
 
-Ordinary Model, Context, policy, or Tool failures settle a Turn and do not degrade the Session. Degraded health records a durability or invariant problem that makes further submit unsafe, including an unknown append outcome or an active critical append failure. A degraded Session rejects submit with the retained redacted diagnostic.
+Ordinary Model, Context, policy, or Tool failures settle a Turn and do not degrade the Session. Degraded health records a durability or invariant problem that makes further execution unsafe:
+
+- An unknown append outcome or active critical append failure during turn execution.
+- Storage consistency failures during transcript reading (`Conflict`, `Corrupt`, `UnknownOutcome`, page contract violation, or projection mismatch).
+
+When a session degrades during an active turn:
+
+- Authoritative `Degraded` health is published to the state watch channel before emitting `HealthChanged` and before replying to callers.
+- The first observed failure diagnostic is preserved.
+- The active turn's cancellation token is triggered.
+- Pending interactions are rejected with `SuspensionError::Cancelled`.
+- An `ActiveCommitFailure` is latched to suppress settlement terminal append attempts, preventing fabricated completions.
+- Subsequent `submit` and `answer` commands are rejected.
+
+Transient storage errors (`Unavailable` [retryable] or `Internal` [non-retryable]), caller errors (invalid cursor or limit), and `Closed` logs preserve `Healthy` session state.
 
 Health and status are distinct. A Session may be `Closing` while degraded, and a durability failure does not invent a terminal entry.
 

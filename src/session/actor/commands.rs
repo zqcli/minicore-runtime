@@ -12,6 +12,7 @@ use crate::error::SessionError;
 use crate::tools::ApprovalDecision;
 
 use super::super::event::{InteractionResolutionSummary, SessionEvent};
+use super::settlement::TranscriptDisposition;
 use super::*;
 
 const DEFAULT_TURN_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -58,12 +59,12 @@ impl SessionActor {
             let _ = reply.send(Err(SessionError::Closed));
             return;
         }
-        if let Some(active_turn) = self.active_turn_id() {
-            let _ = reply.send(Err(SessionError::Busy { active_turn }));
-            return;
-        }
         if let SessionHealth::Degraded { diagnostic } = &self.health {
             let _ = reply.send(Err(SessionError::Degraded(diagnostic.clone())));
+            return;
+        }
+        if let Some(active_turn) = self.active_turn_id() {
+            let _ = reply.send(Err(SessionError::Busy { active_turn }));
             return;
         }
         let effective_rounds = match self.validate_submit(&input, &options) {
@@ -236,6 +237,9 @@ impl SessionActor {
         if self.closing {
             return Err(SessionError::Closed);
         }
+        if let SessionHealth::Degraded { diagnostic } = &self.health {
+            return Err(SessionError::Degraded(diagnostic.clone()));
+        }
         if self.last_resolved_interaction == Some(interaction_id) {
             return Err(SessionError::InteractionAlreadyResolved);
         }
@@ -305,13 +309,20 @@ impl SessionActor {
         }
         match self.conversation.transcript(after, limit).await {
             Ok(page) => Ok(page),
-            Err(error) => {
-                let diagnostic = transcript_error(error.clone());
-                if error.kind() == ConversationCommitErrorKind::DurabilityUnknown {
-                    self.mark_degraded(diagnostic.clone());
+            Err(error) => match super::settlement::classify_transcript_error(&error) {
+                TranscriptDisposition::Closed => Err(SessionError::Closed),
+                TranscriptDisposition::Caller(diagnostic) => {
+                    Err(SessionError::InvalidInput(diagnostic))
                 }
-                Err(SessionError::TranscriptUnavailable(diagnostic))
-            }
+                TranscriptDisposition::Unavailable(diagnostic)
+                | TranscriptDisposition::StorageInternal(diagnostic) => {
+                    Err(SessionError::TranscriptUnavailable(diagnostic))
+                }
+                TranscriptDisposition::Degrade(diagnostic, unknown) => {
+                    self.degrade_on_transcript_failure(diagnostic.clone(), unknown);
+                    Err(SessionError::TranscriptUnavailable(diagnostic))
+                }
+            },
         }
     }
 
@@ -324,7 +335,7 @@ impl SessionActor {
                 SessionError::InvalidInput(invalid_input())
             }
             _ => {
-                let diagnostic = commit_diagnostic(&error);
+                let diagnostic = super::settlement::commit_diagnostic(&error);
                 self.mark_degraded(diagnostic.clone());
                 SessionError::Degraded(diagnostic)
             }
@@ -360,35 +371,6 @@ fn invalid_input() -> DiagnosticSummary {
         DiagnosticCode::InvalidConfiguration,
         DiagnosticCategory::Configuration,
         "session command input is invalid",
-        false,
-    )
-}
-
-fn transcript_error(error: ConversationCommitError) -> DiagnosticSummary {
-    let retryable = matches!(
-        error.kind(),
-        ConversationCommitErrorKind::Log(crate::error::SessionLogErrorKind::Unavailable)
-    );
-    SessionActor::diagnostic(
-        DiagnosticCode::Internal,
-        DiagnosticCategory::Storage,
-        "session transcript is unavailable",
-        retryable,
-    )
-}
-
-pub(super) fn commit_diagnostic(error: &ConversationCommitError) -> DiagnosticSummary {
-    let code = match error.kind() {
-        ConversationCommitErrorKind::DurabilityUnknown => DiagnosticCode::LogUnknownOutcome,
-        ConversationCommitErrorKind::Log(crate::error::SessionLogErrorKind::Conflict) => {
-            DiagnosticCode::LogConflict
-        }
-        _ => DiagnosticCode::Internal,
-    };
-    SessionActor::diagnostic(
-        code,
-        DiagnosticCategory::Storage,
-        "session conversation commit failed",
         false,
     )
 }

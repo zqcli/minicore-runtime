@@ -63,3 +63,11 @@ Already terminal history receives no repair. Pending approvals, ToolInput reques
 ## Transcript
 
 `SessionHandle::transcript(after, limit)` returns only adapter-confirmed entries in a checked `TranscriptPage`. Page sequence, cursor, observed head, and slice contents are validated against the confirmed projection. If adapter transcript I/O becomes uncertain, Core falls back to confirmed memory where defined and never exposes a speculative entry.
+
+Transcript error classification is explicit and non-wildcard:
+
+- Caller errors (invalid cursor or limit) return `SessionError::InvalidInput` without affecting session health.
+- Transient storage failures (`Unavailable` [retryable] or `Internal` [non-retryable]) return `SessionError::TranscriptUnavailable` while preserving `Healthy` session state.
+- Closed log or actor return `SessionError::Closed` without altering health.
+- Consistency failures (`Conflict`, `Corrupt`, `UnknownOutcome`, page contract violations, or projection mismatches) return `SessionError::TranscriptUnavailable` and transition session health to `SessionHealth::Degraded`.
+- When degradation occurs during an active turn, the turn's cancellation token is triggered, pending interactions are rejected, and settlement terminal appends are suppressed (`ActiveCommitFailure`), preventing fabricated outcomes. Subsequent `submit` and `answer` commands are rejected.
