@@ -22,7 +22,7 @@ MiniCore Runtime is an embeddable single-session Agent Execution Kernel. One `Se
 
 ## Install and MSRV
 
-The crate targets Rust `1.85` and edition 2024. The v0.3 implementation, regenerated lockfile, remote Rust gates, P8 documentation, Linux functional acceptance, and native macOS and Windows CI matrix ([run 32705101762](https://github.com/zqcli/minicore-runtime/actions/runs/32705101762)) are complete and ready for publication.
+The crate targets Rust `1.85` and edition 2024. The v0.3 implementation, regenerated lockfile, remote Rust gates, P8 documentation, Linux functional acceptance, and native macOS and Windows CI matrix ([run 32755428283](https://github.com/zqcli/minicore-runtime/actions/runs/32755428283)) are complete and ready for publication. This run validates review fixes AT-K01 through AT-K96; no package or tag release has occurred.
 
 The host owns tool capabilities. A host implementation captures workspace, process, RPC, or other authority inside its `Tool` implementation rather than receiving those capabilities through `ToolContext`.
 
