@@ -1,10 +1,12 @@
+use minicore_runtime::storage::ConversationPage;
 use minicore_runtime::storage::SessionLogErrorKind;
 
 use super::Script;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum ScriptOutcome {
     Continue,
+    Page(ConversationPage),
     Error(SessionLogErrorKind),
     UnknownOutcome { committed: bool },
 }
@@ -12,6 +14,7 @@ pub(super) enum ScriptOutcome {
 pub(super) async fn run_script(script: Option<Script>) -> ScriptOutcome {
     match script {
         None | Some(Script::Continue) => ScriptOutcome::Continue,
+        Some(Script::Page(page)) => ScriptOutcome::Page(page),
         Some(Script::Error(kind)) => ScriptOutcome::Error(kind),
         Some(Script::UnknownOutcome { committed }) => ScriptOutcome::UnknownOutcome { committed },
         Some(Script::GateContinue(gate)) => {

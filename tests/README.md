@@ -32,6 +32,7 @@ The root test suite covers only the final v0.3 public surface and private execut
 - `session_runtime_restart_event_evidence.rs` covers nondurable interaction restart repair, forced event loss with authoritative state/Turn/transcript, and atomic unresolved-tool settlement.
 - `session_runtime_shared_ports_evidence.rs` proves two owners use the exact same Model/ToolPolicy/ContextProvider Arcs concurrently while cancellation remains isolated.
 - `session_runtime_semantic_limits_evidence.rs` covers instance-level limits, custom `max_tool_count` create/load roundtrip, early rejection before log initialize, and absolute structural bounds.
+- `session_runtime_transcript_degraded_evidence.rs` covers transcript consistency classification, store Conflict/Corrupt degradation, observed head and contract violation degradation, and Healthy isolation for caller input and temporary unavailable errors.
 - `event_summary_structure_contract.rs` locks the public event summary field set against payload, argument, answer, and raw-error expansion.
 - Private runtime test `post_ready_actor_panic_joins_pending_runner_before_close` proves the real post-ready panic supervisor joins the pending runner before close.
 
@@ -44,4 +45,4 @@ The root test suite covers only the final v0.3 public surface and private execut
 
 The standalone `provider-gate/` package is deterministic historical protocol evidence and does not define a root-crate adapter API.
 
-The canonical criterion-by-criterion mapping is `scripts/acceptance_v03.json`; [docs/acceptance-v0.3.md](../docs/acceptance-v0.3.md) is generated from it. This is reviewed traceability, not semantic proof by the documentation checker: remote Rust gates execute the attributed tests. The mapping records AT-K01 through AT-K78, the remote Rust/doc environment, and the passing cross-platform CI matrix.
+The canonical criterion-by-criterion mapping is `scripts/acceptance_v03.json`; [docs/acceptance-v0.3.md](../docs/acceptance-v0.3.md) is generated from it. This is reviewed traceability, not semantic proof by the documentation checker: remote Rust gates execute the attributed tests. The mapping records AT-K01 through AT-K85, the remote Rust/doc environment, and the passing cross-platform CI matrix.

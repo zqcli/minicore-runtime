@@ -2,7 +2,7 @@
 
 This matrix is generated from `scripts/acceptance_v03.json`. The mapping is reviewed traceability: the documentation checker validates exact identity, criterion/status/evidence equality, allowed gates, attributed non-ignored Rust tests in Cargo-enabled reachable library sources or direct integration targets, and the current Markdown authority inventory. It does not semantically prove behavior; the remote Rust gates execute the cited evidence.
 
-All functional criteria AT-K01 through AT-K78 passed on the remote Linux validation checkout. Cross-platform validation is complete with passing native macOS and Windows CI.
+All functional criteria AT-K01 through AT-K85 passed on the remote Linux validation checkout. Cross-platform validation is complete with passing native macOS and Windows CI.
 
 ## Validation Environment
 
@@ -147,6 +147,18 @@ All functional acceptance criteria passed on Linux, and native macOS and Windows
 | AT-K76 | A session created with custom limits can be shutdown and reloaded under matching runtime limits. | Passed | [`tests/session_runtime_semantic_limits_evidence.rs`](../tests/session_runtime_semantic_limits_evidence.rs) — `create_shutdown_load_roundtrip_with_custom_max_tool_count` |
 | AT-K77 | Narrower runtime limits reject creation before log initialization without spawning an owner. | Passed | [`tests/session_runtime_semantic_limits_evidence.rs`](../tests/session_runtime_semantic_limits_evidence.rs) — `narrower_instance_limits_reject_create_before_log_initialize` |
 | AT-K78 | SessionSpec and SessionManifest reject inputs exceeding absolute structural limits during construction and deserialization. | Passed | [`tests/session_runtime_semantic_limits_evidence.rs`](../tests/session_runtime_semantic_limits_evidence.rs) — `session_spec_and_manifest_enforce_absolute_structural_bounds` |
+
+## Conversation And Log
+
+| ID | Criterion | Status | Evidence |
+| --- | --- | --- | --- |
+| AT-K79 | A Store Conflict error during transcript reading returns a LogConflict diagnostic and degrades session health. | Passed | [`tests/session_runtime_transcript_degraded_evidence.rs`](../tests/session_runtime_transcript_degraded_evidence.rs) — `transcript_store_conflict_returns_log_conflict_and_degrades_session` |
+| AT-K80 | A Store Corrupt error during transcript reading degrades session health and emits a HealthChanged event. | Passed | [`tests/session_runtime_transcript_degraded_evidence.rs`](../tests/session_runtime_transcript_degraded_evidence.rs) — `transcript_store_corrupt_emits_health_changed_and_degrades_session` |
+| AT-K81 | An observed head mismatch between store transcript page and confirmed head degrades session health. | Passed | [`tests/session_runtime_transcript_degraded_evidence.rs`](../tests/session_runtime_transcript_degraded_evidence.rs) — `transcript_observed_head_mismatch_degrades_session` |
+| AT-K82 | A transcript page contract violation or projection mismatch degrades session health. | Passed | [`tests/session_runtime_transcript_degraded_evidence.rs`](../tests/session_runtime_transcript_degraded_evidence.rs) — `transcript_page_contract_violation_degrades_session` |
+| AT-K83 | Invalid caller transcript cursor or limit returns InvalidInput and preserves healthy session state. | Passed | [`tests/session_runtime_transcript_degraded_evidence.rs`](../tests/session_runtime_transcript_degraded_evidence.rs) — `transcript_caller_invalid_cursor_and_limit_return_invalid_input_and_remain_healthy` |
+| AT-K84 | A temporary Store Unavailable error during transcript reading returns a retryable error and preserves healthy session state. | Passed | [`tests/session_runtime_transcript_degraded_evidence.rs`](../tests/session_runtime_transcript_degraded_evidence.rs) — `transcript_temporary_store_unavailable_returns_retryable_and_remains_healthy`; [`tests/session_runtime_transcript_degraded_evidence.rs`](../tests/session_runtime_transcript_degraded_evidence.rs) — `transcript_store_closed_and_internal_preserve_healthy_session` |
+| AT-K85 | A degraded session permits state inspection, transcript read, and shutdown while rejecting turn submission. | Passed | [`tests/session_runtime_transcript_degraded_evidence.rs`](../tests/session_runtime_transcript_degraded_evidence.rs) — `degraded_session_permits_state_read_and_shutdown_while_rejecting_submit`; [`tests/session_runtime_transcript_degraded_evidence.rs`](../tests/session_runtime_transcript_degraded_evidence.rs) — `active_turn_transcript_conflict_degrades_cancels_and_prevents_settlement` |
 
 ## Acceptance Conclusion
 

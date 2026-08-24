@@ -46,7 +46,7 @@ FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})", re.MULTILINE)
 HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
 HTML_ID_RE = re.compile(r'<(?:a|span)\s+(?:[^>]*?\s)?(?:id|name)=["\']([^"\']+)["\']', re.IGNORECASE)
 RUST_NO_RUN_RE = re.compile(r"```rust,no_run\n(.*?)\n```", re.DOTALL)
-ACCEPTANCE_IDS = tuple(f"AT-K{index:02d}" for index in range(1, 79))
+ACCEPTANCE_IDS = tuple(f"AT-K{index:02d}" for index in range(1, 86))
 BASELINE_COMMIT = "2fd7104"
 BASELINE_METRICS = {
     "production_loc": 15_483,
@@ -1100,7 +1100,7 @@ def acceptance_mapping_errors(mapping: dict, root: Path) -> list[str]:
     identifiers = [item.get("id") for item in criteria if isinstance(item, dict)]
     if identifiers != list(ACCEPTANCE_IDS):
         errors.append(
-            "scripts/acceptance_v03.json: acceptance IDs must be exactly AT-K01..AT-K78 in order"
+            "scripts/acceptance_v03.json: acceptance IDs must be exactly AT-K01..AT-K85 in order"
         )
     reachable_sources, reachability_errors = resolve_test_reachable_sources(root)
     errors.extend(

@@ -99,7 +99,7 @@ impl SessionActor {
             ConversationCommitErrorKind::Log(_) => RunnerCommitError::DurabilityUnavailable,
             _ => RunnerCommitError::DurabilityUnavailable,
         };
-        let diagnostic = super::commands::commit_diagnostic(&error);
+        let diagnostic = super::settlement::commit_diagnostic(&error);
         if let Some(active) = self.active.as_mut() {
             active.cancellation.cancel();
             if active.commit_failure.is_none() {

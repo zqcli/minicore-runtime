@@ -158,6 +158,8 @@ Stream events are typed text/reasoning deltas, tool-call boundaries, usage, and 
 
 `TurnHandle` is Clone + Send + Sync and controls one exact Turn. Cancellation and completion share one mutex linearization point; cancellation is first-request-only, completion is first-wins, multiple waiters receive the same durable outcome, and dropping handles does not cancel.
 
+`SessionHandle::transcript` returns paginated committed history. Invalid cursors or limits return `SessionError::InvalidInput` without altering health. Transient storage errors (`Unavailable` [retryable] or `Internal` [non-retryable]) return `TranscriptUnavailable` while preserving `Healthy` state; a `Closed` log returns `SessionError::Closed`. Storage consistency violations (`Conflict`, `Corrupt`, `UnknownOutcome`, page contract violations, or projection mismatches) transition health to `Degraded`, cancel any active turn without appending a fabricated terminal, and reject subsequent `submit` and `answer` commands.
+
 ## Session Runtime
 
 `SessionRuntimeOptions` fixes one checked `KernelConfig`, immutable `SessionBindings`, and Host-selected Tokio Handle. Construction synchronously and panic-safely enters that Handle and creates then drops a zero-duration sleep, rejecting runtimes without an enabled time driver. The runtime must remain alive and actively driven while create, load, or shutdown is in progress; a live but undriven current-thread runtime cannot advance Tokio work. A non-Tokio caller is supported when the configured runtime is timer-enabled and actively driven.

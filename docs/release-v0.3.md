@@ -69,13 +69,15 @@ Conversation contains exactly UserMessage, AssistantMessage, ToolResult, Summary
 
 ToolFinished and TurnFinished are best-effort events after durability. TurnHandle completion follows durable terminal settlement. Unknown/failed critical append outcomes degrade the Session and do not fabricate a terminal.
 
+`SessionHandle::transcript` returns confirmed history without speculative entries. Transcript errors use explicit semantic classification: caller input errors and `Closed` logs leave health unaffected, transient `Unavailable` and `Internal` errors return `TranscriptUnavailable` while preserving `Healthy` state (`Unavailable` retryable), while storage consistency failures (`Conflict`, `Corrupt`, `UnknownOutcome`, page contract or projection mismatches) transition health to `Degraded`. Degraded health during an active turn cancels active work, suppresses fallback terminal appends, rejects pending interactions, and rejects subsequent `submit` and `answer` commands.
+
 Restart restores durable Conversation only. It atomically appends cancelled results for unresolved calls followed by `CancelledByRestart`; pending approval, ToolInput, Model/Tool continuations, events, and task state are not restored.
 
 See the [Conversation contract](contracts/conversation.md).
 
 ## Acceptance
 
-All functional criteria in [AT-K01 through AT-K78](acceptance-v0.3.md) are **Passed on Linux**. `scripts/acceptance_v03.json` is the canonical reviewed traceability mapping; the generated Markdown and attributed evidence are checker-enforced, while the remote Rust gates—not the documentation checker—execute and validate the cited behavior.
+All functional criteria in [AT-K01 through AT-K85](acceptance-v0.3.md) are **Passed on Linux**. `scripts/acceptance_v03.json` is the canonical reviewed traceability mapping; the generated Markdown and attributed evidence are checker-enforced, while the remote Rust gates—not the documentation checker—execute and validate the cited behavior.
 
 Validation environment:
 
@@ -111,8 +113,8 @@ The reviewed comparison uses baseline commit `2fd7104`. “cfg(test)-excluded pr
 
 | Metric | Baseline | Current | Change |
 | --- | ---: | ---: | ---: |
-| cfg(test)-excluded production LOC | 15,483 | 13,965 | -1,518 |
-| raw `src/**/*.rs` lines | 48,055 | 30,862 | -17,193 |
+| cfg(test)-excluded production LOC | 15,483 | 14,175 | -1,308 |
+| raw `src/**/*.rs` lines | 48,055 | 31,072 | -16,983 |
 | `src` Rust files | 174 | 143 | -31 |
 | files with production content | 83 | 77 | -6 |
 

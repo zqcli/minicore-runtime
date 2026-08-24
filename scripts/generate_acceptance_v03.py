@@ -49,7 +49,7 @@ def render_acceptance(mapping: dict[str, Any]) -> str:
         "",
         "This matrix is generated from `scripts/acceptance_v03.json`. The mapping is reviewed traceability: the documentation checker validates exact identity, criterion/status/evidence equality, allowed gates, attributed non-ignored Rust tests in Cargo-enabled reachable library sources or direct integration targets, and the current Markdown authority inventory. It does not semantically prove behavior; the remote Rust gates execute the cited evidence.",
         "",
-        "All functional criteria AT-K01 through AT-K78 passed on the remote Linux validation checkout. Cross-platform validation is complete with passing native macOS and Windows CI.",
+        "All functional criteria AT-K01 through AT-K85 passed on the remote Linux validation checkout. Cross-platform validation is complete with passing native macOS and Windows CI.",
         "",
         "## Validation Environment",
         "",

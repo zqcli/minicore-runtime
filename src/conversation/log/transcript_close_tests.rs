@@ -56,7 +56,7 @@ async fn transcript_is_confirmed_bounded_and_validates_page_contract() {
         .push_back(page(vec![user(1, turn)], None, 4));
     assert_eq!(
         log.transcript(None, 2).await.err().unwrap().kind(),
-        ConversationCommitErrorKind::TranscriptInvalid
+        ConversationCommitErrorKind::TranscriptContractViolation
     );
 }
 
@@ -89,7 +89,7 @@ async fn transcript_accepts_empty_tail_and_rejects_empty_wrong_head_or_slice_mis
     .await;
     assert_eq!(
         wrong_head.transcript(None, 2).await.err().unwrap().kind(),
-        ConversationCommitErrorKind::TranscriptInvalid
+        ConversationCommitErrorKind::TranscriptContractViolation
     );
 
     let audit = Audit::new(Vec::new());
@@ -123,7 +123,7 @@ async fn transcript_accepts_empty_tail_and_rejects_empty_wrong_head_or_slice_mis
         .push_back(page(vec![user(1, turn_id(9))], Some(1), 3));
     assert_eq!(
         log.transcript(None, 2).await.err().unwrap().kind(),
-        ConversationCommitErrorKind::TranscriptInvalid
+        ConversationCommitErrorKind::TranscriptProjectionMismatch
     );
 }
 
@@ -169,7 +169,7 @@ async fn transcript_unknown_latches_and_falls_back_to_confirmed_projection() {
             .err()
             .unwrap()
             .kind(),
-        ConversationCommitErrorKind::TranscriptInvalid
+        ConversationCommitErrorKind::TranscriptCursor
     );
     assert_eq!(audit.read_calls.load(Ordering::SeqCst), reads);
 }

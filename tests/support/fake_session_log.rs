@@ -23,6 +23,7 @@ use script::{ScriptOutcome, run_script};
 #[derive(Clone, Debug)]
 pub enum Script {
     Continue,
+    Page(ConversationPage),
     Error(SessionLogErrorKind),
     UnknownOutcome { committed: bool },
     GateContinue(ScriptGate),
@@ -106,6 +107,14 @@ impl InspectionHandle {
 
     pub fn head(&self) -> ConversationSeq {
         current_head(&lock_state(&self.state))
+    }
+
+    pub fn script_read(&self, script: Script) {
+        lock_state(&self.state).read_scripts.push_back(script);
+    }
+
+    pub fn script_append(&self, script: Script) {
+        lock_state(&self.state).append_scripts.push_back(script);
     }
 
     pub async fn wait_for_operation_count(&self, count: usize) {
@@ -293,6 +302,9 @@ impl SessionLog for FakeSessionLog {
             let _active = active;
             match run_script(script).await {
                 ScriptOutcome::Error(kind) => Err(error(kind)),
+                ScriptOutcome::Page(_) => {
+                    panic!("Script::Page is only supported for read_page")
+                }
                 ScriptOutcome::UnknownOutcome { .. } => {
                     Err(error(SessionLogErrorKind::UnknownOutcome))
                 }
@@ -324,6 +336,9 @@ impl SessionLog for FakeSessionLog {
             let _active = active;
             match run_script(script).await {
                 ScriptOutcome::Error(kind) => Err(error(kind)),
+                ScriptOutcome::Page(_) => {
+                    panic!("Script::Page is only supported for read_page")
+                }
                 ScriptOutcome::UnknownOutcome { .. } => {
                     Err(error(SessionLogErrorKind::UnknownOutcome))
                 }
@@ -359,6 +374,7 @@ impl SessionLog for FakeSessionLog {
             let _active = active;
             match run_script(script).await {
                 ScriptOutcome::Error(kind) => Err(error(kind)),
+                ScriptOutcome::Page(page) => Ok(page),
                 ScriptOutcome::UnknownOutcome { .. } => {
                     Err(error(SessionLogErrorKind::UnknownOutcome))
                 }
@@ -416,6 +432,9 @@ impl SessionLog for FakeSessionLog {
             let _active = active;
             match run_script(script).await {
                 ScriptOutcome::Error(kind) => Err(error(kind)),
+                ScriptOutcome::Page(_) => {
+                    panic!("Script::Page is only supported for read_page")
+                }
                 ScriptOutcome::UnknownOutcome { committed } => {
                     if committed {
                         let mut state = lock_state(&state);
@@ -442,6 +461,9 @@ impl SessionLog for FakeSessionLog {
             let _active = active;
             match run_script(script).await {
                 ScriptOutcome::Error(kind) => Err(error(kind)),
+                ScriptOutcome::Page(_) => {
+                    panic!("Script::Page is only supported for read_page")
+                }
                 ScriptOutcome::UnknownOutcome { .. } => {
                     Err(error(SessionLogErrorKind::UnknownOutcome))
                 }

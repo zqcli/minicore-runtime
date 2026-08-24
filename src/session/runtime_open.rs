@@ -368,7 +368,9 @@ fn map_conversation_error(error: ConversationCommitError) -> SessionOpenError {
         | ConversationCommitErrorKind::Closed
         | ConversationCommitErrorKind::EmptyBatch
         | ConversationCommitErrorKind::TranscriptLimit
-        | ConversationCommitErrorKind::TranscriptInvalid
+        | ConversationCommitErrorKind::TranscriptCursor
+        | ConversationCommitErrorKind::TranscriptContractViolation
+        | ConversationCommitErrorKind::TranscriptProjectionMismatch
         | ConversationCommitErrorKind::SequenceOverflow
         | ConversationCommitErrorKind::Timestamp => SessionOpenError::actor_start_failed(),
     };

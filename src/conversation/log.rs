@@ -87,7 +87,9 @@ pub(crate) enum ConversationCommitErrorKind {
     ReplayInvalid,
     RecoveryUncertain,
     TranscriptLimit,
-    TranscriptInvalid,
+    TranscriptCursor,
+    TranscriptContractViolation,
+    TranscriptProjectionMismatch,
     SequenceOverflow,
     Timestamp,
     Validation,
@@ -461,7 +463,7 @@ impl ConversationLog {
             cursor > self.head()
                 || (cursor != ConversationSeq::ZERO && !self.state.contains_seq(cursor))
         }) {
-            return Err(commit_error(ConversationCommitErrorKind::TranscriptInvalid));
+            return Err(commit_error(ConversationCommitErrorKind::TranscriptCursor));
         }
         if self.durability_unknown {
             return Ok(self.confirmed_transcript(after, limit));
@@ -485,10 +487,16 @@ impl ConversationLog {
         let after_head = after.unwrap_or(ConversationSeq::ZERO);
         if page.observed_head != self.head()
             || !valid_page_contract(&page, after, limit)
-            || !self.state.matches_confirmed_page(after, &page.entries)
             || (page.entries.is_empty() && after_head != self.head())
         {
-            return Err(commit_error(ConversationCommitErrorKind::TranscriptInvalid));
+            return Err(commit_error(
+                ConversationCommitErrorKind::TranscriptContractViolation,
+            ));
+        }
+        if !self.state.matches_confirmed_page(after, &page.entries) {
+            return Err(commit_error(
+                ConversationCommitErrorKind::TranscriptProjectionMismatch,
+            ));
         }
         Ok(TranscriptPage {
             entries: page.entries,
