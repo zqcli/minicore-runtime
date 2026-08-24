@@ -93,6 +93,11 @@ impl fmt::Debug for SessionRuntimeOptions {
     }
 }
 
+/// The unique owner of one loaded Session and its actor resources.
+///
+/// Dropping `SessionRuntime` only triggers best-effort cancellation.
+/// Call `shutdown(self).await` for complete cleanup and the durability barrier.
+#[must_use = "SessionRuntime owns a loaded session and should be retained until explicit shutdown"]
 pub struct SessionRuntime {
     session_id: SessionId,
     instance_id: SessionInstanceId,

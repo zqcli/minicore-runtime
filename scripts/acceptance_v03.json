@@ -102,6 +102,9 @@
 
     {"id":"AT-K91","group":"Event Stream Cutover","criterion":"A capacity-one event queue resumes ordinary delivery and attaches accumulated drops to the next delivered event.","status":"Passed","evidence":[{"kind":"rust_test","file":"src/session/event_stream.rs","test":"capacity_one_recovers_ordinary_events_with_dropped_count"}]},
     {"id":"AT-K92","group":"Event Stream Cutover","criterion":"Event loss counts accumulate exactly, saturate at u64::MAX, and reset after delivery.","status":"Passed","evidence":[{"kind":"rust_test","file":"src/session/event_stream.rs","test":"cumulative_and_saturating_drop_counts_are_exact"}]},
-    {"id":"AT-K93","group":"Event Stream Cutover","criterion":"Dropping SessionEventStream does not block Turn completion.","status":"Passed","evidence":[{"kind":"rust_test","file":"tests/session_state_event_contract.rs","test":"dropping_session_event_stream_does_not_block_turn_completion"}]}
+    {"id":"AT-K93","group":"Event Stream Cutover","criterion":"Dropping SessionEventStream does not block Turn completion.","status":"Passed","evidence":[{"kind":"rust_test","file":"tests/session_state_event_contract.rs","test":"dropping_session_event_stream_does_not_block_turn_completion"}]},
+    {"id":"AT-K94","group":"API Ergonomics","criterion":"SessionEventStream supports StreamExt::next() and receives live events.","status":"Passed","evidence":[{"kind":"rust_test","file":"tests/session_runtime_event_stream_evidence.rs","test":"session_event_stream_next_receives_events"}]},
+    {"id":"AT-K95","group":"API Ergonomics","criterion":"SessionEventStream can be selected against an external CancellationToken.","status":"Passed","evidence":[{"kind":"rust_test","file":"tests/session_runtime_event_stream_evidence.rs","test":"session_event_stream_next_can_be_cancelled_by_external_token"}]},
+    {"id":"AT-K96","group":"API Ergonomics","criterion":"After SessionRuntime shutdown, SessionEventStream drains queued events and eventually returns None.","status":"Passed","evidence":[{"kind":"rust_test","file":"tests/session_runtime_event_stream_evidence.rs","test":"session_event_stream_drains_after_shutdown_and_then_ends"}]}
   ]
 }

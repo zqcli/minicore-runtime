@@ -17,7 +17,7 @@ Tokens are never shared across independent SessionRuntime owners merely because 
 
 Cancellation and completion share one mutex linearization point. The first cancellation request returns `true`; repeated requests and requests after completion return `false`. Completion is first-wins and wakes every cloned waiter with the same result.
 
-Dropping TurnHandle does not cancel. Dropping SessionHandle does not cancel. Only root owner Drop sends root cancellation, and it performs no blocking cleanup.
+Dropping TurnHandle does not cancel. `TurnHandle` is `#[must_use]`; a Host may intentionally detach it, but should record that decision. Dropping SessionHandle does not cancel. Only root owner Drop sends root cancellation, and it performs no blocking cleanup.
 
 ## Deadline Provenance
 
@@ -53,4 +53,4 @@ Core does not promise recovery from arbitrary allocation or invariant panics out
 
 ## Drop Limits
 
-Runtime Drop is cancel-only. It must not use `mem::forget`, `block_on`, synchronous waiting, ownership-taking graceful cleanup, or a new detached task. Explicit `shutdown` is the only durability barrier. Hosts must retain and drive a runtime long enough to await shutdown for every loaded SessionRuntime.
+Runtime Drop is cancel-only and best-effort. It must not use `mem::forget`, `block_on`, synchronous waiting, ownership-taking graceful cleanup, or a new detached task. `SessionRuntime` is `#[must_use]`, and explicit `shutdown(self).await` is the only durability barrier. Hosts must retain and drive a runtime long enough to await shutdown for every loaded SessionRuntime.

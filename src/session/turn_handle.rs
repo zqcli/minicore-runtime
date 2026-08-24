@@ -16,6 +16,11 @@ pub struct TurnOutcome {
     pub usage: Usage,
 }
 
+/// A cloneable handle for cancellation and durable completion of one Turn.
+///
+/// Dropping `TurnHandle` does not cancel the Turn. A Host may intentionally
+/// detach a handle, but should record that decision.
+#[must_use = "TurnHandle should be awaited, cancelled, or intentionally detached"]
 #[derive(Clone)]
 pub struct TurnHandle {
     inner: Arc<TurnInner>,

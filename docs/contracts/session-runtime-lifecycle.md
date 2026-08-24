@@ -68,7 +68,9 @@ Evidence includes `dropped_and_cancelled_open_owners_close_without_orphans`, `pr
 
 ## Drop And Shutdown
 
-`SessionRuntime::drop` is cancel-only. It does not block, spawn, call `block_on`, take the owner task, or claim graceful durability. `SessionHandle` and `TurnHandle` Drop have no owner-lifecycle effect; dropping a TurnHandle does not cancel its Turn.
+`SessionRuntime` is marked `#[must_use]` because it owns a loaded Session. Its Drop is cancellation-only: it does not block, spawn, call `block_on`, take the owner task, or claim graceful durability. Complete cleanup and the durability barrier require `shutdown(self).await`.
+
+`SessionHandle` and `TurnHandle` Drop have no owner-lifecycle effect; dropping a TurnHandle does not cancel its Turn. `TurnHandle` is marked `#[must_use]`; a Host may intentionally detach one, but should record that decision.
 
 `SessionRuntime::shutdown(self)` is the explicit durability barrier:
 

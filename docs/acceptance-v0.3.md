@@ -2,7 +2,7 @@
 
 This matrix is generated from `scripts/acceptance_v03.json`. The mapping is reviewed traceability: the documentation checker validates exact identity, criterion/status/evidence equality, allowed gates, attributed non-ignored Rust tests in Cargo-enabled reachable library sources or direct integration targets, and the current Markdown authority inventory. It does not semantically prove behavior; the remote Rust gates execute the cited evidence.
 
-All functional criteria AT-K01 through AT-K93 passed on the remote Linux validation checkout. Cross-platform validation is complete with passing native macOS and Windows CI.
+All functional criteria AT-K01 through AT-K96 passed on the remote Linux validation checkout. Cross-platform validation is complete with passing native macOS and Windows CI.
 
 ## Validation Environment
 
@@ -177,6 +177,14 @@ All functional acceptance criteria passed on Linux, and native macOS and Windows
 | AT-K91 | A capacity-one event queue resumes ordinary delivery and attaches accumulated drops to the next delivered event. | Passed | [`src/session/event_stream.rs`](../src/session/event_stream.rs) — `capacity_one_recovers_ordinary_events_with_dropped_count` |
 | AT-K92 | Event loss counts accumulate exactly, saturate at u64::MAX, and reset after delivery. | Passed | [`src/session/event_stream.rs`](../src/session/event_stream.rs) — `cumulative_and_saturating_drop_counts_are_exact` |
 | AT-K93 | Dropping SessionEventStream does not block Turn completion. | Passed | [`tests/session_state_event_contract.rs`](../tests/session_state_event_contract.rs) — `dropping_session_event_stream_does_not_block_turn_completion` |
+
+## API Ergonomics
+
+| ID | Criterion | Status | Evidence |
+| --- | --- | --- | --- |
+| AT-K94 | SessionEventStream supports StreamExt::next() and receives live events. | Passed | [`tests/session_runtime_event_stream_evidence.rs`](../tests/session_runtime_event_stream_evidence.rs) — `session_event_stream_next_receives_events` |
+| AT-K95 | SessionEventStream can be selected against an external CancellationToken. | Passed | [`tests/session_runtime_event_stream_evidence.rs`](../tests/session_runtime_event_stream_evidence.rs) — `session_event_stream_next_can_be_cancelled_by_external_token` |
+| AT-K96 | After SessionRuntime shutdown, SessionEventStream drains queued events and eventually returns None. | Passed | [`tests/session_runtime_event_stream_evidence.rs`](../tests/session_runtime_event_stream_evidence.rs) — `session_event_stream_drains_after_shutdown_and_then_ends` |
 
 ## Acceptance Conclusion
 

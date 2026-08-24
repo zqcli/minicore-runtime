@@ -50,7 +50,9 @@ Create initializes a checked v3 manifest and empty Conversation before readiness
 
 `SessionSpec` and `SessionManifest` constructors and Serde deserialization enforce absolute structural safety bounds, while the host-configured `KernelConfig.limits` serves as the sole instance limit enforced during `SessionRuntime::create`, `SessionRuntime::load`, and `SessionBindings::validate`.
 
-Runtime Drop is cancellation-only. `SessionRuntime::shutdown(self)` is the explicit durability barrier that cancels active work, settles where possible, closes the one SessionLog, and joins owner-tracked tasks.
+`SessionRuntime` and `TurnHandle` are `#[must_use]` types, so ignored owners/handles produce compiler warnings. Runtime Drop is cancellation-only and best-effort; `SessionRuntime::shutdown(self)` is the explicit durability barrier that cancels active work, settles where possible, closes the one SessionLog, and joins owner-tracked tasks. TurnHandle Drop does not cancel, and a Host may intentionally detach a handle while recording that decision.
+
+`SessionEventStream` now also implements the additive standard `futures_util::Stream` interface, enabling `StreamExt::next()` and `tokio::select!` while preserving `recv`, `try_recv`, single-consumer ownership, and close semantics. Dropping the stream has no execution effect.
 
 See the [SessionRuntime lifecycle contract](contracts/session-runtime-lifecycle.md), [state contract](contracts/session-state.md), [event contract](contracts/event-stream.md), and [cancellation contract](contracts/cancellation.md).
 
@@ -83,7 +85,7 @@ See the [Conversation contract](contracts/conversation.md).
 
 ## Acceptance
 
-All functional criteria in [AT-K01 through AT-K93](acceptance-v0.3.md) are **Passed on Linux**. `scripts/acceptance_v03.json` is the canonical reviewed traceability mapping; the generated Markdown and attributed evidence are checker-enforced, while the remote Rust gates—not the documentation checker—execute and validate the cited behavior.
+All functional criteria in [AT-K01 through AT-K96](acceptance-v0.3.md) are **Passed on Linux**. `scripts/acceptance_v03.json` is the canonical reviewed traceability mapping; the generated Markdown and attributed evidence are checker-enforced, while the remote Rust gates—not the documentation checker—execute and validate the cited behavior.
 
 Validation environment:
 
@@ -119,8 +121,8 @@ The reviewed comparison uses baseline commit `2fd7104`. “cfg(test)-excluded pr
 
 | Metric | Baseline | Current | Change |
 | --- | ---: | ---: | ---: |
-| cfg(test)-excluded production LOC | 15,483 | 14,226 | -1,257 |
-| raw `src/**/*.rs` lines | 48,055 | 31,205 | -16,850 |
+| cfg(test)-excluded production LOC | 15,483 | 14,251 | -1,232 |
+| raw `src/**/*.rs` lines | 48,055 | 31,230 | -16,825 |
 | `src` Rust files | 174 | 143 | -31 |
 | files with production content | 83 | 77 | -6 |
 

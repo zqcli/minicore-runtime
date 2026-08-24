@@ -7,6 +7,7 @@
 mod v03_public_api_compile_contract {
     use std::sync::Arc;
 
+    use futures_util::StreamExt;
     use tokio::sync::{mpsc, watch};
 
     use minicore_runtime::compaction::CompactionStrategy;
@@ -81,10 +82,11 @@ mod v03_public_api_compile_contract {
         let mut events = take_result?;
         let received: Option<SessionEventEnvelope> = events.recv().await;
         let tried: Result<SessionEventEnvelope, mpsc::error::TryRecvError> = events.try_recv();
+        let streamed: Option<SessionEventEnvelope> = events.next().await;
         let dropped_before = received
             .as_ref()
             .map_or(0, |envelope| envelope.dropped_before);
-        let _ = (received, tried, dropped_before);
+        let _ = (received, tried, streamed, dropped_before);
 
         let handle: SessionHandle = owner.handle();
         assert_eq!(handle.session_id(), owner_session_id);

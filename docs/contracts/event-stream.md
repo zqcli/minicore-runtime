@@ -38,7 +38,9 @@ Events do not expose full tool output, tool arguments, interaction answers, raw 
 
 ## Bounded Single Consumer
 
-`SessionRuntime::take_events()` transfers the only receiver. A second call returns `EventStreamTakenError::AlreadyTaken`. `SessionEventStream` is not Clone and offers `recv` and `try_recv`.
+`SessionRuntime::take_events()` transfers the only receiver. A second call returns `EventStreamTakenError::AlreadyTaken`. `SessionEventStream` is not Clone and offers `recv`, `try_recv`, and the standard `futures_util::Stream` interface for `StreamExt::next()`.
+
+Dropping the stream has no execution effect: it only closes the receiver, while the actor continues without backpressure.
 
 Internal publication uses bounded `try_send` semantics. A slow, absent, full, or closed event consumer never blocks actor progress, Port execution, durable append, Turn completion, or shutdown.
 
