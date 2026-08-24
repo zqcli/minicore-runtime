@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::super::compaction_support::*;
 use super::super::*;
 use crate::agent::runner::compaction::{
-    CompactionState, prepare_model_request, turn_control_outcome,
+    CompactionState, PreparedModelRequest, prepare_model_request, turn_control_outcome,
 };
 use crate::agent::turn_context::TurnRunnerContext;
 use crate::compaction::CompactionStrategy;
@@ -102,7 +102,8 @@ async fn expired_turn_after_context_success_wins_without_strategy_or_boundary() 
     let mut state = CompactionState::default();
     assert!(matches!(
         prepare_model_request(&mut context, 0, usage, &mut state).await,
-        Err(RunnerOutcome::BudgetExceeded { usage: actual }) if actual == usage
+        PreparedModelRequest::Terminal(RunnerOutcome::BudgetExceeded { usage: actual })
+            if actual == usage
     ));
     assert_eq!(provider.requests().len(), 1);
     assert!(model.requests().is_empty());
