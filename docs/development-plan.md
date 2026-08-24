@@ -6,7 +6,7 @@ The final v0.3 source architecture and P6 cleanup validation are complete: the s
 
 `Cargo.lock` was regenerated remotely from the cleaned manifest. The root lock now contains 37 package records; review found 39 removed records, no added records, and no retained-package version drift. The deleted dependencies are absent. Remote formatting and check commands passed, followed by the complete remote `scripts/check.sh` gate.
 
-P8 user documentation is also pending. The repository does not yet contain the required Host-boundary guide, v0.2-to-v0.3 migration guide, complete SessionRuntime lifecycle example, or v0.3 release note.
+P8 documentation and Linux functional acceptance are complete. The nine runtime contracts, Host-boundary guide, v0.2-to-v0.3 migration guide, README lifecycle example, AT-K01 through AT-K73 evidence matrix, and v0.3 release note are current authority. Native macOS and Windows CI were not executed in this session, so publication remains blocked on those external jobs.
 
 ## Implemented Source Milestones
 
@@ -28,16 +28,21 @@ P8 user documentation is also pending. The repository does not yet contain the r
 - [x] Passed remote `scripts/check.sh` under its current toolchain. The script covers root formatting, locked all-target tests, warnings-denied all-target/all-feature Clippy, provider-gate formatting/tests/Clippy, documentation checks, architecture scanner self-tests/full gate, and diff checks.
 - [x] Observed 285 passing root library tests; the cleaned integration suites and provider-gate tests also passed. No aggregate test total is asserted here.
 
-The accurate status is: P6 source, lockfile, and remote Rust/script gates complete. P8 user documentation and release acceptance are next.
+The accurate status is: P6 source, lockfile, and remote Rust/script gates complete; P8 documentation and Linux functional acceptance are complete; the native macOS and Windows CI matrix still blocks publication.
 
-## Pending P8 User Documentation
+## Completed P8 Documentation And Acceptance
 
-- [ ] Add `docs/integration/host-boundary.md` explaining that Hosts own multi-session maps, repositories, storage acquisition, workspace/process authority, credentials, and concrete adapters.
-- [ ] Add `docs/migrations/v0.2-to-v0.3.md` mapping the removed Runtime/registry/store/workspace APIs to SessionRuntime, SessionHandle, SessionBindings, and pre-opened SessionLog adapters.
-- [ ] Add a Host-facing create/load lifecycle example covering SessionRuntimeOptions, external Ports, state/watch, `take_events`, submit/wait, and explicit shutdown without referencing nonexistent adapters.
-- [ ] Add `docs/release-v0.3.md` with breaking changes, validation results, dependency/code-size review, and the actual Rust/platform matrix.
+- [x] Added nine normative contract pages under `docs/contracts/` for lifecycle, state, events, Conversation, SessionLog, Model, Tool/policy/interaction, cancellation, and extensions.
+- [x] Added `docs/integration/host-boundary.md` covering Host collections, repository/lease ownership, storage/workspace capabilities, global limits, shared Ports, and shutdown-all.
+- [x] Added `docs/migrations/v0.2-to-v0.3.md` with exact breaking API/ownership mappings and an external storage migration checklist.
+- [x] Added the all-target `examples/session_runtime_lifecycle.rs`; README contains an exact synchronized copy whose failure path always shuts down and joins the event task before propagating errors.
+- [x] Added canonical `scripts/acceptance_v03.json` and generated `docs/acceptance-v0.3.md` with one Passed row and one-or-more attributed evidence entries for every AT-K criterion.
+- [x] Added checker mutation evidence for unrelated Markdown mapping edits, stale unlisted current Markdown, and functions missing a Rust test attribute.
+- [x] Added `docs/release-v0.3.md` with D-01 through D-15, breaking changes, evidence, dependency/lock review, known limitations, and upgrade guidance.
+- [x] Recorded Linux functional acceptance, stable/MSRV commands, warnings-denied rustdoc, 285 root library tests, integration/provider suites, scanner output, and lock metrics.
+- [ ] Obtain passing native macOS and Windows CI jobs before publication.
 
-P8 remains pending until these files exist and their examples and claims are checked against the final public API and completed remote evidence.
+P8 documentation and functional acceptance are complete. The remaining release-candidate limitation is external native CI, not missing Core implementation or documentation.
 
 ## Current Authority Inventory
 
@@ -47,14 +52,29 @@ The current, non-archive documentation authority is exactly:
 - `CONTEXT.md`
 - `docs/README.md`
 - `docs/architecture.md`
+- `docs/acceptance-v0.3.md`
 - `docs/development-plan.md`
+- `docs/release-v0.3.md`
 - `docs/modules/README.md`
+- `docs/contracts/session-runtime-lifecycle.md`
+- `docs/contracts/session-state.md`
+- `docs/contracts/event-stream.md`
+- `docs/contracts/conversation.md`
+- `docs/contracts/session-log.md`
+- `docs/contracts/model.md`
+- `docs/contracts/tool-policy-interaction.md`
+- `docs/contracts/cancellation.md`
+- `docs/contracts/extensions.md`
+- `docs/integration/host-boundary.md`
+- `docs/migrations/v0.2-to-v0.3.md`
 - `docs/adr/README.md`
 - `docs/adr/0200-v0.2-core-reset-uses-typed-runtime.md`
 - `docs/adr/0203-model-calls-are-single-attempt-with-turn-retry.md`
 - `tests/README.md`
 
-There are currently no authoritative format specifications, migration guide, Host-boundary guide, v0.3 release note, or complete runtime lifecycle example. Historical v0.1/v0.2 formats, migration, release, workspace, store, ADR, and review material remains under `docs/archive/v2/` and is not validated as current API documentation.
+The only non-archive Markdown allowed outside authority is the root `minicore-runtime-v0.3-session-runtime-refactor-spec.md`. It is untracked implementation input and **MUST NOT be committed**. The checker allows it to be present or absent without checking Git tracking, and rejects every other missing authority file or unlisted current Markdown file.
+
+Core intentionally defines no concrete persistence-format specification because SessionLog adapters are Host-owned. Historical v0.1/v0.2 formats, migration, release, workspace, store, ADR, and review material remains under `docs/archive/v2/` and is not validated as current API documentation.
 
 ## Local Maintenance Gates
 
@@ -67,7 +87,7 @@ Local work for this refactor uses only non-Rust checks:
 5. Python syntax, source-contract, path, UTF-8, newline, width, and size checks.
 6. `git diff --check` and verification that no unrelated files are staged or reverted.
 
-The completed P6 remote evidence is recorded above. P8 release acceptance must document any additional release-note, example, rustdoc, or platform-matrix evidence when those checks are actually run.
+The completed P6/P8 evidence is recorded in `docs/acceptance-v0.3.md` and `docs/release-v0.3.md`. Publication remains blocked until the configured native macOS and Windows CI jobs pass and those results are added without inference.
 
 ## Non-Core Limits
 

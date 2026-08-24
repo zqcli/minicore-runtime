@@ -26,12 +26,21 @@ The root test suite covers only the final v0.3 public surface and private execut
 - `session_runtime_interaction_contract.rs` covers approval suspension, denial, cancellation, ToolResult durability, and answer/cancellation races.
 - `session_runtime_command_contract.rs` covers bounded mailbox pressure and submit receiver-loss ownership.
 - `session_runtime_compaction_commit_contract.rs` covers actor-owned Summary failure handling and continuation suppression.
+- `session_runtime_lifecycle_evidence.rs` covers already-initialized create failure, reload/stale-instance isolation, exact Busy admission, conflict degradation, and shutdown under a full mailbox.
+- `session_runtime_context_failure_evidence.rs` covers ordinary Model failure and real-runtime Context error/timeout/panic settlement with Healthy actor state.
+- `session_runtime_tool_policy_failure_evidence.rs` covers ordinary Tool errors plus Tool and Policy timeout/panic behavior through SessionRuntime.
+- `session_runtime_restart_event_evidence.rs` covers nondurable interaction restart repair, forced event loss with authoritative state/Turn/transcript, and atomic unresolved-tool settlement.
+- `session_runtime_shared_ports_evidence.rs` proves two owners use the exact same Model/ToolPolicy/ContextProvider Arcs concurrently while cancellation remains isolated.
+- `event_summary_structure_contract.rs` locks the public event summary field set against payload, argument, answer, and raw-error expansion.
 - Private runtime test `post_ready_actor_panic_joins_pending_runner_before_close` proves the real post-ready panic supervisor joins the pending runner before close.
 
 ## Architecture
 
 - `p1_surface.rs` and `final_architecture_contract.rs` protect the exact root facade and physical absence of removed implementation paths.
 - `api_compile.rs` type-checks the complete final public workflow.
+- `examples/session_runtime_lifecycle.rs` is an all-target compiled, failure-safe Host lifecycle example; the documentation checker requires README to contain its exact marked body.
 - `scripts/check_v03_architecture.py` is the authoritative module/dependency/path/Port/DAG gate; its fixture self-tests live in `scripts/check_v03_architecture_test.py`.
 
 The standalone `provider-gate/` package is deterministic historical protocol evidence and does not define a root-crate adapter API.
+
+The canonical criterion-by-criterion mapping is `scripts/acceptance_v03.json`; [docs/acceptance-v0.3.md](../docs/acceptance-v0.3.md) is generated from it. This is reviewed traceability, not semantic proof by the documentation checker: remote Rust gates execute the attributed tests. The mapping records AT-K01 through AT-K73, the remote Rust/doc environment, and the native CI publication blocker.

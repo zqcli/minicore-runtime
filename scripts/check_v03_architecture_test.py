@@ -18,7 +18,9 @@ if __package__:
         PRIVATE_MODULES,
         REQUIRED_FILES,
         ROOT_EXPORTS,
+        mask_rust,
         production_view,
+        root_module_declarations,
         scan,
     )
 else:
@@ -30,7 +32,9 @@ else:
         PRIVATE_MODULES,
         REQUIRED_FILES,
         ROOT_EXPORTS,
+        mask_rust,
         production_view,
+        root_module_declarations,
         scan,
     )
 
@@ -463,6 +467,25 @@ def self_test() -> None:
             "let character = 'R';\nfn borrowed<'a>(value: &'a str) -> &'a str { value }\n",
             encoding="utf-8",
         )
+        lifetime_mask = mask_rust("fn borrowed<'a>(value: &'a str) -> &'a str { value }")
+        assert "fn borrowed< a>(value: & a str) -> & a str { value }" == lifetime_mask
+        prefixed_source = (
+            "\ufeff#!/usr/bin/env tool(arg)[x]{y}\n"
+            "#![cfg(test)]\nfn prefixed() {}\n"
+        )
+        prefixed_mask = mask_rust(prefixed_source)
+        attribute_start = prefixed_source.index("#![cfg(test)]")
+        assert len(prefixed_mask) == len(prefixed_source)
+        assert not prefixed_mask[:attribute_start].strip()
+        assert prefixed_mask[attribute_start:].startswith("#![cfg(test)]")
+        assert mask_rust("#![cfg(test)]\nfn ordinary() {}\n").startswith("#![")
+        root_modules = mask_rust(
+            "pub mod real;\nmod private_real;\n"
+            "macro_rules! brace {\n    () => {\n        pub mod fake_brace;\n    };\n}\n"
+            "macro_rules! paren (\n    pub mod fake_paren;\n);\n"
+            "macro_rules! bracket [\n    pub mod fake_bracket;\n];\n"
+        )
+        assert root_module_declarations(root_modules) == ({"real"}, {"private_real"})
         assert not scan(masking), scan(masking)
         (masking / "src/value.rs").write_text("use tokio :: { net :: TcpStream };\n", encoding="utf-8")
         expect_failure(masking, "forbidden production import")

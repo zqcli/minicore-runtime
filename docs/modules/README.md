@@ -66,7 +66,9 @@ src/
 
 ## Tests
 
-Focused source contracts protect each public Port and private driver boundary. Public integration tests cover create/load/shutdown, command admission, interactions, compaction commits, durability failures, transcript behavior, panic cleanup, and concurrent owner isolation. `tests/final_architecture_contract.rs` plus `scripts/check_v03_architecture.py` protect physical absence of the removed graph and the exact root/dependency/module surface.
+Focused source contracts protect each public Port and private driver boundary. Public integration tests cover create/load/shutdown, command admission, interactions/restart, forced event loss, compaction commits, Port failures, durability failures, transcript behavior, panic cleanup, shared-Port concurrency, and owner isolation. `tests/final_architecture_contract.rs` plus `scripts/check_v03_architecture.py` protect physical absence of the removed graph and the exact root/dependency/module surface. `scripts/acceptance_v03.json` is the canonical reviewed AT traceability map, and the documentation checker requires its generated Markdown and attributed tests to remain synchronized.
+
+The normative behavior pages are indexed from [Documentation Authority](../README.md): [SessionRuntime lifecycle](../contracts/session-runtime-lifecycle.md), [state](../contracts/session-state.md), [events](../contracts/event-stream.md), [Conversation](../contracts/conversation.md), [SessionLog](../contracts/session-log.md), [Model](../contracts/model.md), [Tool/policy/interaction](../contracts/tool-policy-interaction.md), [cancellation](../contracts/cancellation.md), and [extensions](../contracts/extensions.md). Host ownership is defined in the [Host boundary](../integration/host-boundary.md), and final evidence is recorded in the [acceptance matrix](../acceptance-v0.3.md).
 
 ## Boundary Rules
 

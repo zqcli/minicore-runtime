@@ -201,10 +201,19 @@ def raw_prefix(text: str, index: int) -> tuple[int, int, str] | None:
     return start, index, '"' + ("#" * hashes)
 
 
+def rust_file_prefix_end(text: str) -> int:
+    cursor = 1 if text.startswith("\ufeff") else 0
+    if text.startswith("#!", cursor) and not text.startswith("#![", cursor):
+        newline = text.find("\n", cursor)
+        return len(text) if newline < 0 else newline + 1
+    return cursor
+
+
 def mask_rust(text: str) -> str:
-    """Mask comments, ordinary/raw strings, byte strings, chars, and lifetimes."""
+    """Mask file prefixes, comments, strings, byte strings, chars, and lifetimes."""
     chars = list(text)
-    index = 0
+    index = rust_file_prefix_end(text)
+    blank(chars, 0, index)
     block_depth = 0
     while index < len(text):
         if block_depth:
@@ -257,6 +266,19 @@ def mask_rust(text: str) -> str:
             continue
         char_quote = index + 1 if text.startswith("b'", index) else index
         if text[index] == "'" or text.startswith("b'", index):
+            if text[index] == "'" and index + 1 < len(text):
+                next_character = text[index + 1]
+                if next_character == "_" or next_character.isalpha():
+                    lifetime_end = index + 2
+                    while lifetime_end < len(text):
+                        character = text[lifetime_end]
+                        if character != "_" and not character.isalnum():
+                            break
+                        lifetime_end += 1
+                    if lifetime_end >= len(text) or text[lifetime_end] != "'":
+                        chars[index] = " "
+                        index += 1
+                        continue
             cursor = char_quote + 1
             escaped = False
             found = False
@@ -613,17 +635,35 @@ def root_pub_use_statements(masked: str) -> list[str]:
     return result
 
 
+def root_delimiter_stack_empty(masked: str, position: int) -> bool:
+    stack: list[str] = []
+    pairs = {"}": "{", ")": "(", "]": "["}
+    for token in masked[:position]:
+        if token in "{([":
+            stack.append(token)
+        elif token in pairs:
+            if not stack or stack[-1] != pairs[token]:
+                return False
+            stack.pop()
+    return not stack
+
+
 def root_module_declarations(masked: str) -> tuple[set[str], set[str]]:
     public: set[str] = set()
     private: set[str] = set()
-    depth = 0
-    for line in masked.splitlines():
-        if depth == 0:
-            public.update(re.findall(r"^\s*pub\s+mod\s+([A-Za-z_]\w*)\s*(?:;|\{)", line))
-            private.update(re.findall(r"^\s*(?:pub\(crate\)\s+)?mod\s+([A-Za-z_]\w*)\s*(?:;|\{)", line))
-            private.difference_update(public)
-        depth += line.count("{") - line.count("}")
-        depth = max(0, depth)
+    pattern = re.compile(
+        r"^[ \t]*(?P<visibility>pub(?:[ \t]*\([ \t]*crate[ \t]*\))?[ \t]+)?"
+        r"mod[ \t]+(?P<name>[A-Za-z_]\w*)[ \t]*(?:;|\{)",
+        re.MULTILINE,
+    )
+    for declaration in pattern.finditer(masked):
+        if not root_delimiter_stack_empty(masked, declaration.start()):
+            continue
+        visibility = re.sub(r"\s+", "", declaration.group("visibility") or "")
+        if visibility == "pub":
+            public.add(declaration.group("name"))
+        else:
+            private.add(declaration.group("name"))
     return public, private
 
 
