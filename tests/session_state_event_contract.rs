@@ -1,3 +1,6 @@
+pub mod support;
+
+use minicore_runtime::config::{TurnOptions, UserInput};
 use minicore_runtime::conversation::{ConversationSeq, TurnTerminal};
 use minicore_runtime::error::{
     DiagnosticCategory, DiagnosticCode, DiagnosticSummary, EventStreamTakenError,
@@ -12,6 +15,9 @@ use minicore_runtime::tools::{ApprovalRequest, ApprovalRisk, ToolProgress, ToolR
 use minicore_runtime::{
     BoundedText, InteractionId, SessionId, SessionInstanceId, ToolCallId, TurnId,
 };
+
+use support::fake_session_log::FakeSessionLog;
+use support::transcript_runtime::{create_runtime, session};
 
 fn session_id() -> SessionId {
     "ses_00000000000000000000000000000001".parse().unwrap()
@@ -93,7 +99,6 @@ fn event_name(event: &SessionEvent) -> &'static str {
         SessionEvent::InteractionResolved { .. } => "interaction_resolved",
         SessionEvent::HealthChanged { .. } => "health_changed",
         SessionEvent::TurnFinished { .. } => "turn_finished",
-        SessionEvent::EventsDropped { .. } => "events_dropped",
     }
 }
 
@@ -376,7 +381,6 @@ fn event_variants_envelope_and_stream_surface_are_exact() {
             turn_id: turn,
             outcome: outcome(turn, TurnTerminal::Completed),
         },
-        SessionEvent::EventsDropped { count: 3 },
     ];
     for event in &events {
         assert!(!event_name(event).is_empty());
@@ -389,10 +393,12 @@ fn event_variants_envelope_and_stream_surface_are_exact() {
     let envelope = SessionEventEnvelope {
         session_id: session_id(),
         instance_id: instance_id(),
+        dropped_before: 0,
         event: events[0].clone(),
     };
     assert_eq!(envelope.session_id, session_id());
     assert_eq!(envelope.instance_id, instance_id());
+    assert_eq!(envelope.dropped_before, 0);
 
     assert_eq!(
         EventStreamTakenError::AlreadyTaken.to_string(),
@@ -412,10 +418,14 @@ fn event_variants_envelope_and_stream_surface_are_exact() {
         "cursor",
         "revision",
         "epoch",
+        "MarkerReserved",
     ] {
         assert!(!stream.contains(forbidden));
     }
     let event_source = include_str!("../src/session/event.rs");
+    assert!(event_source.contains("pub dropped_before: u64"));
+    assert!(!event_source.contains("EventsDropped"));
+    assert!(!stream.contains("EventsDropped"));
     for forbidden in [
         "Serialize",
         "Deserialize",
@@ -440,4 +450,18 @@ fn event_variants_envelope_and_stream_surface_are_exact() {
             assert!(!final_source.contains(forbidden));
         }
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_session_event_stream_does_not_block_turn_completion() {
+    let log = FakeSessionLog::new();
+    let (runtime, handle, _inspection, events) = create_runtime(session(93), log).await;
+    drop(events);
+    let turn = handle
+        .submit(UserInput::text("test").unwrap(), TurnOptions::default())
+        .await
+        .unwrap();
+    let outcome = turn.wait().await.unwrap();
+    assert!(matches!(outcome.terminal, TurnTerminal::Completed));
+    runtime.shutdown().await.unwrap();
 }

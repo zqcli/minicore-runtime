@@ -10,6 +10,12 @@ A Host now owns its Session collection, repositories, writer leases, concrete st
 
 See [Migrating from v0.2 to v0.3](migrations/v0.2-to-v0.3.md) and the [Host boundary](integration/host-boundary.md).
 
+The event stream also has a direct breaking cutover: `SessionEventEnvelope` now exposes public
+`dropped_before: u64`, every dropped count is attached to the next successfully delivered ordinary
+event, and the `SessionEvent::EventsDropped` variant plus the internal marker-reservation error
+are removed. A closed receiver returns `Closed` without increasing the accumulated count. There is
+no compatibility marker or legacy event shape.
+
 ## Final Decisions
 
 | ID | Decision | Explicitly excluded |
@@ -77,7 +83,7 @@ See the [Conversation contract](contracts/conversation.md).
 
 ## Acceptance
 
-All functional criteria in [AT-K01 through AT-K90](acceptance-v0.3.md) are **Passed on Linux**. `scripts/acceptance_v03.json` is the canonical reviewed traceability mapping; the generated Markdown and attributed evidence are checker-enforced, while the remote Rust gates—not the documentation checker—execute and validate the cited behavior.
+All functional criteria in [AT-K01 through AT-K93](acceptance-v0.3.md) are **Passed on Linux**. `scripts/acceptance_v03.json` is the canonical reviewed traceability mapping; the generated Markdown and attributed evidence are checker-enforced, while the remote Rust gates—not the documentation checker—execute and validate the cited behavior.
 
 Validation environment:
 
@@ -113,8 +119,8 @@ The reviewed comparison uses baseline commit `2fd7104`. “cfg(test)-excluded pr
 
 | Metric | Baseline | Current | Change |
 | --- | ---: | ---: | ---: |
-| cfg(test)-excluded production LOC | 15,483 | 14,239 | -1,244 |
-| raw `src/**/*.rs` lines | 48,055 | 31,191 | -16,864 |
+| cfg(test)-excluded production LOC | 15,483 | 14,226 | -1,257 |
+| raw `src/**/*.rs` lines | 48,055 | 31,205 | -16,850 |
 | `src` Rust files | 174 | 143 | -31 |
 | files with production content | 83 | 77 | -6 |
 

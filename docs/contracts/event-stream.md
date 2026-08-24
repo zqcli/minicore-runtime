@@ -10,7 +10,11 @@ Every item is a `SessionEventEnvelope` containing:
 
 - `session_id`;
 - `instance_id`;
+- `dropped_before`, the saturating count of events lost immediately before this item;
 - one `SessionEvent`.
+
+`dropped_before` is zero when no event was lost since the previous successful delivery. It is
+informational only; it is not a replay cursor or a durability guarantee.
 
 Turn-scoped variants carry their exact `TurnId`; Tool variants also carry `ToolCallId` and safe `ToolName` identity. `InteractionRequested` carries a checked `PendingInteraction`. The instance ID prevents events from an older load from being mistaken for a newer runtime of the same durable Session.
 
@@ -28,8 +32,7 @@ The event variants are exactly:
 - `InteractionRequested`;
 - `InteractionResolved` with a typed summary;
 - `HealthChanged`;
-- `TurnFinished` with the durable `TurnOutcome`;
-- `EventsDropped` with a cumulative count.
+- `TurnFinished` with the durable `TurnOutcome`.
 
 Events do not expose full tool output, tool arguments, interaction answers, raw adapter errors, credentials, or host paths.
 
@@ -41,11 +44,17 @@ Internal publication uses bounded `try_send` semantics. A slow, absent, full, or
 
 ## Dropped Semantics
 
-When an ordinary event cannot be enqueued because the queue is full, the sink increments a saturating drop counter and returns success to the actor. Before a later ordinary event, it first attempts to enqueue `EventsDropped { count }`.
+For every ordinary event, the sink makes one nonblocking `try_send` attempt for that actual event,
+with the current accumulated loss count in `dropped_before`. A successful send clears the counter.
 
-If the marker attempt is also full, the current ordinary event is dropped too and the counter increases. When space becomes available, the marker precedes the next successfully enqueued ordinary event. `EventsDropped` is reserved to the internal sink; producers cannot inject their own marker.
+When the queue is full, the current event is lost, the counter becomes the previous count plus one
+with `u64::saturating_add`, and the actor still receives success. The next event that fits carries
+the exact accumulated count, so a capacity-one queue cannot be starved by a separate marker. If the
+receiver is closed, `try_emit` returns `Closed` and leaves the accumulated count unchanged; it does
+not keep growing after the stream has gone away.
 
-The count reports events lost since the previous successfully enqueued marker. It is not a sequence cursor and does not make the stream replayable.
+The count reports events lost since the previous successfully enqueued ordinary event. It is not a
+sequence cursor and does not make the stream replayable.
 
 ## Ordering Guarantees
 
@@ -55,7 +64,7 @@ Ordering applies only to events that are successfully enqueued:
 - WaitingForInput state is published before `InteractionRequested`;
 - durable ToolResult append precedes `ToolFinished`;
 - durable terminal append and authoritative state/TurnHandle completion precede `TurnFinished`;
-- a pending drop marker precedes the next ordinary event.
+- a successfully delivered event carries the loss count accumulated before it.
 
 Loss can remove any best-effort event, including interaction and terminal notifications. It cannot reorder durable Conversation entries or change state.
 
@@ -69,4 +78,4 @@ Use:
 - `TurnHandle::wait` for exact Turn completion;
 - `SessionHandle::transcript` for confirmed durable history.
 
-Never use EventStream replay, absence, or an `EventsDropped` count as a durability fact.
+Never use EventStream replay, absence, or a `dropped_before` count as a durability fact.

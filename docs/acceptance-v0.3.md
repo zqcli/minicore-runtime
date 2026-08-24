@@ -2,7 +2,7 @@
 
 This matrix is generated from `scripts/acceptance_v03.json`. The mapping is reviewed traceability: the documentation checker validates exact identity, criterion/status/evidence equality, allowed gates, attributed non-ignored Rust tests in Cargo-enabled reachable library sources or direct integration targets, and the current Markdown authority inventory. It does not semantically prove behavior; the remote Rust gates execute the cited evidence.
 
-All functional criteria AT-K01 through AT-K90 passed on the remote Linux validation checkout. Cross-platform validation is complete with passing native macOS and Windows CI.
+All functional criteria AT-K01 through AT-K93 passed on the remote Linux validation checkout. Cross-platform validation is complete with passing native macOS and Windows CI.
 
 ## Validation Environment
 
@@ -104,11 +104,11 @@ All functional acceptance criteria passed on Linux, and native macOS and Windows
 | ID | Criterion | Status | Evidence |
 | --- | --- | --- | --- |
 | AT-K45 | The state watch has its initial value before SessionRuntime returns. | Passed | [`src/session/actor/tests.rs`](../src/session/actor/tests.rs) — `initial_state_rehydrates_head_terminal_and_final_handle_identity` |
-| AT-K46 | A slow or absent event consumer does not block Turn completion. | Passed | [`src/session/event_stream.rs`](../src/session/event_stream.rs) — `channel_capacity_is_checked_and_stream_is_truly_bounded`; [`src/agent/runner/tests/model_only.rs`](../src/agent/runner/tests/model_only.rs) — `progress_full_or_closed_never_controls_model_completion` |
-| AT-K47 | A full event queue accumulates loss and attempts an EventsDropped marker. | Passed | [`src/session/event_stream.rs`](../src/session/event_stream.rs) — `full_marker_attempt_accumulates_then_precedes_the_next_ordinary_event` |
+| AT-K46 | A slow or absent event consumer does not block Turn completion. | Passed | [`src/session/event_stream.rs`](../src/session/event_stream.rs) — `channel_capacity_is_checked_and_closed_receiver_is_terminal`; [`src/agent/runner/tests/model_only.rs`](../src/agent/runner/tests/model_only.rs) — `progress_full_or_closed_never_controls_model_completion` |
+| AT-K47 | A full event queue accumulates loss and attaches it to the next delivered ordinary event. | Passed | [`src/session/event_stream.rs`](../src/session/event_stream.rs) — `capacity_one_recovers_ordinary_events_with_dropped_count`; [`src/session/event_stream.rs`](../src/session/event_stream.rs) — `cumulative_and_saturating_drop_counts_are_exact` |
 | AT-K48 | If InteractionRequested is dropped, pending state still allows the interaction to be answered. | Passed | [`tests/session_runtime_restart_event_evidence.rs`](../tests/session_runtime_restart_event_evidence.rs) — `dropped_interaction_and_turn_events_leave_state_wait_and_transcript_authoritative` |
 | AT-K49 | If TurnFinished is dropped, TurnHandle wait and transcript still expose the result. | Passed | [`tests/session_runtime_restart_event_evidence.rs`](../tests/session_runtime_restart_event_evidence.rs) — `dropped_interaction_and_turn_events_leave_state_wait_and_transcript_authoritative` |
-| AT-K50 | Every event envelope and scoped variant carries the correct SessionId, SessionInstanceId, and TurnId. | Passed | [`tests/session_state_event_contract.rs`](../tests/session_state_event_contract.rs) — `event_variants_envelope_and_stream_surface_are_exact`; [`src/session/event_stream.rs`](../src/session/event_stream.rs) — `full_marker_attempt_accumulates_then_precedes_the_next_ordinary_event` |
+| AT-K50 | Every event envelope and scoped variant carries the correct SessionId, SessionInstanceId, TurnId, and dropped-before count. | Passed | [`tests/session_state_event_contract.rs`](../tests/session_state_event_contract.rs) — `event_variants_envelope_and_stream_surface_are_exact`; [`src/session/event_stream.rs`](../src/session/event_stream.rs) — `cumulative_and_saturating_drop_counts_are_exact` |
 
 ## Ports Cancellation And Panic
 
@@ -169,6 +169,14 @@ All functional acceptance criteria passed on Linux, and native macOS and Windows
 | AT-K88 | Stream interruption with Started delivery state is not automatically retried. | Passed | [`tests/session_runtime_model_retry_evidence.rs`](../tests/session_runtime_model_retry_evidence.rs) — `model_retry_started_stream_interrupted_does_not_retry` |
 | AT-K89 | RateLimited ModelError retry behavior depends strictly on explicit delivery state and retry hint. | Passed | [`tests/session_runtime_model_retry_evidence.rs`](../tests/session_runtime_model_retry_evidence.rs) — `model_retry_rate_limited_retry_depends_on_explicit_delivery_and_hint` |
 | AT-K90 | Model retry backoff sleep responds promptly to cancellation without executing subsequent attempts. | Passed | [`tests/session_runtime_model_retry_evidence.rs`](../tests/session_runtime_model_retry_evidence.rs) — `model_retry_sleep_responds_to_cancellation` |
+
+## Event Stream Cutover
+
+| ID | Criterion | Status | Evidence |
+| --- | --- | --- | --- |
+| AT-K91 | A capacity-one event queue resumes ordinary delivery and attaches accumulated drops to the next delivered event. | Passed | [`src/session/event_stream.rs`](../src/session/event_stream.rs) — `capacity_one_recovers_ordinary_events_with_dropped_count` |
+| AT-K92 | Event loss counts accumulate exactly, saturate at u64::MAX, and reset after delivery. | Passed | [`src/session/event_stream.rs`](../src/session/event_stream.rs) — `cumulative_and_saturating_drop_counts_are_exact` |
+| AT-K93 | Dropping SessionEventStream does not block Turn completion. | Passed | [`tests/session_state_event_contract.rs`](../tests/session_state_event_contract.rs) — `dropping_session_event_stream_does_not_block_turn_completion` |
 
 ## Acceptance Conclusion
 
