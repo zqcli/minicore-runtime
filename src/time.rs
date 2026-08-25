@@ -10,12 +10,6 @@ use thiserror::Error;
 use tokio::time::Instant as TokioInstant;
 
 // Keep this foundation type-checked before the SessionActor slice consumes it.
-const _: () = {
-    let _ = std::mem::size_of::<Timestamp>();
-    let _: fn(&str) -> Result<Timestamp, TimestampError> = Timestamp::new;
-    let _: fn() -> Result<Timestamp, TimestampError> = Timestamp::now_utc;
-    let _: fn(&Timestamp) -> &str = Timestamp::as_str;
-};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeadlineSource {

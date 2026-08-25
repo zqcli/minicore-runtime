@@ -170,15 +170,6 @@ impl TurnInner {
     }
 }
 
-const _: () = {
-    let _ = std::mem::size_of::<TurnCompletion>();
-    let _ = TurnHandle::new;
-    let _ = TurnCompletion::finish;
-    let _ = TurnCompletion::durability_unknown;
-    let _ = TurnCompletion::durability_unavailable;
-    let _ = TurnCompletion::runtime_terminated;
-};
-
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, task::Poll};

@@ -104,14 +104,6 @@ pub(crate) enum ModelDriverProgress {
     ReasoningDelta(BoundedText),
 }
 
-impl ModelDriverProgress {
-    pub(super) fn delta(&self) -> &BoundedText {
-        match self {
-            Self::TextDelta(delta) | Self::ReasoningDelta(delta) => delta,
-        }
-    }
-}
-
 pub(crate) struct ModelDriver {
     model: Arc<dyn Model>,
     descriptor: ModelDescriptor,
@@ -145,6 +137,7 @@ impl ModelDriver {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn run(
         &self,
         request: ModelRequest,

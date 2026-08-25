@@ -46,12 +46,6 @@ pub(crate) enum SuspensionError {
     RuntimeClosed,
 }
 
-impl SuspensionError {
-    pub(crate) const fn stale_turn() -> Self {
-        Self::StaleTurn
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitAck {
     pub(crate) head: ConversationSeq,
@@ -99,6 +93,7 @@ impl RunnerOutcome {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn diagnostic(&self) -> Option<&DiagnosticSummary> {
         match self {
             Self::Failed { diagnostic, .. } => Some(diagnostic),

@@ -67,6 +67,7 @@ impl ContextDriver {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn provide(
         &self,
         request: ContextRequest,

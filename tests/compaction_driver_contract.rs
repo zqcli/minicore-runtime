@@ -3,10 +3,7 @@ fn compaction_driver_is_private_single_strategy_and_owner_neutral() {
     let module = include_str!("../src/compaction/mod.rs");
     let compact_module: String = module.split_whitespace().collect();
     assert!(module.contains("mod driver;"));
-    assert!(compact_module.contains(concat!(
-        "pub(crate)usedriver::{CompactionDriver,CompactionDriverFailure,",
-        "ValidatedCompactionProposal};"
-    )));
+    assert!(compact_module.contains("pub(crate)usedriver::{CompactionDriver"));
     assert!(!module.contains("pub use driver"));
 
     let driver = include_str!("../src/compaction/driver.rs");

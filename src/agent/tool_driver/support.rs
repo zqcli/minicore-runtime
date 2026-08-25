@@ -21,24 +21,11 @@ pub(super) enum ExecutionResolution {
     DeadlineExceeded,
 }
 
+#[cfg(test)]
 impl ToolDriverProgress {
     pub(crate) const fn tool_call_id(&self) -> &ToolCallId {
         match self {
             Self::Started { tool_call_id, .. } | Self::Update { tool_call_id, .. } => tool_call_id,
-        }
-    }
-
-    pub(crate) const fn tool_name(&self) -> Option<&crate::tools::ToolName> {
-        match self {
-            Self::Started { tool_name, .. } => Some(tool_name),
-            Self::Update { .. } => None,
-        }
-    }
-
-    pub(crate) const fn progress(&self) -> Option<&ToolProgress> {
-        match self {
-            Self::Update { progress, .. } => Some(progress),
-            Self::Started { .. } => None,
         }
     }
 }
