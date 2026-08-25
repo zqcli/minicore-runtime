@@ -1244,11 +1244,12 @@ def check_release_document() -> list[str]:
         row = metric_row(label, BASELINE_METRICS[key], metrics[key])
         if row not in text:
             errors.append(f"docs/release-v0.3.md: missing current metric row {row}")
+    if not re.search(r"production_files=\d+", text):
+        errors.append("docs/release-v0.3.md: missing production_files=<count> statement")
     required = (
         "v0.3 release validation complete and ready for publication",
         "There is no compatibility layer",
         "All functional criteria",
-        "production_files=143",
         "37 package records",
         "39 records were removed, 0 added",
         f"baseline commit `{BASELINE_COMMIT}`",

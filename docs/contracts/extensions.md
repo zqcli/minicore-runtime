@@ -2,7 +2,7 @@
 
 MiniCore extends only through typed Ports and immutable checked DTOs. It has no generic extension registry or privileged lifecycle escape hatch.
 
-Primary source surfaces: [`src/bindings.rs`](../../src/bindings.rs), [`src/model/model.rs`](../../src/model/model.rs), [`src/tools/tool.rs`](../../src/tools/tool.rs), [`src/tools/policy.rs`](../../src/tools/policy.rs), [`src/context/provider.rs`](../../src/context/provider.rs), [`src/compaction/strategy.rs`](../../src/compaction/strategy.rs), and [`src/conversation/session_log.rs`](../../src/conversation/session_log.rs). Boundary evidence: [`final_architecture_contract.rs`](../../tests/final_architecture_contract.rs), the authoritative [`check_v03_architecture.py`](../../scripts/check_v03_architecture.py), and exact shared-Arc concurrency in [`session_runtime_shared_ports_evidence.rs`](../../tests/session_runtime_shared_ports_evidence.rs).
+Primary source surfaces: [`src/bindings.rs`](../../src/bindings.rs), [`src/model/model.rs`](../../src/model/model.rs), [`src/tools/tool.rs`](../../src/tools/tool.rs), [`src/tools/policy.rs`](../../src/tools/policy.rs), [`src/context/provider.rs`](../../src/context/provider.rs), [`src/compaction/strategy.rs`](../../src/compaction/strategy.rs), and [`src/conversation/session_log.rs`](../../src/conversation/session_log.rs). Boundary evidence: the authoritative [`check_v03_architecture.py`](../../scripts/check_v03_architecture.py), and exact shared-Arc concurrency in [`session_runtime_shared_ports_evidence.rs`](../../tests/session_runtime_shared_ports_evidence.rs).
 
 ## Supported Seams
 

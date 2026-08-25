@@ -130,7 +130,7 @@ All functional acceptance criteria passed on Linux, and native macOS and Windows
 | ID | Criterion | Status | Evidence |
 | --- | --- | --- | --- |
 | AT-K61 | Production source contains no std::fs, std::process, reqwest, cap_std, or fs4 authority. | Passed | [v0.3 architecture gate](../scripts/check_v03_architecture.py) |
-| AT-K62 | Production source contains no Workspace, builtin Tool, concrete Provider, or concrete Store. | Passed | [`tests/final_architecture_contract.rs`](../tests/final_architecture_contract.rs) — `removed_implementation_graph_is_physically_absent`; [v0.3 architecture gate](../scripts/check_v03_architecture.py) |
+| AT-K62 | Production source contains no Workspace, builtin Tool, concrete Provider, or concrete Store. | Passed | [v0.3 architecture gate](../scripts/check_v03_architecture.py) |
 | AT-K63 | Production source contains no Subagent, AgentSpawner, or parent-child Agent graph. | Passed | [v0.3 architecture gate](../scripts/check_v03_architecture.py) |
 | AT-K64 | Production source contains no SessionSnapshot, ObservationFrame, or ResyncRequired. | Passed | [`tests/session_state_event_contract.rs`](../tests/session_state_event_contract.rs) — `event_variants_envelope_and_stream_surface_are_exact`; [v0.3 architecture gate](../scripts/check_v03_architecture.py) |
 | AT-K65 | Two SessionRuntime owners on one Tokio runtime keep cancellation and state isolated. | Passed | [`tests/session_runtime_owner_contract.rs`](../tests/session_runtime_owner_contract.rs) — `two_same_id_owners_open_concurrently_with_isolated_cancellation`; [`tests/session_runtime_shared_ports_evidence.rs`](../tests/session_runtime_shared_ports_evidence.rs) — `two_runtimes_share_exact_ports_concurrently_with_cancellation_isolation` |

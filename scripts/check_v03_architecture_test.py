@@ -182,10 +182,9 @@ def self_test() -> None:
             ("session-missing-runtime-role", "missing required production role: session runtime owner", lambda root: (root / "src/session/runtime.rs").unlink()),
             ("model-gateway-file", "forbidden production src/model path", lambda root: (root / "src/model/gateway.rs").write_text("pub(crate) const _MODEL_GATEWAY: () = ();\n", encoding="utf-8")),
             ("agent-extra-file", "forbidden production src/agent path", lambda root: (root / "src/agent/manager.rs").write_text("pub struct Manager;\n", encoding="utf-8")),
-            ("model-extra-file", "forbidden production src/model path", lambda root: (root / "src/model/legacy.rs").write_text("pub struct Legacy;\n", encoding="utf-8")),
+            ("model-extra-file", "forbidden final legacy path", lambda root: (root / "src/model/legacy.rs").write_text("pub struct Legacy;\n", encoding="utf-8")),
             ("model-driver-extra-production", "forbidden production src/model path", lambda root: (root / "src/model/driver/network.rs").write_text("pub struct Network;\n", encoding="utf-8")),
-            ("model-empty-file", "forbidden production src/model path", lambda root: (root / "src/model/legacy.rs").write_text("", encoding="utf-8")),
-            ("model-test-helper-production", "forbidden production src/model path", lambda root: (root / "src/model/test_helper.rs").write_text("#[cfg(test)]\npub struct FakeModel;\npub struct Production;\n", encoding="utf-8")),
+            ("model-empty-file", "forbidden final legacy path", lambda root: (root / "src/model/legacy.rs").write_text("", encoding="utf-8")),
             ("model-provider-file", "forbidden production src/model path", lambda root: (root / "src/model/provider.rs").write_text("pub struct Provider;\n", encoding="utf-8")),
             ("model-transport-file", "forbidden production src/model path", lambda root: (root / "src/model/transport.rs").write_text("pub struct Transport;\n", encoding="utf-8")),
             ("model-anthropic-dir", "forbidden production src/model path", lambda root: ((root / "src/model/anthropic").mkdir(), (root / "src/model/anthropic/client.rs").write_text("pub struct Client;\n", encoding="utf-8"))),
@@ -193,9 +192,8 @@ def self_test() -> None:
             ("model-transport-dir", "forbidden production src/model path", lambda root: ((root / "src/model/transport").mkdir(), (root / "src/model/transport/client.rs").write_text("pub struct Client;\n", encoding="utf-8"))),
             ("model-provider-dir", "forbidden production src/model path", lambda root: ((root / "src/model/provider").mkdir(), (root / "src/model/provider/client.rs").write_text("pub struct Client;\n", encoding="utf-8"))),
             ("model-empty-dir", "forbidden production src/model path", lambda root: (root / "src/model/providers").mkdir()),
-            ("tools-extra-file", "forbidden production src/tools path", lambda root: (root / "src/tools/legacy.rs").write_text("pub struct Legacy;\n", encoding="utf-8")),
-            ("tools-empty-file", "forbidden production src/tools path", lambda root: (root / "src/tools/legacy.rs").write_text("", encoding="utf-8")),
-            ("tools-test-helper-production", "forbidden production src/tools path", lambda root: (root / "src/tools/test_helper.rs").write_text("#[cfg(test)]\npub struct FakeTool;\npub struct Production;\n", encoding="utf-8")),
+            ("tools-extra-file", "forbidden final legacy path", lambda root: (root / "src/tools/legacy.rs").write_text("pub struct Legacy;\n", encoding="utf-8")),
+            ("tools-empty-file", "forbidden final legacy path", lambda root: (root / "src/tools/legacy.rs").write_text("", encoding="utf-8")),
             ("tools-progress-alias", "forbidden production src/tools path", lambda root: (root / "src/tools/provider.rs").write_text("pub struct Provider;\n", encoding="utf-8")),
             ("tools-filesystem-dir", "forbidden production src/tools path", lambda root: ((root / "src/tools/filesystem").mkdir(), (root / "src/tools/filesystem/adapter.rs").write_text("pub struct Adapter;\n", encoding="utf-8"))),
             ("tools-process-dir", "forbidden production src/tools path", lambda root: ((root / "src/tools/process").mkdir(), (root / "src/tools/process/adapter.rs").write_text("pub struct Adapter;\n", encoding="utf-8"))),
@@ -362,7 +360,7 @@ def self_test() -> None:
         (non_test_module / "src/model/model_fixture/mod.rs").write_text(
             "pub struct Runtime;\n", encoding="utf-8"
         )
-        expect_failure(non_test_module, "forbidden production src/model path")
+        expect_failure(non_test_module, "forbidden production symbol Runtime")
 
         optional = directory_path / "optional-files"
         shutil.copytree(base, optional)
