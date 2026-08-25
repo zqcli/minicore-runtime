@@ -113,21 +113,30 @@ pub(crate) struct ModelDriver {
 }
 
 impl ModelDriver {
+    #[cfg(test)]
     pub(crate) fn new(
         model: Arc<dyn Model>,
         config: ModelDriverConfig,
     ) -> Result<Self, ModelError> {
+        let descriptor = catch_unwind(AssertUnwindSafe(|| model.descriptor().clone()))
+            .map_err(|_| generated_error(ModelErrorKind::Panicked, DeliveryState::NotStarted))?;
+        Self::from_validated(model, descriptor, config)
+    }
+
+    pub(crate) fn from_validated(
+        model: Arc<dyn Model>,
+        descriptor: ModelDescriptor,
+        config: ModelDriverConfig,
+    ) -> Result<Self, ModelError> {
+        descriptor.validate().map_err(|_| {
+            generated_error(ModelErrorKind::InvalidRequest, DeliveryState::NotStarted)
+        })?;
         if !config.validate() {
             return Err(generated_error(
                 ModelErrorKind::InvalidRequest,
                 DeliveryState::NotStarted,
             ));
         }
-        let descriptor = catch_unwind(AssertUnwindSafe(|| model.descriptor().clone()))
-            .map_err(|_| generated_error(ModelErrorKind::Panicked, DeliveryState::NotStarted))?;
-        descriptor.validate().map_err(|_| {
-            generated_error(ModelErrorKind::InvalidRequest, DeliveryState::NotStarted)
-        })?;
         Ok(Self {
             model,
             descriptor,

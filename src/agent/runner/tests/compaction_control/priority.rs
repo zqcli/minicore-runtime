@@ -78,8 +78,9 @@ async fn expired_turn_after_context_success_wins_without_strategy_or_boundary() 
         ),
         conversation,
     );
-    let mut context = TurnRunnerContext::new(request).unwrap();
+    let mut context = TurnRunnerContext::from_request(request);
     context
+        .environment
         .context
         .provide_detailed(ContextRequest {
             session_id: context.session_id,

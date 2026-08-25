@@ -18,6 +18,7 @@ use super::runtime::{SessionRuntimeOptions, SessionRuntimeParts};
 use super::runtime_log::{
     cancellable_log, close_raw, synthetic_log_error, timestamp_source, with_secondary,
 };
+use crate::agent::{SessionEnvironment, SessionEnvironmentError};
 use crate::bindings::SessionBindingError;
 
 const FAILED_OPEN_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -182,22 +183,17 @@ async fn prepare_create(
     parts: SessionRuntimeParts,
     owner_cancel: &CancellationToken,
 ) -> Result<PreparedOwner, SessionOpenError> {
-    if spec.validate(&parts.kernel.limits).is_err() {
-        return Err(close_raw(
-            log,
-            parts.kernel.log_operation_timeout,
-            SessionOpenError::invalid_manifest(),
-        )
-        .await);
-    }
-    if let Err(error) = parts.bindings.validate(&spec, &parts.kernel.limits) {
-        return Err(close_raw(
-            log,
-            parts.kernel.log_operation_timeout,
-            binding_error(error),
-        )
-        .await);
-    }
+    let environment = match SessionEnvironment::build(&parts.kernel, &spec, &parts.bindings) {
+        Ok(environment) => environment,
+        Err(error) => {
+            return Err(close_raw(
+                log,
+                parts.kernel.log_operation_timeout,
+                environment_error(error),
+            )
+            .await);
+        }
+    };
     if owner_cancel.is_cancelled() {
         return Err(close_raw(
             log,
@@ -232,7 +228,7 @@ async fn prepare_create(
             secondary,
         ));
     }
-    build_owner(session_id, spec, conversation, parts, owner_cancel).await
+    build_owner(session_id, conversation, environment, owner_cancel).await
 }
 
 async fn prepare_load(
@@ -256,13 +252,14 @@ async fn prepare_load(
             secondary,
         ));
     }
-    if let Err(error) = parts
-        .bindings
-        .validate(&pending.manifest().spec, &parts.kernel.limits)
-    {
-        let secondary = pending.abort().await;
-        return Err(with_secondary(binding_error(error), secondary));
-    }
+    let environment =
+        match SessionEnvironment::build(&parts.kernel, &pending.manifest().spec, &parts.bindings) {
+            Ok(environment) => environment,
+            Err(error) => {
+                let secondary = pending.abort().await;
+                return Err(with_secondary(environment_error(error), secondary));
+            }
+        };
     if owner_cancel.is_cancelled() {
         let secondary = pending.abort().await;
         return Err(with_secondary(
@@ -271,7 +268,6 @@ async fn prepare_load(
         ));
     }
     let session_id = pending.manifest().session_id;
-    let spec = pending.manifest().spec.clone();
     let proof = LoadCompatibilityValidated::after_session_bindings_validation(&pending);
     let mut conversation = pending
         .finish(proof)
@@ -284,14 +280,13 @@ async fn prepare_load(
             secondary,
         ));
     }
-    build_owner(session_id, spec, conversation, parts, owner_cancel).await
+    build_owner(session_id, conversation, environment, owner_cancel).await
 }
 
 async fn build_owner(
     session_id: SessionId,
-    spec: SessionSpec,
     mut conversation: ConversationLog,
-    parts: SessionRuntimeParts,
+    environment: Arc<SessionEnvironment>,
     owner_cancel: &CancellationToken,
 ) -> Result<PreparedOwner, SessionOpenError> {
     let instance_id = match SessionInstanceId::new() {
@@ -306,9 +301,7 @@ async fn build_owner(
     };
     let (actor, ready) = match SessionActor::new(
         conversation,
-        parts.kernel,
-        parts.bindings,
-        spec,
+        environment,
         session_id,
         instance_id,
         owner_cancel.clone(),
@@ -332,6 +325,18 @@ async fn build_owner(
 
 fn binding_error(error: SessionBindingError) -> SessionOpenError {
     SessionOpenError::binding_mismatch(matches!(error, SessionBindingError::ModelMismatch))
+}
+
+fn environment_error(error: SessionEnvironmentError) -> SessionOpenError {
+    match error {
+        SessionEnvironmentError::InvalidKernel => SessionOpenError::invalid_configuration(),
+        SessionEnvironmentError::Bindings(error) => match error {
+            SessionBindingError::InvalidLimits => SessionOpenError::invalid_configuration(),
+            SessionBindingError::InvalidSpec => SessionOpenError::invalid_manifest(),
+            error => binding_error(error),
+        },
+        SessionEnvironmentError::Driver => SessionOpenError::actor_start_failed(),
+    }
 }
 
 fn map_conversation_error(error: ConversationCommitError) -> SessionOpenError {

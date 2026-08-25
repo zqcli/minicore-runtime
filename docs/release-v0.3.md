@@ -95,7 +95,7 @@ Validation environment:
 - 285 root library tests plus passing cleaned integration/provider-gate suites;
 - MSRV `rustc 1.85.0` and `cargo 1.85.0` with `scripts/check-msrv.sh` passing;
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked` passing;
-- authoritative architecture scanner passing with `production_files=143`;
+- authoritative architecture scanner passing with `production_files=144`;
 - GitHub Actions [run 32755428283](https://github.com/zqcli/minicore-runtime/actions/runs/32755428283) passed for commit `815494dad38c34c585dfeda3c0845ccc7c1fb7d0` across all four jobs (Rust stable Clippy quality gate, Rust 1.85.0 MSRV, `macos-latest`, and `windows-latest` with MSVC), validating review fixes AT-K01 through AT-K96.
 
 Cross-platform validation is complete across Linux, macOS, and Windows. No package or tag release has occurred; the repository is ready for publication.
@@ -121,12 +121,12 @@ The reviewed comparison uses baseline commit `2fd7104`. “cfg(test)-excluded pr
 
 | Metric | Baseline | Current | Change |
 | --- | ---: | ---: | ---: |
-| cfg(test)-excluded production LOC | 15,483 | 14,096 | -1,387 |
-| raw `src/**/*.rs` lines | 48,055 | 31,171 | -16,884 |
-| `src` Rust files | 174 | 143 | -31 |
-| files with production content | 83 | 77 | -6 |
+| cfg(test)-excluded production LOC | 15,483 | 14,102 | -1,381 |
+| raw `src/**/*.rs` lines | 48,055 | 31,262 | -16,793 |
+| `src` Rust files | 174 | 144 | -30 |
+| files with production content | 83 | 78 | -5 |
 
-The authoritative architecture gate separately prints `production_files=143`, meaning all physical Rust source files enumerated by that scanner. It must not be confused with the 77 files whose cfg(test)-excluded production view is nonempty. The gate also enforces canonical production paths, direct dependencies, public Port declarations, root exports, source-size limits, forbidden authority, and an all-singleton module DAG.
+The authoritative architecture gate separately prints `production_files=144`, meaning all physical Rust source files enumerated by that scanner. It must not be confused with the 78 files whose cfg(test)-excluded production view is nonempty. The gate also enforces canonical production paths, direct dependencies, public Port declarations, root exports, source-size limits, forbidden authority, and an all-singleton module DAG.
 
 ## Known Limitations
 

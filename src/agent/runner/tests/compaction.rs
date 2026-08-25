@@ -37,23 +37,24 @@ async fn proactive_trigger_equality_and_same_head_suppression_are_exact() {
     let conversation = active_conversation(&spec, 4, "old history");
     let bindings = bindings_with_compaction(model, None, Vec::new(), None, Arc::clone(&strategy));
     let (request, _critical_rx, _progress_rx) = runner_request(spec, 4, bindings, conversation);
-    let mut context = TurnRunnerContext::new(request).unwrap();
+    let mut context = TurnRunnerContext::from_request(request);
     let estimate = context
+        .environment
         .prompt
-        .estimated_fixed_input_tokens(&context.conversation, context.model_limits)
+        .estimated_fixed_input_tokens(&context.conversation, context.environment.model_limits)
         .unwrap();
     assert!(estimate > 1);
     let mut state = CompactionState::default();
     let mut fixed = FixedInputEstimate::default();
 
-    context.compaction.as_mut().unwrap().trigger_tokens = estimate.checked_add(1).unwrap();
+    context.set_compaction_trigger_tokens(estimate.checked_add(1).unwrap());
     assert!(matches!(
         proactive(&mut context, Usage::default(), &mut state, &mut fixed).await,
         CompactionAttempt::Skipped
     ));
     assert_eq!(strategy.calls(), 0);
 
-    context.compaction.as_mut().unwrap().trigger_tokens = estimate;
+    context.set_compaction_trigger_tokens(estimate);
     assert!(matches!(
         proactive(&mut context, Usage::default(), &mut state, &mut fixed).await,
         CompactionAttempt::Skipped

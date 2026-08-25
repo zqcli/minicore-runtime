@@ -9,14 +9,15 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::run_turn;
+use crate::agent::SessionEnvironment;
 use crate::agent::runner_protocol::{
     CommitAck, RunnerCommitError, RunnerEvent, RunnerOutcome, RunnerProgress, SuspensionError,
     TurnRunnerExit,
 };
 use crate::agent::turn_context::{
-    TurnRunnerControl, TurnRunnerIdentity, TurnRunnerKernel, TurnRunnerRequest,
-    TurnRunnerRequestError,
+    TurnRunnerControl, TurnRunnerIdentity, TurnRunnerRequest, TurnRunnerRequestError,
 };
+use crate::bindings::SessionBindings;
 use crate::config::{CompactionConfig, KernelConfig, SemanticLimits, SessionSpec};
 use crate::context::{
     ContextBlock, ContextBundle, ContextError, ContextFuture, ContextProvider, ContextRequest,
@@ -29,12 +30,12 @@ use crate::conversation::{
 };
 use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::ids::{ContextSourceId, SessionId, SessionInstanceId, ToolCallId, TurnId};
+use crate::interaction::InteractionAnswer;
 use crate::model::{
     DeliveryState, Model, ModelCallContext, ModelDescriptor, ModelError, ModelErrorKind,
     ModelEvent, ModelFinishReason, ModelMessage, ModelRef, ModelStartFuture, ModelStream,
     ReasoningPreference, Usage,
 };
-use crate::session::{InteractionAnswer, SessionBindings};
 use crate::time::Timestamp;
 use crate::tools::{
     ApprovalDecision, ApprovalRequest, ApprovalRisk, Tool, ToolContext, ToolDecision,
@@ -167,7 +168,7 @@ fn request_with_control(
     mpsc::Receiver<RunnerProgress>,
 ) {
     let kernel = KernelConfig::default_checked().unwrap();
-    let snapshot = TurnRunnerKernel::from_kernel(&kernel).unwrap();
+    let environment = SessionEnvironment::build(&kernel, &spec, &bindings).unwrap();
     let (critical_tx, critical_rx) = mpsc::channel(critical_capacity);
     let (progress_tx, progress_rx) = mpsc::channel(64);
     let request = TurnRunnerRequest::new(
@@ -176,11 +177,9 @@ fn request_with_control(
             instance_id: instance_id(),
             turn_id: turn_id(),
         },
-        spec,
+        environment,
         effective_max_tool_rounds,
-        bindings,
         conversation,
-        snapshot,
         TurnRunnerControl {
             cancellation,
             deadline,

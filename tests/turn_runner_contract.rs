@@ -7,6 +7,7 @@ fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
     let module = include_str!("../src/agent/mod.rs");
     for required in [
         "mod runner;",
+        "mod environment;",
         "mod runner_protocol;",
         "mod tool_driver;",
         "mod turn_context;",
@@ -22,10 +23,12 @@ fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
     let compaction = include_str!("../src/agent/runner/compaction.rs");
     let support = include_str!("../src/agent/runner/support.rs");
     let diagnostics = include_str!("../src/agent/runner/diagnostics.rs");
+    let environment = include_str!("../src/agent/environment.rs");
     let context = include_str!("../src/agent/turn_context.rs");
     let protocol = include_str!("../src/agent/runner_protocol.rs");
-    let production =
-        format!("{runner}\n{compaction}\n{support}\n{diagnostics}\n{context}\n{protocol}");
+    let production = format!(
+        "{runner}\n{compaction}\n{support}\n{diagnostics}\n{environment}\n{context}\n{protocol}"
+    );
     let compact_production = compact(&production);
     for required in [
         "pub(crate) async fn run_turn(",
@@ -44,10 +47,10 @@ fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
     for required in [
         "PromptBuilder::remaining_context_budget_for(fixed,",
         "ContextRequest{",
-        "context.prompt.build(",
+        "context.environment.prompt.build(",
         ".provide_detailed(ContextRequest{",
-        "letrun=context.model.run_detailed(",
-        "letrun=context.tools.run(",
+        "letrun=context.environment.model.run_detailed(",
+        "letrun=context.environment.tools.run(",
         "prepare_model_request(",
         ".run_detailed(",
         "estimated_fixed_input_tokens(",
@@ -89,7 +92,15 @@ fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
         );
     }
     assert!(production.contains("CompactionDriver"));
-    for source in [runner, compaction, support, diagnostics, context, protocol] {
+    for source in [
+        runner,
+        compaction,
+        support,
+        diagnostics,
+        environment,
+        context,
+        protocol,
+    ] {
         assert!(source.lines().count() < 500);
     }
     let immediate = support.find("control.sender.try_send(event)").unwrap();
@@ -263,50 +274,75 @@ fn summary_commit_is_stale_head_checked_redacted_and_actor_owned() {
 }
 
 #[test]
-fn request_context_validates_full_turn_configuration_without_owner_authority() {
+fn request_context_reuses_the_frozen_environment_without_owner_authority() {
     let runner = include_str!("../src/agent/runner.rs");
     let context = include_str!("../src/agent/turn_context.rs");
+    let environment = include_str!("../src/agent/environment.rs");
     let compact_context = compact(context);
     for required in [
         "pub(crate) struct TurnRunnerRequest",
         "pub(crate) session_id: SessionId",
         "pub(crate) instance_id: SessionInstanceId",
         "pub(crate) turn_id: TurnId",
-        "pub(crate) spec: SessionSpec",
+        "pub(super) environment: Arc<SessionEnvironment>",
+        "pub(super) fn from_request(request: TurnRunnerRequest) -> Self",
         "pub(crate) effective_max_tool_rounds: u16",
-        "pub(crate) bindings: SessionBindings",
         "pub(crate) conversation: ConversationView",
         "pub(crate) cancellation: CancellationToken",
         "pub(crate) deadline: Instant",
-        "pub(crate) kernel: TurnRunnerKernel",
         "pub(crate) critical_tx: mpsc::Sender<RunnerEvent>",
         "pub(crate) progress_tx: mpsc::Sender<RunnerProgress>",
     ] {
         assert!(context.contains(required), "turn context misses {required}");
     }
     for required in [
-        "bindings.validate(&spec,&kernel.limits)",
-        ".validated_active_turn(&spec,&kernel.limits)",
+        "environment.spec.max_tool_rounds",
+        "environment.limits.max_tool_rounds",
+        ".validated_active_turn(&environment.spec,&environment.limits)",
         "active.turn_id!=Some(identity.turn_id)",
         concat!(
             "active.execution.as_ref().is_none_or(|execution|",
             "execution.max_tool_rounds!=effective_max_tool_rounds)"
         ),
-        "u32::try_from(descriptor.context_window)",
-        ".unwrap_or(u32::MAX)",
-        "ModelLimits::new(Some(context_window),None)",
-        "PromptBuilder::new(",
-        "ContextDriver::new(",
-        "ModelDriver::new(",
-        "ToolDriver::new(",
-        "CompactionDriver::new(",
-        "request.kernel.context_timeout",
     ] {
         assert!(
             compact_context.contains(required),
             "turn context misses compact pattern {required}"
         );
     }
+    for forbidden in [
+        "TurnRunnerKernel",
+        "SessionBindings",
+        "PromptBuilder::new(",
+        "ContextDriver::new(",
+        "CompactionDriver::new(",
+        "ModelDriver::new(",
+        "ToolDriver::new(",
+        "descriptor()",
+    ] {
+        assert!(
+            !context.contains(forbidden),
+            "turn context retains {forbidden}"
+        );
+    }
+    let compact_environment = compact(environment);
+    for required in [
+        "bindings.freeze(spec,&kernel.limits)",
+        "PromptBuilder::new(",
+        "ContextDriver::new(",
+        "CompactionDriver::new(",
+        "ModelDriver::from_validated(",
+        "ToolDriver::from_enabled(",
+        "SessionChannelCapacities",
+        "pub(crate)fnsession_inputs(",
+    ] {
+        assert!(
+            compact_environment.contains(required),
+            "environment misses {required}"
+        );
+    }
+    assert!(!environment.contains("pub(super) kernel"));
+    assert!(!environment.contains("kernel: KernelConfig"));
     assert!(!context.contains("panic_after_context_creation"));
     assert!(
         runner.contains("#[cfg(test)]\n    if tests::take_scripted_turn_panic(context.turn_id)")
@@ -325,7 +361,7 @@ fn detailed_deadline_provenance_is_wired_without_clock_inference() {
         format!("{runner}\n{runner_compaction}\n{diagnostics}\n{context}\n{model}\n{compaction}");
     for required in [
         ".provide_detailed(ContextRequest {",
-        "context.model.run_detailed(",
+        "context.environment.model.run_detailed(",
         "ContextDriverFailure",
         "ModelDriverFailure",
         "CompactionDriverFailure",

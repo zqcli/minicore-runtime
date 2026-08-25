@@ -1,3 +1,6 @@
+#[cfg(test)]
+use crate::tools::ToolSet;
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -12,9 +15,9 @@ use tokio_util::sync::CancellationToken;
 use crate::interaction::{InteractionAnswer, InteractionKind};
 use crate::time::{DeadlineSource, effective_deadline};
 use crate::tools::{
-    ApprovalDecision, Tool, ToolContext, ToolDecision, ToolExecutionOutcome, ToolInputRequest,
-    ToolInvocation, ToolName, ToolOutput, ToolPolicy, ToolPolicyRequest, ToolProgress,
-    ToolResultOutcome, ToolSet, ToolSpec,
+    ApprovalDecision, EnabledTools, Tool, ToolContext, ToolDecision, ToolExecutionOutcome,
+    ToolInputRequest, ToolInvocation, ToolName, ToolOutput, ToolPolicy, ToolPolicyRequest,
+    ToolProgress, ToolResultOutcome, ToolSpec,
 };
 use crate::value::{BoundedText, MAX_JSON_BYTES, validate_json_size};
 
@@ -84,31 +87,41 @@ pub(crate) struct ToolDriverResult {
 }
 
 pub(crate) struct ToolDriver {
-    tools: ToolSet,
-    enabled: BTreeSet<ToolName>,
+    enabled: EnabledTools,
     policy: Option<Arc<dyn ToolPolicy>>,
     config: ToolDriverConfig,
 }
 
 impl ToolDriver {
-    pub(crate) fn new(
-        tools: ToolSet,
-        enabled: BTreeSet<ToolName>,
+    pub(crate) fn from_enabled(
+        enabled: EnabledTools,
         policy: Option<Arc<dyn ToolPolicy>>,
         config: ToolDriverConfig,
     ) -> Result<Self, ToolDriverBuildError> {
         if !config.valid() {
             return Err(ToolDriverBuildError::InvalidConfiguration);
         }
-        if !enabled.is_empty() && policy.is_none() {
+        if !enabled.specs().is_empty() && policy.is_none() {
             return Err(ToolDriverBuildError::MissingPolicy);
         }
         Ok(Self {
-            tools,
             enabled,
             policy,
             config,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(
+        tools: crate::tools::ToolSet,
+        enabled: BTreeSet<ToolName>,
+        policy: Option<Arc<dyn ToolPolicy>>,
+        config: ToolDriverConfig,
+    ) -> Result<Self, ToolDriverBuildError> {
+        if !enabled.is_empty() && policy.is_none() {
+            return Err(ToolDriverBuildError::MissingPolicy);
+        }
+        Self::from_enabled(tools.enabled_subset(&enabled), policy, config)
     }
 
     pub(crate) async fn run(
@@ -119,9 +132,11 @@ impl ToolDriver {
         suspensions: &mpsc::Sender<TurnSuspension>,
         progress: &mpsc::Sender<ToolDriverProgress>,
     ) -> Result<ToolDriverResult, SuspensionError> {
-        let Some((tool, spec)) = self.preflight(&invocation) else {
+        let Some(enabled) = self.preflight(&invocation) else {
             return Ok(self.failed());
         };
+        let implementation = Arc::clone(&enabled.implementation);
+        let spec = enabled.spec.clone();
         match self
             .decide(&invocation, spec, turn_deadline, &cancellation)
             .await
@@ -140,7 +155,7 @@ impl ToolDriver {
                 match answer {
                     InteractionAnswer::Approval(ApprovalDecision::AllowOnce) => {
                         self.execute(
-                            tool,
+                            implementation,
                             invocation,
                             turn_deadline,
                             cancellation,
@@ -155,7 +170,7 @@ impl ToolDriver {
             }
             PolicyResolution::Decision(ToolDecision::Allow) => {
                 self.execute(
-                    tool,
+                    implementation,
                     invocation,
                     turn_deadline,
                     cancellation,
@@ -167,19 +182,13 @@ impl ToolDriver {
         }
     }
 
-    fn preflight(&self, invocation: &ToolInvocation) -> Option<(Arc<dyn Tool>, ToolSpec)> {
-        if !self.enabled.contains(invocation.tool_name())
-            || !invocation.arguments().is_object()
+    fn preflight(&self, invocation: &ToolInvocation) -> Option<&crate::tools::EnabledTool> {
+        if !invocation.arguments().is_object()
             || validate_json_size(invocation.arguments(), self.config.max_tool_input_bytes).is_err()
         {
             return None;
         }
-        let tool = self.tools.get(invocation.tool_name())?;
-        let spec = self.tools.frozen_spec(invocation.tool_name())?.clone();
-        if spec.name() != invocation.tool_name() {
-            return None;
-        }
-        Some((tool, spec))
+        self.enabled.get(invocation.tool_name())
     }
 
     async fn decide(

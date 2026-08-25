@@ -27,7 +27,7 @@ pub(super) fn assistant_draft(
             AssistantPart::Text(value) => append(
                 &mut text,
                 value,
-                context.limits.max_model_text_bytes_per_round,
+                context.environment.limits.max_model_text_bytes_per_round,
             )?,
             AssistantPart::Reasoning(value) => {
                 if value.encrypted().is_some() || value.signature().is_some() {
@@ -37,29 +37,41 @@ pub(super) fn assistant_draft(
                     append(
                         &mut reasoning,
                         value,
-                        context.limits.max_model_reasoning_bytes_per_round,
+                        context
+                            .environment
+                            .limits
+                            .max_model_reasoning_bytes_per_round,
                     )?;
                 }
                 if let Some(value) = value.summary() {
                     append(
                         &mut reasoning,
                         value,
-                        context.limits.max_model_reasoning_bytes_per_round,
+                        context
+                            .environment
+                            .limits
+                            .max_model_reasoning_bytes_per_round,
                     )?;
                 }
             }
             AssistantPart::ToolCall(call) => tool_calls.push(call.clone()),
         }
     }
-    let text = optional_text(text, context.limits.max_model_text_bytes_per_round)?;
+    let text = optional_text(
+        text,
+        context.environment.limits.max_model_text_bytes_per_round,
+    )?;
     let reasoning = optional_text(
         reasoning,
-        context.limits.max_model_reasoning_bytes_per_round,
+        context
+            .environment
+            .limits
+            .max_model_reasoning_bytes_per_round,
     )?;
     Ok((
         AssistantMessageDraft {
             turn_id: context.turn_id,
-            model: context.spec.model.clone(),
+            model: context.environment.spec.model.clone(),
             text,
             reasoning,
             tool_calls: tool_calls.clone(),
@@ -207,11 +219,11 @@ pub(super) fn validate_summary_ack(
     validate_ack_shape(context, snapshot_head, &acknowledgement)?;
     let before = context
         .conversation
-        .validated_active_turn(&context.spec, &context.limits)
+        .validated_active_turn(&context.environment.spec, &context.environment.limits)
         .map_err(|_| CriticalFailure::InvalidAck)?;
     let after = acknowledgement
         .conversation
-        .validated_active_turn(&context.spec, &context.limits)
+        .validated_active_turn(&context.environment.spec, &context.environment.limits)
         .map_err(|_| CriticalFailure::InvalidAck)?;
     if before.turn_id != after.turn_id || before.execution != after.execution {
         return Err(CriticalFailure::InvalidAck);

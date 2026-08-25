@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{RunnerEvent, RunnerOutcome, RunnerProgress, SuspensionError, TurnRunnerExit};
-use crate::config::{KernelConfig, SessionSpec};
+use crate::agent::{
+    RunnerEvent, RunnerOutcome, RunnerProgress, SessionEnvironment, SuspensionError, TurnRunnerExit,
+};
 use crate::conversation::{ConversationCommitError, ConversationLog, ConversationSeq};
 use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::ids::{InteractionId, SessionId, SessionInstanceId, TurnId};
@@ -13,9 +16,7 @@ use super::event_stream::{InternalEventSink, SessionEventStream};
 use super::handle::SessionHandle;
 use super::state::{SessionHealth, SessionState, SessionStatus};
 use super::turn_handle::{TurnCompletion, TurnHandle, TurnOutcome};
-use crate::bindings::SessionBindings;
 use crate::interaction::{InteractionAnswer, PendingInteraction};
-
 mod commands;
 mod lifecycle;
 mod run;
@@ -50,9 +51,7 @@ pub(super) struct ActorReady {
 pub(crate) struct SessionActor {
     session_id: SessionId,
     instance_id: SessionInstanceId,
-    kernel: KernelConfig,
-    spec: SessionSpec,
-    bindings: SessionBindings,
+    environment: Arc<SessionEnvironment>,
     conversation: ConversationLog,
     commands: mpsc::Receiver<SessionCommand>,
     state_tx: watch::Sender<SessionState>,
@@ -119,9 +118,7 @@ impl Drop for ActiveTurn {
 impl SessionActor {
     pub(super) fn new(
         conversation: ConversationLog,
-        kernel: KernelConfig,
-        bindings: SessionBindings,
-        spec: SessionSpec,
+        environment: Arc<SessionEnvironment>,
         session_id: SessionId,
         instance_id: SessionInstanceId,
         root_cancel: CancellationToken,
@@ -142,21 +139,20 @@ impl SessionActor {
             return Err(Box::new(ActorBuildFailure { log: conversation }));
         }
         let (state_tx, state_rx) = watch::channel(state);
+        let (_, _, channels) = environment.session_inputs();
         let (events, event_stream) =
-            match InternalEventSink::channel(session_id, instance_id, kernel.event_capacity) {
+            match InternalEventSink::channel(session_id, instance_id, channels.event) {
                 Ok(channels) => channels,
                 Err(_) => return Err(Box::new(ActorBuildFailure { log: conversation })),
             };
-        let (command_tx, commands) = mpsc::channel(kernel.command_capacity);
+        let (command_tx, commands) = mpsc::channel(channels.command);
         let handle = SessionHandle::new(session_id, instance_id, command_tx, state_rx);
         let runner_lifecycle = RunnerLifecycle::new();
         Ok((
             Self {
                 session_id,
                 instance_id,
-                kernel,
-                spec,
-                bindings,
+                environment,
                 conversation,
                 commands,
                 state_tx,

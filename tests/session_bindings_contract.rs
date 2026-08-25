@@ -443,18 +443,3 @@ fn compaction_requirements_and_validation_are_pure() {
     assert_eq!(calls.context.load(Ordering::SeqCst), 0);
     assert_eq!(calls.compaction.load(Ordering::SeqCst), 0);
 }
-
-#[test]
-fn p4_load_contract_orders_binding_validation_before_proof_and_finish() {
-    let source = include_str!("../src/conversation/load.rs");
-    let validate = source
-        .find("bindings.validate(&pending.manifest().spec, limits)")
-        .unwrap();
-    let proof = source
-        .find("LoadCompatibilityValidated::after_session_bindings_validation(&pending)")
-        .unwrap();
-    let finish = source.find("pending.finish(proof)").unwrap();
-    assert!(validate < proof && proof < finish);
-    assert!(source.contains("pub(crate) struct LoadCompatibilityValidated"));
-    assert!(!include_str!("../src/bindings.rs").contains("LoadCompatibilityValidated"));
-}

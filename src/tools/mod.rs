@@ -14,6 +14,7 @@ pub use policy::{
 };
 pub(crate) use progress::ToolProgressEmitter;
 pub use progress::{ToolProgress, ToolProgressError, ToolProgressSink};
+pub(crate) use set::{EnabledTool, EnabledTools};
 pub use set::{ToolSet, ToolSetBuilder, ToolSetError};
 pub use tool::{Tool, ToolExecutionOutcome, ToolFuture, ToolInvocation, ToolOutput, ToolSpec};
 pub(crate) use types::validate_json_shape;

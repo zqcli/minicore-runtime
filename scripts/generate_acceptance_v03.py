@@ -62,7 +62,7 @@ def render_acceptance(mapping: dict[str, Any]) -> str:
         "| Provider evidence | provider-gate tests and warnings-denied Clippy passed through `scripts/check.sh` |",
         "| MSRV | `rustc 1.85.0`, `cargo 1.85.0`; `scripts/check-msrv.sh` passed |",
         "| Documentation | `RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps --locked` passed |",
-        "| Architecture | authoritative scanner passed with `production_files=143` |",
+        "| Architecture | authoritative scanner passed with `production_files=144` |",
         "| Dependencies | 8 direct dependencies; root lock contains 37 package records |",
         "| P6 lock diff | 39 records removed, 0 added, 0 retained-package version drift |",
         "| GitHub Actions CI | [Run 32755428283](https://github.com/zqcli/minicore-runtime/actions/runs/32755428283) for commit `815494dad38c34c585dfeda3c0845ccc7c1fb7d0` passed all four jobs (Rust stable, Rust 1.85.0, `macos-latest`, `windows-latest` MSVC) |",

@@ -235,7 +235,7 @@ impl ScriptModel {
     fn driver(self: &Arc<Self>, kernel: &KernelConfig) -> ModelDriver {
         let model = Arc::clone(self);
         let model: Arc<dyn Model> = model;
-        ModelDriver::new(model, driver_config(kernel)).unwrap()
+        ModelDriver::from_validated(model, self.descriptor.clone(), driver_config(kernel)).unwrap()
     }
 
     fn starts(&self) -> usize {

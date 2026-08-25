@@ -13,6 +13,18 @@ pub struct ToolSet {
     specs: Arc<BTreeMap<ToolName, ToolSpec>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct EnabledTools {
+    entries: Arc<BTreeMap<ToolName, EnabledTool>>,
+    specs: Arc<[ToolSpec]>,
+}
+
+#[derive(Clone)]
+pub(crate) struct EnabledTool {
+    pub(crate) implementation: Arc<dyn Tool>,
+    pub(crate) spec: ToolSpec,
+}
+
 #[derive(Default)]
 pub struct ToolSetBuilder {
     tools: BTreeMap<ToolName, RegisteredTool>,
@@ -58,8 +70,37 @@ impl ToolSet {
         self.specs.values()
     }
 
-    pub(crate) fn frozen_spec(&self, name: &ToolName) -> Option<&ToolSpec> {
-        self.specs.get(name)
+    pub(crate) fn enabled_subset(&self, enabled: &BTreeSet<ToolName>) -> EnabledTools {
+        let mut entries = BTreeMap::new();
+        let mut specs = Vec::with_capacity(enabled.len());
+        for name in enabled {
+            if let (Some(implementation), Some(spec)) = (self.tools.get(name), self.specs.get(name))
+            {
+                let spec = spec.clone();
+                specs.push(spec.clone());
+                entries.insert(
+                    name.clone(),
+                    EnabledTool {
+                        implementation: Arc::clone(implementation),
+                        spec,
+                    },
+                );
+            }
+        }
+        EnabledTools {
+            entries: Arc::new(entries),
+            specs: specs.into(),
+        }
+    }
+}
+
+impl EnabledTools {
+    pub(crate) fn get(&self, name: &ToolName) -> Option<&EnabledTool> {
+        self.entries.get(name)
+    }
+
+    pub(crate) fn specs(&self) -> &[ToolSpec] {
+        &self.specs
     }
 }
 

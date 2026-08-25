@@ -7,6 +7,10 @@ fn build_request(
 ) -> Result<TurnRunnerRequest, TurnRunnerRequestError> {
     let model = ScriptModel::new(4_096, Vec::new());
     let conversation = initial_conversation(&spec, durable_max_tool_rounds);
+    let bindings = session_bindings(model, None, Vec::new(), None);
+    let environment =
+        SessionEnvironment::build(&KernelConfig::default_checked().unwrap(), &spec, &bindings)
+            .unwrap();
     let (critical_tx, _critical_rx) = mpsc::channel(1);
     let (progress_tx, _progress_rx) = mpsc::channel(1);
     TurnRunnerRequest::new(
@@ -15,11 +19,9 @@ fn build_request(
             instance_id: instance_id(),
             turn_id: turn_id(),
         },
-        spec,
+        environment,
         supplied_max_tool_rounds,
-        session_bindings(model, None, Vec::new(), None),
         conversation,
-        TurnRunnerKernel::from_kernel(&KernelConfig::default_checked().unwrap()).unwrap(),
         TurnRunnerControl {
             cancellation: CancellationToken::new(),
             deadline: Instant::now() + Duration::from_secs(30),
