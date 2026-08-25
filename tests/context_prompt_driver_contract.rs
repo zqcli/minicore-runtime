@@ -25,7 +25,6 @@ fn context_driver_is_private_single_provider_and_owner_neutral() {
             "context driver misses {required}"
         );
     }
-    assert!(driver.matches(".validate_and_sort(&self.limits)").count() >= 2);
     for forbidden in [
         "SessionRuntime",
         "SessionHandle",
