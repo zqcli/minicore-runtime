@@ -68,6 +68,33 @@ Before owner spawn and before any await, `OpenGuard` synchronously installs clea
 
 Model descriptor access, SessionLog future construction and polling, and the post-ready actor loop are explicit host-controlled panic boundaries. During panic cleanup the active runner JoinHandle stays installed while awaited; if the outer shutdown timeout aborts cleanup, ActiveTurn Drop still owns and aborts the runner. Deterministic Drop-probe evidence checks the runner future is dropped before shutdown returns. Panic cleanup then resolves the Turn waiter and attempts one close.
 
+## Conversation Memory And Commit Cost
+
+The confirmed conversation is held entirely in memory for the loaded lifetime.
+Compaction adds a Summary entry and shortens the prompt, but it does not drop
+the entries it summarised: `SemanticLimits` bounds per-entry size, never the
+total. A long-lived session therefore grows monotonically in resident memory,
+and compaction lowers token cost without lowering RSS.
+
+Commit cost grows with the same length. `ConversationState::candidate` builds a
+non-destructive candidate so a failed durable append leaves the committed state
+untouched; that two-phase rule requires copying the confirmed entries per
+commit. Measured on the reference machine, this is roughly 0.4 microseconds per
+entry per commit — about 400 microseconds per commit at 900 entries, and about
+4 milliseconds at 10,000, incurred once per assistant message and once per tool
+result.
+
+Reads are not on this curve. A `ConversationView` produced by the log carries
+the validated `ConversationState`, so prompt projection and turn-identity
+proofs reuse it instead of replaying the validator; `SessionRuntime::view` is a
+pointer clone rather than a copy.
+
+Hosts that need bounded memory or flat commit cost should bound session length
+and open a fresh Session, rather than relying on compaction to reclaim either.
+Removing the growth inside Core requires either a persistent entry structure or
+a single-phase commit, both of which are architecture decisions rather than
+tuning.
+
 ## Error Boundary
 
 `SessionOpenError` is a redacted struct with public `SessionOpenErrorKind`. It preserves invalid configuration, invalid manifest, SessionId mismatch, binding mismatch, typed log failure, recovery uncertainty, and owner-start failure. Failed-open close information is a secondary bounded diagnostic and never replaces the primary error.

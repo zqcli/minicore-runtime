@@ -146,6 +146,13 @@ The following are intentional v0.3 boundaries from the final specification, not 
 
 Hosts may implement these outside Core behind typed Ports and explicit product ownership. Reintroducing them into SessionRuntime requires a new architecture decision.
 
+Two scaling properties are also intentional rather than incomplete, and are stated so Hosts can plan around them:
+
+- the confirmed conversation stays resident for the loaded lifetime, and compaction shortens the prompt without dropping the entries it summarised, so a long session lowers token cost but not resident memory;
+- each commit copies the confirmed entries, because a candidate must leave the committed state untouched when a durable append fails; the cost is about 0.4 microseconds per entry per commit, or roughly 400 microseconds at 900 entries and 4 milliseconds at 10,000.
+
+Bounding either inside Core requires a persistent entry structure or a single-phase commit. Hosts that need bounded memory or flat commit cost should bound session length and open a fresh Session.
+
 ## Upgrade Guidance
 
 1. Read the [migration guide](migrations/v0.2-to-v0.3.md).
