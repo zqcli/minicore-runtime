@@ -115,9 +115,7 @@ fn actor_latches_active_commit_failures_and_authenticates_suspensions() {
     assert!(conversation.contains("unresolved_tool_calls().first().is_some_and("));
 
     let settlement = compact(include_str!("../src/session/actor/settlement.rs"));
-    let failure = settlement
-        .find("ifletSome(failure)=active.commit_failure.take()")
-        .unwrap();
+    let failure = settlement.find("active.commit_failure.take()").unwrap();
     let drafts = settlement.find(".settlement_drafts(").unwrap();
     assert!(failure < drafts);
 
@@ -126,7 +124,7 @@ fn actor_latches_active_commit_failures_and_authenticates_suspensions() {
         .find(".and_then(|active|active.runner.as_mut())")
         .unwrap();
     let take_active = supervisor
-        .find("ifletSome(mutactive)=self.active.take()")
+        .find("ifletSome(mutactive)=self.core.active.take()")
         .unwrap();
     assert!(await_installed < take_active);
 
@@ -135,7 +133,7 @@ fn actor_latches_active_commit_failures_and_authenticates_suspensions() {
         .find("letclose_error=self.conversation.close().await.err()")
         .unwrap();
     let durability = run
-        .find("ifself.closing_durability_failure.take().is_some()")
+        .find("ifself.core.closing_durability_failure.take().is_some()")
         .unwrap();
     assert!(close < durability);
 }

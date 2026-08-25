@@ -54,11 +54,11 @@ impl SessionActor {
         options: crate::config::TurnOptions,
         reply: oneshot::Sender<Result<TurnHandle, SessionError>>,
     ) {
-        if self.closing {
+        if self.core.closing {
             let _ = reply.send(Err(SessionError::Closed));
             return;
         }
-        if let SessionHealth::Degraded { diagnostic } = &self.health {
+        if let SessionHealth::Degraded { diagnostic } = &self.core.health {
             let _ = reply.send(Err(SessionError::Degraded(diagnostic.clone())));
             return;
         }
@@ -117,17 +117,6 @@ impl SessionActor {
             turn_id,
             cancellation.clone(),
         );
-        let mut state = self.state();
-        state.status = SessionStatus::Running;
-        state.active_turn = Some(turn_id);
-        state.pending_interaction = None;
-        state.conversation_seq = self.conversation.head();
-        self.publish_state(state);
-        if reply.send(Ok(handle)).is_err() {
-            cancellation.cancel();
-        }
-        let _ = self.events.try_emit(SessionEvent::TurnStarted { turn_id });
-
         let (_, _, channels) = self.environment.session_inputs();
         let (critical_tx, critical) = mpsc::channel(channels.runner);
         let (progress_tx, progress) = mpsc::channel(channels.runner);
@@ -152,7 +141,7 @@ impl SessionActor {
                 progress_tx,
             },
         );
-        let mut active = ActiveTurn {
+        self.install_active(ActiveTurn {
             turn_id,
             cancellation,
             completion,
@@ -164,7 +153,16 @@ impl SessionActor {
             outcome: None,
             pending: None,
             commit_failure: None,
-        };
+        });
+        if reply.send(Ok(handle)).is_err() {
+            self.core
+                .active
+                .as_ref()
+                .expect("active turn installed before reply")
+                .cancellation
+                .cancel();
+        }
+        let _ = self.events.try_emit(SessionEvent::TurnStarted { turn_id });
         match request {
             Ok(request) => {
                 let guard = self.runner_lifecycle.start();
@@ -175,10 +173,18 @@ impl SessionActor {
                 });
                 self.runner_lifecycle
                     .install_abort(generation, runner.abort_handle());
-                active.runner = Some(runner);
+                self.core
+                    .active
+                    .as_mut()
+                    .expect("active turn retained while starting runner")
+                    .runner = Some(runner);
             }
             Err(_) => {
-                active.outcome = Some(RunnerOutcome::Failed {
+                self.core
+                    .active
+                    .as_mut()
+                    .expect("active turn retained after request validation")
+                    .outcome = Some(RunnerOutcome::Failed {
                     diagnostic: Self::diagnostic(
                         DiagnosticCode::Internal,
                         DiagnosticCategory::Internal,
@@ -189,8 +195,8 @@ impl SessionActor {
                 });
             }
         }
-        self.active = Some(active);
         if self
+            .core
             .active
             .as_ref()
             .is_some_and(|active| active.runner.is_none())
@@ -225,17 +231,18 @@ impl SessionActor {
         interaction_id: InteractionId,
         answer: InteractionAnswer,
     ) -> Result<(), SessionError> {
-        if self.closing {
+        if self.core.closing {
             return Err(SessionError::Closed);
         }
-        if let SessionHealth::Degraded { diagnostic } = &self.health {
+        if let SessionHealth::Degraded { diagnostic } = &self.core.health {
             return Err(SessionError::Degraded(diagnostic.clone()));
         }
-        if self.last_resolved_interaction == Some(interaction_id) {
+        if self.core.last_resolved_interaction == Some(interaction_id) {
             return Err(SessionError::InteractionAlreadyResolved);
         }
         let (turn_id, pending) = {
             let active = self
+                .core
                 .active
                 .as_mut()
                 .ok_or(SessionError::InteractionNotFound)?;
@@ -260,14 +267,11 @@ impl SessionActor {
             (active.turn_id, pending)
         };
         let resolution = resolution(&answer);
-        let mut state = self.state();
-        state.status = SessionStatus::Running;
-        state.pending_interaction = None;
-        self.publish_state(state);
-        self.last_resolved_interaction = Some(interaction_id);
+        self.core.last_resolved_interaction = Some(interaction_id);
+        self.publish_state();
         if pending.resume.send(Ok(answer)).is_err() {
             let usage = self.conversation.confirmed_turn_usage(turn_id);
-            if let Some(active) = self.active.as_mut() {
+            if let Some(active) = self.core.active.as_mut() {
                 if active.outcome.is_none() {
                     active.outcome = Some(RunnerOutcome::Failed {
                         diagnostic: Self::diagnostic(
@@ -295,7 +299,7 @@ impl SessionActor {
         after: Option<crate::conversation::ConversationSeq>,
         limit: usize,
     ) -> Result<crate::conversation::TranscriptPage, SessionError> {
-        if self.closing {
+        if self.core.closing {
             return Err(SessionError::Closed);
         }
         match self.conversation.transcript(after, limit).await {

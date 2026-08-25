@@ -48,7 +48,7 @@ impl ActorFixture {
         self.actor
             .runner_lifecycle
             .install_abort(generation, runner.abort_handle());
-        self.actor.active.as_mut().unwrap().runner = Some(runner);
+        self.actor.core.active.as_mut().unwrap().runner = Some(runner);
     }
 
     pub(crate) fn root_cancel(&self) -> CancellationToken {
@@ -184,7 +184,7 @@ pub(crate) async fn actor_fixture_with_tool_calls(tool_call_count: usize) -> Act
         TurnHandle::new(session_id, instance_id, turn_id, cancellation.clone());
     let (critical_tx, critical) = mpsc::channel(kernel.runner_capacity);
     let (_progress_tx, progress) = mpsc::channel(kernel.runner_capacity);
-    actor.active = Some(ActiveTurn {
+    actor.core.active = Some(ActiveTurn {
         turn_id,
         cancellation,
         completion,
@@ -197,10 +197,7 @@ pub(crate) async fn actor_fixture_with_tool_calls(tool_call_count: usize) -> Act
         pending: None,
         commit_failure: None,
     });
-    let mut state = actor.state();
-    state.status = SessionStatus::Running;
-    state.active_turn = Some(turn_id);
-    actor.publish_state(state);
+    actor.publish_state();
     ActorFixture {
         actor,
         ready,

@@ -29,7 +29,7 @@ impl SessionActor {
             }
             RunnerEvent::Suspend { suspension } => self.register_suspension(suspension),
             RunnerEvent::Finish { outcome } => {
-                if let Some(active) = self.active.as_mut() {
+                if let Some(active) = self.core.active.as_mut() {
                     if active.outcome.is_none() {
                         active.outcome = Some(outcome);
                     }
@@ -68,17 +68,15 @@ impl SessionActor {
         &mut self,
         draft: UnsequencedEntry,
     ) -> Result<CommitAck, RunnerCommitError> {
-        if self.closing && self.active.is_none() {
+        if self.core.closing && self.core.active.is_none() {
             return Err(RunnerCommitError::RuntimeClosed);
         }
-        if matches!(&self.health, SessionHealth::Degraded { .. }) {
+        if matches!(&self.core.health, SessionHealth::Degraded { .. }) {
             return Err(RunnerCommitError::Degraded);
         }
         match self.conversation.append_validated(vec![draft]).await {
             Ok(batch) => {
-                let mut state = self.state();
-                state.conversation_seq = batch.head;
-                self.publish_state(state);
+                self.publish_state();
                 Ok(CommitAck {
                     head: batch.head,
                     conversation: self.conversation.view(),
@@ -100,7 +98,7 @@ impl SessionActor {
             _ => RunnerCommitError::DurabilityUnavailable,
         };
         let diagnostic = super::settlement::commit_diagnostic(&error);
-        if let Some(active) = self.active.as_mut() {
+        if let Some(active) = self.core.active.as_mut() {
             active.cancellation.cancel();
             if active.commit_failure.is_none() {
                 active.commit_failure = Some(ActiveCommitFailure {
@@ -109,8 +107,8 @@ impl SessionActor {
                 });
             }
         }
-        if self.closing && self.closing_durability_failure.is_none() {
-            self.closing_durability_failure = Some(diagnostic.clone());
+        if self.core.closing && self.core.closing_durability_failure.is_none() {
+            self.core.closing_durability_failure = Some(diagnostic.clone());
         }
         self.mark_degraded(diagnostic);
         result
@@ -124,11 +122,11 @@ impl SessionActor {
             kind,
             resume,
         } = suspension;
-        if self.closing {
+        if self.core.closing || self.root_cancel.is_cancelled() {
             let _ = resume.send(Err(SuspensionError::Cancelled));
             return;
         }
-        let Some(active) = self.active.as_mut() else {
+        let Some(active) = self.core.active.as_ref() else {
             let _ = resume.send(Err(SuspensionError::RuntimeClosed));
             return;
         };
@@ -136,7 +134,15 @@ impl SessionActor {
             let _ = resume.send(Err(SuspensionError::StaleTurn));
             return;
         }
-        if active.pending.is_some() || self.state_tx.borrow().status != SessionStatus::Running {
+        if active.cancellation.is_cancelled() {
+            let _ = resume.send(Err(SuspensionError::Cancelled));
+            return;
+        }
+        if matches!(&self.core.health, SessionHealth::Degraded { .. })
+            || active.pending.is_some()
+            || active.outcome.is_some()
+            || active.commit_failure.is_some()
+        {
             let _ = resume.send(Err(SuspensionError::InvalidState));
             return;
         }
@@ -154,6 +160,16 @@ impl SessionActor {
                 return;
             }
         };
+        if self.root_cancel.is_cancelled()
+            || self
+                .core
+                .active
+                .as_ref()
+                .is_some_and(|active| active.cancellation.is_cancelled())
+        {
+            let _ = resume.send(Err(SuspensionError::Cancelled));
+            return;
+        }
         let public = PendingInteraction {
             interaction_id,
             turn_id,
@@ -161,14 +177,16 @@ impl SessionActor {
             tool_name,
             kind,
         };
+        let Some(active) = self.core.active.as_mut() else {
+            let _ = resume.send(Err(SuspensionError::RuntimeClosed));
+            return;
+        };
+        debug_assert_eq!(active.turn_id, turn_id);
         active.pending = Some(PendingInteractionState {
             public: public.clone(),
             resume,
         });
-        let mut state = self.state();
-        state.status = SessionStatus::WaitingForInput;
-        state.pending_interaction = Some(public.clone());
-        self.publish_state(state);
+        self.publish_state();
         let _ = self.events.try_emit(SessionEvent::InteractionRequested {
             interaction: public,
         });
@@ -241,11 +259,11 @@ impl SessionActor {
         &mut self,
         exit: Option<Result<TurnRunnerExit, tokio::task::JoinError>>,
     ) {
-        let Some(turn_id) = self.active.as_ref().map(|active| active.turn_id) else {
+        let Some(turn_id) = self.core.active.as_ref().map(|active| active.turn_id) else {
             return;
         };
         let confirmed_usage = self.conversation.confirmed_turn_usage(turn_id);
-        let Some(active) = self.active.as_mut() else {
+        let Some(active) = self.core.active.as_mut() else {
             return;
         };
         active.runner.take();

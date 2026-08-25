@@ -29,7 +29,7 @@ The Host acquires exactly one `Box<dyn SessionLog>` and passes it to `SessionRun
 
 `SessionBindings` freezes one direct `Arc<dyn Model>`, one immutable `ToolSet`, and optional ToolPolicy, ContextProvider, and CompactionStrategy adapters. Validation is pure apart from panic-isolated descriptor inspection and invokes no adapter future. Create/load then constructs one checked `Arc<agent::SessionEnvironment>` containing the immutable SessionSpec/limits, model limits, enabled tools, and static Prompt/Context/Compaction/Model/Tool drivers for the loaded lifetime.
 
-`SessionActor` is the sole durable mutation owner. It serializes commands, runner commit acknowledgements, interactions, transcript reads, settlement, health degradation, and close ordering. `SessionHandle` contains only stable IDs, a bounded command sender, and watch state.
+`SessionActor` is the sole durable mutation owner. Its private `ActorCoreState` owns active Turn state, health, closing/durability facts, the last durable terminal, and interaction-resolution identity. Public `SessionState` is derived from that core and `ConversationLog::head()`; the watch sender is output-only. The actor serializes commands, runner commit acknowledgements, interactions, transcript reads, settlement, health degradation, and close ordering. `SessionHandle` contains only stable IDs, a bounded command sender, and watch state.
 
 The SessionLog trait is physically declared in `conversation/session_log.rs` because conversation validation and ConversationLog consume it. `storage` publicly reexports the Port so the external API remains `storage::SessionLog`. This placement removes the former `conversation ↔ storage` module cycle.
 

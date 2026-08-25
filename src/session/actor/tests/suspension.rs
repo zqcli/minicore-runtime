@@ -9,25 +9,18 @@ use crate::value::BoundedText;
 
 use super::super::run::ActorSignal;
 use super::super::*;
-use super::support::{actor_fixture, actor_fixture_with_tool_calls};
+use super::support::{ActorFixture, actor_fixture, actor_fixture_with_tool_calls};
 
 #[tokio::test]
 async fn suspension_without_durable_unresolved_tool_is_rejected_without_publication() {
     let mut fixture = actor_fixture(false).await;
-    let before = fixture.actor.state();
-    let (suspension, receiver) =
-        suspension(fixture.turn_id, fixture.tool_call_id, fixture.tool_name);
-    fixture.actor.register_suspension(suspension);
-    assert_eq!(receiver.await.unwrap(), Err(SuspensionError::InvalidState));
-    assert_eq!(fixture.actor.state(), before);
-    assert!(fixture.ready.events.try_recv().is_err());
+    assert_rejected_exact_suspension(&mut fixture, SuspensionError::InvalidState).await;
 }
 
 #[tokio::test]
 async fn suspension_wrong_call_or_name_is_rejected_without_publication() {
     for wrong_call in [true, false] {
         let mut fixture = actor_fixture(true).await;
-        let before = fixture.actor.state();
         let call_id = if wrong_call {
             "call_00000000000000000000000000000082".parse().unwrap()
         } else {
@@ -38,11 +31,15 @@ async fn suspension_wrong_call_or_name_is_rejected_without_publication() {
         } else {
             "other".parse().unwrap()
         };
-        let (suspension, receiver) = suspension(fixture.turn_id, call_id, tool_name);
-        fixture.actor.register_suspension(suspension);
-        assert_eq!(receiver.await.unwrap(), Err(SuspensionError::InvalidState));
-        assert_eq!(fixture.actor.state(), before);
-        assert!(fixture.ready.events.try_recv().is_err());
+        let turn_id = fixture.turn_id;
+        assert_rejected_suspension(
+            &mut fixture,
+            turn_id,
+            call_id,
+            tool_name,
+            SuspensionError::InvalidState,
+        )
+        .await;
     }
 }
 
@@ -70,21 +67,95 @@ async fn suspension_for_exact_durable_unresolved_tool_publishes_state_before_eve
 }
 
 #[tokio::test]
+async fn stale_suspension_after_cancellation_is_rejected_without_publication() {
+    let mut fixture = actor_fixture(true).await;
+    fixture
+        .actor
+        .core
+        .active
+        .as_ref()
+        .unwrap()
+        .cancellation
+        .cancel();
+    assert_rejected_exact_suspension(&mut fixture, SuspensionError::Cancelled).await;
+}
+
+#[tokio::test]
+async fn stale_suspension_after_outcome_or_commit_failure_is_rejected_without_publication() {
+    for commit_failure in [false, true] {
+        let mut fixture = actor_fixture(true).await;
+        if commit_failure {
+            fixture.actor.core.active.as_mut().unwrap().commit_failure =
+                Some(ActiveCommitFailure {
+                    diagnostic: SessionActor::diagnostic(
+                        DiagnosticCode::Internal,
+                        DiagnosticCategory::Storage,
+                        "test commit failure",
+                        false,
+                    ),
+                    unknown: false,
+                });
+        } else {
+            fixture.actor.core.active.as_mut().unwrap().outcome = Some(RunnerOutcome::Completed {
+                usage: Usage::default(),
+            });
+        }
+        assert_rejected_exact_suspension(&mut fixture, SuspensionError::InvalidState).await;
+    }
+}
+
+#[tokio::test]
+async fn suspension_rejects_root_cancellation_and_closing_without_publication() {
+    let mut root_cancelled = actor_fixture(true).await;
+    root_cancelled.actor.root_cancel.cancel();
+    assert_rejected_exact_suspension(&mut root_cancelled, SuspensionError::Cancelled).await;
+
+    let mut closing = actor_fixture(true).await;
+    closing.actor.core.closing = true;
+    closing.actor.publish_state();
+    assert_rejected_exact_suspension(&mut closing, SuspensionError::Cancelled).await;
+}
+
+#[tokio::test]
+async fn suspension_rejects_real_degraded_state_with_cancellation_priority() {
+    let mut degraded = actor_fixture(true).await;
+    degraded.actor.degrade_on_transcript_failure(
+        SessionActor::diagnostic(
+            DiagnosticCode::Internal,
+            DiagnosticCategory::Storage,
+            "test degraded state",
+            false,
+        ),
+        false,
+    );
+    assert!(matches!(
+        degraded.actor.core.health,
+        SessionHealth::Degraded { .. }
+    ));
+    assert!(degraded.actor.core.active.as_ref().is_some_and(|active| {
+        active.cancellation.is_cancelled() && active.commit_failure.is_some()
+    }));
+    assert!(matches!(
+        degraded.ready.events.try_recv().unwrap().event,
+        super::super::super::event::SessionEvent::HealthChanged { .. }
+    ));
+    assert_rejected_exact_suspension(&mut degraded, SuspensionError::Cancelled).await;
+}
+
+#[tokio::test]
 async fn suspension_requires_the_next_unresolved_tool_in_durable_order() {
     let mut fixture = actor_fixture_with_tool_calls(2).await;
-    let before = fixture.actor.state();
-    let (second, second_receiver) = suspension(
-        fixture.turn_id,
-        fixture.second_tool_call_id.clone(),
-        fixture.second_tool_name.clone(),
-    );
-    fixture.actor.register_suspension(second);
-    assert_eq!(
-        second_receiver.await.unwrap(),
-        Err(SuspensionError::InvalidState)
-    );
-    assert_eq!(fixture.actor.state(), before);
-    assert!(fixture.ready.events.try_recv().is_err());
+    let turn_id = fixture.turn_id;
+    let second_tool_call_id = fixture.second_tool_call_id.clone();
+    let second_tool_name = fixture.second_tool_name.clone();
+    assert_rejected_suspension(
+        &mut fixture,
+        turn_id,
+        second_tool_call_id,
+        second_tool_name,
+        SuspensionError::InvalidState,
+    )
+    .await;
 
     let batch = fixture
         .actor
@@ -98,9 +169,8 @@ async fn suspension_requires_the_next_unresolved_tool_in_durable_order() {
         })])
         .await
         .unwrap();
-    let mut state = fixture.actor.state();
-    state.conversation_seq = batch.head;
-    fixture.actor.publish_state(state);
+    assert_eq!(fixture.actor.conversation.head(), batch.head);
+    fixture.actor.publish_state();
 
     let (second, second_receiver) = suspension(
         fixture.turn_id,
@@ -125,7 +195,14 @@ async fn suspension_requires_the_next_unresolved_tool_in_durable_order() {
 #[tokio::test]
 async fn failed_resume_send_clears_pending_without_resolution_event_and_settles() {
     let mut fixture = actor_fixture(true).await;
-    let cancellation = fixture.actor.active.as_ref().unwrap().cancellation.clone();
+    let cancellation = fixture
+        .actor
+        .core
+        .active
+        .as_ref()
+        .unwrap()
+        .cancellation
+        .clone();
     let started = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let task_started = std::sync::Arc::clone(&started);
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
@@ -169,6 +246,7 @@ async fn failed_resume_send_clears_pending_without_resolution_event_and_settles(
     assert!(matches!(
         fixture
             .actor
+            .core
             .active
             .as_ref()
             .and_then(|active| active.outcome.as_ref()),
@@ -224,4 +302,34 @@ fn suspension(
         },
         receiver,
     )
+}
+
+async fn assert_rejected_exact_suspension(fixture: &mut ActorFixture, expected: SuspensionError) {
+    let turn_id = fixture.turn_id;
+    let tool_call_id = fixture.tool_call_id.clone();
+    let tool_name = fixture.tool_name.clone();
+    assert_rejected_suspension(fixture, turn_id, tool_call_id, tool_name, expected).await;
+}
+
+async fn assert_rejected_suspension(
+    fixture: &mut ActorFixture,
+    turn_id: TurnId,
+    tool_call_id: crate::ids::ToolCallId,
+    tool_name: ToolName,
+    expected: SuspensionError,
+) {
+    let before = fixture.actor.state();
+    let (suspension, receiver) = suspension(turn_id, tool_call_id, tool_name);
+    fixture.actor.register_suspension(suspension);
+    assert_eq!(receiver.await.unwrap(), Err(expected));
+    assert_eq!(fixture.actor.state(), before);
+    assert!(
+        fixture
+            .actor
+            .core
+            .active
+            .as_ref()
+            .is_none_or(|active| active.pending.is_none())
+    );
+    assert!(fixture.ready.events.try_recv().is_err());
 }

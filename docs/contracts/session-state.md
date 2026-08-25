@@ -63,6 +63,6 @@ Health and status are distinct. A Session may be `Closing` while degraded, and a
 
 `SessionHandle::state()` clones the current watch value. `watch_state()` returns another receiver for the same authoritative state channel. The initial value exists before `SessionRuntime::create` or `load` returns ready, so callers never need an event to discover initial identity, health, status, or confirmed head.
 
-The actor is the only state writer. For public transitions it updates state before best-effort event delivery. A dropped `InteractionRequested`, `HealthChanged`, or `TurnFinished` event therefore does not erase the authoritative current state or durable result.
+The actor is the only state writer. Its private `ActorCoreState` is the sole owner of active Turn, health, closing/durability, last-terminal, and interaction-resolution facts; `SessionState` is derived from that core plus `ConversationLog::head()`. The watch sender is output-only and is never read for production decisions. For public transitions it updates the derived state before best-effort event delivery. A dropped `InteractionRequested`, `HealthChanged`, or `TurnFinished` event therefore does not erase the authoritative current state or durable result.
 
 Watch is level-triggered current truth, not a lossless transition history. Consumers that need durable history use `SessionHandle::transcript`; consumers that need exact Turn completion use `TurnHandle::wait`.
