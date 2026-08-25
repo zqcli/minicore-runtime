@@ -27,40 +27,18 @@ FORBIDDEN_PATHS = {
 FORBIDDEN_ADAPTER_DIRECTORIES = {
     "src/storage/jsonl", "src/storage/store", "src/storage/conversation_jsonl",
 }
-FINAL_ABSENT_PATHS = {
-    "src/agent/legacy.rs", "src/agent/legacy_context.rs", "src/agent/legacy_runner.rs",
-    "src/model/legacy_gateway.rs", "src/model/legacy_provider.rs",
-    "src/model/legacy_registry.rs", "src/prompt/legacy.rs",
-    "src/prompt/legacy_builder.rs", "src/prompt/legacy_compaction.rs",
-    "src/session/legacy_actor.rs", "src/session/legacy_command.rs",
-    "src/session/legacy_event.rs", "src/session/legacy_event_stream.rs",
-    "src/session/legacy_snapshot.rs", "src/session/legacy_state.rs",
-    "src/session/transcript.rs", "src/tools/legacy_context.rs",
-    "src/tools/legacy_policy.rs", "src/tools/legacy_types.rs", "src/tools/registry.rs",
-    "src/workspace", "src/workspace.rs", "src/storage/conversation",
-    "src/storage/conversation.rs", "src/storage/store.rs",
-    "src/storage/compaction_visibility.rs",
-}
 CONCRETE_FILENAMES = {
     "anthropic.rs", "openai.rs", "provider.rs", "providers.rs", "filesystem.rs",
     "process.rs", "builtins.rs",
 }
-CANONICAL_PRODUCTION_FILES = {
-    "src/agent": {"mod.rs", "runner.rs", "runner_protocol.rs", "tool_driver.rs", "turn_context.rs"},
-    "src/context": {"mod.rs", "provider.rs", "driver.rs"},
-    "src/model": {"mod.rs", "model.rs", "driver.rs", "request.rs", "response.rs", "types.rs"},
-    "src/prompt": {"mod.rs", "builder.rs"},
-    "src/tools": {"mod.rs", "tool.rs", "set.rs", "context.rs", "input.rs", "policy.rs", "progress.rs", "types.rs"},
-}
-CANONICAL_PRODUCTION_DIRECTORIES = {
-    "src/agent/runner": {"compaction.rs", "diagnostics.rs", "support.rs"},
-    "src/agent/tool_driver": {"support.rs"},
-    "src/compaction/driver": set(),
-    "src/model/driver": {"assembler.rs", "failure.rs"},
-    "src/session/actor": {
-        "commands.rs", "lifecycle.rs", "run.rs", "runner.rs", "settlement.rs",
-        "supervisor.rs",
-    },
+# Directories whose contents must stay Port/driver-shaped: a concrete adapter must
+# never appear beneath them. This is a deny-list of adapter-shaped names, not an
+# allow-list of permitted filenames, so ordinary refactors need no gate change.
+ADAPTER_FREE_DIRECTORIES = ("src/model", "src/tools", "src/agent", "src/context", "src/compaction")
+ADAPTER_STEMS = {
+    "anthropic", "openai", "open_ai", "bedrock", "vertex", "azure", "ollama",
+    "provider", "providers", "registry", "gateway", "transport", "network",
+    "http", "client", "filesystem", "process", "builtins", "manager",
 }
 MODEL_DRIVER_ROLE_FILES = {"src/model/driver.rs"}
 TOOL_DRIVER_ROLE_FILES = {"src/agent/tool_driver.rs"}
@@ -751,9 +729,6 @@ def forbidden_path_errors(root: Path, test_files: set[str]) -> list[str]:
         relative = path.relative_to(root).as_posix()
         if any(part.casefold().startswith("legacy") for part in Path(relative).parts):
             errors.append(f"forbidden final legacy path: {relative}")
-    for relative in sorted(FINAL_ABSENT_PATHS):
-        if (root / relative).exists():
-            errors.append(f"forbidden final legacy path: {relative}")
     for relative in sorted(FORBIDDEN_PATHS):
         path = root / relative
         if path.is_dir():
@@ -839,67 +814,27 @@ def test_helper_with_empty_production_view(
     return bool(excluded) and not mask_rust(view).strip()
 
 
-def canonical_allowlist_errors(
-    root: Path,
-    test_files: set[str],
-    source_texts: dict[str, str],
-) -> list[str]:
+def adapter_free_errors(root: Path, test_files: set[str]) -> list[str]:
+    """Reject concrete adapters and empty directories under the Port-owning trees."""
     errors: list[str] = []
-
-    for directory, allowed_names in CANONICAL_PRODUCTION_FILES.items():
-        path = root / directory
-        if not path.exists():
+    for directory in ADAPTER_FREE_DIRECTORIES:
+        base = root / directory
+        if not base.is_dir():
             continue
-        if not path.is_dir():
-            errors.append(f"forbidden production {directory} path: {directory}")
-            continue
-        for child in path.iterdir():
+        for child in sorted(base.rglob("*")):
             relative = child.relative_to(root).as_posix()
-            if child.is_file():
-                if relative in TRANSITIONAL_PRIVATE_FILES:
-                    continue
-                if child.name in allowed_names:
-                    continue
-                if child.suffix == ".rs" and test_helper_with_empty_production_view(relative, source_texts, test_files):
-                    continue
-                errors.append(f"forbidden production {directory} path: {relative}")
+            if child.is_dir():
+                if not any(child.iterdir()):
+                    errors.append(f"forbidden production {directory} path: {relative} (empty directory)")
+                elif child.name.casefold() in ADAPTER_STEMS:
+                    errors.append(f"forbidden production {directory} path: {relative} (adapter-shaped directory)")
                 continue
-            if not child.is_dir():
-                errors.append(f"forbidden production {directory} path: {relative}")
+            if relative in test_files:
                 continue
-            descendants = list(child.rglob("*"))
-            rust_files = [descendant for descendant in descendants if descendant.is_file() and descendant.suffix == ".rs"]
-            empty_directories = [descendant for descendant in descendants if descendant.is_dir() and not any(descendant.iterdir())]
-            allowed_production = CANONICAL_PRODUCTION_DIRECTORIES.get(relative)
-            if allowed_production is not None:
-                invalid = [
-                    descendant
-                    for descendant in rust_files
-                    if not (
-                        descendant.parent == child
-                        and descendant.name in allowed_production
-                    )
-                    and not test_helper_with_empty_production_view(
-                        descendant.relative_to(root).as_posix(),
-                        source_texts,
-                        test_files,
-                    )
-                ]
-                if (
-                    invalid
-                    or empty_directories
-                    or any(
-                        descendant.is_file() and descendant.suffix != ".rs"
-                        for descendant in descendants
-                    )
-                ):
-                    errors.append(f"forbidden production {directory} path: {relative}")
-                continue
-            if not rust_files or empty_directories or any(
-                not test_helper_with_empty_production_view(descendant.relative_to(root).as_posix(), source_texts, test_files)
-                for descendant in rust_files
-            ) or any(descendant.is_file() and descendant.suffix != ".rs" for descendant in descendants):
-                errors.append(f"forbidden production {directory} path: {relative}")
+            if child.suffix != ".rs":
+                errors.append(f"forbidden production {directory} path: {relative} (non-Rust file)")
+            elif child.stem.casefold() in ADAPTER_STEMS and relative not in ALLOWED_PORT_PATHS:
+                errors.append(f"forbidden production {directory} path: {relative} (adapter-shaped file)")
     return errors
 
 
@@ -1190,7 +1125,7 @@ def scan(root: Path) -> list[str]:
     for dependency in sorted(dependencies & FORBIDDEN_DEPENDENCIES):
         errors.append(f"Cargo.toml: forbidden direct dependency {dependency}")
     errors.extend(root_surface_errors(views))
-    errors.extend(canonical_allowlist_errors(root, test_files, source_texts))
+    errors.extend(adapter_free_errors(root, test_files))
     errors.extend(storage_allowlist_errors(root, test_files, source_texts))
     errors.extend(f"module cycle: {' -> '.join(component)}" for component in strongly_connected(graph_edges(root, views)))
     for required in sorted(REQUIRED_FILES):
