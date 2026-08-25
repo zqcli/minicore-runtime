@@ -150,7 +150,7 @@ impl SessionActor {
             runner: None,
             critical_open: true,
             progress_open: true,
-            outcome: None,
+            forced_outcome: None,
             pending: None,
             commit_failure: None,
         });
@@ -184,7 +184,7 @@ impl SessionActor {
                     .active
                     .as_mut()
                     .expect("active turn retained after request validation")
-                    .outcome = Some(RunnerOutcome::Failed {
+                    .forced_outcome = Some(RunnerOutcome::Failed {
                     diagnostic: Self::diagnostic(
                         DiagnosticCode::Internal,
                         DiagnosticCategory::Internal,
@@ -272,8 +272,8 @@ impl SessionActor {
         if pending.resume.send(Ok(answer)).is_err() {
             let usage = self.conversation.confirmed_turn_usage(turn_id);
             if let Some(active) = self.core.active.as_mut() {
-                if active.outcome.is_none() {
-                    active.outcome = Some(RunnerOutcome::Failed {
+                if active.forced_outcome.is_none() {
+                    active.forced_outcome = Some(RunnerOutcome::Failed {
                         diagnostic: Self::diagnostic(
                             DiagnosticCode::Internal,
                             DiagnosticCategory::Internal,

@@ -284,10 +284,7 @@ async fn committed_update_acknowledges_a_ten_thousand_entry_history() {
         event => panic!("unexpected event: {event:?}"),
     }
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Completed { .. }
-        })
+        joined_outcome(task).await,
+        RunnerOutcome::Completed { .. }
     ));
-    assert_finished(task.await.unwrap());
 }

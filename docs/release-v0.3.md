@@ -92,7 +92,7 @@ Validation environment:
 - remote Linux checkout: `/root/minicore-runtime-v03`;
 - stable `rustc 1.98.0`, `cargo 1.98.0`, and `clippy 1.98.0`;
 - full `scripts/check.sh` pass;
-- 293 root library tests plus passing cleaned integration/provider-gate suites;
+- 291 root library tests plus passing cleaned integration/provider-gate suites;
 - MSRV `rustc 1.85.0` and `cargo 1.85.0` with `scripts/check-msrv.sh` passing;
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked` passing;
 - authoritative architecture scanner passing with `production_files=144`;
@@ -121,8 +121,8 @@ The reviewed comparison uses baseline commit `2fd7104`. “cfg(test)-excluded pr
 
 | Metric | Baseline | Current | Change |
 | --- | ---: | ---: | ---: |
-| cfg(test)-excluded production LOC | 15,483 | 14,149 | -1,334 |
-| raw `src/**/*.rs` lines | 48,055 | 31,658 | -16,397 |
+| cfg(test)-excluded production LOC | 15,483 | 14,100 | -1,383 |
+| raw `src/**/*.rs` lines | 48,055 | 31,329 | -16,726 |
 | `src` Rust files | 174 | 144 | -30 |
 | files with production content | 83 | 78 | -5 |
 

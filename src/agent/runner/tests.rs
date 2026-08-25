@@ -539,8 +539,11 @@ fn input_request() -> ToolInputRequest {
     ToolInputRequest::new("input", Vec::new(), ToolInputAnswerKind::Text).unwrap()
 }
 
-fn assert_finished(exit: TurnRunnerExit) {
-    assert!(matches!(exit, TurnRunnerExit::Finished { .. }));
+async fn joined_outcome(task: tokio::task::JoinHandle<TurnRunnerExit>) -> RunnerOutcome {
+    match task.await.unwrap() {
+        TurnRunnerExit::Finished { outcome } => outcome,
+        TurnRunnerExit::Panicked => panic!("runner panicked"),
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

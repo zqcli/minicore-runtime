@@ -19,39 +19,22 @@ mod support;
 use compaction::{CompactionState, PreparedModelRequest, prepare_model_request};
 use diagnostics::{budget_exceeded, critical_failure, internal_failure, model_failure};
 use support::{
-    CriticalFailure, FinishControl, UsageAccumulator, assistant_draft, commit_assistant,
-    commit_tool_result, finish_outcome, model_progress, progress, send_critical,
-    send_critical_for_context, tool_progress, validate_assistant_ack, validate_tool_ack,
+    CriticalFailure, UsageAccumulator, assistant_draft, commit_assistant, commit_tool_result,
+    model_progress, progress, send_critical_for_context, tool_progress, validate_assistant_ack,
+    validate_tool_ack,
 };
 
 const LOCAL_PROGRESS_CAPACITY: usize = 64;
 const LOCAL_SUSPENSION_CAPACITY: usize = 1;
 
 pub(crate) async fn run_turn(request: TurnRunnerRequest) -> TurnRunnerExit {
-    let finish = FinishControl {
-        sender: request.critical_tx.clone(),
-        cancellation: request.cancellation.clone(),
-        deadline: request.deadline,
-    };
     let task = async move {
         let mut context = TurnRunnerContext::from_request(request);
         run_ordinary_loop(&mut context).await
     };
     match AssertUnwindSafe(task).catch_unwind().await {
-        Ok(outcome) => finish_outcome(&finish, outcome).await,
-        Err(_) => {
-            let _ = send_critical(
-                &finish,
-                RunnerEvent::Finish {
-                    outcome: internal_failure(
-                        "turn runner panicked",
-                        crate::model::Usage::default(),
-                    ),
-                },
-            )
-            .await;
-            TurnRunnerExit::Panicked
-        }
+        Ok(outcome) => TurnRunnerExit::Finished { outcome },
+        Err(_) => TurnRunnerExit::Panicked,
     }
 }
 

@@ -96,9 +96,10 @@ async fn stale_suspension_after_outcome_or_commit_failure_is_rejected_without_pu
                     unknown: false,
                 });
         } else {
-            fixture.actor.core.active.as_mut().unwrap().outcome = Some(RunnerOutcome::Completed {
-                usage: Usage::default(),
-            });
+            fixture.actor.core.active.as_mut().unwrap().forced_outcome =
+                Some(RunnerOutcome::Completed {
+                    usage: Usage::default(),
+                });
         }
         assert_rejected_exact_suspension(&mut fixture, SuspensionError::InvalidState).await;
     }
@@ -249,7 +250,7 @@ async fn failed_resume_send_clears_pending_without_resolution_event_and_settles(
             .core
             .active
             .as_ref()
-            .and_then(|active| active.outcome.as_ref()),
+            .and_then(|active| active.forced_outcome.as_ref()),
         Some(RunnerOutcome::Failed { .. })
     ));
     barrier.wait().await;

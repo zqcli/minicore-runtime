@@ -148,7 +148,7 @@ async fn context_deadline_case(turn_after: Duration, port_timeout: Duration) -> 
         context_timeout: port_timeout,
         ..KernelConfig::default_checked().unwrap()
     };
-    let (request, mut critical_rx, _progress_rx) =
+    let (request, _critical_rx, _progress_rx) =
         request_with_kernel(spec, bindings, initial, kernel, turn_after);
     let notified = context.started.notified();
     tokio::pin!(notified);
@@ -156,12 +156,7 @@ async fn context_deadline_case(turn_after: Duration, port_timeout: Duration) -> 
     let task = tokio::spawn(run_turn(request));
     notified.await;
     tokio::time::advance(Duration::from_secs(6)).await;
-    let outcome = match critical_rx.recv().await.unwrap() {
-        RunnerEvent::Finish { outcome } => outcome,
-        event => panic!("unexpected event: {event:?}"),
-    };
-    assert_finished(task.await.unwrap());
-    outcome
+    joined_outcome(task).await
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -190,7 +185,7 @@ async fn model_deadline_case(turn_after: Duration, port_timeout: Duration) -> Ru
         model_call_timeout: port_timeout,
         ..KernelConfig::default_checked().unwrap()
     };
-    let (request, mut critical_rx, _progress_rx) = request_with_kernel(
+    let (request, _critical_rx, _progress_rx) = request_with_kernel(
         spec,
         empty_bindings(model_port),
         initial,
@@ -203,12 +198,7 @@ async fn model_deadline_case(turn_after: Duration, port_timeout: Duration) -> Ru
     let task = tokio::spawn(run_turn(request));
     notified.await;
     tokio::time::advance(Duration::from_secs(6)).await;
-    let outcome = match critical_rx.recv().await.unwrap() {
-        RunnerEvent::Finish { outcome } => outcome,
-        event => panic!("unexpected event: {event:?}"),
-    };
-    assert_finished(task.await.unwrap());
-    outcome
+    joined_outcome(task).await
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -264,12 +254,6 @@ async fn finish_after_tool_result(
         }
         event => panic!("unexpected event: {event:?}"),
     }
-    assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Completed { .. }
-        })
-    ));
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -308,12 +292,9 @@ async fn policy_turn_deadline_has_no_tool_result_commit() {
     notified.await;
     tokio::time::advance(Duration::from_secs(6)).await;
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::BudgetExceeded { .. }
-        })
+        joined_outcome(task).await,
+        RunnerOutcome::BudgetExceeded { .. }
     ));
-    assert_finished(task.await.unwrap());
     assert_eq!(tool.calls(), 0);
     assert!(critical_rx.try_recv().is_err());
 }
@@ -360,7 +341,10 @@ async fn configured_policy_timeout_commits_denied_result_and_continues() {
         ToolResultOutcome::Denied,
     )
     .await;
-    assert_finished(task.await.unwrap());
+    assert!(matches!(
+        joined_outcome(task).await,
+        RunnerOutcome::Completed { .. }
+    ));
 }
 
 fn pending_tool_bindings(model: Arc<ScriptModel>, tool: Arc<PendingTool>) -> SessionBindings {
@@ -407,12 +391,9 @@ async fn tool_turn_deadline_has_no_tool_result_commit() {
     notified.await;
     tokio::time::advance(Duration::from_secs(6)).await;
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::BudgetExceeded { .. }
-        })
+        joined_outcome(task).await,
+        RunnerOutcome::BudgetExceeded { .. }
     ));
-    assert_finished(task.await.unwrap());
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     assert!(critical_rx.try_recv().is_err());
 }
@@ -454,6 +435,9 @@ async fn configured_tool_timeout_commits_failed_result_and_continues() {
         ToolResultOutcome::Failed,
     )
     .await;
-    assert_finished(task.await.unwrap());
+    assert!(matches!(
+        joined_outcome(task).await,
+        RunnerOutcome::Completed { .. }
+    ));
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
 }

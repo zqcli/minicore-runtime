@@ -28,13 +28,6 @@ impl SessionActor {
                 let _ = reply.send(result);
             }
             RunnerEvent::Suspend { suspension } => self.register_suspension(suspension),
-            RunnerEvent::Finish { outcome } => {
-                if let Some(active) = self.core.active.as_mut() {
-                    if active.outcome.is_none() {
-                        active.outcome = Some(outcome);
-                    }
-                }
-            }
         }
     }
 
@@ -146,7 +139,7 @@ impl SessionActor {
         }
         if matches!(&self.core.health, SessionHealth::Degraded { .. })
             || active.pending.is_some()
-            || active.outcome.is_some()
+            || active.forced_outcome.is_some()
             || active.commit_failure.is_some()
         {
             let _ = resume.send(Err(SuspensionError::InvalidState));
@@ -273,17 +266,14 @@ impl SessionActor {
             return;
         };
         active.runner.take();
-        let fallback = match exit {
-            Some(Ok(TurnRunnerExit::Finished { outcome }))
-            | Some(Ok(TurnRunnerExit::ProtocolClosed { outcome })) => outcome,
+        let joined = match exit {
+            Some(Ok(TurnRunnerExit::Finished { outcome })) => Some(outcome),
             Some(Ok(TurnRunnerExit::Panicked)) | Some(Err(_)) | None => {
-                internal_outcome(confirmed_usage)
+                Some(internal_outcome(confirmed_usage))
             }
         };
-        if active.outcome.is_none() {
-            active.outcome = Some(fallback);
-        }
-        self.settle_active(None).await;
+        let outcome = active.forced_outcome.take().or(joined);
+        self.settle_active(outcome).await;
     }
 }
 

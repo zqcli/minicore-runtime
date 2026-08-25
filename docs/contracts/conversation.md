@@ -42,7 +42,7 @@ A Summary cannot cross a nonterminal boundary, summarize the active Turn, forge 
 
 Only `ConversationLog` assigns sequence numbers and timestamps. Runners submit unsequenced drafts; SessionActor submits them to ConversationLog. Confirmed in-memory state advances only after the adapter returns an exact `AppendReceipt` proving one canonical prefix extension.
 
-Known append failure leaves confirmed memory unchanged. Unknown outcome, timeout, panic, or invalid receipt never commits memory and latches durability uncertainty. The actor-owned log view carries validated provenance for its exact state/head/spec/limits; after a successful single-entry append, the actor acknowledges only the committed entry delta and validated new view. Runner validation requires that provenance and never compares or replays the old prefix. Public state, ToolFinished, TurnHandle completion, and TurnFinished obey the durable-first order defined by their contracts.
+Known append failure leaves confirmed memory unchanged. Unknown outcome, timeout, panic, or invalid receipt never commits memory and latches durability uncertainty. The actor-owned log view carries validated provenance for its exact state/head/spec/limits; after a successful single-entry append, the actor acknowledges only the committed entry delta and validated new view. Runner validation requires that provenance and never compares or replays the old prefix. Normal runner completion returns through the tracked JoinHandle, not a critical-channel finish event; actor-forced outcomes remain separate from the joined outcome. Public state, ToolFinished, TurnHandle completion, and TurnFinished obey the durable-first order defined by their contracts.
 
 ## Settlement
 

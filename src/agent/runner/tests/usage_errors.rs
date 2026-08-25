@@ -58,19 +58,14 @@ async fn context_model_and_prompt_failures_map_to_bounded_finish_diagnostics() {
         };
         let spec = session_spec(&[], 4);
         let initial = initial_conversation(&spec, 4);
-        let (request, mut critical_rx, _progress_rx) = runner_request(
+        let (request, _critical_rx, _progress_rx) = runner_request(
             spec,
             4,
             session_bindings(model, context, Vec::new(), None),
             initial,
         );
         let task = tokio::spawn(run_turn(request));
-        let diagnostic = match critical_rx.recv().await.unwrap() {
-            RunnerEvent::Finish {
-                outcome: RunnerOutcome::Failed { diagnostic, .. },
-            } => diagnostic,
-            event => panic!("unexpected event: {event:?}"),
-        };
+        let diagnostic = joined_outcome(task).await.diagnostic().unwrap().clone();
         assert_eq!(
             diagnostic.category,
             if case == "context" {
@@ -79,7 +74,6 @@ async fn context_model_and_prompt_failures_map_to_bounded_finish_diagnostics() {
                 crate::error::DiagnosticCategory::Compaction
             }
         );
-        assert_finished(task.await.unwrap());
     }
 }
 
@@ -113,17 +107,14 @@ async fn context_deadline_and_model_timeout_have_exact_failure_diagnostics() {
         };
         let spec = session_spec(&[], 4);
         let initial = initial_conversation(&spec, 4);
-        let (request, mut critical_rx, _progress_rx) = runner_request(
+        let (request, _critical_rx, _progress_rx) = runner_request(
             spec,
             4,
             session_bindings(model, context, Vec::new(), None),
             initial,
         );
         let task = tokio::spawn(run_turn(request));
-        let outcome = match critical_rx.recv().await.unwrap() {
-            RunnerEvent::Finish { outcome } => outcome,
-            event => panic!("unexpected event: {event:?}"),
-        };
+        let outcome = joined_outcome(task).await;
         assert_eq!(outcome.usage(), Usage::default());
         let diagnostic = outcome.diagnostic().unwrap();
         assert_eq!(
@@ -140,7 +131,6 @@ async fn context_deadline_and_model_timeout_have_exact_failure_diagnostics() {
                 )
             }
         );
-        assert_finished(task.await.unwrap());
     }
 }
 
@@ -167,7 +157,7 @@ async fn absolute_turn_deadline_during_context_is_budget_exceeded() {
     let mut bindings = session_bindings(model, None, Vec::new(), None);
     let context: Arc<dyn ContextProvider> = context;
     bindings.context = Some(context);
-    let (request, mut critical_rx, _progress_rx) = request_with_control(
+    let (request, _critical_rx, _progress_rx) = request_with_control(
         spec,
         4,
         bindings,
@@ -183,12 +173,9 @@ async fn absolute_turn_deadline_during_context_is_budget_exceeded() {
     notified.await;
     tokio::time::advance(Duration::from_secs(6)).await;
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::BudgetExceeded { usage }
-        }) if usage == Usage::default()
+        joined_outcome(task).await,
+        RunnerOutcome::BudgetExceeded { usage } if usage == Usage::default()
     ));
-    assert_finished(task.await.unwrap());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -244,22 +231,23 @@ async fn model_and_context_failures_retain_usage_from_the_prior_round() {
         );
         let task = tokio::spawn(run_turn(request));
         let mut conversation = initial;
-        let outcome = loop {
-            match critical_rx.recv().await.unwrap() {
-                RunnerEvent::CommitAssistant { draft, reply } => {
+        loop {
+            match critical_rx.recv().await {
+                None => break,
+                Some(RunnerEvent::CommitAssistant { draft, reply }) => {
                     let acknowledgement = ack_assistant(&conversation, &draft, &spec);
                     conversation = acknowledgement.conversation.clone();
                     reply.send(Ok(acknowledgement)).unwrap();
                 }
-                RunnerEvent::CommitToolResult { draft, reply } => {
+                Some(RunnerEvent::CommitToolResult { draft, reply }) => {
                     let acknowledgement = ack_tool(&conversation, &draft, &spec);
                     conversation = acknowledgement.conversation.clone();
                     reply.send(Ok(acknowledgement)).unwrap();
                 }
-                RunnerEvent::Finish { outcome } => break outcome,
-                event => panic!("unexpected event: {event:?}"),
+                Some(event) => panic!("unexpected event: {event:?}"),
             }
-        };
+        }
+        let outcome = joined_outcome(task).await;
         assert_eq!(outcome.usage(), prior_usage);
         let diagnostic = outcome.diagnostic().unwrap();
         assert_eq!(
@@ -276,7 +264,6 @@ async fn model_and_context_failures_retain_usage_from_the_prior_round() {
                 )
             }
         );
-        assert_finished(task.await.unwrap());
         assert_eq!(
             model.requests().len(),
             if case == "context" { 1 } else { 4 }
@@ -328,10 +315,7 @@ async fn usage_overflow_reports_internal_failure_with_the_prior_conservative_usa
             event => panic!("unexpected event: {event:?}"),
         }
     }
-    let outcome = match critical_rx.recv().await.unwrap() {
-        RunnerEvent::Finish { outcome } => outcome,
-        event => panic!("unexpected event: {event:?}"),
-    };
+    let outcome = joined_outcome(task).await;
     assert_eq!(outcome.usage(), prior_usage);
     let diagnostic = outcome.diagnostic().unwrap();
     assert_eq!(diagnostic.code, crate::error::DiagnosticCode::Internal);
@@ -339,7 +323,6 @@ async fn usage_overflow_reports_internal_failure_with_the_prior_conservative_usa
         diagnostic.category,
         crate::error::DiagnosticCategory::Internal
     );
-    assert_finished(task.await.unwrap());
     assert!(critical_rx.try_recv().is_err());
 }
 
@@ -377,15 +360,14 @@ async fn enabled_compaction_without_boundary_fails_overflow_without_strategy_cal
     });
     let mut bindings = session_bindings(model, None, Vec::new(), None);
     bindings.compaction = Some(compaction.clone());
-    let (request, mut critical_rx, _progress_rx) = runner_request(spec, 4, bindings, initial);
+    let (request, _critical_rx, _progress_rx) = runner_request(spec, 4, bindings, initial);
     let task = tokio::spawn(run_turn(request));
+    let outcome = joined_outcome(task).await;
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Failed { diagnostic, .. }
-        }) if diagnostic.category == crate::error::DiagnosticCategory::Compaction
+        outcome,
+        RunnerOutcome::Failed { diagnostic, .. }
+            if diagnostic.category == crate::error::DiagnosticCategory::Compaction
     ));
-    assert_finished(task.await.unwrap());
     assert_eq!(compaction.calls.load(Ordering::SeqCst), 0);
 }
 

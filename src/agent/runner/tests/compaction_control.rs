@@ -1,6 +1,8 @@
 use super::compaction_support::*;
 use super::*;
 use crate::compaction::CompactionError;
+use crate::conversation::SummaryDraft;
+use tokio::sync::oneshot;
 
 #[cfg(test)]
 mod priority;
@@ -94,12 +96,9 @@ async fn proactive_configured_timeout_is_skipped_and_model_continues() {
         event => panic!("unexpected event: {event:?}"),
     }
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Completed { .. }
-        })
+        joined_outcome(task).await,
+        RunnerOutcome::Completed { .. }
     ));
-    assert_finished(task.await.unwrap());
     assert_eq!(strategy.calls(), 1);
     assert_eq!(model.requests().len(), 1);
 }
@@ -108,7 +107,7 @@ async fn proactive_configured_timeout_is_skipped_and_model_continues() {
 async fn proactive_parent_cancellation_is_terminal_without_model_continuation() {
     let strategy = ScriptCompaction::new(vec![CompactionBehavior::Pending]);
     let cancellation = CancellationToken::new();
-    let (_spec, _conversation, request, mut critical_rx, model) = proactive_request(
+    let (_spec, _conversation, request, _critical_rx, model) = proactive_request(
         Arc::clone(&strategy),
         cancellation.clone(),
         Duration::from_secs(30),
@@ -118,19 +117,16 @@ async fn proactive_parent_cancellation_is_terminal_without_model_continuation() 
     strategy.wait_called().await;
     cancellation.cancel();
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Cancelled { .. }
-        })
+        joined_outcome(task).await,
+        RunnerOutcome::Cancelled { .. }
     ));
-    assert_finished(task.await.unwrap());
     assert!(model.requests().is_empty());
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn proactive_turn_deadline_is_terminal_without_model_continuation() {
     let strategy = ScriptCompaction::new(vec![CompactionBehavior::Pending]);
-    let (_spec, _conversation, request, mut critical_rx, model) = proactive_request(
+    let (_spec, _conversation, request, _critical_rx, model) = proactive_request(
         Arc::clone(&strategy),
         CancellationToken::new(),
         Duration::from_secs(5),
@@ -140,12 +136,9 @@ async fn proactive_turn_deadline_is_terminal_without_model_continuation() {
     strategy.wait_called().await;
     tokio::time::advance(Duration::from_secs(6)).await;
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::BudgetExceeded { .. }
-        })
+        joined_outcome(task).await,
+        RunnerOutcome::BudgetExceeded { .. }
     ));
-    assert_finished(task.await.unwrap());
     assert!(model.requests().is_empty());
 }
 
@@ -153,7 +146,7 @@ async fn proactive_turn_deadline_is_terminal_without_model_continuation() {
 async fn forced_compaction_parent_cancellation_is_cancelled() {
     let strategy = ScriptCompaction::new(vec![CompactionBehavior::Pending]);
     let cancellation = CancellationToken::new();
-    let (request, mut critical_rx, _progress_rx, model) = forced_request(
+    let (request, _critical_rx, _progress_rx, model) = forced_request(
         Arc::clone(&strategy),
         cancellation.clone(),
         Duration::from_secs(30),
@@ -164,19 +157,16 @@ async fn forced_compaction_parent_cancellation_is_cancelled() {
     strategy.wait_called().await;
     cancellation.cancel();
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Cancelled { .. }
-        })
+        joined_outcome(task).await,
+        RunnerOutcome::Cancelled { .. }
     ));
-    assert_finished(task.await.unwrap());
     assert!(model.requests().is_empty());
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn forced_compaction_turn_deadline_is_budget_exceeded() {
     let strategy = ScriptCompaction::new(vec![CompactionBehavior::Pending]);
-    let (request, mut critical_rx, _progress_rx, model) = forced_request(
+    let (request, _critical_rx, _progress_rx, model) = forced_request(
         Arc::clone(&strategy),
         CancellationToken::new(),
         Duration::from_secs(5),
@@ -187,19 +177,16 @@ async fn forced_compaction_turn_deadline_is_budget_exceeded() {
     strategy.wait_called().await;
     tokio::time::advance(Duration::from_secs(6)).await;
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::BudgetExceeded { .. }
-        })
+        joined_outcome(task).await,
+        RunnerOutcome::BudgetExceeded { .. }
     ));
-    assert_finished(task.await.unwrap());
     assert!(model.requests().is_empty());
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn forced_compaction_configured_timeout_is_a_compaction_failure() {
     let strategy = ScriptCompaction::new(vec![CompactionBehavior::Pending]);
-    let (request, mut critical_rx, _progress_rx, model) = forced_request(
+    let (request, _critical_rx, _progress_rx, model) = forced_request(
         Arc::clone(&strategy),
         CancellationToken::new(),
         Duration::from_secs(30),
@@ -209,15 +196,11 @@ async fn forced_compaction_configured_timeout_is_a_compaction_failure() {
     let task = tokio::spawn(run_turn(request));
     strategy.wait_called().await;
     tokio::time::advance(Duration::from_secs(6)).await;
-    let outcome = match critical_rx.recv().await.unwrap() {
-        RunnerEvent::Finish { outcome } => outcome,
-        event => panic!("unexpected event: {event:?}"),
-    };
+    let outcome = joined_outcome(task).await;
     assert_eq!(
         outcome.diagnostic().unwrap().category,
         crate::error::DiagnosticCategory::Compaction
     );
-    assert_finished(task.await.unwrap());
     assert!(model.requests().is_empty());
 }
 
@@ -226,7 +209,7 @@ async fn adapter_deadline_error_is_not_misclassified_as_the_turn_deadline() {
     let strategy = ScriptCompaction::new(vec![CompactionBehavior::Error(
         CompactionError::DeadlineExceeded,
     )]);
-    let (request, mut critical_rx, _progress_rx, model) = forced_request(
+    let (request, _critical_rx, _progress_rx, model) = forced_request(
         strategy,
         CancellationToken::new(),
         Duration::from_secs(30),
@@ -234,15 +217,11 @@ async fn adapter_deadline_error_is_not_misclassified_as_the_turn_deadline() {
         4,
     );
     let task = tokio::spawn(run_turn(request));
-    let outcome = match critical_rx.recv().await.unwrap() {
-        RunnerEvent::Finish { outcome } => outcome,
-        event => panic!("unexpected event: {event:?}"),
-    };
+    let outcome = joined_outcome(task).await;
     assert_eq!(
         outcome.diagnostic().unwrap().category,
         crate::error::DiagnosticCategory::Compaction
     );
-    assert_finished(task.await.unwrap());
     assert!(model.requests().is_empty());
 }
 
@@ -258,26 +237,28 @@ async fn full_summary_send_is_cancellable_without_a_delayed_commit() {
         Duration::from_secs(30),
         1,
     );
+    let (reply, _receiver) = oneshot::channel();
     request
         .critical_tx
-        .try_send(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Cancelled {
-                usage: Usage::default(),
+        .try_send(RunnerEvent::CommitSummary {
+            snapshot_head: ConversationSeq::new(4),
+            draft: SummaryDraft {
+                through: ConversationSeq::new(3),
+                summary: BoundedText::new("queued").unwrap(),
             },
+            reply,
         })
         .unwrap();
     let task = tokio::spawn(run_turn(request));
     strategy.wait_called().await;
     cancellation.cancel();
     assert!(matches!(
-        task.await.unwrap(),
-        TurnRunnerExit::ProtocolClosed {
-            outcome: RunnerOutcome::Cancelled { .. }
-        }
+        joined_outcome(task).await,
+        RunnerOutcome::Cancelled { .. }
     ));
     assert!(matches!(
         critical_rx.try_recv(),
-        Ok(RunnerEvent::Finish { .. })
+        Ok(RunnerEvent::CommitSummary { .. })
     ));
     assert!(matches!(
         critical_rx.try_recv(),
@@ -296,22 +277,24 @@ async fn full_summary_send_deadline_drops_the_pending_commit_without_a_delayed_e
         Duration::from_secs(30),
         1,
     );
+    let (reply, _receiver) = oneshot::channel();
     request
         .critical_tx
-        .try_send(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Cancelled {
-                usage: Usage::default(),
+        .try_send(RunnerEvent::CommitSummary {
+            snapshot_head: ConversationSeq::new(4),
+            draft: SummaryDraft {
+                through: ConversationSeq::new(3),
+                summary: BoundedText::new("queued").unwrap(),
             },
+            reply,
         })
         .unwrap();
     let task = tokio::spawn(run_turn(request));
     strategy.wait_called().await;
     tokio::time::advance(Duration::from_secs(6)).await;
     assert!(matches!(
-        task.await.unwrap(),
-        TurnRunnerExit::ProtocolClosed {
-            outcome: RunnerOutcome::BudgetExceeded { .. }
-        }
+        joined_outcome(task).await,
+        RunnerOutcome::BudgetExceeded { .. }
     ));
     assert!(critical_rx.try_recv().is_ok());
     assert!(matches!(
@@ -338,14 +321,11 @@ async fn cancellation_while_waiting_for_summary_ack_has_no_model_continuation() 
         event => panic!("unexpected event: {event:?}"),
     };
     cancellation.cancel();
-    assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Cancelled { .. }
-        })
-    ));
     drop(reply);
-    assert_finished(task.await.unwrap());
+    assert!(matches!(
+        joined_outcome(task).await,
+        RunnerOutcome::Cancelled { .. }
+    ));
     assert!(model.requests().is_empty());
 }
 
@@ -366,13 +346,10 @@ async fn deadline_while_waiting_for_summary_ack_has_no_model_continuation() {
         event => panic!("unexpected event: {event:?}"),
     };
     tokio::time::advance(Duration::from_secs(6)).await;
-    assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::BudgetExceeded { .. }
-        })
-    ));
     drop(reply);
-    assert_finished(task.await.unwrap());
+    assert!(matches!(
+        joined_outcome(task).await,
+        RunnerOutcome::BudgetExceeded { .. }
+    ));
     assert!(model.requests().is_empty());
 }

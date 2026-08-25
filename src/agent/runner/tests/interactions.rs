@@ -82,12 +82,9 @@ async fn approval_suspension_forwards_exact_resume_sender_through_runner() {
         event => panic!("unexpected event: {event:?}"),
     }
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Completed { .. }
-        })
+        joined_outcome(task).await,
+        RunnerOutcome::Completed { .. }
     ));
-    assert_finished(task.await.unwrap());
     assert_eq!(tool.calls(), 1);
 }
 
@@ -175,12 +172,9 @@ async fn tool_input_orders_started_before_suspend_and_finished_after_commit_with
         event => panic!("unexpected event: {event:?}"),
     }
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Completed { .. }
-        })
+        joined_outcome(task).await,
+        RunnerOutcome::Completed { .. }
     ));
-    assert_finished(task.await.unwrap());
     assert_eq!(tool.calls(), 1);
 }
 
@@ -227,12 +221,9 @@ async fn typed_suspension_failures_map_without_fabricating_tool_results() {
             event => panic!("unexpected event: {event:?}"),
         }
         assert!(matches!(
-            critical_rx.recv().await,
-            Some(RunnerEvent::Finish {
-                outcome: RunnerOutcome::Failed { .. }
-            })
+            joined_outcome(task).await,
+            RunnerOutcome::Failed { .. }
         ));
-        assert_finished(task.await.unwrap());
         assert!(critical_rx.try_recv().is_err());
     }
 }
@@ -279,10 +270,7 @@ async fn suspension_cancellation_and_deadline_retain_usage_with_exact_outcomes()
             }
             event => panic!("unexpected event: {event:?}"),
         }
-        let outcome = match critical_rx.recv().await.unwrap() {
-            RunnerEvent::Finish { outcome } => outcome,
-            event => panic!("unexpected event: {event:?}"),
-        };
+        let outcome = joined_outcome(task).await;
         assert_eq!(outcome.usage(), prior_usage);
         assert!(match error {
             SuspensionError::Cancelled => matches!(outcome, RunnerOutcome::Cancelled { .. }),
@@ -291,7 +279,6 @@ async fn suspension_cancellation_and_deadline_retain_usage_with_exact_outcomes()
             }
             _ => false,
         });
-        assert_finished(task.await.unwrap());
         assert!(critical_rx.try_recv().is_err());
     }
 }
@@ -332,11 +319,11 @@ async fn blocked_suspension_forward_is_cancellable_without_delayed_enqueue() {
     notified.as_mut().enable();
     match critical_rx.recv().await.unwrap() {
         RunnerEvent::CommitAssistant { draft, reply } => {
+            let (dummy_reply, _dummy_receiver) = tokio::sync::oneshot::channel();
             critical_tx
-                .try_send(RunnerEvent::Finish {
-                    outcome: RunnerOutcome::Cancelled {
-                        usage: Usage::default(),
-                    },
+                .try_send(RunnerEvent::CommitAssistant {
+                    draft: draft.clone(),
+                    reply: dummy_reply,
                 })
                 .unwrap();
             reply
@@ -347,17 +334,13 @@ async fn blocked_suspension_forward_is_cancellable_without_delayed_enqueue() {
     }
     notified.await;
     cancellation.cancel();
-    assert_eq!(
-        task.await.unwrap(),
-        TurnRunnerExit::ProtocolClosed {
-            outcome: RunnerOutcome::Cancelled {
-                usage: Usage::default(),
-            },
-        }
-    );
+    assert!(matches!(
+        joined_outcome(task).await,
+        RunnerOutcome::Cancelled { .. }
+    ));
     assert!(matches!(
         critical_rx.try_recv(),
-        Ok(RunnerEvent::Finish { .. })
+        Ok(RunnerEvent::CommitAssistant { .. })
     ));
     drop(critical_tx);
     assert!(matches!(
@@ -401,11 +384,11 @@ async fn blocked_suspension_forward_deadline_has_no_delayed_enqueue() {
     notified.as_mut().enable();
     match critical_rx.recv().await.unwrap() {
         RunnerEvent::CommitAssistant { draft, reply } => {
+            let (dummy_reply, _dummy_receiver) = tokio::sync::oneshot::channel();
             critical_tx
-                .try_send(RunnerEvent::Finish {
-                    outcome: RunnerOutcome::Cancelled {
-                        usage: Usage::default(),
-                    },
+                .try_send(RunnerEvent::CommitAssistant {
+                    draft: draft.clone(),
+                    reply: dummy_reply,
                 })
                 .unwrap();
             reply
@@ -416,14 +399,10 @@ async fn blocked_suspension_forward_deadline_has_no_delayed_enqueue() {
     }
     notified.await;
     tokio::time::advance(Duration::from_secs(6)).await;
-    assert_eq!(
-        task.await.unwrap(),
-        TurnRunnerExit::ProtocolClosed {
-            outcome: RunnerOutcome::BudgetExceeded {
-                usage: Usage::default(),
-            },
-        }
-    );
+    assert!(matches!(
+        joined_outcome(task).await,
+        RunnerOutcome::BudgetExceeded { .. }
+    ));
     assert!(critical_rx.try_recv().is_ok());
     drop(critical_tx);
     assert!(matches!(

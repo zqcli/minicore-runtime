@@ -26,13 +26,9 @@ async fn assert_commit_failure(
     code: crate::error::DiagnosticCode,
     category: crate::error::DiagnosticCategory,
 ) {
-    let outcome = match critical_rx.recv().await.unwrap() {
-        RunnerEvent::Finish { outcome } => outcome,
-        event => panic!("unexpected event: {event:?}"),
-    };
+    let outcome = joined_outcome(task).await;
     let diagnostic = outcome.diagnostic().unwrap();
     assert_eq!((diagnostic.code, diagnostic.category), (code, category));
-    assert_finished(task.await.unwrap());
     assert!(model.requests().is_empty());
     assert!(critical_rx.try_recv().is_err());
 }

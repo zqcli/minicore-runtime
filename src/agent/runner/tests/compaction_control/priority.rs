@@ -49,12 +49,9 @@ async fn provider_cancellation_after_success_wins_forced_overflow_interpretation
     let (request, mut critical_rx, _progress_rx) = runner_request(spec, 4, bindings, conversation);
     let task = tokio::spawn(run_turn(request));
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Cancelled { .. }
-        })
+        joined_outcome(task).await,
+        RunnerOutcome::Cancelled { .. }
     ));
-    assert_finished(task.await.unwrap());
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(strategy.calls(), 0);
     assert!(model.requests().is_empty());

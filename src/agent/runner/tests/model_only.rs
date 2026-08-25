@@ -42,18 +42,9 @@ async fn model_only_turn_uses_exact_context_prompt_commit_ack_and_finish_order()
         event => panic!("unexpected event: {event:?}"),
     };
     assert_eq!(draft.usage, usage);
-    let outcome = match critical_rx.recv().await.unwrap() {
-        RunnerEvent::Finish { outcome } => outcome,
-        event => panic!("unexpected event: {event:?}"),
-    };
+    let outcome = joined_outcome(task).await;
     assert_eq!(outcome.usage(), usage);
     assert_eq!(outcome.diagnostic(), None);
-    assert_eq!(
-        task.await.unwrap(),
-        TurnRunnerExit::Finished {
-            outcome: outcome.clone(),
-        }
-    );
 
     let context_requests = context.requests();
     assert_eq!(context_requests.len(), 1);
@@ -154,12 +145,9 @@ async fn progress_full_or_closed_never_controls_model_completion() {
             event => panic!("unexpected event: {event:?}"),
         }
         assert!(matches!(
-            critical_rx.recv().await,
-            Some(RunnerEvent::Finish {
-                outcome: RunnerOutcome::Completed { .. }
-            })
+            joined_outcome(task).await,
+            RunnerOutcome::Completed { .. }
         ));
-        assert_finished(task.await.unwrap());
     }
 }
 
@@ -192,7 +180,9 @@ async fn completed_runner_drops_its_request_owned_model_reference() {
         }
         event => panic!("unexpected event: {event:?}"),
     }
-    assert!(critical_rx.recv().await.is_some());
-    assert_finished(task.await.unwrap());
+    assert!(matches!(
+        joined_outcome(task).await,
+        RunnerOutcome::Completed { .. }
+    ));
     assert!(dropped.load(Ordering::SeqCst));
 }

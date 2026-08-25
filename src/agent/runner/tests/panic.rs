@@ -44,7 +44,7 @@ fn panic_request(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn panic_delivers_internal_finish_with_default_usage_then_exits_panicked() {
+async fn panic_returns_panicked_without_a_finish_event() {
     let (request, mut critical_rx) = panic_request(
         CancellationToken::new(),
         Instant::now() + Duration::from_secs(30),
@@ -55,82 +55,6 @@ async fn panic_delivers_internal_finish_with_default_usage_then_exits_panicked()
         futures_util::poll!(run.as_mut()),
         Poll::Ready(TurnRunnerExit::Panicked)
     ));
-    let outcome = match critical_rx.try_recv().unwrap() {
-        RunnerEvent::Finish { outcome } => outcome,
-        event => panic!("unexpected event: {event:?}"),
-    };
-    assert_eq!(outcome.usage(), Usage::default());
-    let diagnostic = outcome.diagnostic().unwrap();
-    assert_eq!(diagnostic.code, crate::error::DiagnosticCode::Internal);
-    assert_eq!(
-        diagnostic.category,
-        crate::error::DiagnosticCategory::Internal
-    );
-    assert!(!format!("{outcome:?}").contains("turn runner panicked"));
-    assert!(matches!(
-        critical_rx.try_recv(),
-        Err(mpsc::error::TryRecvError::Disconnected)
-    ));
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn panic_finish_blocked_by_full_channel_is_cancellable_without_delayed_enqueue() {
-    let cancellation = CancellationToken::new();
-    let (request, mut critical_rx) = panic_request(
-        cancellation.clone(),
-        Instant::now() + Duration::from_secs(30),
-        1,
-    );
-    request
-        .critical_tx
-        .try_send(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Cancelled {
-                usage: Usage::default(),
-            },
-        })
-        .unwrap();
-    let mut run = Box::pin(run_turn(request));
-    assert!(matches!(futures_util::poll!(run.as_mut()), Poll::Pending));
-    cancellation.cancel();
-    assert!(matches!(
-        futures_util::poll!(run.as_mut()),
-        Poll::Ready(TurnRunnerExit::Panicked)
-    ));
-    assert!(matches!(
-        critical_rx.try_recv(),
-        Ok(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Cancelled { .. }
-        })
-    ));
-    assert!(matches!(
-        critical_rx.try_recv(),
-        Err(mpsc::error::TryRecvError::Disconnected)
-    ));
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn panic_finish_blocked_by_full_channel_respects_the_absolute_deadline() {
-    let (request, mut critical_rx) = panic_request(
-        CancellationToken::new(),
-        Instant::now() + Duration::from_secs(5),
-        1,
-    );
-    request
-        .critical_tx
-        .try_send(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Cancelled {
-                usage: Usage::default(),
-            },
-        })
-        .unwrap();
-    let mut run = Box::pin(run_turn(request));
-    assert!(matches!(futures_util::poll!(run.as_mut()), Poll::Pending));
-    tokio::time::advance(Duration::from_secs(6)).await;
-    assert!(matches!(
-        futures_util::poll!(run.as_mut()),
-        Poll::Ready(TurnRunnerExit::Panicked)
-    ));
-    assert!(critical_rx.try_recv().is_ok());
     assert!(matches!(
         critical_rx.try_recv(),
         Err(mpsc::error::TryRecvError::Disconnected)

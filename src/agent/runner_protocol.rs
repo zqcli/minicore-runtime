@@ -121,9 +121,6 @@ pub(crate) enum RunnerEvent {
     Suspend {
         suspension: TurnSuspension,
     },
-    Finish {
-        outcome: RunnerOutcome,
-    },
 }
 
 impl fmt::Debug for RunnerEvent {
@@ -150,10 +147,6 @@ impl fmt::Debug for RunnerEvent {
             Self::Suspend { suspension } => formatter
                 .debug_struct("Suspend")
                 .field("suspension", suspension)
-                .finish(),
-            Self::Finish { outcome } => formatter
-                .debug_struct("Finish")
-                .field("outcome", outcome)
                 .finish(),
         }
     }
@@ -191,6 +184,5 @@ pub(crate) enum RunnerProgress {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TurnRunnerExit {
     Finished { outcome: RunnerOutcome },
-    ProtocolClosed { outcome: RunnerOutcome },
     Panicked,
 }
