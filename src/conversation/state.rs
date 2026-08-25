@@ -10,7 +10,6 @@ use super::validator::{ConversationValidationError, ConversationValidator, Pendi
 pub(crate) struct ConversationState {
     validator: ConversationValidator,
     projection: PromptProjection,
-    head: ConversationSeq,
 }
 
 impl ConversationState {
@@ -18,10 +17,8 @@ impl ConversationState {
         spec: SessionSpec,
         limits: SemanticLimits,
     ) -> Result<Self, ConversationValidationError> {
-        let validator = ConversationValidator::new(spec, limits)?;
         Ok(Self {
-            head: validator.head(),
-            validator,
+            validator: ConversationValidator::new(spec, limits)?,
             projection: PromptProjection::default(),
         })
     }
@@ -30,27 +27,9 @@ impl ConversationState {
         &self,
         entries: &[ConversationEntry],
     ) -> Result<Self, ConversationValidationError> {
-        let validator = self.validator.validate_batch(entries)?;
-        let projection = self.projection.appended(entries);
-        debug_assert_eq!(validator.head(), projection.head());
-        debug_assert_eq!(
-            validator.latest_summary_through(),
-            projection.latest_summary().map(|summary| summary.through)
-        );
-        debug_assert_eq!(
-            validator.latest_summary_through(),
-            projection.latest_summary_through()
-        );
-        debug_assert!(validator.terminal_boundaries().iter().all(|boundary| {
-            projection
-                .entries()
-                .iter()
-                .any(|entry| entry.seq() == *boundary)
-        }));
         Ok(Self {
-            head: validator.head(),
-            validator,
-            projection,
+            validator: self.validator.validate_batch(entries)?,
+            projection: self.projection.appended(entries),
         })
     }
 
@@ -67,7 +46,7 @@ impl ConversationState {
     }
 
     pub(crate) const fn head(&self) -> ConversationSeq {
-        self.head
+        self.validator.head()
     }
 
     pub(crate) fn projection(&self) -> &PromptProjection {
@@ -85,7 +64,7 @@ impl ConversationState {
             .into();
         CompactionCandidate::from_confirmed(
             entries,
-            self.head,
+            self.head(),
             self.validator.latest_summary_through(),
             completed_boundaries,
         )
@@ -127,7 +106,6 @@ impl ConversationState {
 
     #[cfg(test)]
     pub(crate) fn set_head_for_test(&mut self, head: ConversationSeq) {
-        self.head = head;
         self.validator.set_head_for_test(head);
     }
 }

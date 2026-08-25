@@ -18,7 +18,6 @@ use super::entry::{
     TurnExecutionRecord, TurnTerminal, TurnTerminalEntry, UserInputRecord, UserMessageEntry,
 };
 use super::load::PendingConversationLoad;
-use super::projection::PromptProjection;
 use super::recovery::RecoveryPlan;
 use super::session_log::{AppendReceipt, LogFuture, SessionLog};
 use super::state::ConversationState;
@@ -226,7 +225,6 @@ impl std::error::Error for ConversationCommitError {}
 pub(crate) struct CommittedBatch {
     pub(crate) entries: Vec<ConversationEntry>,
     pub(crate) head: ConversationSeq,
-    pub(crate) projection: Arc<PromptProjection>,
 }
 
 pub(crate) struct ConversationLog {
@@ -387,11 +385,10 @@ impl ConversationLog {
         Ok(CommittedBatch {
             entries,
             head: self.state.head(),
-            projection: Arc::new(self.state.projection().clone()),
         })
     }
     #[cfg(test)]
-    pub(crate) fn projection(&self) -> PromptProjection {
+    pub(crate) fn projection(&self) -> super::projection::PromptProjection {
         self.state.projection().clone()
     }
 

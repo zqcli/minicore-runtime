@@ -333,10 +333,12 @@ async fn append_assigns_ordered_seq_and_timestamp_and_updates_projection_after_d
     assert_eq!(audit.timestamp_calls.load(Ordering::SeqCst), 6);
     assert_eq!(batch.entries.len(), 6);
     assert_eq!(batch.head, ConversationSeq::new(6));
-    assert_eq!(batch.projection.entries(), batch.entries.as_slice());
-    assert!(batch.projection.latest_summary().is_some());
+    assert_eq!(log.projection().entries(), batch.entries.as_slice());
+    assert!(log.projection().latest_summary().is_some());
     assert_eq!(
-        batch.projection.latest_summary_through(),
+        log.projection()
+            .latest_summary()
+            .map(|summary| summary.through),
         Some(ConversationSeq::new(5))
     );
     for (index, entry) in batch.entries.iter().enumerate() {
