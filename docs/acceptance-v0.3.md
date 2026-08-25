@@ -11,7 +11,7 @@ All functional criteria AT-K01 through AT-K96 passed on the remote Linux validat
 | Remote checkout | Linux, `/root/minicore-runtime-v03` |
 | Stable toolchain | `rustc 1.98.0`, `cargo 1.98.0`, `clippy 1.98.0` |
 | Stable gate | `scripts/check.sh` passed in full |
-| Root tests | 293 library tests passed; cleaned integration suites also passed |
+| Root tests | 291 library tests passed; cleaned integration suites also passed |
 | Provider evidence | provider-gate tests and warnings-denied Clippy passed through `scripts/check.sh` |
 | MSRV | `rustc 1.85.0`, `cargo 1.85.0`; `scripts/check-msrv.sh` passed |
 | Documentation | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked` passed |
@@ -70,7 +70,7 @@ All functional acceptance criteria passed on Linux, and native macOS and Windows
 | AT-K24 | Confirmed Conversation state changes only after a durable AppendReceipt. | Passed | [`src/conversation/log/append_tests.rs`](../src/conversation/log/append_tests.rs) — `append_assigns_ordered_seq_and_timestamp_and_updates_projection_after_durable_append`; [`src/conversation/log/append_tests.rs`](../src/conversation/log/append_tests.rs) — `unknown_outcome_timeout_panic_and_bad_receipt_never_commit_memory` |
 | AT-K25 | ToolFinished is attempted only after ToolResult is durable. | Passed | [`src/agent/runner/tests/interactions.rs`](../src/agent/runner/tests/interactions.rs) — `tool_input_orders_started_before_suspend_and_finished_after_commit_without_reexecution` |
 | AT-K26 | TurnHandle completion and TurnFinished happen only after terminal durability. | Passed | [`tests/session_runtime_turn_contract.rs`](../tests/session_runtime_turn_contract.rs) — `model_only_turn_is_durable_before_completion_and_transcript_visible` |
-| AT-K27 | A Turn receives exactly one terminal entry. | Passed | [`src/session/actor/tests/scheduling.rs`](../src/session/actor/tests/scheduling.rs) — `simultaneous_finish_and_join_readiness_settles_exactly_once` |
+| AT-K27 | A Turn receives exactly one terminal entry. | Passed | [`src/session/actor/tests/scheduling.rs`](../src/session/actor/tests/scheduling.rs) — `simultaneous_join_readiness_settles_exactly_once` |
 | AT-K28 | An active expected-head conflict degrades the Session, rejects submit, and creates no terminal. | Passed | [`tests/session_runtime_lifecycle_evidence.rs`](../tests/session_runtime_lifecycle_evidence.rs) — `active_conflict_degrades_rejects_submit_and_creates_no_terminal` |
 | AT-K29 | Transcript contains only durable entries. | Passed | [`src/conversation/log/transcript_close_tests.rs`](../src/conversation/log/transcript_close_tests.rs) — `transcript_is_confirmed_bounded_and_validates_page_contract` |
 | AT-K30 | An invalid Summary boundary or proposal is rejected without append. | Passed | [`src/conversation/validator/tests/summary.rs`](../src/conversation/validator/tests/summary.rs) — `active_turn_summary_cannot_cross_a_nonterminal_or_fake_boundary`; [`src/session/actor/tests/summary.rs`](../src/session/actor/tests/summary.rs) — `stale_summary_snapshot_is_rejected_before_append_without_latching`; [`src/compaction/driver/tests/validation.rs`](../src/compaction/driver/tests/validation.rs) — `proposal_must_use_an_exact_newer_completed_boundary_within_snapshot` |

@@ -6,7 +6,7 @@ use crate::conversation::{
 use crate::error::SessionLogErrorKind;
 
 impl SessionActor {
-    pub(super) async fn settle_active(&mut self, override_outcome: Option<RunnerOutcome>) {
+    pub(super) async fn settle_active(&mut self, joined_outcome: Option<RunnerOutcome>) {
         let Some(turn_id) = self.core.active.as_ref().map(|active| active.turn_id) else {
             return;
         };
@@ -39,13 +39,13 @@ impl SessionActor {
             }
             return;
         }
-        let stored_outcome = self
+        let forced_outcome = self
             .core
             .active
             .as_mut()
-            .and_then(|active| active.outcome.take());
-        let outcome = override_outcome
-            .or(stored_outcome)
+            .and_then(|active| active.forced_outcome.take());
+        let outcome = forced_outcome
+            .or(joined_outcome)
             .unwrap_or_else(|| internal_outcome(self.conversation.confirmed_turn_usage(turn_id)));
         let usage = outcome.usage();
         let terminal = terminal_for(&outcome, self.core.closing);

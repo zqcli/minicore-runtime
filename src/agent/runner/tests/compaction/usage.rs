@@ -77,10 +77,7 @@ async fn proactive_commit_failure_after_model_usage_preserves_usage() {
         }
         event => panic!("unexpected event: {event:?}"),
     }
-    let outcome = match critical_rx.recv().await.unwrap() {
-        RunnerEvent::Finish { outcome } => outcome,
-        event => panic!("unexpected event: {event:?}"),
-    };
+    let outcome = joined_outcome(task).await;
     assert_eq!(outcome.usage(), usage);
     let diagnostic = outcome.diagnostic().unwrap();
     assert_eq!(
@@ -91,7 +88,6 @@ async fn proactive_commit_failure_after_model_usage_preserves_usage() {
         diagnostic.category,
         crate::error::DiagnosticCategory::Storage
     );
-    assert_finished(task.await.unwrap());
     assert_eq!(model.requests().len(), 1);
 }
 
@@ -105,15 +101,11 @@ async fn forced_failure_after_model_usage_preserves_usage() {
         usage_case(1_000, 10_000, strategy, usage);
     let task = tokio::spawn(run_turn(request));
     let _conversation = acknowledge_tool_round(&mut critical_rx, &initial, &spec).await;
-    let outcome = match critical_rx.recv().await.unwrap() {
-        RunnerEvent::Finish { outcome } => outcome,
-        event => panic!("unexpected event: {event:?}"),
-    };
+    let outcome = joined_outcome(task).await;
     assert_eq!(outcome.usage(), usage);
     assert_eq!(
         outcome.diagnostic().unwrap().category,
         crate::error::DiagnosticCategory::Compaction
     );
-    assert_finished(task.await.unwrap());
     assert_eq!(model.requests().len(), 1);
 }

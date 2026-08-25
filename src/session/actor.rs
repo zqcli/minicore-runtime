@@ -79,7 +79,7 @@ struct ActiveTurn {
     runner: Option<JoinHandle<TurnRunnerExit>>,
     critical_open: bool,
     progress_open: bool,
-    outcome: Option<RunnerOutcome>,
+    forced_outcome: Option<RunnerOutcome>,
     pending: Option<PendingInteractionState>,
     commit_failure: Option<ActiveCommitFailure>,
 }

@@ -9,8 +9,7 @@ use crate::model::{AssistantPart, ModelDriverProgress, ModelResponse, Usage};
 use crate::value::BoundedText;
 
 use super::super::runner_protocol::{
-    CommittedUpdate, RunnerCommitError, RunnerEvent, RunnerOutcome, RunnerProgress,
-    SuspensionError, TurnRunnerExit,
+    CommittedUpdate, RunnerCommitError, RunnerEvent, RunnerProgress, SuspensionError,
 };
 use super::super::tool_driver::ToolDriverProgress;
 use super::super::turn_context::TurnRunnerContext;
@@ -259,23 +258,10 @@ fn validate_update_shape(
     Ok(())
 }
 
-pub(super) struct FinishControl {
+pub(super) struct CriticalControl {
     pub(super) sender: mpsc::Sender<RunnerEvent>,
     pub(super) cancellation: tokio_util::sync::CancellationToken,
     pub(super) deadline: std::time::Instant,
-}
-
-pub(super) async fn finish_outcome(
-    control: &FinishControl,
-    outcome: RunnerOutcome,
-) -> TurnRunnerExit {
-    let event = RunnerEvent::Finish {
-        outcome: outcome.clone(),
-    };
-    match send_critical(control, event).await {
-        Ok(()) => TurnRunnerExit::Finished { outcome },
-        Err(_) => TurnRunnerExit::ProtocolClosed { outcome },
-    }
 }
 
 pub(super) async fn send_critical_for_context(
@@ -283,7 +269,7 @@ pub(super) async fn send_critical_for_context(
     event: RunnerEvent,
 ) -> Result<(), CriticalFailure> {
     send_critical(
-        &FinishControl {
+        &CriticalControl {
             sender: context.critical_tx.clone(),
             cancellation: context.cancellation.clone(),
             deadline: context.deadline,
@@ -294,7 +280,7 @@ pub(super) async fn send_critical_for_context(
 }
 
 pub(super) async fn send_critical(
-    control: &FinishControl,
+    control: &CriticalControl,
     event: RunnerEvent,
 ) -> Result<(), CriticalFailure> {
     let event = match control.sender.try_send(event) {

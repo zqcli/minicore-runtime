@@ -89,12 +89,9 @@ async fn multiple_tools_are_sequential_and_every_commit_ack_precedes_continuatio
         event => panic!("unexpected event: {event:?}"),
     }
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::Completed { usage }
-        }) if usage == Usage::new(8, 3, 1)
+        joined_outcome(task).await,
+        RunnerOutcome::Completed { usage } if usage == Usage::new(8, 3, 1)
     ));
-    assert_finished(task.await.unwrap());
     assert_eq!(conversation.head(), ConversationSeq::new(5));
 
     let trailing = std::iter::from_fn(|| progress_rx.try_recv().ok()).collect::<Vec<_>>();
@@ -182,11 +179,8 @@ async fn tool_round_limit_commits_assistant_but_never_executes_over_budget_calls
     }
     assert_eq!(tool.calls(), 1);
     assert!(matches!(
-        critical_rx.recv().await,
-        Some(RunnerEvent::Finish {
-            outcome: RunnerOutcome::BudgetExceeded { usage }
-        }) if usage == Usage::new(8, 6, 3)
+        joined_outcome(task).await,
+        RunnerOutcome::BudgetExceeded { usage } if usage == Usage::new(8, 6, 3)
     ));
-    assert_finished(task.await.unwrap());
     assert_eq!(tool.calls(), 1);
 }

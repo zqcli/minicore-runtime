@@ -65,10 +65,12 @@ fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
             "turn runner misses compact pattern {required}"
         );
     }
-    assert!(
-        compact_production.contains("RunnerEvent::Finish{outcome}")
-            || compact_production.contains("RunnerEvent::Finish{outcome:")
-    );
+    assert!(compact_production.contains("Ok(outcome)=>TurnRunnerExit::Finished{outcome}"));
+    assert!(compact_production.contains("Err(_)=>TurnRunnerExit::Panicked"));
+    assert!(!production.contains("RunnerEvent::Finish"));
+    assert!(!production.contains("FinishControl"));
+    assert!(!production.contains("finish_outcome"));
+    assert!(!production.contains("ProtocolClosed"));
     for forbidden in [
         "SessionLog",
         "ConversationLog",
@@ -182,7 +184,6 @@ fn runner_protocol_has_exact_critical_ack_outcome_and_progress_roles() {
             "reply:oneshot::Sender<Result<CommittedUpdate,RunnerCommitError>>,}"
         ),
         "Suspend{suspension:TurnSuspension,}",
-        "Finish{outcome:RunnerOutcome,}",
         concat!(
             "pub(crate)structCommittedUpdate{",
             "pub(crate)previous_head:ConversationSeq,",
@@ -214,7 +215,7 @@ fn runner_protocol_has_exact_critical_ack_outcome_and_progress_roles() {
         ),
         "pub(crate)enumTurnRunnerExit{",
         "Finished{outcome:RunnerOutcome}",
-        "ProtocolClosed{outcome:RunnerOutcome}",
+        "Panicked,",
     ] {
         assert!(
             compact_protocol.contains(required),
@@ -223,9 +224,14 @@ fn runner_protocol_has_exact_critical_ack_outcome_and_progress_roles() {
     }
     assert!(!protocol.contains("take_resume_for_actor"));
     assert!(!protocol.contains("take_commit_reply_for_actor"));
+    assert!(!protocol.contains("RunnerEvent::Finish"));
+    assert!(!protocol.contains("ProtocolClosed"));
     let actor = include_str!("../src/session/actor/runner.rs");
     assert!(actor.contains("let TurnSuspension {"));
     assert!(actor.contains("RunnerEvent::CommitSummary"));
+    assert!(!actor.contains("RunnerEvent::Finish"));
+    assert!(actor.contains("active.forced_outcome.take().or(joined)"));
+    assert!(actor.contains("TurnRunnerExit::Finished { outcome }"));
     assert!(!protocol.contains("serde"));
     assert!(!protocol.contains("reply: Box"));
 }
@@ -414,6 +420,8 @@ fn reviewer_regressions_have_deterministic_private_evidence() {
     let compaction_usage = include_str!("../src/agent/runner/tests/compaction/usage.rs");
     let compaction_ack = include_str!("../src/agent/runner/tests/compaction_acknowledgements.rs");
     let compaction_control = include_str!("../src/agent/runner/tests/compaction_control.rs");
+    let control = include_str!("../src/agent/runner/tests/control.rs");
+    let actor_scheduling = include_str!("../src/session/actor/tests/scheduling.rs");
     let compaction_priority =
         include_str!("../src/agent/runner/tests/compaction_control/priority.rs");
     for required in [
@@ -424,6 +432,12 @@ fn reviewer_regressions_have_deterministic_private_evidence() {
     ] {
         assert!(acknowledgements.contains(required));
     }
+    assert!(
+        control.contains(
+            "closed_critical_channel_returns_a_joined_failure_without_orphaning_the_turn"
+        )
+    );
+    assert!(actor_scheduling.contains("panicked_runner_join_persists_a_durable_internal_terminal"));
     for required in [
         "request_rejects_supplied_rounds_above_the_durable_active_turn_value",
         "request_rejects_supplied_rounds_below_the_durable_active_turn_value",
@@ -432,9 +446,7 @@ fn reviewer_regressions_have_deterministic_private_evidence() {
         assert!(request.contains(required));
     }
     for required in [
-        "panic_delivers_internal_finish_with_default_usage_then_exits_panicked",
-        "panic_finish_blocked_by_full_channel_is_cancellable_without_delayed_enqueue",
-        "panic_finish_blocked_by_full_channel_respects_the_absolute_deadline",
+        "panic_returns_panicked_without_a_finish_event",
         "panic_with_closed_critical_channel_returns_panicked_without_retry",
     ] {
         assert!(panic.contains(required));

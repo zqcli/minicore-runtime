@@ -13,6 +13,7 @@ async fn complete_final_assistant(
     critical_rx: &mut mpsc::Receiver<RunnerEvent>,
     conversation: &ConversationView,
     spec: &SessionSpec,
+    task: tokio::task::JoinHandle<TurnRunnerExit>,
 ) -> RunnerOutcome {
     match critical_rx.recv().await.unwrap() {
         RunnerEvent::CommitAssistant { draft, reply } => {
@@ -22,10 +23,7 @@ async fn complete_final_assistant(
         }
         event => panic!("unexpected event: {event:?}"),
     }
-    match critical_rx.recv().await.unwrap() {
-        RunnerEvent::Finish { outcome } => outcome,
-        event => panic!("unexpected event: {event:?}"),
-    }
+    joined_outcome(task).await
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -111,9 +109,8 @@ async fn proactive_compaction_commits_before_context_and_model_use_the_new_view(
         }
         event => panic!("unexpected event: {event:?}"),
     };
-    let outcome = complete_final_assistant(&mut critical_rx, &conversation, &spec).await;
+    let outcome = complete_final_assistant(&mut critical_rx, &conversation, &spec, task).await;
     assert!(matches!(outcome, RunnerOutcome::Completed { .. }));
-    assert_finished(task.await.unwrap());
 
     assert_eq!(strategy.calls(), 1);
     assert_eq!(
@@ -158,9 +155,8 @@ async fn proactive_strategy_failure_is_best_effort_and_does_not_repeat_the_head(
     let (request, mut critical_rx, _progress_rx) =
         runner_request(spec.clone(), 4, bindings, initial.clone());
     let task = tokio::spawn(run_turn(request));
-    let outcome = complete_final_assistant(&mut critical_rx, &initial, &spec).await;
+    let outcome = complete_final_assistant(&mut critical_rx, &initial, &spec, task).await;
     assert!(matches!(outcome, RunnerOutcome::Completed { .. }));
-    assert_finished(task.await.unwrap());
     assert_eq!(strategy.calls(), 1);
     assert_eq!(model.requests().len(), 1);
 }
@@ -187,9 +183,8 @@ async fn proactive_compaction_without_a_prior_boundary_continues_without_strateg
     let (request, mut critical_rx, _progress_rx) =
         runner_request(spec.clone(), 4, bindings, initial.clone());
     let task = tokio::spawn(run_turn(request));
-    let outcome = complete_final_assistant(&mut critical_rx, &initial, &spec).await;
+    let outcome = complete_final_assistant(&mut critical_rx, &initial, &spec, task).await;
     assert!(matches!(outcome, RunnerOutcome::Completed { .. }));
-    assert_finished(task.await.unwrap());
     assert_eq!(strategy.calls(), 0);
 }
 
@@ -242,9 +237,8 @@ async fn forced_final_build_overflow_commits_then_retries_the_same_model_round()
         }
         event => panic!("unexpected event: {event:?}"),
     };
-    let outcome = complete_final_assistant(&mut critical_rx, &conversation, &spec).await;
+    let outcome = complete_final_assistant(&mut critical_rx, &conversation, &spec, task).await;
     assert!(matches!(outcome, RunnerOutcome::Completed { .. }));
-    assert_finished(task.await.unwrap());
     assert_eq!(strategy.calls(), 1);
     assert_eq!(context.requests().len(), 2);
     assert_eq!(context.requests()[0].model_round, 0);
@@ -270,17 +264,13 @@ async fn forced_compaction_failure_is_a_compaction_diagnostic_without_model_call
         None,
         Arc::clone(&strategy),
     );
-    let (request, mut critical_rx, _progress_rx) = runner_request(spec, 4, bindings, initial);
+    let (request, _critical_rx, _progress_rx) = runner_request(spec, 4, bindings, initial);
     let task = tokio::spawn(run_turn(request));
-    let outcome = match critical_rx.recv().await.unwrap() {
-        RunnerEvent::Finish { outcome } => outcome,
-        event => panic!("unexpected event: {event:?}"),
-    };
+    let outcome = joined_outcome(task).await;
     assert_eq!(
         outcome.diagnostic().unwrap().category,
         crate::error::DiagnosticCategory::Compaction
     );
-    assert_finished(task.await.unwrap());
     assert_eq!(strategy.calls(), 1);
     assert!(model.requests().is_empty());
 }
@@ -323,15 +313,11 @@ async fn forced_retry_overflow_fails_without_a_second_strategy_call_or_loop() {
             .unwrap(),
         event => panic!("unexpected event: {event:?}"),
     }
-    let outcome = match critical_rx.recv().await.unwrap() {
-        RunnerEvent::Finish { outcome } => outcome,
-        event => panic!("unexpected event: {event:?}"),
-    };
+    let outcome = joined_outcome(task).await;
     assert_eq!(
         outcome.diagnostic().unwrap().category,
         crate::error::DiagnosticCategory::Compaction
     );
-    assert_finished(task.await.unwrap());
     assert_eq!(strategy.calls(), 1);
     assert_eq!(context.requests().len(), 2);
     assert!(model.requests().is_empty());

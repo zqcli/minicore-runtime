@@ -60,7 +60,7 @@ async fn root_then_critical_progress_ahead_of_ready_command_flood() {
 }
 
 #[tokio::test]
-async fn simultaneous_finish_and_join_readiness_settles_exactly_once() {
+async fn simultaneous_join_readiness_settles_exactly_once() {
     let mut fixture = actor_fixture(false).await;
     let ready = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let task_ready = std::sync::Arc::clone(&ready);
@@ -74,20 +74,8 @@ async fn simultaneous_finish_and_join_readiness_settles_exactly_once() {
             TurnRunnerExit::Finished { outcome }
         }
     });
-    fixture
-        .critical_tx
-        .send(RunnerEvent::Finish {
-            outcome: outcome.clone(),
-        })
-        .await
-        .unwrap();
     let permit = ready.acquire_owned().await.unwrap();
     permit.forget();
-    let critical = fixture.actor.next_signal().await;
-    assert!(matches!(&critical, ActorSignal::Critical(Some(_))));
-    if let ActorSignal::Critical(Some(event)) = critical {
-        fixture.actor.handle_runner_event(event).await;
-    }
     let exit = fixture.actor.next_signal().await;
     assert!(matches!(&exit, ActorSignal::RunnerExited(Some(Ok(_)))));
     if let ActorSignal::RunnerExited(exit) = exit {
@@ -110,4 +98,33 @@ async fn simultaneous_finish_and_join_readiness_settles_exactly_once() {
             if outcome.terminal == TurnTerminal::CancelledByUser
     ));
     assert!(fixture.ready.events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn panicked_runner_join_persists_a_durable_internal_terminal() {
+    let mut fixture = actor_fixture(false).await;
+    fixture.actor.core.active.as_mut().unwrap().progress_open = false;
+    fixture.install_runner(async { TurnRunnerExit::Panicked });
+    let exit = match fixture.actor.next_signal().await {
+        ActorSignal::RunnerExited(exit) => exit,
+        _ => panic!("runner join did not become the actor signal"),
+    };
+    assert!(matches!(exit, Some(Ok(TurnRunnerExit::Panicked))));
+    fixture.actor.handle_runner_exit(exit).await;
+    let conversation = fixture.actor.conversation.view();
+    let terminal = conversation
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            ConversationEntry::TurnTerminal(entry) => Some(entry),
+            _ => None,
+        })
+        .expect("runner panic must settle a terminal");
+    assert!(matches!(
+        terminal.terminal,
+        TurnTerminal::Failed { ref diagnostic }
+            if diagnostic.code == DiagnosticCode::RuntimeTerminated
+                && diagnostic.category == DiagnosticCategory::Internal
+    ));
+    assert!(fixture.actor.state().last_terminal.is_some());
 }

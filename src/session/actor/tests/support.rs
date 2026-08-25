@@ -193,7 +193,7 @@ pub(crate) async fn actor_fixture_with_tool_calls(tool_call_count: usize) -> Act
         runner: None,
         critical_open: true,
         progress_open: true,
-        outcome: None,
+        forced_outcome: None,
         pending: None,
         commit_failure: None,
     });
