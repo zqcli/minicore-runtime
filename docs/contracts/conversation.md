@@ -18,7 +18,7 @@ There are no durable interaction, pending approval, continuation, job, event, wo
 
 ## Validator Invariants
 
-The validator requires contiguous `ConversationSeq` values and applies a batch to a cloned candidate before mutating confirmed state. It enforces:
+The validator requires contiguous `ConversationSeq` values and applies a batch to a cloned candidate before mutating confirmed state. Pending ToolCalls use a `Vec` plus an index; consuming a result advances the index and clears/resets the vector when all calls resolve, avoiding `remove(0)`. The larger P5-A prepare/commit validation plan remains benchmark-gated and deferred in this stage because immutable `Arc<ConversationState>` views still require a post-receipt candidate copy; no persistent collection or second mutable canonical state is introduced. It enforces:
 
 - one active Turn at a time;
 - User execution matches the durable SessionSpec;

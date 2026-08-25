@@ -214,6 +214,10 @@ fn pending_tools_preserve_call_order_and_batch_failure_rolls_back() {
         recovered.unresolved_tool_calls()[0].tool_call_id.as_str(),
         "call-b"
     );
+    let resolved = recovered
+        .validate_batch(&[result(4, turn_id, "call-b", "write_file")])
+        .unwrap();
+    assert!(resolved.unresolved_tool_calls().is_empty());
 }
 
 #[test]

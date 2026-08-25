@@ -11,6 +11,7 @@ The root test suite covers only the final v0.3 public surface and private execut
 - `tool_policy_interaction_contract.rs` covers ToolPolicy, approval/input DTOs, process-local interactions, and redaction.
 - `p3_context_compaction_ports.rs` covers ContextProvider and CompactionStrategy Ports and checked DTOs.
 - `session_log_contract.rs` covers the SessionLog Port, canonical conversation DTOs, fake adapter behavior, and root/storage reexports.
+- Conversation validator tests cover indexed pending-tool consumption and preserve the clone-and-apply baseline; ValidationPlan optimization remains benchmark-gated.
 - `session_bindings_contract.rs` covers the exact immutable adapter bundle and pure compatibility validation.
 
 ## Private Drivers And Runner

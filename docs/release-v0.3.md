@@ -121,12 +121,16 @@ The reviewed comparison uses baseline commit `2fd7104`. “cfg(test)-excluded pr
 
 | Metric | Baseline | Current | Change |
 | --- | ---: | ---: | ---: |
-| cfg(test)-excluded production LOC | 15,483 | 14,100 | -1,383 |
-| raw `src/**/*.rs` lines | 48,055 | 31,329 | -16,726 |
+| cfg(test)-excluded production LOC | 15,483 | 14,105 | -1,378 |
+| raw `src/**/*.rs` lines | 48,055 | 31,338 | -16,717 |
 | `src` Rust files | 174 | 144 | -30 |
 | files with production content | 83 | 78 | -5 |
 
-The authoritative architecture gate separately prints `production_files=144`, meaning all physical Rust source files enumerated by that scanner. It must not be confused with the 78 files whose cfg(test)-excluded production view is nonempty. The gate also enforces canonical production paths, direct dependencies, public Port declarations, root exports, source-size limits, forbidden authority, and an all-singleton module DAG.
+The authoritative architecture gate separately prints `production_files=144`, meaning all physical Rust source files enumerated by that scanner. It must not be confused with the 78 files whose cfg(test)-excluded production view is nonempty. Relative to P5-A baseline `HEAD=7383a6a`, this minimal IC-06 slice adds 5 authoritative production lines, 9 raw Rust lines, and no root library tests.
+
+**Approved exception — IC-05:** the ValidationCursor/ValidationPlan design measured `+202` cfg(test)-excluded production LOC against `HEAD=7383a6a` and was rejected because durable success would still clone the complete validator sets and `PromptProjection`. This stage delivers only IC-06 (`pending_index`); IC-05 remains incomplete and awaits benchmark evidence or an independent design before acceptance.
+
+The gate also enforces canonical production paths, direct dependencies, public Port declarations, root exports, source-size limits, forbidden authority, and an all-singleton module DAG.
 
 ## Known Limitations
 

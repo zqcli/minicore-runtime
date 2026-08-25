@@ -259,6 +259,25 @@ fn public_compaction_port_exports_remain_adapter_only() {
 }
 
 #[test]
+fn conversation_pending_tools_use_an_indexed_slice_without_remove_zero() {
+    let validator = include_str!("../src/conversation/validator.rs");
+    for required in [
+        "pending_tools: Vec<PendingToolCall>",
+        "pending_index: usize",
+        "&self.pending_tools[self.pending_index..]",
+        "self.pending_index += 1",
+        "self.pending_tools.clear()",
+        "self.pending_index = 0",
+    ] {
+        assert!(
+            validator.contains(required),
+            "pending index misses {required}"
+        );
+    }
+    assert!(!validator.contains("remove(0)"));
+}
+
+#[test]
 fn summary_semantics_preserve_active_turns_but_require_prior_terminal_boundaries() {
     let validator = include_str!("../src/conversation/validator.rs");
     let tests = include_str!("../src/conversation/validator/tests/summary.rs");
