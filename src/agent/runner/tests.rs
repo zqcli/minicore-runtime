@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use super::run_turn;
 use crate::agent::SessionEnvironment;
 use crate::agent::runner_protocol::{
-    CommitAck, RunnerCommitError, RunnerEvent, RunnerOutcome, RunnerProgress, SuspensionError,
-    TurnRunnerExit,
+    CommittedUpdate, RunnerCommitError, RunnerEvent, RunnerOutcome, RunnerProgress,
+    SuspensionError, TurnRunnerExit,
 };
 use crate::agent::turn_context::{
     TurnRunnerControl, TurnRunnerIdentity, TurnRunnerRequest, TurnRunnerRequestError,
@@ -34,7 +34,7 @@ use crate::interaction::InteractionAnswer;
 use crate::model::{
     DeliveryState, Model, ModelCallContext, ModelDescriptor, ModelError, ModelErrorKind,
     ModelEvent, ModelFinishReason, ModelMessage, ModelRef, ModelStartFuture, ModelStream,
-    ReasoningPreference, Usage,
+    ReasoningPreference, ToolCall, Usage,
 };
 use crate::time::Timestamp;
 use crate::tools::{
@@ -130,7 +130,35 @@ fn initial_conversation(spec: &SessionSpec, effective_max_tool_rounds: u16) -> C
         .unwrap(),
         created_at: timestamp(),
     });
-    ConversationView::from_confirmed(ConversationSeq::new(1), Arc::from(vec![entry]))
+    ConversationView::from_validated_entries(
+        spec,
+        &SemanticLimits::default(),
+        Arc::from(vec![entry]),
+    )
+    .unwrap()
+}
+
+fn pending_tool_conversation(
+    spec: &SessionSpec,
+    tool_name: &str,
+    tool_call_id: ToolCallId,
+) -> ConversationView {
+    let mut entries = initial_conversation(spec, 4).entries().to_vec();
+    entries.push(ConversationEntry::AssistantMessage(AssistantMessageEntry {
+        seq: ConversationSeq::new(2),
+        turn_id: turn_id(),
+        model: spec.model.clone(),
+        text: None,
+        reasoning: None,
+        tool_calls: vec![
+            ToolCall::new(tool_call_id, tool_name.parse().unwrap(), json!({}), 0).unwrap(),
+        ],
+        usage: Usage::default(),
+        finish_reason: ModelFinishReason::ToolCalls,
+        created_at: timestamp(),
+    }));
+    ConversationView::from_validated_entries(spec, &SemanticLimits::default(), entries.into())
+        .unwrap()
 }
 
 fn runner_request(
@@ -223,10 +251,10 @@ fn ack_assistant(
     conversation: &ConversationView,
     draft: &AssistantMessageDraft,
     spec: &SessionSpec,
-) -> CommitAck {
-    let seq = conversation.head().next().unwrap();
-    let mut entries = conversation.entries().to_vec();
-    entries.push(ConversationEntry::AssistantMessage(AssistantMessageEntry {
+) -> CommittedUpdate {
+    let previous_head = conversation.head();
+    let seq = previous_head.next().unwrap();
+    let entry = ConversationEntry::AssistantMessage(AssistantMessageEntry {
         seq,
         turn_id: draft.turn_id,
         model: draft.model.clone(),
@@ -236,13 +264,15 @@ fn ack_assistant(
         usage: draft.usage,
         finish_reason: draft.finish_reason,
         created_at: timestamp(),
-    }));
-    let conversation = ConversationView::from_confirmed(seq, entries.into());
-    conversation
-        .validated_prompt_projection(spec, &SemanticLimits::default())
-        .unwrap();
-    CommitAck {
-        head: seq,
+    });
+    let mut entries = conversation.entries().to_vec();
+    entries.push(entry.clone());
+    let conversation =
+        ConversationView::from_validated_entries(spec, &SemanticLimits::default(), entries.into())
+            .unwrap();
+    CommittedUpdate {
+        previous_head,
+        entry,
         conversation,
     }
 }
@@ -251,10 +281,10 @@ fn ack_tool(
     conversation: &ConversationView,
     draft: &ToolResultDraft,
     spec: &SessionSpec,
-) -> CommitAck {
-    let seq = conversation.head().next().unwrap();
-    let mut entries = conversation.entries().to_vec();
-    entries.push(ConversationEntry::ToolResult(ToolResultEntry {
+) -> CommittedUpdate {
+    let previous_head = conversation.head();
+    let seq = previous_head.next().unwrap();
+    let entry = ConversationEntry::ToolResult(ToolResultEntry {
         seq,
         turn_id: draft.turn_id,
         tool_call_id: draft.tool_call_id.clone(),
@@ -262,13 +292,15 @@ fn ack_tool(
         outcome: draft.outcome,
         content: draft.content.clone(),
         created_at: timestamp(),
-    }));
-    let conversation = ConversationView::from_confirmed(seq, entries.into());
-    conversation
-        .validated_prompt_projection(spec, &SemanticLimits::default())
-        .unwrap();
-    CommitAck {
-        head: seq,
+    });
+    let mut entries = conversation.entries().to_vec();
+    entries.push(entry.clone());
+    let conversation =
+        ConversationView::from_validated_entries(spec, &SemanticLimits::default(), entries.into())
+            .unwrap();
+    CommittedUpdate {
+        previous_head,
+        entry,
         conversation,
     }
 }

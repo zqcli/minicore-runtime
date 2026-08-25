@@ -53,7 +53,7 @@ async fn root_then_critical_progress_ahead_of_ready_command_flood() {
         fixture.actor.handle_runner_event(event).await;
     }
     assert_eq!(
-        receiver.await.unwrap().unwrap().head,
+        receiver.await.unwrap().unwrap().entry.seq(),
         ConversationSeq::new(2)
     );
     drop(commands);

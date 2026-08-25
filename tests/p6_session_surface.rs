@@ -158,8 +158,18 @@ fn actor_priority_submit_commit_and_settlement_order_are_source_locked() {
         .find("self.commit_one(UnsequencedEntry::Summary(draft))")
         .unwrap();
     assert!(stale < summary);
-    assert!(runner.contains("append_validated(vec![draft]).await"));
+    assert!(runner.contains("let previous_head = self.conversation.head();"));
+    let commit_append = runner.find("append_validated(vec![draft]).await").unwrap();
+    let commit_shape = runner.find(".try_into()").unwrap();
+    let commit_publish =
+        runner[commit_shape..].find("self.publish_state()").unwrap() + commit_shape;
+    let committed_update = runner.find("Ok(CommittedUpdate {").unwrap();
+    assert!(commit_append < commit_shape && commit_shape < commit_publish);
+    assert!(commit_publish < committed_update);
+    assert!(runner.contains("previous_head,"));
+    assert!(runner.contains("entry,"));
     assert!(runner.contains("conversation: self.conversation.view()"));
+    assert!(!runner.contains("CommitAck"));
 
     assert_eq!(
         settlement.matches("append_validated(drafts).await").count(),

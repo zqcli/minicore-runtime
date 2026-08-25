@@ -40,7 +40,7 @@ The SessionLog trait is physically declared in `conversation/session_log.rs` bec
 - `context::driver` owns zero-or-one provider execution, validation, cancellation, and deadline provenance.
 - `prompt::builder` owns deterministic prompt ordering and exact serialized-request budgeting.
 - `compaction::driver` owns canonical candidate validation and one strategy call without commit authority.
-- `agent::environment` freezes the checked static Session environment once at create/load; `agent::runner` owns ordinary model/tool rounds, compaction recovery, exact prefix acknowledgements, and conservative usage.
+- `agent::environment` freezes the checked static Session environment once at create/load; `agent::runner` owns ordinary model/tool rounds, compaction recovery, exact single-entry delta acknowledgements, and conservative usage.
 - `session::actor` owns durable append authority and terminal settlement.
 
 ## Source Inventory

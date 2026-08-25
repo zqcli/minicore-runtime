@@ -16,7 +16,7 @@ The root test suite covers only the final v0.3 public surface and private execut
 ## Private Drivers And Runner
 
 - `model_driver_contract.rs`, `tool_driver_contract.rs`, `context_prompt_driver_contract.rs`, and `compaction_driver_contract.rs` source-check the private drivers, authority boundaries, deadline provenance, panic/cancellation behavior, and focused file limits. Behavioral tests live beside those private modules.
-- `turn_runner_contract.rs` protects ordinary execution, exact prefix/Summary acknowledgements, durable rounds, compaction recovery, critical taxonomy, cancellation-first control, usage retention, and owner neutrality.
+- `turn_runner_contract.rs` protects ordinary execution, exact delta/Summary acknowledgements, durable rounds, compaction recovery, critical taxonomy, cancellation-first control, usage retention, and owner neutrality.
 
 ## Session Ownership
 
