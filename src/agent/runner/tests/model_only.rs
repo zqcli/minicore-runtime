@@ -125,17 +125,17 @@ async fn progress_full_or_closed_never_controls_model_completion() {
         if close_progress {
             drop(progress_rx);
         }
+        let bindings = session_bindings(Arc::clone(&model), None, Vec::new(), None);
+        let environment = SessionEnvironment::build(&kernel, &spec, &bindings).unwrap();
         let request = TurnRunnerRequest::new(
             TurnRunnerIdentity {
                 session_id: session_id(),
                 instance_id: instance_id(),
                 turn_id: turn_id(),
             },
-            spec.clone(),
+            environment,
             4,
-            session_bindings(Arc::clone(&model), None, Vec::new(), None),
             initial.clone(),
-            TurnRunnerKernel::from_kernel(&kernel).unwrap(),
             TurnRunnerControl {
                 cancellation: CancellationToken::new(),
                 deadline: Instant::now() + Duration::from_secs(30),

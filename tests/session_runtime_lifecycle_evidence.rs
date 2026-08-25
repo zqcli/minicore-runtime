@@ -83,23 +83,31 @@ struct Fixture {
 }
 
 fn fixture(gated: bool) -> Fixture {
-    fixture_with_descriptor_panic(gated, None)
+    fixture_with_static_environment(gated, None, false)
 }
 
 fn fixture_with_descriptor_panic(gated: bool, panic_on_descriptor_call: Option<usize>) -> Fixture {
+    fixture_with_static_environment(gated, panic_on_descriptor_call, false)
+}
+
+fn fixture_with_static_environment(
+    gated: bool,
+    panic_on_descriptor_call: Option<usize>,
+    invalid_descriptor: bool,
+) -> Fixture {
     let model_ref: ModelRef = "host:lifecycle-evidence".parse().unwrap();
     let started = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
     let descriptor_calls = Arc::new(AtomicUsize::new(0));
+    let descriptor = ModelDescriptor {
+        model_ref: model_ref.clone(),
+        context_window: if invalid_descriptor { 0 } else { 4_096 },
+        supported_reasoning: BTreeSet::from([ReasoningPreference::Auto]),
+        supports_tools: false,
+    };
     let model: Arc<dyn Model> = Arc::new(EvidenceModel {
-        descriptor: ModelDescriptor::new(
-            model_ref.clone(),
-            4_096,
-            BTreeSet::from([ReasoningPreference::Auto]),
-            false,
-        )
-        .unwrap(),
+        descriptor,
         gated,
         started: Arc::clone(&started),
         release,
@@ -153,8 +161,34 @@ async fn wait_started(fixture: &Fixture) {
     permit.forget();
 }
 
+async fn assert_static_open_failure(fixture: &Fixture, session_id: SessionId) {
+    let log = FakeSessionLog::new();
+    let inspection = log.inspection();
+    let error = match SessionRuntime::create(
+        session_id,
+        fixture.spec.clone(),
+        Box::new(log),
+        options(fixture, None),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(runtime) => {
+            runtime.shutdown().await.unwrap();
+            panic!("static environment failure unexpectedly opened a runtime")
+        }
+    };
+    assert_eq!(error.kind(), SessionOpenErrorKind::BindingMismatch);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.descriptor_calls.load(Ordering::SeqCst), 1);
+    assert!(inspection.entries().is_empty());
+    assert_eq!(inspection.operations(), vec![Operation::Close]);
+    assert_eq!(inspection.close_count(), 1);
+    assert_eq!(inspection.active_mutable_operations(), 0);
+}
+
 #[tokio::test(flavor = "current_thread")]
-async fn baseline_created_session_turns_repeat_descriptor_validation() {
+async fn created_session_freezes_descriptor_for_all_turns() {
     let fixture = fixture(false);
     let runtime = SessionRuntime::create(
         session(80),
@@ -165,6 +199,7 @@ async fn baseline_created_session_turns_repeat_descriptor_validation() {
     .await
     .unwrap();
     let opened = fixture.descriptor_calls.load(Ordering::SeqCst);
+    assert_eq!(opened, 1);
     let handle = runtime.handle();
     for turn in 0..2 {
         handle
@@ -178,51 +213,61 @@ async fn baseline_created_session_turns_repeat_descriptor_validation() {
             .await
             .unwrap();
     }
-    assert!(fixture.descriptor_calls.load(Ordering::SeqCst) > opened);
+    assert_eq!(fixture.descriptor_calls.load(Ordering::SeqCst), opened);
     runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn baseline_descriptor_panic_after_user_append_fails_without_model_start() {
-    let fixture = fixture_with_descriptor_panic(false, Some(5));
+async fn loaded_session_turns_do_not_repeat_descriptor_validation() {
+    let fixture = fixture(false);
+    let session_id = session(79);
     let log = FakeSessionLog::new();
     let inspection = log.inspection();
     let runtime = SessionRuntime::create(
-        session(77),
+        session_id,
         fixture.spec.clone(),
         Box::new(log),
         options(&fixture, None),
     )
     .await
     .unwrap();
-    let outcome = runtime
-        .handle()
-        .submit(
-            UserInput::text("static setup").unwrap(),
-            TurnOptions::default(),
-        )
-        .await
-        .unwrap()
-        .wait()
+    runtime.shutdown().await.unwrap();
+    let loaded = fixture.descriptor_calls.load(Ordering::SeqCst);
+    assert_eq!(loaded, 1);
+    let log =
+        FakeSessionLog::with_initial(inspection.manifest().unwrap(), inspection.entries()).unwrap();
+    let runtime = SessionRuntime::load(session_id, Box::new(log), options(&fixture, None))
         .await
         .unwrap();
-    assert!(matches!(outcome.terminal, TurnTerminal::Failed { .. }));
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(fixture.descriptor_calls.load(Ordering::SeqCst), 5);
-    let entries = inspection.entries();
-    assert_eq!(entries.len(), 2);
-    assert!(matches!(
-        entries.first(),
-        Some(ConversationEntry::UserMessage(_))
-    ));
-    assert!(matches!(
-        entries.last(),
-        Some(ConversationEntry::TurnTerminal(entry))
-            if matches!(entry.terminal, TurnTerminal::Failed { .. })
-    ));
+    let opened = fixture.descriptor_calls.load(Ordering::SeqCst);
+    assert_eq!(opened, loaded + 1);
+    for turn in 0..2 {
+        runtime
+            .handle()
+            .submit(
+                UserInput::text(format!("loaded-{turn}")).unwrap(),
+                TurnOptions::default(),
+            )
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+    }
+    assert_eq!(fixture.descriptor_calls.load(Ordering::SeqCst), opened);
     runtime.shutdown().await.unwrap();
-    assert_eq!(inspection.close_count(), 1);
-    assert_eq!(inspection.active_mutable_operations(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn descriptor_panic_during_open_fails_before_user_append_and_model_start() {
+    let fixture = fixture_with_descriptor_panic(false, Some(1));
+    assert_static_open_failure(&fixture, session(77)).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_static_environment_fails_before_user_append_and_model_start() {
+    let fixture = fixture_with_static_environment(false, None, true);
+    assert_static_open_failure(&fixture, session(78)).await;
 }
 
 #[tokio::test(flavor = "current_thread")]

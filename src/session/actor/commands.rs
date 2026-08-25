@@ -1,8 +1,7 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::agent::{
-    TurnRunnerControl, TurnRunnerIdentity, TurnRunnerKernel, TurnRunnerRequest, run_turn,
-};
+use crate::agent::{TurnRunnerControl, TurnRunnerIdentity, TurnRunnerRequest, run_turn};
 use crate::config::UserInput;
 use crate::conversation::{
     ConversationCommitError, ConversationCommitErrorKind, TurnExecutionRecord, UnsequencedEntry,
@@ -90,17 +89,15 @@ impl SessionActor {
                 return;
             }
         };
-        let execution = match TurnExecutionRecord::new(
-            self.spec.model.clone(),
-            self.spec.reasoning,
-            effective_rounds,
-        ) {
-            Ok(execution) => execution,
-            Err(_) => {
-                let _ = reply.send(Err(SessionError::InvalidInput(invalid_input())));
-                return;
-            }
-        };
+        let (spec, _, _) = self.environment.session_inputs();
+        let execution =
+            match TurnExecutionRecord::new(spec.model.clone(), spec.reasoning, effective_rounds) {
+                Ok(execution) => execution,
+                Err(_) => {
+                    let _ = reply.send(Err(SessionError::InvalidInput(invalid_input())));
+                    return;
+                }
+            };
         if let Err(error) = self
             .conversation
             .append_validated(vec![UnsequencedEntry::UserMessage(UserMessageDraft {
@@ -131,33 +128,30 @@ impl SessionActor {
         }
         let _ = self.events.try_emit(SessionEvent::TurnStarted { turn_id });
 
-        let (critical_tx, critical) = mpsc::channel(self.kernel.runner_capacity);
-        let (progress_tx, progress) = mpsc::channel(self.kernel.runner_capacity);
+        let (_, _, channels) = self.environment.session_inputs();
+        let (critical_tx, critical) = mpsc::channel(channels.runner);
+        let (progress_tx, progress) = mpsc::channel(channels.runner);
         let deadline = options.deadline.unwrap_or_else(|| {
             Instant::now()
                 .checked_add(DEFAULT_TURN_DEADLINE)
                 .unwrap_or_else(Instant::now)
         });
-        let request = TurnRunnerKernel::from_kernel(&self.kernel).and_then(|kernel| {
-            TurnRunnerRequest::new(
-                TurnRunnerIdentity {
-                    session_id: self.session_id,
-                    instance_id: self.instance_id,
-                    turn_id,
-                },
-                self.spec.clone(),
-                effective_rounds,
-                self.bindings.clone(),
-                self.conversation.view(),
-                kernel,
-                TurnRunnerControl {
-                    cancellation: cancellation.clone(),
-                    deadline,
-                    critical_tx,
-                    progress_tx,
-                },
-            )
-        });
+        let request = TurnRunnerRequest::new(
+            TurnRunnerIdentity {
+                session_id: self.session_id,
+                instance_id: self.instance_id,
+                turn_id,
+            },
+            Arc::clone(&self.environment),
+            effective_rounds,
+            self.conversation.view(),
+            TurnRunnerControl {
+                cancellation: cancellation.clone(),
+                deadline,
+                critical_tx,
+                progress_tx,
+            },
+        );
         let mut active = ActiveTurn {
             turn_id,
             cancellation,
@@ -210,20 +204,17 @@ impl SessionActor {
         input: &UserInput,
         options: &crate::config::TurnOptions,
     ) -> Result<u16, SessionError> {
-        if input.validate(&self.kernel.limits).is_err()
-            || options.validate(&self.kernel.limits).is_err()
-            || self
-                .bindings
-                .validate(&self.spec, &self.kernel.limits)
-                .is_err()
+        let (spec, limits, _) = self.environment.session_inputs();
+        if input.validate(limits).is_err()
+            || options.validate(limits).is_err()
             || options
                 .deadline
                 .is_some_and(|deadline| deadline <= Instant::now())
         {
             return Err(SessionError::InvalidInput(invalid_input()));
         }
-        let rounds = options.max_tool_rounds.unwrap_or(self.spec.max_tool_rounds);
-        if rounds > self.spec.max_tool_rounds {
+        let rounds = options.max_tool_rounds.unwrap_or(spec.max_tool_rounds);
+        if rounds > spec.max_tool_rounds {
             return Err(SessionError::InvalidInput(invalid_input()));
         }
         Ok(rounds)

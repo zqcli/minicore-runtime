@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::config::{CompactionConfig, SessionManifest};
+use crate::agent::SessionEnvironment;
+use crate::config::{CompactionConfig, KernelConfig, SessionManifest, SessionSpec};
 use crate::conversation::{
     AssistantMessageDraft, TurnExecutionRecord, UnsequencedEntry, UserInputRecord, UserMessageDraft,
 };
@@ -10,9 +11,13 @@ use crate::model::{
     Model, ModelCallContext, ModelDescriptor, ModelFinishReason, ModelRequest, ModelStartFuture,
     ReasoningPreference, ToolCall, Usage,
 };
+use crate::session::SessionBindings;
 use crate::storage::{AppendReceipt, ConversationPage, LogFuture, SessionLog};
 use crate::time::Timestamp;
-use crate::tools::{ToolName, ToolSet};
+use crate::tools::{
+    Tool, ToolContext, ToolFuture, ToolInvocation, ToolName, ToolPolicy, ToolPolicyFuture,
+    ToolPolicyRequest, ToolSet, ToolSpec,
+};
 use crate::value::BoundedText;
 
 use super::super::*;
@@ -152,13 +157,22 @@ pub(crate) async fn actor_fixture_with_tool_calls(tool_call_count: usize) -> Act
         )
         .unwrap(),
     ));
-    let bindings =
-        SessionBindings::new(model, ToolSet::builder().build().unwrap(), None, None, None);
+    let mut tool_builder = ToolSet::builder();
+    tool_builder.register(ActorTool::new(tool_name.clone()));
+    if tool_call_count > 1 {
+        tool_builder.register(ActorTool::new(second_tool_name.clone()));
+    }
+    let bindings = SessionBindings::new(
+        model,
+        tool_builder.build().unwrap(),
+        Some(Arc::new(NoopPolicy)),
+        None,
+        None,
+    );
+    let environment = SessionEnvironment::build(&kernel, &spec, &bindings).unwrap();
     let (mut actor, ready) = SessionActor::new(
         conversation,
-        kernel.clone(),
-        bindings,
-        spec,
+        environment,
         session_id,
         instance_id,
         CancellationToken::new(),
@@ -201,6 +215,36 @@ pub(crate) async fn actor_fixture_with_tool_calls(tool_call_count: usize) -> Act
 }
 
 struct NoCallModel(ModelDescriptor);
+
+struct NoopPolicy;
+
+struct ActorTool {
+    spec: ToolSpec,
+}
+
+impl ActorTool {
+    fn new(name: ToolName) -> Self {
+        Self {
+            spec: ToolSpec::new(name, "actor test tool", serde_json::json!({})).unwrap(),
+        }
+    }
+}
+
+impl Tool for ActorTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn execute<'a>(&'a self, _invocation: ToolInvocation, _context: ToolContext) -> ToolFuture<'a> {
+        panic!("actor fixture tool must not execute")
+    }
+}
+
+impl ToolPolicy for NoopPolicy {
+    fn decide<'a>(&'a self, _request: ToolPolicyRequest) -> ToolPolicyFuture<'a> {
+        Box::pin(async { Ok(crate::tools::ToolDecision::Allow) })
+    }
+}
 
 impl Model for NoCallModel {
     fn descriptor(&self) -> &ModelDescriptor {

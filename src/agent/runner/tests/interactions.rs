@@ -55,7 +55,7 @@ async fn approval_suspension_forwards_exact_resume_sender_through_runner() {
             assert_eq!(suspension.tool_name.as_str(), "search");
             assert!(matches!(
                 suspension.kind,
-                crate::session::InteractionKind::Approval(_)
+                crate::interaction::InteractionKind::Approval(_)
             ));
             suspension
                 .resume
@@ -133,7 +133,7 @@ async fn tool_input_orders_started_before_suspend_and_finished_after_commit_with
             )));
             assert!(matches!(
                 suspension.kind,
-                crate::session::InteractionKind::ToolInput(_)
+                crate::interaction::InteractionKind::ToolInput(_)
             ));
             suspension
                 .resume

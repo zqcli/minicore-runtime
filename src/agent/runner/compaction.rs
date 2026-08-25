@@ -37,9 +37,10 @@ impl FixedInputEstimate {
                 return Ok(estimate);
             }
         }
-        let estimate = context
-            .prompt
-            .estimated_fixed_input_tokens(&context.conversation, context.model_limits)?;
+        let estimate = context.environment.prompt.estimated_fixed_input_tokens(
+            &context.conversation,
+            context.environment.model_limits,
+        )?;
         self.cached = Some((head, estimate));
         Ok(estimate)
     }
@@ -84,7 +85,7 @@ pub(super) async fn prepare_model_request(
             return PreparedModelRequest::Terminal(outcome);
         }
         let remaining = match estimate.get(context).and_then(|fixed| {
-            PromptBuilder::remaining_context_budget_for(fixed, context.model_limits)
+            PromptBuilder::remaining_context_budget_for(fixed, context.environment.model_limits)
         }) {
             Ok(remaining) => remaining,
             Err(PromptError::ContextOverflow) if !forced_attempted => {
@@ -113,6 +114,7 @@ pub(super) async fn prepare_model_request(
             }
         };
         let context_bundle = match context
+            .environment
             .context
             .provide_detailed(ContextRequest {
                 session_id: context.session_id,
@@ -134,10 +136,11 @@ pub(super) async fn prepare_model_request(
         if let Some(outcome) = turn_control_outcome(context, usage) {
             return PreparedModelRequest::Terminal(outcome);
         }
-        match context
-            .prompt
-            .build(&context.conversation, &context_bundle, context.model_limits)
-        {
+        match context.environment.prompt.build(
+            &context.conversation,
+            &context_bundle,
+            context.environment.model_limits,
+        ) {
             Ok(request) => {
                 return match turn_control_outcome(context, usage) {
                     Some(outcome) => PreparedModelRequest::Terminal(outcome),
@@ -181,7 +184,7 @@ pub(super) async fn proactive(
     if let Some(outcome) = turn_control_outcome(context, usage) {
         return CompactionAttempt::Terminal(outcome);
     }
-    let Some(compaction) = context.compaction.as_ref() else {
+    let Some(compaction) = context.environment.compaction.as_ref() else {
         return CompactionAttempt::Skipped;
     };
     let estimate = match estimate.get(context) {
@@ -205,7 +208,7 @@ async fn required(context: &mut TurnRunnerContext, usage: Usage) -> CompactionAt
     if let Some(outcome) = turn_control_outcome(context, usage) {
         return CompactionAttempt::Terminal(outcome);
     }
-    if context.compaction.is_none() {
+    if context.environment.compaction.is_none() {
         return CompactionAttempt::Terminal(compaction_failure(usage));
     }
     attempt(context, usage, CompactionMode::Forced).await
@@ -221,7 +224,7 @@ async fn attempt(
     }
     let candidate = match context
         .conversation
-        .validated_compaction_candidate(&context.spec, &context.limits)
+        .validated_compaction_candidate(&context.environment.spec, &context.environment.limits)
     {
         Ok(candidate) => candidate,
         Err(_) => return failed_attempt(mode, usage),
@@ -229,7 +232,7 @@ async fn attempt(
     if let Some(outcome) = turn_control_outcome(context, usage) {
         return CompactionAttempt::Terminal(outcome);
     }
-    let Some(compaction) = context.compaction.as_ref() else {
+    let Some(compaction) = context.environment.compaction.as_ref() else {
         return failed_attempt(mode, usage);
     };
     let proposal = match compaction

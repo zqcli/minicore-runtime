@@ -20,6 +20,7 @@ fn canonical_driver_is_private_bounded_and_adapter_neutral() {
         "retry_policy: RetryPolicySnapshot",
         "limits: SemanticLimitsSnapshot",
         "pub(crate) fn new(",
+        "pub(crate) fn from_validated(",
         "pub(crate) async fn run(",
         "pub(crate) async fn run_detailed(",
         "effective_deadline(context.deadline, self.model_call_timeout)",
@@ -36,6 +37,10 @@ fn canonical_driver_is_private_bounded_and_adapter_neutral() {
             "driver misses {required}"
         );
     }
+    assert!(!driver.contains("validate_capabilities"));
+    assert!(driver.contains("self.descriptor.validate().map_err(|_| invalid())?;"));
+    assert!(driver.contains("!self.descriptor.supports_reasoning(request.reasoning())"));
+    assert!(driver.contains("!request.tools().is_empty() && !self.descriptor.supports_tools"));
     assert!(!driver.contains("fn effective_deadline("));
     for forbidden in [
         "SessionHandle",

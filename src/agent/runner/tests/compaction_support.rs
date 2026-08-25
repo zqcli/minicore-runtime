@@ -194,17 +194,16 @@ pub(super) fn request_with_compaction_kernel(
 ) {
     let (critical_tx, critical_rx) = mpsc::channel(critical_capacity);
     let (progress_tx, progress_rx) = mpsc::channel(64);
+    let environment = SessionEnvironment::build(&kernel, &spec, &bindings).unwrap();
     let request = TurnRunnerRequest::new(
         TurnRunnerIdentity {
             session_id: session_id(),
             instance_id: instance_id(),
             turn_id: turn_id(),
         },
-        spec,
+        environment,
         4,
-        bindings,
         conversation,
-        TurnRunnerKernel::from_kernel(&kernel).unwrap(),
         TurnRunnerControl {
             cancellation,
             deadline: Instant::now() + turn_after,

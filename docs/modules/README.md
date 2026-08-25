@@ -27,7 +27,7 @@ This page maps the final v0.3 source graph. Core contains host-neutral Ports, ch
 
 The Host acquires exactly one `Box<dyn SessionLog>` and passes it to `SessionRuntime::create` or `load`. Core owns that adapter for the loaded lifetime. Listing sessions, selecting storage formats, writer leases, repository policy, and multi-session shutdown belong to the Host.
 
-`SessionBindings` freezes one direct `Arc<dyn Model>`, one immutable `ToolSet`, and optional ToolPolicy, ContextProvider, and CompactionStrategy adapters. Validation is pure apart from panic-isolated descriptor inspection and invokes no adapter future.
+`SessionBindings` freezes one direct `Arc<dyn Model>`, one immutable `ToolSet`, and optional ToolPolicy, ContextProvider, and CompactionStrategy adapters. Validation is pure apart from panic-isolated descriptor inspection and invokes no adapter future. Create/load then constructs one checked `Arc<agent::SessionEnvironment>` containing the immutable SessionSpec/limits, model limits, enabled tools, and static Prompt/Context/Compaction/Model/Tool drivers for the loaded lifetime.
 
 `SessionActor` is the sole durable mutation owner. It serializes commands, runner commit acknowledgements, interactions, transcript reads, settlement, health degradation, and close ordering. `SessionHandle` contains only stable IDs, a bounded command sender, and watch state.
 
@@ -40,14 +40,14 @@ The SessionLog trait is physically declared in `conversation/session_log.rs` bec
 - `context::driver` owns zero-or-one provider execution, validation, cancellation, and deadline provenance.
 - `prompt::builder` owns deterministic prompt ordering and exact serialized-request budgeting.
 - `compaction::driver` owns canonical candidate validation and one strategy call without commit authority.
-- `agent::runner` owns ordinary model/tool rounds, compaction recovery, exact prefix acknowledgements, and conservative usage.
+- `agent::environment` freezes the checked static Session environment once at create/load; `agent::runner` owns ordinary model/tool rounds, compaction recovery, exact prefix acknowledgements, and conservative usage.
 - `session::actor` owns durable append authority and terminal settlement.
 
 ## Source Inventory
 
 ```text
 src/
-├── agent/{mod.rs,runner.rs,runner/{compaction.rs,diagnostics.rs,support.rs,tests/...},runner_protocol.rs,tool_driver.rs,tool_driver/{support.rs,tests/...},turn_context.rs}
+├── agent/{mod.rs,environment.rs,runner.rs,runner/{compaction.rs,diagnostics.rs,support.rs,tests/...},runner_protocol.rs,tool_driver.rs,tool_driver/{support.rs,tests/...},turn_context.rs}
 ├── bindings.rs
 ├── compaction/{mod.rs,strategy.rs,driver.rs,driver/tests/...}
 ├── config/{kernel.rs,retry.rs,session.rs,session_spec.rs}

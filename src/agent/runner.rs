@@ -10,16 +10,14 @@ use crate::tools::ToolInvocation;
 
 use super::runner_protocol::{RunnerEvent, RunnerOutcome, RunnerProgress, TurnRunnerExit};
 use super::tool_driver::ToolDriverResult;
-use super::turn_context::{TurnRunnerContext, TurnRunnerRequest, TurnRunnerRequestError};
+use super::turn_context::{TurnRunnerContext, TurnRunnerRequest};
 
 mod compaction;
 mod diagnostics;
 mod support;
 
 use compaction::{CompactionState, PreparedModelRequest, prepare_model_request};
-use diagnostics::{
-    budget_exceeded, critical_failure, internal_failure, model_failure, request_failure,
-};
+use diagnostics::{budget_exceeded, critical_failure, internal_failure, model_failure};
 use support::{
     CriticalFailure, FinishControl, UsageAccumulator, assistant_draft, commit_assistant,
     commit_tool_result, finish_outcome, model_progress, progress, send_critical,
@@ -36,12 +34,11 @@ pub(crate) async fn run_turn(request: TurnRunnerRequest) -> TurnRunnerExit {
         deadline: request.deadline,
     };
     let task = async move {
-        let mut context = TurnRunnerContext::new(request)?;
-        Ok::<RunnerOutcome, TurnRunnerRequestError>(run_ordinary_loop(&mut context).await)
+        let mut context = TurnRunnerContext::from_request(request);
+        run_ordinary_loop(&mut context).await
     };
     match AssertUnwindSafe(task).catch_unwind().await {
-        Ok(Ok(outcome)) => finish_outcome(&finish, outcome).await,
-        Ok(Err(error)) => finish_outcome(&finish, request_failure(error)).await,
+        Ok(outcome) => finish_outcome(&finish, outcome).await,
         Err(_) => {
             let _ = send_critical(
                 &finish,
@@ -193,7 +190,7 @@ async fn run_model(
 ) -> Result<ModelResponse, ModelDriverFailure> {
     let (progress_tx, mut progress_rx) = mpsc::channel(LOCAL_PROGRESS_CAPACITY);
     let result = {
-        let run = context.model.run_detailed(
+        let run = context.environment.model.run_detailed(
             request,
             ModelCallContext::new(
                 context.session_id,
@@ -231,7 +228,7 @@ async fn run_tool(
     let (suspension_tx, mut suspension_rx) = mpsc::channel(LOCAL_SUSPENSION_CAPACITY);
     let (progress_tx, mut progress_rx) = mpsc::channel(LOCAL_PROGRESS_CAPACITY);
     let result = {
-        let run = context.tools.run(
+        let run = context.environment.tools.run(
             invocation,
             context.deadline,
             context.cancellation.clone(),

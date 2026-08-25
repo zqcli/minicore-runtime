@@ -7,8 +7,8 @@ use thiserror::Error;
 use crate::compaction::CompactionStrategy;
 use crate::config::{CompactionConfig, SemanticLimits, SessionSpec};
 use crate::context::ContextProvider;
-use crate::model::Model;
-use crate::tools::{ToolPolicy, ToolSet};
+use crate::model::{Model, ModelDescriptor, ModelLimits};
+use crate::tools::{EnabledTools, ToolPolicy, ToolSet};
 
 #[derive(Clone)]
 pub struct SessionBindings {
@@ -17,6 +17,16 @@ pub struct SessionBindings {
     pub tool_policy: Option<Arc<dyn ToolPolicy>>,
     pub context: Option<Arc<dyn ContextProvider>>,
     pub compaction: Option<Arc<dyn CompactionStrategy>>,
+}
+
+pub(crate) struct ValidatedSessionBindings {
+    pub(crate) model: Arc<dyn Model>,
+    pub(crate) model_descriptor: ModelDescriptor,
+    pub(crate) model_limits: ModelLimits,
+    pub(crate) enabled_tools: EnabledTools,
+    pub(crate) tool_policy: Option<Arc<dyn ToolPolicy>>,
+    pub(crate) context: Option<Arc<dyn ContextProvider>>,
+    pub(crate) compaction: Option<Arc<dyn CompactionStrategy>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -69,6 +79,14 @@ impl SessionBindings {
         spec: &SessionSpec,
         limits: &SemanticLimits,
     ) -> Result<(), SessionBindingError> {
+        self.freeze(spec, limits).map(|_| ())
+    }
+
+    pub(crate) fn freeze(
+        &self,
+        spec: &SessionSpec,
+        limits: &SemanticLimits,
+    ) -> Result<ValidatedSessionBindings, SessionBindingError> {
         limits
             .validate()
             .map_err(|_| SessionBindingError::InvalidLimits)?;
@@ -95,11 +113,8 @@ impl SessionBindings {
                 return Err(SessionBindingError::MissingToolPolicy);
             }
         }
-        if spec
-            .enabled_tools
-            .iter()
-            .any(|name| !self.tools.contains(name))
-        {
+        let enabled_tools = self.tools.enabled_subset(&spec.enabled_tools);
+        if enabled_tools.specs().len() != spec.enabled_tools.len() {
             return Err(SessionBindingError::MissingTool);
         }
 
@@ -117,7 +132,18 @@ impl SessionBindings {
         {
             return Err(SessionBindingError::MissingCompactionStrategy);
         }
-        Ok(())
+        let context_window = u32::try_from(descriptor.context_window).unwrap_or(u32::MAX);
+        let model_limits = ModelLimits::new(Some(context_window), None)
+            .map_err(|_| SessionBindingError::InvalidModelDescriptor)?;
+        Ok(ValidatedSessionBindings {
+            model: Arc::clone(&self.model),
+            model_descriptor: descriptor,
+            model_limits,
+            enabled_tools,
+            tool_policy: self.tool_policy.clone(),
+            context: self.context.clone(),
+            compaction: self.compaction.clone(),
+        })
     }
 }
 

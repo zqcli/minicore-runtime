@@ -33,17 +33,17 @@ fn load_orders_manifest_binding_proof_replay_repair_and_ready() {
         .map(|(body, _)| body)
         .unwrap();
     let begin = prepare_load.find("ConversationLog::begin_load").unwrap();
-    let validate = prepare_load
-        .find(".validate(&pending.manifest().spec,&parts.kernel.limits)")
+    let environment = prepare_load
+        .find("SessionEnvironment::build(&parts.kernel,&pending.manifest().spec,&parts.bindings)")
         .unwrap();
     let proof = prepare_load
         .find("LoadCompatibilityValidated::after_session_bindings_validation(&pending)")
         .unwrap();
     let finish = prepare_load.find(".finish(proof)").unwrap();
     let build = prepare_load
-        .find("build_owner(session_id,spec,conversation,parts,owner_cancel).await")
+        .find("build_owner(session_id,conversation,environment,owner_cancel).await")
         .unwrap();
-    assert!(begin < validate && validate < proof && proof < finish && finish < build);
+    assert!(begin < environment && environment < proof && proof < finish && finish < build);
 
     let run_open = source
         .split_once("pub(super)asyncfnrun_open(")

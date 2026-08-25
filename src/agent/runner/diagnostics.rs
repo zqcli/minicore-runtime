@@ -5,30 +5,7 @@ use crate::prompt::PromptError;
 use crate::time::DeadlineSource;
 
 use super::super::runner_protocol::{RunnerCommitError, RunnerOutcome, SuspensionError};
-use super::super::turn_context::TurnRunnerRequestError;
 use super::support::CriticalFailure;
-
-pub(super) fn request_failure(error: TurnRunnerRequestError) -> RunnerOutcome {
-    match error {
-        TurnRunnerRequestError::Configuration => failed(
-            DiagnosticCode::InvalidConfiguration,
-            DiagnosticCategory::Configuration,
-            "turn runner configuration is invalid",
-            false,
-            Usage::default(),
-        ),
-        TurnRunnerRequestError::Bindings | TurnRunnerRequestError::ModelDescriptor => failed(
-            DiagnosticCode::ModelMismatch,
-            DiagnosticCategory::Configuration,
-            "turn runner bindings are invalid",
-            false,
-            Usage::default(),
-        ),
-        TurnRunnerRequestError::Conversation => {
-            internal_failure("turn conversation is invalid", Usage::default())
-        }
-    }
-}
 
 pub(super) fn context_failure(failure: ContextDriverFailure, usage: Usage) -> RunnerOutcome {
     let error = failure.error();

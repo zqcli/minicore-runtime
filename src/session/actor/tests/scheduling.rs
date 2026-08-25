@@ -27,7 +27,7 @@ async fn root_then_critical_progress_ahead_of_ready_command_flood() {
         .send(RunnerEvent::CommitAssistant {
             draft: AssistantMessageDraft {
                 turn_id: fixture.turn_id,
-                model: fixture.actor.spec.model.clone(),
+                model: fixture.actor.environment.session_inputs().0.model.clone(),
                 text: Some(BoundedText::new("answer").unwrap()),
                 reasoning: None,
                 tool_calls: Vec::new(),

@@ -117,13 +117,25 @@ fn tool_driver_owns_only_policy_tool_suspension_and_progress_execution() {
         "ToolResultOutcome::InputProvided",
         "answer.encode_result(&request)",
         "validate_json_size(invocation.arguments()",
-        "self.tools.frozen_spec(invocation.tool_name())",
+        "self.enabled.get(invocation.tool_name())",
+        "Option<&crate::tools::EnabledTool>",
     ] {
         assert!(
             implementation.contains(required),
             "tool driver misses {required}"
         );
     }
+    assert!(!driver.contains("self.enabled.get(invocation.tool_name()).cloned()"));
+    assert_eq!(
+        driver
+            .matches("Arc::clone(&enabled.implementation)")
+            .count(),
+        1
+    );
+    assert_eq!(
+        driver.matches("let spec = enabled.spec.clone();").count(),
+        1
+    );
     assert!(!driver.contains("tool.spec()"));
     assert!(!driver.contains("fn suspension_failure"));
     assert!(!driver.contains("fn effective_deadline("));
@@ -159,8 +171,9 @@ fn tool_driver_owns_only_policy_tool_suspension_and_progress_execution() {
 #[test]
 fn narrow_tool_capabilities_are_crate_private_and_public_surface_is_unchanged() {
     let set = include_str!("../src/tools/set.rs");
-    assert!(set.contains("pub(crate) fn frozen_spec("));
-    assert!(!set.contains("pub fn frozen_spec("));
+    assert!(set.contains("pub(crate) struct EnabledTools"));
+    assert!(set.contains("pub(crate) fn enabled_subset("));
+    assert!(!set.contains("pub struct EnabledTools"));
 
     let progress = include_str!("../src/tools/mod.rs");
     assert!(progress.contains("pub(crate) use progress::ToolProgressEmitter;"));

@@ -18,17 +18,19 @@ fn panic_request(
     let conversation = ConversationView::from_confirmed(ConversationSeq::new(1), entries.into());
     let (critical_tx, critical_rx) = mpsc::channel(critical_capacity);
     let (progress_tx, _progress_rx) = mpsc::channel(1);
+    let bindings = session_bindings(model, None, Vec::new(), None);
+    let environment =
+        SessionEnvironment::build(&KernelConfig::default_checked().unwrap(), &spec, &bindings)
+            .unwrap();
     let request = TurnRunnerRequest::new(
         TurnRunnerIdentity {
             session_id: session_id(),
             instance_id: instance_id(),
             turn_id: panic_turn_id,
         },
-        spec,
+        environment,
         4,
-        session_bindings(model, None, Vec::new(), None),
         conversation,
-        TurnRunnerKernel::from_kernel(&KernelConfig::default_checked().unwrap()).unwrap(),
         TurnRunnerControl {
             cancellation,
             deadline,

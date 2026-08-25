@@ -394,7 +394,9 @@ fn request_validation_rejects_invalid_effective_rounds() {
     let model = ScriptModel::new(4_096, Vec::new());
     let spec = session_spec(&[], 4);
     let conversation = initial_conversation(&spec, 4);
-    let kernel = TurnRunnerKernel::from_kernel(&KernelConfig::default_checked().unwrap()).unwrap();
+    let kernel = KernelConfig::default_checked().unwrap();
+    let bindings = session_bindings(model, None, Vec::new(), None);
+    let environment = SessionEnvironment::build(&kernel, &spec, &bindings).unwrap();
     let (critical_tx, _critical_rx) = mpsc::channel(1);
     let (progress_tx, _progress_rx) = mpsc::channel(1);
     let control = TurnRunnerControl {
@@ -410,11 +412,9 @@ fn request_validation_rejects_invalid_effective_rounds() {
                 instance_id: instance_id(),
                 turn_id: turn_id(),
             },
-            spec,
+            environment,
             0,
-            session_bindings(model, None, Vec::new(), None),
             conversation,
-            kernel,
             control,
         ),
         Err(TurnRunnerRequestError::Configuration)
@@ -433,6 +433,9 @@ fn request_validation_rejects_a_different_canonical_active_turn() {
     let conversation = ConversationView::from_confirmed(ConversationSeq::new(1), entries.into());
     let (critical_tx, _critical_rx) = mpsc::channel(1);
     let (progress_tx, _progress_rx) = mpsc::channel(1);
+    let kernel = KernelConfig::default_checked().unwrap();
+    let bindings = session_bindings(model, None, Vec::new(), None);
+    let environment = SessionEnvironment::build(&kernel, &spec, &bindings).unwrap();
     assert!(matches!(
         TurnRunnerRequest::new(
             TurnRunnerIdentity {
@@ -440,11 +443,9 @@ fn request_validation_rejects_a_different_canonical_active_turn() {
                 instance_id: instance_id(),
                 turn_id: turn_id(),
             },
-            spec,
+            environment,
             4,
-            session_bindings(model, None, Vec::new(), None),
             conversation,
-            TurnRunnerKernel::from_kernel(&KernelConfig::default_checked().unwrap()).unwrap(),
             TurnRunnerControl {
                 cancellation: CancellationToken::new(),
                 deadline: Instant::now() + Duration::from_secs(30),
