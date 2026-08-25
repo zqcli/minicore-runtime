@@ -81,6 +81,7 @@ impl ModelDriverFailure {
         &self.error
     }
 
+    #[cfg(test)]
     pub(crate) fn into_error(self) -> ModelError {
         self.error
     }

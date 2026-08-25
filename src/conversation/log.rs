@@ -390,9 +390,11 @@ impl ConversationLog {
             projection: Arc::new(self.state.projection().clone()),
         })
     }
+    #[cfg(test)]
     pub(crate) fn projection(&self) -> PromptProjection {
         self.state.projection().clone()
     }
+
     pub(crate) fn view(&self) -> super::ConversationView {
         super::ConversationView::from_confirmed(
             self.state.head(),

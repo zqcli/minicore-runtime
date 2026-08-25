@@ -107,12 +107,6 @@ impl InternalEventSink {
     }
 }
 
-const _: () = {
-    let _ = std::mem::size_of::<InternalEventSink>();
-    let _ = InternalEventSink::channel;
-    let _ = InternalEventSink::try_emit;
-};
-
 #[cfg(test)]
 mod tests {
     use super::*;

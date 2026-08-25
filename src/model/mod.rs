@@ -17,15 +17,3 @@ pub use types::{
 pub(crate) use driver::{
     ModelDriver, ModelDriverConfig, ModelDriverFailure, ModelDriverProgress, SemanticLimitsSnapshot,
 };
-
-const _: () = {
-    let _ = ModelDriverConfig::from_kernel_values;
-    let _ = SemanticLimitsSnapshot::from_kernel_values;
-    let _ = ModelDriver::new;
-    let _ = ModelDriver::run;
-    let _ = ModelDriver::run_detailed;
-    let _ = std::mem::size_of::<ModelDriverFailure>();
-    let _ = ModelDriverFailure::error;
-    let _ = ModelDriverFailure::deadline_source;
-    let _ = ModelDriverProgress::delta;
-};

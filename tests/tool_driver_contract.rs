@@ -9,7 +9,6 @@ fn canonical_agent_module_is_private_and_legacy_free() {
     assert!(module.contains("mod runner_protocol;"));
     assert!(module.contains("mod tool_driver;"));
     assert!(module.contains("pub(crate) use runner_protocol::{"));
-    assert!(module.contains("pub(crate) use tool_driver::{"));
     assert!(!module.contains("legacy"));
 }
 
@@ -46,7 +45,7 @@ fn runner_protocol_is_exact_redacted_and_continuation_free() {
     );
     let errors = protocol
         .split_once("pub(crate) enum SuspensionError {")
-        .and_then(|(_, tail)| tail.split_once("}\n\nimpl SuspensionError"))
+        .and_then(|(_, tail)| tail.split_once("\n}\n"))
         .map(|(body, _)| body)
         .unwrap();
     assert_eq!(

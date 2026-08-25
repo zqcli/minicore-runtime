@@ -74,10 +74,6 @@ pub struct ToolProgressSink {
     inner: Arc<dyn ToolProgressEmitter>,
 }
 
-const _: () = {
-    let _ = ToolProgressSink::from_emitter::<NoopToolProgressEmitter>;
-};
-
 impl Default for ToolProgressSink {
     fn default() -> Self {
         Self {

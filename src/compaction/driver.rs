@@ -109,6 +109,7 @@ impl CompactionDriver {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn run(
         &self,
         session_id: SessionId,
