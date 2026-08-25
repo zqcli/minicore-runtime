@@ -42,7 +42,7 @@ fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
         );
     }
     for required in [
-        "remaining_context_budget(&context.conversation",
+        "PromptBuilder::remaining_context_budget_for(fixed,",
         "ContextRequest{",
         "context.prompt.build(",
         ".provide_detailed(ContextRequest{",
@@ -99,7 +99,7 @@ fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
         "previous_head != context.conversation.head()",
         "checked_add(1)",
         "replacement_entries.get(..current_entries.len()) != Some(current_entries)",
-        "before.active_turn_execution() != after.active_turn_execution()",
+        "before.turn_id != after.turn_id || before.execution != after.execution",
     ] {
         assert!(
             support.contains(required),
@@ -245,8 +245,7 @@ fn summary_commit_is_stale_head_checked_redacted_and_actor_owned() {
     assert!(!debug.contains("draft.summary.as_str()"));
     for required in [
         "replacement_entries.get(..current_entries.len()) != Some(current_entries)",
-        "before.active_turn_id() != after.active_turn_id()",
-        "before.active_turn_execution() != after.active_turn_execution()",
+        "before.turn_id != after.turn_id || before.execution != after.execution",
         "Some(ConversationEntry::Summary(entry))",
         "entry.through == draft.through",
         "entry.summary == draft.summary",
@@ -287,10 +286,10 @@ fn request_context_validates_full_turn_configuration_without_owner_authority() {
     }
     for required in [
         "bindings.validate(&spec,&kernel.limits)",
-        ".validated_prompt_projection(&spec,&kernel.limits)",
-        "projection.active_turn_id()!=Some(identity.turn_id)",
+        ".validated_active_turn(&spec,&kernel.limits)",
+        "active.turn_id!=Some(identity.turn_id)",
         concat!(
-            "projection.active_turn_execution().is_none_or(|execution|",
+            "active.execution.as_ref().is_none_or(|execution|",
             "execution.max_tool_rounds!=effective_max_tool_rounds)"
         ),
         "u32::try_from(descriptor.context_window)",

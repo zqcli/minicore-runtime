@@ -78,7 +78,10 @@ fn active_turn_summary_keeps_the_current_turn_in_the_prompt_projection() {
     let projection = conversation
         .validated_prompt_projection(&spec(), &SemanticLimits::default())
         .unwrap();
-    assert_eq!(projection.active_turn_id(), Some(active));
+    let active_proof = conversation
+        .validated_active_turn(&spec(), &SemanticLimits::default())
+        .unwrap();
+    assert_eq!(active_proof.turn_id, Some(active));
     assert_eq!(projection.entries(), &conversation.entries()[3..5]);
     assert_eq!(
         projection
@@ -103,10 +106,7 @@ fn active_turn_summary_keeps_the_current_turn_in_the_prompt_projection() {
         projection.selected_summary().unwrap().seq,
         ConversationSeq::new(5)
     );
-    assert_eq!(
-        projection.active_turn_execution().unwrap().max_tool_rounds,
-        1
-    );
+    assert_eq!(active_proof.execution.unwrap().max_tool_rounds, 1);
 }
 
 #[test]

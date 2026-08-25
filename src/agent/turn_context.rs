@@ -124,12 +124,13 @@ impl TurnRunnerRequest {
         bindings
             .validate(&spec, &kernel.limits)
             .map_err(map_binding_error)?;
-        let projection = conversation
-            .validated_prompt_projection(&spec, &kernel.limits)
+        let active = conversation
+            .validated_active_turn(&spec, &kernel.limits)
             .map_err(|_| TurnRunnerRequestError::Conversation)?;
-        if projection.active_turn_id() != Some(identity.turn_id)
-            || projection
-                .active_turn_execution()
+        if active.turn_id != Some(identity.turn_id)
+            || active
+                .execution
+                .as_ref()
                 .is_none_or(|execution| execution.max_tool_rounds != effective_max_tool_rounds)
         {
             return Err(TurnRunnerRequestError::Conversation);
@@ -265,12 +266,13 @@ impl TurnRunnerContext {
         &self,
         conversation: &ConversationView,
     ) -> Result<(), TurnRunnerRequestError> {
-        let projection = conversation
-            .validated_prompt_projection(&self.spec, &self.limits)
+        let active = conversation
+            .validated_active_turn(&self.spec, &self.limits)
             .map_err(|_| TurnRunnerRequestError::Conversation)?;
-        if projection.active_turn_id() != Some(self.turn_id)
-            || projection
-                .active_turn_execution()
+        if active.turn_id != Some(self.turn_id)
+            || active
+                .execution
+                .as_ref()
                 .is_none_or(|execution| execution.max_tool_rounds != self.effective_max_tool_rounds)
         {
             return Err(TurnRunnerRequestError::Conversation);

@@ -83,19 +83,32 @@ impl PromptBuilder {
         })
     }
 
+    /// Converts a fixed (context-free) input estimate into the budget the
+    /// context provider may spend. Pure arithmetic: the caller supplies the
+    /// estimate from `estimated_fixed_input_tokens`, so a round never
+    /// serialises the same conversation twice.
+    pub(crate) fn remaining_context_budget_for(
+        estimated_fixed_input_tokens: u64,
+        model_limits: ModelLimits,
+    ) -> Result<u64, PromptError> {
+        let Some(window) = model_limits.context_window_tokens() else {
+            return Ok(u64::MAX);
+        };
+        remaining_budget(
+            estimated_fixed_input_tokens,
+            u64::from(window),
+            model_limits,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn remaining_context_budget(
         &self,
         conversation: &ConversationView,
         model_limits: ModelLimits,
     ) -> Result<u64, PromptError> {
-        let messages =
-            self.compose_messages(conversation, &ContextBundle { blocks: Vec::new() })?;
-        let request = self.request(messages, model_limits)?;
-        let estimated = estimate_request(&request)?;
-        let Some(window) = model_limits.context_window_tokens() else {
-            return Ok(u64::MAX);
-        };
-        remaining_budget(estimated, u64::from(window), model_limits)
+        let fixed = self.estimated_fixed_input_tokens(conversation, model_limits)?;
+        Self::remaining_context_budget_for(fixed, model_limits)
     }
 
     pub(crate) fn estimated_fixed_input_tokens(
@@ -272,11 +285,29 @@ fn format_context_block(block: &ContextBlock) -> Result<ModelMessage, PromptErro
     .map_err(|_| PromptError::InvalidContext)
 }
 
+/// Measures the serialized request without materialising it. The byte count is
+/// exactly the length serde would produce, but nothing is allocated, which
+/// matters because a turn estimates once per round over the whole prompt.
 fn estimate_request(request: &ModelRequest) -> Result<u64, PromptError> {
-    let bytes = serde_json::to_vec(request)
-        .map_err(|_| PromptError::Serialization)?
-        .len();
-    estimate_tokens(bytes)
+    let mut sink = ByteCountingWriter::default();
+    serde_json::to_writer(&mut sink, request).map_err(|_| PromptError::Serialization)?;
+    estimate_tokens(sink.written)
+}
+
+#[derive(Default)]
+struct ByteCountingWriter {
+    written: usize,
+}
+
+impl std::io::Write for ByteCountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.written = self.written.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn estimate_tokens(bytes: usize) -> Result<u64, PromptError> {

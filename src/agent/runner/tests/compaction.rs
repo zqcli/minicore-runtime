@@ -1,6 +1,8 @@
 use super::compaction_support::*;
 use super::*;
-use crate::agent::runner::compaction::{CompactionAttempt, CompactionState, proactive};
+use crate::agent::runner::compaction::{
+    CompactionAttempt, CompactionState, FixedInputEstimate, proactive,
+};
 use crate::agent::turn_context::TurnRunnerContext;
 use crate::compaction::CompactionError;
 
@@ -42,22 +44,23 @@ async fn proactive_trigger_equality_and_same_head_suppression_are_exact() {
         .unwrap();
     assert!(estimate > 1);
     let mut state = CompactionState::default();
+    let mut fixed = FixedInputEstimate::default();
 
     context.compaction.as_mut().unwrap().trigger_tokens = estimate.checked_add(1).unwrap();
     assert!(matches!(
-        proactive(&mut context, Usage::default(), &mut state).await,
+        proactive(&mut context, Usage::default(), &mut state, &mut fixed).await,
         CompactionAttempt::Skipped
     ));
     assert_eq!(strategy.calls(), 0);
 
     context.compaction.as_mut().unwrap().trigger_tokens = estimate;
     assert!(matches!(
-        proactive(&mut context, Usage::default(), &mut state).await,
+        proactive(&mut context, Usage::default(), &mut state, &mut fixed).await,
         CompactionAttempt::Skipped
     ));
     assert_eq!(strategy.calls(), 1);
     assert!(matches!(
-        proactive(&mut context, Usage::default(), &mut state).await,
+        proactive(&mut context, Usage::default(), &mut state, &mut fixed).await,
         CompactionAttempt::Skipped
     ));
     assert_eq!(strategy.calls(), 1);
