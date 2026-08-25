@@ -4,7 +4,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::config::{SemanticLimits, SessionSpec};
-use crate::context::{ContextBlock, ContextBundle, ContextSlot};
+use crate::context::{ContextBlock, ContextDriver, ContextSlot, ValidatedContextBundle};
 use crate::conversation::{ConversationEntry, ConversationView, PromptConversationProjection};
 use crate::model::{AssistantPart, ModelLimits, ModelMessage, ModelRequest, ReasoningContent};
 use crate::tools::{ToolOutput, ToolSpec};
@@ -116,15 +116,15 @@ impl PromptBuilder {
         conversation: &ConversationView,
         model_limits: ModelLimits,
     ) -> Result<u64, PromptError> {
-        let messages =
-            self.compose_messages(conversation, &ContextBundle { blocks: Vec::new() })?;
+        let context = ContextDriver::empty_bundle();
+        let messages = self.compose_messages(conversation, &context)?;
         estimate_request(&self.request(messages, model_limits)?)
     }
 
     pub(crate) fn build(
         &self,
         conversation: &ConversationView,
-        context: &ContextBundle,
+        context: &ValidatedContextBundle,
         model_limits: ModelLimits,
     ) -> Result<ModelRequest, PromptError> {
         let messages = self.compose_messages(conversation, context)?;
@@ -139,22 +139,16 @@ impl PromptBuilder {
     fn compose_messages(
         &self,
         conversation: &ConversationView,
-        context: &ContextBundle,
+        context: &ValidatedContextBundle,
     ) -> Result<Vec<ModelMessage>, PromptError> {
-        let sorted_context = context
-            .clone()
-            .validate_and_sort(&self.limits)
-            .map_err(|_| PromptError::InvalidContext)?;
-        if &sorted_context != context {
-            return Err(PromptError::InvalidContext);
-        }
         let projection = conversation
             .validated_prompt_projection(&self.spec, &self.limits)
             .map_err(|_| PromptError::InvalidConversation)?;
         let projected = project_conversation(&projection)?;
+        let context_blocks = context.blocks();
         let mut messages = Vec::with_capacity(
             2usize
-                .saturating_add(sorted_context.blocks.len())
+                .saturating_add(context_blocks.len())
                 .saturating_add(projected.len()),
         );
         messages.push(
@@ -167,7 +161,7 @@ impl PromptBuilder {
                     .map_err(|_| PromptError::InvalidConfiguration)?,
             );
         }
-        for block in &sorted_context.blocks {
+        for block in context_blocks {
             messages.push(format_context_block(block)?);
         }
         messages.extend(projected);

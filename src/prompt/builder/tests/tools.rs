@@ -85,11 +85,7 @@ fn built_request_uses_exact_frozen_tools_reasoning_and_limits() {
     let builder = builder("", &["alpha", "beta"]);
     let limits = ModelLimits::new(Some(4096), Some(64)).unwrap();
     let request = builder
-        .build(
-            &ConversationView::empty(),
-            &ContextBundle { blocks: Vec::new() },
-            limits,
-        )
+        .build(&ConversationView::empty(), &empty_context(), limits)
         .unwrap();
     assert_eq!(request.tools(), &[tool_spec("alpha"), tool_spec("beta")]);
     assert_eq!(request.reasoning(), ReasoningPreference::High);

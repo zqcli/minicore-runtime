@@ -21,7 +21,7 @@ fn constructor_rejects_invalid_session_text_and_limits() {
 #[test]
 fn malformed_view_head_sequence_and_incomplete_tool_exchange_are_rejected() {
     let builder = builder("", &["search"]);
-    let empty_context = ContextBundle { blocks: Vec::new() };
+    let empty_context = empty_context();
     assert_eq!(
         builder.build(
             &view_with_head(2, vec![user(1, 1, "question")]),
@@ -49,52 +49,17 @@ fn malformed_view_head_sequence_and_incomplete_tool_exchange_are_rejected() {
 }
 
 #[test]
-fn unsorted_duplicate_and_malformed_context_are_rejected_not_reordered() {
+fn context_block_formatting_failure_is_reported() {
     let builder = builder("", &[]);
     let conversation = ConversationView::empty();
-    let unsorted = ContextBundle {
-        blocks: vec![
-            context_block("turn", ContextSlot::TurnContext, 0, "turn"),
-            context_block("project", ContextSlot::ProjectInstructions, 0, "project"),
-        ],
-    };
-    assert_eq!(
-        builder.build(&conversation, &unsorted, ModelLimits::default()),
-        Err(PromptError::InvalidContext)
-    );
-    let duplicate = ContextBundle {
-        blocks: vec![
-            context_block("same", ContextSlot::TurnContext, 0, "one"),
-            context_block("same", ContextSlot::TurnContext, 0, "two"),
-        ],
-    };
-    assert_eq!(
-        builder.build(&conversation, &duplicate, ModelLimits::default()),
-        Err(PromptError::InvalidContext)
-    );
-    let malformed = ContextBundle {
-        blocks: vec![ContextBlock {
-            source: "bad".parse().unwrap(),
-            slot: ContextSlot::TurnContext,
-            priority: 0,
-            content: BoundedText::new("bad\0context").unwrap(),
-        }],
-    };
+    let malformed = checked_context(vec![ContextBlock {
+        source: "bad".parse().unwrap(),
+        slot: ContextSlot::TurnContext,
+        priority: 0,
+        content: BoundedText::new("bad\0context").unwrap(),
+    }]);
     assert_eq!(
         builder.build(&conversation, &malformed, ModelLimits::default()),
-        Err(PromptError::InvalidContext)
-    );
-
-    let hard_limit = ContextBundle {
-        blocks: vec![context_block(
-            "large",
-            ContextSlot::TurnContext,
-            0,
-            &"x".repeat(BoundedText::MAX_BYTES),
-        )],
-    };
-    assert_eq!(
-        builder.build(&conversation, &hard_limit, ModelLimits::default()),
         Err(PromptError::InvalidContext)
     );
 }
@@ -107,7 +72,7 @@ fn assistant_text_and_reasoning_follow_semantic_round_limits() {
         ..SemanticLimits::default()
     };
     let builder = PromptBuilder::new(&session_spec("", &[]), Vec::new(), limits).unwrap();
-    let context = ContextBundle { blocks: Vec::new() };
+    let context = empty_context();
     let exact = view(vec![
         user(1, 1, "question"),
         assistant(2, 1, Some("abc"), Some("abc"), Vec::new()),
@@ -153,7 +118,7 @@ fn assistant_text_and_reasoning_follow_semantic_round_limits() {
 fn exact_request_serialization_drives_budget_and_includes_reasoning_and_limits() {
     let builder = builder("session", &["search"]);
     let conversation = view(vec![user(1, 1, "question")]);
-    let context = ContextBundle { blocks: Vec::new() };
+    let context = empty_context();
     let output = 7_u32;
     let mut exact_window = 512_u32;
     let mut independently_built = None;

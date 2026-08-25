@@ -14,11 +14,7 @@ fn latest_summary_replaces_through_history_and_keeps_current_open_turn() {
         user(9, 3, "current question"),
     ]);
     let request = builder("", &[])
-        .build(
-            &conversation,
-            &ContextBundle { blocks: Vec::new() },
-            ModelLimits::default(),
-        )
+        .build(&conversation, &empty_context(), ModelLimits::default())
         .unwrap();
     assert_eq!(
         request.messages(),
@@ -59,11 +55,7 @@ fn no_summary_projects_all_entries_in_canonical_part_and_tool_result_order() {
     entries.push(assistant(8, 1, None, Some("final answer"), Vec::new()));
     entries.push(terminal(9, 1));
     let request = builder("", &["search"])
-        .build(
-            &view(entries),
-            &ContextBundle { blocks: Vec::new() },
-            ModelLimits::default(),
-        )
+        .build(&view(entries), &empty_context(), ModelLimits::default())
         .unwrap();
 
     let expected_parts = {
@@ -124,11 +116,7 @@ fn history_and_current_active_turn_accept_lower_per_turn_round_limits() {
         user_with_rounds(4, 2, "current", 1),
     ]);
     let request = builder("", &[])
-        .build(
-            &conversation,
-            &ContextBundle { blocks: Vec::new() },
-            ModelLimits::default(),
-        )
+        .build(&conversation, &empty_context(), ModelLimits::default())
         .unwrap();
     assert_eq!(
         request.messages(),
@@ -151,11 +139,7 @@ fn maximum_valid_summary_is_projected_without_metadata_prefix() {
         summary(4, 3, &text),
     ]);
     let request = builder("", &[])
-        .build(
-            &conversation,
-            &ContextBundle { blocks: Vec::new() },
-            ModelLimits::default(),
-        )
+        .build(&conversation, &empty_context(), ModelLimits::default())
         .unwrap();
     assert_eq!(request.messages()[1], ModelMessage::system(text).unwrap());
 }

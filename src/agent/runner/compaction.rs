@@ -113,7 +113,7 @@ pub(super) async fn prepare_model_request(
                 return PreparedModelRequest::Terminal(prompt_failure(error, usage));
             }
         };
-        let context_bundle = match context
+        let validated_context = match context
             .environment
             .context
             .provide_detailed(ContextRequest {
@@ -128,7 +128,7 @@ pub(super) async fn prepare_model_request(
             })
             .await
         {
-            Ok(context_bundle) => context_bundle,
+            Ok(validated_context) => validated_context,
             Err(failure) => {
                 return PreparedModelRequest::Terminal(context_failure(failure, usage));
             }
@@ -138,7 +138,7 @@ pub(super) async fn prepare_model_request(
         }
         match context.environment.prompt.build(
             &context.conversation,
-            &context_bundle,
+            &validated_context,
             context.environment.model_limits,
         ) {
             Ok(request) => {
