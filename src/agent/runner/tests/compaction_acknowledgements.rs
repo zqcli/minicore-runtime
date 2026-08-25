@@ -70,7 +70,7 @@ async fn stale_summary_snapshot_is_rejected_before_actor_append() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn summary_ack_cannot_replace_an_earlier_canonical_entry() {
+async fn summary_ack_rejects_active_turn_provenance_change() {
     let (spec, initial, request, mut critical_rx, model) = forced_ack_case();
     let task = tokio::spawn(run_turn(request));
     match critical_rx.recv().await.unwrap() {
@@ -79,24 +79,28 @@ async fn summary_ack_cannot_replace_an_earlier_canonical_entry() {
             draft,
             reply,
         } => {
-            let acknowledgement = ack_summary(&initial, snapshot_head, &draft, &spec).unwrap();
-            let mut entries = acknowledgement.conversation.entries().to_vec();
-            match &mut entries[0] {
-                ConversationEntry::UserMessage(entry) => {
-                    entry.input =
-                        UserInputRecord::new(BoundedText::new("forged prior input").unwrap())
-                            .unwrap();
-                }
-                entry => panic!("unexpected entry: {entry:?}"),
-            }
-            let conversation =
-                ConversationView::from_confirmed(acknowledgement.head, entries.into());
-            conversation
-                .validated_prompt_projection(&spec, &SemanticLimits::default())
+            let update = ack_summary(&initial, snapshot_head, &draft, &spec).unwrap();
+            let mut entries = update.conversation.entries().to_vec();
+            let active = entries
+                .iter_mut()
+                .rev()
+                .find_map(|entry| match entry {
+                    ConversationEntry::UserMessage(entry) => Some(entry),
+                    _ => None,
+                })
                 .unwrap();
+            active.execution.max_tool_rounds = 3;
+            let conversation = ConversationView::from_validated_entries(
+                &spec,
+                &SemanticLimits::default(),
+                entries.into(),
+            )
+            .unwrap();
+            assert!(conversation.is_validated_for(&spec, &SemanticLimits::default()));
             reply
-                .send(Ok(CommitAck {
-                    head: acknowledgement.head,
+                .send(Ok(CommittedUpdate {
+                    previous_head: update.previous_head,
+                    entry: update.entry,
                     conversation,
                 }))
                 .unwrap();
@@ -125,20 +129,23 @@ async fn summary_ack_must_end_with_the_exact_committed_summary() {
         } => {
             let acknowledgement = ack_summary(&initial, snapshot_head, &draft, &spec).unwrap();
             let mut entries = acknowledgement.conversation.entries().to_vec();
-            match entries.last_mut().unwrap() {
+            let entry = match entries.last_mut().unwrap() {
                 ConversationEntry::Summary(entry) => {
                     entry.summary = BoundedText::new("forged summary").unwrap();
+                    ConversationEntry::Summary(entry.clone())
                 }
                 entry => panic!("unexpected entry: {entry:?}"),
-            }
-            let conversation =
-                ConversationView::from_confirmed(acknowledgement.head, entries.into());
-            conversation
-                .validated_prompt_projection(&spec, &SemanticLimits::default())
-                .unwrap();
+            };
+            let conversation = ConversationView::from_validated_entries(
+                &spec,
+                &SemanticLimits::default(),
+                entries.into(),
+            )
+            .unwrap();
             reply
-                .send(Ok(CommitAck {
-                    head: acknowledgement.head,
+                .send(Ok(CommittedUpdate {
+                    previous_head: acknowledgement.previous_head,
+                    entry,
                     conversation,
                 }))
                 .unwrap();

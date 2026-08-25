@@ -152,7 +152,8 @@ pub(super) fn active_conversation(
             created_at: timestamp(),
         }),
     ];
-    ConversationView::from_confirmed(ConversationSeq::new(4), entries.into())
+    ConversationView::from_validated_entries(spec, &SemanticLimits::default(), entries.into())
+        .unwrap()
 }
 
 pub(super) fn ack_summary(
@@ -160,23 +161,27 @@ pub(super) fn ack_summary(
     snapshot_head: ConversationSeq,
     draft: &SummaryDraft,
     spec: &SessionSpec,
-) -> Result<CommitAck, RunnerCommitError> {
+) -> Result<CommittedUpdate, RunnerCommitError> {
     if conversation.head() != snapshot_head {
         return Err(RunnerCommitError::Stale);
     }
     let head = snapshot_head.next().ok_or(RunnerCommitError::Stale)?;
-    let mut entries = conversation.entries().to_vec();
-    entries.push(ConversationEntry::Summary(SummaryEntry {
+    let entry = ConversationEntry::Summary(SummaryEntry {
         seq: head,
         through: draft.through,
         summary: draft.summary.clone(),
         created_at: timestamp(),
-    }));
-    let conversation = ConversationView::from_confirmed(head, entries.into());
-    conversation
-        .validated_prompt_projection(spec, &SemanticLimits::default())
-        .map_err(|_| RunnerCommitError::Stale)?;
-    Ok(CommitAck { head, conversation })
+    });
+    let mut entries = conversation.entries().to_vec();
+    entries.push(entry.clone());
+    let conversation =
+        ConversationView::from_validated_entries(spec, &SemanticLimits::default(), entries.into())
+            .map_err(|_| RunnerCommitError::Stale)?;
+    Ok(CommittedUpdate {
+        previous_head: snapshot_head,
+        entry,
+        conversation,
+    })
 }
 
 pub(super) fn request_with_compaction_kernel(

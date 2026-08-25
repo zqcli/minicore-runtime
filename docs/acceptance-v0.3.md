@@ -11,7 +11,7 @@ All functional criteria AT-K01 through AT-K96 passed on the remote Linux validat
 | Remote checkout | Linux, `/root/minicore-runtime-v03` |
 | Stable toolchain | `rustc 1.98.0`, `cargo 1.98.0`, `clippy 1.98.0` |
 | Stable gate | `scripts/check.sh` passed in full |
-| Root tests | 290 library tests passed; cleaned integration suites also passed |
+| Root tests | 293 library tests passed; cleaned integration suites also passed |
 | Provider evidence | provider-gate tests and warnings-denied Clippy passed through `scripts/check.sh` |
 | MSRV | `rustc 1.85.0`, `cargo 1.85.0`; `scripts/check-msrv.sh` passed |
 | Documentation | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked` passed |

@@ -4,7 +4,8 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 
 use crate::conversation::{
-    AssistantMessageDraft, ConversationSeq, ConversationView, SummaryDraft, ToolResultDraft,
+    AssistantMessageDraft, ConversationEntry, ConversationSeq, ConversationView, SummaryDraft,
+    ToolResultDraft,
 };
 use crate::error::DiagnosticSummary;
 use crate::ids::{ToolCallId, TurnId};
@@ -47,8 +48,9 @@ pub(crate) enum SuspensionError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommitAck {
-    pub(crate) head: ConversationSeq,
+pub(crate) struct CommittedUpdate {
+    pub(crate) previous_head: ConversationSeq,
+    pub(crate) entry: ConversationEntry,
     pub(crate) conversation: ConversationView,
 }
 
@@ -105,16 +107,16 @@ impl RunnerOutcome {
 pub(crate) enum RunnerEvent {
     CommitAssistant {
         draft: AssistantMessageDraft,
-        reply: oneshot::Sender<Result<CommitAck, RunnerCommitError>>,
+        reply: oneshot::Sender<Result<CommittedUpdate, RunnerCommitError>>,
     },
     CommitToolResult {
         draft: ToolResultDraft,
-        reply: oneshot::Sender<Result<CommitAck, RunnerCommitError>>,
+        reply: oneshot::Sender<Result<CommittedUpdate, RunnerCommitError>>,
     },
     CommitSummary {
         snapshot_head: ConversationSeq,
         draft: SummaryDraft,
-        reply: oneshot::Sender<Result<CommitAck, RunnerCommitError>>,
+        reply: oneshot::Sender<Result<CommittedUpdate, RunnerCommitError>>,
     },
     Suspend {
         suspension: TurnSuspension,

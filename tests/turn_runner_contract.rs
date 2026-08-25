@@ -106,15 +106,39 @@ fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
     let immediate = support.find("control.sender.try_send(event)").unwrap();
     let blocked = support.find("control.sender.send(event)").unwrap();
     assert!(immediate < blocked);
+    let compact_support = compact(support);
     for required in [
         "previous_head != context.conversation.head()",
-        "checked_add(1)",
-        "replacement_entries.get(..current_entries.len()) != Some(current_entries)",
+        "update.previous_head != previous_head",
+        "previous_head.next() != Some(update.entry.seq())",
+        "update.conversation.head() != update.entry.seq()",
+        "update.conversation.entries().last() != Some(&update.entry)",
         "before.turn_id != after.turn_id || before.execution != after.execution",
     ] {
         assert!(
             support.contains(required),
             "ack validation misses {required}"
+        );
+    }
+    assert!(compact_support.contains(
+        "update.conversation.is_validated_for(&context.environment.spec,&context.environment.limits)"
+    ));
+    let provenance = compact_support
+        .find("if!update.conversation.is_validated_for(")
+        .unwrap();
+    let shape = compact_support
+        .find("ifprevious_head!=context.conversation.head()")
+        .unwrap();
+    assert!(provenance < shape);
+    for forbidden in [
+        "current_entries",
+        "replacement_entries",
+        "get(..current_entries.len())",
+        ".zip(",
+    ] {
+        assert!(
+            !support.contains(forbidden),
+            "ack validation retains {forbidden}"
         );
     }
     let run_tool = &runner[runner.find("async fn run_tool(").unwrap()..];
@@ -147,20 +171,22 @@ fn runner_protocol_has_exact_critical_ack_outcome_and_progress_roles() {
         "pub(crate)enumRunnerEvent{",
         concat!(
             "CommitAssistant{draft:AssistantMessageDraft,",
-            "reply:oneshot::Sender<Result<CommitAck,RunnerCommitError>>,}"
+            "reply:oneshot::Sender<Result<CommittedUpdate,RunnerCommitError>>,}"
         ),
         concat!(
             "CommitToolResult{draft:ToolResultDraft,",
-            "reply:oneshot::Sender<Result<CommitAck,RunnerCommitError>>,}"
+            "reply:oneshot::Sender<Result<CommittedUpdate,RunnerCommitError>>,}"
         ),
         concat!(
             "CommitSummary{snapshot_head:ConversationSeq,draft:SummaryDraft,",
-            "reply:oneshot::Sender<Result<CommitAck,RunnerCommitError>>,}"
+            "reply:oneshot::Sender<Result<CommittedUpdate,RunnerCommitError>>,}"
         ),
         "Suspend{suspension:TurnSuspension,}",
         "Finish{outcome:RunnerOutcome,}",
         concat!(
-            "pub(crate)structCommitAck{pub(crate)head:ConversationSeq,",
+            "pub(crate)structCommittedUpdate{",
+            "pub(crate)previous_head:ConversationSeq,",
+            "pub(crate)entry:ConversationEntry,",
             "pub(crate)conversation:ConversationView,}"
         ),
         "pub(crate)enumRunnerCommitError{",
@@ -235,7 +261,7 @@ fn summary_commit_is_stale_head_checked_redacted_and_actor_owned() {
     );
     let summary_variant = concat!(
         "CommitSummary{snapshot_head:ConversationSeq,draft:SummaryDraft,",
-        "reply:oneshot::Sender<Result<CommitAck,RunnerCommitError>>,}"
+        "reply:oneshot::Sender<Result<CommittedUpdate,RunnerCommitError>>,}"
     );
     assert!(
         compact_protocol.contains(summary_variant),
@@ -255,9 +281,8 @@ fn summary_commit_is_stale_head_checked_redacted_and_actor_owned() {
     assert!(!debug.contains(".field(\"draft\""));
     assert!(!debug.contains("draft.summary.as_str()"));
     for required in [
-        "replacement_entries.get(..current_entries.len()) != Some(current_entries)",
         "before.turn_id != after.turn_id || before.execution != after.execution",
-        "Some(ConversationEntry::Summary(entry))",
+        "ConversationEntry::Summary(entry)",
         "entry.through == draft.through",
         "entry.summary == draft.summary",
     ] {
@@ -392,8 +417,10 @@ fn reviewer_regressions_have_deterministic_private_evidence() {
     let compaction_priority =
         include_str!("../src/agent/runner/tests/compaction_control/priority.rs");
     for required in [
-        "assistant_ack_cannot_replace_an_earlier_canonical_user_entry",
-        "tool_ack_cannot_replace_an_earlier_canonical_assistant_entry",
+        "assistant_ack_rejects_semantically_valid_untrusted_early_prefix_replacement",
+        "tool_result_ack_rejects_each_draft_field_mismatch",
+        "committed_update_acknowledges_a_ten_thousand_entry_history",
+        "sequence_mismatch",
     ] {
         assert!(acknowledgements.contains(required));
     }
@@ -445,7 +472,6 @@ fn reviewer_regressions_have_deterministic_private_evidence() {
     }
     for required in [
         "stale_summary_snapshot_is_rejected_before_actor_append",
-        "summary_ack_cannot_replace_an_earlier_canonical_entry",
         "summary_ack_must_end_with_the_exact_committed_summary",
         "every_summary_commit_error_uses_the_existing_critical_taxonomy",
     ] {

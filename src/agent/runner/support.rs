@@ -9,8 +9,8 @@ use crate::model::{AssistantPart, ModelDriverProgress, ModelResponse, Usage};
 use crate::value::BoundedText;
 
 use super::super::runner_protocol::{
-    CommitAck, RunnerCommitError, RunnerEvent, RunnerOutcome, RunnerProgress, SuspensionError,
-    TurnRunnerExit,
+    CommittedUpdate, RunnerCommitError, RunnerEvent, RunnerOutcome, RunnerProgress,
+    SuspensionError, TurnRunnerExit,
 };
 use super::super::tool_driver::ToolDriverProgress;
 use super::super::turn_context::TurnRunnerContext;
@@ -107,7 +107,7 @@ fn optional_text(value: String, maximum: usize) -> Result<Option<BoundedText>, (
 pub(super) async fn commit_assistant(
     context: &TurnRunnerContext,
     draft: AssistantMessageDraft,
-) -> Result<CommitAck, CriticalFailure> {
+) -> Result<CommittedUpdate, CriticalFailure> {
     let (reply, receiver) = oneshot::channel();
     send_critical_for_context(context, RunnerEvent::CommitAssistant { draft, reply }).await?;
     await_commit(context, receiver).await
@@ -116,7 +116,7 @@ pub(super) async fn commit_assistant(
 pub(super) async fn commit_tool_result(
     context: &TurnRunnerContext,
     draft: ToolResultDraft,
-) -> Result<CommitAck, CriticalFailure> {
+) -> Result<CommittedUpdate, CriticalFailure> {
     let (reply, receiver) = oneshot::channel();
     send_critical_for_context(context, RunnerEvent::CommitToolResult { draft, reply }).await?;
     await_commit(context, receiver).await
@@ -126,7 +126,7 @@ pub(super) async fn commit_summary(
     context: &TurnRunnerContext,
     snapshot_head: ConversationSeq,
     draft: SummaryDraft,
-) -> Result<CommitAck, CriticalFailure> {
+) -> Result<CommittedUpdate, CriticalFailure> {
     let (reply, receiver) = oneshot::channel();
     send_critical_for_context(
         context,
@@ -142,8 +142,8 @@ pub(super) async fn commit_summary(
 
 async fn await_commit(
     context: &TurnRunnerContext,
-    mut receiver: oneshot::Receiver<Result<CommitAck, RunnerCommitError>>,
-) -> Result<CommitAck, CriticalFailure> {
+    mut receiver: oneshot::Receiver<Result<CommittedUpdate, RunnerCommitError>>,
+) -> Result<CommittedUpdate, CriticalFailure> {
     match receiver.try_recv() {
         Ok(result) => return result.map_err(CriticalFailure::Commit),
         Err(oneshot::error::TryRecvError::Closed) => return Err(CriticalFailure::RuntimeClosed),
@@ -165,13 +165,12 @@ pub(super) fn validate_assistant_ack(
     context: &TurnRunnerContext,
     previous_head: ConversationSeq,
     draft: &AssistantMessageDraft,
-    acknowledgement: CommitAck,
+    update: CommittedUpdate,
 ) -> Result<ConversationView, CriticalFailure> {
-    validate_ack_shape(context, previous_head, &acknowledgement)?;
-    match acknowledgement.conversation.entries().last() {
-        Some(ConversationEntry::AssistantMessage(entry))
-            if entry.seq == acknowledgement.head
-                && entry.turn_id == draft.turn_id
+    validate_update_shape(context, previous_head, &update)?;
+    match &update.entry {
+        ConversationEntry::AssistantMessage(entry)
+            if entry.turn_id == draft.turn_id
                 && entry.model == draft.model
                 && entry.text == draft.text
                 && entry.reasoning == draft.reasoning
@@ -179,7 +178,7 @@ pub(super) fn validate_assistant_ack(
                 && entry.usage == draft.usage
                 && entry.finish_reason == draft.finish_reason =>
         {
-            Ok(acknowledgement.conversation)
+            Ok(update.conversation)
         }
         _ => Err(CriticalFailure::InvalidAck),
     }
@@ -189,19 +188,18 @@ pub(super) fn validate_tool_ack(
     context: &TurnRunnerContext,
     previous_head: ConversationSeq,
     draft: &ToolResultDraft,
-    acknowledgement: CommitAck,
+    update: CommittedUpdate,
 ) -> Result<ConversationView, CriticalFailure> {
-    validate_ack_shape(context, previous_head, &acknowledgement)?;
-    match acknowledgement.conversation.entries().last() {
-        Some(ConversationEntry::ToolResult(entry))
-            if entry.seq == acknowledgement.head
-                && entry.turn_id == draft.turn_id
+    validate_update_shape(context, previous_head, &update)?;
+    match &update.entry {
+        ConversationEntry::ToolResult(entry)
+            if entry.turn_id == draft.turn_id
                 && entry.tool_call_id == draft.tool_call_id
                 && entry.tool_name == draft.tool_name
                 && entry.outcome == draft.outcome
                 && entry.content == draft.content =>
         {
-            Ok(acknowledgement.conversation)
+            Ok(update.conversation)
         }
         _ => Err(CriticalFailure::InvalidAck),
     }
@@ -211,53 +209,50 @@ pub(super) fn validate_summary_ack(
     context: &TurnRunnerContext,
     snapshot_head: ConversationSeq,
     draft: &SummaryDraft,
-    acknowledgement: CommitAck,
+    update: CommittedUpdate,
 ) -> Result<ConversationView, CriticalFailure> {
     if context.conversation.head() != snapshot_head {
         return Err(CriticalFailure::InvalidAck);
     }
-    validate_ack_shape(context, snapshot_head, &acknowledgement)?;
+    validate_update_shape(context, snapshot_head, &update)?;
     let before = context
         .conversation
         .validated_active_turn(&context.environment.spec, &context.environment.limits)
         .map_err(|_| CriticalFailure::InvalidAck)?;
-    let after = acknowledgement
+    let after = update
         .conversation
         .validated_active_turn(&context.environment.spec, &context.environment.limits)
         .map_err(|_| CriticalFailure::InvalidAck)?;
     if before.turn_id != after.turn_id || before.execution != after.execution {
         return Err(CriticalFailure::InvalidAck);
     }
-    match acknowledgement.conversation.entries().last() {
-        Some(ConversationEntry::Summary(entry))
-            if entry.seq == acknowledgement.head
-                && entry.through == draft.through
-                && entry.summary == draft.summary =>
+    match &update.entry {
+        ConversationEntry::Summary(entry)
+            if entry.through == draft.through && entry.summary == draft.summary =>
         {
-            Ok(acknowledgement.conversation)
+            Ok(update.conversation)
         }
         _ => Err(CriticalFailure::InvalidAck),
     }
 }
 
-fn validate_ack_shape(
+fn validate_update_shape(
     context: &TurnRunnerContext,
     previous_head: ConversationSeq,
-    acknowledgement: &CommitAck,
+    update: &CommittedUpdate,
 ) -> Result<(), CriticalFailure> {
-    let current_entries = context.conversation.entries();
-    let replacement_entries = acknowledgement.conversation.entries();
+    if !update
+        .conversation
+        .is_validated_for(&context.environment.spec, &context.environment.limits)
+    {
+        return Err(CriticalFailure::InvalidAck);
+    }
     if previous_head != context.conversation.head()
-        || previous_head.next() != Some(acknowledgement.head)
-        || current_entries
-            .len()
-            .checked_add(1)
-            .is_none_or(|length| replacement_entries.len() != length)
-        || replacement_entries.get(..current_entries.len()) != Some(current_entries)
-        || acknowledgement.conversation.head() != acknowledgement.head
-        || context
-            .validate_conversation(&acknowledgement.conversation)
-            .is_err()
+        || update.previous_head != previous_head
+        || previous_head.next() != Some(update.entry.seq())
+        || update.conversation.head() != update.entry.seq()
+        || update.conversation.entries().last() != Some(&update.entry)
+        || context.validate_conversation(&update.conversation).is_err()
     {
         return Err(CriticalFailure::InvalidAck);
     }

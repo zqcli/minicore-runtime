@@ -97,6 +97,17 @@ impl ConversationView {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_validated_entries(
+        spec: &SessionSpec,
+        limits: &SemanticLimits,
+        entries: Arc<[ConversationEntry]>,
+    ) -> Result<Self, ConversationValidationError> {
+        let state =
+            Arc::new(ConversationState::new(spec.clone(), limits.clone())?.candidate(&entries)?);
+        Ok(Self::from_validated_state(&state))
+    }
+
     /// Builds a view from the owning log's validated state. The state proves the
     /// entries already passed semantic validation at `head`, so consumers that
     /// supply a matching configuration need no replay.
@@ -114,6 +125,10 @@ impl ConversationView {
 
     pub fn entries(&self) -> &[ConversationEntry] {
         &self.entries
+    }
+
+    pub(crate) fn is_validated_for(&self, spec: &SessionSpec, limits: &SemanticLimits) -> bool {
+        self.validated_state_for(spec, limits).is_some()
     }
 
     /// Resolves the active turn and its durable execution record without
@@ -167,10 +182,8 @@ impl ConversationView {
         spec: &SessionSpec,
         limits: &SemanticLimits,
     ) -> Result<MaybeOwnedState<'_>, ConversationValidationError> {
-        if let Some(state) = &self.state {
-            if state.head() == self.head && state.matches_configuration(spec, limits) {
-                return Ok(MaybeOwnedState::Validated(state));
-            }
+        if let Some(state) = self.validated_state_for(spec, limits) {
+            return Ok(MaybeOwnedState::Validated(state));
         }
         let state =
             ConversationState::new(spec.clone(), limits.clone())?.candidate(self.entries())?;
@@ -178,6 +191,16 @@ impl ConversationView {
             return Err(ConversationValidationError::SequenceGap);
         }
         Ok(MaybeOwnedState::Replayed(Box::new(state)))
+    }
+
+    fn validated_state_for(
+        &self,
+        spec: &SessionSpec,
+        limits: &SemanticLimits,
+    ) -> Option<&ConversationState> {
+        self.state
+            .as_deref()
+            .filter(|state| state.head() == self.head && state.matches_configuration(spec, limits))
     }
 }
 

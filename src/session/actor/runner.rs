@@ -1,4 +1,4 @@
-use crate::agent::{CommitAck, RunnerCommitError, TurnSuspension};
+use crate::agent::{CommittedUpdate, RunnerCommitError, TurnSuspension};
 use crate::conversation::{
     AssistantMessageDraft, ConversationCommitError, ConversationCommitErrorKind, SummaryDraft,
     ToolResultDraft, UnsequencedEntry,
@@ -41,7 +41,7 @@ impl SessionActor {
     async fn commit_assistant(
         &mut self,
         draft: AssistantMessageDraft,
-    ) -> Result<CommitAck, RunnerCommitError> {
+    ) -> Result<CommittedUpdate, RunnerCommitError> {
         self.commit_one(UnsequencedEntry::AssistantMessage(draft))
             .await
     }
@@ -49,7 +49,7 @@ impl SessionActor {
     async fn commit_tool_result(
         &mut self,
         draft: ToolResultDraft,
-    ) -> Result<CommitAck, RunnerCommitError> {
+    ) -> Result<CommittedUpdate, RunnerCommitError> {
         self.commit_one(UnsequencedEntry::ToolResult(draft)).await
     }
 
@@ -57,7 +57,7 @@ impl SessionActor {
         &mut self,
         snapshot_head: ConversationSeq,
         draft: SummaryDraft,
-    ) -> Result<CommitAck, RunnerCommitError> {
+    ) -> Result<CommittedUpdate, RunnerCommitError> {
         if self.conversation.head() != snapshot_head {
             return Err(RunnerCommitError::Stale);
         }
@@ -67,18 +67,24 @@ impl SessionActor {
     async fn commit_one(
         &mut self,
         draft: UnsequencedEntry,
-    ) -> Result<CommitAck, RunnerCommitError> {
+    ) -> Result<CommittedUpdate, RunnerCommitError> {
         if self.core.closing && self.core.active.is_none() {
             return Err(RunnerCommitError::RuntimeClosed);
         }
         if matches!(&self.core.health, SessionHealth::Degraded { .. }) {
             return Err(RunnerCommitError::Degraded);
         }
+        let previous_head = self.conversation.head();
         match self.conversation.append_validated(vec![draft]).await {
             Ok(batch) => {
+                let [entry] = batch
+                    .entries
+                    .try_into()
+                    .expect("single-entry commit must return exactly one entry");
                 self.publish_state();
-                Ok(CommitAck {
-                    head: batch.head,
+                Ok(CommittedUpdate {
+                    previous_head,
+                    entry,
                     conversation: self.conversation.view(),
                 })
             }

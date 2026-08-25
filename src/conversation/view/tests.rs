@@ -45,6 +45,33 @@ fn view(entries: Vec<ConversationEntry>) -> ConversationView {
     ConversationView::from_confirmed(head, Arc::from(entries))
 }
 
+#[test]
+fn validated_provenance_requires_state_head_spec_and_limits_match() {
+    let spec = spec();
+    let limits = SemanticLimits::default();
+    let turn = TurnId::new().unwrap();
+    let trusted =
+        ConversationView::from_validated_entries(&spec, &limits, Arc::from(vec![user(1, turn, 4)]))
+            .unwrap();
+    assert!(trusted.is_validated_for(&spec, &limits));
+
+    let external =
+        ConversationView::from_confirmed(trusted.head(), trusted.entries().to_vec().into());
+    assert!(!external.is_validated_for(&spec, &limits));
+
+    let mut wrong_head = trusted.clone();
+    wrong_head.head = ConversationSeq::new(2);
+    assert!(!wrong_head.is_validated_for(&spec, &limits));
+
+    let mut wrong_spec = spec.clone();
+    wrong_spec.model = "other:v1".parse().unwrap();
+    assert!(!trusted.is_validated_for(&wrong_spec, &limits));
+
+    let mut wrong_limits = limits.clone();
+    wrong_limits.max_tool_rounds -= 1;
+    assert!(!trusted.is_validated_for(&spec, &wrong_limits));
+}
+
 fn user(seq: u64, turn_id: TurnId, max_tool_rounds: u16) -> ConversationEntry {
     ConversationEntry::UserMessage(UserMessageEntry {
         seq: ConversationSeq::new(seq),

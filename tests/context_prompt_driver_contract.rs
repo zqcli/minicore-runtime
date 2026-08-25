@@ -143,6 +143,8 @@ fn conversation_owns_the_canonical_prompt_projection_proof() {
     assert!(module.contains("pub(crate) use view::PromptConversationProjection;"));
     for required in [
         "pub(crate) struct PromptConversationProjection",
+        "pub(crate) fn is_validated_for(",
+        "self.validated_state_for(spec, limits).is_some()",
         "pub(crate) fn validated_prompt_projection(",
         "pub(crate) fn validated_active_turn(",
         // A cached state is only reused when it proves the same head and the
@@ -150,6 +152,7 @@ fn conversation_owns_the_canonical_prompt_projection_proof() {
         "state.head() == self.head && state.matches_configuration(spec, limits)",
         "ConversationState::new(spec.clone(), limits.clone())?",
         "state.head() != self.head",
+        "fn validated_state_for(",
         "state.projection().latest_summary().cloned()",
         "Some(entry.execution.clone())",
         "entry.seq() > through",
