@@ -31,10 +31,16 @@ struct EvidenceModel {
     started: Arc<Semaphore>,
     release: Arc<Semaphore>,
     calls: Arc<AtomicUsize>,
+    descriptor_calls: Arc<AtomicUsize>,
+    panic_on_descriptor_call: Option<usize>,
 }
 
 impl Model for EvidenceModel {
     fn descriptor(&self) -> &ModelDescriptor {
+        let call = self.descriptor_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.panic_on_descriptor_call == Some(call) {
+            panic!("scripted descriptor panic");
+        }
         &self.descriptor
     }
 
@@ -73,13 +79,19 @@ struct Fixture {
     bindings: SessionBindings,
     started: Arc<Semaphore>,
     calls: Arc<AtomicUsize>,
+    descriptor_calls: Arc<AtomicUsize>,
 }
 
 fn fixture(gated: bool) -> Fixture {
+    fixture_with_descriptor_panic(gated, None)
+}
+
+fn fixture_with_descriptor_panic(gated: bool, panic_on_descriptor_call: Option<usize>) -> Fixture {
     let model_ref: ModelRef = "host:lifecycle-evidence".parse().unwrap();
     let started = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
+    let descriptor_calls = Arc::new(AtomicUsize::new(0));
     let model: Arc<dyn Model> = Arc::new(EvidenceModel {
         descriptor: ModelDescriptor::new(
             model_ref.clone(),
@@ -92,6 +104,8 @@ fn fixture(gated: bool) -> Fixture {
         started: Arc::clone(&started),
         release,
         calls: Arc::clone(&calls),
+        descriptor_calls: Arc::clone(&descriptor_calls),
+        panic_on_descriptor_call,
     });
     let spec = SessionSpec::new(
         model_ref,
@@ -113,6 +127,7 @@ fn fixture(gated: bool) -> Fixture {
         ),
         started,
         calls,
+        descriptor_calls,
     }
 }
 
@@ -136,6 +151,78 @@ fn options(fixture: &Fixture, command_capacity: Option<usize>) -> SessionRuntime
 async fn wait_started(fixture: &Fixture) {
     let permit = Arc::clone(&fixture.started).acquire_owned().await.unwrap();
     permit.forget();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn baseline_created_session_turns_repeat_descriptor_validation() {
+    let fixture = fixture(false);
+    let runtime = SessionRuntime::create(
+        session(80),
+        fixture.spec.clone(),
+        Box::new(FakeSessionLog::new()),
+        options(&fixture, None),
+    )
+    .await
+    .unwrap();
+    let opened = fixture.descriptor_calls.load(Ordering::SeqCst);
+    let handle = runtime.handle();
+    for turn in 0..2 {
+        handle
+            .submit(
+                UserInput::text(format!("baseline-{turn}")).unwrap(),
+                TurnOptions::default(),
+            )
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+    }
+    assert!(fixture.descriptor_calls.load(Ordering::SeqCst) > opened);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn baseline_descriptor_panic_after_user_append_fails_without_model_start() {
+    let fixture = fixture_with_descriptor_panic(false, Some(5));
+    let log = FakeSessionLog::new();
+    let inspection = log.inspection();
+    let runtime = SessionRuntime::create(
+        session(77),
+        fixture.spec.clone(),
+        Box::new(log),
+        options(&fixture, None),
+    )
+    .await
+    .unwrap();
+    let outcome = runtime
+        .handle()
+        .submit(
+            UserInput::text("static setup").unwrap(),
+            TurnOptions::default(),
+        )
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert!(matches!(outcome.terminal, TurnTerminal::Failed { .. }));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.descriptor_calls.load(Ordering::SeqCst), 5);
+    let entries = inspection.entries();
+    assert_eq!(entries.len(), 2);
+    assert!(matches!(
+        entries.first(),
+        Some(ConversationEntry::UserMessage(_))
+    ));
+    assert!(matches!(
+        entries.last(),
+        Some(ConversationEntry::TurnTerminal(entry))
+            if matches!(entry.terminal, TurnTerminal::Failed { .. })
+    ));
+    runtime.shutdown().await.unwrap();
+    assert_eq!(inspection.close_count(), 1);
+    assert_eq!(inspection.active_mutable_operations(), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
