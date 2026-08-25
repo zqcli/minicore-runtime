@@ -58,6 +58,14 @@ impl ConversationState {
         *self = candidate;
     }
 
+    pub(crate) fn matches_configuration(
+        &self,
+        spec: &SessionSpec,
+        limits: &SemanticLimits,
+    ) -> bool {
+        self.validator.matches_configuration(spec, limits)
+    }
+
     pub(crate) const fn head(&self) -> ConversationSeq {
         self.head
     }

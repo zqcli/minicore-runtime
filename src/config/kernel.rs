@@ -75,7 +75,7 @@ impl KernelConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemanticLimits {
     pub max_user_input_bytes: usize,
     pub max_system_prompt_bytes: usize,

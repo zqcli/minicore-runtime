@@ -571,7 +571,9 @@ async fn empty_closed_and_sequence_overflow_are_rejected_before_append() {
         Duration::from_secs(1),
     )
     .await;
-    log.state.set_head_for_test(ConversationSeq::new(u64::MAX));
+    std::sync::Arc::get_mut(&mut log.state)
+        .expect("log owns the only state reference")
+        .set_head_for_test(ConversationSeq::new(u64::MAX));
     assert_eq!(
         log.append_validated(vec![user(turn_id)])
             .await

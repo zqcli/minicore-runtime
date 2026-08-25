@@ -4,7 +4,7 @@ use super::entry::{ConversationEntry, ConversationSeq, SummaryEntry};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PromptProjection {
-    entries: Arc<Vec<ConversationEntry>>,
+    entries: Arc<[ConversationEntry]>,
     head: ConversationSeq,
     latest_summary: Option<SummaryEntry>,
 }
@@ -12,7 +12,7 @@ pub(crate) struct PromptProjection {
 impl Default for PromptProjection {
     fn default() -> Self {
         Self {
-            entries: Arc::new(Vec::new()),
+            entries: Arc::from([]),
             head: ConversationSeq::ZERO,
             latest_summary: None,
         }
@@ -25,7 +25,11 @@ impl PromptProjection {
     }
 
     pub(crate) fn entries(&self) -> &[ConversationEntry] {
-        self.entries.as_slice()
+        &self.entries
+    }
+
+    pub(crate) fn entries_arc(&self) -> Arc<[ConversationEntry]> {
+        Arc::clone(&self.entries)
     }
 
     pub(crate) fn latest_summary(&self) -> Option<&SummaryEntry> {
@@ -50,7 +54,7 @@ impl PromptProjection {
             .or_else(|| self.latest_summary.clone());
         let head = entries.last().map_or(self.head, ConversationEntry::seq);
         Self {
-            entries: Arc::new(retained),
+            entries: retained.into(),
             head,
             latest_summary,
         }

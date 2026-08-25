@@ -83,14 +83,14 @@ fn final_prompt_builder_is_private_deterministic_and_dependency_narrow() {
         "pub(crate) const KERNEL_INVARIANT",
         "pub(crate) struct PromptBuilder",
         "pub(crate) enum PromptError",
-        "pub(crate) fn remaining_context_budget(",
+        "pub(crate) fn remaining_context_budget_for(",
         "pub(crate) fn build(",
         "[minicore-context slot={slot} source={}]",
         "validated_prompt_projection(&self.spec, &self.limits)",
         "ModelMessage::system(summary.summary.as_str())",
         "ModelRequest::new(",
         "let request = self.request(messages, model_limits)?;",
-        "serde_json::to_vec(request)",
+        "serde_json::to_writer(&mut sink, request)",
     ] {
         assert!(
             builder.contains(required),
@@ -129,12 +129,10 @@ fn final_prompt_builder_is_private_deterministic_and_dependency_narrow() {
             "prompt builder retains {removed}"
         );
     }
-    assert_eq!(
-        builder
-            .matches("let request = self.request(messages, model_limits)?;")
-            .count(),
-        2
-    );
+    // Estimation must never materialise the serialized prompt: a counting sink
+    // keeps the byte count exact without allocating a copy per round.
+    assert!(!builder.contains("serde_json::to_vec"));
+    assert!(builder.contains("serde_json::to_writer"));
     assert_eq!(builder.matches("ModelRequest::new(").count(), 1);
     assert!(builder.lines().count() < 500);
 }
@@ -147,14 +145,14 @@ fn conversation_owns_the_canonical_prompt_projection_proof() {
     for required in [
         "pub(crate) struct PromptConversationProjection",
         "pub(crate) fn validated_prompt_projection(",
+        "pub(crate) fn validated_active_turn(",
+        // A cached state is only reused when it proves the same head and the
+        // same spec/limits; otherwise the validator is replayed in full.
+        "state.head() == self.head && state.matches_configuration(spec, limits)",
         "ConversationState::new(spec.clone(), limits.clone())?",
-        ".candidate(self.entries())?",
         "state.head() != self.head",
         "state.projection().latest_summary().cloned()",
-        "active_turn_execution: Option<TurnExecutionRecord>",
-        "pub(crate) fn active_turn_execution(&self)",
         "Some(entry.execution.clone())",
-        "active_turn_max_tool_rounds",
         "entry.seq() > through",
     ] {
         assert!(

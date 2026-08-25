@@ -14,8 +14,6 @@ pub(crate) struct PromptConversationProjection {
     selected_summary: Option<SummaryEntry>,
     entries: Arc<[ConversationEntry]>,
     head: ConversationSeq,
-    active_turn_id: Option<TurnId>,
-    active_turn_execution: Option<TurnExecutionRecord>,
 }
 
 impl fmt::Debug for PromptConversationProjection {
@@ -35,21 +33,6 @@ impl fmt::Debug for PromptConversationProjection {
                     .map(|summary| summary.through),
             )
             .field("entry_count", &self.entries.len())
-            .field("active_turn_id", &self.active_turn_id)
-            .field(
-                "active_turn_model",
-                &self
-                    .active_turn_execution
-                    .as_ref()
-                    .map(|execution| &execution.model),
-            )
-            .field(
-                "active_turn_max_tool_rounds",
-                &self
-                    .active_turn_execution
-                    .as_ref()
-                    .map(|execution| execution.max_tool_rounds),
-            )
             .finish()
     }
 }
@@ -62,20 +45,17 @@ impl PromptConversationProjection {
     pub(crate) fn entries(&self) -> &[ConversationEntry] {
         &self.entries
     }
-
-    pub(crate) const fn active_turn_id(&self) -> Option<TurnId> {
-        self.active_turn_id
-    }
-
-    pub(crate) fn active_turn_execution(&self) -> Option<&TurnExecutionRecord> {
-        self.active_turn_execution.as_ref()
-    }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct ConversationView {
     head: ConversationSeq,
     entries: Arc<[ConversationEntry]>,
+    /// The already-validated state this view was projected from, when the view
+    /// came from the owning `ConversationLog`. Present views are consumed
+    /// without replaying the validator; absent views fall back to a full
+    /// replay so externally constructed views keep the same guarantees.
+    state: Option<Arc<ConversationState>>,
 }
 
 impl fmt::Debug for ConversationView {
@@ -84,20 +64,48 @@ impl fmt::Debug for ConversationView {
             .debug_struct("ConversationView")
             .field("head", &self.head)
             .field("entry_count", &self.entries.len())
+            .field("validated", &self.state.is_some())
             .finish()
     }
 }
+
+/// Two views are equal when they carry the same confirmed conversation.
+/// The cached validated state is provenance, not content, so it is excluded.
+impl PartialEq for ConversationView {
+    fn eq(&self, other: &Self) -> bool {
+        self.head == other.head && self.entries == other.entries
+    }
+}
+
+impl Eq for ConversationView {}
 
 impl ConversationView {
     pub fn empty() -> Self {
         Self {
             head: ConversationSeq::ZERO,
             entries: Arc::<[ConversationEntry]>::from([]),
+            state: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_confirmed(head: ConversationSeq, entries: Arc<[ConversationEntry]>) -> Self {
-        Self { head, entries }
+        Self {
+            head,
+            entries,
+            state: None,
+        }
+    }
+
+    /// Builds a view from the owning log's validated state. The state proves the
+    /// entries already passed semantic validation at `head`, so consumers that
+    /// supply a matching configuration need no replay.
+    pub(crate) fn from_validated_state(state: &Arc<ConversationState>) -> Self {
+        Self {
+            head: state.head(),
+            entries: state.projection().entries_arc(),
+            state: Some(Arc::clone(state)),
+        }
     }
 
     pub const fn head(&self) -> ConversationSeq {
@@ -108,27 +116,26 @@ impl ConversationView {
         &self.entries
     }
 
+    /// Resolves the active turn and its durable execution record without
+    /// materialising a prompt projection. Callers that only need to confirm
+    /// turn identity use this instead of building the full projection.
+    pub(crate) fn validated_active_turn(
+        &self,
+        spec: &SessionSpec,
+        limits: &SemanticLimits,
+    ) -> Result<ActiveTurnProof, ConversationValidationError> {
+        let state = self.validated_state(spec, limits)?;
+        Ok(active_turn_proof(state.as_ref()))
+    }
+
     pub(crate) fn validated_prompt_projection(
         &self,
         spec: &SessionSpec,
         limits: &SemanticLimits,
     ) -> Result<PromptConversationProjection, ConversationValidationError> {
         let state = self.validated_state(spec, limits)?;
+        let state = state.as_ref();
         let selected_summary = state.projection().latest_summary().cloned();
-        let active_turn_id = state.active_turn_id();
-        let active_turn_execution = active_turn_id.and_then(|turn_id| {
-            state
-                .projection()
-                .entries()
-                .iter()
-                .rev()
-                .find_map(|entry| match entry {
-                    ConversationEntry::UserMessage(entry) if entry.turn_id == turn_id => {
-                        Some(entry.execution.clone())
-                    }
-                    _ => None,
-                })
-        });
         let through = selected_summary.as_ref().map(|summary| summary.through);
         let entries = state
             .projection()
@@ -141,8 +148,6 @@ impl ConversationView {
             selected_summary,
             entries: entries.into(),
             head: state.head(),
-            active_turn_id,
-            active_turn_execution,
         })
     }
 
@@ -154,17 +159,66 @@ impl ConversationView {
         Ok(self.validated_state(spec, limits)?.compaction_candidate())
     }
 
+    /// Returns the validated state for `spec`/`limits`, reusing the state the
+    /// view carries when it was validated against the same configuration and
+    /// replaying the validator otherwise.
     fn validated_state(
         &self,
         spec: &SessionSpec,
         limits: &SemanticLimits,
-    ) -> Result<ConversationState, ConversationValidationError> {
+    ) -> Result<MaybeOwnedState<'_>, ConversationValidationError> {
+        if let Some(state) = &self.state {
+            if state.head() == self.head && state.matches_configuration(spec, limits) {
+                return Ok(MaybeOwnedState::Validated(state));
+            }
+        }
         let state =
             ConversationState::new(spec.clone(), limits.clone())?.candidate(self.entries())?;
         if state.head() != self.head {
             return Err(ConversationValidationError::SequenceGap);
         }
-        Ok(state)
+        Ok(MaybeOwnedState::Replayed(Box::new(state)))
+    }
+}
+
+pub(crate) struct ActiveTurnProof {
+    pub(crate) turn_id: Option<TurnId>,
+    pub(crate) execution: Option<TurnExecutionRecord>,
+}
+
+fn active_turn_proof(state: &ConversationState) -> ActiveTurnProof {
+    let turn_id = state.active_turn_id();
+    let execution = turn_id.and_then(|turn_id| {
+        state
+            .projection()
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                ConversationEntry::UserMessage(entry) if entry.turn_id == turn_id => {
+                    Some(entry.execution.clone())
+                }
+                _ => None,
+            })
+    });
+    ActiveTurnProof { turn_id, execution }
+}
+
+enum MaybeOwnedState<'a> {
+    Validated(&'a ConversationState),
+    Replayed(Box<ConversationState>),
+}
+
+impl MaybeOwnedState<'_> {
+    fn as_ref(&self) -> &ConversationState {
+        match self {
+            Self::Validated(state) => state,
+            Self::Replayed(state) => state,
+        }
+    }
+
+    fn compaction_candidate(&self) -> CompactionCandidate {
+        self.as_ref().compaction_candidate()
     }
 }
 

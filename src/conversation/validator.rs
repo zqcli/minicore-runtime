@@ -149,6 +149,14 @@ impl ConversationValidator {
         self.active_turn
     }
 
+    pub(crate) fn matches_configuration(
+        &self,
+        spec: &SessionSpec,
+        limits: &SemanticLimits,
+    ) -> bool {
+        &self.spec == spec && &self.limits == limits
+    }
+
     pub(crate) fn unresolved_tool_calls(&self) -> &[PendingToolCall] {
         &self.pending_tools
     }

@@ -231,7 +231,7 @@ pub(crate) struct CommittedBatch {
 
 pub(crate) struct ConversationLog {
     inner: Box<dyn SessionLog>,
-    state: ConversationState,
+    state: Arc<ConversationState>,
     max_replay_page_size: usize,
     max_transcript_page_size: usize,
     log_operation_timeout: Duration,
@@ -307,7 +307,7 @@ impl ConversationLog {
         };
         Ok(Self {
             inner,
-            state,
+            state: Arc::new(state),
             max_replay_page_size: kernel.limits.max_replay_page_size,
             max_transcript_page_size: kernel.limits.max_transcript_page_size,
             log_operation_timeout: kernel.log_operation_timeout,
@@ -335,7 +335,7 @@ impl ConversationLog {
     ) -> Self {
         Self {
             inner,
-            state,
+            state: Arc::new(state),
             max_replay_page_size: limits.max_replay_page_size,
             max_transcript_page_size: limits.max_transcript_page_size,
             log_operation_timeout,
@@ -383,7 +383,7 @@ impl ConversationLog {
         if !valid_receipt(&receipt, expected_head, candidate.head(), entries.len()) {
             return Err(self.mark_durability_unknown(None));
         }
-        self.state.commit(candidate);
+        self.state = Arc::new(candidate);
         Ok(CommittedBatch {
             entries,
             head: self.state.head(),
@@ -396,10 +396,7 @@ impl ConversationLog {
     }
 
     pub(crate) fn view(&self) -> super::ConversationView {
-        super::ConversationView::from_confirmed(
-            self.state.head(),
-            self.state.projection().entries().to_vec().into(),
-        )
+        super::ConversationView::from_validated_state(&self.state)
     }
     pub(crate) fn settlement_drafts(
         &self,
@@ -430,7 +427,7 @@ impl ConversationLog {
     pub(crate) fn recovery_plan(&self) -> Option<RecoveryPlan> {
         RecoveryPlan::from_state(&self.state)
     }
-    pub(crate) const fn head(&self) -> ConversationSeq {
+    pub(crate) fn head(&self) -> ConversationSeq {
         self.state.head()
     }
 

@@ -207,15 +207,13 @@ pub(super) fn validate_summary_ack(
     validate_ack_shape(context, snapshot_head, &acknowledgement)?;
     let before = context
         .conversation
-        .validated_prompt_projection(&context.spec, &context.limits)
+        .validated_active_turn(&context.spec, &context.limits)
         .map_err(|_| CriticalFailure::InvalidAck)?;
     let after = acknowledgement
         .conversation
-        .validated_prompt_projection(&context.spec, &context.limits)
+        .validated_active_turn(&context.spec, &context.limits)
         .map_err(|_| CriticalFailure::InvalidAck)?;
-    if before.active_turn_id() != after.active_turn_id()
-        || before.active_turn_execution() != after.active_turn_execution()
-    {
+    if before.turn_id != after.turn_id || before.execution != after.execution {
         return Err(CriticalFailure::InvalidAck);
     }
     match acknowledgement.conversation.entries().last() {
