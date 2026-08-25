@@ -2,16 +2,22 @@
 fn context_driver_is_private_single_provider_and_owner_neutral() {
     let module = include_str!("../src/context/mod.rs");
     assert!(module.contains("mod driver;"));
-    assert!(module.contains("pub(crate) use driver::{ContextDriver, ContextDriverFailure};"));
+    assert!(module.contains(
+        "pub(crate) use driver::{ContextDriver, ContextDriverFailure, ValidatedContextBundle};"
+    ));
     assert!(!module.contains("pub use driver"));
 
     let driver = include_str!("../src/context/driver.rs");
     for required in [
         "pub(crate) struct ContextDriver",
+        "pub(crate) struct ValidatedContextBundle",
+        "blocks: Vec<ContextBlock>",
         "pub(crate) struct ContextDriverFailure",
         "provider: Option<Arc<dyn ContextProvider>>",
         "pub(crate) async fn provide(",
         "pub(crate) async fn provide_detailed(",
+        "Result<ValidatedContextBundle, ContextDriverFailure>",
+        "bundle.validate_and_sort(limits)",
         "effective_deadline(request.deadline, self.context_timeout)",
         "deadline_source: Option<DeadlineSource>",
         "ContextDriverFailure::deadline(deadline.source())",
@@ -19,6 +25,7 @@ fn context_driver_is_private_single_provider_and_owner_neutral() {
         "ContextError::Cancelled",
         "ContextError::DeadlineExceeded",
         "ContextError::Internal",
+        "Self::empty_bundle()",
     ] {
         assert!(
             driver.contains(required),
@@ -37,6 +44,8 @@ fn context_driver_is_private_single_provider_and_owner_neutral() {
         "retry",
         "allow(",
         "expect(",
+        "total_bytes",
+        "pub struct ValidatedContextBundle",
     ] {
         assert!(
             !driver.contains(forbidden),
@@ -84,6 +93,8 @@ fn final_prompt_builder_is_private_deterministic_and_dependency_narrow() {
         "pub(crate) enum PromptError",
         "pub(crate) fn remaining_context_budget_for(",
         "pub(crate) fn build(",
+        "&ValidatedContextBundle",
+        "context.blocks()",
         "[minicore-context slot={slot} source={}]",
         "validated_prompt_projection(&self.spec, &self.limits)",
         "ModelMessage::system(summary.summary.as_str())",
@@ -116,6 +127,10 @@ fn final_prompt_builder_is_private_deterministic_and_dependency_narrow() {
             "prompt builder contains {forbidden}"
         );
     }
+    assert!(!builder.contains("validate_and_sort"));
+    assert!(!builder.contains("ContextBundle {"));
+    assert!(!builder.contains("&ContextBundle"));
+    assert!(!builder.contains("context.clone()"));
     for removed in [
         "EstimatedPrompt",
         "validate_view",

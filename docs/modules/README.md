@@ -12,7 +12,7 @@ This page maps the final v0.3 source graph. Core contains host-neutral Ports, ch
 | --- | --- |
 | `config` | Kernel limits, retry policy, session specs, manifests, and checked inputs |
 | `conversation` | Canonical entries, validation, replay/recovery, transcript, prompt/compaction proofs, settlement, and the physical SessionLog Port declaration |
-| `context` | Public ContextProvider Port, checked context DTOs, and private ContextDriver |
+| `context` | Public ContextProvider Port/DTOs, private ContextDriver, and crate-private ValidatedContextBundle |
 | `compaction` | Public CompactionStrategy Port, candidates/proposals, and private CompactionDriver |
 | `error` | Redacted diagnostics plus typed session/log/open/shutdown/turn errors |
 | `ids` | Checked runtime, interaction, tool-call, and context-source identifiers |
@@ -37,7 +37,7 @@ The SessionLog trait is physically declared in `conversation/session_log.rs` bec
 
 - `model::driver` owns stream grammar, usage settlement, retry truth, cancellation, deadline provenance, and panic isolation for one direct Model.
 - `agent::tool_driver` owns frozen-spec policy decisions, approval/input suspension, Tool execution, output bounds, and lossy progress.
-- `context::driver` owns zero-or-one provider execution, validation, cancellation, and deadline provenance.
+- `context::driver` owns zero-or-one provider execution, the single ContextBundle validation/canonical-sort seam, crate-private ValidatedContextBundle construction, cancellation, and deadline provenance.
 - `prompt::builder` owns deterministic prompt ordering and exact serialized-request budgeting.
 - `compaction::driver` owns canonical candidate validation and one strategy call without commit authority.
 - `agent::environment` freezes the checked static Session environment once at create/load; `agent::runner` owns ordinary model/tool rounds, compaction recovery, exact single-entry delta acknowledgements, conservative usage, and normal completion through the tracked runner join.

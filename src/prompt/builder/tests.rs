@@ -4,7 +4,9 @@ use serde_json::json;
 
 use super::*;
 use crate::config::CompactionConfig;
-use crate::context::{ContextBlock, ContextSlot};
+use crate::context::{
+    ContextBlock, ContextBundle, ContextDriver, ContextSlot, ValidatedContextBundle,
+};
 use crate::conversation::{
     AssistantMessageEntry, ConversationSeq, SummaryEntry, ToolResultEntry, TurnExecutionRecord,
     TurnTerminal, TurnTerminalEntry, UserInputRecord, UserMessageEntry,
@@ -173,4 +175,13 @@ fn context_block(source: &str, slot: ContextSlot, priority: i16, content: &str) 
         priority,
         content: BoundedText::new(content).unwrap(),
     }
+}
+
+fn checked_context(blocks: Vec<ContextBlock>) -> ValidatedContextBundle {
+    ContextDriver::validated_for_tests(ContextBundle { blocks }, &SemanticLimits::default())
+        .unwrap()
+}
+
+fn empty_context() -> ValidatedContextBundle {
+    checked_context(Vec::new())
 }

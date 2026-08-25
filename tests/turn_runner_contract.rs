@@ -49,6 +49,7 @@ fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
         "ContextRequest{",
         "context.environment.prompt.build(",
         ".provide_detailed(ContextRequest{",
+        "letvalidated_context=matchcontext.environment.context.provide_detailed(ContextRequest{",
         "letrun=context.environment.model.run_detailed(",
         "letrun=context.environment.tools.run(",
         "prepare_model_request(",

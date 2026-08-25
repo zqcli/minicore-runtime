@@ -8,9 +8,20 @@ use tokio::time::Instant as TokioInstant;
 use crate::config::SemanticLimits;
 use crate::time::{DeadlineSource, effective_deadline};
 
-use super::{ContextBundle, ContextError, ContextProvider, ContextRequest};
+use super::{ContextBlock, ContextBundle, ContextError, ContextProvider, ContextRequest};
 
 const MAX_CONTEXT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedContextBundle {
+    blocks: Vec<ContextBlock>,
+}
+
+impl ValidatedContextBundle {
+    pub(crate) fn blocks(&self) -> &[ContextBlock] {
+        &self.blocks
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ContextDriverFailure {
@@ -67,11 +78,33 @@ impl ContextDriver {
         })
     }
 
+    pub(crate) fn empty_bundle() -> ValidatedContextBundle {
+        ValidatedContextBundle { blocks: Vec::new() }
+    }
+
+    fn validate_bundle(
+        bundle: ContextBundle,
+        limits: &SemanticLimits,
+    ) -> Result<ValidatedContextBundle, ContextError> {
+        let bundle = bundle.validate_and_sort(limits)?;
+        Ok(ValidatedContextBundle {
+            blocks: bundle.blocks,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validated_for_tests(
+        bundle: ContextBundle,
+        limits: &SemanticLimits,
+    ) -> Result<ValidatedContextBundle, ContextError> {
+        Self::validate_bundle(bundle, limits)
+    }
+
     #[cfg(test)]
     pub(crate) async fn provide(
         &self,
         request: ContextRequest,
-    ) -> Result<ContextBundle, ContextError> {
+    ) -> Result<ValidatedContextBundle, ContextError> {
         self.provide_detailed(request)
             .await
             .map_err(ContextDriverFailure::error)
@@ -80,11 +113,9 @@ impl ContextDriver {
     pub(crate) async fn provide_detailed(
         &self,
         mut request: ContextRequest,
-    ) -> Result<ContextBundle, ContextDriverFailure> {
+    ) -> Result<ValidatedContextBundle, ContextDriverFailure> {
         let Some(provider) = self.provider.as_ref() else {
-            return ContextBundle { blocks: Vec::new() }
-                .validate_and_sort(&self.limits)
-                .map_err(ContextDriverFailure::ordinary);
+            return Ok(Self::empty_bundle());
         };
         let cancellation = request.cancellation.clone();
         if cancellation.is_cancelled() {
@@ -111,9 +142,9 @@ impl ContextDriver {
             result = &mut future => result,
         };
         match result {
-            Ok(Ok(bundle)) => bundle
-                .validate_and_sort(&self.limits)
-                .map_err(ContextDriverFailure::ordinary),
+            Ok(Ok(bundle)) => {
+                Self::validate_bundle(bundle, &self.limits).map_err(ContextDriverFailure::ordinary)
+            }
             Ok(Err(error)) => Err(ContextDriverFailure::ordinary(error)),
             Err(_) => Err(ContextDriverFailure::ordinary(ContextError::Internal)),
         }

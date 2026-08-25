@@ -21,7 +21,7 @@ async fn provider_bundle_is_validated_and_sorted_canonically() {
         .unwrap();
     assert_eq!(
         result
-            .blocks
+            .blocks()
             .iter()
             .map(|block| block.source.as_str())
             .collect::<Vec<_>>(),
