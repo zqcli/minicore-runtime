@@ -84,6 +84,36 @@ fn actor_priority_submit_commit_and_settlement_order_are_source_locked() {
     let commands = include_str!("../src/session/actor/commands.rs");
     let compact_commands = compact(commands);
     let runner = include_str!("../src/session/actor/runner.rs");
+    let suspension = runner
+        .split_once("pub(super) fn register_suspension")
+        .map(|(_, source)| source)
+        .unwrap();
+    let suspension_order = [
+        suspension
+            .find("if self.core.closing || self.root_cancel.is_cancelled()")
+            .unwrap(),
+        suspension
+            .find("let Some(active) = self.core.active.as_ref()")
+            .unwrap(),
+        suspension.find("if active.turn_id != turn_id").unwrap(),
+        suspension
+            .find("if active.cancellation.is_cancelled()")
+            .unwrap(),
+        suspension
+            .find("matches!(&self.core.health, SessionHealth::Degraded")
+            .unwrap(),
+        suspension.find("is_next_unresolved_tool").unwrap(),
+        suspension
+            .find("if self.root_cancel.is_cancelled()")
+            .unwrap(),
+        suspension
+            .find(".is_some_and(|active| active.cancellation.is_cancelled())")
+            .unwrap(),
+        suspension
+            .find("active.pending = Some(PendingInteractionState")
+            .unwrap(),
+    ];
+    assert!(suspension_order.windows(2).all(|pair| pair[0] < pair[1]));
     let settlement = include_str!("../src/session/actor/settlement.rs");
     let supervisor = include_str!("../src/session/actor/supervisor.rs");
     for required in [
@@ -93,7 +123,8 @@ fn actor_priority_submit_commit_and_settlement_order_are_source_locked() {
         "state_tx: watch::Sender<SessionState>",
         "events: InternalEventSink",
         "root_cancel: CancellationToken",
-        "active: Option<ActiveTurn>",
+        "core: ActorCoreState",
+        "last_terminal: Option<TurnOutcome>",
     ] {
         assert!(actor.contains(required), "actor misses {required}");
     }
@@ -108,7 +139,7 @@ fn actor_priority_submit_commit_and_settlement_order_are_source_locked() {
         .find(".append_validated(vec![UnsequencedEntry::UserMessage")
         .unwrap();
     let running = compact_commands
-        .find("state.status=SessionStatus::Running")
+        .find("self.install_active(ActiveTurn{")
         .unwrap();
     let reply = compact_commands.find("reply.send(Ok(handle))").unwrap();
     let started = compact_commands.find("SessionEvent::TurnStarted").unwrap();
@@ -134,7 +165,9 @@ fn actor_priority_submit_commit_and_settlement_order_are_source_locked() {
         settlement.matches("append_validated(drafts).await").count(),
         1
     );
-    let state = settlement.find("self.publish_state(state)").unwrap();
+    let state = settlement
+        .find("self.record_terminal(outcome.clone())")
+        .unwrap();
     let complete = settlement
         .find("active.completion.finish(outcome.clone())")
         .unwrap();
@@ -142,6 +175,22 @@ fn actor_priority_submit_commit_and_settlement_order_are_source_locked() {
     assert!(state < complete && complete < event);
     assert!(supervisor.contains("AssertUnwindSafe(actor.run()).catch_unwind()"));
     assert!(supervisor.contains("actor.close_after_panic().await"));
+
+    assert!(actor.contains("fn derived_state(&self) -> SessionState"));
+    assert!(actor.contains("self.conversation.head()"));
+    let production = format!("{actor}\n{run}\n{commands}\n{runner}\n{settlement}\n{supervisor}");
+    for forbidden in [
+        "state_tx.borrow()",
+        "publish_state(state)",
+        "state.status =",
+        "state.health =",
+        "state.active_turn =",
+        "state.pending_interaction =",
+        "state.conversation_seq =",
+        "state.last_terminal =",
+    ] {
+        assert!(!production.contains(forbidden), "actor retains {forbidden}");
+    }
 
     for source in [actor, run, commands, runner, settlement, supervisor] {
         assert!(source.lines().count() < 500);

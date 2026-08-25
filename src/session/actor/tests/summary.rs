@@ -26,10 +26,11 @@ async fn stale_summary_snapshot_is_rejected_before_append_without_latching() {
     assert_eq!(error, RunnerCommitError::Stale);
     assert_eq!(fixture.append_count.load(Ordering::SeqCst), appends);
     assert_eq!(fixture.actor.conversation.head(), head);
-    assert!(matches!(&fixture.actor.health, SessionHealth::Healthy));
+    assert!(matches!(&fixture.actor.core.health, SessionHealth::Healthy));
     assert!(
         fixture
             .actor
+            .core
             .active
             .as_ref()
             .is_some_and(|active| active.commit_failure.is_none())

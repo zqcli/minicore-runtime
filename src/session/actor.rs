@@ -58,10 +58,15 @@ pub(crate) struct SessionActor {
     events: InternalEventSink,
     root_cancel: CancellationToken,
     runner_lifecycle: RunnerLifecycle,
+    core: ActorCoreState,
+}
+
+struct ActorCoreState {
     active: Option<ActiveTurn>,
     health: SessionHealth,
     closing: bool,
     closing_durability_failure: Option<DiagnosticSummary>,
+    last_terminal: Option<TurnOutcome>,
     last_resolved_interaction: Option<InteractionId>,
 }
 
@@ -123,18 +128,19 @@ impl SessionActor {
         instance_id: SessionInstanceId,
         root_cancel: CancellationToken,
     ) -> Result<(Self, ActorReady), Box<ActorBuildFailure>> {
-        let health = SessionHealth::Healthy;
-        let state = initial_state(
-            session_id,
-            instance_id,
-            conversation.head(),
-            conversation.last_terminal().map(|entry| TurnOutcome {
+        let core = ActorCoreState {
+            active: None,
+            health: SessionHealth::Healthy,
+            closing: false,
+            closing_durability_failure: None,
+            last_terminal: conversation.last_terminal().map(|entry| TurnOutcome {
                 turn_id: entry.turn_id,
                 terminal: entry.terminal,
                 usage: entry.usage,
             }),
-            health.clone(),
-        );
+            last_resolved_interaction: None,
+        };
+        let state = derive_state(session_id, instance_id, conversation.head(), &core);
         if state.validate().is_err() {
             return Err(Box::new(ActorBuildFailure { log: conversation }));
         }
@@ -159,11 +165,7 @@ impl SessionActor {
                 events,
                 root_cancel,
                 runner_lifecycle: runner_lifecycle.clone(),
-                active: None,
-                health,
-                closing: false,
-                closing_durability_failure: None,
-                last_resolved_interaction: None,
+                core,
             },
             ActorReady {
                 handle,
@@ -173,17 +175,38 @@ impl SessionActor {
         ))
     }
 
-    fn state(&self) -> SessionState {
-        self.state_tx.borrow().clone()
+    fn derived_state(&self) -> SessionState {
+        derive_state(
+            self.session_id,
+            self.instance_id,
+            self.conversation.head(),
+            &self.core,
+        )
     }
 
-    fn publish_state(&self, state: SessionState) {
+    fn publish_state(&self) {
+        let state = self.derived_state();
         debug_assert!(state.validate().is_ok());
         self.state_tx.send_replace(state);
     }
 
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> SessionState {
+        self.derived_state()
+    }
+
+    fn install_active(&mut self, active: ActiveTurn) {
+        self.core.active = Some(active);
+        self.publish_state();
+    }
+
+    fn record_terminal(&mut self, outcome: TurnOutcome) {
+        self.core.last_terminal = Some(outcome);
+        self.publish_state();
+    }
+
     fn active_turn_id(&self) -> Option<TurnId> {
-        self.active.as_ref().map(|active| active.turn_id)
+        self.core.active.as_ref().map(|active| active.turn_id)
     }
 
     fn diagnostic(
@@ -196,22 +219,39 @@ impl SessionActor {
     }
 }
 
-fn initial_state(
+fn derive_state(
     session_id: SessionId,
     instance_id: SessionInstanceId,
     conversation_seq: ConversationSeq,
-    last_terminal: Option<TurnOutcome>,
-    health: SessionHealth,
+    core: &ActorCoreState,
 ) -> SessionState {
+    let active_turn = core.active.as_ref().map(|active| active.turn_id);
+    let pending_interaction = if core.closing {
+        None
+    } else {
+        core.active
+            .as_ref()
+            .and_then(|active| active.pending.as_ref())
+            .map(|pending| pending.public.clone())
+    };
+    let status = if core.closing {
+        SessionStatus::Closing
+    } else if pending_interaction.is_some() {
+        SessionStatus::WaitingForInput
+    } else if active_turn.is_some() {
+        SessionStatus::Running
+    } else {
+        SessionStatus::Idle
+    };
     SessionState {
         session_id,
         instance_id,
-        status: SessionStatus::Idle,
-        health,
-        active_turn: None,
-        pending_interaction: None,
+        status,
+        health: core.health.clone(),
+        active_turn,
+        pending_interaction,
         conversation_seq,
-        last_terminal,
+        last_terminal: core.last_terminal.clone(),
     }
 }
 

@@ -15,6 +15,7 @@ impl SessionActor {
         loop {
             #[cfg(test)]
             if self
+                .core
                 .active
                 .as_ref()
                 .is_some_and(|active| active.runner.is_some())
@@ -24,7 +25,7 @@ impl SessionActor {
                     panic!("scripted session actor panic with active turn");
                 }
             }
-            if self.closing && self.active.is_none() {
+            if self.core.closing && self.core.active.is_none() {
                 return self.close_log().await;
             }
             let signal = self.next_signal().await;
@@ -32,7 +33,7 @@ impl SessionActor {
                 ActorSignal::RootCancelled => self.begin_shutdown(),
                 ActorSignal::Critical(Some(event)) => self.handle_runner_event(event).await,
                 ActorSignal::Critical(None) => {
-                    if let Some(active) = self.active.as_mut() {
+                    if let Some(active) = self.core.active.as_mut() {
                         active.critical_open = false;
                     }
                 }
@@ -41,7 +42,7 @@ impl SessionActor {
                 ActorSignal::Command(None) => self.begin_shutdown(),
                 ActorSignal::Progress(Some(progress)) => self.handle_progress(progress),
                 ActorSignal::Progress(None) => {
-                    if let Some(active) = self.active.as_mut() {
+                    if let Some(active) = self.core.active.as_mut() {
                         active.progress_open = false;
                     }
                 }
@@ -50,8 +51,8 @@ impl SessionActor {
     }
 
     pub(super) async fn next_signal(&mut self) -> ActorSignal {
-        let root_open = !self.closing;
-        if let Some(active) = self.active.as_mut() {
+        let root_open = !self.core.closing;
+        if let Some(active) = self.core.active.as_mut() {
             let root = self.root_cancel.clone();
             let commands = &mut self.commands;
             tokio::select! {
@@ -76,22 +77,20 @@ impl SessionActor {
     }
 
     pub(super) fn begin_shutdown(&mut self) {
-        if self.closing {
+        if self.core.closing {
             return;
         }
-        self.closing = true;
-        if self.closing_durability_failure.is_none() {
-            self.closing_durability_failure = self
+        self.core.closing = true;
+        if self.core.closing_durability_failure.is_none() {
+            self.core.closing_durability_failure = self
+                .core
                 .active
                 .as_ref()
                 .and_then(|active| active.commit_failure.as_ref())
                 .map(|failure| failure.diagnostic.clone());
         }
-        let mut state = self.state();
-        state.status = SessionStatus::Closing;
-        state.pending_interaction = None;
-        self.publish_state(state);
-        if let Some(active) = self.active.as_mut() {
+        self.publish_state();
+        if let Some(active) = self.core.active.as_mut() {
             active.cancellation.cancel();
             if let Some(pending) = active.pending.take() {
                 let _ = pending.resume.send(Err(SuspensionError::Cancelled));
@@ -101,7 +100,7 @@ impl SessionActor {
 
     pub(super) async fn close_log(&mut self) -> SessionActorExit {
         let close_error = self.conversation.close().await.err();
-        if self.closing_durability_failure.take().is_some() {
+        if self.core.closing_durability_failure.take().is_some() {
             return SessionActorExit::DurabilityFailed {
                 close_error: close_error.map(Box::new),
             };

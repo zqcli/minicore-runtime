@@ -7,12 +7,20 @@ use crate::error::SessionLogErrorKind;
 
 impl SessionActor {
     pub(super) async fn settle_active(&mut self, override_outcome: Option<RunnerOutcome>) {
-        let Some(mut active) = self.active.take() else {
+        let Some(turn_id) = self.core.active.as_ref().map(|active| active.turn_id) else {
             return;
         };
-        let cancellation_won = self.closing || active.cancellation.is_cancelled();
-        active.cancellation.cancel();
-        if let Some(pending) = active.pending.take() {
+        let cancellation_won = self.core.closing
+            || self
+                .core
+                .active
+                .as_ref()
+                .is_some_and(|active| active.cancellation.is_cancelled());
+        let pending = self.core.active.as_mut().and_then(|active| {
+            active.cancellation.cancel();
+            active.pending.take()
+        });
+        if let Some(pending) = pending {
             let error = if cancellation_won {
                 SuspensionError::Cancelled
             } else {
@@ -20,20 +28,30 @@ impl SessionActor {
             };
             let _ = pending.resume.send(Err(error));
         }
-        if let Some(failure) = active.commit_failure.take() {
-            self.finish_active_commit_failure(active, failure);
+        if let Some(failure) = self
+            .core
+            .active
+            .as_mut()
+            .and_then(|active| active.commit_failure.take())
+        {
+            if let Some(active) = self.core.active.take() {
+                self.finish_active_commit_failure(active, failure);
+            }
             return;
         }
+        let stored_outcome = self
+            .core
+            .active
+            .as_mut()
+            .and_then(|active| active.outcome.take());
         let outcome = override_outcome
-            .or(active.outcome.take())
-            .unwrap_or_else(|| {
-                internal_outcome(self.conversation.confirmed_turn_usage(active.turn_id))
-            });
+            .or(stored_outcome)
+            .unwrap_or_else(|| internal_outcome(self.conversation.confirmed_turn_usage(turn_id)));
         let usage = outcome.usage();
-        let terminal = terminal_for(&outcome, self.closing);
-        let Some(drafts) =
-            self.conversation
-                .settlement_drafts(active.turn_id, terminal.clone(), usage)
+        let terminal = terminal_for(&outcome, self.core.closing);
+        let Some(drafts) = self
+            .conversation
+            .settlement_drafts(turn_id, terminal.clone(), usage)
         else {
             let diagnostic = Self::diagnostic(
                 DiagnosticCode::RuntimeTerminated,
@@ -41,8 +59,10 @@ impl SessionActor {
                 "turn settlement state is invalid",
                 false,
             );
-            active.completion.runtime_terminated(diagnostic.clone());
-            self.finish_failed_state(diagnostic);
+            if let Some(active) = self.core.active.take() {
+                self.finish_failed_state(diagnostic.clone());
+                active.completion.runtime_terminated(diagnostic);
+            }
             return;
         };
         match self.conversation.append_validated(drafts).await {
@@ -58,82 +78,67 @@ impl SessionActor {
                         "turn settlement terminal is missing",
                         false,
                     );
-                    active.completion.runtime_terminated(diagnostic.clone());
-                    self.finish_failed_state(diagnostic);
+                    if let Some(active) = self.core.active.take() {
+                        self.finish_failed_state(diagnostic.clone());
+                        active.completion.runtime_terminated(diagnostic);
+                    }
+                    return;
+                };
+                let Some(active) = self.core.active.take() else {
                     return;
                 };
                 let outcome = TurnOutcome {
-                    turn_id: active.turn_id,
+                    turn_id,
                     terminal: terminal_entry.terminal,
                     usage: terminal_entry.usage,
                 };
-                let mut state = self.state();
-                state.status = if self.closing {
-                    SessionStatus::Closing
-                } else {
-                    SessionStatus::Idle
-                };
-                state.health = self.health.clone();
-                state.active_turn = None;
-                state.pending_interaction = None;
-                state.conversation_seq = batch.head;
-                state.last_terminal = Some(outcome.clone());
-                self.publish_state(state);
+                self.record_terminal(outcome.clone());
                 active.completion.finish(outcome.clone());
-                let _ = self.events.try_emit(SessionEvent::TurnFinished {
-                    turn_id: active.turn_id,
-                    outcome,
-                });
+                let _ = self
+                    .events
+                    .try_emit(SessionEvent::TurnFinished { turn_id, outcome });
             }
-            Err(error) => self.settlement_failed(active, error),
+            Err(error) => {
+                if let Some(active) = self.core.active.take() {
+                    self.settlement_failed(active, error);
+                }
+            }
         }
     }
 
     fn settlement_failed(&mut self, active: ActiveTurn, error: ConversationCommitError) {
         let diagnostic = commit_diagnostic(&error);
-        if self.closing && self.closing_durability_failure.is_none() {
-            self.closing_durability_failure = Some(diagnostic.clone());
+        if self.core.closing && self.core.closing_durability_failure.is_none() {
+            self.core.closing_durability_failure = Some(diagnostic.clone());
         }
-        let health_changed = matches!(&self.health, SessionHealth::Healthy);
-        self.health = SessionHealth::Degraded {
+        let health_changed = matches!(&self.core.health, SessionHealth::Healthy);
+        self.core.health = SessionHealth::Degraded {
             diagnostic: diagnostic.clone(),
         };
-        let mut state = self.state();
-        state.status = if self.closing {
-            SessionStatus::Closing
-        } else {
-            SessionStatus::Idle
-        };
-        state.health = self.health.clone();
-        state.active_turn = None;
-        state.pending_interaction = None;
-        state.conversation_seq = self.conversation.head();
-        self.publish_state(state);
+        self.publish_state();
+        if health_changed {
+            let _ = self.events.try_emit(SessionEvent::HealthChanged {
+                health: self.core.health.clone(),
+            });
+        }
         if error.kind() == ConversationCommitErrorKind::DurabilityUnknown {
             active.completion.durability_unknown(diagnostic.clone());
         } else {
             active.completion.durability_unavailable(diagnostic.clone());
         }
-        if health_changed {
-            let _ = self.events.try_emit(SessionEvent::HealthChanged {
-                health: self.health.clone(),
-            });
-        }
     }
 
     pub(super) fn mark_degraded(&mut self, diagnostic: DiagnosticSummary) {
-        let health_changed = matches!(&self.health, SessionHealth::Healthy);
+        let health_changed = matches!(&self.core.health, SessionHealth::Healthy);
         if !health_changed {
             return;
         }
-        self.health = SessionHealth::Degraded {
+        self.core.health = SessionHealth::Degraded {
             diagnostic: diagnostic.clone(),
         };
-        let mut state = self.state();
-        state.health = self.health.clone();
-        self.publish_state(state);
+        self.publish_state();
         let _ = self.events.try_emit(SessionEvent::HealthChanged {
-            health: self.health.clone(),
+            health: self.core.health.clone(),
         });
     }
 
@@ -142,13 +147,13 @@ impl SessionActor {
         diagnostic: DiagnosticSummary,
         unknown: bool,
     ) {
-        let health_changed = matches!(&self.health, SessionHealth::Healthy);
+        let health_changed = matches!(&self.core.health, SessionHealth::Healthy);
         if health_changed {
-            self.health = SessionHealth::Degraded {
+            self.core.health = SessionHealth::Degraded {
                 diagnostic: diagnostic.clone(),
             };
         }
-        if let Some(active) = self.active.as_mut() {
+        if let Some(active) = self.core.active.as_mut() {
             active.cancellation.cancel();
             if let Some(pending) = active.pending.take() {
                 let _ = pending.resume.send(Err(SuspensionError::Cancelled));
@@ -160,38 +165,22 @@ impl SessionActor {
                 });
             }
         }
-        if self.closing && self.closing_durability_failure.is_none() {
-            self.closing_durability_failure = Some(diagnostic.clone());
+        if self.core.closing && self.core.closing_durability_failure.is_none() {
+            self.core.closing_durability_failure = Some(diagnostic.clone());
         }
-        let mut state = self.state();
-        state.health = self.health.clone();
-        if state.status == SessionStatus::WaitingForInput {
-            state.status = SessionStatus::Running;
-            state.pending_interaction = None;
-        }
-        self.publish_state(state);
+        self.publish_state();
         if health_changed {
             let _ = self.events.try_emit(SessionEvent::HealthChanged {
-                health: self.health.clone(),
+                health: self.core.health.clone(),
             });
         }
     }
 
     fn finish_active_commit_failure(&mut self, active: ActiveTurn, failure: ActiveCommitFailure) {
-        if self.closing && self.closing_durability_failure.is_none() {
-            self.closing_durability_failure = Some(failure.diagnostic.clone());
+        if self.core.closing && self.core.closing_durability_failure.is_none() {
+            self.core.closing_durability_failure = Some(failure.diagnostic.clone());
         }
-        let mut state = self.state();
-        state.status = if self.closing {
-            SessionStatus::Closing
-        } else {
-            SessionStatus::Idle
-        };
-        state.health = self.health.clone();
-        state.active_turn = None;
-        state.pending_interaction = None;
-        state.conversation_seq = self.conversation.head();
-        self.publish_state(state);
+        self.publish_state();
         if failure.unknown {
             active.completion.durability_unknown(failure.diagnostic);
         } else {
@@ -200,21 +189,12 @@ impl SessionActor {
     }
 
     fn finish_failed_state(&mut self, diagnostic: DiagnosticSummary) {
-        self.health = SessionHealth::Degraded {
+        self.core.health = SessionHealth::Degraded {
             diagnostic: diagnostic.clone(),
         };
-        let mut state = self.state();
-        state.status = if self.closing {
-            SessionStatus::Closing
-        } else {
-            SessionStatus::Idle
-        };
-        state.health = self.health.clone();
-        state.active_turn = None;
-        state.pending_interaction = None;
-        self.publish_state(state);
+        self.publish_state();
         let _ = self.events.try_emit(SessionEvent::HealthChanged {
-            health: self.health.clone(),
+            health: self.core.health.clone(),
         });
     }
 }
