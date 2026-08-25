@@ -102,6 +102,7 @@ pub(crate) struct ConversationValidator {
     active_turn: Option<TurnId>,
     active_phase: Option<ActiveTurnPhase>,
     pending_tools: Vec<PendingToolCall>,
+    pending_index: usize,
     seen_tool_call_ids: BTreeSet<ToolCallId>,
     terminal_boundaries: BTreeSet<ConversationSeq>,
     last_summary_through: Option<ConversationSeq>,
@@ -124,6 +125,7 @@ impl ConversationValidator {
             active_turn: None,
             active_phase: None,
             pending_tools: Vec::new(),
+            pending_index: 0,
             seen_tool_call_ids: BTreeSet::new(),
             terminal_boundaries: BTreeSet::new(),
             last_summary_through: None,
@@ -158,7 +160,7 @@ impl ConversationValidator {
     }
 
     pub(crate) fn unresolved_tool_calls(&self) -> &[PendingToolCall] {
-        &self.pending_tools
+        &self.pending_tools[self.pending_index..]
     }
 
     pub(crate) fn terminal_boundaries(&self) -> &BTreeSet<ConversationSeq> {
@@ -221,7 +223,7 @@ impl ConversationValidator {
         if self.active_phase == Some(ActiveTurnPhase::FinalAssistant) {
             return Err(ConversationValidationError::InvalidPhase);
         }
-        if !self.pending_tools.is_empty() {
+        if !self.unresolved_tool_calls().is_empty() {
             return Err(ConversationValidationError::IncompleteToolExchange);
         }
         if self.active_phase != Some(ActiveTurnPhase::AwaitingAssistant) {
@@ -286,6 +288,7 @@ impl ConversationValidator {
             });
         }
         self.pending_tools = pending;
+        self.pending_index = 0;
         self.active_phase = Some(if entry.tool_calls.is_empty() {
             ActiveTurnPhase::FinalAssistant
         } else {
@@ -305,7 +308,7 @@ impl ConversationValidator {
             return Err(ConversationValidationError::TurnMismatch);
         }
         let expected = self
-            .pending_tools
+            .unresolved_tool_calls()
             .first()
             .ok_or(ConversationValidationError::ToolResultWithoutPending)?;
         if self.active_phase != Some(ActiveTurnPhase::AwaitingToolResults) {
@@ -317,8 +320,10 @@ impl ConversationValidator {
         if entry.content.byte_len() > self.limits.max_tool_output_bytes {
             return Err(ConversationValidationError::ToolOutputTooLarge);
         }
-        self.pending_tools.remove(0);
-        if self.pending_tools.is_empty() {
+        self.pending_index += 1;
+        if self.pending_index == self.pending_tools.len() {
+            self.pending_tools.clear();
+            self.pending_index = 0;
             self.active_phase = Some(ActiveTurnPhase::AwaitingAssistant);
         }
         Ok(())
@@ -334,7 +339,7 @@ impl ConversationValidator {
         if entry.turn_id != active_turn {
             return Err(ConversationValidationError::TerminalTurnMismatch);
         }
-        if !self.pending_tools.is_empty() {
+        if !self.unresolved_tool_calls().is_empty() {
             return Err(ConversationValidationError::TerminalWithPendingTools);
         }
         if matches!(&entry.terminal, super::entry::TurnTerminal::Completed)
