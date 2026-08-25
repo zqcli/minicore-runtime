@@ -92,7 +92,7 @@ Validation environment:
 - remote Linux checkout: `/root/minicore-runtime-v03`;
 - stable `rustc 1.98.0`, `cargo 1.98.0`, and `clippy 1.98.0`;
 - full `scripts/check.sh` pass;
-- 291 root library tests plus passing cleaned integration/provider-gate suites;
+- 294 root library tests plus passing cleaned integration/provider-gate suites;
 - MSRV `rustc 1.85.0` and `cargo 1.85.0` with `scripts/check-msrv.sh` passing;
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked` passing;
 - authoritative architecture scanner passing with `production_files=144`;
@@ -121,8 +121,8 @@ The reviewed comparison uses baseline commit `2fd7104`. “cfg(test)-excluded pr
 
 | Metric | Baseline | Current | Change |
 | --- | ---: | ---: | ---: |
-| cfg(test)-excluded production LOC | 15,483 | 14,122 | -1,361 |
-| raw `src/**/*.rs` lines | 48,055 | 31,317 | -16,738 |
+| cfg(test)-excluded production LOC | 15,483 | 14,097 | -1,386 |
+| raw `src/**/*.rs` lines | 48,055 | 31,642 | -16,413 |
 | `src` Rust files | 174 | 144 | -30 |
 | files with production content | 83 | 78 | -5 |
 
@@ -130,7 +130,9 @@ The authoritative architecture gate separately prints `production_files=144`, me
 
 **Approved exception — IC-05:** the ValidationCursor/ValidationPlan design measured `+202` cfg(test)-excluded production LOC against `HEAD=7383a6a` and was rejected because durable success would still clone the complete validator sets and `PromptProjection`. The preceding IC-06 slice delivered only `pending_index`; IC-05 remains incomplete and awaits benchmark evidence or an independent design before acceptance.
 
-Relative to IC-07 baseline `HEAD=6d37803`, this stage adds 17 authoritative production lines, removes 21 raw Rust lines, leaves the 291 root library tests unchanged, and leaves all file counts unchanged. `ContextDriver` now returns the crate-private `ValidatedContextBundle`; it is the only production seam that validates and canonicalizes provider output, while the public `ContextBundle` and external provider boundary remain unchanged.
+Relative to IC-07A baseline `HEAD=6d37803`, the context slice added 17 authoritative production lines, removed 21 raw Rust lines, and left all file counts unchanged. `ContextDriver` now returns the crate-private `ValidatedContextBundle`; it is the only production seam that validates and canonicalizes provider output, while the public `ContextBundle` and external provider boundary remain unchanged.
+
+Relative to IC-07B baseline `HEAD=b8e0003`, this PromptPlan slice removes 25 authoritative production lines, adds 325 raw Rust lines, increases root library tests from 291 to 294, and leaves all file counts unchanged. `PromptBuilder::plan` performs conversation projection, static-message composition, fixed serialization, and context-budget calculation once per head; `PromptPlan::finish` inserts checked context and performs the final request/window check without reprojection. Each model round permits one initial proactive attempt and, after a successful head advance, one changed-head replan with no second proactive attempt. Forced ContextOverflow recovery likewise replans once and retries Context without proactive compaction.
 
 The gate also enforces canonical production paths, direct dependencies, public Port declarations, root exports, source-size limits, forbidden authority, and an all-singleton module DAG.
 

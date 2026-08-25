@@ -45,16 +45,15 @@ fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
         );
     }
     for required in [
-        "PromptBuilder::remaining_context_budget_for(fixed,",
         "ContextRequest{",
-        "context.environment.prompt.build(",
+        "context.environment.prompt.plan(",
+        "plan.finish(&validated_context)",
         ".provide_detailed(ContextRequest{",
         "letvalidated_context=matchcontext.environment.context.provide_detailed(ContextRequest{",
         "letrun=context.environment.model.run_detailed(",
         "letrun=context.environment.tools.run(",
         "prepare_model_request(",
         ".run_detailed(",
-        "estimated_fixed_input_tokens(",
         "context.conversation=conversation;",
         "ToolInvocation::new(",
         "try_send(event)",

@@ -84,9 +84,13 @@ fn tool_count_name_description_and_schema_semantic_boundaries_are_checked() {
 fn built_request_uses_exact_frozen_tools_reasoning_and_limits() {
     let builder = builder("", &["alpha", "beta"]);
     let limits = ModelLimits::new(Some(4096), Some(64)).unwrap();
-    let request = builder
-        .build(&ConversationView::empty(), &empty_context(), limits)
-        .unwrap();
+    let request = finish(
+        &builder,
+        &ConversationView::empty(),
+        &empty_context(),
+        limits,
+    )
+    .unwrap();
     assert_eq!(request.tools(), &[tool_spec("alpha"), tool_spec("beta")]);
     assert_eq!(request.reasoning(), ReasoningPreference::High);
     assert_eq!(request.limits(), &limits);

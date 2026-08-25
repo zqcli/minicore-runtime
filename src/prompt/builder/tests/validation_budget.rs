@@ -23,7 +23,8 @@ fn malformed_view_head_sequence_and_incomplete_tool_exchange_are_rejected() {
     let builder = builder("", &["search"]);
     let empty_context = empty_context();
     assert_eq!(
-        builder.build(
+        finish(
+            &builder,
             &view_with_head(2, vec![user(1, 1, "question")]),
             &empty_context,
             ModelLimits::default(),
@@ -31,7 +32,8 @@ fn malformed_view_head_sequence_and_incomplete_tool_exchange_are_rejected() {
         Err(PromptError::InvalidConversation)
     );
     assert_eq!(
-        builder.build(
+        finish(
+            &builder,
             &view_with_head(1, vec![user(1, 1, "first"), user(1, 2, "duplicate")],),
             &empty_context,
             ModelLimits::default(),
@@ -43,7 +45,12 @@ fn malformed_view_head_sequence_and_incomplete_tool_exchange_are_rejected() {
         assistant(2, 1, None, None, vec![call(0, 1, "search")]),
     ]);
     assert_eq!(
-        builder.build(&incomplete, &empty_context, ModelLimits::default()),
+        finish(
+            &builder,
+            &incomplete,
+            &empty_context,
+            ModelLimits::default(),
+        ),
         Err(PromptError::InvalidConversation)
     );
 }
@@ -59,7 +66,7 @@ fn context_block_formatting_failure_is_reported() {
         content: BoundedText::new("bad\0context").unwrap(),
     }]);
     assert_eq!(
-        builder.build(&conversation, &malformed, ModelLimits::default()),
+        finish(&builder, &conversation, &malformed, ModelLimits::default(),),
         Err(PromptError::InvalidContext)
     );
 }
@@ -77,11 +84,7 @@ fn assistant_text_and_reasoning_follow_semantic_round_limits() {
         user(1, 1, "question"),
         assistant(2, 1, Some("abc"), Some("abc"), Vec::new()),
     ]);
-    assert!(
-        builder
-            .build(&exact, &context, ModelLimits::default())
-            .is_ok()
-    );
+    assert!(finish(&builder, &exact, &context, ModelLimits::default()).is_ok());
     for conversation in [
         view(vec![
             user(1, 1, "question"),
@@ -93,7 +96,7 @@ fn assistant_text_and_reasoning_follow_semantic_round_limits() {
         ]),
     ] {
         assert_eq!(
-            builder.build(&conversation, &context, ModelLimits::default()),
+            finish(&builder, &conversation, &context, ModelLimits::default()),
             Err(PromptError::InvalidConversation)
         );
     }
@@ -109,7 +112,12 @@ fn assistant_text_and_reasoning_follow_semantic_round_limits() {
         oversized_summary_entry,
     ]);
     assert_eq!(
-        builder.build(&oversized_summary, &context, ModelLimits::default()),
+        finish(
+            &builder,
+            &oversized_summary,
+            &context,
+            ModelLimits::default(),
+        ),
         Err(PromptError::InvalidConversation)
     );
 }
@@ -118,67 +126,83 @@ fn assistant_text_and_reasoning_follow_semantic_round_limits() {
 fn exact_request_serialization_drives_budget_and_includes_reasoning_and_limits() {
     let builder = builder("session", &["search"]);
     let conversation = view(vec![user(1, 1, "question")]);
-    let context = empty_context();
+    let context = checked_context(vec![context_block(
+        "test-context",
+        ContextSlot::TurnContext,
+        0,
+        "context",
+    )]);
     let output = 7_u32;
-    let mut exact_window = 512_u32;
-    let mut independently_built = None;
-    for _ in 0..16 {
+    let mut fixed_window = 512_u32;
+    let independently_built = loop {
+        let limits = ModelLimits::new(Some(fixed_window), Some(output)).unwrap();
+        let expected = expected_request(limits, false);
+        let derived = u32::try_from(direct_request_tokens(&expected) + u64::from(output)).unwrap();
+        if derived == fixed_window {
+            break expected;
+        }
+        fixed_window = derived;
+    };
+    let fixed_limits = *independently_built.limits();
+    let fixed_direct = direct_request_tokens(&independently_built);
+    let fixed_plan = builder.plan(&conversation, fixed_limits).unwrap();
+    assert_eq!(fixed_plan.fixed_input_tokens(), fixed_direct);
+    assert_eq!(fixed_plan.remaining_context_budget(), Ok(0));
+
+    let mut exact_window = fixed_window;
+    let expected_final = loop {
         let limits = ModelLimits::new(Some(exact_window), Some(output)).unwrap();
-        let request = ModelRequest::new(
-            builder.compose_messages(&conversation, &context).unwrap(),
-            builder.tools.to_vec(),
-            limits,
-            builder.spec.reasoning,
-        )
-        .unwrap();
-        let derived = u32::try_from(direct_request_tokens(&request) + u64::from(output)).unwrap();
+        let expected = expected_request(limits, true);
+        let derived = u32::try_from(direct_request_tokens(&expected) + u64::from(output)).unwrap();
         if derived == exact_window {
-            independently_built = Some(request);
-            break;
+            break expected;
         }
         exact_window = derived;
-    }
-    let independently_built = independently_built.unwrap();
+    };
     let exact = ModelLimits::new(Some(exact_window), Some(output)).unwrap();
-    let direct = direct_request_tokens(&independently_built);
-    assert_eq!(direct + u64::from(output), u64::from(exact_window));
+    assert_eq!(expected_final, expected_request(exact, true));
+    let expected_fixed = expected_request(exact, false);
+    let direct = direct_request_tokens(&expected_fixed);
+    let plan = builder.plan(&conversation, exact).unwrap();
+    assert_eq!(plan.fixed_input_tokens(), direct);
     assert_eq!(
-        builder
-            .remaining_context_budget(&conversation, exact)
-            .unwrap(),
-        0
+        plan.remaining_context_budget(),
+        Ok(u64::from(exact_window) - u64::from(output) - direct)
     );
-    let returned = builder.build(&conversation, &context, exact).unwrap();
-    assert_eq!(returned, independently_built);
-    assert_eq!(estimate_request(&returned).unwrap(), direct);
+    let returned = plan.finish(&context).unwrap();
+    assert_eq!(returned, expected_final);
     assert_eq!(
-        direct,
+        direct_request_tokens(&returned) + u64::from(output),
+        u64::from(exact_window)
+    );
+    assert_eq!(
+        estimate_request(&returned).unwrap(),
         u64::try_from(serde_json::to_vec(&returned).unwrap().len().div_ceil(4)).unwrap()
     );
+    assert_eq!(direct, direct_request_tokens(&expected_fixed));
 
     let below = ModelLimits::new(Some(exact_window - 1), Some(output)).unwrap();
-    let below_request = ModelRequest::new(
-        builder.compose_messages(&conversation, &context).unwrap(),
-        builder.tools.to_vec(),
-        below,
-        builder.spec.reasoning,
-    )
-    .unwrap();
+    let below_request = expected_request(below, true);
     assert!(
         direct_request_tokens(&below_request) + u64::from(output) > u64::from(exact_window - 1)
     );
-    assert_eq!(
-        builder.remaining_context_budget(&conversation, below),
-        Err(PromptError::ContextOverflow)
+    assert!(
+        builder
+            .plan(&conversation, below)
+            .unwrap()
+            .remaining_context_budget()
+            .is_ok()
     );
     assert_eq!(
-        builder.build(&conversation, &context, below),
+        finish(&builder, &conversation, &context, below),
         Err(PromptError::ContextOverflow)
     );
     let unknown = ModelLimits::new(None, Some(output)).unwrap();
     assert_eq!(
         builder
-            .remaining_context_budget(&conversation, unknown)
+            .plan(&conversation, unknown)
+            .unwrap()
+            .remaining_context_budget()
             .unwrap(),
         u64::MAX
     );
@@ -213,6 +237,29 @@ fn exact_request_serialization_drives_budget_and_includes_reasoning_and_limits()
         remaining_budget(1, 1, ModelLimits::new(Some(1), Some(1)).unwrap()),
         Err(PromptError::ContextOverflow)
     );
+}
+
+fn expected_request(limits: ModelLimits, include_context: bool) -> ModelRequest {
+    let mut messages = vec![
+        ModelMessage::system(KERNEL_INVARIANT).unwrap(),
+        ModelMessage::system("session").unwrap(),
+    ];
+    if include_context {
+        messages.push(
+            ModelMessage::system(
+                "[minicore-context slot=turn_context source=test-context]\ncontext",
+            )
+            .unwrap(),
+        );
+    }
+    messages.push(ModelMessage::user("question").unwrap());
+    ModelRequest::new(
+        messages,
+        vec![tool_spec("search")],
+        limits,
+        ReasoningPreference::High,
+    )
+    .unwrap()
 }
 
 fn direct_request_tokens(request: &ModelRequest) -> u64 {

@@ -1,8 +1,6 @@
 use super::compaction_support::*;
 use super::*;
-use crate::agent::runner::compaction::{
-    CompactionAttempt, CompactionState, FixedInputEstimate, proactive,
-};
+use crate::agent::runner::compaction::{CompactionAttempt, CompactionState, proactive};
 use crate::agent::turn_context::TurnRunnerContext;
 use crate::compaction::CompactionError;
 
@@ -36,30 +34,30 @@ async fn proactive_trigger_equality_and_same_head_suppression_are_exact() {
     let bindings = bindings_with_compaction(model, None, Vec::new(), None, Arc::clone(&strategy));
     let (request, _critical_rx, _progress_rx) = runner_request(spec, 4, bindings, conversation);
     let mut context = TurnRunnerContext::from_request(request);
-    let estimate = context
+    let plan = context
         .environment
         .prompt
-        .estimated_fixed_input_tokens(&context.conversation, context.environment.model_limits)
+        .plan(&context.conversation, context.environment.model_limits)
         .unwrap();
+    let estimate = plan.fixed_input_tokens();
     assert!(estimate > 1);
     let mut state = CompactionState::default();
-    let mut fixed = FixedInputEstimate::default();
 
     context.set_compaction_trigger_tokens(estimate.checked_add(1).unwrap());
     assert!(matches!(
-        proactive(&mut context, Usage::default(), &mut state, &mut fixed).await,
+        proactive(&mut context, Usage::default(), &mut state, &plan).await,
         CompactionAttempt::Skipped
     ));
     assert_eq!(strategy.calls(), 0);
 
     context.set_compaction_trigger_tokens(estimate);
     assert!(matches!(
-        proactive(&mut context, Usage::default(), &mut state, &mut fixed).await,
+        proactive(&mut context, Usage::default(), &mut state, &plan).await,
         CompactionAttempt::Skipped
     ));
     assert_eq!(strategy.calls(), 1);
     assert!(matches!(
-        proactive(&mut context, Usage::default(), &mut state, &mut fixed).await,
+        proactive(&mut context, Usage::default(), &mut state, &plan).await,
         CompactionAttempt::Skipped
     ));
     assert_eq!(strategy.calls(), 1);
@@ -90,6 +88,7 @@ async fn proactive_compaction_commits_before_context_and_model_use_the_new_view(
     );
     let (request, mut critical_rx, _progress_rx) =
         runner_request(spec.clone(), 4, bindings, initial.clone());
+    let environment = Arc::clone(&request.environment);
     let task = tokio::spawn(run_turn(request));
 
     let conversation = match critical_rx.recv().await.unwrap() {
@@ -111,6 +110,7 @@ async fn proactive_compaction_commits_before_context_and_model_use_the_new_view(
     };
     let outcome = complete_final_assistant(&mut critical_rx, &conversation, &spec, task).await;
     assert!(matches!(outcome, RunnerOutcome::Completed { .. }));
+    assert_eq!(environment.prompt.projection_calls(), 2);
 
     assert_eq!(strategy.calls(), 1);
     assert_eq!(
@@ -130,6 +130,71 @@ async fn proactive_compaction_commits_before_context_and_model_use_the_new_view(
     assert!(serialized.contains("summary of prior turn"));
     assert!(serialized.contains("current question"));
     assert!(!serialized.contains("old private history"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn proactive_compaction_is_once_per_model_round_across_two_valid_boundaries() {
+    let model = ScriptModel::new(
+        4_096,
+        vec![ModelBehavior::Events(final_events(
+            "answer",
+            Usage::default(),
+        ))],
+    );
+    let context = ScriptContext::new(vec![Ok(ContextBundle { blocks: Vec::new() })]);
+    let strategy = ScriptCompaction::new(vec![
+        CompactionBehavior::Proposal(proposal(3, "first summary")),
+        CompactionBehavior::Proposal(proposal(6, "second valid summary")),
+    ]);
+    let spec = enabled_spec(&[], 4, 2, 1);
+    let initial = active_conversation_with_two_completed_boundaries(&spec, 4);
+    let bindings = bindings_with_compaction(
+        Arc::clone(&model),
+        Some(Arc::clone(&context)),
+        Vec::new(),
+        None,
+        Arc::clone(&strategy),
+    );
+    let (request, mut critical_rx, _progress_rx) =
+        runner_request(spec.clone(), 4, bindings, initial.clone());
+    let environment = Arc::clone(&request.environment);
+    let task = tokio::spawn(run_turn(request));
+
+    let conversation = match critical_rx.recv().await.unwrap() {
+        RunnerEvent::CommitSummary {
+            snapshot_head,
+            draft,
+            reply,
+        } => {
+            assert_eq!(snapshot_head, ConversationSeq::new(7));
+            assert_eq!(draft.through, ConversationSeq::new(3));
+            assert!(context.requests().is_empty());
+            assert!(model.requests().is_empty());
+            let acknowledgement = ack_summary(&initial, snapshot_head, &draft, &spec).unwrap();
+            let conversation = acknowledgement.conversation.clone();
+            reply.send(Ok(acknowledgement)).unwrap();
+            conversation
+        }
+        event => panic!("unexpected event: {event:?}"),
+    };
+    let outcome = complete_final_assistant(&mut critical_rx, &conversation, &spec, task).await;
+    assert!(matches!(outcome, RunnerOutcome::Completed { .. }));
+
+    assert_eq!(strategy.calls(), 1);
+    let requests = strategy.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].candidate.head(), ConversationSeq::new(7));
+    assert_eq!(
+        requests[0].candidate.completed_boundaries(),
+        &[ConversationSeq::new(3), ConversationSeq::new(6)]
+    );
+    assert_eq!(context.requests().len(), 1);
+    assert_eq!(
+        context.requests()[0].conversation.head(),
+        ConversationSeq::new(8)
+    );
+    assert_eq!(model.requests().len(), 1);
+    assert_eq!(environment.prompt.projection_calls(), 2);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -248,6 +313,83 @@ async fn forced_final_build_overflow_commits_then_retries_the_same_model_round()
         ConversationSeq::new(5)
     );
     assert_eq!(model.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn forced_compaction_does_not_retry_proactive_after_the_head_changes() {
+    let model = ScriptModel::new(
+        1_000,
+        vec![ModelBehavior::Events(final_events(
+            "answer",
+            Usage::default(),
+        ))],
+    );
+    let oversized = || ContextBundle {
+        blocks: vec![ContextBlock {
+            source: "forced".parse().unwrap(),
+            slot: ContextSlot::TurnContext,
+            priority: 0,
+            content: BoundedText::new("x".repeat(8_000)).unwrap(),
+        }],
+    };
+    let context = ScriptContext::new(vec![
+        Ok(oversized()),
+        Ok(ContextBundle { blocks: Vec::new() }),
+    ]);
+    let large_summary = "s".repeat(2_048);
+    let strategy = ScriptCompaction::new(vec![
+        CompactionBehavior::Proposal(proposal(3, &large_summary)),
+        CompactionBehavior::Proposal(proposal(6, "second valid summary")),
+    ]);
+    let spec = enabled_spec(&[], 4, 512, 100);
+    let initial = active_conversation_with_two_completed_boundaries(&spec, 4);
+    let bindings = bindings_with_compaction(
+        Arc::clone(&model),
+        Some(Arc::clone(&context)),
+        Vec::new(),
+        None,
+        Arc::clone(&strategy),
+    );
+    let (request, mut critical_rx, _progress_rx) =
+        runner_request(spec.clone(), 4, bindings, initial.clone());
+    let environment = Arc::clone(&request.environment);
+    let task = tokio::spawn(run_turn(request));
+
+    let conversation = match critical_rx.recv().await.unwrap() {
+        RunnerEvent::CommitSummary {
+            snapshot_head,
+            draft,
+            reply,
+        } => {
+            assert_eq!(snapshot_head, ConversationSeq::new(7));
+            assert_eq!(draft.through, ConversationSeq::new(3));
+            let acknowledgement = ack_summary(&initial, snapshot_head, &draft, &spec).unwrap();
+            let conversation = acknowledgement.conversation.clone();
+            reply.send(Ok(acknowledgement)).unwrap();
+            conversation
+        }
+        event => panic!("unexpected event: {event:?}"),
+    };
+    let outcome = complete_final_assistant(&mut critical_rx, &conversation, &spec, task).await;
+    assert!(matches!(outcome, RunnerOutcome::Completed { .. }));
+
+    assert_eq!(strategy.calls(), 1);
+    let requests = strategy.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].candidate.head(), ConversationSeq::new(7));
+    assert_eq!(
+        requests[0].candidate.completed_boundaries(),
+        &[ConversationSeq::new(3), ConversationSeq::new(6)]
+    );
+    assert_eq!(context.requests().len(), 2);
+    assert_eq!(context.requests()[0].model_round, 0);
+    assert_eq!(context.requests()[1].model_round, 0);
+    assert_eq!(
+        context.requests()[1].conversation.head(),
+        ConversationSeq::new(8)
+    );
+    assert_eq!(model.requests().len(), 1);
+    assert_eq!(environment.prompt.projection_calls(), 2);
 }
 
 #[tokio::test(flavor = "current_thread")]
