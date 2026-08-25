@@ -1,3 +1,3 @@
 mod builder;
 
-pub(crate) use builder::{PromptBuilder, PromptError};
+pub(crate) use builder::{PromptBuilder, PromptError, PromptPlan};

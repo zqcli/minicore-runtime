@@ -90,16 +90,19 @@ fn final_prompt_builder_is_private_deterministic_and_dependency_narrow() {
     for required in [
         "pub(crate) const KERNEL_INVARIANT",
         "pub(crate) struct PromptBuilder",
+        "pub(crate) struct PromptPlan",
         "pub(crate) enum PromptError",
-        "pub(crate) fn remaining_context_budget_for(",
-        "pub(crate) fn build(",
+        "pub(crate) fn plan(",
+        "pub(crate) fn finish(",
+        "static_messages: Arc<[ModelMessage]>",
+        "fixed_request.into_parts()",
         "&ValidatedContextBundle",
-        "context.blocks()",
+        ".blocks()",
         "[minicore-context slot={slot} source={}]",
         "validated_prompt_projection(&self.spec, &self.limits)",
         "ModelMessage::system(summary.summary.as_str())",
         "ModelRequest::new(",
-        "let request = self.request(messages, model_limits)?;",
+        "let fixed_request = self.request(messages, model_limits)?;",
         "serde_json::to_writer(&mut sink, request)",
     ] {
         assert!(
@@ -128,6 +131,10 @@ fn final_prompt_builder_is_private_deterministic_and_dependency_narrow() {
         );
     }
     assert!(!builder.contains("validate_and_sort"));
+    assert!(!builder.contains("estimated_fixed_input_tokens"));
+    assert!(!builder.contains("remaining_context_budget_for"));
+    assert!(!builder.contains("pub(crate) fn build("));
+    assert!(!builder.contains("compose_messages"));
     assert!(!builder.contains("ContextBundle {"));
     assert!(!builder.contains("&ContextBundle"));
     assert!(!builder.contains("context.clone()"));
@@ -147,7 +154,13 @@ fn final_prompt_builder_is_private_deterministic_and_dependency_narrow() {
     // keeps the byte count exact without allocating a copy per round.
     assert!(!builder.contains("serde_json::to_vec"));
     assert!(builder.contains("serde_json::to_writer"));
-    assert_eq!(builder.matches("ModelRequest::new(").count(), 1);
+    assert_eq!(
+        builder
+            .matches("ModelMessage::system(KERNEL_INVARIANT)")
+            .count(),
+        1
+    );
+    assert_eq!(builder.matches("ModelRequest::new(").count(), 2);
     assert!(builder.lines().count() < 500);
 }
 

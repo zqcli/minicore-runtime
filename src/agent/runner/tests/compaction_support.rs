@@ -156,6 +156,80 @@ pub(super) fn active_conversation(
         .unwrap()
 }
 
+pub(super) fn active_conversation_with_two_completed_boundaries(
+    spec: &SessionSpec,
+    effective_max_tool_rounds: u16,
+) -> ConversationView {
+    let first: TurnId = "trn_00000000000000000000000000000082".parse().unwrap();
+    let second: TurnId = "trn_00000000000000000000000000000083".parse().unwrap();
+    let entries = vec![
+        ConversationEntry::UserMessage(UserMessageEntry {
+            seq: ConversationSeq::new(1),
+            turn_id: first,
+            input: UserInputRecord::new(BoundedText::new("first question").unwrap()).unwrap(),
+            execution: TurnExecutionRecord::new(spec.model.clone(), spec.reasoning, 1).unwrap(),
+            created_at: timestamp(),
+        }),
+        ConversationEntry::AssistantMessage(AssistantMessageEntry {
+            seq: ConversationSeq::new(2),
+            turn_id: first,
+            model: spec.model.clone(),
+            text: Some(BoundedText::new("first answer").unwrap()),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            usage: Usage::default(),
+            finish_reason: ModelFinishReason::Stop,
+            created_at: timestamp(),
+        }),
+        ConversationEntry::TurnTerminal(TurnTerminalEntry {
+            seq: ConversationSeq::new(3),
+            turn_id: first,
+            terminal: TurnTerminal::Completed,
+            usage: Usage::default(),
+            created_at: timestamp(),
+        }),
+        ConversationEntry::UserMessage(UserMessageEntry {
+            seq: ConversationSeq::new(4),
+            turn_id: second,
+            input: UserInputRecord::new(BoundedText::new("second question").unwrap()).unwrap(),
+            execution: TurnExecutionRecord::new(spec.model.clone(), spec.reasoning, 1).unwrap(),
+            created_at: timestamp(),
+        }),
+        ConversationEntry::AssistantMessage(AssistantMessageEntry {
+            seq: ConversationSeq::new(5),
+            turn_id: second,
+            model: spec.model.clone(),
+            text: Some(BoundedText::new("second answer").unwrap()),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            usage: Usage::default(),
+            finish_reason: ModelFinishReason::Stop,
+            created_at: timestamp(),
+        }),
+        ConversationEntry::TurnTerminal(TurnTerminalEntry {
+            seq: ConversationSeq::new(6),
+            turn_id: second,
+            terminal: TurnTerminal::Completed,
+            usage: Usage::default(),
+            created_at: timestamp(),
+        }),
+        ConversationEntry::UserMessage(UserMessageEntry {
+            seq: ConversationSeq::new(7),
+            turn_id: turn_id(),
+            input: UserInputRecord::new(BoundedText::new("current question").unwrap()).unwrap(),
+            execution: TurnExecutionRecord::new(
+                spec.model.clone(),
+                spec.reasoning,
+                effective_max_tool_rounds,
+            )
+            .unwrap(),
+            created_at: timestamp(),
+        }),
+    ];
+    ConversationView::from_validated_entries(spec, &SemanticLimits::default(), entries.into())
+        .unwrap()
+}
+
 pub(super) fn ack_summary(
     conversation: &ConversationView,
     snapshot_head: ConversationSeq,

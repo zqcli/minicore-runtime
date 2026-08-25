@@ -1,10 +1,12 @@
 use std::fmt;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use thiserror::Error;
 
 use crate::config::{SemanticLimits, SessionSpec};
-use crate::context::{ContextBlock, ContextDriver, ContextSlot, ValidatedContextBundle};
+use crate::context::{ContextBlock, ContextSlot, ValidatedContextBundle};
 use crate::conversation::{ConversationEntry, ConversationView, PromptConversationProjection};
 use crate::model::{AssistantPart, ModelLimits, ModelMessage, ModelRequest, ReasoningContent};
 use crate::tools::{ToolOutput, ToolSpec};
@@ -32,11 +34,51 @@ pub(crate) enum PromptError {
     ContextOverflow,
 }
 
+pub(crate) struct PromptPlan {
+    fixed_request: ModelRequest,
+    context_index: usize,
+    fixed_input_tokens: u64,
+    context_budget: Result<u64, PromptError>,
+}
+
+impl PromptPlan {
+    pub(crate) fn fixed_input_tokens(&self) -> u64 {
+        self.fixed_input_tokens
+    }
+
+    pub(crate) fn remaining_context_budget(&self) -> Result<u64, PromptError> {
+        self.context_budget
+    }
+
+    pub(crate) fn finish(
+        self,
+        context: &ValidatedContextBundle,
+    ) -> Result<ModelRequest, PromptError> {
+        let (mut messages, tools, model_limits, reasoning) = self.fixed_request.into_parts();
+        let context_messages = context
+            .blocks()
+            .iter()
+            .map(format_context_block)
+            .collect::<Result<Vec<_>, _>>()?;
+        messages.splice(self.context_index..self.context_index, context_messages);
+        let request = ModelRequest::new(messages, tools, model_limits, reasoning)
+            .map_err(|_| PromptError::InvalidConversation)?;
+        let estimated = estimate_request(&request)?;
+        if let Some(window) = model_limits.context_window_tokens() {
+            let _ = remaining_budget(estimated, u64::from(window), model_limits)?;
+        }
+        Ok(request)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PromptBuilder {
     spec: SessionSpec,
     tools: Arc<[ToolSpec]>,
     limits: SemanticLimits,
+    static_messages: Arc<[ModelMessage]>,
+    #[cfg(test)]
+    projection_calls: Arc<AtomicUsize>,
 }
 
 impl fmt::Debug for PromptBuilder {
@@ -68,104 +110,62 @@ impl PromptBuilder {
         {
             return Err(PromptError::InvalidTools);
         }
-        if spec.validate(&limits).is_err()
-            || (!spec.system_prompt.is_empty()
-                && ModelMessage::system(spec.system_prompt.as_str()).is_err())
-            || ModelMessage::system(KERNEL_INVARIANT).is_err()
-        {
+        if spec.validate(&limits).is_err() {
             return Err(PromptError::InvalidConfiguration);
         }
         validate_tools(&tools, spec, &limits)?;
+        let mut static_messages = Vec::with_capacity(2);
+        static_messages.push(
+            ModelMessage::system(KERNEL_INVARIANT)
+                .map_err(|_| PromptError::InvalidConfiguration)?,
+        );
+        if !spec.system_prompt.is_empty() {
+            static_messages.push(
+                ModelMessage::system(spec.system_prompt.as_str())
+                    .map_err(|_| PromptError::InvalidConfiguration)?,
+            );
+        }
         Ok(Self {
             spec: spec.clone(),
             tools: tools.into(),
             limits,
+            static_messages: static_messages.into(),
+            #[cfg(test)]
+            projection_calls: Arc::new(AtomicUsize::new(0)),
         })
     }
 
-    /// Converts a fixed (context-free) input estimate into the budget the
-    /// context provider may spend. Pure arithmetic: the caller supplies the
-    /// estimate from `estimated_fixed_input_tokens`, so a round never
-    /// serialises the same conversation twice.
-    pub(crate) fn remaining_context_budget_for(
-        estimated_fixed_input_tokens: u64,
-        model_limits: ModelLimits,
-    ) -> Result<u64, PromptError> {
-        let Some(window) = model_limits.context_window_tokens() else {
-            return Ok(u64::MAX);
-        };
-        remaining_budget(
-            estimated_fixed_input_tokens,
-            u64::from(window),
-            model_limits,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn remaining_context_budget(
+    pub(crate) fn plan(
         &self,
         conversation: &ConversationView,
         model_limits: ModelLimits,
-    ) -> Result<u64, PromptError> {
-        let fixed = self.estimated_fixed_input_tokens(conversation, model_limits)?;
-        Self::remaining_context_budget_for(fixed, model_limits)
-    }
-
-    pub(crate) fn estimated_fixed_input_tokens(
-        &self,
-        conversation: &ConversationView,
-        model_limits: ModelLimits,
-    ) -> Result<u64, PromptError> {
-        let context = ContextDriver::empty_bundle();
-        let messages = self.compose_messages(conversation, &context)?;
-        estimate_request(&self.request(messages, model_limits)?)
-    }
-
-    pub(crate) fn build(
-        &self,
-        conversation: &ConversationView,
-        context: &ValidatedContextBundle,
-        model_limits: ModelLimits,
-    ) -> Result<ModelRequest, PromptError> {
-        let messages = self.compose_messages(conversation, context)?;
-        let request = self.request(messages, model_limits)?;
-        let estimated = estimate_request(&request)?;
-        if let Some(window) = model_limits.context_window_tokens() {
-            let _ = remaining_budget(estimated, u64::from(window), model_limits)?;
-        }
-        Ok(request)
-    }
-
-    fn compose_messages(
-        &self,
-        conversation: &ConversationView,
-        context: &ValidatedContextBundle,
-    ) -> Result<Vec<ModelMessage>, PromptError> {
+    ) -> Result<PromptPlan, PromptError> {
+        #[cfg(test)]
+        self.projection_calls.fetch_add(1, Ordering::Relaxed);
         let projection = conversation
             .validated_prompt_projection(&self.spec, &self.limits)
             .map_err(|_| PromptError::InvalidConversation)?;
         let projected = project_conversation(&projection)?;
-        let context_blocks = context.blocks();
-        let mut messages = Vec::with_capacity(
-            2usize
-                .saturating_add(context_blocks.len())
-                .saturating_add(projected.len()),
-        );
-        messages.push(
-            ModelMessage::system(KERNEL_INVARIANT)
-                .map_err(|_| PromptError::InvalidConfiguration)?,
-        );
-        if !self.spec.system_prompt.is_empty() {
-            messages.push(
-                ModelMessage::system(self.spec.system_prompt.as_str())
-                    .map_err(|_| PromptError::InvalidConfiguration)?,
-            );
-        }
-        for block in context_blocks {
-            messages.push(format_context_block(block)?);
-        }
+        let mut messages = self.static_messages.to_vec();
+        let context_index = messages.len();
         messages.extend(projected);
-        Ok(messages)
+        let fixed_request = self.request(messages, model_limits)?;
+        let fixed_input_tokens = estimate_request(&fixed_request)?;
+        let context_budget = match model_limits.context_window_tokens() {
+            Some(window) => remaining_budget(fixed_input_tokens, u64::from(window), model_limits),
+            None => Ok(u64::MAX),
+        };
+        Ok(PromptPlan {
+            fixed_request,
+            context_index,
+            fixed_input_tokens,
+            context_budget,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn projection_calls(&self) -> usize {
+        self.projection_calls.load(Ordering::Relaxed)
     }
 
     fn request(

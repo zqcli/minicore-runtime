@@ -663,6 +663,17 @@ impl ModelRequest {
     pub const fn reasoning(&self) -> ReasoningPreference {
         self.reasoning
     }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<ModelMessage>,
+        Vec<ToolSpec>,
+        ModelLimits,
+        ReasoningPreference,
+    ) {
+        (self.messages, self.tools, self.limits, self.reasoning)
+    }
 }
 
 impl fmt::Debug for ModelRequest {

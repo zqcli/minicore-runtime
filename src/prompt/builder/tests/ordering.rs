@@ -27,8 +27,8 @@ fn fixed_message_order_headers_and_repeat_build_are_byte_stable() {
         context_block("turn", ContextSlot::TurnContext, 0, "turn context"),
     ]);
     let limits = ModelLimits::new(None, Some(32)).unwrap();
-    let first = builder.build(&conversation, &context, limits).unwrap();
-    let second = builder.build(&conversation, &context, limits).unwrap();
+    let first = finish(&builder, &conversation, &context, limits).unwrap();
+    let second = finish(&builder, &conversation, &context, limits).unwrap();
 
     assert_eq!(
         first.messages(),
@@ -65,13 +65,13 @@ fn fixed_message_order_headers_and_repeat_build_are_byte_stable() {
 
 #[test]
 fn empty_session_prompt_is_omitted_but_kernel_invariant_is_always_first() {
-    let request = builder("", &[])
-        .build(
-            &ConversationView::empty(),
-            &empty_context(),
-            ModelLimits::default(),
-        )
-        .unwrap();
+    let request = finish(
+        &builder("", &[]),
+        &ConversationView::empty(),
+        &empty_context(),
+        ModelLimits::default(),
+    )
+    .unwrap();
     assert_eq!(
         request.messages(),
         &[ModelMessage::system(KERNEL_INVARIANT).unwrap()]

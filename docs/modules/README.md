@@ -17,7 +17,7 @@ This page maps the final v0.3 source graph. Core contains host-neutral Ports, ch
 | `error` | Redacted diagnostics plus typed session/log/open/shutdown/turn errors |
 | `ids` | Checked runtime, interaction, tool-call, and context-source identifiers |
 | `model` | Direct streaming Model Port, checked DTOs, and private ModelDriver |
-| `prompt` | Private deterministic PromptBuilder |
+| `prompt` | Private deterministic PromptBuilder and crate-private PromptPlan |
 | `agent` | Private TurnRunner, ToolDriver, commit/suspension protocol, and compaction recovery |
 | `session` | SessionRuntime, SessionHandle, actor, commands, state/events, interactions, and TurnHandle |
 | `storage` | Public reexport facade for the SessionLog Port and its DTOs; no adapter implementation |
@@ -38,7 +38,7 @@ The SessionLog trait is physically declared in `conversation/session_log.rs` bec
 - `model::driver` owns stream grammar, usage settlement, retry truth, cancellation, deadline provenance, and panic isolation for one direct Model.
 - `agent::tool_driver` owns frozen-spec policy decisions, approval/input suspension, Tool execution, output bounds, and lossy progress.
 - `context::driver` owns zero-or-one provider execution, the single ContextBundle validation/canonical-sort seam, crate-private ValidatedContextBundle construction, cancellation, and deadline provenance.
-- `prompt::builder` owns deterministic prompt ordering and exact serialized-request budgeting.
+- `prompt::builder` owns one-per-head conversation planning, deterministic prompt ordering, fixed/final serialized-request budgeting, and checked-context finalization.
 - `compaction::driver` owns canonical candidate validation and one strategy call without commit authority.
 - `agent::environment` freezes the checked static Session environment once at create/load; `agent::runner` owns ordinary model/tool rounds, compaction recovery, exact single-entry delta acknowledgements, conservative usage, and normal completion through the tracked runner join.
 - `session::actor` owns durable append authority and terminal settlement.

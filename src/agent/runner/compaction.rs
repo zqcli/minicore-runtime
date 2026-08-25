@@ -6,7 +6,7 @@ use crate::compaction::{CompactionDriverFailure, CompactionError};
 use crate::context::ContextRequest;
 use crate::conversation::{ConversationSeq, SummaryDraft};
 use crate::model::{ModelRequest, Usage};
-use crate::prompt::{PromptBuilder, PromptError};
+use crate::prompt::{PromptError, PromptPlan};
 use crate::time::DeadlineSource;
 
 use super::super::runner_protocol::RunnerOutcome;
@@ -19,31 +19,6 @@ use super::support::{commit_summary, validate_summary_ack};
 #[derive(Default)]
 pub(super) struct CompactionState {
     proactive_heads: BTreeSet<ConversationSeq>,
-}
-
-/// Caches the fixed (context-free) input estimate for one conversation head.
-/// Proactive compaction and the context budget both need it, and it only
-/// changes when a commit advances the head, so a round serialises once.
-#[derive(Default)]
-pub(super) struct FixedInputEstimate {
-    cached: Option<(ConversationSeq, u64)>,
-}
-
-impl FixedInputEstimate {
-    fn get(&mut self, context: &TurnRunnerContext) -> Result<u64, PromptError> {
-        let head = context.conversation.head();
-        if let Some((cached_head, estimate)) = self.cached {
-            if cached_head == head {
-                return Ok(estimate);
-            }
-        }
-        let estimate = context.environment.prompt.estimated_fixed_input_tokens(
-            &context.conversation,
-            context.environment.model_limits,
-        )?;
-        self.cached = Some((head, estimate));
-        Ok(estimate)
-    }
 }
 
 pub(super) enum PreparedModelRequest {
@@ -63,6 +38,13 @@ enum CompactionMode {
     Forced,
 }
 
+fn plan_current_head(context: &TurnRunnerContext) -> Result<PromptPlan, PromptError> {
+    context
+        .environment
+        .prompt
+        .plan(&context.conversation, context.environment.model_limits)
+}
+
 pub(super) async fn prepare_model_request(
     context: &mut TurnRunnerContext,
     model_round: u16,
@@ -72,29 +54,52 @@ pub(super) async fn prepare_model_request(
     if let Some(outcome) = turn_control_outcome(context, usage) {
         return PreparedModelRequest::Terminal(outcome);
     }
-    let mut estimate = FixedInputEstimate::default();
-    if let CompactionAttempt::Terminal(outcome) =
-        proactive(context, usage, state, &mut estimate).await
-    {
-        return PreparedModelRequest::Terminal(outcome);
+    let mut plan = match plan_current_head(context) {
+        Ok(plan) => plan,
+        Err(error) => return PreparedModelRequest::Terminal(prompt_failure(error, usage)),
+    };
+    let mut compaction_applied = false;
+    match proactive(context, usage, state, &plan).await {
+        CompactionAttempt::Applied => {
+            compaction_applied = true;
+            if let Some(outcome) = turn_control_outcome(context, usage) {
+                return PreparedModelRequest::Terminal(outcome);
+            }
+            plan = match plan_current_head(context) {
+                Ok(plan) => plan,
+                Err(error) => return PreparedModelRequest::Terminal(prompt_failure(error, usage)),
+            };
+        }
+        CompactionAttempt::Skipped => {}
+        CompactionAttempt::Terminal(outcome) => {
+            return PreparedModelRequest::Terminal(outcome);
+        }
     }
-
     let mut forced_attempted = false;
     loop {
         if let Some(outcome) = turn_control_outcome(context, usage) {
             return PreparedModelRequest::Terminal(outcome);
         }
-        let remaining = match estimate.get(context).and_then(|fixed| {
-            PromptBuilder::remaining_context_budget_for(fixed, context.environment.model_limits)
-        }) {
+        let remaining = match plan.remaining_context_budget() {
             Ok(remaining) => remaining,
-            Err(PromptError::ContextOverflow) if !forced_attempted => {
+            Err(PromptError::ContextOverflow) if !forced_attempted && !compaction_applied => {
                 if let Some(outcome) = turn_control_outcome(context, usage) {
                     return PreparedModelRequest::Terminal(outcome);
                 }
                 forced_attempted = true;
                 match required(context, usage).await {
-                    CompactionAttempt::Applied => continue,
+                    CompactionAttempt::Applied => {
+                        compaction_applied = true;
+                        plan = match plan_current_head(context) {
+                            Ok(plan) => plan,
+                            Err(error) => {
+                                return PreparedModelRequest::Terminal(prompt_failure(
+                                    error, usage,
+                                ));
+                            }
+                        };
+                        continue;
+                    }
                     CompactionAttempt::Skipped => {
                         return PreparedModelRequest::Terminal(compaction_failure(usage));
                     }
@@ -136,24 +141,31 @@ pub(super) async fn prepare_model_request(
         if let Some(outcome) = turn_control_outcome(context, usage) {
             return PreparedModelRequest::Terminal(outcome);
         }
-        match context.environment.prompt.build(
-            &context.conversation,
-            &validated_context,
-            context.environment.model_limits,
-        ) {
+        match plan.finish(&validated_context) {
             Ok(request) => {
                 return match turn_control_outcome(context, usage) {
                     Some(outcome) => PreparedModelRequest::Terminal(outcome),
                     None => PreparedModelRequest::Ready(request),
                 };
             }
-            Err(PromptError::ContextOverflow) if !forced_attempted => {
+            Err(PromptError::ContextOverflow) if !forced_attempted && !compaction_applied => {
                 if let Some(outcome) = turn_control_outcome(context, usage) {
                     return PreparedModelRequest::Terminal(outcome);
                 }
                 forced_attempted = true;
                 match required(context, usage).await {
-                    CompactionAttempt::Applied => continue,
+                    CompactionAttempt::Applied => {
+                        compaction_applied = true;
+                        plan = match plan_current_head(context) {
+                            Ok(plan) => plan,
+                            Err(error) => {
+                                return PreparedModelRequest::Terminal(prompt_failure(
+                                    error, usage,
+                                ));
+                            }
+                        };
+                        continue;
+                    }
                     CompactionAttempt::Skipped => {
                         return PreparedModelRequest::Terminal(compaction_failure(usage));
                     }
@@ -179,7 +191,7 @@ pub(super) async fn proactive(
     context: &mut TurnRunnerContext,
     usage: Usage,
     state: &mut CompactionState,
-    estimate: &mut FixedInputEstimate,
+    plan: &PromptPlan,
 ) -> CompactionAttempt {
     if let Some(outcome) = turn_control_outcome(context, usage) {
         return CompactionAttempt::Terminal(outcome);
@@ -187,14 +199,10 @@ pub(super) async fn proactive(
     let Some(compaction) = context.environment.compaction.as_ref() else {
         return CompactionAttempt::Skipped;
     };
-    let estimate = match estimate.get(context) {
-        Ok(estimate) => estimate,
-        Err(_) => return CompactionAttempt::Skipped,
-    };
     if let Some(outcome) = turn_control_outcome(context, usage) {
         return CompactionAttempt::Terminal(outcome);
     }
-    if estimate < compaction.trigger_tokens {
+    if plan.fixed_input_tokens() < compaction.trigger_tokens {
         return CompactionAttempt::Skipped;
     }
     let head = context.conversation.head();

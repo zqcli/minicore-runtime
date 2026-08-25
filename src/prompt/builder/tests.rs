@@ -185,3 +185,26 @@ fn checked_context(blocks: Vec<ContextBlock>) -> ValidatedContextBundle {
 fn empty_context() -> ValidatedContextBundle {
     checked_context(Vec::new())
 }
+
+fn finish(
+    builder: &PromptBuilder,
+    conversation: &ConversationView,
+    context: &ValidatedContextBundle,
+    model_limits: ModelLimits,
+) -> Result<ModelRequest, PromptError> {
+    builder.plan(conversation, model_limits)?.finish(context)
+}
+
+#[test]
+fn plan_projects_once_and_finish_reuses_the_projection() {
+    let builder = builder("session rules", &[]);
+    let conversation = view(vec![user(1, 1, "question")]);
+    let plan = builder.plan(&conversation, ModelLimits::default()).unwrap();
+    assert_eq!(builder.projection_calls(), 1);
+    let request = plan.finish(&empty_context()).unwrap();
+    assert_eq!(builder.projection_calls(), 1);
+    assert_eq!(
+        request.messages()[0],
+        ModelMessage::system(KERNEL_INVARIANT).unwrap()
+    );
+}
