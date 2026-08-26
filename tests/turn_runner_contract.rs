@@ -3,6 +3,81 @@ fn compact(source: &str) -> String {
 }
 
 #[test]
+fn shared_port_call_is_private_bounded_and_excludes_core_protocols() {
+    let root = include_str!("../src/lib.rs");
+    let helper = include_str!("../src/port_call.rs");
+    assert!(root.contains("mod port_call;"));
+    assert!(!root.contains("pub mod port_call;"));
+    assert!(!root.contains("pub use port_call"));
+    for required in [
+        "pub(crate) enum PortCallOutcome<T, E>",
+        "Returned(Result<T, E>)",
+        "Cancelled",
+        "DeadlineExceeded(DeadlineSource)",
+        "InvalidDeadline(DeadlineOverflow)",
+        "Panicked",
+        "pub(crate) async fn run_port_call<F, Fut, T, E>(",
+        "effective_deadline(turn_deadline, port_timeout)",
+        "parent_cancellation.is_cancelled()",
+        "parent_cancellation.child_token()",
+        "catch_unwind(AssertUnwindSafe(||",
+        ".catch_unwind()",
+        "biased;",
+        "child_cancellation.cancel();",
+    ] {
+        assert!(helper.contains(required), "port helper misses {required}");
+    }
+    let production = helper
+        .split_once("#[cfg(test)]\nmod tests")
+        .map(|(production, _)| production)
+        .unwrap();
+    for forbidden in [
+        "ModelDriver",
+        "SessionLog",
+        "ConversationLog",
+        "Interaction",
+        "RunnerEvent",
+        "retry",
+        "durability",
+        "ServiceLocator",
+        "Hook",
+        "tokio::spawn",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "port helper contains {forbidden}"
+        );
+    }
+    assert!(production.lines().count() < 100);
+    assert_eq!(
+        include_str!("../src/context/driver.rs")
+            .matches("run_port_call(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        include_str!("../src/compaction/driver.rs")
+            .matches("run_port_call(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        include_str!("../src/agent/tool_driver.rs")
+            .matches("run_port_call(")
+            .count(),
+        2
+    );
+    for source in [
+        include_str!("../src/model/driver.rs"),
+        include_str!("../src/conversation/log.rs"),
+        include_str!("../src/conversation/session_log.rs"),
+        include_str!("../src/agent/runner.rs"),
+    ] {
+        assert!(!source.contains("run_port_call"));
+    }
+}
+
+#[test]
 fn final_turn_runner_is_private_no_spawn_and_owner_neutral() {
     let module = include_str!("../src/agent/mod.rs");
     for required in [
@@ -501,7 +576,7 @@ fn reviewer_regressions_have_deterministic_private_evidence() {
         assert!(compaction_control.contains(required));
     }
     for required in [
-        "provider_cancellation_after_success_wins_forced_overflow_interpretation",
+        "provider_cancellation_after_success_does_not_cancel_the_parent_turn",
         "expired_turn_after_context_success_wins_without_strategy_or_boundary",
     ] {
         assert!(compaction_priority.contains(required));

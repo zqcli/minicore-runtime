@@ -1,16 +1,14 @@
 use std::fmt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::FutureExt;
-use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::SemanticLimits;
 use crate::conversation::{ConversationEntry, ConversationSeq};
 use crate::ids::{SessionId, TurnId};
-use crate::time::{DeadlineSource, EffectiveDeadline, effective_deadline};
+use crate::port_call::{PortCallOutcome, run_port_call};
+use crate::time::DeadlineSource;
 use crate::value::BoundedText;
 
 use super::{
@@ -140,82 +138,59 @@ impl CompactionDriver {
         turn_deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<ValidatedCompactionProposal, CompactionDriverFailure> {
-        let deadline = effective_deadline(turn_deadline, self.timeout)
-            .map_err(|_| CompactionDriverFailure::ordinary(CompactionError::DeadlineExceeded))?;
-        check_control(&cancellation, &deadline)?;
+        let strategy = self.strategy.clone();
+        let candidate_for_call = candidate.clone();
         if target_tokens == 0 {
             return Err(CompactionDriverFailure::ordinary(
                 CompactionError::InvalidRequest,
             ));
         }
         let has_newer_completed_boundary =
-            validate_candidate(&candidate).map_err(CompactionDriverFailure::ordinary)?;
+            validate_candidate(&candidate_for_call).map_err(CompactionDriverFailure::ordinary)?;
         #[cfg(test)]
         tests::pause_after_candidate(turn_id).await;
-        check_control(&cancellation, &deadline)?;
-        if !has_newer_completed_boundary {
-            return Err(CompactionDriverFailure::ordinary(
+        match run_port_call(
+            &cancellation,
+            turn_deadline,
+            self.timeout,
+            move |child_cancellation, deadline| async move {
+                let Some(strategy) = strategy.filter(|_| has_newer_completed_boundary) else {
+                    return Ok(None);
+                };
+                let request = CompactionRequest {
+                    session_id,
+                    turn_id,
+                    candidate: candidate_for_call,
+                    target_tokens,
+                    cancellation: child_cancellation,
+                    deadline,
+                };
+                strategy.compact(request).await.map(Some)
+            },
+        )
+        .await
+        {
+            PortCallOutcome::Returned(Ok(Some(proposal))) => {
+                validate_proposal(candidate, proposal, self.max_summary_bytes)
+                    .map_err(CompactionDriverFailure::ordinary)
+            }
+            PortCallOutcome::Returned(Ok(None)) => Err(CompactionDriverFailure::ordinary(
                 CompactionError::Unavailable,
-            ));
+            )),
+            PortCallOutcome::Returned(Err(error)) => Err(CompactionDriverFailure::ordinary(error)),
+            PortCallOutcome::Cancelled => Err(CompactionDriverFailure::ordinary(
+                CompactionError::Cancelled,
+            )),
+            PortCallOutcome::DeadlineExceeded(source) => {
+                Err(CompactionDriverFailure::deadline(source))
+            }
+            PortCallOutcome::InvalidDeadline(_) => Err(CompactionDriverFailure::ordinary(
+                CompactionError::DeadlineExceeded,
+            )),
+            PortCallOutcome::Panicked => {
+                Err(CompactionDriverFailure::ordinary(CompactionError::Internal))
+            }
         }
-        let Some(strategy) = self.strategy.as_ref() else {
-            return Err(CompactionDriverFailure::ordinary(
-                CompactionError::Unavailable,
-            ));
-        };
-
-        let child_cancellation = cancellation.child_token();
-        let request = CompactionRequest {
-            session_id,
-            turn_id,
-            candidate: candidate.clone(),
-            target_tokens,
-            cancellation: child_cancellation.clone(),
-            deadline: deadline.standard(),
-        };
-        let future = match catch_unwind(AssertUnwindSafe(|| strategy.compact(request))) {
-            Ok(future) => future,
-            Err(_) => {
-                child_cancellation.cancel();
-                return Err(CompactionDriverFailure::ordinary(CompactionError::Internal));
-            }
-        };
-        let future = AssertUnwindSafe(future).catch_unwind();
-        tokio::pin!(future);
-        let result = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                child_cancellation.cancel();
-                return Err(CompactionDriverFailure::ordinary(CompactionError::Cancelled));
-            }
-            _ = tokio::time::sleep_until(deadline.tokio()) => {
-                child_cancellation.cancel();
-                return Err(CompactionDriverFailure::deadline(deadline.source()));
-            }
-            result = &mut future => result,
-        };
-        child_cancellation.cancel();
-        match result {
-            Ok(Ok(proposal)) => validate_proposal(candidate, proposal, self.max_summary_bytes)
-                .map_err(CompactionDriverFailure::ordinary),
-            Ok(Err(error)) => Err(CompactionDriverFailure::ordinary(error)),
-            Err(_) => Err(CompactionDriverFailure::ordinary(CompactionError::Internal)),
-        }
-    }
-}
-
-fn check_control(
-    cancellation: &CancellationToken,
-    deadline: &EffectiveDeadline,
-) -> Result<(), CompactionDriverFailure> {
-    if cancellation.is_cancelled() {
-        Err(CompactionDriverFailure::ordinary(
-            CompactionError::Cancelled,
-        ))
-    } else if TokioInstant::now() >= deadline.tokio() {
-        Err(CompactionDriverFailure::deadline(deadline.source()))
-    } else {
-        Ok(())
     }
 }
 

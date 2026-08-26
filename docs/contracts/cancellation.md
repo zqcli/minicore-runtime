@@ -36,7 +36,7 @@ Turn deadline generally settles as `BudgetExceeded` or Turn control. A configure
 - **ToolPolicy:** cancellation/Turn deadline prevents or interrupts policy evaluation and fails closed without Tool execution.
 - **Tool:** child cancellation is fired before a pending Tool future is dropped; configured timeout may become a failed ToolResult.
 - **ContextProvider:** cancellation and deadline drop the provider future and terminate the Turn with exact provenance.
-- **CompactionStrategy:** cancellation is checked before candidate/strategy availability and again after candidate validation; no strategy call may begin after control wins.
+- **CompactionStrategy:** candidate validation and the test-only race pause remain outside the shared call; execution then enters `run_port_call` directly. Its production cancellation/deadline precheck runs before the closure's availability check, request construction, and strategy invocation. No strategy call may begin after control wins.
 - **Interaction:** cancellation consumes the pending sender once, clears public pending state, and lets runner Join drive durable settlement. Root or active-Turn cancellation wins suspension admission before a new pending interaction is installed.
 
 ## Shutdown

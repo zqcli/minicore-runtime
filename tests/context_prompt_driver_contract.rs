@@ -18,10 +18,12 @@ fn context_driver_is_private_single_provider_and_owner_neutral() {
         "pub(crate) async fn provide_detailed(",
         "Result<ValidatedContextBundle, ContextDriverFailure>",
         "bundle.validate_and_sort(limits)",
-        "effective_deadline(request.deadline, self.context_timeout)",
+        "use crate::port_call::{PortCallOutcome, run_port_call};",
+        "match run_port_call(",
         "deadline_source: Option<DeadlineSource>",
-        "ContextDriverFailure::deadline(deadline.source())",
-        "catch_unwind(AssertUnwindSafe(|| provider.provide(request)))",
+        "PortCallOutcome::DeadlineExceeded(source)",
+        "PortCallOutcome::InvalidDeadline(_)",
+        "PortCallOutcome::Panicked",
         "ContextError::Cancelled",
         "ContextError::DeadlineExceeded",
         "ContextError::Internal",
@@ -53,6 +55,8 @@ fn context_driver_is_private_single_provider_and_owner_neutral() {
         );
     }
     assert!(!driver.contains("fn effective_deadline("));
+    assert!(!driver.contains("catch_unwind"));
+    assert!(!driver.contains("tokio::select!"));
     assert!(driver.lines().count() < 500);
 }
 

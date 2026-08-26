@@ -8,6 +8,7 @@ pub mod error;
 pub mod ids;
 mod interaction;
 pub mod model;
+mod port_call;
 mod prompt;
 pub mod session;
 pub mod storage;

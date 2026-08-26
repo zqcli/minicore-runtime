@@ -30,7 +30,7 @@ impl ContextProvider for CancellingOversizedContext {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn provider_cancellation_after_success_wins_forced_overflow_interpretation() {
+async fn provider_cancellation_after_success_does_not_cancel_the_parent_turn() {
     let provider = Arc::new(CancellingOversizedContext {
         calls: AtomicUsize::new(0),
     });
@@ -47,11 +47,23 @@ async fn provider_cancellation_after_success_wins_forced_overflow_interpretation
     bindings.context = Some(context_port);
     bindings.compaction = Some(strategy_port);
     let (request, mut critical_rx, _progress_rx) = runner_request(spec, 4, bindings, conversation);
-    let task = tokio::spawn(run_turn(request));
-    assert!(matches!(
-        joined_outcome(task).await,
-        RunnerOutcome::Cancelled { .. }
-    ));
+    let context = TurnRunnerContext::from_request(request);
+    let result = context
+        .environment
+        .context
+        .provide_detailed(ContextRequest {
+            session_id: context.session_id,
+            instance_id: context.instance_id,
+            turn_id: context.turn_id,
+            model_round: 0,
+            conversation: context.conversation.clone(),
+            remaining_context_budget: u64::MAX,
+            cancellation: context.cancellation.clone(),
+            deadline: context.deadline,
+        })
+        .await;
+    assert!(result.is_ok());
+    assert!(!context.cancellation.is_cancelled());
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(strategy.calls(), 0);
     assert!(model.requests().is_empty());

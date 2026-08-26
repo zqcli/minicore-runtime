@@ -84,6 +84,7 @@ async fn cancellation_during_provider_drops_future() {
     cancellation.cancel();
     assert_eq!(run.await.unwrap(), Err(ContextError::Cancelled));
     assert!(probe.dropped.load(Ordering::SeqCst));
+    assert!(probe.cancelled_before_drop.load(Ordering::SeqCst));
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -105,6 +106,7 @@ async fn timeout_during_provider_drops_future() {
     tokio::time::advance(Duration::from_secs(6)).await;
     assert_eq!(run.await.unwrap(), Err(ContextError::DeadlineExceeded));
     assert!(probe.dropped.load(Ordering::SeqCst));
+    assert!(probe.cancelled_before_drop.load(Ordering::SeqCst));
 }
 
 #[tokio::test(flavor = "current_thread")]
