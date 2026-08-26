@@ -80,7 +80,7 @@ Core catches the host-controlled panic boundaries: Model descriptor access, Sess
 
 ## Checked DTOs
 
-`ToolInvocation` accepts only bounded object-shaped JSON arguments and redacts arguments from `Debug`. `ToolSpec` exposes the exact public fields `name`, `description`, and `input_schema`, while its constructor and strict unknown-field deserializer enforce their bounds. Public `ToolOutput` contains only `content: BoundedText`, serializes as `{ "content": "..." }`, and never exposes a failure-status bit.
+`ToolInvocation` accepts only bounded object-shaped JSON arguments and redacts arguments from `Debug`. `ToolSpec` exposes the exact public fields `name`, `description`, and `input_schema`, while its constructor and strict unknown-field deserializer enforce their bounds. Public `ToolOutput` contains only `content: BoundedText`, serializes as `{ "content": "..." }`, and never exposes a failure-status bit. After a completed Tool returns a checked `ToolOutput`, the private ToolDriver checks only the session `max_tool_output_bytes`; an in-bound output is moved directly into `ToolDriverResult`, while an over-bound output becomes Failed. The completed path does not reconstruct or revalidate the content, and the public ToolOutput constructor/deserializer remain unchanged.
 
 Input requests have bounded prompt/choice text and an explicit answer kind. Text answers reject empty, oversized, and control-character content. Choice answers reject non-object or extra-field wire shapes; their index is checked against the request before execution.
 

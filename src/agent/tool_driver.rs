@@ -361,12 +361,9 @@ impl ToolDriver {
         if output.content().byte_len() > self.config.max_tool_output_bytes {
             return self.failed();
         }
-        match ToolOutput::new(output.content().as_str()) {
-            Ok(output) => ToolDriverResult {
-                output,
-                outcome: ToolResultOutcome::Success,
-            },
-            Err(_) => self.failed(),
+        ToolDriverResult {
+            output,
+            outcome: ToolResultOutcome::Success,
         }
     }
 

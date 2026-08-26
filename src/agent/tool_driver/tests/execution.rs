@@ -124,20 +124,15 @@ async fn turn_cancellation_during_tool_cancels_child_before_drop() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn completed_output_enforces_exact_semantic_boundary_and_revalidates_content() {
-    let invalid = ToolOutput {
-        content: BoundedText::new("x\0").unwrap(),
-    };
+async fn completed_output_enforces_exact_session_output_limit() {
     let tool = ScriptTool::new(
         "search",
         vec![
             ToolBehavior::Complete(ToolOutput::new("abc").unwrap()),
             ToolBehavior::Complete(ToolOutput::new("abcd").unwrap()),
-            ToolBehavior::Complete(invalid),
         ],
     );
     let policy = ScriptPolicy::new(vec![
-        PolicyBehavior::Decision(ToolDecision::Allow),
         PolicyBehavior::Decision(ToolDecision::Allow),
         PolicyBehavior::Decision(ToolDecision::Allow),
     ]);
@@ -164,19 +159,17 @@ async fn completed_output_enforces_exact_semantic_boundary_and_revalidates_conte
         .unwrap();
     assert_outcome(&exact, ToolResultOutcome::Success, "abc");
 
-    for value in [67, 68] {
-        let result = driver
-            .run(
-                invocation("search", value, json!({})),
-                deadline_after(Duration::from_secs(30)),
-                CancellationToken::new(),
-                &suspensions,
-                &progress,
-            )
-            .await
-            .unwrap();
-        assert_eq!(result.outcome, ToolResultOutcome::Failed);
-        assert!(result.output.content().byte_len() <= 3);
-    }
-    assert_eq!(tool.calls(), 3);
+    let oversized = driver
+        .run(
+            invocation("search", 67, json!({})),
+            deadline_after(Duration::from_secs(30)),
+            CancellationToken::new(),
+            &suspensions,
+            &progress,
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.outcome, ToolResultOutcome::Failed);
+    assert!(oversized.output.content().byte_len() <= 3);
+    assert_eq!(tool.calls(), 2);
 }

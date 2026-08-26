@@ -119,12 +119,21 @@ fn tool_driver_owns_only_policy_tool_suspension_and_progress_execution() {
         "validate_json_size(invocation.arguments()",
         "self.enabled.get(invocation.tool_name())",
         "Option<&crate::tools::EnabledTool>",
+        "if output.content().byte_len() > self.config.max_tool_output_bytes",
+        "ToolResultOutcome::Success",
     ] {
         assert!(
             implementation.contains(required),
             "tool driver misses {required}"
         );
     }
+    let completed = driver
+        .split_once("fn completed(")
+        .and_then(|(_, tail)| tail.split_once("\n    fn denied("))
+        .map(|(body, _)| body)
+        .unwrap();
+    assert!(!completed.contains("ToolOutput::new"));
+    assert!(completed.contains("output,\n            outcome: ToolResultOutcome::Success"));
     assert!(!driver.contains("self.enabled.get(invocation.tool_name()).cloned()"));
     assert_eq!(
         driver
