@@ -201,7 +201,7 @@ async fn created_session_freezes_descriptor_for_all_turns() {
     let opened = fixture.descriptor_calls.load(Ordering::SeqCst);
     assert_eq!(opened, 1);
     let handle = runtime.handle();
-    for turn in 0..2 {
+    for turn in 0..100 {
         handle
             .submit(
                 UserInput::text(format!("baseline-{turn}")).unwrap(),
@@ -213,6 +213,7 @@ async fn created_session_freezes_descriptor_for_all_turns() {
             .await
             .unwrap();
     }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 100);
     assert_eq!(fixture.descriptor_calls.load(Ordering::SeqCst), opened);
     runtime.shutdown().await.unwrap();
 }
@@ -241,7 +242,7 @@ async fn loaded_session_turns_do_not_repeat_descriptor_validation() {
         .unwrap();
     let opened = fixture.descriptor_calls.load(Ordering::SeqCst);
     assert_eq!(opened, loaded + 1);
-    for turn in 0..2 {
+    for turn in 0..100 {
         runtime
             .handle()
             .submit(
@@ -254,6 +255,7 @@ async fn loaded_session_turns_do_not_repeat_descriptor_validation() {
             .await
             .unwrap();
     }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 100);
     assert_eq!(fixture.descriptor_calls.load(Ordering::SeqCst), opened);
     runtime.shutdown().await.unwrap();
 }
