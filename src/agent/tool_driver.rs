@@ -2,18 +2,17 @@
 use crate::tools::ToolSet;
 #[cfg(test)]
 use std::collections::BTreeSet;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::FutureExt;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
 use crate::interaction::{InteractionAnswer, InteractionKind};
-use crate::time::{DeadlineSource, effective_deadline};
+use crate::port_call::{PortCallOutcome, run_port_call};
+use crate::time::DeadlineSource;
 use crate::tools::{
     ApprovalDecision, EnabledTools, Tool, ToolContext, ToolDecision, ToolExecutionOutcome,
     ToolInputRequest, ToolInvocation, ToolName, ToolOutput, ToolPolicy, ToolPolicyRequest,
@@ -204,45 +203,35 @@ impl ToolDriver {
         let Some(policy) = self.policy.as_ref() else {
             return PolicyResolution::Denied;
         };
-        let Ok(deadline) = effective_deadline(turn_deadline, self.config.policy_timeout) else {
-            return PolicyResolution::Denied;
-        };
-        if TokioInstant::now() >= deadline.tokio() {
-            return match deadline.source() {
-                DeadlineSource::Turn => PolicyResolution::DeadlineExceeded,
-                DeadlineSource::Port => PolicyResolution::Denied,
-            };
-        }
-        let child = cancellation.child_token();
-        let request = ToolPolicyRequest {
-            invocation: invocation.clone(),
-            spec,
-            cancellation: child.clone(),
-            deadline: deadline.standard(),
-        };
-        let future = match catch_unwind(AssertUnwindSafe(|| policy.decide(request))) {
-            Ok(future) => AssertUnwindSafe(future).catch_unwind(),
-            Err(_) => return PolicyResolution::Denied,
-        };
-        tokio::pin!(future);
-        let result = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                child.cancel();
-                return PolicyResolution::Cancelled;
-            }
-            _ = tokio::time::sleep_until(deadline.tokio()) => {
-                child.cancel();
-                return match deadline.source() {
-                    DeadlineSource::Turn => PolicyResolution::DeadlineExceeded,
-                    DeadlineSource::Port => PolicyResolution::Denied,
+        let policy = Arc::clone(policy);
+        match run_port_call(
+            cancellation,
+            turn_deadline,
+            self.config.policy_timeout,
+            |child, deadline| {
+                let request = ToolPolicyRequest {
+                    invocation: invocation.clone(),
+                    spec,
+                    cancellation: child,
+                    deadline,
                 };
+                policy.decide(request)
+            },
+        )
+        .await
+        {
+            PortCallOutcome::Returned(Ok(decision)) if decision.validate().is_ok() => {
+                PolicyResolution::Decision(decision)
             }
-            result = &mut future => result,
-        };
-        match result {
-            Ok(Ok(decision)) if decision.validate().is_ok() => PolicyResolution::Decision(decision),
-            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => PolicyResolution::Denied,
+            PortCallOutcome::Cancelled => PolicyResolution::Cancelled,
+            PortCallOutcome::DeadlineExceeded(DeadlineSource::Turn) => {
+                PolicyResolution::DeadlineExceeded
+            }
+            PortCallOutcome::Returned(Ok(_))
+            | PortCallOutcome::Returned(Err(_))
+            | PortCallOutcome::DeadlineExceeded(DeadlineSource::Port)
+            | PortCallOutcome::InvalidDeadline(_)
+            | PortCallOutcome::Panicked => PolicyResolution::Denied,
         }
     }
 
@@ -309,51 +298,37 @@ impl ToolDriver {
         cancellation: &CancellationToken,
         progress: &mpsc::Sender<ToolDriverProgress>,
     ) -> ExecutionResolution {
-        if cancellation.is_cancelled() {
-            return ExecutionResolution::Cancelled;
-        }
-        let Ok(deadline) = effective_deadline(turn_deadline, self.config.tool_timeout) else {
-            return ExecutionResolution::Failed;
-        };
-        if TokioInstant::now() >= deadline.tokio() {
-            return match deadline.source() {
-                DeadlineSource::Turn => ExecutionResolution::DeadlineExceeded,
-                DeadlineSource::Port => ExecutionResolution::Failed,
-            };
-        }
-        let child = cancellation.child_token();
-        let context = ToolContext {
-            cancellation: child.clone(),
-            deadline: deadline.standard(),
-            progress: progress_sink(invocation.tool_call_id().clone(), progress.clone()),
-        };
-        let _ = progress.try_send(ToolDriverProgress::Started {
-            tool_call_id: invocation.tool_call_id().clone(),
-            tool_name: invocation.tool_name().clone(),
-        });
-        let future = match catch_unwind(AssertUnwindSafe(|| tool.execute(invocation, context))) {
-            Ok(future) => AssertUnwindSafe(future).catch_unwind(),
-            Err(_) => return ExecutionResolution::Failed,
-        };
-        tokio::pin!(future);
-        let result = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                child.cancel();
-                return ExecutionResolution::Cancelled;
-            }
-            _ = tokio::time::sleep_until(deadline.tokio()) => {
-                child.cancel();
-                return match deadline.source() {
-                    DeadlineSource::Turn => ExecutionResolution::DeadlineExceeded,
-                    DeadlineSource::Port => ExecutionResolution::Failed,
+        let tool_call_id = invocation.tool_call_id().clone();
+        let tool_name = invocation.tool_name().clone();
+        let progress = progress.clone();
+        match run_port_call(
+            cancellation,
+            turn_deadline,
+            self.config.tool_timeout,
+            |child, deadline| {
+                let context = ToolContext {
+                    cancellation: child,
+                    deadline,
+                    progress: progress_sink(tool_call_id.clone(), progress.clone()),
                 };
+                let _ = progress.try_send(ToolDriverProgress::Started {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone(),
+                });
+                tool.execute(invocation, context)
+            },
+        )
+        .await
+        {
+            PortCallOutcome::Returned(Ok(outcome)) => ExecutionResolution::Outcome(outcome),
+            PortCallOutcome::Cancelled => ExecutionResolution::Cancelled,
+            PortCallOutcome::DeadlineExceeded(DeadlineSource::Turn) => {
+                ExecutionResolution::DeadlineExceeded
             }
-            result = &mut future => result,
-        };
-        match result {
-            Ok(Ok(outcome)) => ExecutionResolution::Outcome(outcome),
-            Ok(Err(_)) | Err(_) => ExecutionResolution::Failed,
+            PortCallOutcome::Returned(Err(_))
+            | PortCallOutcome::DeadlineExceeded(DeadlineSource::Port)
+            | PortCallOutcome::InvalidDeadline(_)
+            | PortCallOutcome::Panicked => ExecutionResolution::Failed,
         }
     }
 

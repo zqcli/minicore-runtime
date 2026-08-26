@@ -4,7 +4,7 @@ This page maps the final v0.3 source graph. Core contains host-neutral Ports, ch
 
 ## Root Surface
 
-`src/lib.rs` exposes the public modules `compaction`, `config`, `context`, `conversation`, `error`, `ids`, `model`, `session`, `storage`, `tools`, and `value`. The private root modules are `agent`, `bindings`, `interaction`, `prompt`, and `time`.
+`src/lib.rs` exposes the public modules `compaction`, `config`, `context`, `conversation`, `error`, `ids`, `model`, `session`, `storage`, `tools`, and `value`. The private root modules are `agent`, `bindings`, `interaction`, `port_call`, `prompt`, and `time`.
 
 `src/bindings.rs` and `src/interaction.rs` are neutral physical modules used to keep the module graph acyclic. Their public types are reexported through `session`; they are not duplicate public paths.
 
@@ -22,6 +22,7 @@ This page maps the final v0.3 source graph. Core contains host-neutral Ports, ch
 | `session` | SessionRuntime, SessionHandle, actor, commands, state/events, interactions, and TurnHandle |
 | `storage` | Public reexport facade for the SessionLog Port and its DTOs; no adapter implementation |
 | `tools` | Tool, ToolSet, ToolPolicy, invocation/context/input/progress/output DTOs |
+| `port_call` | Crate-private bounded one-shot execution for Context, Compaction, ToolPolicy, and Tool ports |
 
 ## Ownership
 
@@ -39,7 +40,8 @@ The SessionLog trait is physically declared in `conversation/session_log.rs` bec
 - `agent::tool_driver` owns frozen-spec policy decisions, approval/input suspension, Tool execution, output bounds, and lossy progress.
 - `context::driver` owns zero-or-one provider execution, the single ContextBundle validation/canonical-sort seam, crate-private ValidatedContextBundle construction, cancellation, and deadline provenance.
 - `prompt::builder` owns one-per-head conversation planning, deterministic prompt ordering, fixed/final serialized-request budgeting, and checked-context finalization.
-- `compaction::driver` owns canonical candidate validation and one strategy call without commit authority.
+- `compaction::driver` owns canonical candidate validation and one strategy call without commit authority; candidate validation and the test-only race pause remain outside the helper, which is entered directly and prechecks control before its closure resolves availability.
+- `port_call` owns the shared cancellation/deadline/panic/drop protocol for the four bounded one-shot Port calls, including distinct invalid-effective-deadline reporting; it owns no retry, durability, interaction, or runner protocol policy.
 - `agent::environment` freezes the checked static Session environment once at create/load; `agent::runner` owns ordinary model/tool rounds, compaction recovery, exact single-entry delta acknowledgements, conservative usage, and normal completion through the tracked runner join.
 - `session::actor` owns durable append authority and terminal settlement.
 
@@ -56,6 +58,7 @@ src/
 ├── error/{operations.rs}
 ├── interaction.rs
 ├── model/{mod.rs,model.rs,response.rs,types.rs,driver.rs,driver/{assembler.rs,failure.rs,tests/...}}
+├── port_call.rs
 ├── prompt/{mod.rs,builder.rs,builder/tests/...}
 ├── session/{mod.rs,actor.rs,actor/{commands.rs,lifecycle.rs,run.rs,runner.rs,settlement.rs,supervisor.rs,tests/...},command.rs,event.rs,event_stream.rs,handle.rs,runtime.rs,runtime_log.rs,runtime_open.rs,runtime_shutdown.rs,state.rs,turn_handle.rs}
 ├── storage/mod.rs
@@ -66,7 +69,7 @@ src/
 
 ## Tests
 
-Focused source contracts protect each public Port and private driver boundary. Public integration tests cover create/load/shutdown, command admission, interactions/restart, forced event loss, compaction commits, Port failures, durability failures, transcript behavior, panic cleanup, shared-Port concurrency, and owner isolation. `tests/final_architecture_contract.rs` plus `scripts/check_v03_architecture.py` protect physical absence of the removed graph and the exact root/dependency/module surface. `scripts/acceptance_v03.json` is the canonical reviewed AT traceability map, and the documentation checker requires its generated Markdown and attributed tests to remain synchronized.
+Focused source contracts protect each public Port and private driver boundary. Public integration tests cover create/load/shutdown, command admission, interactions/restart, forced event loss, compaction commits, Port failures, durability failures, transcript behavior, panic cleanup, shared-Port concurrency, and owner isolation. `port_call` unit tests directly cover construction/poll panic, Ok/Err result cleanup, precheck suppression, biased cancellation/deadline/result priority, invalid effective deadlines, and child cancellation before future drop; source contracts prove only Context/Compaction/ToolPolicy/Tool use it and Model/ConversationLog do not. `tests/final_architecture_contract.rs` plus `scripts/check_v03_architecture.py` protect physical absence of the removed graph and the exact root/dependency/module surface. `scripts/acceptance_v03.json` is the canonical reviewed AT traceability map, and the documentation checker requires its generated Markdown and attributed tests to remain synchronized.
 
 The normative behavior pages are indexed from [Documentation Authority](../README.md): [SessionRuntime lifecycle](../contracts/session-runtime-lifecycle.md), [state](../contracts/session-state.md), [events](../contracts/event-stream.md), [Conversation](../contracts/conversation.md), [SessionLog](../contracts/session-log.md), [Model](../contracts/model.md), [Tool/policy/interaction](../contracts/tool-policy-interaction.md), [cancellation](../contracts/cancellation.md), and [extensions](../contracts/extensions.md). Host ownership is defined in the [Host boundary](../integration/host-boundary.md), and final evidence is recorded in the [acceptance matrix](../acceptance-v0.3.md).
 

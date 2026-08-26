@@ -92,7 +92,7 @@ REQUIRED_FILES = {
     "src/agent/runner/diagnostics.rs",
     "src/agent/runner/support.rs", "src/agent/runner_protocol.rs", "src/agent/tool_driver.rs",
     "src/agent/tool_driver/support.rs", "src/agent/turn_context.rs", "src/bindings.rs",
-    "src/prompt/mod.rs", "src/prompt/builder.rs",
+    "src/prompt/mod.rs", "src/prompt/builder.rs", "src/port_call.rs",
     "src/compaction/driver.rs",
     "src/session/mod.rs", "src/session/runtime.rs",
     "src/session/runtime_log.rs", "src/session/runtime_open.rs", "src/session/handle.rs",
@@ -121,7 +121,7 @@ PUBLIC_MODULES = {
     "compaction", "config", "context", "conversation", "error", "ids", "model", "session",
     "storage", "tools", "value",
 }
-PRIVATE_MODULES = {"agent", "bindings", "interaction", "prompt", "time"}
+PRIVATE_MODULES = {"agent", "bindings", "interaction", "port_call", "prompt", "time"}
 ROOT_EXPORTS = {
     "value": {"BoundedText"},
     "config": {"CompactionConfig", "KernelConfig", "RetryPolicy", "SemanticLimits", "SessionManifest", "SessionSpec", "TurnOptions", "UserInput"},

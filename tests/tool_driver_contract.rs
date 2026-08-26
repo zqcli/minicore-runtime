@@ -103,15 +103,14 @@ fn tool_driver_owns_only_policy_tool_suspension_and_progress_execution() {
         "pub(crate) struct ToolDriverResult",
         "pub(crate) async fn run(",
         ") -> Result<ToolDriverResult, SuspensionError>",
-        "effective_deadline(turn_deadline, self.config.policy_timeout)",
-        "effective_deadline(turn_deadline, self.config.tool_timeout)",
-        "DeadlineSource::Turn => PolicyResolution::DeadlineExceeded",
-        "DeadlineSource::Port => PolicyResolution::Denied",
-        "DeadlineSource::Turn => ExecutionResolution::DeadlineExceeded",
-        "DeadlineSource::Port => ExecutionResolution::Failed",
-        "catch_unwind(AssertUnwindSafe(|| policy.decide(request)))",
-        "catch_unwind(AssertUnwindSafe(|| tool.execute(invocation, context)))",
-        "child.cancel();",
+        "run_port_call(",
+        "PortCallOutcome::DeadlineExceeded(DeadlineSource::Turn)",
+        "PortCallOutcome::DeadlineExceeded(DeadlineSource::Port)",
+        "PortCallOutcome::InvalidDeadline(_)",
+        "PolicyResolution::DeadlineExceeded",
+        "ExecutionResolution::DeadlineExceeded",
+        "PortCallOutcome::InvalidDeadline(_)",
+        "PortCallOutcome::Returned(Err(_))",
         "suspensions.send(suspension)",
         ".try_send(ToolDriverProgress",
         "ToolResultOutcome::InputProvided",
@@ -145,6 +144,12 @@ fn tool_driver_owns_only_policy_tool_suspension_and_progress_execution() {
         driver.matches("let spec = enabled.spec.clone();").count(),
         1
     );
+    assert_eq!(driver.matches("run_port_call(").count(), 2);
+    let wait = driver
+        .split_once("async fn wait_for_answer(")
+        .map(|(_, body)| body)
+        .unwrap();
+    assert!(!wait.contains("run_port_call("));
     assert!(!driver.contains("tool.spec()"));
     assert!(!driver.contains("fn suspension_failure"));
     assert!(!driver.contains("fn effective_deadline("));

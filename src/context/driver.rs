@@ -1,12 +1,9 @@
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::FutureExt;
-use tokio::time::Instant as TokioInstant;
-
 use crate::config::SemanticLimits;
-use crate::time::{DeadlineSource, effective_deadline};
+use crate::port_call::{PortCallOutcome, run_port_call};
+use crate::time::DeadlineSource;
 
 use super::{ContextBlock, ContextBundle, ContextError, ContextProvider, ContextRequest};
 
@@ -118,35 +115,32 @@ impl ContextDriver {
             return Ok(Self::empty_bundle());
         };
         let cancellation = request.cancellation.clone();
-        if cancellation.is_cancelled() {
-            return Err(ContextDriverFailure::ordinary(ContextError::Cancelled));
-        }
-        let deadline = effective_deadline(request.deadline, self.context_timeout)
-            .map_err(|_| ContextDriverFailure::ordinary(ContextError::Internal))?;
-        if TokioInstant::now() >= deadline.tokio() {
-            return Err(ContextDriverFailure::deadline(deadline.source()));
-        }
-        request.deadline = deadline.standard();
-        let future = catch_unwind(AssertUnwindSafe(|| provider.provide(request)))
-            .map_err(|_| ContextDriverFailure::ordinary(ContextError::Internal))?;
-        let future = AssertUnwindSafe(future).catch_unwind();
-        tokio::pin!(future);
-        let result = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                return Err(ContextDriverFailure::ordinary(ContextError::Cancelled));
-            }
-            _ = tokio::time::sleep_until(deadline.tokio()) => {
-                return Err(ContextDriverFailure::deadline(deadline.source()));
-            }
-            result = &mut future => result,
-        };
-        match result {
-            Ok(Ok(bundle)) => {
+        let provider = Arc::clone(provider);
+        match run_port_call(
+            &cancellation,
+            request.deadline,
+            self.context_timeout,
+            |cancellation, deadline| {
+                request.cancellation = cancellation;
+                request.deadline = deadline;
+                provider.provide(request)
+            },
+        )
+        .await
+        {
+            PortCallOutcome::Returned(Ok(bundle)) => {
                 Self::validate_bundle(bundle, &self.limits).map_err(ContextDriverFailure::ordinary)
             }
-            Ok(Err(error)) => Err(ContextDriverFailure::ordinary(error)),
-            Err(_) => Err(ContextDriverFailure::ordinary(ContextError::Internal)),
+            PortCallOutcome::Returned(Err(error)) => Err(ContextDriverFailure::ordinary(error)),
+            PortCallOutcome::Cancelled => {
+                Err(ContextDriverFailure::ordinary(ContextError::Cancelled))
+            }
+            PortCallOutcome::DeadlineExceeded(source) => {
+                Err(ContextDriverFailure::deadline(source))
+            }
+            PortCallOutcome::InvalidDeadline(_) | PortCallOutcome::Panicked => {
+                Err(ContextDriverFailure::ordinary(ContextError::Internal))
+            }
         }
     }
 }

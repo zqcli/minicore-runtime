@@ -56,6 +56,7 @@ fn bundle(blocks: Vec<ContextBlock>) -> ContextBundle {
 struct StreamProbe {
     polled: AtomicBool,
     dropped: AtomicBool,
+    cancelled_before_drop: AtomicBool,
     notify: Notify,
 }
 
@@ -64,6 +65,7 @@ impl StreamProbe {
         Arc::new(Self {
             polled: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
+            cancelled_before_drop: AtomicBool::new(false),
             notify: Notify::new(),
         })
     }
@@ -83,6 +85,7 @@ impl StreamProbe {
 
 struct PendingContextFuture {
     probe: Arc<StreamProbe>,
+    cancellation: CancellationToken,
 }
 
 impl Future for PendingContextFuture {
@@ -97,6 +100,9 @@ impl Future for PendingContextFuture {
 
 impl Drop for PendingContextFuture {
     fn drop(&mut self) {
+        self.probe
+            .cancelled_before_drop
+            .store(self.cancellation.is_cancelled(), Ordering::SeqCst);
         self.probe.dropped.store(true, Ordering::SeqCst);
     }
 }
@@ -137,6 +143,7 @@ impl ScriptProvider {
 impl ContextProvider for ScriptProvider {
     fn provide<'a>(&'a self, request: ContextRequest) -> ContextFuture<'a> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let cancellation = request.cancellation.clone();
         lock(&self.requests).push(request);
         let behavior = lock(&self.behaviors)
             .pop_front()
@@ -146,7 +153,10 @@ impl ContextProvider for ScriptProvider {
             ProviderBehavior::Error(error) => Box::pin(async move { Err(error) }),
             ProviderBehavior::ConstructionPanic => panic!("scripted context construction panic"),
             ProviderBehavior::FuturePanic => Box::pin(async { panic!("scripted context panic") }),
-            ProviderBehavior::Pending(probe) => Box::pin(PendingContextFuture { probe }),
+            ProviderBehavior::Pending(probe) => Box::pin(PendingContextFuture {
+                probe,
+                cancellation,
+            }),
             ProviderBehavior::Barrier(barrier, bundle) => Box::pin(async move {
                 barrier.wait().await;
                 Ok(bundle)

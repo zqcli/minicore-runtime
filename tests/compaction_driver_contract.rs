@@ -14,16 +14,15 @@ fn compaction_driver_is_private_single_strategy_and_owner_neutral() {
         "pub(crate) async fn run_detailed(",
         "pub(crate) struct CompactionDriverFailure",
         "deadline_source: Option<DeadlineSource>",
-        "CompactionDriverFailure::deadline(deadline.source())",
-        "fn check_control(",
-        "effective_deadline(turn_deadline, self.timeout)",
-        "deadline.standard()",
-        "deadline.tokio()",
-        "catch_unwind(AssertUnwindSafe(|| strategy.compact(request)))",
-        "AssertUnwindSafe(future).catch_unwind()",
-        "let child_cancellation = cancellation.child_token();",
-        "child_cancellation.cancel();",
-        "validate_candidate(&candidate).map_err(CompactionDriverFailure::ordinary)?",
+        "CompactionDriverFailure::deadline(source)",
+        "run_port_call(",
+        "PortCallOutcome::Returned(Ok(Some(proposal)))",
+        "PortCallOutcome::Returned(Ok(None))",
+        "PortCallOutcome::Cancelled",
+        "PortCallOutcome::DeadlineExceeded(source)",
+        "PortCallOutcome::InvalidDeadline(_)",
+        "PortCallOutcome::Panicked",
+        "validate_candidate(&candidate_for_call).map_err(CompactionDriverFailure::ordinary)?",
         "fn validate_candidate(candidate: &CompactionCandidate) -> Result<bool, CompactionError>",
         "if candidate.entries().is_empty()",
         "candidate.head() == ConversationSeq::ZERO",
@@ -52,50 +51,37 @@ fn compaction_driver_is_private_single_strategy_and_owner_neutral() {
         1
     );
     let detailed_start = driver.find("pub(crate) async fn run_detailed(").unwrap();
-    let control_start = driver.find("fn check_control(").unwrap();
-    let detailed = &driver[detailed_start..control_start];
-    let deadline = detailed
-        .find("effective_deadline(turn_deadline, self.timeout)")
-        .unwrap();
-    let first_control = detailed
-        .find("check_control(&cancellation, &deadline)?")
-        .unwrap();
+    let candidate_start = driver.find("fn validate_candidate(").unwrap();
+    let detailed = &driver[detailed_start..candidate_start];
+    let call = detailed.find("run_port_call(").unwrap();
     let target = detailed.find("if target_tokens == 0").unwrap();
-    let candidate = detailed.find("validate_candidate(&candidate)").unwrap();
+    let candidate = detailed
+        .find("validate_candidate(&candidate_for_call).map_err(CompactionDriverFailure::ordinary)?")
+        .unwrap();
     let pause = detailed
         .find("tests::pause_after_candidate(turn_id).await")
         .unwrap();
-    let second_control = detailed
-        .rfind("check_control(&cancellation, &deadline)?")
-        .unwrap();
-    let boundary = detailed.find("if !has_newer_completed_boundary").unwrap();
-    let strategy = detailed
-        .find("let Some(strategy) = self.strategy.as_ref()")
-        .unwrap();
-    assert_eq!(
-        detailed
-            .matches("check_control(&cancellation, &deadline)?")
-            .count(),
-        2
-    );
-    assert!(
-        detailed.contains("#[cfg(test)]\n        tests::pause_after_candidate(turn_id).await;")
-    );
-    assert!(deadline < first_control);
-    assert!(first_control < target);
     assert!(target < candidate);
     assert!(candidate < pause);
-    assert!(pause < second_control);
-    assert!(second_control < boundary);
-    assert!(boundary < strategy);
-    let control = &driver[control_start..driver.find("fn validate_candidate(").unwrap()];
-    assert!(
-        control.find("cancellation.is_cancelled()").unwrap()
-            < control
-                .find("TokioInstant::now() >= deadline.tokio()")
-                .unwrap()
-    );
-    assert!(!driver.contains("fn effective_deadline("));
+    assert!(pause < call);
+    let closure_start = detailed
+        .find("move |child_cancellation, deadline| async move")
+        .unwrap();
+    let closure = &detailed[closure_start..];
+    let availability = closure
+        .find("let Some(strategy) = strategy.filter(|_| has_newer_completed_boundary)")
+        .unwrap();
+    let request = closure.find("let request = CompactionRequest").unwrap();
+    assert!(availability < request);
+    assert!(!closure.contains("target_tokens == 0"));
+    assert!(!closure.contains("validate_candidate"));
+    assert!(!closure.contains("pause_after_candidate"));
+    assert!(closure.contains("return Ok(None)"));
+    assert!(closure.contains("strategy.compact(request).await.map(Some)"));
+    assert!(!driver.contains("fn check_control("));
+    assert!(!driver.contains("effective_deadline("));
+    assert!(!driver.contains("tokio::select!"));
+    assert!(!driver.contains("catch_unwind"));
     for removed in [
         "fn is_terminal_boundary(",
         "candidate.entries().iter().any(",
@@ -130,12 +116,13 @@ fn compaction_driver_is_private_single_strategy_and_owner_neutral() {
     assert!(driver.lines().count() < 500);
     let deadline_tests = include_str!("../src/compaction/driver/tests/deadline.rs");
     assert!(
-        deadline_tests.contains("turn_control_precedes_target_candidate_and_strategy_availability")
+        deadline_tests
+            .contains("turn_control_after_candidate_validation_precedes_strategy_availability")
     );
     assert!(
-        deadline_tests
-            .contains("cancellation_after_candidate_validation_wins_before_strategy_invocation")
+        deadline_tests.contains("cancellation_after_candidate_validation_reaches_helper_precheck")
     );
+    assert!(deadline_tests.contains("deadline_after_candidate_validation_reaches_helper_precheck"));
     let test_support = include_str!("../src/compaction/driver/tests.rs");
     for required in [
         "OnceLock<Mutex<BTreeMap<TurnId, CandidateControlHook>>>",

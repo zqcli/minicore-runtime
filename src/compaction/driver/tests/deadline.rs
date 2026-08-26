@@ -2,47 +2,45 @@ use super::*;
 use crate::time::DeadlineSource;
 
 #[tokio::test(flavor = "current_thread")]
-async fn turn_control_precedes_target_candidate_and_strategy_availability() {
-    let cancelled = CancellationToken::new();
-    cancelled.cancel();
+async fn turn_control_after_candidate_validation_precedes_strategy_availability() {
+    let candidate = completed_candidate();
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
     let failure = driver(None, 64)
         .run_detailed(
             session_id(),
             turn_id(9),
-            CompactionCandidate::empty(),
-            0,
-            Instant::now() + Duration::from_secs(30),
-            cancelled,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(failure.error(), CompactionError::Cancelled);
-    assert_eq!(failure.deadline_source(), None);
-
-    let strategy = ScriptStrategy::new(Vec::new());
-    let cancellation = CancellationToken::new();
-    cancellation.cancel();
-    let failure = driver(Some(strategy_port(&strategy)), 64)
-        .run_detailed(
-            session_id(),
-            turn_id(9),
-            CompactionCandidate::empty(),
-            0,
+            candidate.clone(),
+            10,
             Instant::now() + Duration::from_secs(30),
             cancellation,
         )
         .await
         .unwrap_err();
     assert_eq!(failure.error(), CompactionError::Cancelled);
-    assert_eq!(strategy.calls(), 0);
+    assert_eq!(failure.deadline_source(), None);
+
+    let failure = driver(None, 64)
+        .run_detailed(
+            session_id(),
+            turn_id(9),
+            candidate.clone(),
+            10,
+            Instant::now() + Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure.error(), CompactionError::Unavailable);
 
     let strategy = ScriptStrategy::new(Vec::new());
     let failure = driver(Some(strategy_port(&strategy)), 64)
         .run_detailed(
             session_id(),
             turn_id(9),
-            CompactionCandidate::empty(),
-            0,
+            candidate,
+            10,
             Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
             CancellationToken::new(),
         )
@@ -54,9 +52,8 @@ async fn turn_control_precedes_target_candidate_and_strategy_availability() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn cancellation_after_candidate_validation_wins_before_strategy_invocation() {
-    let strategy = ScriptStrategy::new(Vec::new());
-    let compact = driver(Some(strategy_port(&strategy)), 64);
+async fn cancellation_after_candidate_validation_reaches_helper_precheck() {
+    let compact = driver(None, 64);
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
     let race_turn = turn_id(88);
@@ -79,7 +76,31 @@ async fn cancellation_after_candidate_validation_wins_before_strategy_invocation
     let failure = task.await.unwrap().unwrap_err();
     assert_eq!(failure.error(), CompactionError::Cancelled);
     assert_eq!(failure.deadline_source(), None);
-    assert_eq!(strategy.calls(), 0);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn deadline_after_candidate_validation_reaches_helper_precheck() {
+    let compact = driver(None, 64);
+    let race_turn = turn_id(89);
+    let hook = install_candidate_control_hook(race_turn);
+    let task = tokio::spawn(async move {
+        compact
+            .run_detailed(
+                session_id(),
+                race_turn,
+                completed_candidate(),
+                10,
+                Instant::now() + Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await
+    });
+    hook.wait_reached().await;
+    tokio::time::advance(Duration::from_secs(6)).await;
+    hook.release().await;
+    let failure = task.await.unwrap().unwrap_err();
+    assert_eq!(failure.error(), CompactionError::DeadlineExceeded);
+    assert_eq!(failure.deadline_source(), Some(DeadlineSource::Turn));
 }
 
 #[tokio::test(flavor = "current_thread")]

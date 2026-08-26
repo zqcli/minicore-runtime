@@ -23,6 +23,25 @@ use serde_json::json;
 
 use support::fake_session_log::{FakeSessionLog, Operation, Script};
 
+#[test]
+fn conversation_log_does_not_use_shared_port_call_execution() {
+    for path in [
+        "../src/conversation/log.rs",
+        "../src/conversation/session_log.rs",
+        "../src/session/runtime_log.rs",
+    ] {
+        let source = match path {
+            "../src/conversation/log.rs" => include_str!("../src/conversation/log.rs"),
+            "../src/conversation/session_log.rs" => {
+                include_str!("../src/conversation/session_log.rs")
+            }
+            "../src/session/runtime_log.rs" => include_str!("../src/session/runtime_log.rs"),
+            _ => unreachable!(),
+        };
+        assert!(!source.contains("run_port_call"), "{path} uses port helper");
+    }
+}
+
 fn timestamp() -> Timestamp {
     "2026-08-19T12:34:56.789Z".parse().unwrap()
 }

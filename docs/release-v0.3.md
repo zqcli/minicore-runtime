@@ -92,10 +92,10 @@ Validation environment:
 - remote Linux checkout: `/root/minicore-runtime-v03`;
 - stable `rustc 1.98.0`, `cargo 1.98.0`, and `clippy 1.98.0`;
 - full `scripts/check.sh` pass;
-- 294 root library tests plus passing cleaned integration/provider-gate suites;
+- 304 root library tests plus passing cleaned integration/provider-gate suites;
 - MSRV `rustc 1.85.0` and `cargo 1.85.0` with `scripts/check-msrv.sh` passing;
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked` passing;
-- authoritative architecture scanner passing with `production_files=144`;
+- authoritative architecture scanner passing with `production_files=145`;
 - GitHub Actions [run 32755428283](https://github.com/zqcli/minicore-runtime/actions/runs/32755428283) passed for commit `815494dad38c34c585dfeda3c0845ccc7c1fb7d0` across all four jobs (Rust stable Clippy quality gate, Rust 1.85.0 MSRV, `macos-latest`, and `windows-latest` with MSVC), validating review fixes AT-K01 through AT-K96.
 
 Cross-platform validation is complete across Linux, macOS, and Windows. No package or tag release has occurred; the repository is ready for publication.
@@ -121,12 +121,12 @@ The reviewed comparison uses baseline commit `2fd7104`. “cfg(test)-excluded pr
 
 | Metric | Baseline | Current | Change |
 | --- | ---: | ---: | ---: |
-| cfg(test)-excluded production LOC | 15,483 | 14,094 | -1,389 |
-| raw `src/**/*.rs` lines | 48,055 | 31,632 | -16,423 |
-| `src` Rust files | 174 | 144 | -30 |
-| files with production content | 83 | 78 | -5 |
+| cfg(test)-excluded production LOC | 15,483 | 14,107 | -1,376 |
+| raw `src/**/*.rs` lines | 48,055 | 32,004 | -16,051 |
+| `src` Rust files | 174 | 145 | -29 |
+| files with production content | 83 | 79 | -4 |
 
-The authoritative architecture gate separately prints `production_files=144`, meaning all physical Rust source files enumerated by that scanner. It must not be confused with the 78 files whose cfg(test)-excluded production view is nonempty. Relative to P5-A baseline `HEAD=7383a6a`, this minimal IC-06 slice adds 5 authoritative production lines, 9 raw Rust lines, and no root library tests.
+The authoritative architecture gate separately prints `production_files=145`, meaning all physical Rust source files enumerated by that scanner. It must not be confused with the 79 files whose cfg(test)-excluded production view is nonempty. Relative to P5-A baseline `HEAD=7383a6a`, this minimal IC-06 slice adds 5 authoritative production lines, 9 raw Rust lines, and no root library tests.
 
 **Approved exception — IC-05:** the ValidationCursor/ValidationPlan design measured `+202` cfg(test)-excluded production LOC against `HEAD=7383a6a` and was rejected because durable success would still clone the complete validator sets and `PromptProjection`. The preceding IC-06 slice delivered only `pending_index`; IC-05 remains incomplete and awaits benchmark evidence or an independent design before acceptance.
 
@@ -135,6 +135,8 @@ Relative to IC-07A baseline `HEAD=6d37803`, the context slice added 17 authorita
 Relative to IC-07B baseline `HEAD=b8e0003`, this PromptPlan slice removes 25 authoritative production lines, adds 325 raw Rust lines, increases root library tests from 291 to 294, and leaves all file counts unchanged. `PromptBuilder::plan` performs conversation projection, static-message composition, fixed serialization, and context-budget calculation once per head; `PromptPlan::finish` inserts checked context and performs the final request/window check without reprojection. Each model round permits one initial proactive attempt and, after a successful head advance, one changed-head replan with no second proactive attempt. Forced ContextOverflow recovery likewise replans once and retries Context without proactive compaction.
 
 Relative to IC-10 baseline `HEAD=4cd6c64`, this ToolDriver slice removes 3 authoritative production lines and 10 raw Rust lines, leaves root library tests and all file counts unchanged, and preserves the public ToolOutput boundary. Completed Tool results still fail when they exceed the session `max_tool_output_bytes`; otherwise the already checked `ToolOutput` is moved directly into `ToolDriverResult` without content reconstruction. The exact-boundary behavior and completed source shape are covered by `completed_output_enforces_exact_session_output_limit` and `tool_driver_owns_only_policy_tool_suspension_and_progress_execution`.
+
+Relative to IC-08 baseline `HEAD=a87027a`, this revision adds 13 authoritative production lines and 372 raw Rust lines, increases root library tests from 294 to 304, adds one Rust source file and one production-content file, and preserves the public Port/DTO surfaces. Driver deltas are Context `-6`, Compaction `-25`, and Tool `-25` production lines; the shared helper contributes 68 lines and root wiring contributes one. `port_call::run_port_call` now owns the shared one-shot cancellation, deadline-source, panic, child-before-Drop, and future-poll protocol. Its `InvalidDeadline(DeadlineOverflow)` outcome is distinct from `Panicked`; Context/Policy/Tool retain their baseline Internal/Denied/Failed classifications, while Compaction maps it to `DeadlineExceeded`. Compaction validates its candidate and runs the test-only race pause outside the helper, then enters it directly; the helper precheck runs before the closure's `Ok(None)` availability result or minimal strategy request/invocation. Validation races therefore retain `Cancelled`/Turn `BudgetExceeded` forced outcomes rather than `CompactionFailure`. ModelDriver, ConversationLog/SessionLog, Interaction waits, and runner critical channels do not use the helper.
 
 The gate also enforces canonical production paths, direct dependencies, public Port declarations, root exports, source-size limits, forbidden authority, and an all-singleton module DAG.
 
