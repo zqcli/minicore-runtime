@@ -26,7 +26,7 @@ P8 documentation and Linux functional acceptance are complete. The nine runtime 
 - [x] Confirmed the deleted dependencies are absent from the regenerated lock.
 - [x] Passed the supplied full remote formatting and check commands.
 - [x] Passed remote `scripts/check.sh` under its current toolchain. The script covers root formatting, locked all-target tests, warnings-denied all-target/all-feature Clippy, provider-gate formatting/tests/Clippy, documentation checks, architecture scanner self-tests/full gate, and diff checks.
-- [x] Observed 285 passing root library tests; the cleaned integration suites and provider-gate tests also passed. No aggregate test total is asserted here.
+- [x] Historical P6 snapshot: observed 285 passing root library tests; the cleaned integration suites and provider-gate tests also passed. Current test totals are maintained in `docs/release-v0.3.md`.
 
 The accurate status is: P6 source, lockfile, remote Rust/script gates, P8 documentation, Linux functional acceptance, and the native macOS and Windows CI matrix are complete; no package or tag release has occurred, and the repository is ready for publication.
 
@@ -39,7 +39,7 @@ The accurate status is: P6 source, lockfile, remote Rust/script gates, P8 docume
 - [x] Added canonical `scripts/acceptance_v03.json` and generated `docs/acceptance-v0.3.md` with one Passed row and one-or-more attributed evidence entries for every AT-K criterion (AT-K01 through AT-K96), including event-stream ergonomics, must-use warnings, and the breaking event-stream cutover.
 - [x] Added checker mutation evidence for unrelated Markdown mapping edits, stale unlisted current Markdown, and functions missing a Rust test attribute.
 - [x] Added `docs/release-v0.3.md` with D-01 through D-15, breaking changes, evidence, dependency/lock review, known limitations, and upgrade guidance.
-- [x] Recorded Linux functional acceptance, stable/MSRV commands, warnings-denied rustdoc, 285 root library tests, integration/provider suites, scanner output, and lock metrics.
+- [x] Recorded the historical P6 Linux functional snapshot, stable/MSRV commands, warnings-denied rustdoc, 285 root library tests, integration/provider suites, scanner output, and lock metrics.
 - [x] Obtain passing native macOS and Windows CI jobs before publication ([run 32755428283](https://github.com/zqcli/minicore-runtime/actions/runs/32755428283), commit `815494dad38c34c585dfeda3c0845ccc7c1fb7d0`).
 
 P8 documentation, functional acceptance, and native cross-platform CI are complete. The review fixes covered by AT-K01 through AT-K96 are validated; no package or tag release has occurred, and the repository is a validated release candidate ready for publication.
