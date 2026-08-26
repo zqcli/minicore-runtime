@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures_util::FutureExt;
 
 use crate::config::{KernelConfig, SessionManifest};
-use crate::error::{SessionLogError, SessionLogErrorKind};
+use crate::error::{DiagnosticCode, DurabilityClass, SessionLogError, SessionLogErrorKind};
 use crate::ids::{SessionId, ToolCallId, TurnId};
 use crate::model::{ModelFinishReason, ModelRef, ToolCall, Usage};
 use crate::time::{Timestamp, TimestampError};
@@ -97,6 +97,20 @@ pub(crate) enum ConversationCommitErrorKind {
     Log(SessionLogErrorKind),
 }
 
+impl ConversationCommitErrorKind {
+    pub(crate) const fn durability_class(self) -> DurabilityClass {
+        match self {
+            Self::DurabilityUnknown | Self::RecoveryUncertain => DurabilityClass::UnknownOutcome,
+            Self::Log(kind) => kind.durability_class(),
+            Self::ContractViolation
+            | Self::ReplayInvalid
+            | Self::TranscriptContractViolation
+            | Self::TranscriptProjectionMismatch => DurabilityClass::ConsistencyFailure,
+            _ => DurabilityClass::NotApplicable,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ConversationCloseOutcome {
     Known(SessionLogError),
@@ -176,6 +190,32 @@ impl ConversationCommitError {
     }
     pub(crate) const fn kind(&self) -> ConversationCommitErrorKind {
         self.kind
+    }
+
+    pub(crate) const fn durability_class(&self) -> DurabilityClass {
+        self.kind.durability_class()
+    }
+
+    pub(crate) const fn diagnostic_code(&self) -> DiagnosticCode {
+        match self.kind {
+            ConversationCommitErrorKind::DurabilityUnknown => DiagnosticCode::LogUnknownOutcome,
+            ConversationCommitErrorKind::Log(SessionLogErrorKind::UnknownOutcome) => {
+                DiagnosticCode::LogUnknownOutcome
+            }
+            ConversationCommitErrorKind::Log(SessionLogErrorKind::Conflict) => {
+                DiagnosticCode::LogConflict
+            }
+            ConversationCommitErrorKind::Log(
+                SessionLogErrorKind::Corrupt
+                | SessionLogErrorKind::NotInitialized
+                | SessionLogErrorKind::AlreadyInitialized,
+            ) => DiagnosticCode::LogCorrupt,
+            ConversationCommitErrorKind::TranscriptProjectionMismatch => {
+                DiagnosticCode::LogConflict
+            }
+            ConversationCommitErrorKind::TranscriptContractViolation => DiagnosticCode::LogCorrupt,
+            _ => DiagnosticCode::Internal,
+        }
     }
 
     pub(crate) const fn validation_error(&self) -> Option<ConversationValidationError> {
@@ -369,7 +409,7 @@ impl ConversationLog {
         let receipt = match outcome {
             OperationOutcome::Success(receipt) => receipt,
             OperationOutcome::Known(error)
-                if error.kind() == SessionLogErrorKind::UnknownOutcome =>
+                if error.kind().durability_class() == DurabilityClass::UnknownOutcome =>
             {
                 return Err(self.mark_durability_unknown(Some(error)));
             }
@@ -471,7 +511,7 @@ impl ConversationLog {
         let page = match outcome {
             OperationOutcome::Success(page) => page,
             OperationOutcome::Known(error)
-                if error.kind() == SessionLogErrorKind::UnknownOutcome =>
+                if error.kind().durability_class() == DurabilityClass::UnknownOutcome =>
             {
                 return Err(self.mark_durability_unknown(Some(error)));
             }
@@ -526,7 +566,7 @@ impl ConversationLog {
         match run_log_operation(self.log_operation_timeout, || self.inner.close()).await {
             OperationOutcome::Success(()) => Ok(()),
             OperationOutcome::Known(error)
-                if error.kind() == SessionLogErrorKind::UnknownOutcome =>
+                if error.kind().durability_class() == DurabilityClass::UnknownOutcome =>
             {
                 Err(self.mark_durability_unknown(Some(error)))
             }
@@ -679,7 +719,7 @@ pub(super) fn commit_error(kind: ConversationCommitErrorKind) -> ConversationCom
 pub(super) const FAILED_OPEN_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) fn map_log_error(error: SessionLogError) -> ConversationCommitError {
-    if error.kind() == SessionLogErrorKind::UnknownOutcome {
+    if error.kind().durability_class() == DurabilityClass::UnknownOutcome {
         ConversationCommitError::new(ConversationCommitErrorKind::DurabilityUnknown)
             .with_primary_log(error)
     } else {

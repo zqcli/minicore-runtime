@@ -39,7 +39,7 @@ pub(super) fn synthetic_log_error(kind: SessionLogErrorKind) -> SessionLogError 
     SessionLogError::new(
         kind,
         DiagnosticSummary::bounded_static(
-            log_code(kind),
+            kind.diagnostic_code(),
             DiagnosticCategory::Storage,
             "session log violated the owner lifecycle contract",
             false,
@@ -50,7 +50,7 @@ pub(super) fn synthetic_log_error(kind: SessionLogErrorKind) -> SessionLogError 
 fn secondary_diagnostic(outcome: ConversationCloseOutcome) -> DiagnosticSummary {
     match outcome {
         ConversationCloseOutcome::Known(error) => DiagnosticSummary::bounded_static(
-            log_code(error.kind()),
+            error.kind().diagnostic_code(),
             DiagnosticCategory::Storage,
             "session log close failed after an open failure",
             false,
@@ -67,21 +67,6 @@ fn secondary_diagnostic(outcome: ConversationCloseOutcome) -> DiagnosticSummary 
             "session log close panicked after an open failure",
             false,
         ),
-    }
-}
-
-fn log_code(kind: SessionLogErrorKind) -> DiagnosticCode {
-    match kind {
-        SessionLogErrorKind::Conflict => DiagnosticCode::LogConflict,
-        SessionLogErrorKind::Corrupt => DiagnosticCode::LogCorrupt,
-        SessionLogErrorKind::UnknownOutcome => DiagnosticCode::LogUnknownOutcome,
-        SessionLogErrorKind::NotInitialized | SessionLogErrorKind::AlreadyInitialized => {
-            DiagnosticCode::InvalidSessionManifest
-        }
-        SessionLogErrorKind::Closed => DiagnosticCode::SessionClosed,
-        SessionLogErrorKind::Unavailable | SessionLogErrorKind::Internal => {
-            DiagnosticCode::Internal
-        }
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::agent::{CommittedUpdate, RunnerCommitError, TurnSuspension};
 use crate::conversation::{
-    AssistantMessageDraft, ConversationCommitError, ConversationCommitErrorKind, SummaryDraft,
-    ToolResultDraft, UnsequencedEntry,
+    AssistantMessageDraft, ConversationCommitError, ConversationCommitErrorKind, DurabilityClass,
+    SummaryDraft, ToolResultDraft, UnsequencedEntry,
 };
 use crate::model::ModelDriverProgress;
 
@@ -86,14 +86,13 @@ impl SessionActor {
     }
 
     fn latch_commit_failure(&mut self, error: ConversationCommitError) -> RunnerCommitError {
-        let unknown = error.kind() == ConversationCommitErrorKind::DurabilityUnknown;
+        let unknown = error.durability_class() == DurabilityClass::UnknownOutcome;
         let result = match error.kind() {
-            ConversationCommitErrorKind::DurabilityUnknown => RunnerCommitError::DurabilityUnknown,
             ConversationCommitErrorKind::Closed => RunnerCommitError::RuntimeClosed,
             ConversationCommitErrorKind::Validation
             | ConversationCommitErrorKind::SequenceOverflow
             | ConversationCommitErrorKind::Timestamp => RunnerCommitError::Stale,
-            ConversationCommitErrorKind::Log(_) => RunnerCommitError::DurabilityUnavailable,
+            _ if unknown => RunnerCommitError::DurabilityUnknown,
             _ => RunnerCommitError::DurabilityUnavailable,
         };
         let diagnostic = super::settlement::commit_diagnostic(&error);

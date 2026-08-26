@@ -76,7 +76,7 @@ The batch must commit all entries or none. A mismatched expected head is `Confli
 - `Closed`;
 - `Internal`.
 
-`SessionLogError` carries a redacted `DiagnosticSummary`; Display exposes the kind, not raw adapter messages.
+`SessionLogError` carries a redacted `DiagnosticSummary`; Display exposes the kind, not raw adapter messages. Core maps these kinds through a crate-private `DurabilityClass`: known failure, unknown outcome, consistency failure, or not applicable. The class is a bottom operation fact, not a public health policy; append and transcript callers may intentionally choose different dispositions.
 
 `UnknownOutcome` means the caller cannot know whether mutation happened. Core must not retry blindly or advance confirmed state. During an active Session it degrades durability and blocks new submit. During restart repair it prevents readiness. Timeout, panic, cancellation after admission, and malformed success receipts may also be classified as durability unknown by the Core wrapper.
 

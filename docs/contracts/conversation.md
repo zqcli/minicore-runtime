@@ -42,7 +42,7 @@ A Summary cannot cross a nonterminal boundary, summarize the active Turn, forge 
 
 Only `ConversationLog` assigns sequence numbers and timestamps. Runners submit unsequenced drafts; SessionActor submits them to ConversationLog. Confirmed in-memory state advances only after the adapter returns an exact `AppendReceipt` proving one canonical prefix extension.
 
-Known append failure leaves confirmed memory unchanged. Unknown outcome, timeout, panic, or invalid receipt never commits memory and latches durability uncertainty. The actor-owned log view carries validated provenance for its exact state/head/spec/limits; after a successful single-entry append, the actor acknowledges only the committed entry delta and validated new view. Runner validation requires that provenance and never compares or replays the old prefix. Normal runner completion returns through the tracked JoinHandle, not a critical-channel finish event; actor-forced outcomes remain separate from the joined outcome. Public state, ToolFinished, TurnHandle completion, and TurnFinished obey the durable-first order defined by their contracts.
+Known append failure leaves confirmed memory unchanged. Unknown outcome, timeout, panic, or invalid receipt never commits memory and latches durability uncertainty. The private `DurabilityClass` seam centralizes `KnownFailure`, `UnknownOutcome`, `ConsistencyFailure`, and `NotApplicable` across SessionLog and ConversationCommit errors without deciding public health or caller disposition. The actor-owned log view carries validated provenance for its exact state/head/spec/limits; after a successful single-entry append, the actor acknowledges only the committed entry delta and validated new view. Runner validation requires that provenance and never compares or replays the old prefix. Normal runner completion returns through the tracked JoinHandle, not a critical-channel finish event; actor-forced outcomes remain separate from the joined outcome. Public state, ToolFinished, TurnHandle completion, and TurnFinished obey the durable-first order defined by their contracts.
 
 ## Settlement
 
@@ -59,6 +59,19 @@ Load replays and validates all pages before readiness. An unfinished Turn is rep
 - the repair is one atomic append batch.
 
 Already terminal history receives no repair. Pending approvals, ToolInput requests, Tool futures, Model continuations, and in-memory cancellation state are not restored. An unknown repair outcome fails load without spawning a ready actor.
+
+## Durability Classification
+
+The low-level classification matrix is shared by append, runner commit, settlement, open, recovery, and shutdown:
+
+| Class | SessionLog kinds | Meaning |
+| --- | --- | --- |
+| `KnownFailure` | `Unavailable`, `Internal`, `Closed` | The operation failed with a known outcome; the caller chooses whether that operation remains Healthy. |
+| `UnknownOutcome` | `UnknownOutcome` and timeout/panic/invalid-receipt latches | Durable state may have changed without confirmation; the latch and terminal suppression rules apply. |
+| `ConsistencyFailure` | `Conflict`, `Corrupt`, initialization-state violations, and contract/projection mismatches | Durable state or its contract is inconsistent. |
+| `NotApplicable` | caller/configuration/validation-only Conversation errors | No durable operation classification applies. |
+
+This is not a global health policy. In particular, append `Unavailable` degrades an active commit, while transcript `Unavailable` remains Healthy and retryable; transcript caller-invalid, `Closed`, and `Internal` dispositions remain operation-specific.
 
 ## Transcript
 

@@ -34,7 +34,7 @@ The root test suite covers only the final v0.3 public surface and private execut
 - `session_runtime_restart_event_evidence.rs` covers nondurable interaction restart repair, forced event loss with authoritative state/Turn/transcript, and atomic unresolved-tool settlement.
 - `session_runtime_shared_ports_evidence.rs` proves two owners use the exact same Model/ToolPolicy/ContextProvider Arcs concurrently while cancellation remains isolated.
 - `session_runtime_semantic_limits_evidence.rs` covers instance-level limits, custom `max_tool_count` create/load roundtrip, early rejection before log initialize, and absolute structural bounds.
-- `session_runtime_transcript_degraded_evidence.rs` covers transcript consistency classification, store Conflict/Corrupt degradation, observed head and contract violation degradation, and Healthy isolation for caller input and temporary unavailable errors.
+- `session_runtime_transcript_degraded_evidence.rs` covers the table-driven append/transcript durability matrix: append Unavailable degrades while transcript Unavailable remains Healthy, Conflict/Corrupt/Unknown degrade with stable diagnostics, Internal remains transcript-Healthy, and caller-invalid input remains Healthy; it also covers observed head and contract violation degradation.
 - `event_summary_structure_contract.rs` locks the public event summary field set against payload, argument, answer, and raw-error expansion.
 - Private runtime test `post_ready_actor_panic_joins_pending_runner_before_close` proves the real post-ready panic supervisor joins the pending runner before close.
 

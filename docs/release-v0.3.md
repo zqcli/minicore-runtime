@@ -92,7 +92,7 @@ Validation environment:
 - remote Linux checkout: `/root/minicore-runtime-v03`;
 - stable `rustc 1.98.0`, `cargo 1.98.0`, and `clippy 1.98.0`;
 - full `scripts/check.sh` pass;
-- 304 root library tests plus passing cleaned integration/provider-gate suites;
+- 305 root library tests plus passing cleaned integration/provider-gate suites;
 - MSRV `rustc 1.85.0` and `cargo 1.85.0` with `scripts/check-msrv.sh` passing;
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked` passing;
 - authoritative architecture scanner passing with `production_files=145`;
@@ -121,8 +121,8 @@ The reviewed comparison uses baseline commit `2fd7104`. “cfg(test)-excluded pr
 
 | Metric | Baseline | Current | Change |
 | --- | ---: | ---: | ---: |
-| cfg(test)-excluded production LOC | 15,483 | 14,107 | -1,376 |
-| raw `src/**/*.rs` lines | 48,055 | 32,004 | -16,051 |
+| cfg(test)-excluded production LOC | 15,483 | 14,112 | -1,371 |
+| raw `src/**/*.rs` lines | 48,055 | 32,072 | -15,983 |
 | `src` Rust files | 174 | 145 | -29 |
 | files with production content | 83 | 79 | -4 |
 
@@ -137,6 +137,8 @@ Relative to IC-07B baseline `HEAD=b8e0003`, this PromptPlan slice removes 25 aut
 Relative to IC-10 baseline `HEAD=4cd6c64`, this ToolDriver slice removes 3 authoritative production lines and 10 raw Rust lines, leaves root library tests and all file counts unchanged, and preserves the public ToolOutput boundary. Completed Tool results still fail when they exceed the session `max_tool_output_bytes`; otherwise the already checked `ToolOutput` is moved directly into `ToolDriverResult` without content reconstruction. The exact-boundary behavior and completed source shape are covered by `completed_output_enforces_exact_session_output_limit` and `tool_driver_owns_only_policy_tool_suspension_and_progress_execution`.
 
 Relative to IC-08 baseline `HEAD=a87027a`, this revision adds 13 authoritative production lines and 372 raw Rust lines, increases root library tests from 294 to 304, adds one Rust source file and one production-content file, and preserves the public Port/DTO surfaces. Driver deltas are Context `-6`, Compaction `-25`, and Tool `-25` production lines; the shared helper contributes 68 lines and root wiring contributes one. `port_call::run_port_call` now owns the shared one-shot cancellation, deadline-source, panic, child-before-Drop, and future-poll protocol. Its `InvalidDeadline(DeadlineOverflow)` outcome is distinct from `Panicked`; Context/Policy/Tool retain their baseline Internal/Denied/Failed classifications, while Compaction maps it to `DeadlineExceeded`. Compaction validates its candidate and runs the test-only race pause outside the helper, then enters it directly; the helper precheck runs before the closure's `Ok(None)` availability result or minimal strategy request/invocation. Validation races therefore retain `Cancelled`/Turn `BudgetExceeded` forced outcomes rather than `CompactionFailure`. ModelDriver, ConversationLog/SessionLog, Interaction waits, and runner critical channels do not use the helper.
+
+Relative to IC-09 baseline `HEAD=a72278e`, this durability-classification slice adds 5 authoritative production lines and 68 raw Rust lines, increases root library tests from 304 to 305, leaves all file counts unchanged, and removes the duplicated log-code helper plus scattered unknown-outcome checks. `DurabilityClass::{KnownFailure, UnknownOutcome, ConsistencyFailure, NotApplicable}` is shared by SessionLog and ConversationCommit errors across append, runner commit, settlement, open, recovery, and shutdown. Transcript caller-invalid, temporary-unavailable, Closed/Internal, and consistency dispositions remain operation-specific; append `Unavailable` still degrades while transcript `Unavailable` remains Healthy. The table-driven matrix preserves Conflict/Corrupt/Unknown diagnostics, retryability, health transitions, durability latches, and state-before-event ordering.
 
 The gate also enforces canonical production paths, direct dependencies, public Port declarations, root exports, source-size limits, forbidden authority, and an all-singleton module DAG.
 
