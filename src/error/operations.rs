@@ -19,6 +19,43 @@ pub enum SessionLogErrorKind {
     Internal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DurabilityClass {
+    KnownFailure,
+    UnknownOutcome,
+    ConsistencyFailure,
+    NotApplicable,
+}
+
+impl SessionLogErrorKind {
+    pub(crate) const fn durability_class(self) -> DurabilityClass {
+        match self {
+            Self::Conflict | Self::Corrupt | Self::NotInitialized | Self::AlreadyInitialized => {
+                DurabilityClass::ConsistencyFailure
+            }
+            Self::UnknownOutcome => DurabilityClass::UnknownOutcome,
+            Self::Unavailable | Self::Closed | Self::Internal => DurabilityClass::KnownFailure,
+        }
+    }
+
+    pub(crate) const fn diagnostic_code(self) -> DiagnosticCode {
+        match self {
+            Self::Conflict => DiagnosticCode::LogConflict,
+            Self::Corrupt => DiagnosticCode::LogCorrupt,
+            Self::UnknownOutcome => DiagnosticCode::LogUnknownOutcome,
+            Self::NotInitialized | Self::AlreadyInitialized => {
+                DiagnosticCode::InvalidSessionManifest
+            }
+            Self::Closed => DiagnosticCode::SessionClosed,
+            Self::Unavailable | Self::Internal => DiagnosticCode::Internal,
+        }
+    }
+
+    pub(crate) const fn retryable(self) -> bool {
+        matches!(self, Self::Unavailable)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionLogError {
     kind: SessionLogErrorKind,
@@ -150,10 +187,10 @@ impl SessionOpenError {
     pub(crate) fn log(log_error: SessionLogError) -> Self {
         let mut error = Self::new(
             SessionOpenErrorKind::Log,
-            log_code(log_error.kind()),
+            log_error.kind().diagnostic_code(),
             DiagnosticCategory::Storage,
             "session log operation failed while opening the session",
-            matches!(log_error.kind(), SessionLogErrorKind::Unavailable),
+            log_error.kind().retryable(),
         );
         error.details_mut().log_error = Some(log_error);
         error
@@ -271,10 +308,10 @@ impl SessionShutdownError {
 
     pub(crate) fn log_close(kind: SessionLogErrorKind) -> Self {
         Self::LogClose(DiagnosticSummary::bounded_static(
-            log_code(kind),
+            kind.diagnostic_code(),
             DiagnosticCategory::Storage,
             "session log close failed",
-            matches!(kind, SessionLogErrorKind::Unavailable),
+            kind.retryable(),
         ))
     }
 
@@ -320,26 +357,74 @@ impl fmt::Display for SessionShutdownError {
 
 impl std::error::Error for SessionShutdownError {}
 
-fn log_code(kind: SessionLogErrorKind) -> DiagnosticCode {
-    match kind {
-        SessionLogErrorKind::Conflict => DiagnosticCode::LogConflict,
-        SessionLogErrorKind::Corrupt => DiagnosticCode::LogCorrupt,
-        SessionLogErrorKind::UnknownOutcome => DiagnosticCode::LogUnknownOutcome,
-        SessionLogErrorKind::NotInitialized | SessionLogErrorKind::AlreadyInitialized => {
-            DiagnosticCode::InvalidSessionManifest
-        }
-        SessionLogErrorKind::Closed => DiagnosticCode::SessionClosed,
-        SessionLogErrorKind::Unavailable | SessionLogErrorKind::Internal => {
-            DiagnosticCode::Internal
-        }
-    }
-}
-
 fn shutdown_kind(error: &SessionShutdownError) -> &'static str {
     match error {
         SessionShutdownError::Timeout(_) => "Timeout",
         SessionShutdownError::Durability(_) => "Durability",
         SessionShutdownError::LogClose(_) => "LogClose",
         SessionShutdownError::ActorTerminated(_) => "ActorTerminated",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_log_durability_classification_matrix_is_stable() {
+        for (kind, class, code, retryable) in [
+            (
+                SessionLogErrorKind::Unavailable,
+                DurabilityClass::KnownFailure,
+                DiagnosticCode::Internal,
+                true,
+            ),
+            (
+                SessionLogErrorKind::Internal,
+                DurabilityClass::KnownFailure,
+                DiagnosticCode::Internal,
+                false,
+            ),
+            (
+                SessionLogErrorKind::Closed,
+                DurabilityClass::KnownFailure,
+                DiagnosticCode::SessionClosed,
+                false,
+            ),
+            (
+                SessionLogErrorKind::UnknownOutcome,
+                DurabilityClass::UnknownOutcome,
+                DiagnosticCode::LogUnknownOutcome,
+                false,
+            ),
+            (
+                SessionLogErrorKind::Conflict,
+                DurabilityClass::ConsistencyFailure,
+                DiagnosticCode::LogConflict,
+                false,
+            ),
+            (
+                SessionLogErrorKind::Corrupt,
+                DurabilityClass::ConsistencyFailure,
+                DiagnosticCode::LogCorrupt,
+                false,
+            ),
+            (
+                SessionLogErrorKind::NotInitialized,
+                DurabilityClass::ConsistencyFailure,
+                DiagnosticCode::InvalidSessionManifest,
+                false,
+            ),
+            (
+                SessionLogErrorKind::AlreadyInitialized,
+                DurabilityClass::ConsistencyFailure,
+                DiagnosticCode::InvalidSessionManifest,
+                false,
+            ),
+        ] {
+            assert_eq!(kind.durability_class(), class);
+            assert_eq!(kind.diagnostic_code(), code);
+            assert_eq!(kind.retryable(), retryable);
+        }
     }
 }

@@ -25,6 +25,17 @@ use support::fake_session_log::{FakeSessionLog, Operation, Script};
 
 #[test]
 fn conversation_log_does_not_use_shared_port_call_execution() {
+    let operations = include_str!("../src/error/operations.rs");
+    let runtime_log = include_str!("../src/session/runtime_log.rs");
+    let conversation_log = include_str!("../src/conversation/log.rs");
+    assert!(operations.contains("pub(crate) enum DurabilityClass"));
+    assert!(operations.contains("pub(crate) const fn durability_class"));
+    assert!(operations.contains("pub(crate) const fn diagnostic_code"));
+    assert!(operations.contains("pub(crate) const fn retryable"));
+    assert!(conversation_log.contains("pub(crate) const fn durability_class(&self)"));
+    assert!(conversation_log.contains("pub(crate) const fn diagnostic_code(&self)"));
+    assert!(!operations.contains("fn log_code("));
+    assert!(!runtime_log.contains("fn log_code("));
     for path in [
         "../src/conversation/log.rs",
         "../src/conversation/session_log.rs",

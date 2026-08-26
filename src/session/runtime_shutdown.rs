@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-use crate::conversation::{ConversationCommitError, ConversationCommitErrorKind};
+use crate::conversation::{ConversationCommitError, ConversationCommitErrorKind, DurabilityClass};
 use crate::error::SessionShutdownError;
 use crate::storage::SessionLogErrorKind;
 
@@ -37,15 +37,12 @@ pub(super) fn map_actor_exit(exit: SessionActorExit) -> Result<(), SessionShutdo
             Err(SessionShutdownError::actor_terminated())
         }
         SessionActorExit::CloseFailed(error)
-            if error.kind() == ConversationCommitErrorKind::DurabilityUnknown =>
+            if error.durability_class() == DurabilityClass::UnknownOutcome =>
         {
             Err(SessionShutdownError::durability())
         }
         SessionActorExit::CloseFailed(error) => match error.kind() {
             ConversationCommitErrorKind::Log(kind) => Err(SessionShutdownError::log_close(kind)),
-            ConversationCommitErrorKind::DurabilityUnknown => {
-                Err(SessionShutdownError::durability())
-            }
             _ => Err(SessionShutdownError::log_close(
                 SessionLogErrorKind::Internal,
             )),

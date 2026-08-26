@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use super::session_log::SessionLog;
 use crate::config::{KernelConfig, SemanticLimits, SessionManifest};
+use crate::error::DurabilityClass;
 use crate::ids::SessionId;
 use futures_util::FutureExt;
 
@@ -216,9 +217,7 @@ impl PendingConversationLoad {
                 .await;
             let primary = match append {
                 Ok(Ok(_)) => None,
-                Ok(Err(error))
-                    if error.kind() == ConversationCommitErrorKind::DurabilityUnknown =>
-                {
+                Ok(Err(error)) if error.durability_class() == DurabilityClass::UnknownOutcome => {
                     Some(error.with_kind(ConversationCommitErrorKind::RecoveryUncertain))
                 }
                 Ok(Err(error)) => Some(error),

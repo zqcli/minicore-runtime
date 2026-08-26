@@ -8,6 +8,7 @@ use crate::value::BoundedText;
 
 mod operations;
 
+pub(crate) use operations::DurabilityClass;
 pub use operations::{
     SessionLogError, SessionLogErrorKind, SessionOpenError, SessionOpenErrorKind,
     SessionShutdownError,

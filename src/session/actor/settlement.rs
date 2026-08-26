@@ -1,7 +1,8 @@
 use super::super::event::SessionEvent;
 use super::*;
 use crate::conversation::{
-    ConversationCommitError, ConversationCommitErrorKind, ConversationEntry, TurnTerminal,
+    ConversationCommitError, ConversationCommitErrorKind, ConversationEntry, DurabilityClass,
+    TurnTerminal,
 };
 use crate::error::SessionLogErrorKind;
 
@@ -121,7 +122,7 @@ impl SessionActor {
                 health: self.core.health.clone(),
             });
         }
-        if error.kind() == ConversationCommitErrorKind::DurabilityUnknown {
+        if error.durability_class() == DurabilityClass::UnknownOutcome {
             active.completion.durability_unknown(diagnostic.clone());
         } else {
             active.completion.durability_unavailable(diagnostic.clone());
@@ -283,18 +284,6 @@ pub(super) fn classify_transcript_error(error: &ConversationCommitError) -> Tran
                 false,
             )
         }
-        ConversationCommitErrorKind::DurabilityUnknown
-        | ConversationCommitErrorKind::Log(SessionLogErrorKind::UnknownOutcome) => {
-            TranscriptDisposition::Degrade(
-                SessionActor::diagnostic(
-                    DiagnosticCode::LogUnknownOutcome,
-                    DiagnosticCategory::Storage,
-                    "session log durability unknown during transcript read",
-                    false,
-                ),
-                true,
-            )
-        }
         ConversationCommitErrorKind::TranscriptContractViolation => TranscriptDisposition::Degrade(
             SessionActor::diagnostic(
                 DiagnosticCode::LogCorrupt,
@@ -315,17 +304,20 @@ pub(super) fn classify_transcript_error(error: &ConversationCommitError) -> Tran
                 false,
             )
         }
-        ConversationCommitErrorKind::EmptyBatch
-        | ConversationCommitErrorKind::InvalidConfiguration
-        | ConversationCommitErrorKind::InvalidManifest
-        | ConversationCommitErrorKind::CompatibilityProofMismatch
-        | ConversationCommitErrorKind::SessionIdMismatch
-        | ConversationCommitErrorKind::ReplayInvalid
-        | ConversationCommitErrorKind::RecoveryUncertain
-        | ConversationCommitErrorKind::SequenceOverflow
-        | ConversationCommitErrorKind::Timestamp
-        | ConversationCommitErrorKind::Validation
-        | ConversationCommitErrorKind::ContractViolation => TranscriptDisposition::Degrade(
+        kind if error.durability_class() == DurabilityClass::UnknownOutcome
+            && !matches!(kind, ConversationCommitErrorKind::RecoveryUncertain) =>
+        {
+            TranscriptDisposition::Degrade(
+                SessionActor::diagnostic(
+                    DiagnosticCode::LogUnknownOutcome,
+                    DiagnosticCategory::Storage,
+                    "session log durability unknown during transcript read",
+                    false,
+                ),
+                true,
+            )
+        }
+        _ => TranscriptDisposition::Degrade(
             SessionActor::diagnostic(
                 DiagnosticCode::Internal,
                 DiagnosticCategory::Storage,
@@ -338,39 +330,8 @@ pub(super) fn classify_transcript_error(error: &ConversationCommitError) -> Tran
 }
 
 pub(super) fn commit_diagnostic(error: &ConversationCommitError) -> DiagnosticSummary {
-    let code = match error.kind() {
-        ConversationCommitErrorKind::DurabilityUnknown
-        | ConversationCommitErrorKind::Log(SessionLogErrorKind::UnknownOutcome) => {
-            DiagnosticCode::LogUnknownOutcome
-        }
-        ConversationCommitErrorKind::Log(SessionLogErrorKind::Conflict)
-        | ConversationCommitErrorKind::TranscriptProjectionMismatch => DiagnosticCode::LogConflict,
-        ConversationCommitErrorKind::Log(SessionLogErrorKind::Corrupt)
-        | ConversationCommitErrorKind::Log(SessionLogErrorKind::NotInitialized)
-        | ConversationCommitErrorKind::Log(SessionLogErrorKind::AlreadyInitialized)
-        | ConversationCommitErrorKind::TranscriptContractViolation => DiagnosticCode::LogCorrupt,
-        ConversationCommitErrorKind::Closed
-        | ConversationCommitErrorKind::EmptyBatch
-        | ConversationCommitErrorKind::InvalidConfiguration
-        | ConversationCommitErrorKind::InvalidManifest
-        | ConversationCommitErrorKind::CompatibilityProofMismatch
-        | ConversationCommitErrorKind::SessionIdMismatch
-        | ConversationCommitErrorKind::ReplayInvalid
-        | ConversationCommitErrorKind::RecoveryUncertain
-        | ConversationCommitErrorKind::TranscriptLimit
-        | ConversationCommitErrorKind::TranscriptCursor
-        | ConversationCommitErrorKind::SequenceOverflow
-        | ConversationCommitErrorKind::Timestamp
-        | ConversationCommitErrorKind::Validation
-        | ConversationCommitErrorKind::ContractViolation
-        | ConversationCommitErrorKind::Log(SessionLogErrorKind::Unavailable)
-        | ConversationCommitErrorKind::Log(SessionLogErrorKind::Closed)
-        | ConversationCommitErrorKind::Log(SessionLogErrorKind::Internal) => {
-            DiagnosticCode::Internal
-        }
-    };
     SessionActor::diagnostic(
-        code,
+        error.diagnostic_code(),
         DiagnosticCategory::Storage,
         "session conversation commit failed",
         false,

@@ -53,6 +53,116 @@ async fn transcript_store_conflict_returns_log_conflict_and_degrades_session() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn append_and_transcript_durability_matrix_preserves_operation_disposition() {
+    let matrix = [
+        (
+            SessionLogErrorKind::Unavailable,
+            DiagnosticCode::Internal,
+            true,
+            false,
+        ),
+        (
+            SessionLogErrorKind::Internal,
+            DiagnosticCode::Internal,
+            false,
+            false,
+        ),
+        (
+            SessionLogErrorKind::Conflict,
+            DiagnosticCode::LogConflict,
+            false,
+            false,
+        ),
+        (
+            SessionLogErrorKind::Corrupt,
+            DiagnosticCode::LogCorrupt,
+            false,
+            false,
+        ),
+        (
+            SessionLogErrorKind::UnknownOutcome,
+            DiagnosticCode::LogUnknownOutcome,
+            false,
+            true,
+        ),
+    ];
+
+    for (index, (kind, code, retryable, unknown)) in matrix.into_iter().enumerate() {
+        let mut log = FakeSessionLog::new();
+        log.script_append(Script::Continue);
+        if unknown {
+            log.script_append(Script::UnknownOutcome { committed: false });
+        } else {
+            log.script_append(Script::Error(kind));
+        }
+        let (runtime, handle, _inspection, _events) =
+            create_runtime(session(20 + index as u8), log).await;
+        let turn = handle
+            .submit(
+                UserInput::text("append matrix").unwrap(),
+                TurnOptions::default(),
+            )
+            .await
+            .unwrap();
+        let wait_error = turn.wait().await.unwrap_err();
+        match (unknown, wait_error) {
+            (true, TurnWaitError::DurabilityUnknown(diagnostic))
+            | (false, TurnWaitError::DurabilityUnavailable(diagnostic)) => {
+                assert_eq!(diagnostic.code, code);
+                assert!(!diagnostic.retryable);
+            }
+            (expected, other) => {
+                panic!("append matrix mismatch for {kind:?}, unknown={expected}: {other:?}")
+            }
+        }
+        match handle.state().health {
+            SessionHealth::Degraded { diagnostic } => {
+                assert_eq!(diagnostic.code, code);
+                assert!(!diagnostic.retryable);
+            }
+            other => panic!("append {kind:?} did not degrade: {other:?}"),
+        }
+        runtime.shutdown().await.unwrap();
+
+        let mut log = FakeSessionLog::new();
+        log.script_read(Script::Error(kind));
+        let (runtime, handle, _inspection, _events) =
+            create_runtime(session(30 + index as u8), log).await;
+        let transcript_error = handle.transcript(None, 32).await.unwrap_err();
+        match transcript_error {
+            SessionError::TranscriptUnavailable(diagnostic) => {
+                assert_eq!(diagnostic.code, code);
+                assert_eq!(diagnostic.retryable, retryable);
+            }
+            other => panic!("transcript {kind:?} returned the wrong error: {other:?}"),
+        }
+        if matches!(
+            kind,
+            SessionLogErrorKind::Conflict | SessionLogErrorKind::Corrupt
+        ) || unknown
+        {
+            assert!(matches!(
+                handle.state().health,
+                SessionHealth::Degraded { .. }
+            ));
+        } else {
+            assert_eq!(handle.state().health, SessionHealth::Healthy);
+        }
+        runtime.shutdown().await.unwrap();
+    }
+
+    let (runtime, handle, _inspection, _events) =
+        create_runtime(session(40), FakeSessionLog::new()).await;
+    let error = handle
+        .transcript(Some(ConversationSeq::new(999)), 32)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SessionError::InvalidInput(_)));
+    assert_eq!(handle.state().health, SessionHealth::Healthy);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn transcript_store_corrupt_emits_health_changed_and_degrades_session() {
     let mut log = FakeSessionLog::new();
     log.script_read(Script::Error(SessionLogErrorKind::Corrupt));

@@ -43,7 +43,7 @@ A state is invalid if its active Turn is already recorded as `last_terminal`. Wa
 
 Ordinary Model, Context, policy, or Tool failures settle a Turn and do not degrade the Session. Degraded health records a durability or invariant problem that makes further execution unsafe:
 
-- An unknown append outcome or active critical append failure during turn execution.
+- A known or unknown active append/critical-commit failure during turn execution; unknown outcomes additionally latch durability uncertainty.
 - Storage consistency failures during transcript reading (`Conflict`, `Corrupt`, `UnknownOutcome`, page contract violation, or projection mismatch).
 
 When a session degrades during an active turn:
@@ -55,7 +55,7 @@ When a session degrades during an active turn:
 - An `ActiveCommitFailure` is latched to suppress settlement terminal append attempts, preventing fabricated completions.
 - Subsequent `submit` and `answer` commands are rejected.
 
-Transient storage errors (`Unavailable` [retryable] or `Internal` [non-retryable]), caller errors (invalid cursor or limit), and `Closed` logs preserve `Healthy` session state.
+Transient storage errors (`Unavailable` [retryable] or `Internal` [non-retryable]), caller errors (invalid cursor or limit), and `Closed` logs preserve `Healthy` session state when they arise from transcript operations. The same low-level `KnownFailure` class from an active append is a commit durability failure and degrades the Session.
 
 Health and status are distinct. A Session may be `Closing` while degraded, and a durability failure does not invent a terminal entry.
 

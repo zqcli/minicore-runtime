@@ -11,6 +11,7 @@ pub mod transcript;
 mod validator;
 mod view;
 
+pub(crate) use crate::error::DurabilityClass;
 pub(crate) use load::{LoadCompatibilityValidated, close_unopened_log};
 pub(crate) use log::{
     AssistantMessageDraft, ConversationCloseOutcome, ConversationCommitError,
