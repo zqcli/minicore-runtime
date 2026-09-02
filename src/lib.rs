@@ -1,27 +1,42 @@
 mod agent;
+mod agent_loop;
 mod bindings;
 pub mod compaction;
 pub mod config;
 pub mod context;
 pub mod conversation;
 pub mod error;
+pub mod execution;
+pub mod history;
 pub mod ids;
 mod interaction;
+pub mod limits;
 pub mod model;
 mod port_call;
 mod prompt;
+pub mod prompt_provider;
 pub mod session;
 pub mod storage;
 mod time;
 pub mod tools;
 pub mod value;
 
+pub use agent_loop::{
+    CancelReason, LoopFailure, LoopFailureKind, LoopOptions, LoopOutcome, LoopReport,
+    LoopStartError,
+};
 pub use config::{
     CompactionConfig, KernelConfig, RetryPolicy, SemanticLimits, SessionManifest, SessionSpec,
     TurnOptions, UserInput,
 };
 pub use conversation::{ConversationEntry, ConversationSeq, TranscriptPage, TurnTerminal};
-pub use ids::{InteractionId, SessionId, SessionInstanceId, ToolCallId, TurnId};
+pub use execution::{ConfigRevision, ExecutionConfig, ExecutionConfigError};
+pub use history::{
+    AssistantHistory, HistoryItem, HistoryView, SummaryHistory, ToolResultHistory, UserHistory,
+    UserMessageKind,
+};
+pub use ids::{InteractionId, LoopId, SessionId, SessionInstanceId, ToolCallId, TurnId};
+pub use limits::{LoopLimits, LoopLimitsError};
 pub use session::{
     InteractionAnswer, InteractionKind, PendingInteraction, SessionBindings, SessionEvent,
     SessionEventEnvelope, SessionEventStream, SessionHandle, SessionHealth, SessionRuntime,
