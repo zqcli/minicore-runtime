@@ -14,7 +14,7 @@ use super::turn_context::{TurnRunnerContext, TurnRunnerRequest};
 
 mod compaction;
 mod diagnostics;
-mod support;
+pub(crate) mod support;
 
 use compaction::{CompactionState, PreparedModelRequest, prepare_model_request};
 use diagnostics::{budget_exceeded, critical_failure, internal_failure, model_failure};

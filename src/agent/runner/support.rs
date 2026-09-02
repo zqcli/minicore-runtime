@@ -355,12 +355,12 @@ pub(super) enum CriticalFailure {
 }
 
 #[derive(Default)]
-pub(super) struct UsageAccumulator {
+pub(crate) struct UsageAccumulator {
     value: Option<Usage>,
 }
 
 impl UsageAccumulator {
-    pub(super) fn add(&mut self, value: Usage) -> Result<(), ()> {
+    pub(crate) fn add(&mut self, value: Usage) -> Result<(), ()> {
         self.value = Some(match self.value {
             Some(current) => sum_usage(current, value)?,
             None => value,
@@ -368,11 +368,11 @@ impl UsageAccumulator {
         Ok(())
     }
 
-    pub(super) fn finish(self) -> Usage {
+    pub(crate) fn finish(self) -> Usage {
         self.value.unwrap_or_default()
     }
 
-    pub(super) fn current(&self) -> Usage {
+    pub(crate) fn current(&self) -> Usage {
         self.value.unwrap_or_default()
     }
 }
