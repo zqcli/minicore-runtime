@@ -1,119 +1,80 @@
-# Current Architecture
+# Architecture
 
-This document describes the final v0.3 single-session Core. The former multi-session Runtime, legacy execution graph, workspace implementation, concrete storage, provider lookup, and builtin/process tools are physically absent rather than hidden behind compatibility or test-only modules.
+## Positioning
 
-## Public Spine
+MiniCore Runtime is a small Rust execution core for **one live agent loop**.
+It runs model/tool iterations, streaming, cancellation, interaction,
+steering, and request-boundary configuration updates. It does not own
+sessions, persistence, transcripts, providers, or workspaces.
 
-```text
-Host
- ├── session::SessionRuntime { exactly one loaded Session }
- │   ├── session::SessionRuntimeOptions
- │   ├── session::SessionHandle { bounded commands + watch state }
- │   ├── storage::SessionLog { exactly one owned adapter }
- │   ├── session::SessionEventStream { taken once }
- │   └── root cancellation + one owner JoinHandle
- ├── session::SessionBindings
- │   ├── model::Model
- │   │   └── ModelStream { typed events }
- │   ├── tools::ToolSet ── Arc<dyn tools::Tool>
- │   │   └── ToolContext { cancellation, deadline, progress }
- │   ├── tools::ToolPolicy
- │   │   └── ToolPolicyRequest { invocation, spec, cancellation, deadline }
- │   ├── context::ContextProvider
- │   └── compaction::CompactionStrategy
- └── storage::SessionLog
+The single architectural invariant: **there is one boundary — the running
+`AgentLoop` — and everything durable or stateful lives on the host side of
+it.** The runtime consumes host-provided history and a host-built execution
+configuration, and it returns a report plus best-effort events. The host
+decides what to persist, where, and when.
+
+```
+        host history            ExecutionConfig
+             |                        |
+             v                        v
+        LoopRequest --------------> AgentLoop
+                                      |  one tokio task
+        LoopReport  <---------------- |  (runner.rs + model.rs + tools.rs)
+        event stream <--------------- |
+                 (best-effort)
 ```
 
-The Host obtains one exclusive SessionLog and calls `SessionRuntime::create` or `load`. Managing `HashMap<SessionId, SessionRuntime>`, list/delete policy, writer leases, global rate limits, and shutdown-all belongs outside Core.
+## Ownership
 
-The public Tool seam is host-neutral. A Tool receives a checked `ToolInvocation` and a context containing only cancellation, deadline, and synchronous best-effort progress. Workspace roots, process capabilities, RPC clients, credentials, policy decisions, and runtime/session handles are not fields of `ToolContext`.
+- **Host owns sessions.** There is no session type anywhere in the crate.
+  `AgentLoop::start` allocates a fresh `LoopId` and runs once.
+- **Host owns history.** `LoopRequest::history: Arc<[HistoryItem]>` is a
+  borrowed input. The loop appends only in-memory results, exposed as
+  `LoopReport::appended`.
+- **Host owns persistence.** Nothing in the runtime writes a file, a store,
+  or a log. `LoopReport::usage` and `::appended` are the only durable-worthy
+  outputs, and their persistence is entirely the host's call.
+- **Host owns providers and workspaces.** `Model`, `Tool`, `ToolPolicy` and
+  `PromptProvider` are host- or host-adapter-supplied seams.
 
-`ToolSetBuilder` is the only mutable phase. Registration captures a checked `ToolSpec`, validates its public fields, and records the first duplicate name, spec panic, or invalid-spec mutation; `build()` returns that error or a frozen immutable set. `specs_for` deterministically returns only registered enabled specs and omits unknown names; `SessionBindings::validate` rejects unknown enabled names and checks every frozen spec against semantic budgets. Cloned sets share the same `Arc` tool values and support concurrent execution. There is no public `ToolRegistry`, no default concrete adapter set, and no builtin/process implementation in `src/tools`.
+## Module Map
 
-## Session Bindings
+- `agent_loop/` — the loop: `AgentLoop`, `LoopHandle`, `LoopRequest`,
+  `LoopOptions`, control linearization, best-effort events, state, and the
+  runner (`runner.rs`, `runner/model.rs`, `runner/tools.rs`).
+- `execution.rs` — immutable `ExecutionConfig` (model, reasoning, tools,
+  policy, prompt provider) and `UserInput`.
+- `history.rs` — host-facing `HistoryItem` vocabulary and borrowed
+  `HistoryView`.
+- `prompt.rs` — `PromptProvider` seam and `DefaultPromptProvider`.
+- `model/` — `Model` seam, typed `ModelRequest`/`ModelMessage`/responses,
+  and the delivery-aware `ModelDriver`.
+- `tools/` — `Tool` seam, `ToolSet`, `ToolPolicy`, interactions, progress.
+- `limits.rs`, `usage.rs`, `interaction.rs`, `ids.rs`, `value.rs`,
+  `time.rs`, `error.rs`, `port_call.rs` — validation, accounting, id and
+  value types, and per-port isolation.
 
-`session::SessionBindings` is the immutable adapter bundle for one future loaded session. Its exact fields are one direct Model, one ToolSet, and optional ToolPolicy, ContextProvider, and CompactionStrategy values. It contains no Clock, runtime/task handle, log, store, workspace, owner, or metadata. Construction installs no defaults.
+## Runner Shape
 
-Validation is pure and does not invoke adapter futures. The only adapter call is `Model::descriptor`, cloned inside `catch_unwind`; a panic becomes the payload-free `ModelPanicked` error. Validation then checks limits/specs, descriptor integrity and compatibility, enabled tool support/policy/registration, all frozen ToolSpec semantic budgets, and compaction strategy presence. Disabled compaction permits a strategy without invoking it, and optional context is never invoked.
-
-`model::driver` is the private P5-A execution module. `ModelDriver` binds one `Arc<dyn Model>` plus an immutable Kernel-derived snapshot of model timeout, retry policy, and semantic limits. The snapshot avoids a `model → config` dependency and preserves the singleton module DAG. `run_detailed` applies one shared effective deadline and retains whether the Turn or model-port timeout selected it through start, stream, and retry waits; the existing `run` wrapper erases only that internal provenance and preserves the ModelError contract. Adapter-returned Timeout has no Core provenance. Cancellation, panic isolation, delivery-safe retry, strict EOF/Finish/Usage/tool-call grammar, checked response construction, and bounded progress remain unchanged. Missing Usage becomes `Usage::default()`; every response still requires at least one assistant part. The driver imports no session, agent, storage, workspace, provider lookup, credential, HTTP, or tool-execution authority.
-
-`agent::tool_driver` is the private P5-B tool-execution module. It binds one immutable ToolSet, the enabled ToolName set, an optional policy that is required whenever tools are enabled, and checked Kernel-derived policy/tool timeout and semantic input/output snapshots. Policy and Tool stages use `port_call::run_port_call`; the helper owns only the shared one-shot cancellation/deadline/panic/drop protocol, while the driver maps its outcomes. A Core-selected Turn deadline before or during either pending stage returns exact `Err(SuspensionError::DeadlineExceeded)` and produces no ordinary ToolResult; a configured policy timeout becomes generic Denied, and a configured Tool timeout becomes generic Failed. Adapter-returned policy/Tool errors, including Tool TimedOut, remain ordinary port failures with no Core deadline provenance. Child cancellation occurs before interrupted future Drop for both sources. Approval/input suspension waits remain bounded solely by the Turn deadline. Canonical input encoding, semantic output checks, Started/Update progress, and no-spawn/no-append authority remain unchanged.
-
-`context::driver` is the private P5-C ContextProvider execution module. It binds zero or one provider, a checked context timeout, and immutable semantic limits. `provide_detailed` uses `port_call::run_port_call` and returns the crate-private `ValidatedContextBundle` after the single provider-output validation/canonical-sort seam; a provider-returned DeadlineExceeded has no Core provenance. The public `ContextBundle` and `validate_and_sort` boundary remain unchanged, while no-provider sessions receive an empty checked bundle. Construction/poll panic isolation, cancellation, child-before-Drop ordering, typed errors, duplicate/source/count/byte limits, and canonical ordering remain single-sourced. There is no retry, fanout, spawn, or partial-success merge.
-
-`ConversationView::validated_prompt_projection` is the only prompt-history proof seam. An actor-owned `ConversationLog::view()` carries the validated `ConversationState` provenance; when `head`, SessionSpec, and SemanticLimits match, the crate-private provenance query reuses that state without replay, while external confirmed views fall back to full validation for general prompt use. The projection then derives the latest validated SummaryEntry, the canonical active UserMessage TurnExecutionRecord, and entries after the summary boundary from the canonical PromptProjection. Runner committed-delta acknowledgements require matching actor-owned provenance and reject external views before any replay. Sequence gaps, turn phases and identity, session-wide tool-call IDs, tool/result order, finish shape, terminal settlement, summary boundaries, and lower valid per-turn tool-round overrides therefore have exactly the durable validator semantics. The crate-private proof Debug reports only head, selected summary sequence/boundary, entry count, active Turn identity, model reference, and max tool rounds; it never reports User input or summary content.
-
-ConversationValidator keeps pending ToolCalls in a Vec plus an index; result consumption advances the index and clears/resets the vector when complete, with no `remove(0)`. The broader P5-A ValidationCursor/ValidationPlan prepare/commit optimization is benchmark-gated and deferred: immutable Arc state replacement would still clone long-lived sets after receipt, so this stage does not introduce persistent collections or a duplicate mutable canonical state. The validator permits a Summary while a Turn is active only when `through` is an already authenticated prior TurnTerminal boundary, advances the previous summary, does not exceed the current head, and carries valid bounded text. Because the active Turn has no terminal boundary, a Summary cannot cross or include it. Applying that Summary changes only the latest-summary proof and conversation head; active Turn identity/phase, pending tools, and seen tool-call IDs remain intact, so current tool exchange and terminal validation continue canonically.
-
-`prompt::builder` is the private final P5-C prompt module. Its immutable constructor captures the full SessionSpec, exact already-selected frozen ToolSpecs, semantic limits, and the kernel/session `ModelMessage` values constructed once for the loaded SessionEnvironment. `PromptBuilder::plan` accepts a canonical ConversationView and model limits, performs validated conversation projection once, combines the static messages with the projected conversation, builds the fixed request, and records its exact serialized estimate and context budget. `PromptPlan::finish` consumes that plan, inserts only the driver-produced `ValidatedContextBundle`, constructs the final ModelRequest once, and repeats the final serialized/context-window check without reprojection. Prompt order is kernel invariant, optional session system prompt, canonical ProjectInstructions, RetrievedKnowledge, TurnContext blocks, then the conversation-owned validated projection. Context headers include fixed slot and ContextSourceId fields inside System messages. The selected SummaryEntry becomes a System message containing exactly its checked summary text, with no metadata prefix, and entries through its boundary are suppressed; later user/assistant/tool-result entries are mapped while summaries and terminals are omitted. The runner retains one plan through provider context and finalization, and discards it only when a compaction acknowledgement advances the conversation head. The builder invokes no provider, model, tool, log, workspace, store, or owner.
-
-`ConversationView::validated_compaction_candidate` shares the same fresh ConversationState and whole-view candidate validation as the prompt proof. ConversationState constructs the immutable CompactionCandidate from all confirmed projection entries, the exact snapshot head, the validator-owned latest summary boundary, and the validator's sorted terminal-boundary set. An active current turn remains visible to a strategy but never becomes a completed boundary. Conversation owns this proof DTO physically; `compaction` publicly reexports it through the unchanged Port path without creating a reverse dependency.
-
-`error::operations` and `conversation::log` provide the smallest shared durability seam: `DurabilityClass::{KnownFailure, UnknownOutcome, ConsistencyFailure, NotApplicable}`, plus stable log diagnostic-code/retryability mapping and ConversationCommit aggregation. Append, runner commit, settlement, open, recovery, and shutdown consume the bottom classification; transcript still applies its own caller-invalid, temporary-unavailable, Closed/Internal, and consistency dispositions. Thus append `Unavailable` degrades while transcript `Unavailable` remains Healthy, without introducing a global health-effect enum.
-
-`compaction::driver` is the private P5-D/P5-E2 strategy-execution module. It binds zero or one immutable CompactionStrategy, a checked timeout, and the max summary byte snapshot. `run_detailed` performs target/candidate validation and the test-only race pause outside `port_call::run_port_call`, then enters the helper directly. The helper's production pre-cancel/expiry check runs before the closure's first-step boundary/strategy availability check; that closure returns `Ok(None)` for unavailable work and `Ok(Some(proposal))` after the minimal request construction and strategy call. The driver retains proposal validation and proactive/forced error mapping; an invalid effective deadline maps to Compaction `DeadlineExceeded` rather than panic. Cancellation/deadline races after candidate validation therefore remain `Cancelled`/Turn `BudgetExceeded`, not forced `CompactionFailure`. Exact Turn/Port provenance, the CompactionError-only `run` wrapper, panic isolation, proposal validation, and no-commit/no-spawn authority remain unchanged.
-
-`port_call` is a crate-private deep module with one small interface: it returns `Returned(Result<T, E)>`, `Cancelled`, `DeadlineExceeded(DeadlineSource)`, `InvalidDeadline(DeadlineOverflow)`, or `Panicked` for one bounded Port future. It owns effective-deadline selection, pre-cancel/expiry checks, child-token creation, construction and poll panic isolation, biased parent-cancel/deadline/result selection, and child cancellation before interrupted future Drop. Invalid effective deadlines are distinct from panics; Context maps them to Internal, Policy to Denied, Tool to Failed, and Compaction to `DeadlineExceeded`. Compaction's closure may return `Ok(None)` for no boundary or no strategy and `Ok(Some(proposal))` for a strategy result; the helper precheck always precedes that choice. Only ContextProvider, CompactionStrategy, ToolPolicy, and Tool::execute use it. ModelDriver, ConversationLog/SessionLog, Interaction wait, and runner critical-channel protocols deliberately remain outside this seam; the helper adds no retry, durability, logging, hooks, or service locator policy.
-
-`agent::environment`, `agent::turn_context`, `agent::runner_protocol`, and `agent::runner` are the private P5-E1/P5-E2 Turn modules. Create/load builds one checked `Arc<agent::SessionEnvironment>` after static bindings validation; it freezes the SessionSpec, semantic limits, model limits, enabled tools, compaction settings, and all static drivers once. TurnRunnerRequest carries that Arc plus exact identity, the durable effective tool-round cap, one canonical active ConversationView, cancellation/deadline, and bounded critical/progress senders. It does not rebuild or revalidate static bindings/drivers per Turn. Enabled compaction freezes one CompactionDriver plus trigger/target values; the explicit external strategy timeout is the Kernel context timeout because compaction is context shaping, still capped by the absolute Turn deadline. Cancellation-first Turn control is checked at preparation/loop/proactive/forced/attempt entry, around overflow interpretation, and immediately after successful Context return and final Prompt construction. Each model round builds one initial PromptPlan and can make at most one proactive best-effort attempt. If that attempt advances the head, the runner discards the old plan, builds the changed-head plan once, and never retries proactive in that round. Prompt ContextOverflow requires one successful proposal and exact Summary acknowledgement, then retries the same model round from the changed-head plan and Context construction without proactive compaction; a second overflow or a second successful compaction fails without another plan. Configured or adapter compaction failures are skipped proactively and become a Compaction diagnostic when forced.
-
-`RunnerEvent::CommitSummary` carries the validated `snapshot_head`, a checked SummaryDraft, and one move-owned reply; the critical runner channel contains only Assistant/ToolResult/Summary commits and Suspension traffic. Successful Assistant, ToolResult, and Summary commits return one private delta containing the previous head, exact committed entry, and validated ConversationView; the runner checks the new head/tail without comparing the old prefix. Normal `RunnerOutcome` is returned only by `TurnRunnerExit::Finished` through the tracked runner JoinHandle; `SessionActor::handle_runner_exit` is its sole normal outcome entry, while `Panicked` maps to an internal durable failure. `ActiveTurn::forced_outcome` is reserved for actor-injected outcomes such as closed interaction responders or request construction failure. SessionActor rejects a stale snapshot before append. After any attempted Assistant, ToolResult, or Summary append failure, ActiveTurn stores the first diagnostic/unknown flag, publishes Degraded health, cancels the exact Turn, and replies with the matching RunnerCommitError. Runner exit consumes that latch without constructing settlement drafts, appending a terminal, or emitting TurnFinished.
-
-## State, Event, And Turn Foundation
-
-`session::SessionState` replaces the final heavy snapshot concept with one process-local current-state value. The private `ActorCoreState` is the single owner of active Turn state, health, closing/durability facts, the last durable terminal, and interaction-resolution identity. `SessionActor` derives each public `SessionState` from that core and `ConversationLog::head()`; its watch sender is output-only and never feeds production decisions. `SessionStatus` is exactly Idle, Running, WaitingForInput, or Closing, with Closing taking priority, Waiting requiring active plus pending interaction, Running requiring active without pending interaction, and Idle requiring no active Turn. Validation centralizes the same shape and prevents an active Turn from also being the latest durable terminal. `SessionHealth::Degraded` carries a checked `DiagnosticSummary`; its Debug reports message bytes rather than message content.
-
-`session::SessionEventStream` owns one bounded mpsc receiver and implements the standard `futures_util::Stream` interface without becoming Clone. It has no snapshot, subscribe, broadcast, cursor, revision, epoch, gap, or resync interface. The crate-private `InternalEventSink` uses one nonblocking `try_send` per real event; full queues increment a saturating loss count, and the next delivered event carries that count in `SessionEventEnvelope::dropped_before`. A closed receiver returns `Closed` without growing the count. Dropping the stream has no execution effect. State and TurnHandle remain authoritative when best-effort events are lost.
-
-`session::TurnHandle` contains only stable identities plus shared cancellation/completion state. One mutex orders cancel and completion, cancellation tokens carry only the exact-Turn signal, and Notify wakes all waiters after first-wins settlement. Successful wait results contain the confirmed durable `conversation::TurnTerminal` and Usage. Unknown/unavailable durability and actor termination remain typed diagnostic errors.
-
-## SessionRuntime Ownership
-
-`SessionRuntimeOptions` contains exactly a checked KernelConfig, immutable SessionBindings, and Tokio Handle. Construction enters the supplied Handle inside `catch_unwind`, constructs and drops a zero-duration sleep, and rejects a missing time driver without executing or blocking. The timer-enabled runtime must remain alive and actively driven during create, load, and shutdown. A non-Tokio caller is valid when that configured runtime is driven; a live but undriven current-thread runtime cannot provide progress.
-
-Before owner spawn and before any await, OpenGuard attempts cleanup-watcher spawns on the configured Handle and `Handle::try_current()`. Each watcher captures the single-take payload, owner cancellation, and payload-claimed token. On first poll it panic-safely constructs and drops a zero-duration sleep in its executing runtime; without a time driver it exits before taking payload ownership. `run_open` signals claim immediately after its take. Watcher handles are retained and polled by mutable reference; after one returns a close result, loser handles may detach because the shared payload is empty and their tasks are finite under active runtime progress.
-
-Create ordering is kernel → checked `Arc<agent::SessionEnvironment>` (custom-limit SessionSpec, bindings, descriptor, and static drivers) → manifest → initialize/zero head → fresh instance → validated Idle/Healthy state and bounded events → ready. Load ordering is manifest/expected identity → checked `Arc<agent::SessionEnvironment>` → identity-bound proof → paged replay/semantic validation → atomic restart repair → fresh instance → confirmed head/last terminal state → ready. No first snapshot event is emitted.
-
-After ready, SessionActor owns ConversationLog, one immutable `Arc<agent::SessionEnvironment>`, its private `ActorCoreState`, the bounded command receiver, output-only state sender, InternalEventSink, root cancellation, and at most one tracked active runner. Root cancellation is selected before critical traffic, runner exit, commands, and lossy progress. A normal active shutdown settles one shutdown terminal; a commit/settlement durability failure while Closing suppresses terminal settlement, remains the shutdown primary, and does not suppress the mandatory close attempt.
-
-Successful SessionRuntime retains the configured Handle. `shutdown(self)` first cancels, then enters that Handle only long enough to construct the timeout future. During actor panic cleanup the runner JoinHandle remains inside ActiveTurn until its await completes; outer timeout abort therefore drops the actor while it still owns and aborts the runner. A deterministic pending-runner Drop probe verifies no detached runner remains when shutdown returns Timeout.
-
-Core catches the host-controlled panic boundaries: Model descriptor access, SessionLog future construction and polling, and the post-ready actor loop. These become typed failures and preserve their specified close attempts. Arbitrary Core allocation or invariant panics after ownership transfer are not a recoverable API error boundary and may skip graceful close, as may destruction of all timer-capable runtimes. Core deliberately does not add a shared-log worker solely to claim recovery from every possible internal panic.
-
-## Checked DTOs
-
-`ToolInvocation` accepts only bounded object-shaped JSON arguments and redacts arguments from `Debug`. `ToolSpec` exposes the exact public fields `name`, `description`, and `input_schema`, while its constructor and strict unknown-field deserializer enforce their bounds. Public `ToolOutput` contains only `content: BoundedText`, serializes as `{ "content": "..." }`, and never exposes a failure-status bit. After a completed Tool returns a checked `ToolOutput`, the private ToolDriver checks only the session `max_tool_output_bytes`; an in-bound output is moved directly into `ToolDriverResult`, while an over-bound output becomes Failed. The completed path does not reconstruct or revalidate the content, and the public ToolOutput constructor/deserializer remain unchanged.
-
-Input requests have bounded prompt/choice text and an explicit answer kind. Text answers reject empty, oversized, and control-character content. Choice answers reject non-object or extra-field wire shapes; their index is checked against the request before execution.
-
-Progress is synchronous and nonblocking. `ToolProgressSink::emit` validates `completed <= total` and delegates to a private emitter using `try_send`-style semantics. Full, closed, invalid, and no-op sinks return `false` without waiting.
-
-## Policy And Interaction
-
-`ToolPolicy` is an asynchronous `Send + Sync + 'static` Port. It receives an owned `ToolPolicyRequest`, so the exact checked invocation and captured spec cross the seam without borrowing actor/session internals. Decisions are exactly `Allow`, bounded `Deny`, or `RequireApproval`; approval answers are exactly `AllowOnce` or `Deny`. Policy and approval `Debug` output reports safe identities, counts, risks, and byte lengths while redacting arguments, reasons, and prompts.
-
-`session::PendingInteraction`, `InteractionKind`, and `InteractionAnswer` are process-local DTOs only. Before publication, SessionActor requires the request to match the first canonical unresolved `(turn_id, tool_call_id, tool_name)` produced by a durable Assistant entry; later calls cannot suspend before earlier ToolResults are durable. It then stores the sole resume sender separately and publishes WaitingForInput before InteractionRequested. Wrong-phase or forged suspension traffic receives InvalidState without state/event mutation.
-
-## Model Port
-
-`model::Model` is the only public model execution Port. A loaded session binds one host-owned model directly; there is no registry, resolver, installation manager, endpoint policy, credential source, or concrete network adapter in the root crate. `ModelDescriptor` has exactly `model_ref`, `context_window`, `supported_reasoning`, and `supports_tools`. `ModelCallContext` carries exact session/instance/turn identity, a zero-based round, cancellation, and deadline without owner or capability handles.
-
-`ModelRequest` contains only checked messages, tools, limits, and reasoning. `ModelStream` emits bounded typed `ModelEvent` values for text, reasoning, tool-call grammar, usage, and finish. Event `Debug` output reports only safe identities and byte counts. `ModelError` reports `DeliveryState::{NotStarted, Started, Unknown}`, retryability, and an optional retry-after hint; retryable/hint combinations are rejected unless delivery is `NotStarted`.
-
-## Final Boundary
-
-The old top-level Runtime manager graph, legacy SessionConfig, ToolRegistry, actor/command/observation graph, provider registry/gateway, workspace implementation, filesystem store, old prompt/compaction implementation, and legacy tool wire DTOs are physically removed. The Core provides no aliases or test-only compatibility modules for them.
-
-Concrete filesystem/process adapters and their tests were deleted in P3-B rather than replaced with defaults. Future concrete tools must be host-owned implementations of the public `Tool` Port, not reintroduced builtins or process policy modules.
-
-P4-C/P5-E2 supply the final SessionHandle, state watch, bounded commands, transcript routing, actor-owned acknowledgements and suspension state, ordinary Turn execution, compaction, and durable terminal settlement. The P6 cleanup graph, regenerated lockfile, remote Rust gates, P8 documentation, Linux functional acceptance, and native macOS and Windows CI [run 32755428283](https://github.com/zqcli/minicore-runtime/actions/runs/32755428283) for commit `815494dad38c34c585dfeda3c0845ccc7c1fb7d0` are complete and validate review fixes AT-K01 through AT-K96; no package or tag release has occurred, and release validation is ready for publication.
-
-## Model Retry
-
-The retry contract is implemented in ModelDriver: retry requires `retryable == true`, `delivery == NotStarted`, no semantic event in the attempt, remaining attempts, a valid delay no greater than 30 seconds, and remaining overall deadline. `Started` and `Unknown` are never retried. Any adapter error claiming NotStarted after an event is normalized to Started and stripped of retry metadata.
+- One `tokio::spawn` per loop; the completion sender lives in that task.
+- `runner.rs` keeps the main loop, control/final handling, and finish
+  reporting; `runner/model.rs` holds prompt preparation and the model
+  driver; `runner/tools.rs` holds policy, interaction, and tool execution.
+- Every control touch is a short critical section; every event is a
+  best-effort `try_send`.
 
 ## Dependency Direction
 
-Public Ports and SessionBindings do not import SessionRuntime, SessionHandle, Workspace, Store, registry lookup, direct I/O, or fanout. SessionRuntime depends only on checked config/bindings, ConversationLog, SessionLog, IDs, Tokio ownership primitives, state, and events. Owner/Port/DTO files remain below 500 lines, and the module DAG remains all singleton SCCs.
+`agent_loop` depends on `model`, `tools`, `prompt`, `history`,
+`execution`, `limits`, `usage`, `interaction`, `ids`, `value`, `time`,
+`error`, `port_call`. None of those modules depends on `agent_loop`. Every
+seam points outward: the runtime defines traits, hosts implement adapters.
+
+## What v0.3 Had That v0.4 Removed
+
+Session runtime, session manifest/state/log, conversation ledger and durable
+compaction, storage, agent definitions, workspace capability models,
+provider gates in the production baseline, and the old
+session-owned history model. All of that is either gone or, where evidence
+was still valued, preserved in the standalone `provider-gate` harness and
+the archived docs. See [the migration](migrations/v0.3-to-v0.4.md).
