@@ -4,8 +4,8 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::task::JoinHandle;
 
-use crate::config::UserInput;
 use crate::error::DiagnosticSummary;
+use crate::execution::UserInput;
 use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::{HistoryItem, estimate_history_bytes};
 use crate::ids::LoopId;

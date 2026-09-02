@@ -4,9 +4,13 @@
 //! relies on sleeping to prove ordering.
 
 use std::collections::BTreeSet;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
+
+use futures_util::Stream;
 
 use serde_json::json;
 use tokio::sync::Notify;
@@ -99,7 +103,7 @@ impl Model for ScriptedModel {
     ) -> ModelStartFuture<'a> {
         let round = self
             .rounds
-            .get(usize::from(context.round))
+            .get(context.request_index as usize)
             .cloned()
             .unwrap_or(Round::Final {
                 text: "default final",
@@ -194,6 +198,8 @@ enum ToolBehavior {
     Hold,
     /// Succeeds after a Notify is released (deterministic mid-batch update).
     Gate(Arc<Notify>),
+    /// Panics when the tool future is polled (isolated and treated as Failed).
+    Panic,
     RequestInput,
 }
 
@@ -232,6 +238,7 @@ impl Tool for RecordingTool {
                         ToolOutput::new("tool result").unwrap(),
                     ))
                 }
+                ToolBehavior::Panic => panic!("scripted tool execute panic"),
                 ToolBehavior::RequestInput => {
                     let request =
                         ToolInputRequest::new("type the answer", vec![], ToolInputAnswerKind::Text)
@@ -295,6 +302,8 @@ enum PolicyPlan {
     Deny,
     RequireApproval,
     Hold,
+    /// Panics when the decision future is polled (fail-closed Denied).
+    Panic,
 }
 
 struct ScriptedPolicy {
@@ -317,6 +326,7 @@ impl ToolPolicy for ScriptedPolicy {
                     request.cancellation.cancelled().await;
                     Err(ToolPolicyError::Cancelled)
                 }
+                PolicyPlan::Panic => panic!("scripted policy decide panic"),
             }
         })
     }
@@ -3071,5 +3081,357 @@ async fn steer_accepted_but_cancelled_before_application_stays_out_of_report() {
         steerings(&report),
         Vec::<String>::new(),
         "an unapplied steer must never reach the report"
+    );
+}
+
+// ===== Phase 5 reviewer fixes: end-to-end panic/timeout isolation =====
+
+struct PanicStartModel {
+    descriptor: minicore_runtime::model::ModelDescriptor,
+}
+
+impl minicore_runtime::model::Model for PanicStartModel {
+    fn descriptor(&self) -> &minicore_runtime::model::ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn start<'a>(
+        &'a self,
+        _request: ModelRequest,
+        _context: minicore_runtime::model::ModelCallContext,
+    ) -> ModelStartFuture<'a> {
+        Box::pin(async { panic!("scripted model start panic") })
+    }
+}
+
+/// A stream that panics on its first poll, as some adapters can.
+struct PanicStream;
+
+impl Stream for PanicStream {
+    type Item = Result<ModelEvent, ModelError>;
+
+    fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        panic!("scripted model stream poll panic")
+    }
+}
+
+struct PanicStreamModel {
+    descriptor: minicore_runtime::model::ModelDescriptor,
+}
+
+impl minicore_runtime::model::Model for PanicStreamModel {
+    fn descriptor(&self) -> &minicore_runtime::model::ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn start<'a>(
+        &'a self,
+        _request: ModelRequest,
+        _context: minicore_runtime::model::ModelCallContext,
+    ) -> ModelStartFuture<'a> {
+        Box::pin(async { Ok::<ModelStream, ModelError>(Box::pin(PanicStream)) })
+    }
+}
+
+struct PanicPrompt;
+
+impl PromptProvider for PanicPrompt {
+    fn prepare<'a>(&'a self, _request: PromptRequest<'a>) -> PromptFuture<'a> {
+        Box::pin(async { panic!("scripted prompt prepare panic") })
+    }
+}
+
+fn model_failure_kind(report: &LoopReport) -> Option<minicore_runtime::LoopFailureKind> {
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => Some(failure.kind),
+        _ => None,
+    }
+}
+
+fn tool_results_by_call(
+    report: &LoopReport,
+) -> Vec<(String, minicore_runtime::tools::ToolResultOutcome)> {
+    report
+        .appended
+        .iter()
+        .filter_map(|item| match item {
+            HistoryItem::ToolResult(result) => {
+                Some((result.call_id.as_str().to_string(), result.outcome))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A model `start` panic is isolated by the driver: the loop reports
+/// Failed(Model), the completion is delivered normally, and no partial
+/// assistant text ever reaches the history.
+#[tokio::test]
+async fn model_start_panic_yields_model_failure_without_history() {
+    let descriptor = minicore_runtime::model::ModelDescriptor::new(
+        "fake/panic-start".parse().unwrap(),
+        8192,
+        BTreeSet::from([ReasoningPreference::Auto]),
+        false,
+    )
+    .unwrap();
+    let agent = AgentLoop::start(
+        request(config_full(
+            Arc::new(PanicStartModel { descriptor }),
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            project(),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(
+        model_failure_kind(&report),
+        Some(minicore_runtime::LoopFailureKind::Model)
+    );
+    assert_eq!(report.requests, 0);
+    assert!(
+        !report
+            .appended
+            .iter()
+            .any(|item| matches!(item, HistoryItem::Assistant(_))),
+        "a panicked model call must not leave a partial assistant in the history"
+    );
+    let waited = handle.wait().await.unwrap();
+    assert!(
+        Arc::ptr_eq(&waited, &report),
+        "completion is delivered without deadlock"
+    );
+}
+
+/// The same for a panic while polling the stream: Failed(Model), no partial
+/// assistant, normal completion.
+#[tokio::test]
+async fn model_stream_poll_panic_yields_model_failure_without_history() {
+    let descriptor = minicore_runtime::model::ModelDescriptor::new(
+        "fake/panic-stream".parse().unwrap(),
+        8192,
+        BTreeSet::from([ReasoningPreference::Auto]),
+        false,
+    )
+    .unwrap();
+    let agent = AgentLoop::start(
+        request(config_full(
+            Arc::new(PanicStreamModel { descriptor }),
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            project(),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(
+        model_failure_kind(&report),
+        Some(minicore_runtime::LoopFailureKind::Model)
+    );
+    assert_eq!(report.requests, 0);
+    assert!(
+        !report
+            .appended
+            .iter()
+            .any(|item| matches!(item, HistoryItem::Assistant(_)))
+    );
+}
+
+/// A `Tool::execute` panic becomes exactly one Failed ToolResult for that call
+/// and the loop continues to the next model request.
+#[tokio::test]
+async fn tool_execute_panic_is_a_failed_result_and_the_loop_continues() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (model, _) = scripted_model(vec![
+        Round::Tools {
+            calls: vec![("echo", "call_1")],
+        },
+        Round::Final { text: "done" },
+    ]);
+    let agent = AgentLoop::start(
+        request(config(
+            model,
+            tool_set(Arc::clone(&calls), ToolBehavior::Panic),
+            None,
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(
+        report.requests, 2,
+        "the loop continued after the failed call"
+    );
+    assert_eq!(recorded_calls(&calls), ["call_1"]);
+    let results = tool_results_by_call(&report);
+    assert_eq!(
+        results,
+        vec![(
+            "call_1".to_string(),
+            minicore_runtime::tools::ToolResultOutcome::Failed
+        )]
+    );
+    assert!(
+        report
+            .appended
+            .iter()
+            .any(|item| matches!(item, HistoryItem::Assistant(_))),
+        "the continuation request runs the model again"
+    );
+}
+
+/// A panicking PromptProvider surfaces as Failed(Prompt) with a delivered
+/// report and no model request ever issued.
+#[tokio::test]
+async fn prompt_provider_panic_yields_prompt_failure() {
+    let (model, _) = scripted_model(vec![Round::Final { text: "a" }]);
+    let agent = AgentLoop::start(
+        request(config_full(
+            model,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            Arc::new(PanicPrompt),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(
+        model_failure_kind(&report),
+        Some(minicore_runtime::LoopFailureKind::Prompt)
+    );
+    assert_eq!(report.requests, 0);
+}
+
+/// A panicking ToolPolicy::decide fails closed: the call gets exactly one
+/// Denied ToolResult and the loop continues to the next request.
+#[tokio::test]
+async fn policy_panic_is_denied_and_the_loop_continues() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (model, _) = scripted_model(vec![
+        Round::Tools {
+            calls: vec![("echo", "call_1")],
+        },
+        Round::Final { text: "done" },
+    ]);
+    let policy = Arc::new(ScriptedPolicy {
+        plan: Arc::new(vec![PolicyPlan::Panic]),
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let agent = AgentLoop::start(
+        request(config(
+            model,
+            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
+            Some(policy),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.requests, 2);
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "a denied call must not execute the tool"
+    );
+    let results = tool_results_by_call(&report);
+    assert_eq!(
+        results,
+        vec![(
+            "call_1".to_string(),
+            minicore_runtime::tools::ToolResultOutcome::Denied
+        )]
+    );
+}
+
+/// A `tool_timeout` port deadline marks only the current call Failed; the
+/// remaining calls of the same batch still run in order and the final model
+/// request still happens.
+#[tokio::test(start_paused = true)]
+async fn tool_timeout_port_deadline_fails_the_call_and_the_batch_continues() {
+    let hold_entered = Arc::new(Notify::new());
+    let calls_b = Arc::new(Mutex::new(Vec::new()));
+    let (model, _) = scripted_model(vec![
+        Round::Tools {
+            calls: vec![("hold", "call_1"), ("echo", "call_2")],
+        },
+        Round::Final { text: "done" },
+    ]);
+    let mut tools = ToolSet::builder();
+    tools.register(RecordingTool {
+        spec: ToolSpec::new(
+            "hold".parse().unwrap(),
+            "holds forever",
+            json!({"type": "object"}),
+        )
+        .unwrap(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+        behavior: ToolBehavior::Hold,
+        entered: Some(Arc::clone(&hold_entered)),
+    });
+    tools.register(RecordingTool {
+        spec: echo_spec(),
+        calls: Arc::clone(&calls_b),
+        behavior: ToolBehavior::Succeed,
+        entered: None,
+    });
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.tool_timeout = Duration::from_millis(100);
+    let agent = AgentLoop::start(
+        request(config_full(
+            model,
+            ReasoningPreference::Auto,
+            tools.build().unwrap(),
+            None,
+            project(),
+        )),
+        options,
+    )
+    .unwrap();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    // Let request 0 reach the first (holding) tool call, then expire only the
+    // tool port deadline.
+    let entered = hold_entered.notified();
+    tokio::pin!(entered);
+    entered.as_mut().enable();
+    tokio::time::advance(Duration::from_millis(10)).await;
+    entered.as_mut().await;
+    tokio::time::advance(Duration::from_millis(300)).await;
+
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(
+        report.requests, 2,
+        "the model continued after the timed-out call"
+    );
+    assert_eq!(recorded_calls(&calls_b), ["call_2"]);
+    let results = tool_results_by_call(&report);
+    assert_eq!(
+        results,
+        vec![
+            (
+                "call_1".to_string(),
+                minicore_runtime::tools::ToolResultOutcome::Failed
+            ),
+            (
+                "call_2".to_string(),
+                minicore_runtime::tools::ToolResultOutcome::Success
+            ),
+        ],
+        "exactly one result per call, in order"
     );
 }

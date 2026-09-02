@@ -10,7 +10,7 @@ use minicore_runtime::tools::{
     ToolProgress, ToolResultOutcome, ToolSet, ToolSpec,
 };
 use minicore_runtime::value::{MAX_JSON_BYTES, MAX_JSON_DEPTH, MAX_JSON_NODES, MAX_TEXT_BYTES};
-use minicore_runtime::{BoundedText, SessionId, SessionInstanceId, ToolCallId, TurnId};
+use minicore_runtime::{BoundedText, LoopId, ToolCallId};
 use serde_json::json;
 
 fn assert_json_round_trip<T>(value: &T)
@@ -22,29 +22,19 @@ where
     assert_eq!(&decoded, value);
 }
 
-fn id_values() -> (SessionId, SessionInstanceId, TurnId, ToolCallId) {
+fn id_values() -> (LoopId, ToolCallId) {
     (
-        "ses_00000000000000000000000000000001".parse().unwrap(),
-        "ins_00000000000000000000000000000001".parse().unwrap(),
-        "trn_00000000000000000000000000000001".parse().unwrap(),
+        "lup_00000000000000000000000000000001".parse().unwrap(),
         "call_00000000000000000000000000000001".parse().unwrap(),
     )
 }
 
 #[test]
 fn final_tool_dtos_round_trip_and_redact_payloads() {
-    let (session_id, instance_id, turn_id, call_id) = id_values();
+    let (_, call_id) = id_values();
     let name = ToolName::from_str("read_file").unwrap();
     let spec = ToolSpec::new(name.clone(), "Read one file", json!({"type": "object"})).unwrap();
-    let invocation = ToolInvocation::new(
-        session_id,
-        instance_id,
-        turn_id,
-        call_id,
-        name,
-        json!({"secret": "do-not-print"}),
-    )
-    .unwrap();
+    let invocation = ToolInvocation::new(call_id, name, json!({"secret": "do-not-print"})).unwrap();
     let output = ToolOutput::new("safe output").unwrap();
     assert_json_round_trip(&spec);
     assert_json_round_trip(&invocation);
@@ -60,7 +50,7 @@ fn final_tool_dtos_round_trip_and_redact_payloads() {
 
 #[test]
 fn public_model_tool_wire_has_content_and_outcome_only() {
-    let (_, _, _, call_id) = id_values();
+    let (_, call_id) = id_values();
     let message = ModelMessage::tool_with_outcome(
         call_id,
         ToolOutput::new("visible result").unwrap(),
@@ -138,18 +128,9 @@ fn object_with_nodes(nodes: usize) -> serde_json::Value {
 
 #[test]
 fn tool_schema_and_invocation_share_json_byte_depth_and_node_bounds() {
-    let (_, instance_id, turn_id, call_id) = id_values();
+    let (_, call_id) = id_values();
     let name: ToolName = "bounded".parse().unwrap();
-    let make_invocation = |arguments| {
-        ToolInvocation::new(
-            id_values().0,
-            instance_id,
-            turn_id,
-            call_id.clone(),
-            name.clone(),
-            arguments,
-        )
-    };
+    let make_invocation = |arguments| ToolInvocation::new(call_id.clone(), name.clone(), arguments);
 
     let exact_bytes = object_json_exact_bytes(MAX_JSON_BYTES);
     assert!(ToolSpec::new(name.clone(), "schema", exact_bytes.clone()).is_ok());
@@ -407,7 +388,7 @@ fn public_model_wires_reject_unknown_fields() {
 
 #[test]
 fn public_model_debug_redacts_nested_payloads() {
-    let (_, _, _, call_id) = id_values();
+    let (_, call_id) = id_values();
     let parts = vec![
         AssistantPart::Text("assistant-text-secret".to_owned()),
         AssistantPart::Reasoning(

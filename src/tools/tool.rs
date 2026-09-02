@@ -8,7 +8,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use crate::ids::{SessionId, SessionInstanceId, ToolCallId, TurnId};
+use crate::ids::ToolCallId;
 use crate::value::{BoundedText, MAX_JSON_BYTES, MAX_TEXT_BYTES, validate_json_size};
 
 use super::context::ToolContext;
@@ -186,9 +186,6 @@ impl<'de> Deserialize<'de> for ToolOutput {
 #[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolInvocation {
-    pub session_id: SessionId,
-    pub instance_id: SessionInstanceId,
-    pub turn_id: TurnId,
     pub tool_call_id: ToolCallId,
     pub tool_name: ToolName,
     pub arguments: Value,
@@ -197,9 +194,6 @@ pub struct ToolInvocation {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolInvocationWire {
-    session_id: SessionId,
-    instance_id: SessionInstanceId,
-    turn_id: TurnId,
     tool_call_id: ToolCallId,
     tool_name: ToolName,
     arguments: Value,
@@ -207,9 +201,6 @@ struct ToolInvocationWire {
 
 impl ToolInvocation {
     pub fn new(
-        session_id: SessionId,
-        instance_id: SessionInstanceId,
-        turn_id: TurnId,
         tool_call_id: ToolCallId,
         tool_name: ToolName,
         arguments: Value,
@@ -218,25 +209,10 @@ impl ToolInvocation {
             return Err(ToolError::InvalidInvocation);
         }
         Ok(Self {
-            session_id,
-            instance_id,
-            turn_id,
             tool_call_id,
             tool_name,
             arguments,
         })
-    }
-
-    pub const fn session_id(&self) -> SessionId {
-        self.session_id
-    }
-
-    pub const fn instance_id(&self) -> SessionInstanceId {
-        self.instance_id
-    }
-
-    pub const fn turn_id(&self) -> TurnId {
-        self.turn_id
     }
 
     pub const fn tool_call_id(&self) -> &ToolCallId {
@@ -256,9 +232,6 @@ impl fmt::Debug for ToolInvocation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ToolInvocation")
-            .field("session_id", &self.session_id)
-            .field("instance_id", &self.instance_id)
-            .field("turn_id", &self.turn_id)
             .field("tool_call_id", &self.tool_call_id)
             .field("tool_name", &self.tool_name)
             .field("arguments", &"<redacted>")
@@ -272,15 +245,7 @@ impl<'de> Deserialize<'de> for ToolInvocation {
         D: Deserializer<'de>,
     {
         let value = ToolInvocationWire::deserialize(deserializer)?;
-        Self::new(
-            value.session_id,
-            value.instance_id,
-            value.turn_id,
-            value.tool_call_id,
-            value.tool_name,
-            value.arguments,
-        )
-        .map_err(D::Error::custom)
+        Self::new(value.tool_call_id, value.tool_name, value.arguments).map_err(D::Error::custom)
     }
 }
 

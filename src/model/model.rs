@@ -8,7 +8,7 @@ use std::time::Instant;
 use futures_util::Stream;
 use tokio_util::sync::CancellationToken;
 
-use crate::ids::{SessionId, SessionInstanceId, TurnId};
+use crate::ids::LoopId;
 
 use super::response::{ModelError, ModelEvent};
 use super::types::{ModelRef, ModelRequest, ModelValueError, ReasoningPreference};
@@ -64,29 +64,24 @@ impl fmt::Debug for ModelDescriptor {
 
 #[derive(Clone)]
 pub struct ModelCallContext {
-    pub session_id: SessionId,
-    pub instance_id: SessionInstanceId,
-    pub turn_id: TurnId,
-    /// Zero-based model call round within the current Turn.
-    pub round: u16,
+    /// The agent loop this model call belongs to.
+    pub loop_id: LoopId,
+    /// Zero-based index of the loop request that issues this model call.
+    pub request_index: u32,
     pub cancellation: CancellationToken,
     pub deadline: Instant,
 }
 
 impl ModelCallContext {
     pub fn new(
-        session_id: SessionId,
-        instance_id: SessionInstanceId,
-        turn_id: TurnId,
-        round: u16,
+        loop_id: LoopId,
+        request_index: u32,
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> Self {
         Self {
-            session_id,
-            instance_id,
-            turn_id,
-            round,
+            loop_id,
+            request_index,
             cancellation,
             deadline,
         }
@@ -97,10 +92,8 @@ impl fmt::Debug for ModelCallContext {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ModelCallContext")
-            .field("session_id", &self.session_id)
-            .field("instance_id", &self.instance_id)
-            .field("turn_id", &self.turn_id)
-            .field("round", &self.round)
+            .field("loop_id", &self.loop_id)
+            .field("request_index", &self.request_index)
             .field("cancelled", &self.cancellation.is_cancelled())
             .field("deadline", &self.deadline)
             .finish()

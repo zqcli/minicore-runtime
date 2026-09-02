@@ -7,7 +7,6 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::runner::support::UsageAccumulator;
 use crate::agent_loop::event::{LoopEvent, LoopEventSink, LoopOutcomeSummary, OutputChannel};
 use crate::agent_loop::{
     CancelReason, LoopFailure, LoopFailureKind, LoopOptions, LoopOutcome, LoopReport, LoopRequest,
@@ -16,7 +15,7 @@ use crate::agent_loop::{
 use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::{HistoryView, WorkingHistory};
-use crate::ids::{InteractionId, LoopId, SessionId, SessionInstanceId, ToolCallId, TurnId};
+use crate::ids::{InteractionId, LoopId, ToolCallId};
 use crate::interaction::{InteractionAnswer, InteractionKind, PendingInteraction};
 use crate::model::{
     ModelCallContext, ModelDriverFailure, ModelFinishReason, ModelLimits, ModelMessage,
@@ -31,6 +30,7 @@ use crate::tools::{
     ToolPolicyRequest, ToolProgress, ToolProgressEmitter, ToolProgressSink, ToolResultOutcome,
     ToolSet, ToolSpec,
 };
+use crate::usage::UsageAccumulator;
 use crate::value::BoundedText;
 
 use super::control::FinishSeal;
@@ -52,7 +52,6 @@ const LOOP_HORIZON: Duration = Duration::from_secs(24 * 60 * 60);
 struct LoopCtx<'a> {
     id: LoopId,
     control: &'a LoopControl,
-    identity: &'a PortIdentity,
     options: &'a LoopOptions,
     sink: &'a mut LoopEventSink,
     completion_tx: &'a watch::Sender<Option<Arc<LoopReport>>>,
@@ -119,13 +118,11 @@ async fn run_loop_inner(
     completion_tx: watch::Sender<Option<Arc<LoopReport>>>,
 ) -> Arc<LoopReport> {
     let id = control.id;
-    let identity = port_identity(id);
     let cancellation = control.cancellation();
     let loop_deadline = options.deadline;
     let mut ctx = LoopCtx {
         id,
         control: &control,
-        identity: &identity,
         options: &options,
         sink: &mut sink,
         completion_tx: &completion_tx,
@@ -370,9 +367,6 @@ async fn run_loop_inner(
                 continue;
             };
             let invocation = match ToolInvocation::new(
-                identity.session,
-                identity.instance,
-                identity.turn,
                 call.tool_call_id().clone(),
                 call.name().clone(),
                 call.arguments().clone(),
@@ -665,14 +659,7 @@ async fn run_model(
     )
     .map_err(ModelDriverFailure::ordinary)?;
 
-    let context = ModelCallContext::new(
-        ctx.identity.session,
-        ctx.identity.instance,
-        ctx.identity.turn,
-        u16::try_from(request_index).unwrap_or(u16::MAX),
-        cancellation.clone(),
-        turn_deadline,
-    );
+    let context = ModelCallContext::new(ctx.id, request_index, cancellation.clone(), turn_deadline);
 
     let (progress_tx, mut progress_rx) = mpsc::channel(MODEL_PROGRESS_CAPACITY);
     let run = driver.run_detailed(request, context, &progress_tx);
@@ -1034,7 +1021,6 @@ async fn wait_interaction(
 ) -> Result<InteractionAnswer, FailPath> {
     let pending = PendingInteraction {
         interaction_id,
-        turn_id: ctx.identity.turn,
         tool_call_id: invocation.tool_call_id().clone(),
         tool_name: invocation.tool_name().clone(),
         kind: kind.clone(),
@@ -1155,34 +1141,6 @@ fn invocation_terminal_result(
         tool_name: invocation.tool_name().clone(),
         outcome,
         output: ToolOutput::new(message).expect("terminal tool message is valid text"),
-    }
-}
-
-/// v0.3 Model/Tool ports still carry session identity. A loop owns no session,
-/// so these fields receive a deterministic derivation of the loop id. The
-/// bridge disappears when the session-shaped port fields are removed.
-struct PortIdentity {
-    session: SessionId,
-    instance: SessionInstanceId,
-    turn: TurnId,
-}
-
-fn port_identity(loop_id: LoopId) -> PortIdentity {
-    let mut hex = String::with_capacity(32);
-    for byte in loop_id.as_bytes() {
-        use std::fmt::Write as _;
-        write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    PortIdentity {
-        session: format!("ses_{hex}")
-            .parse()
-            .expect("loop-derived session id is canonical"),
-        instance: format!("ins_{hex}")
-            .parse()
-            .expect("loop-derived instance id is canonical"),
-        turn: format!("trn_{hex}")
-            .parse()
-            .expect("loop-derived turn id is canonical"),
     }
 }
 

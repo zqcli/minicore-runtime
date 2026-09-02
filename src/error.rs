@@ -1,20 +1,9 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
-use crate::ids::TurnId;
 use crate::value::BoundedText;
 
-mod operations;
-
-pub(crate) use operations::DurabilityClass;
-pub use operations::{
-    SessionLogError, SessionLogErrorKind, SessionOpenError, SessionOpenErrorKind,
-    SessionShutdownError,
-};
-
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticCategory {
@@ -23,8 +12,6 @@ pub enum DiagnosticCategory {
     Tool,
     Policy,
     Context,
-    Compaction,
-    Storage,
     Cancellation,
     Internal,
 }
@@ -33,29 +20,19 @@ pub enum DiagnosticCategory {
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticCode {
     InvalidConfiguration,
-    InvalidSessionManifest,
-    SessionClosed,
-    SessionBusy,
-    SessionDegraded,
-    CommandBackpressure,
-    InteractionNotFound,
-    InteractionKindMismatch,
-    ModelMismatch,
     ModelTimeout,
     ModelMalformedResponse,
     ModelUnavailable,
+    RuntimeTerminated,
     ContextFailed,
     PolicyDenied,
     PolicyFailed,
     ToolNotFound,
     ToolTimeout,
     ToolFailed,
+    InteractionNotFound,
+    InteractionKindMismatch,
     TurnBudgetExceeded,
-    LogConflict,
-    LogCorrupt,
-    LogUnknownOutcome,
-    RuntimeTerminated,
-    ShutdownTimeout,
     Internal,
 }
 
@@ -131,44 +108,4 @@ impl<'de> Deserialize<'de> for DiagnosticSummary {
             value.retryable,
         ))
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum EventStreamTakenError {
-    #[error("session event stream was already taken")]
-    AlreadyTaken,
-}
-
-#[non_exhaustive]
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum SessionError {
-    #[error("session is closed")]
-    Closed,
-    #[error("session is busy")]
-    Busy { active_turn: TurnId },
-    #[error("session durability is degraded")]
-    Degraded(DiagnosticSummary),
-    #[error("session command queue is full")]
-    Backpressure,
-    #[error("session input is invalid")]
-    InvalidInput(DiagnosticSummary),
-    #[error("session interaction was not found")]
-    InteractionNotFound,
-    #[error("session interaction answer kind does not match")]
-    InteractionKindMismatch,
-    #[error("session interaction was already resolved")]
-    InteractionAlreadyResolved,
-    #[error("session transcript is unavailable")]
-    TranscriptUnavailable(DiagnosticSummary),
-}
-
-#[non_exhaustive]
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum TurnWaitError {
-    #[error("turn durability outcome is unknown")]
-    DurabilityUnknown(DiagnosticSummary),
-    #[error("turn durability is unavailable")]
-    DurabilityUnavailable(DiagnosticSummary),
-    #[error("turn runtime terminated before durable completion")]
-    RuntimeTerminated(DiagnosticSummary),
 }

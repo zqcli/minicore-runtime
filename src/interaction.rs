@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::ids::{InteractionId, ToolCallId, TurnId};
+use crate::ids::{InteractionId, ToolCallId};
 use crate::tools::{
     ApprovalDecision, ApprovalRequest, ToolInputAnswer, ToolInputRequest, ToolName, ToolValueError,
 };
@@ -8,7 +8,6 @@ use crate::tools::{
 #[derive(Clone, Eq, PartialEq)]
 pub struct PendingInteraction {
     pub interaction_id: InteractionId,
-    pub turn_id: TurnId,
     pub tool_call_id: ToolCallId,
     pub tool_name: ToolName,
     pub kind: InteractionKind,
@@ -25,7 +24,6 @@ impl fmt::Debug for PendingInteraction {
         formatter
             .debug_struct("PendingInteraction")
             .field("interaction_id", &self.interaction_id)
-            .field("turn_id", &self.turn_id)
             .field("tool_call_id", &self.tool_call_id)
             .field("tool_name", &self.tool_name)
             .field("kind", &self.kind)

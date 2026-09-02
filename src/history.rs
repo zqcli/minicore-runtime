@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::UserInput;
+use crate::execution::UserInput;
 use crate::ids::{LoopId, ToolCallId};
 use crate::model::{AssistantPart, ModelFinishReason, ModelRef, ReasoningPreference, Usage};
 use crate::tools::{ToolName, ToolOutput, ToolResultOutcome};

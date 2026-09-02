@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use minicore_runtime::ids::{SessionId, SessionInstanceId, TurnId};
 use minicore_runtime::tools::{
     Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolFuture, ToolInputAnswer,
     ToolInputAnswerKind, ToolInputRequest, ToolInvocation, ToolOutput, ToolProgress,
@@ -13,23 +12,8 @@ use minicore_runtime::value::{BoundedText, MAX_JSON_BYTES, MAX_JSON_DEPTH, MAX_J
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-fn session_id() -> SessionId {
-    "ses_00000000000000000000000000000001".parse().unwrap()
-}
-
-fn instance_id() -> SessionInstanceId {
-    "ins_00000000000000000000000000000001".parse().unwrap()
-}
-
-fn turn_id() -> TurnId {
-    "trn_00000000000000000000000000000001".parse().unwrap()
-}
-
 fn invocation(name: &str, arguments: serde_json::Value) -> ToolInvocation {
     ToolInvocation::new(
-        session_id(),
-        instance_id(),
-        turn_id(),
         "call_00000000000000000000000000000001".parse().unwrap(),
         name.parse().unwrap(),
         arguments,
@@ -109,13 +93,10 @@ impl Tool for FakeTool {
         &self.spec
     }
 
-    fn execute<'a>(&'a self, invocation: ToolInvocation, context: ToolContext) -> ToolFuture<'a> {
+    fn execute<'a>(&'a self, _invocation: ToolInvocation, context: ToolContext) -> ToolFuture<'a> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let request_input = self.request_input;
         Box::pin(async move {
-            assert_eq!(invocation.session_id(), session_id());
-            assert_eq!(invocation.instance_id(), instance_id());
-            assert_eq!(invocation.turn_id(), turn_id());
             assert!(context.deadline > Instant::now() - Duration::from_secs(1));
             if context.cancellation.is_cancelled() {
                 return Err(ToolError::Cancelled);
@@ -321,9 +302,6 @@ fn invocation_serde_is_strict_bounded_and_redacted() {
     assert_eq!(
         wire,
         json!({
-            "session_id": "ses_00000000000000000000000000000001",
-            "instance_id": "ins_00000000000000000000000000000001",
-            "turn_id": "trn_00000000000000000000000000000001",
             "tool_call_id": "call_00000000000000000000000000000001",
             "tool_name": "read_file",
             "arguments": {"path": "README.md"}
@@ -341,13 +319,7 @@ fn invocation_serde_is_strict_bounded_and_redacted() {
     for invalid in [unknown, non_object] {
         assert!(serde_json::from_value::<ToolInvocation>(invalid).is_err());
     }
-    for (field, invalid) in [
-        ("session_id", "invalid"),
-        ("instance_id", "invalid"),
-        ("turn_id", "invalid"),
-        ("tool_call_id", ""),
-        ("tool_name", "bad name"),
-    ] {
+    for (field, invalid) in [("tool_call_id", ""), ("tool_name", "bad name")] {
         let mut candidate = wire.clone();
         candidate[field] = json!(invalid);
         assert!(serde_json::from_value::<ToolInvocation>(candidate).is_err());
