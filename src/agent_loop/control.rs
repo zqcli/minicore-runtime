@@ -4,11 +4,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::ids::{InteractionId, LoopId};
 use crate::interaction::InteractionAnswer;
+use crate::limits::LoopLimits;
 
 use super::event::EventSinkError;
-use super::{AnswerError, CancelReason, LoopReport, LoopState, LoopStatus};
+use super::{AnswerError, CancelReason, LoopReport, LoopState, LoopStatus, UpdateError};
 
 /// Single linearizable state machine for cancelling and sealing a loop.
 ///
@@ -44,6 +46,7 @@ pub(crate) enum FinishSeal {
 pub(crate) struct LoopControl {
     pub(crate) id: LoopId,
     pub(crate) cancel: CancellationToken,
+    limits: LoopLimits,
 
     state_tx: watch::Sender<LoopState>,
     /// Seed receiver shared by all waiters. The sender is owned by the runner
@@ -56,6 +59,21 @@ pub(crate) struct LoopControl {
 
 struct ControlState {
     interaction: Option<InteractionSlot>,
+    /// False once the final seal closes: update (and, in Phase 4, steer and
+    /// seal races) linearize on this mutex through this flag.
+    accepting_updates: bool,
+    /// Revision of the config the runner has actually applied.
+    current_revision: ConfigRevision,
+    /// Revision the next accepted update will be handed.
+    next_revision: ConfigRevision,
+    /// Latest accepted config, applied at the next request boundary.
+    pending_config: Option<PendingConfig>,
+}
+
+/// Latest accepted config waiting for the next request boundary.
+struct PendingConfig {
+    revision: ConfigRevision,
+    config: Arc<ExecutionConfig>,
 }
 
 pub(crate) struct InteractionSlot {
@@ -96,7 +114,7 @@ pub(crate) type ControlParts = Result<
 >;
 
 impl LoopControl {
-    pub(crate) fn new(id: LoopId, event_capacity: usize) -> ControlParts {
+    pub(crate) fn new(id: LoopId, event_capacity: usize, limits: LoopLimits) -> ControlParts {
         let initial = LoopState::new(
             id,
             LoopStatus::Starting,
@@ -110,10 +128,17 @@ impl LoopControl {
             Self {
                 id,
                 cancel: CancellationToken::new(),
+                limits,
                 state_tx,
                 completion_rx,
                 state: AtomicU8::new(STATE_NONE),
-                inner: Mutex::new(ControlState { interaction: None }),
+                inner: Mutex::new(ControlState {
+                    interaction: None,
+                    accepting_updates: true,
+                    current_revision: ConfigRevision::INITIAL,
+                    next_revision: ConfigRevision::INITIAL.next(),
+                    pending_config: None,
+                }),
             },
             sink,
             stream,
@@ -146,6 +171,55 @@ impl LoopControl {
         }
     }
 
+    /// Accepts a full config replacement; it takes effect at the next request
+    /// boundary. `config` is validated against the loop limits *before* the
+    /// lock so an invalid config consumes no revision and never disturbs the
+    /// pending slot. Repeated updates before a boundary each hand out a
+    /// monotonic revision while the runner only ever applies the latest.
+    pub(crate) fn update(&self, config: ExecutionConfig) -> Result<ConfigRevision, UpdateError> {
+        config
+            .validate_against_limits(&self.limits)
+            .map_err(|_| UpdateError::InvalidConfig)?;
+        let mut guard = lock_control(&self.inner);
+        if !guard.accepting_updates {
+            return Err(UpdateError::NotActive);
+        }
+        let revision = guard.next_revision;
+        guard.next_revision = revision.next();
+        guard.pending_config = Some(PendingConfig {
+            revision,
+            config: Arc::new(config),
+        });
+        Ok(revision)
+    }
+
+    /// Runner-side take of the latest accepted config at a request boundary.
+    /// Linearizes with `update` and the final seal on the same mutex. Taking
+    /// a config is only a *candidate*: the revision is not recorded until the
+    /// runner commits it right before a real Model Request goes out, so a
+    /// taken config whose preparation fails never counts as applied.
+    pub(crate) fn take_pending_config(&self) -> Option<(ConfigRevision, Arc<ExecutionConfig>)> {
+        lock_control(&self.inner)
+            .pending_config
+            .take()
+            .map(|pending| (pending.revision, pending.config))
+    }
+
+    /// Records `revision` as the last actually issued/applied config revision.
+    /// Called by the runner at the exact boundary where a Model Request is
+    /// dispatched under that revision.
+    pub(crate) fn commit_revision(&self, revision: ConfigRevision) {
+        lock_control(&self.inner).current_revision = revision;
+    }
+
+    /// Revision of the config that actually served the last issued Model
+    /// Request. This is exactly what a finished report records as
+    /// `final_config_revision`: a pending or taken-but-never-issued update is
+    /// not counted.
+    pub(crate) fn applied_revision(&self) -> ConfigRevision {
+        lock_control(&self.inner).current_revision
+    }
+
     pub(crate) fn cancel_reason(&self) -> CancelReason {
         match self.state.load(Ordering::SeqCst) {
             STATE_CANCEL_OWNER_DROPPED => CancelReason::OwnerDropped,
@@ -157,9 +231,13 @@ impl LoopControl {
     }
 
     /// Exactly-once completion seal. One winner flips the shared state to
-    /// `FINISHED`; every later call returns `AlreadyFinished`.
+    /// `FINISHED`; every later call returns `AlreadyFinished`. The state
+    /// transition and `accepting_updates = false` happen in the same mutex
+    /// critical section, so `update` either lands entirely before the seal
+    /// (it wins) or observes `NotActive` after it.
     pub(crate) fn finish_once(&self) -> FinishSeal {
-        match self.state.compare_exchange(
+        let mut guard = lock_control(&self.inner);
+        let finish = match self.state.compare_exchange(
             STATE_NONE,
             STATE_FINISHED,
             Ordering::SeqCst,
@@ -178,7 +256,9 @@ impl LoopControl {
             }
             Err(STATE_FINISHED) => FinishSeal::AlreadyFinished,
             Err(_) => unreachable!("unknown loop state value"),
-        }
+        };
+        guard.accepting_updates = false;
+        finish
     }
 
     pub(crate) fn is_finished(&self) -> bool {

@@ -125,6 +125,12 @@ impl AgentLoop {
     pub fn start(request: LoopRequest, options: LoopOptions) -> Result<Self, LoopStartError> {
         tokio::runtime::Handle::try_current().map_err(|_| LoopStartError::NoTokioRuntime)?;
         options.validate()?;
+        // Same config-vs-LoopLimits validation as `LoopHandle::update`: the
+        // initial config must satisfy the loop's runtime budgets too.
+        request
+            .config
+            .validate_against_limits(&options.limits)
+            .map_err(|_| LoopStartError::InvalidConfig)?;
         let input_bytes = request.input.as_text().len();
         if input_bytes == 0 || input_bytes > options.limits.max_user_input_bytes {
             return Err(LoopStartError::InvalidInput);
@@ -137,8 +143,9 @@ impl AgentLoop {
 
         let id = LoopId::new().map_err(|_| LoopStartError::IdGeneration)?;
         let options = Arc::new(options);
-        let (control, sink, events, completion_tx) = LoopControl::new(id, options.event_capacity)
-            .map_err(|_| LoopStartError::InvalidOptions)?;
+        let (control, sink, events, completion_tx) =
+            LoopControl::new(id, options.event_capacity, options.limits)
+                .map_err(|_| LoopStartError::InvalidOptions)?;
         let control = Arc::new(control);
 
         let join = tokio::spawn(runner::run_loop(
@@ -270,6 +277,16 @@ pub enum AnswerError {
     #[error("interaction id or answer kind does not match the pending interaction")]
     WrongInteraction,
     #[error("the loop is not accepting interaction answers")]
+    NotActive,
+}
+
+/// Errors accepting an execution config update.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum UpdateError {
+    #[error("config does not satisfy the loop limits")]
+    InvalidConfig,
+    #[error("the loop is not accepting config updates")]
     NotActive,
 }
 

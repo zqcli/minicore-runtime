@@ -123,8 +123,15 @@ async fn run_loop_inner(
         input: request.input.clone(),
     });
 
-    let current_config = Arc::new(request.config);
-    let current_revision = ConfigRevision::INITIAL;
+    let mut current_config = Arc::new(request.config);
+    // Last revision whose snapshot actually served an issued Model Request.
+    // A taken-but-never-issued candidate must not advance this (prompt or
+    // build failures, cancellation or deadline while preparing).
+    let mut issued_revision = ConfigRevision::INITIAL;
+    // Revision pulled from control by the A/F steps; only committed at the
+    // issue boundary below, so repeated stale rebuilds keep the latest one
+    // while request_index stays put.
+    let mut candidate_revision: Option<ConfigRevision> = None;
     let mut request_index: u32 = 0;
     let mut tool_rounds: u16 = 0;
     let mut requests: u32 = 0;
@@ -136,6 +143,16 @@ async fn run_loop_inner(
         }
         if loop_deadline.is_some_and(|deadline| TokioInstant::now() >= deadline) {
             break FailPath::Deadline;
+        }
+
+        // A. Pull the latest config accepted since the last boundary into the
+        // working slot. It is a *candidate* until the issue boundary: the
+        // snapshot below is pinned for the whole request (model call and its
+        // tool batch), but the revision is only recorded once a Model Request
+        // really goes out.
+        if let Some((revision, config)) = ctx.control.take_pending_config() {
+            current_config = config;
+            candidate_revision = Some(revision);
         }
 
         let snapshot = Arc::clone(&current_config);
@@ -153,15 +170,34 @@ async fn run_loop_inner(
             PromptPrep::End(path) => break path,
         };
 
+        // F. A newer update may have landed while the prompt was being
+        // prepared. Discard the stale prompt and rebuild with the latest
+        // config: request_index does not advance, no model request is ever
+        // issued for the stale snapshot, and the candidate revision keeps the
+        // latest value (spec 15.1).
+        if let Some((revision, config)) = ctx.control.take_pending_config() {
+            current_config = config;
+            candidate_revision = Some(revision);
+            continue;
+        }
+
         let model_request = match build_model_request(messages, &snapshot) {
             Ok(request) => request,
             Err(_) => break FailPath::Prompt,
         };
 
+        // Issue boundary: a real Model Request is about to be dispatched under
+        // the candidate revision (or the previously issued one). Only now is
+        // the revision recorded as actually applied/issued, for RequestStarted,
+        // per-request states, and the final report.
+        let revision = candidate_revision.take().unwrap_or(issued_revision);
+        issued_revision = revision;
+        ctx.control.commit_revision(revision);
+
         ctx.sink.try_emit(LoopEvent::RequestStarted {
             loop_id: id,
             request_index,
-            config_revision: current_revision,
+            config_revision: revision,
             model: snapshot.descriptor().model_ref.clone(),
             reasoning: snapshot.reasoning(),
         });
@@ -169,7 +205,7 @@ async fn run_loop_inner(
             loop_id: id,
             status: LoopStatus::RunningModel,
             request_index,
-            config_revision: current_revision,
+            config_revision: revision,
             model: Some(snapshot.descriptor().model_ref.clone()),
             pending_interaction: None,
         });
@@ -240,7 +276,7 @@ async fn run_loop_inner(
             loop_id: id,
             status: LoopStatus::RunningTools,
             request_index,
-            config_revision: current_revision,
+            config_revision: revision,
             model: Some(snapshot.descriptor().model_ref.clone()),
             pending_interaction: None,
         });
@@ -351,7 +387,6 @@ async fn run_loop_inner(
         usage.finish(),
         requests,
         tool_rounds,
-        current_revision,
     )
 }
 
@@ -362,9 +397,11 @@ fn finish_loop(
     usage: Usage,
     requests: u32,
     tool_rounds: u16,
-    revision: ConfigRevision,
 ) -> Arc<LoopReport> {
     let id = ctx.id;
+    // The revision of the config that was actually applied: a pending update
+    // that never reached a request boundary does not show up here.
+    let revision = ctx.control.applied_revision();
     // The zero-based index of the last request actually issued, not the count.
     let last_request_index = requests.saturating_sub(1);
     // Read cancellation intent before sealing: cancel_reason is only readable

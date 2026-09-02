@@ -4,6 +4,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::limits::LoopLimits;
 use crate::model::{Model, ModelDescriptor, ReasoningPreference};
 use crate::prompt_provider::PromptProvider;
 use crate::tools::{ToolPolicy, ToolSet};
@@ -26,6 +27,12 @@ impl ConfigRevision {
 
     pub const fn as_u64(self) -> u64 {
         self.0
+    }
+
+    /// Next revision; saturating so handed-out revisions stay monotonic even
+    /// at the (unreachable) `u64` ceiling.
+    pub const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
     }
 }
 
@@ -117,5 +124,22 @@ impl ExecutionConfig {
 
     pub fn prompt(&self) -> &Arc<dyn PromptProvider> {
         &self.prompt
+    }
+
+    /// Re-applies a live loop's runtime budgets to this config: per-spec tool
+    /// name and schema byte caps. Descriptor and per-spec validity were
+    /// already checked at construction. Tool *count* is deliberately not a
+    /// loop budget — the registered set size is a product decision. Used
+    /// identically by `AgentLoop::start` and `LoopHandle::update` (both fail
+    /// outside any lock).
+    pub(crate) fn validate_against_limits(
+        &self,
+        limits: &LoopLimits,
+    ) -> Result<(), ExecutionConfigError> {
+        for spec in self.tools.frozen_specs() {
+            spec.validate_for_bindings(limits.max_tool_name_bytes, limits.max_tool_schema_bytes)
+                .map_err(|_| ExecutionConfigError::InvalidTools)?;
+        }
+        Ok(())
     }
 }
