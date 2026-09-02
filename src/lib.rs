@@ -25,7 +25,7 @@ pub use agent_loop::{
     AgentLoop, AnswerError, CancelReason, LoopEvent, LoopEventEnvelope, LoopEventStream,
     LoopFailure, LoopFailureKind, LoopHandle, LoopJoinError, LoopOptions, LoopOutcome,
     LoopOutcomeSummary, LoopReport, LoopRequest, LoopStartError, LoopState, LoopStatus,
-    LoopWaitError, OutputChannel, TakeEventsError, UpdateError,
+    LoopWaitError, OutputChannel, SteerError, TakeEventsError, UpdateError,
 };
 pub use config::{
     CompactionConfig, KernelConfig, RetryPolicy, SemanticLimits, SessionManifest, SessionSpec,

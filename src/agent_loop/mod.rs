@@ -143,9 +143,13 @@ impl AgentLoop {
 
         let id = LoopId::new().map_err(|_| LoopStartError::IdGeneration)?;
         let options = Arc::new(options);
-        let (control, sink, events, completion_tx) =
-            LoopControl::new(id, options.event_capacity, options.limits)
-                .map_err(|_| LoopStartError::InvalidOptions)?;
+        let (control, sink, events, completion_tx) = LoopControl::new(
+            id,
+            options.event_capacity,
+            options.limits,
+            options.max_pending_steers,
+        )
+        .map_err(|_| LoopStartError::InvalidOptions)?;
         let control = Arc::new(control);
 
         let join = tokio::spawn(runner::run_loop(
@@ -287,6 +291,20 @@ pub enum UpdateError {
     #[error("config does not satisfy the loop limits")]
     InvalidConfig,
     #[error("the loop is not accepting config updates")]
+    NotActive,
+}
+
+/// Errors steering a running loop.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum SteerError {
+    #[error("steer input exceeds the loop limits")]
+    InvalidInput,
+    #[error("the steer queue is full")]
+    QueueFull,
+    #[error("the loop is waiting for an interaction answer")]
+    WaitingForInput,
+    #[error("the loop is not accepting steers")]
     NotActive,
 }
 

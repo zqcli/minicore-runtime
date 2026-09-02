@@ -109,7 +109,7 @@ async fn aborted_runner_makes_wait_return_completion_closed() {
 async fn finish_loop_losing_the_seal_returns_the_published_arc() {
     let id = LoopId::new().unwrap();
     let (control, mut sink, _stream, completion_tx) =
-        LoopControl::new(id, 8, LoopLimits::default()).unwrap();
+        LoopControl::new(id, 8, LoopLimits::default(), 16).unwrap();
     let control = Arc::new(control);
 
     // Simulate a prior completion that won the seal and published its report.
@@ -161,7 +161,7 @@ async fn finish_loop_losing_the_seal_returns_the_published_arc() {
 async fn completion_is_exactly_once_and_token_cancel_is_terminal() {
     let id = LoopId::new().unwrap();
     let (control, _sink, _stream, completion_tx) =
-        LoopControl::new(id, 8, LoopLimits::default()).unwrap();
+        LoopControl::new(id, 8, LoopLimits::default(), 16).unwrap();
     let control = Arc::new(control);
     let handle = LoopHandle::new(Arc::clone(&control));
 
