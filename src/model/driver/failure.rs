@@ -90,7 +90,7 @@ impl ModelDriverFailure {
         self.deadline_source
     }
 
-    pub(super) fn ordinary(error: ModelError) -> Self {
+    pub(crate) fn ordinary(error: ModelError) -> Self {
         Self {
             error,
             deadline_source: None,

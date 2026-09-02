@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::UserInput;
@@ -101,5 +103,78 @@ impl<'a> HistoryView<'a> {
 
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &'a HistoryItem> {
         self.base.iter().chain(self.appended.iter())
+    }
+}
+
+/// Turn-local history: the host-owned base plus the current loop's in-memory
+/// delta. The delta becomes `LoopReport::appended` when the loop ends.
+pub(crate) struct WorkingHistory {
+    base: Arc<[HistoryItem]>,
+    appended: Vec<HistoryItem>,
+}
+
+impl WorkingHistory {
+    pub(crate) fn new(base: Arc<[HistoryItem]>) -> Self {
+        Self {
+            base,
+            appended: Vec::new(),
+        }
+    }
+
+    pub(crate) fn view(&self) -> HistoryView<'_> {
+        HistoryView::new(&self.base, &self.appended)
+    }
+
+    pub(crate) fn append_user(&mut self, item: UserHistory) {
+        self.appended.push(HistoryItem::User(item));
+    }
+
+    pub(crate) fn append_assistant(&mut self, item: AssistantHistory) {
+        self.appended.push(HistoryItem::Assistant(item));
+    }
+
+    pub(crate) fn append_tool_result(&mut self, item: ToolResultHistory) {
+        self.appended.push(HistoryItem::ToolResult(item));
+    }
+
+    pub(crate) fn into_appended(self) -> Arc<[HistoryItem]> {
+        self.appended.into()
+    }
+}
+
+/// Estimates the total text footprint of a host history for the resource
+/// ceiling checked at `AgentLoop::start`. This is a conservative upper bound,
+/// not a serialized-size guarantee.
+pub(crate) fn estimate_history_bytes(items: &[HistoryItem]) -> usize {
+    items.iter().map(estimate_item_bytes).sum()
+}
+
+fn estimate_item_bytes(item: &HistoryItem) -> usize {
+    match item {
+        HistoryItem::User(user) => user.input.as_text().len(),
+        HistoryItem::Assistant(assistant) => {
+            assistant.content.iter().map(estimate_part_bytes).sum()
+        }
+        HistoryItem::ToolResult(result) => {
+            result.call_id.as_str().len()
+                + result.tool_name.as_str().len()
+                + result.output.content().as_str().len()
+        }
+        HistoryItem::Summary(summary) => summary.content.as_str().len(),
+    }
+}
+
+fn estimate_part_bytes(part: &AssistantPart) -> usize {
+    match part {
+        AssistantPart::Text(text) => text.len(),
+        AssistantPart::Reasoning(reasoning) => reasoning
+            .text()
+            .map_or(0, str::len)
+            .saturating_add(reasoning.summary().map_or(0, str::len))
+            .saturating_add(reasoning.encrypted().map_or(0, str::len))
+            .saturating_add(reasoning.signature().map_or(0, str::len)),
+        AssistantPart::ToolCall(call) => {
+            call.name().as_str().len() + call.arguments().to_string().len()
+        }
     }
 }

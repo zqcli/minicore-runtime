@@ -1,7 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
 
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -24,6 +23,9 @@ pub enum PromptError {
 }
 
 /// Everything a `PromptProvider` may observe about one model request.
+///
+/// `deadline` uses Tokio clock semantics so providers can drive `sleep_until`
+/// directly without converting a wall-clock instant.
 #[derive(Debug)]
 pub struct PromptRequest<'a> {
     pub loop_id: LoopId,
@@ -33,7 +35,7 @@ pub struct PromptRequest<'a> {
     pub reasoning: ReasoningPreference,
     pub tools: &'a [ToolSpec],
     pub cancellation: CancellationToken,
-    pub deadline: Instant,
+    pub deadline: tokio::time::Instant,
 }
 
 /// Final prompt output for a request.

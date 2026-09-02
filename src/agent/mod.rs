@@ -1,5 +1,5 @@
 mod environment;
-mod runner;
+pub(crate) mod runner;
 mod runner_protocol;
 mod tool_driver;
 mod turn_context;

@@ -440,7 +440,7 @@ async fn prompt_provider_receives_the_full_history_view() {
         reasoning: ReasoningPreference::Auto,
         tools: &[],
         cancellation: CancellationToken::new(),
-        deadline: std::time::Instant::now() + Duration::from_secs(30),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(30),
     };
 
     let prepared = provider
@@ -478,7 +478,7 @@ async fn prompt_provider_rejects_an_empty_prompt() {
         reasoning: ReasoningPreference::Auto,
         tools: &[],
         cancellation: CancellationToken::new(),
-        deadline: std::time::Instant::now() + Duration::from_secs(30),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(30),
     };
     let result = provider.prepare(request).await;
     assert!(matches!(result, Err(PromptError::EmptyPrompt)));
