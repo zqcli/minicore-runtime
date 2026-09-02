@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use tokio::sync::watch;
 
+use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::ids::{InteractionId, LoopId};
 use crate::interaction::InteractionAnswer;
 
 use super::control::LoopControl;
-use super::{AnswerError, LoopReport, LoopState, LoopWaitError};
+use super::{AnswerError, LoopReport, LoopState, LoopWaitError, UpdateError};
 
 /// Live handle to one agent loop. `LoopHandle` is cheap to clone and holds no
 /// history, store, or session metadata: only the shared `LoopControl`.
@@ -45,6 +46,16 @@ impl LoopHandle {
     pub fn cancel(&self) -> bool {
         self.control
             .mark_cancel(crate::agent_loop::CancelReason::User)
+    }
+
+    /// Atomically replaces the loop's execution config. The new config takes
+    /// effect at the next model-request boundary (the in-flight model and the
+    /// tool batch it produced keep the previous snapshot); `Ok` carries the
+    /// monotonic revision handed to this update. After the loop completes
+    /// this returns `NotActive`; a config that violates the loop limits is
+    /// rejected as `InvalidConfig` without consuming a revision.
+    pub fn update(&self, config: ExecutionConfig) -> Result<ConfigRevision, UpdateError> {
+        self.control.update(config)
     }
 
     pub fn is_finished(&self) -> bool {

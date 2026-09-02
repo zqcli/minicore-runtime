@@ -16,6 +16,7 @@ use crate::agent_loop::{
 use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::{HistoryItem, WorkingHistory};
 use crate::ids::LoopId;
+use crate::limits::LoopLimits;
 use crate::model::{
     Model, ModelCallContext, ModelDescriptor, ModelError, ModelMessage, ModelRequest,
     ModelStartFuture, ModelStream, ReasoningPreference, Usage,
@@ -107,7 +108,8 @@ async fn aborted_runner_makes_wait_return_completion_closed() {
 #[tokio::test]
 async fn finish_loop_losing_the_seal_returns_the_published_arc() {
     let id = LoopId::new().unwrap();
-    let (control, mut sink, _stream, completion_tx) = LoopControl::new(id, 8).unwrap();
+    let (control, mut sink, _stream, completion_tx) =
+        LoopControl::new(id, 8, LoopLimits::default()).unwrap();
     let control = Arc::new(control);
 
     // Simulate a prior completion that won the seal and published its report.
@@ -140,7 +142,6 @@ async fn finish_loop_losing_the_seal_returns_the_published_arc() {
         Usage::default(),
         0,
         0,
-        ConfigRevision::INITIAL,
     );
     assert!(
         Arc::ptr_eq(&report, &published),
@@ -159,7 +160,8 @@ async fn finish_loop_losing_the_seal_returns_the_published_arc() {
 #[tokio::test]
 async fn completion_is_exactly_once_and_token_cancel_is_terminal() {
     let id = LoopId::new().unwrap();
-    let (control, _sink, _stream, completion_tx) = LoopControl::new(id, 8).unwrap();
+    let (control, _sink, _stream, completion_tx) =
+        LoopControl::new(id, 8, LoopLimits::default()).unwrap();
     let control = Arc::new(control);
     let handle = LoopHandle::new(Arc::clone(&control));
 

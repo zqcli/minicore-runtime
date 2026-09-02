@@ -26,9 +26,9 @@ use minicore_runtime::tools::{
 };
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{
-    AgentLoop, AnswerError, CancelReason, ExecutionConfig, HistoryItem, InteractionAnswer,
-    LoopEvent, LoopOptions, LoopOutcome, LoopReport, LoopRequest, LoopStartError, LoopStatus,
-    ToolCallId, UserInput,
+    AgentLoop, AnswerError, CancelReason, ConfigRevision, ExecutionConfig, HistoryItem,
+    InteractionAnswer, LoopEvent, LoopOptions, LoopOutcome, LoopReport, LoopRequest,
+    LoopStartError, LoopStatus, ToolCallId, UpdateError, UserInput,
 };
 
 fn reasoning_set() -> BTreeSet<ReasoningPreference> {
@@ -36,13 +36,19 @@ fn reasoning_set() -> BTreeSet<ReasoningPreference> {
 }
 
 fn scripted_model(rounds: Vec<Round>) -> (Arc<dyn Model>, Arc<Notify>) {
-    let descriptor = ModelDescriptor::new(
-        "fake/scripted-model".parse().unwrap(),
-        8192,
-        reasoning_set(),
-        true,
-    )
-    .unwrap();
+    scripted_model_named("fake/scripted-model", rounds)
+}
+
+fn scripted_model_named(name: &str, rounds: Vec<Round>) -> (Arc<dyn Model>, Arc<Notify>) {
+    scripted_model_full(name, reasoning_set(), rounds)
+}
+
+fn scripted_model_full(
+    name: &str,
+    reasoning: BTreeSet<ReasoningPreference>,
+    rounds: Vec<Round>,
+) -> (Arc<dyn Model>, Arc<Notify>) {
+    let descriptor = ModelDescriptor::new(name.parse().unwrap(), 8192, reasoning, true).unwrap();
     let started = Arc::new(Notify::new());
     (
         Arc::new(ScriptedModel {
@@ -61,6 +67,16 @@ enum Round {
     },
     Tools {
         calls: Vec<(&'static str, &'static str)>,
+    },
+    /// Like `Tools` but the stream awaits a Notify before its first event.
+    GatedTools {
+        calls: Vec<(&'static str, &'static str)>,
+        gate: Arc<Notify>,
+    },
+    /// Like `Final` but the stream awaits a Notify before its first event.
+    GatedFinal {
+        text: &'static str,
+        gate: Arc<Notify>,
     },
     Hold,
 }
@@ -105,29 +121,70 @@ fn round_stream(round: Round) -> ModelStream {
                 reason: ModelFinishReason::Stop,
             }),
         ])),
-        Round::Tools { calls } => {
-            let mut events = Vec::new();
-            for (name, call_id) in calls {
-                let call_id: ToolCallId = call_id.parse().unwrap();
-                events.push(Ok(ModelEvent::ToolCallStart {
-                    tool_call_id: call_id.clone(),
-                    tool_name: name.parse().unwrap(),
-                }));
-                events.push(Ok(ModelEvent::tool_call_arguments_delta(
-                    call_id.clone(),
-                    "{}",
-                )
-                .unwrap()));
-                events.push(Ok(ModelEvent::ToolCallEnd {
-                    tool_call_id: call_id,
-                }));
-            }
-            events.push(Ok(ModelEvent::Finish {
-                reason: ModelFinishReason::ToolCalls,
-            }));
-            Box::pin(futures_util::stream::iter(events))
-        }
+        Round::Tools { calls } => Box::pin(futures_util::stream::iter(
+            tool_call_events(calls).into_iter().map(Ok::<_, ModelError>),
+        )),
+        Round::GatedTools { calls, gate } => gated_stream(tool_call_events(calls), gate),
+        Round::GatedFinal { text, gate } => gated_stream(
+            vec![
+                ModelEvent::text_delta(text).unwrap(),
+                ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            ],
+            gate,
+        ),
     }
+}
+
+fn tool_call_events(calls: Vec<(&'static str, &'static str)>) -> Vec<ModelEvent> {
+    let mut events = Vec::new();
+    for (name, call_id) in calls {
+        let call_id: ToolCallId = call_id.parse().unwrap();
+        events.push(ModelEvent::ToolCallStart {
+            tool_call_id: call_id.clone(),
+            tool_name: name.parse().unwrap(),
+        });
+        events.push(ModelEvent::tool_call_arguments_delta(call_id.clone(), "{}").unwrap());
+        events.push(ModelEvent::ToolCallEnd {
+            tool_call_id: call_id,
+        });
+    }
+    events.push(ModelEvent::Finish {
+        reason: ModelFinishReason::ToolCalls,
+    });
+    events
+}
+
+struct GatedSeq {
+    events: Vec<ModelEvent>,
+    next: usize,
+    gate: Option<Arc<Notify>>,
+}
+
+/// Emits `events`, awaiting `gate` (once) before the first one.
+fn gated_stream(events: Vec<ModelEvent>, gate: Arc<Notify>) -> ModelStream {
+    Box::pin(futures_util::stream::unfold(
+        GatedSeq {
+            events,
+            next: 0,
+            gate: Some(gate),
+        },
+        |mut state| async move {
+            if state.next == 0 {
+                if let Some(gate) = state.gate.take() {
+                    gate.notified().await;
+                }
+            }
+            if state.next < state.events.len() {
+                let event = state.events[state.next].clone();
+                state.next += 1;
+                Some((Ok::<ModelEvent, ModelError>(event), state))
+            } else {
+                None
+            }
+        },
+    ))
 }
 
 #[derive(Clone)]
@@ -135,6 +192,8 @@ enum ToolBehavior {
     Succeed,
     Fail,
     Hold,
+    /// Succeeds after a Notify is released (deterministic mid-batch update).
+    Gate(Arc<Notify>),
     RequestInput,
 }
 
@@ -167,6 +226,12 @@ impl Tool for RecordingTool {
                     ToolOutput::new("tool result").unwrap(),
                 )),
                 ToolBehavior::Fail => Err(ToolError::Failed),
+                ToolBehavior::Gate(gate) => {
+                    gate.notified().await;
+                    Ok(ToolExecutionOutcome::Completed(
+                        ToolOutput::new("tool result").unwrap(),
+                    ))
+                }
                 ToolBehavior::RequestInput => {
                     let request =
                         ToolInputRequest::new("type the answer", vec![], ToolInputAnswerKind::Text)
@@ -192,7 +257,7 @@ fn echo_spec() -> ToolSpec {
 }
 
 fn tool_set(calls: Arc<Mutex<Vec<ToolCallId>>>, behavior: ToolBehavior) -> ToolSet {
-    tool_set_with_entered(calls, behavior, None)
+    tool_set_full("echo", calls, behavior, None)
 }
 
 fn tool_set_with_entered(
@@ -200,9 +265,23 @@ fn tool_set_with_entered(
     behavior: ToolBehavior,
     entered: Option<Arc<Notify>>,
 ) -> ToolSet {
+    tool_set_full("echo", calls, behavior, entered)
+}
+
+fn tool_set_full(
+    name: &str,
+    calls: Arc<Mutex<Vec<ToolCallId>>>,
+    behavior: ToolBehavior,
+    entered: Option<Arc<Notify>>,
+) -> ToolSet {
     let mut builder = ToolSet::builder();
     builder.register(RecordingTool {
-        spec: echo_spec(),
+        spec: ToolSpec::new(
+            name.parse().unwrap(),
+            "echo tool",
+            json!({"type": "object"}),
+        )
+        .unwrap(),
         calls,
         behavior,
         entered,
@@ -292,14 +371,82 @@ fn config(
     tools: ToolSet,
     policy: Option<Arc<dyn ToolPolicy>>,
 ) -> ExecutionConfig {
-    ExecutionConfig::new(
+    config_full(
         model,
         ReasoningPreference::Auto,
         tools,
         policy,
         Arc::new(ProjectingPrompt { system: None }),
     )
-    .expect("test config must validate")
+}
+
+fn config_full(
+    model: Arc<dyn Model>,
+    reasoning: ReasoningPreference,
+    tools: ToolSet,
+    policy: Option<Arc<dyn ToolPolicy>>,
+    prompt: Arc<dyn PromptProvider>,
+) -> ExecutionConfig {
+    ExecutionConfig::new(model, reasoning, tools, policy, prompt)
+        .expect("test config must validate")
+}
+
+fn project() -> Arc<dyn PromptProvider> {
+    Arc::new(ProjectingPrompt { system: None })
+}
+
+/// Prompt provider that blocks its first `prepare` on a Notify (unless it has
+/// no gate) and counts invocations, so tests can hold a request boundary.
+struct GatedPrompt {
+    entered: Arc<Notify>,
+    gate: Option<Arc<Notify>>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl PromptProvider for GatedPrompt {
+    fn prepare<'a>(&'a self, request: PromptRequest<'a>) -> PromptFuture<'a> {
+        let entered = Arc::clone(&self.entered);
+        let gate = self.gate.clone();
+        let is_first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+        Box::pin(async move {
+            if is_first {
+                if let Some(gate) = gate {
+                    entered.notify_waiters();
+                    gate.notified().await;
+                }
+            }
+            let mut messages = Vec::new();
+            for item in request.history.iter() {
+                match item {
+                    minicore_runtime::HistoryItem::User(user) => {
+                        messages.push(ModelMessage::user(user.input.as_text()).unwrap())
+                    }
+                    minicore_runtime::HistoryItem::Assistant(assistant) => {
+                        messages.push(ModelMessage::assistant(assistant.content.clone()).unwrap())
+                    }
+                    minicore_runtime::HistoryItem::ToolResult(result) => messages.push(
+                        ModelMessage::tool_with_outcome(
+                            result.call_id.clone(),
+                            result.output.clone(),
+                            result.outcome,
+                        )
+                        .unwrap(),
+                    ),
+                    minicore_runtime::HistoryItem::Summary(summary) => messages.push(
+                        ModelMessage::system(format!(
+                            "Conversation summary:\n{}",
+                            summary.content.as_str()
+                        ))
+                        .unwrap(),
+                    ),
+                }
+            }
+            if messages.is_empty() {
+                return Err(PromptError::EmptyPrompt);
+            }
+            Ok(PreparedPrompt { messages })
+        })
+    }
 }
 
 fn request(config: ExecutionConfig) -> LoopRequest {
@@ -1376,4 +1523,1069 @@ async fn interaction_wait_deadline_cancels_and_settles_the_pending_call() {
             .is_err()
     );
     assert_eq!(handle.state().status, LoopStatus::Finished);
+}
+
+// ===== Phase 3: request-boundary config updates =====
+
+fn model_names(report: &LoopReport) -> Vec<String> {
+    report
+        .appended
+        .iter()
+        .filter_map(|item| match item {
+            HistoryItem::Assistant(assistant) => Some(assistant.model.as_str().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn recorded_calls(calls: &Mutex<Vec<ToolCallId>>) -> Vec<String> {
+    calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|call| call.as_str().to_string())
+        .collect()
+}
+
+async fn collect_request_starts(
+    events: &mut minicore_runtime::LoopEventStream,
+) -> Vec<(
+    u32,
+    ConfigRevision,
+    String,
+    minicore_runtime::model::ReasoningPreference,
+)> {
+    let mut started = Vec::new();
+    while let Some(envelope) = events.recv().await {
+        if let LoopEvent::RequestStarted {
+            request_index,
+            config_revision,
+            model,
+            reasoning,
+            ..
+        } = envelope.event
+        {
+            started.push((
+                request_index,
+                config_revision,
+                model.as_str().to_string(),
+                reasoning,
+            ));
+        }
+    }
+    started
+}
+
+/// MC4-027: an update accepted while a model request is in flight reaches the
+/// next request.
+#[tokio::test]
+async fn update_during_model_reaches_the_next_request() {
+    let gate = Arc::new(Notify::new());
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::GatedTools {
+            calls: vec![("echo", "call_1")],
+            gate: Arc::clone(&gate),
+        }],
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "from b" }]);
+    let mut agent = AgentLoop::start(
+        request(config(
+            model_a,
+            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
+            None,
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let mut events = agent.take_events().unwrap();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    let mut states = handle.watch_state();
+    states
+        .wait_for(|state| state.status == LoopStatus::RunningModel)
+        .await
+        .unwrap();
+
+    let revision = handle
+        .update(config_full(
+            model_b,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            project(),
+        ))
+        .unwrap();
+    assert_eq!(revision, ConfigRevision::new(1));
+
+    gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.requests, 2);
+    assert_eq!(report.final_config_revision, ConfigRevision::new(1));
+    assert_eq!(model_names(&report), ["fake/a", "fake/b"]);
+    assert_eq!(recorded_calls(&calls), ["call_1"]);
+
+    let started = collect_request_starts(&mut events).await;
+    assert_eq!(
+        started,
+        vec![
+            (
+                0,
+                ConfigRevision::INITIAL,
+                "fake/a".to_string(),
+                ReasoningPreference::Auto
+            ),
+            (
+                1,
+                ConfigRevision::new(1),
+                "fake/b".to_string(),
+                ReasoningPreference::Auto
+            ),
+        ]
+    );
+}
+
+/// MC4-028: the tool batch produced by a request keeps that request's snapshot
+/// even when an update lands while the batch is running.
+#[tokio::test]
+async fn update_during_tools_keeps_the_batch_on_the_old_snapshot() {
+    let gate = Arc::new(Notify::new());
+    let entered = Arc::new(Notify::new());
+    let calls_a = Arc::new(Mutex::new(Vec::new()));
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::Tools {
+            calls: vec![("echo", "call_1")],
+        }],
+    );
+    let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "from b" }]);
+    let agent = AgentLoop::start(
+        request(config_full(
+            model_a,
+            ReasoningPreference::Auto,
+            tool_set_full(
+                "echo",
+                Arc::clone(&calls_a),
+                ToolBehavior::Gate(Arc::clone(&gate)),
+                Some(Arc::clone(&entered)),
+            ),
+            None,
+            project(),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    entered.notified().await;
+    let revision = handle
+        .update(config_full(
+            model_b,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            project(),
+        ))
+        .unwrap();
+    assert_eq!(revision, ConfigRevision::new(1));
+
+    gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.requests, 2);
+    assert_eq!(recorded_calls(&calls_a), ["call_1"]);
+    assert_eq!(report.final_config_revision, ConfigRevision::new(1));
+    assert_eq!(model_names(&report), ["fake/a", "fake/b"]);
+}
+
+/// MC4-029: several updates before one boundary hand out monotonic revisions
+/// but only the latest config is applied.
+#[tokio::test]
+async fn multiple_updates_keep_only_the_latest() {
+    let gate = Arc::new(Notify::new());
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::GatedTools {
+            calls: vec![("echo", "call_1")],
+            gate: Arc::clone(&gate),
+        }],
+    );
+    let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "b" }]);
+    let (model_c, _) = scripted_model_named("fake/c", vec![Round::Final { text: "c" }]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = AgentLoop::start(
+        request(config(
+            model_a,
+            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
+            None,
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let mut events = agent.take_events().unwrap();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    let mut states = handle.watch_state();
+    states
+        .wait_for(|state| state.status == LoopStatus::RunningModel)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        handle
+            .update(config_full(
+                model_b,
+                ReasoningPreference::Auto,
+                ToolSet::default(),
+                None,
+                project(),
+            ))
+            .unwrap(),
+        ConfigRevision::new(1)
+    );
+    assert_eq!(
+        handle
+            .update(config_full(
+                model_c,
+                ReasoningPreference::Auto,
+                ToolSet::default(),
+                None,
+                project(),
+            ))
+            .unwrap(),
+        ConfigRevision::new(2)
+    );
+
+    gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.requests, 2);
+    assert_eq!(report.final_config_revision, ConfigRevision::new(2));
+    assert_eq!(model_names(&report), ["fake/a", "fake/c"]);
+
+    let started = collect_request_starts(&mut events).await;
+    assert_eq!(
+        started,
+        vec![
+            (
+                0,
+                ConfigRevision::INITIAL,
+                "fake/a".to_string(),
+                ReasoningPreference::Auto
+            ),
+            (
+                1,
+                ConfigRevision::new(2),
+                "fake/c".to_string(),
+                ReasoningPreference::Auto
+            ),
+        ]
+    );
+}
+
+/// Spec 15.1: an update arriving while the prompt is prepared discards the
+/// stale prompt, rebuilds with the latest config, and never advances the
+/// request index or issues the stale model request.
+#[tokio::test]
+async fn update_during_prompt_prep_is_rebuilt_without_advancing_the_index() {
+    let entered = Arc::new(Notify::new());
+    let prompt_gate = Arc::new(Notify::new());
+    let prompt_a_calls = Arc::new(AtomicUsize::new(0));
+    let prompt_b_calls = Arc::new(AtomicUsize::new(0));
+    let (model_a, _) = scripted_model_named("fake/a", vec![Round::Final { text: "a" }]);
+    let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "b" }]);
+
+    let prompt_a = Arc::new(GatedPrompt {
+        entered: Arc::clone(&entered),
+        gate: Some(Arc::clone(&prompt_gate)),
+        calls: Arc::clone(&prompt_a_calls),
+    });
+    let prompt_b = Arc::new(GatedPrompt {
+        entered: Arc::new(Notify::new()),
+        gate: None,
+        calls: Arc::clone(&prompt_b_calls),
+    });
+
+    let mut agent = AgentLoop::start(
+        request(config_full(
+            model_a,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            prompt_a,
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let mut events = agent.take_events().unwrap();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    entered.notified().await;
+    assert_eq!(prompt_a_calls.load(Ordering::SeqCst), 1);
+
+    let revision = handle
+        .update(config_full(
+            model_b,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            prompt_b,
+        ))
+        .unwrap();
+    assert_eq!(revision, ConfigRevision::new(1));
+
+    prompt_gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_completed_with_text(&report, "b");
+    assert_eq!(
+        report.requests, 1,
+        "the stale prompt never became a request"
+    );
+    assert_eq!(report.final_config_revision, ConfigRevision::new(1));
+    assert_eq!(prompt_a_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(prompt_b_calls.load(Ordering::SeqCst), 1);
+
+    let started = collect_request_starts(&mut events).await;
+    assert_eq!(
+        started,
+        vec![(
+            0,
+            ConfigRevision::new(1),
+            "fake/b".to_string(),
+            ReasoningPreference::Auto
+        )]
+    );
+}
+
+/// MC4-031: updating a completed loop fails with NotActive.
+#[tokio::test]
+async fn update_after_completion_returns_not_active() {
+    let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+
+    let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "x" }]);
+    let error = handle
+        .update(config(model_b, ToolSet::default(), None))
+        .expect_err("update after seal must fail");
+    assert_eq!(error, UpdateError::NotActive);
+}
+
+/// MC4-032: a config update alone never keeps the loop alive; a final request
+/// still completes and the accepted update is simply not applied.
+#[tokio::test]
+async fn update_alone_does_not_extend_the_final_request() {
+    let gate = Arc::new(Notify::new());
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::GatedFinal {
+            text: "final",
+            gate: Arc::clone(&gate),
+        }],
+    );
+    let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "b" }]);
+    let agent = AgentLoop::start(
+        request(config(model_a, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    let mut states = handle.watch_state();
+    states
+        .wait_for(|state| state.status == LoopStatus::RunningModel)
+        .await
+        .unwrap();
+    let revision = handle
+        .update(config(model_b, ToolSet::default(), None))
+        .unwrap();
+    assert_eq!(revision, ConfigRevision::new(1));
+
+    gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.requests, 1);
+    assert_eq!(
+        report.final_config_revision,
+        ConfigRevision::INITIAL,
+        "an applied-but-never-issued update must not leak into the final revision"
+    );
+}
+
+/// MC4-033: the old response can only use the old ToolSet; the next request
+/// runs with the new ToolSet.
+#[tokio::test]
+async fn toolset_switch_applies_to_the_next_request() {
+    let gate = Arc::new(Notify::new());
+    let entered = Arc::new(Notify::new());
+    let calls_a = Arc::new(Mutex::new(Vec::new()));
+    let calls_b = Arc::new(Mutex::new(Vec::new()));
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::Tools {
+            calls: vec![("echo", "call_1")],
+        }],
+    );
+    let (model_b, _) = scripted_model_named(
+        "fake/b",
+        vec![
+            Round::Final {
+                text: "placeholder",
+            },
+            Round::Tools {
+                calls: vec![("echo2", "call_2")],
+            },
+        ],
+    );
+    let agent = AgentLoop::start(
+        request(config_full(
+            model_a,
+            ReasoningPreference::Auto,
+            tool_set_full(
+                "echo",
+                Arc::clone(&calls_a),
+                ToolBehavior::Gate(Arc::clone(&gate)),
+                Some(Arc::clone(&entered)),
+            ),
+            None,
+            project(),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    entered.notified().await;
+    let revision = handle
+        .update(config_full(
+            model_b,
+            ReasoningPreference::Auto,
+            tool_set_full("echo2", Arc::clone(&calls_b), ToolBehavior::Succeed, None),
+            None,
+            project(),
+        ))
+        .unwrap();
+    assert_eq!(revision, ConfigRevision::new(1));
+
+    gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.final_config_revision, ConfigRevision::new(1));
+    assert_eq!(recorded_calls(&calls_a), ["call_1"]);
+    assert_eq!(recorded_calls(&calls_b), ["call_2"]);
+    assert_eq!(model_names(&report), ["fake/a", "fake/b", "fake/b"]);
+}
+
+/// MC4-034: the next request is prepared by the new PromptProvider.
+#[tokio::test]
+async fn prompt_provider_switch_applies_to_the_next_request() {
+    let gate = Arc::new(Notify::new());
+    let entered = Arc::new(Notify::new());
+    let calls_a = Arc::new(Mutex::new(Vec::new()));
+    let prompt_a_calls = Arc::new(AtomicUsize::new(0));
+    let prompt_b_calls = Arc::new(AtomicUsize::new(0));
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::Tools {
+            calls: vec![("echo", "call_1")],
+        }],
+    );
+    let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "from b" }]);
+
+    let prompt_a = Arc::new(GatedPrompt {
+        entered: Arc::clone(&entered),
+        gate: None,
+        calls: Arc::clone(&prompt_a_calls),
+    });
+    let prompt_b = Arc::new(GatedPrompt {
+        entered: Arc::new(Notify::new()),
+        gate: None,
+        calls: Arc::clone(&prompt_b_calls),
+    });
+
+    let agent = AgentLoop::start(
+        request(config_full(
+            model_a,
+            ReasoningPreference::Auto,
+            tool_set_full(
+                "echo",
+                Arc::clone(&calls_a),
+                ToolBehavior::Gate(Arc::clone(&gate)),
+                Some(Arc::clone(&entered)),
+            ),
+            None,
+            prompt_a,
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    entered.notified().await;
+    let revision = handle
+        .update(config_full(
+            model_b,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            prompt_b,
+        ))
+        .unwrap();
+    assert_eq!(revision, ConfigRevision::new(1));
+
+    gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.requests, 2);
+    assert_eq!(prompt_a_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(prompt_b_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(model_names(&report), ["fake/a", "fake/b"]);
+}
+
+/// RequestStarted must record each request's actual snapshot: revision, model,
+/// and reasoning preference across an update.
+#[tokio::test]
+async fn request_started_records_the_actual_snapshot_revision_and_reasoning() {
+    let gate = Arc::new(Notify::new());
+    let entered = Arc::new(Notify::new());
+    let calls_a = Arc::new(Mutex::new(Vec::new()));
+    let (model_a, _) = scripted_model_full(
+        "fake/a",
+        BTreeSet::from([ReasoningPreference::Low]),
+        vec![Round::Tools {
+            calls: vec![("echo", "call_1")],
+        }],
+    );
+    let (model_b, _) = scripted_model_full(
+        "fake/b",
+        BTreeSet::from([ReasoningPreference::High]),
+        vec![Round::Final { text: "from b" }],
+    );
+    let mut agent = AgentLoop::start(
+        request(config_full(
+            model_a,
+            ReasoningPreference::Low,
+            tool_set_full(
+                "echo",
+                Arc::clone(&calls_a),
+                ToolBehavior::Gate(Arc::clone(&gate)),
+                Some(Arc::clone(&entered)),
+            ),
+            None,
+            project(),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let mut events = agent.take_events().unwrap();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    entered.notified().await;
+    let revision = handle
+        .update(config_full(
+            model_b,
+            ReasoningPreference::High,
+            ToolSet::default(),
+            None,
+            project(),
+        ))
+        .unwrap();
+    assert_eq!(revision, ConfigRevision::new(1));
+
+    gate.notify_waiters();
+    report_task.await.unwrap().unwrap();
+
+    let started = collect_request_starts(&mut events).await;
+    assert_eq!(
+        started,
+        vec![
+            (
+                0,
+                ConfigRevision::INITIAL,
+                "fake/a".to_string(),
+                ReasoningPreference::Low
+            ),
+            (
+                1,
+                ConfigRevision::new(1),
+                "fake/b".to_string(),
+                ReasoningPreference::High
+            ),
+        ]
+    );
+}
+
+/// An invalid config against the live loop limits is rejected without
+/// consuming a revision.
+#[tokio::test]
+async fn invalid_config_update_does_not_consume_a_revision() {
+    let gate = Arc::new(Notify::new());
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::GatedFinal {
+            text: "a",
+            gate: Arc::clone(&gate),
+        }],
+    );
+    let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "b" }]);
+
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.limits.max_tool_schema_bytes = 16;
+
+    let agent =
+        AgentLoop::start(request(config(model_a, ToolSet::default(), None)), options).unwrap();
+    let handle = agent.handle();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    let mut states = handle.watch_state();
+    states
+        .wait_for(|state| state.status == LoopStatus::RunningModel)
+        .await
+        .unwrap();
+
+    let mut builder = ToolSet::builder();
+    builder.register(RecordingTool {
+        spec: echo_spec(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+        behavior: ToolBehavior::Succeed,
+        entered: None,
+    });
+    let oversized = builder.build().unwrap();
+    let error = handle
+        .update(config_full(
+            model_b.clone(),
+            ReasoningPreference::Auto,
+            oversized,
+            None,
+            project(),
+        ))
+        .expect_err("oversized tool spec must be rejected");
+    assert_eq!(error, UpdateError::InvalidConfig);
+
+    // The rejected update consumed no revision: the next accepted one is 1.
+    let good = handle
+        .update(config_full(
+            model_b,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            project(),
+        ))
+        .unwrap();
+    assert_eq!(good, ConfigRevision::new(1));
+
+    gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.final_config_revision, ConfigRevision::INITIAL);
+}
+
+/// Spec 13.2/33: an update accepted while waiting for input takes effect on
+/// the request after the interaction is resolved.
+#[tokio::test]
+async fn update_during_interaction_waits_takes_effect_after_the_interaction() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::Tools {
+            calls: vec![("echo", "call_1")],
+        }],
+    );
+    let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "from b" }]);
+    let policy = Arc::new(ScriptedPolicy {
+        plan: Arc::new(vec![PolicyPlan::RequireApproval]),
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let agent = AgentLoop::start(
+        request(config_full(
+            model_a,
+            ReasoningPreference::Auto,
+            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
+            Some(policy),
+            project(),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    let mut states = handle.watch_state();
+    states
+        .wait_for(|state| state.pending_interaction.is_some())
+        .await
+        .unwrap();
+    assert_eq!(handle.state().status, LoopStatus::WaitingForInput);
+
+    let revision = handle
+        .update(config_full(
+            model_b,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            project(),
+        ))
+        .unwrap();
+    assert_eq!(revision, ConfigRevision::new(1));
+
+    let pending = states.borrow().pending_interaction.clone().unwrap();
+    handle
+        .answer(
+            pending.interaction_id,
+            InteractionAnswer::Approval(ApprovalDecision::AllowOnce),
+        )
+        .unwrap();
+
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(recorded_calls(&calls), ["call_1"]);
+    assert_eq!(report.final_config_revision, ConfigRevision::new(1));
+    assert_eq!(model_names(&report), ["fake/a", "fake/b"]);
+}
+
+// ===== Phase 3 reviewer fixes: issued-vs-candidate revisions, shared limits =====
+
+/// An update taken at a request boundary whose prompt then errors must not
+/// advance the issued revision: no RequestStarted, final stays at the last
+/// truly issued revision.
+#[tokio::test]
+async fn failed_prompt_after_taken_update_keeps_the_last_issued_revision() {
+    let gate = Arc::new(Notify::new());
+    let entered = Arc::new(Notify::new());
+    let calls_a = Arc::new(Mutex::new(Vec::new()));
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::Tools {
+            calls: vec![("echo", "call_1")],
+        }],
+    );
+    let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "b" }]);
+    let mut agent = AgentLoop::start(
+        request(config_full(
+            model_a,
+            ReasoningPreference::Auto,
+            tool_set_full(
+                "echo",
+                Arc::clone(&calls_a),
+                ToolBehavior::Gate(Arc::clone(&gate)),
+                Some(Arc::clone(&entered)),
+            ),
+            None,
+            project(),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let mut events = agent.take_events().unwrap();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    entered.notified().await;
+    let revision = handle
+        .update(config_full(
+            model_b,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            Arc::new(FailingPrompt),
+        ))
+        .unwrap();
+    assert_eq!(revision, ConfigRevision::new(1));
+
+    gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert!(matches!(
+        &report.outcome,
+        LoopOutcome::Failed(failure)
+            if failure.kind == minicore_runtime::LoopFailureKind::Prompt
+    ));
+    assert_eq!(report.requests, 1);
+    assert_eq!(
+        report.final_config_revision,
+        ConfigRevision::INITIAL,
+        "a taken-but-never-issued revision must not become the final revision"
+    );
+
+    let started = collect_request_starts(&mut events).await;
+    assert_eq!(
+        started,
+        vec![(
+            0,
+            ConfigRevision::INITIAL,
+            "fake/a".to_string(),
+            ReasoningPreference::Auto
+        )],
+        "revision 1 must never appear in RequestStarted"
+    );
+}
+
+/// Same as above for a prompt timeout: the taken update is not issued and the
+/// final revision stays at the last genuinely issued one.
+#[tokio::test(start_paused = true)]
+async fn prompt_timeout_after_taken_update_keeps_the_last_issued_revision() {
+    let gate = Arc::new(Notify::new());
+    let entered = Arc::new(Notify::new());
+    let calls_a = Arc::new(Mutex::new(Vec::new()));
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::Tools {
+            calls: vec![("echo", "call_1")],
+        }],
+    );
+    let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "b" }]);
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.prompt_timeout = Duration::from_millis(100);
+    let mut agent = AgentLoop::start(
+        request(config_full(
+            model_a,
+            ReasoningPreference::Auto,
+            tool_set_full(
+                "echo",
+                Arc::clone(&calls_a),
+                ToolBehavior::Gate(Arc::clone(&gate)),
+                Some(Arc::clone(&entered)),
+            ),
+            None,
+            project(),
+        )),
+        options,
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let mut events = agent.take_events().unwrap();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    entered.notified().await;
+    let revision = handle
+        .update(config_full(
+            model_b,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            Arc::new(HoldingPrompt),
+        ))
+        .unwrap();
+    assert_eq!(revision, ConfigRevision::new(1));
+
+    gate.notify_waiters();
+    tokio::time::advance(Duration::from_millis(300)).await;
+
+    let report = report_task.await.unwrap().unwrap();
+    assert!(matches!(
+        &report.outcome,
+        LoopOutcome::Failed(failure)
+            if failure.kind == minicore_runtime::LoopFailureKind::Prompt
+    ));
+    assert_eq!(report.requests, 1);
+    assert_eq!(report.final_config_revision, ConfigRevision::INITIAL);
+
+    let started = collect_request_starts(&mut events).await;
+    assert_eq!(
+        started,
+        vec![(
+            0,
+            ConfigRevision::INITIAL,
+            "fake/a".to_string(),
+            ReasoningPreference::Auto
+        )]
+    );
+}
+
+/// Several stale rebuilds under a flood of updates keep the latest candidate
+/// revision, advance no request index, and finally issue exactly one request
+/// with the newest config.
+#[tokio::test]
+async fn multiple_stale_rebuilds_issue_only_the_latest_revision() {
+    let gate = Arc::new(Notify::new());
+    let entered = Arc::new(Notify::new());
+    let calls_a = Arc::new(Mutex::new(Vec::new()));
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::Tools {
+            calls: vec![("echo", "call_1")],
+        }],
+    );
+    let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "b" }]);
+    let (model_c, _) = scripted_model_named("fake/c", vec![Round::Final { text: "c" }]);
+    let (model_d, _) = scripted_model_named("fake/d", vec![Round::Final { text: "d" }]);
+
+    let b_entered = Arc::new(Notify::new());
+    let b_gate = Arc::new(Notify::new());
+    let c_entered = Arc::new(Notify::new());
+    let c_gate = Arc::new(Notify::new());
+    let prompt_b = Arc::new(GatedPrompt {
+        entered: Arc::clone(&b_entered),
+        gate: Some(Arc::clone(&b_gate)),
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let prompt_c = Arc::new(GatedPrompt {
+        entered: Arc::clone(&c_entered),
+        gate: Some(Arc::clone(&c_gate)),
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+
+    let mut agent = AgentLoop::start(
+        request(config_full(
+            model_a,
+            ReasoningPreference::Auto,
+            tool_set_full(
+                "echo",
+                Arc::clone(&calls_a),
+                ToolBehavior::Gate(Arc::clone(&gate)),
+                Some(Arc::clone(&entered)),
+            ),
+            None,
+            project(),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let mut events = agent.take_events().unwrap();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    entered.notified().await;
+    assert_eq!(
+        handle
+            .update(config_full(
+                model_b,
+                ReasoningPreference::Auto,
+                ToolSet::default(),
+                None,
+                prompt_b,
+            ))
+            .unwrap(),
+        ConfigRevision::new(1)
+    );
+    gate.notify_waiters();
+
+    // First rebuild: B's prompt is prepared, then superseded by C.
+    b_entered.notified().await;
+    assert_eq!(
+        handle
+            .update(config_full(
+                model_c,
+                ReasoningPreference::Auto,
+                ToolSet::default(),
+                None,
+                prompt_c,
+            ))
+            .unwrap(),
+        ConfigRevision::new(2)
+    );
+    b_gate.notify_waiters();
+
+    // Second rebuild: C's prompt is prepared, then superseded by D.
+    c_entered.notified().await;
+    assert_eq!(
+        handle
+            .update(config_full(
+                model_d,
+                ReasoningPreference::Auto,
+                ToolSet::default(),
+                None,
+                project(),
+            ))
+            .unwrap(),
+        ConfigRevision::new(3)
+    );
+    c_gate.notify_waiters();
+
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.requests, 2, "stale rebuilds must not issue requests");
+    assert_eq!(report.final_config_revision, ConfigRevision::new(3));
+
+    let started = collect_request_starts(&mut events).await;
+    assert_eq!(
+        started,
+        vec![
+            (
+                0,
+                ConfigRevision::INITIAL,
+                "fake/a".to_string(),
+                ReasoningPreference::Auto
+            ),
+            (
+                1,
+                ConfigRevision::new(3),
+                "fake/d".to_string(),
+                ReasoningPreference::Auto
+            ),
+        ],
+        "only the latest candidate revision is ever issued"
+    );
+}
+
+/// `AgentLoop::start` applies the same config-vs-LoopLimits validation as
+/// `update`: tool name/schema overruns fail with InvalidConfig.
+#[tokio::test]
+async fn start_rejects_config_outside_loop_limits() {
+    let (model, _) = scripted_model(vec![Round::Final { text: "x" }]);
+
+    // Schema bytes exceed the loop budget.
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.limits.max_tool_schema_bytes = 16;
+    let mut builder = ToolSet::builder();
+    builder.register(RecordingTool {
+        spec: echo_spec(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+        behavior: ToolBehavior::Succeed,
+        entered: None,
+    });
+    let tools = builder.build().unwrap();
+    let error = AgentLoop::start(
+        request(config_full(
+            model.clone(),
+            ReasoningPreference::Auto,
+            tools,
+            None,
+            project(),
+        )),
+        options,
+    )
+    .err()
+    .expect("oversized schema must fail start");
+    assert_eq!(error, LoopStartError::InvalidConfig);
+
+    // Tool name exceeds the loop budget.
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.limits.max_tool_name_bytes = 2;
+    let mut builder = ToolSet::builder();
+    builder.register(RecordingTool {
+        spec: echo_spec(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+        behavior: ToolBehavior::Succeed,
+        entered: None,
+    });
+    let tools = builder.build().unwrap();
+    let error = AgentLoop::start(
+        request(config_full(
+            model,
+            ReasoningPreference::Auto,
+            tools,
+            None,
+            project(),
+        )),
+        options,
+    )
+    .err()
+    .expect("oversized name must fail start");
+    assert_eq!(error, LoopStartError::InvalidConfig);
 }
