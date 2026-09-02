@@ -124,6 +124,11 @@ where
     value.parse().map_err(D::Error::custom)
 }
 
+/// Absolute ceiling for a single `ModelMessage` text payload (system, user,
+/// or an assistant text part). Default prompt projection truncates summary
+/// tails so this bound is always satisfied.
+pub(crate) const MAX_MODEL_MESSAGE_TEXT_BYTES: usize = 262_144;
+
 fn valid_text(value: &str, maximum: usize) -> bool {
     !value.is_empty()
         && value.len() <= maximum
@@ -343,7 +348,7 @@ impl AssistantPart {
     pub fn validate(&self) -> Result<(), ModelValueError> {
         match self {
             Self::Text(text) => {
-                if valid_text(text, 262_144) {
+                if valid_text(text, MAX_MODEL_MESSAGE_TEXT_BYTES) {
                     Ok(())
                 } else {
                     Err(ModelValueError::InvalidText)
@@ -535,7 +540,7 @@ impl fmt::Debug for ModelMessage {
 impl ModelMessage {
     pub fn system(text: impl Into<String>) -> Result<Self, ModelValueError> {
         let text = text.into();
-        if !valid_text(&text, 262_144) {
+        if !valid_text(&text, MAX_MODEL_MESSAGE_TEXT_BYTES) {
             return Err(ModelValueError::InvalidText);
         }
         Ok(Self::System(text))
@@ -543,7 +548,7 @@ impl ModelMessage {
 
     pub fn user(text: impl Into<String>) -> Result<Self, ModelValueError> {
         let text = text.into();
-        if !valid_text(&text, 262_144) {
+        if !valid_text(&text, MAX_MODEL_MESSAGE_TEXT_BYTES) {
             return Err(ModelValueError::InvalidText);
         }
         Ok(Self::User(text))
@@ -570,7 +575,7 @@ impl ModelMessage {
     pub fn validate(&self) -> Result<(), ModelValueError> {
         match self {
             Self::System(text) | Self::User(text) => {
-                if valid_text(text, 262_144) {
+                if valid_text(text, MAX_MODEL_MESSAGE_TEXT_BYTES) {
                     Ok(())
                 } else {
                     Err(ModelValueError::InvalidText)
@@ -637,6 +642,9 @@ impl ModelRequest {
     ) -> Result<Self, ModelValueError> {
         if messages.is_empty() {
             return Err(ModelValueError::EmptyMessages);
+        }
+        for message in &messages {
+            message.validate()?;
         }
         validate_tool_exchange(&messages)?;
         validate_request_tools(&tools)?;

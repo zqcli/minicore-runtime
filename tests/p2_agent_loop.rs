@@ -19,8 +19,8 @@ use minicore_runtime::model::{
     Model, ModelCallContext, ModelDescriptor, ModelError, ModelEvent, ModelFinishReason,
     ModelMessage, ModelRequest, ModelStartFuture, ModelStream, ReasoningPreference,
 };
-use minicore_runtime::prompt_provider::{
-    PreparedPrompt, PromptError, PromptFuture, PromptProvider, PromptRequest,
+use minicore_runtime::prompt::{
+    DefaultPromptProvider, PreparedPrompt, PromptError, PromptFuture, PromptProvider, PromptRequest,
 };
 use minicore_runtime::tools::{
     ApprovalDecision, ApprovalRequest, ApprovalRisk, Tool, ToolContext, ToolDecision, ToolError,
@@ -31,8 +31,9 @@ use minicore_runtime::tools::{
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{
     AgentLoop, AnswerError, CancelReason, ConfigRevision, ExecutionConfig, HistoryItem,
-    InteractionAnswer, LoopEvent, LoopOptions, LoopOutcome, LoopReport, LoopRequest,
-    LoopStartError, LoopStatus, SteerError, ToolCallId, UpdateError, UserInput, UserMessageKind,
+    HistoryView, InteractionAnswer, LoopEvent, LoopOptions, LoopOutcome, LoopReport, LoopRequest,
+    LoopStartError, LoopStatus, SteerError, ToolCallId, UpdateError, UserHistory, UserInput,
+    UserMessageKind,
 };
 
 fn reasoning_set() -> BTreeSet<ReasoningPreference> {
@@ -332,81 +333,6 @@ impl ToolPolicy for ScriptedPolicy {
     }
 }
 
-struct ProjectingPrompt {
-    system: Option<BoundedText>,
-}
-
-impl PromptProvider for ProjectingPrompt {
-    fn prepare<'a>(&'a self, request: PromptRequest<'a>) -> PromptFuture<'a> {
-        Box::pin(async move {
-            let mut messages = Vec::new();
-            if let Some(system) = &self.system {
-                messages.push(ModelMessage::system(system.as_str()).unwrap());
-            }
-            for item in request.history.iter() {
-                match item {
-                    HistoryItem::User(user) => {
-                        messages.push(ModelMessage::user(user.input.as_text()).unwrap())
-                    }
-                    HistoryItem::Assistant(assistant) => {
-                        messages.push(ModelMessage::assistant(assistant.content.clone()).unwrap())
-                    }
-                    HistoryItem::ToolResult(result) => messages.push(
-                        ModelMessage::tool_with_outcome(
-                            result.call_id.clone(),
-                            result.output.clone(),
-                            result.outcome,
-                        )
-                        .unwrap(),
-                    ),
-                    HistoryItem::Summary(summary) => messages.push(
-                        ModelMessage::system(format!(
-                            "Conversation summary:\n{}",
-                            summary.content.as_str()
-                        ))
-                        .unwrap(),
-                    ),
-                }
-            }
-            if messages.is_empty() {
-                return Err(PromptError::EmptyPrompt);
-            }
-            Ok(PreparedPrompt { messages })
-        })
-    }
-}
-
-fn config(
-    model: Arc<dyn Model>,
-    tools: ToolSet,
-    policy: Option<Arc<dyn ToolPolicy>>,
-) -> ExecutionConfig {
-    config_full(
-        model,
-        ReasoningPreference::Auto,
-        tools,
-        policy,
-        Arc::new(ProjectingPrompt { system: None }),
-    )
-}
-
-fn config_full(
-    model: Arc<dyn Model>,
-    reasoning: ReasoningPreference,
-    tools: ToolSet,
-    policy: Option<Arc<dyn ToolPolicy>>,
-    prompt: Arc<dyn PromptProvider>,
-) -> ExecutionConfig {
-    ExecutionConfig::new(model, reasoning, tools, policy, prompt)
-        .expect("test config must validate")
-}
-
-fn project() -> Arc<dyn PromptProvider> {
-    Arc::new(ProjectingPrompt { system: None })
-}
-
-/// Prompt provider that blocks its first `prepare` on a Notify (unless it has
-/// no gate) and counts invocations, so tests can hold a request boundary.
 struct GatedPrompt {
     entered: Arc<Notify>,
     gate: Option<Arc<Notify>>,
@@ -457,6 +383,35 @@ impl PromptProvider for GatedPrompt {
             Ok(PreparedPrompt { messages })
         })
     }
+}
+
+fn config(
+    model: Arc<dyn Model>,
+    tools: ToolSet,
+    policy: Option<Arc<dyn ToolPolicy>>,
+) -> ExecutionConfig {
+    config_full(
+        model,
+        ReasoningPreference::Auto,
+        tools,
+        policy,
+        Arc::new(DefaultPromptProvider::new(None)),
+    )
+}
+
+fn config_full(
+    model: Arc<dyn Model>,
+    reasoning: ReasoningPreference,
+    tools: ToolSet,
+    policy: Option<Arc<dyn ToolPolicy>>,
+    prompt: Arc<dyn PromptProvider>,
+) -> ExecutionConfig {
+    ExecutionConfig::new(model, reasoning, tools, policy, prompt)
+        .expect("test config must validate")
+}
+
+fn project() -> Arc<dyn PromptProvider> {
+    Arc::new(DefaultPromptProvider::new(None))
 }
 
 fn request(config: ExecutionConfig) -> LoopRequest {
@@ -1415,7 +1370,7 @@ async fn bounded_event_queue_attaches_dropped_before_to_the_next_success() {
         ReasoningPreference::Auto,
         ToolSet::default(),
         None,
-        Arc::new(ProjectingPrompt { system: None }),
+        Arc::new(DefaultPromptProvider::new(None)),
     )
     .unwrap();
     let mut options = LoopOptions::default_checked().unwrap();
@@ -3434,4 +3389,427 @@ async fn tool_timeout_port_deadline_fails_the_call_and_the_batch_continues() {
         ],
         "exactly one result per call, in order"
     );
+}
+
+// ===== Phase 6: DefaultPromptProvider and core prompt budgets =====
+
+fn default_descriptor() -> minicore_runtime::model::ModelDescriptor {
+    minicore_runtime::model::ModelDescriptor::new(
+        "host:prompt-default".parse().unwrap(),
+        8192,
+        BTreeSet::from([ReasoningPreference::Auto]),
+        false,
+    )
+    .unwrap()
+}
+
+fn default_request<'a>(
+    history: HistoryView<'a>,
+    cancelled: bool,
+    descriptor: &'a minicore_runtime::model::ModelDescriptor,
+    tools: &'a [ToolSpec],
+) -> PromptRequest<'a> {
+    PromptRequest {
+        loop_id: minicore_runtime::LoopId::new().unwrap(),
+        request_index: 0,
+        history,
+        model: descriptor,
+        reasoning: ReasoningPreference::Auto,
+        tools,
+        cancellation: match cancelled {
+            true => {
+                let token = tokio_util::sync::CancellationToken::new();
+                token.cancel();
+                token
+            }
+            false => tokio_util::sync::CancellationToken::new(),
+        },
+        deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+    }
+}
+
+fn user_item(kind: UserMessageKind, text: &str) -> HistoryItem {
+    HistoryItem::User(UserHistory {
+        loop_id: minicore_runtime::LoopId::new().unwrap(),
+        kind,
+        input: UserInput::text(text).unwrap(),
+    })
+}
+
+fn assistant_item(model: &str, text: &str) -> HistoryItem {
+    HistoryItem::Assistant(minicore_runtime::history::AssistantHistory {
+        loop_id: minicore_runtime::LoopId::new().unwrap(),
+        request_index: 0,
+        model: model.parse().unwrap(),
+        reasoning: ReasoningPreference::Auto,
+        content: vec![minicore_runtime::model::AssistantPart::Text(
+            text.to_owned(),
+        )],
+        finish_reason: ModelFinishReason::Stop,
+        usage: minicore_runtime::model::Usage::new(0, 0, 0),
+    })
+}
+
+fn tool_result_item() -> HistoryItem {
+    HistoryItem::ToolResult(minicore_runtime::history::ToolResultHistory {
+        loop_id: minicore_runtime::LoopId::new().unwrap(),
+        request_index: 0,
+        call_id: "call_00000000000000000000000000000001".parse().unwrap(),
+        tool_name: "echo".parse().unwrap(),
+        outcome: minicore_runtime::tools::ToolResultOutcome::Success,
+        output: minicore_runtime::tools::ToolOutput::new("out").unwrap(),
+    })
+}
+
+/// Default projection preserves base+appended order, folds the summary into
+/// the fixed system text, and omits an empty optional system prompt.
+#[tokio::test]
+async fn default_provider_projects_history_in_order_with_summary_and_optional_system() {
+    let base = vec![
+        user_item(UserMessageKind::Prompt, "base q"),
+        assistant_item("host:model-a", "base a"),
+        HistoryItem::Summary(minicore_runtime::history::SummaryHistory {
+            content: BoundedText::new("s1").unwrap(),
+        }),
+    ];
+    let appended = vec![
+        user_item(UserMessageKind::Steering, "steer"),
+        tool_result_item(),
+        assistant_item("host:model-b", "append a"),
+    ];
+    let view = HistoryView::new(&base, &appended);
+    let descriptor = default_descriptor();
+    let tools: Vec<ToolSpec> = Vec::new();
+
+    let expected_without_system = vec![
+        ModelMessage::user("base q").unwrap(),
+        ModelMessage::assistant(vec![minicore_runtime::model::AssistantPart::Text(
+            "base a".to_owned(),
+        )])
+        .unwrap(),
+        ModelMessage::system("Conversation summary:\ns1").unwrap(),
+        ModelMessage::user("steer").unwrap(),
+        ModelMessage::tool_with_outcome(
+            "call_00000000000000000000000000000001".parse().unwrap(),
+            minicore_runtime::tools::ToolOutput::new("out").unwrap(),
+            minicore_runtime::tools::ToolResultOutcome::Success,
+        )
+        .unwrap(),
+        ModelMessage::assistant(vec![minicore_runtime::model::AssistantPart::Text(
+            "append a".to_owned(),
+        )])
+        .unwrap(),
+    ];
+
+    // No system prompt.
+    let rendered = DefaultPromptProvider::new(None)
+        .prepare(default_request(view, false, &descriptor, &tools))
+        .await
+        .unwrap();
+    assert_eq!(rendered.messages, expected_without_system);
+
+    // Non-empty system prompt is emitted first.
+    let with_system = DefaultPromptProvider::new(Some(BoundedText::new("SYS").unwrap()))
+        .prepare(default_request(view, false, &descriptor, &tools))
+        .await
+        .unwrap();
+    let mut expected = vec![ModelMessage::system("SYS").unwrap()];
+    expected.extend(expected_without_system.iter().cloned());
+    assert_eq!(with_system.messages, expected);
+
+    // An empty (but present) system prompt is omitted too.
+    let empty_system = DefaultPromptProvider::new(Some(BoundedText::new("").unwrap()))
+        .prepare(default_request(view, false, &descriptor, &tools))
+        .await
+        .unwrap();
+    assert_eq!(empty_system.messages, expected_without_system);
+}
+
+/// Mixed model refs in the base history are accepted and projected verbatim.
+#[tokio::test]
+async fn default_provider_accepts_mixed_model_refs_in_the_base() {
+    let base = vec![
+        user_item(UserMessageKind::Prompt, "q"),
+        assistant_item("host:model-a", "a"),
+        assistant_item("host:model-b", "b"),
+    ];
+    let descriptor = default_descriptor();
+    let tools: Vec<ToolSpec> = Vec::new();
+    let view = HistoryView::new(&base, &[]);
+    let rendered = DefaultPromptProvider::new(None)
+        .prepare(default_request(view, false, &descriptor, &tools))
+        .await
+        .unwrap();
+    assert_eq!(rendered.messages.len(), 3);
+    assert!(matches!(&rendered.messages[1], ModelMessage::Assistant(parts) if parts.len() == 1));
+    assert!(matches!(&rendered.messages[2], ModelMessage::Assistant(parts) if parts.len() == 1));
+
+    // An agent loop starts and completes with such a mixed-ref base history.
+    let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
+    let agent = AgentLoop::start(
+        LoopRequest::new(
+            base.into(),
+            UserInput::text("still runs").unwrap(),
+            config_full(
+                model,
+                ReasoningPreference::Auto,
+                ToolSet::default(),
+                None,
+                project(),
+            ),
+        ),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+}
+
+/// An inconsistent old tool history (orphan tool result) is host-trusted at
+/// start but fails the request as Prompt when Core builds the ModelRequest.
+#[tokio::test]
+async fn inconsistent_old_tool_history_fails_as_prompt_but_start_succeeds() {
+    let orphan = vec![user_item(UserMessageKind::Prompt, "q"), tool_result_item()];
+    let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
+    let agent = AgentLoop::start(
+        LoopRequest::new(
+            orphan.into(),
+            UserInput::text("go").unwrap(),
+            config_full(
+                model,
+                ReasoningPreference::Auto,
+                ToolSet::default(),
+                None,
+                project(),
+            ),
+        ),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(
+        model_failure_kind(&report),
+        Some(minicore_runtime::LoopFailureKind::Prompt)
+    );
+    assert_eq!(report.requests, 0);
+}
+
+struct ManyMessagesPrompt;
+
+impl PromptProvider for ManyMessagesPrompt {
+    fn prepare<'a>(&'a self, _request: PromptRequest<'a>) -> PromptFuture<'a> {
+        Box::pin(async {
+            Ok(PreparedPrompt {
+                messages: vec![
+                    ModelMessage::user("a").unwrap(),
+                    ModelMessage::user("b").unwrap(),
+                    ModelMessage::user("c").unwrap(),
+                ],
+            })
+        })
+    }
+}
+
+/// `max_prompt_messages` is enforced by Core for every provider, including
+/// custom ones that do not check it themselves.
+#[tokio::test]
+async fn prompt_message_limit_applies_to_custom_providers() {
+    let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.limits.max_prompt_messages = 2;
+    let agent = AgentLoop::start(
+        request(config_full(
+            model,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            Arc::new(ManyMessagesPrompt),
+        )),
+        options,
+    )
+    .unwrap();
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(
+        model_failure_kind(&report),
+        Some(minicore_runtime::LoopFailureKind::Prompt)
+    );
+    assert_eq!(report.requests, 0);
+}
+
+/// The default provider answers Cancelled for an already-cancelled or expired
+/// request without touching history.
+#[tokio::test]
+async fn default_provider_cancelled_when_request_is_cancelled() {
+    let single = vec![user_item(UserMessageKind::Prompt, "q")];
+    let view = HistoryView::new(&[], &single);
+    let descriptor = default_descriptor();
+    let tools: Vec<ToolSpec> = Vec::new();
+    let cancelled = DefaultPromptProvider::new(None)
+        .prepare(default_request(view, true, &descriptor, &tools))
+        .await
+        .unwrap_err();
+    assert_eq!(cancelled, PromptError::Cancelled);
+
+    let expired = PromptRequest {
+        loop_id: minicore_runtime::LoopId::new().unwrap(),
+        request_index: 0,
+        history: view,
+        model: &descriptor,
+        reasoning: ReasoningPreference::Auto,
+        tools: &tools,
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        deadline: tokio::time::Instant::now() - Duration::from_secs(1),
+    };
+    let expired_error = DefaultPromptProvider::new(None)
+        .prepare(expired)
+        .await
+        .unwrap_err();
+    assert_eq!(expired_error, PromptError::Cancelled);
+}
+
+/// End-to-end: a loop driven entirely by the default provider with a system
+/// prompt projects and completes normally.
+#[tokio::test]
+async fn default_provider_runs_a_loop_end_to_end_with_system_prompt() {
+    let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
+    let agent = AgentLoop::start(
+        request(config_full(
+            model,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            Arc::new(DefaultPromptProvider::new(Some(
+                BoundedText::new("SYSTEM").unwrap(),
+            ))),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_completed_with_text(&report, "done");
+    assert_eq!(report.requests, 1);
+}
+
+/// The default provider always projects a legal maximum-capacity summary: the
+/// fixed prefix is kept verbatim and any overflow is truncated from the
+/// content tail at a UTF-8 character boundary, never mid-character.
+#[tokio::test]
+async fn default_provider_truncates_large_summary_at_the_absolute_limit() {
+    let descriptor = default_descriptor();
+    let tools: Vec<ToolSpec> = Vec::new();
+    let prefix = "Conversation summary:\n";
+    let absolute = BoundedText::MAX_BYTES;
+
+    async fn render(
+        content: &BoundedText,
+        descriptor: &minicore_runtime::model::ModelDescriptor,
+        tools: &[ToolSpec],
+    ) -> Result<Vec<ModelMessage>, PromptError> {
+        let history = vec![HistoryItem::Summary(
+            minicore_runtime::history::SummaryHistory {
+                content: content.clone(),
+            },
+        )];
+        let view = HistoryView::new(&history, &[]);
+        let prepared = DefaultPromptProvider::new(None)
+            .prepare(default_request(view, false, descriptor, tools))
+            .await?;
+        Ok(prepared.messages)
+    }
+
+    // Max ASCII content: must truncate but keep the exact prefix, stay within
+    // the absolute ceiling, and produce a valid ModelMessage.
+    let ascii = BoundedText::new("x".repeat(absolute)).unwrap();
+    let messages = render(&ascii, &descriptor, &tools).await.unwrap();
+    assert_eq!(messages.len(), 1);
+    let ModelMessage::System(text) = &messages[0] else {
+        panic!("summary must project to a System message");
+    };
+    assert!(
+        text.starts_with(prefix),
+        "the fixed prefix must be preserved"
+    );
+    assert!(text.len() <= absolute);
+    messages[0].validate().unwrap();
+
+    // Multi-byte content crossing the truncation point: the cut must land on a
+    // character boundary and never panic.
+    let budget = absolute - prefix.len();
+    let multibyte = BoundedText::new(format!("{}€€", "x".repeat(budget - 2))).unwrap();
+    let messages = render(&multibyte, &descriptor, &tools).await.unwrap();
+    let ModelMessage::System(text) = &messages[0] else {
+        panic!("summary must project to a System message");
+    };
+    assert!(text.starts_with(prefix));
+    assert!(text.len() <= absolute);
+    assert!(text.is_char_boundary(text.len()));
+    messages[0].validate().unwrap();
+
+    // Exactly the remaining budget: no truncation at all.
+    let exact = BoundedText::new("y".repeat(budget)).unwrap();
+    let messages = render(&exact, &descriptor, &tools).await.unwrap();
+    let ModelMessage::System(text) = &messages[0] else {
+        panic!("summary must project to a System message");
+    };
+    assert!(text.starts_with(prefix));
+    assert_eq!(text.len(), absolute);
+    assert!(
+        text.ends_with("y"),
+        "no truncation when content exactly fits"
+    );
+    messages[0].validate().unwrap();
+}
+
+/// The default provider rejects an empty history as EmptyPrompt.
+#[tokio::test]
+async fn default_provider_empty_history_yields_empty_prompt() {
+    let descriptor = default_descriptor();
+    let tools: Vec<ToolSpec> = Vec::new();
+    let empty: Vec<HistoryItem> = Vec::new();
+    let view = HistoryView::new(&empty, &empty);
+    let error = DefaultPromptProvider::new(None)
+        .prepare(default_request(view, false, &descriptor, &tools))
+        .await
+        .unwrap_err();
+    assert_eq!(error, PromptError::EmptyPrompt);
+}
+
+struct InvalidTextPrompt;
+
+impl PromptProvider for InvalidTextPrompt {
+    fn prepare<'a>(&'a self, _request: PromptRequest<'a>) -> PromptFuture<'a> {
+        Box::pin(async {
+            Ok(PreparedPrompt {
+                messages: vec![ModelMessage::User("\u{1}bad".to_string())],
+            })
+        })
+    }
+}
+
+/// A custom provider constructing an invalid message through the public enum
+/// variant is failed as Prompt by Core's ModelRequest validation.
+#[tokio::test]
+async fn invalid_message_from_public_variant_fails_as_prompt() {
+    let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
+    let agent = AgentLoop::start(
+        request(config_full(
+            model,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            Arc::new(InvalidTextPrompt),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(
+        model_failure_kind(&report),
+        Some(minicore_runtime::LoopFailureKind::Prompt)
+    );
+    assert_eq!(report.requests, 0);
 }

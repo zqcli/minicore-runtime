@@ -7,7 +7,7 @@ pub mod interaction;
 pub mod limits;
 pub mod model;
 mod port_call;
-pub mod prompt_provider;
+pub mod prompt;
 mod time;
 pub mod tools;
 mod usage;
