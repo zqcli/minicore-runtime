@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::limits::LoopLimits;
 use crate::model::{Model, ModelDescriptor, ReasoningPreference};
-use crate::prompt_provider::PromptProvider;
+use crate::prompt::PromptProvider;
 use crate::tools::{ToolPolicy, ToolSet};
 use crate::value::BoundedText;
 

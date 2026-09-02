@@ -14,15 +14,12 @@ use crate::agent_loop::{
     LoopWaitError,
 };
 use crate::execution::{ConfigRevision, ExecutionConfig};
-use crate::history::{HistoryItem, WorkingHistory};
+use crate::history::WorkingHistory;
 use crate::ids::LoopId;
 use crate::limits::LoopLimits;
 use crate::model::{
-    Model, ModelCallContext, ModelDescriptor, ModelError, ModelMessage, ModelRequest,
-    ModelStartFuture, ModelStream, ReasoningPreference, Usage,
-};
-use crate::prompt_provider::{
-    PreparedPrompt, PromptError, PromptFuture, PromptProvider, PromptRequest,
+    Model, ModelCallContext, ModelDescriptor, ModelError, ModelRequest, ModelStartFuture,
+    ModelStream, ReasoningPreference, Usage,
 };
 use crate::tools::ToolSet;
 
@@ -47,25 +44,6 @@ impl Model for HoldingModel {
     }
 }
 
-struct PromptToUser;
-
-impl PromptProvider for PromptToUser {
-    fn prepare<'a>(&'a self, request: PromptRequest<'a>) -> PromptFuture<'a> {
-        Box::pin(async move {
-            let mut messages = Vec::new();
-            for item in request.history.iter() {
-                if let HistoryItem::User(user) = item {
-                    messages.push(ModelMessage::user(user.input.as_text()).unwrap());
-                }
-            }
-            if messages.is_empty() {
-                return Err(PromptError::EmptyPrompt);
-            }
-            Ok(PreparedPrompt { messages })
-        })
-    }
-}
-
 fn holding_config() -> ExecutionConfig {
     let descriptor = ModelDescriptor::new(
         "fake/holding".parse().unwrap(),
@@ -79,7 +57,7 @@ fn holding_config() -> ExecutionConfig {
         ReasoningPreference::Auto,
         ToolSet::default(),
         None,
-        Arc::new(PromptToUser),
+        Arc::new(crate::prompt::DefaultPromptProvider::new(None)),
     )
     .expect("holding config must validate")
 }

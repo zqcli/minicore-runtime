@@ -17,7 +17,7 @@ use minicore_runtime::model::{
     AssistantPart, Model, ModelCallContext, ModelDescriptor, ModelError, ModelErrorKind,
     ModelFinishReason, ModelMessage, ModelRequest, ModelStartFuture, ReasoningPreference, Usage,
 };
-use minicore_runtime::prompt_provider::{
+use minicore_runtime::prompt::{
     PreparedPrompt, PromptError, PromptFuture, PromptProvider, PromptRequest,
 };
 use minicore_runtime::tools::{

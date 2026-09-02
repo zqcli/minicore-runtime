@@ -22,7 +22,7 @@ use crate::model::{
     ModelRequest, ModelValueError, Usage,
 };
 use crate::port_call::{PortCallOutcome, run_port_call};
-use crate::prompt_provider::PromptRequest;
+use crate::prompt::PromptRequest;
 use crate::time::DeadlineSource;
 use crate::tools::{
     ApprovalDecision, ApprovalRequest, EnabledTool, EnabledTools, ToolContext, ToolDecision,
@@ -604,7 +604,17 @@ async fn prepare_prompt(
     .await;
 
     match outcome {
-        PortCallOutcome::Returned(Ok(prepared)) => PromptPrep::Ready(prepared.messages),
+        PortCallOutcome::Returned(Ok(prepared)) => {
+            // Core-enforced budget for every provider: an empty prompt or one
+            // over the loop's message ceiling is a Prompt failure, no matter
+            // which provider produced it.
+            if prepared.messages.is_empty()
+                || prepared.messages.len() > ctx.options.limits.max_prompt_messages
+            {
+                return PromptPrep::End(FailPath::Prompt);
+            }
+            PromptPrep::Ready(prepared.messages)
+        }
         PortCallOutcome::Cancelled => PromptPrep::End(FailPath::Cancelled),
         PortCallOutcome::DeadlineExceeded(DeadlineSource::Turn) => {
             PromptPrep::End(FailPath::Deadline)
