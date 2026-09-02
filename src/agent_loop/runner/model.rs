@@ -13,7 +13,7 @@ use crate::model::{
     ModelCallContext, ModelDriverFailure, ModelDriverProgress, ModelLimits, ModelMessage,
     ModelRequest, ModelValueError,
 };
-use crate::port_call::{run_port_call, PortCallOutcome};
+use crate::port_call::{PortCallOutcome, run_port_call};
 use crate::prompt::PromptRequest;
 use crate::time::DeadlineSource;
 use crate::tools::ToolSpec;

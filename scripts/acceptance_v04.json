@@ -1,0 +1,628 @@
+{
+  "phase": "complete",
+  "rows": [
+    {
+      "id": "V4-001",
+      "status": "Passed",
+      "summary": "Runtime不拥有Session；无session生命周期/打开/保存",
+      "evidence": [
+        "scripts/check_v04_architecture.py",
+        "docs/contracts/agent-loop.md",
+        "tests/p2_agent_loop.rs::owner_drop_after_completion_keeps_the_completed_outcome"
+      ]
+    },
+    {
+      "id": "V4-002",
+      "status": "Passed",
+      "summary": "Runtime不解析JSONL；无conversation ledger/JSONL写入",
+      "evidence": [
+        "scripts/check_v04_architecture.py",
+        "docs/migrations/v0.3-to-v0.4.md"
+      ]
+    },
+    {
+      "id": "V4-003",
+      "status": "Passed",
+      "summary": "Runtime不公开SessionLog类型",
+      "evidence": [
+        "scripts/check_v04_architecture.py",
+        "src/lib.rs"
+      ]
+    },
+    {
+      "id": "V4-004",
+      "status": "Passed",
+      "summary": "Runtime不公开Manifest",
+      "evidence": [
+        "scripts/check_v04_architecture.py",
+        "docs/architecture.md"
+      ]
+    },
+    {
+      "id": "V4-005",
+      "status": "Passed",
+      "summary": "Runtime不提供Transcript",
+      "evidence": [
+        "scripts/check_v04_architecture.py",
+        "docs/contracts/history.md"
+      ]
+    },
+    {
+      "id": "V4-006",
+      "status": "Passed",
+      "summary": "无Degraded/durability/recovery状态",
+      "evidence": [
+        "scripts/check_v04_architecture.py",
+        "docs/architecture.md"
+      ]
+    },
+    {
+      "id": "V4-007",
+      "status": "Passed",
+      "summary": "AgentLoop单次使用、不可resume/reopen",
+      "evidence": [
+        "docs/contracts/agent-loop.md",
+        "tests/p2_agent_loop.rs::cancel_and_shutdown_after_completion_do_not_reopen_the_loop",
+        "src/agent_loop/control.rs::finish_once_seals_exactly_once_and_closes_accepting"
+      ]
+    },
+    {
+      "id": "V4-008",
+      "status": "Passed",
+      "summary": "多轮由上层多次创建AgentLoop（MemoryAgent）",
+      "evidence": [
+        "examples/memory_agent.rs",
+        "docs/contracts/agent-loop.md"
+      ]
+    },
+    {
+      "id": "V4-009",
+      "status": "Passed",
+      "summary": "不提供旧v0.3 API兼容层",
+      "evidence": [
+        "scripts/check_v04_architecture.py",
+        "src/lib.rs"
+      ]
+    },
+    {
+      "id": "V4-010",
+      "status": "Passed",
+      "summary": "crate不依赖具体Provider/Workspace/Storage",
+      "evidence": [
+        "scripts/check_v04_architecture.py",
+        "Cargo.toml"
+      ]
+    },
+    {
+      "id": "V4-011",
+      "status": "Passed",
+      "summary": "Model接口保留",
+      "evidence": [
+        "src/model/model.rs",
+        "tests/p1_v04_loop_dtos.rs::execution_config_accepts_a_text_only_model"
+      ]
+    },
+    {
+      "id": "V4-012",
+      "status": "Passed",
+      "summary": "Tool/ToolSet接口保留",
+      "evidence": [
+        "src/tools/tool.rs",
+        "src/tools/set.rs",
+        "tests/p1_v04_loop_dtos.rs::execution_config_accepts_tool_capable_model_with_tools"
+      ]
+    },
+    {
+      "id": "V4-013",
+      "status": "Passed",
+      "summary": "ToolPolicy/Interaction保留",
+      "evidence": [
+        "src/tools/policy.rs",
+        "docs/contracts/tool-policy-interaction.md",
+        "tests/p2_agent_loop.rs::approved_interaction_resumes_the_loop"
+      ]
+    },
+    {
+      "id": "V4-014",
+      "status": "Passed",
+      "summary": "PromptProvider替代Context/Compaction",
+      "evidence": [
+        "src/prompt.rs",
+        "docs/contracts/prompt.md",
+        "tests/p2_agent_loop.rs::default_provider_projects_history_in_order_with_summary_and_optional_system"
+      ]
+    },
+    {
+      "id": "V4-015",
+      "status": "Passed",
+      "summary": "start/handle/events/join/shutdown可用",
+      "evidence": [
+        "src/agent_loop/mod.rs",
+        "examples/agent_loop.rs",
+        "tests/p2_agent_loop.rs::shutdown_cancels_and_joins"
+      ]
+    },
+    {
+      "id": "V4-016",
+      "status": "Passed",
+      "summary": "steer/update/answer/cancel/wait可用",
+      "evidence": [
+        "src/agent_loop/handle.rs",
+        "examples/agent_loop.rs",
+        "tests/p2_agent_loop.rs::steer_during_model_reaches_the_next_request"
+      ]
+    },
+    {
+      "id": "V4-017",
+      "status": "Passed",
+      "summary": "LoopReport返回当前增量",
+      "evidence": [
+        "tests/p3_agent_loop_closeout.rs::report_appended_is_only_the_loop_delta_not_the_base_history",
+        "docs/contracts/agent-loop.md"
+      ]
+    },
+    {
+      "id": "V4-018",
+      "status": "Passed",
+      "summary": "HistoryItem可序列化但Core不持久化",
+      "evidence": [
+        "tests/p1_v04_loop_dtos.rs::history_items_serialize_with_typed_tags_and_round_trip",
+        "src/history.rs",
+        "docs/contracts/history.md"
+      ]
+    },
+    {
+      "id": "V4-019",
+      "status": "Passed",
+      "summary": "初始config revision为0",
+      "evidence": [
+        "tests/p1_v04_loop_dtos.rs::config_revision_is_initial_zero_and_round_trips",
+        "src/execution.rs"
+      ]
+    },
+    {
+      "id": "V4-020",
+      "status": "Passed",
+      "summary": "update只在下一request生效",
+      "evidence": [
+        "tests/p2_agent_loop.rs::update_during_model_reaches_the_next_request",
+        "tests/p2_agent_loop.rs::update_during_prompt_prep_is_rebuilt_without_advancing_the_index"
+      ]
+    },
+    {
+      "id": "V4-021",
+      "status": "Passed",
+      "summary": "当前Tool batch使用旧snapshot",
+      "evidence": [
+        "tests/p2_agent_loop.rs::update_during_tools_keeps_the_batch_on_the_old_snapshot",
+        "tests/p3_agent_loop_closeout.rs::policy_update_applies_the_full_snapshot_at_the_next_request_batch"
+      ]
+    },
+    {
+      "id": "V4-022",
+      "status": "Passed",
+      "summary": "latest update wins",
+      "evidence": [
+        "tests/p2_agent_loop.rs::multiple_updates_keep_only_the_latest",
+        "src/agent_loop/control.rs::updates_are_monotonic_and_latest_wins_until_commit"
+      ]
+    },
+    {
+      "id": "V4-023",
+      "status": "Passed",
+      "summary": "model/reasoning可热更新",
+      "evidence": [
+        "tests/p2_agent_loop.rs::request_started_records_the_actual_snapshot_revision_and_reasoning",
+        "tests/p2_agent_loop.rs::update_during_model_reaches_the_next_request"
+      ]
+    },
+    {
+      "id": "V4-024",
+      "status": "Passed",
+      "summary": "ToolSet/Policy/Prompt可原子热更新",
+      "evidence": [
+        "tests/p2_agent_loop.rs::toolset_switch_applies_to_the_next_request",
+        "tests/p2_agent_loop.rs::prompt_provider_switch_applies_to_the_next_request",
+        "tests/p3_agent_loop_closeout.rs::policy_update_applies_the_full_snapshot_at_the_next_request_batch"
+      ]
+    },
+    {
+      "id": "V4-025",
+      "status": "Passed",
+      "summary": "RequestStarted报告实际config",
+      "evidence": [
+        "tests/p2_agent_loop.rs::request_started_records_the_actual_snapshot_revision_and_reasoning"
+      ]
+    },
+    {
+      "id": "V4-026",
+      "status": "Passed",
+      "summary": "update不强制增加request",
+      "evidence": [
+        "tests/p2_agent_loop.rs::update_alone_does_not_extend_the_final_request"
+      ]
+    },
+    {
+      "id": "V4-027",
+      "status": "Passed",
+      "summary": "无静默能力降级（非法update被拒绝、失败保留）",
+      "evidence": [
+        "tests/p2_agent_loop.rs::invalid_config_update_does_not_consume_a_revision",
+        "tests/p2_agent_loop.rs::start_rejects_config_outside_loop_limits"
+      ]
+    },
+    {
+      "id": "V4-028",
+      "status": "Passed",
+      "summary": "model中steer下一request生效",
+      "evidence": [
+        "tests/p2_agent_loop.rs::steer_during_model_reaches_the_next_request"
+      ]
+    },
+    {
+      "id": "V4-029",
+      "status": "Passed",
+      "summary": "tool中steer在batch后生效",
+      "evidence": [
+        "tests/p2_agent_loop.rs::steer_during_tool_batch_reaches_the_next_request"
+      ]
+    },
+    {
+      "id": "V4-030",
+      "status": "Passed",
+      "summary": "prompt中steer导致rebuild",
+      "evidence": [
+        "tests/p2_agent_loop.rs::steer_during_prompt_discards_the_stale_prompt"
+      ]
+    },
+    {
+      "id": "V4-031",
+      "status": "Passed",
+      "summary": "多steer有序",
+      "evidence": [
+        "tests/p2_agent_loop.rs::multiple_steers_apply_in_accept_order"
+      ]
+    },
+    {
+      "id": "V4-032",
+      "status": "Passed",
+      "summary": "queue有界",
+      "evidence": [
+        "tests/p2_agent_loop.rs::steer_queue_is_bounded_and_full_reports_queue_full"
+      ]
+    },
+    {
+      "id": "V4-033",
+      "status": "Passed",
+      "summary": "final race线性化（steer wins / seal wins）",
+      "evidence": [
+        "tests/p2_agent_loop.rs::final_race_steer_wins_and_keeps_the_loop_alive",
+        "tests/p2_agent_loop.rs::final_race_seal_wins_returns_not_active",
+        "src/agent_loop/control.rs::begin_final_with_pending_steer_keeps_accepting_open"
+      ]
+    },
+    {
+      "id": "V4-034",
+      "status": "Passed",
+      "summary": "applied steer进入LoopReport",
+      "evidence": [
+        "tests/p3_agent_loop_closeout.rs::steer_applied_before_a_prompt_failure_stays_in_the_report",
+        "tests/p2_agent_loop.rs::update_and_steer_combine_on_the_next_request"
+      ]
+    },
+    {
+      "id": "V4-035",
+      "status": "Passed",
+      "summary": "未应用steer不持久化",
+      "evidence": [
+        "tests/p2_agent_loop.rs::steer_accepted_but_cancelled_before_application_stays_out_of_report"
+      ]
+    },
+    {
+      "id": "V4-036",
+      "status": "Passed",
+      "summary": "WaitingForInput拒绝steer",
+      "evidence": [
+        "tests/p2_agent_loop.rs::steer_is_rejected_while_waiting_for_interaction"
+      ]
+    },
+    {
+      "id": "V4-037",
+      "status": "Passed",
+      "summary": "当前Model Response严格验证",
+      "evidence": [
+        "tests/p2_agent_loop.rs::unknown_tool_call_closes_the_loop_with_invalid_response",
+        "tests/p3_agent_loop_closeout.rs::missing_tool_call_terminal_is_invalid_and_not_appended"
+      ]
+    },
+    {
+      "id": "V4-038",
+      "status": "Passed",
+      "summary": "当前ToolCallId唯一",
+      "evidence": [
+        "tests/p3_agent_loop_closeout.rs::duplicate_tool_call_ids_are_rejected_and_not_appended"
+      ]
+    },
+    {
+      "id": "V4-039",
+      "status": "Passed",
+      "summary": "当前ToolCall都有ToolResult",
+      "evidence": [
+        "tests/p3_agent_loop_closeout.rs::cancelling_a_multi_tool_batch_settles_each_call_exactly_once",
+        "tests/p2_agent_loop.rs::cancel_during_tool_ends_cancelled_with_results_for_every_call"
+      ]
+    },
+    {
+      "id": "V4-040",
+      "status": "Passed",
+      "summary": "Tool按顺序执行",
+      "evidence": [
+        "tests/p2_agent_loop.rs::sequential_tool_calls_execute_in_order"
+      ]
+    },
+    {
+      "id": "V4-041",
+      "status": "Passed",
+      "summary": "Cancel传播到Model/Prompt/Tool/Waiting",
+      "evidence": [
+        "tests/p2_agent_loop.rs::cancel_during_model_ends_cancelled_with_report",
+        "tests/p2_agent_loop.rs::cancel_during_tool_ends_cancelled_with_results_for_every_call",
+        "tests/p2_agent_loop.rs::loop_deadline_during_a_tool_call_cancels",
+        "tests/p2_agent_loop.rs::cancel_while_waiting_for_input_ends_the_loop"
+      ]
+    },
+    {
+      "id": "V4-042",
+      "status": "Passed",
+      "summary": "一个Loop只完成一次",
+      "evidence": [
+        "src/agent_loop/control.rs::finish_once_seals_exactly_once_and_closes_accepting",
+        "tests/p2_agent_loop.rs::late_subscriber_gets_the_same_report_immediately"
+      ]
+    },
+    {
+      "id": "V4-043",
+      "status": "Passed",
+      "summary": "invalid response不入History",
+      "evidence": [
+        "tests/p3_agent_loop_closeout.rs::missing_tool_call_terminal_is_invalid_and_not_appended",
+        "tests/p3_agent_loop_closeout.rs::duplicate_tool_call_ids_are_rejected_and_not_appended",
+        "tests/p3_agent_loop_closeout.rs::partial_stream_failure_is_a_model_failure_without_an_assistant_item"
+      ]
+    },
+    {
+      "id": "V4-044",
+      "status": "Passed",
+      "summary": "failure/cancel仍返回Report",
+      "evidence": [
+        "tests/p2_agent_loop.rs::prompt_error_is_a_prompt_failure",
+        "tests/p2_agent_loop.rs::model_start_panic_yields_model_failure_without_history",
+        "tests/p2_agent_loop.rs::cancel_during_model_ends_cancelled_with_report"
+      ]
+    },
+    {
+      "id": "V4-045",
+      "status": "Passed",
+      "summary": "max rounds生效",
+      "evidence": [
+        "tests/p2_agent_loop.rs::max_tool_rounds_ends_with_failed_budget_and_complete_results"
+      ]
+    },
+    {
+      "id": "V4-046",
+      "status": "Passed",
+      "summary": "Starting/Model/Tools/Waiting/Finishing/Finished状态正确",
+      "evidence": [
+        "tests/p2_agent_loop.rs::tool_loop_final_state_request_index_is_last_issued",
+        "src/agent_loop/state.rs"
+      ]
+    },
+    {
+      "id": "V4-047",
+      "status": "Passed",
+      "summary": "Event full不阻塞",
+      "evidence": [
+        "tests/p2_agent_loop.rs::bounded_event_queue_attaches_dropped_before_to_the_next_success"
+      ]
+    },
+    {
+      "id": "V4-048",
+      "status": "Passed",
+      "summary": "Event drop报告dropped_before",
+      "evidence": [
+        "tests/p2_agent_loop.rs::bounded_event_queue_attaches_dropped_before_to_the_next_success"
+      ]
+    },
+    {
+      "id": "V4-049",
+      "status": "Passed",
+      "summary": "Event consumer可缺失",
+      "evidence": [
+        "tests/p3_agent_loop_closeout.rs::loop_completes_without_an_event_consumer",
+        "tests/p2_agent_loop.rs::closing_the_event_stream_does_not_stop_the_loop"
+      ]
+    },
+    {
+      "id": "V4-050",
+      "status": "Passed",
+      "summary": "Finished Event非权威",
+      "evidence": [
+        "docs/contracts/event-stream.md",
+        "tests/p2_agent_loop.rs::event_stream_is_takeable_once_and_best_effort"
+      ]
+    },
+    {
+      "id": "V4-051",
+      "status": "Passed",
+      "summary": "wait/join返回同一Report",
+      "evidence": [
+        "tests/p2_agent_loop.rs::multiple_waiters_receive_the_same_report",
+        "tests/p2_agent_loop.rs::late_subscriber_gets_the_same_report_immediately"
+      ]
+    },
+    {
+      "id": "V4-052",
+      "status": "Passed",
+      "summary": "多waiter安全",
+      "evidence": [
+        "tests/p2_agent_loop.rs::multiple_waiters_receive_the_same_report"
+      ]
+    },
+    {
+      "id": "V4-053",
+      "status": "Passed",
+      "summary": "单spawn门禁+join完成/取消隔离无残留迹象",
+      "evidence": [
+        "tests/p2_agent_loop.rs::concurrent_loops_finish_independently_without_extra_tasks",
+        "tests/p3_agent_loop_closeout.rs::shared_model_and_toolset_loops_cancel_isolated_without_orphans"
+      ]
+    },
+    {
+      "id": "V4-054",
+      "status": "Passed",
+      "summary": "Base history由Host拥有",
+      "evidence": [
+        "docs/contracts/history.md",
+        "tests/p3_agent_loop_closeout.rs::report_appended_is_only_the_loop_delta_not_the_base_history"
+      ]
+    },
+    {
+      "id": "V4-055",
+      "status": "Passed",
+      "summary": "Core不做全局history ledger验证",
+      "evidence": [
+        "tests/p2_agent_loop.rs::inconsistent_old_tool_history_fails_as_prompt_but_start_succeeds",
+        "docs/contracts/history.md"
+      ]
+    },
+    {
+      "id": "V4-056",
+      "status": "Passed",
+      "summary": "History超限安全失败",
+      "evidence": [
+        "tests/p3_agent_loop_closeout.rs::start_rejects_history_over_item_and_byte_limits",
+        "src/agent_loop/mod.rs"
+      ]
+    },
+    {
+      "id": "V4-057",
+      "status": "Passed",
+      "summary": "Report不复制base history",
+      "evidence": [
+        "tests/p3_agent_loop_closeout.rs::report_appended_is_only_the_loop_delta_not_the_base_history"
+      ]
+    },
+    {
+      "id": "V4-058",
+      "status": "Passed",
+      "summary": "同一Loop可记录多个Model",
+      "evidence": [
+        "tests/p2_agent_loop.rs::update_during_model_reaches_the_next_request",
+        "tests/p2_agent_loop.rs::default_provider_accepts_mixed_model_refs_in_the_base"
+      ]
+    },
+    {
+      "id": "V4-059",
+      "status": "Passed",
+      "summary": "Summary无durable boundary语义",
+      "evidence": [
+        "src/history.rs",
+        "docs/contracts/history.md"
+      ]
+    },
+    {
+      "id": "V4-060",
+      "status": "Passed",
+      "summary": "DefaultPrompt可运行简单Agent",
+      "evidence": [
+        "tests/p2_agent_loop.rs::default_provider_runs_a_loop_end_to_end_with_system_prompt"
+      ]
+    },
+    {
+      "id": "V4-061",
+      "status": "Passed",
+      "summary": "Rust 1.85通过",
+      "evidence": [
+        "scripts/check-msrv.sh"
+      ]
+    },
+    {
+      "id": "V4-062",
+      "status": "Passed",
+      "summary": "stable通过",
+      "evidence": [
+        "scripts/check.sh"
+      ]
+    },
+    {
+      "id": "V4-063",
+      "status": "Passed",
+      "summary": "Linux/macOS/Windows CI矩阵四job（macos/windows/stable/1.85）在run 33676282786全绿",
+      "evidence": [
+        ".github/workflows/ci.yml",
+        "docs/release-v0.4.md"
+      ]
+    },
+    {
+      "id": "V4-064",
+      "status": "Passed",
+      "summary": "cargo fmt通过",
+      "evidence": [
+        "scripts/check.sh",
+        "scripts/check-msrv.sh"
+      ]
+    },
+    {
+      "id": "V4-065",
+      "status": "Passed",
+      "summary": "clippy -D warnings通过",
+      "evidence": [
+        "scripts/check.sh"
+      ]
+    },
+    {
+      "id": "V4-066",
+      "status": "Passed",
+      "summary": "rustdoc -D warnings通过",
+      "evidence": [
+        "scripts/check.sh"
+      ]
+    },
+    {
+      "id": "V4-067",
+      "status": "Passed",
+      "summary": "无unsafe生产代码",
+      "evidence": [
+        "scripts/check_v04_architecture.py",
+        "src/lib.rs"
+      ]
+    },
+    {
+      "id": "V4-068",
+      "status": "Passed",
+      "summary": "architecture gate通过",
+      "evidence": [
+        "scripts/check-architecture.sh",
+        "scripts/check_v04_architecture.py"
+      ]
+    },
+    {
+      "id": "V4-069",
+      "status": "Passed",
+      "summary": "旧durable模块不存在",
+      "evidence": [
+        "scripts/check_v04_architecture.py",
+        "docs/migrations/v0.3-to-v0.4.md"
+      ]
+    },
+    {
+      "id": "V4-070",
+      "status": "Passed",
+      "summary": "README与实际边界一致",
+      "evidence": [
+        "README.md",
+        "scripts/check_docs.py"
+      ]
+    }
+  ]
+}

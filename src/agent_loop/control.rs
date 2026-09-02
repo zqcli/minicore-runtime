@@ -430,3 +430,144 @@ fn cancel_reason_value(value: u8) -> CancelReason {
 pub(crate) enum InteractionStateError {
     Busy,
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use crate::agent_loop::control::{FinalGate, FinishSeal, LoopControl};
+    use crate::agent_loop::{CancelReason, SteerError, UpdateError};
+    use crate::execution::{ConfigRevision, ExecutionConfig, UserInput};
+    use crate::ids::LoopId;
+    use crate::limits::LoopLimits;
+    use crate::model::{
+        Model, ModelCallContext, ModelDescriptor, ModelRef, ModelRequest, ModelStartFuture,
+        ModelStream, ReasoningPreference,
+    };
+    use crate::tools::ToolSet;
+
+    struct NoopModel {
+        descriptor: ModelDescriptor,
+    }
+
+    impl Model for NoopModel {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn start<'a>(
+            &'a self,
+            _request: ModelRequest,
+            _context: ModelCallContext,
+        ) -> ModelStartFuture<'a> {
+            Box::pin(async move { Ok::<ModelStream, _>(Box::pin(futures_util::stream::empty())) })
+        }
+    }
+
+    fn config() -> ExecutionConfig {
+        let descriptor = ModelDescriptor::new(
+            "fake/noop".parse::<ModelRef>().unwrap(),
+            8192,
+            BTreeSet::from([ReasoningPreference::Auto]),
+            false,
+        )
+        .unwrap();
+        ExecutionConfig::new(
+            Arc::new(NoopModel { descriptor }),
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            Arc::new(crate::prompt::DefaultPromptProvider::new(None)),
+        )
+        .unwrap()
+    }
+
+    fn control() -> LoopControl {
+        LoopControl::new(LoopId::new().unwrap(), 16, LoopLimits::default(), 4)
+            .unwrap()
+            .0
+    }
+
+    fn steering() -> UserInput {
+        UserInput::text("focus").unwrap()
+    }
+
+    /// The finish CAS seals exactly once and, in the same mutex critical
+    /// section, closes accepting: later update/steer are NotActive and a
+    /// later cancel cannot reopen the loop.
+    #[test]
+    fn finish_once_seals_exactly_once_and_closes_accepting() {
+        let control = control();
+        assert_eq!(control.finish_once(), FinishSeal::Clean);
+        assert_eq!(control.finish_once(), FinishSeal::AlreadyFinished);
+        assert!(control.is_finished());
+        assert!(!control.mark_cancel(CancelReason::User));
+        assert_eq!(control.update(config()), Err(UpdateError::NotActive));
+        assert_eq!(control.steer(steering()), Err(SteerError::NotActive));
+    }
+
+    /// The cancel CAS vs finish CAS window linearizes: whichever wins first
+    /// decides the report outcome and every later transition is a no-op.
+    #[test]
+    fn mark_cancel_then_finish_reports_cancelled_prior_and_locks() {
+        let control = control();
+        assert!(control.mark_cancel(CancelReason::User));
+        assert_eq!(
+            control.finish_once(),
+            FinishSeal::CancelledPrior(CancelReason::User)
+        );
+        assert_eq!(control.finish_once(), FinishSeal::AlreadyFinished);
+        assert!(!control.mark_cancel(CancelReason::Deadline));
+        assert_eq!(control.cancel_reason(), CancelReason::User);
+        assert_eq!(control.update(config()), Err(UpdateError::NotActive));
+        assert_eq!(control.steer(steering()), Err(SteerError::NotActive));
+    }
+
+    /// begin_final with a pending steer keeps accepting open and consumes the
+    /// steer; a second begin_final with nothing pending seals.
+    #[test]
+    fn begin_final_with_pending_steer_keeps_accepting_open() {
+        let control = control();
+        control.steer(steering()).unwrap();
+        match control.begin_final() {
+            FinalGate::Continue(changes) => {
+                assert_eq!(changes.steers.len(), 1);
+                assert!(changes.config.is_none());
+            }
+            FinalGate::Seal => panic!("pending steer must continue the loop"),
+        }
+        // Accepting stays open during the continuation round; with no new
+        // steer, the next final seals: begin_final closes accepting (the
+        // runner-side finish_once then flips the cancelled/finished state).
+        control.update(config()).unwrap();
+        assert!(matches!(control.begin_final(), FinalGate::Seal));
+        assert_eq!(control.update(config()), Err(UpdateError::NotActive));
+    }
+
+    /// begin_final with nothing pending closes accepting in the same lock:
+    /// update/steer that race it observe NotActive.
+    #[test]
+    fn begin_final_without_steer_seals_and_closes_accepting() {
+        let control = control();
+        assert!(matches!(control.begin_final(), FinalGate::Seal));
+        assert_eq!(control.update(config()), Err(UpdateError::NotActive));
+        assert_eq!(control.steer(steering()), Err(SteerError::NotActive));
+    }
+
+    /// Updates hand out monotonic revisions; take_boundary returns only the
+    /// latest, and applied_revision moves only on an explicit commit.
+    #[test]
+    fn updates_are_monotonic_and_latest_wins_until_commit() {
+        let control = control();
+        let first = control.update(config()).unwrap();
+        let second = control.update(config()).unwrap();
+        assert!(first < second);
+        let changes = control.take_boundary();
+        let (revision, _config) = changes.config.expect("a config candidate is pending");
+        assert_eq!(revision, second, "the latest update wins");
+        assert_eq!(control.applied_revision(), ConfigRevision::INITIAL);
+        control.commit_revision(revision);
+        assert_eq!(control.applied_revision(), revision);
+    }
+}

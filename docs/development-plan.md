@@ -9,10 +9,12 @@
 - **Phase 5** `refactor(v0.4): remove session storage and durable conversation ownership` — deleted `session`, `storage`, `conversation`, `agent`, `compaction`, `context`, old `prompt`/`config`; migrated `UserInput`/`Usage`; 181 files, net −36k lines.
 - **Phase 6** `refactor(v0.4): replace context and durable compaction with prompt providers` — `PromptProvider` seam + `DefaultPromptProvider`, runner-side `max_prompt_messages` enforcement, shared `MAX_MODEL_MESSAGE_TEXT_BYTES`.
 - **Phase 7** `refactor(v0.4): converge modules around the agent loop boundary` — runner split (`runner/model.rs`, `runner/tools.rs`), v0.4 documentation and examples, architecture-gate rewrite, dead code and dependency cleanup.
+- **Phase 8** `test(v0.4): close the flexible agent loop contract` — contract close-out (reasoning channels, event-free and multi-batch cancel semantics, policy snapshot swaps, history limits and delta-only reports, malformed-response rejection, loop-level retry, shared-resource isolation, control-layer CAS tests), the V4-001..V4-070 [acceptance matrix](acceptance-v0.4.md) with its gate, and the [release documentation](release-v0.4.md).
 
 ## Remaining
 
-- **Phase 8** `test(v0.4): close the flexible agent loop contract` — full new test close-out, acceptance mapping, release documentation.
+No planned phases remain. Maintenance keeps the gates in the next section
+and the acceptance matrix at `scripts/acceptance_v04.json` in sync.
 
 ## Maintenance Gates
 

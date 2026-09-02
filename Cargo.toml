@@ -1,10 +1,10 @@
 [package]
 name = "minicore-runtime"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "Embeddable MiniCore agent runtime"
+description = "Small Rust execution core for one live agent loop"
 
 [dependencies]
 getrandom = "0.3.3"

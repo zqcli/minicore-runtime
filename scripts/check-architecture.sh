@@ -8,3 +8,5 @@ python3 scripts/check_docs.py --self-test
 python3 scripts/check_docs.py
 python3 scripts/check_v04_architecture.py --self-test
 python3 scripts/check_v04_architecture.py
+python3 scripts/check_acceptance.py --self-test
+python3 scripts/check_acceptance.py

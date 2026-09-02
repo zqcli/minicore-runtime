@@ -33,7 +33,6 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ARCHIVE = ROOT / "docs" / "archive"
 
 AUTHORITY = [
     "README.md",
@@ -54,6 +53,8 @@ AUTHORITY = [
     "docs/contracts/tool-policy-interaction.md",
     "docs/integration/host-boundary.md",
     "docs/migrations/v0.3-to-v0.4.md",
+    "docs/acceptance-v0.4.md",
+    "docs/release-v0.4.md",
 ]
 
 NON_AUTHORITY_SPEC = ["minicore-runtime-v0.4-flex-agent-loop-reset-spec.md"]
@@ -105,13 +106,14 @@ CORE_LINKS = {
 
 
 def markdown_files(root: Path) -> list[Path]:
+    archive = root / "docs" / "archive"
     exclude = {"target", ".git"}
     return sorted(
         p
         for p in root.rglob("*.md")
         if not any(part in exclude for part in p.parts)
-        and ARCHIVE not in p.parents
-        and p != ARCHIVE
+        and archive not in p.parents
+        and p != archive
     )
 
 
@@ -309,7 +311,11 @@ def self_test() -> list[str]:
     problems: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        (root / "docs").mkdir()
+        (root / "docs" / "archive").mkdir(parents=True)
+        # Archived Markdown is exempt from inventory and link checking.
+        (root / "docs" / "archive" / "old.md").write_text(
+            "# old\n\n[x](vanished.md) on an archived page\n", encoding="utf-8"
+        )
         (root / "docs" / "a.md").write_text(
             "# Heading\n\nbroken [x](missing.md) and [frag](#nope) and [ref][r]\n\n[r]: other.md\n",
             encoding="utf-8",
@@ -323,8 +329,13 @@ def self_test() -> list[str]:
             problems.append("self-test: broken-link scanner is vacuous")
         if not any("#nope" in hit or "no heading anchor" in hit for hit in link_hits):
             problems.append("self-test: heading-anchor scanner is vacuous")
-        if not any("stray.md" in hit for hit in check_markdown_inventory(root)):
+        if any("archive" in hit for hit in link_hits):
+            problems.append("self-test: archive pages must be exempt from link checks")
+        inventory_hits = check_markdown_inventory(root)
+        if not any("stray.md" in hit for hit in inventory_hits):
             problems.append("self-test: markdown-inventory scanner is vacuous")
+        if any("archive" in hit for hit in inventory_hits):
+            problems.append("self-test: archive dir must be exempt from the inventory")
         if not check_root_readme(root):
             problems.append("self-test: README required-marker scanner is vacuous")
 
