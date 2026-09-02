@@ -1,16 +1,23 @@
 # Current ADR Index
 
-Current ADRs explain the accepted final v0.3 ownership and execution boundaries. Source, [architecture](../architecture.md), and the [module map](../modules/README.md) remain the contract; ADRs record why those boundaries exist.
+Current ADRs explain the accepted v0.4 execution boundaries. Source,
+[architecture](../architecture.md), and the
+[module map](../modules/README.md) remain the contract; ADRs record why those
+boundaries exist.
 
 ## Current
 
 | ADR | Decision |
 | --- | --- |
-| [0200](0200-v0.2-core-reset-uses-typed-runtime.md) | Core exposes one typed SessionRuntime owner per loaded session and no multi-session facade |
-| [0203](0203-model-calls-are-single-attempt-with-turn-retry.md) | each Model call is one attempt and only delivery-safe failures retry |
+| [0300](0300-v0.4-agent-loop-reset.md) | v0.4 converges the runtime on one live `AgentLoop`; host owns sessions, history, persistence, providers, workspaces |
 
-A new cross-cutting decision must add a current ADR or explicitly revise one of these decisions.
+A new cross-cutting decision must add a current ADR or explicitly revise this
+decision.
 
 ## Historical
 
-Workspace/process authority and flat-v2 storage decisions are archived under [`docs/archive/v2/adr/`](../archive/v2/adr/). Pre-reset ADR prose remains under [`docs/archive/v2/pre-reset/adr/`](../archive/v2/pre-reset/adr/). Neither archive is current Core authority.
+Session-era and pre-reset decisions (v0.1/v0.2/v0.3) are archived under
+[`docs/archive/v2/adr/`](../archive/v2/adr/) and
+[`docs/archive/v2/pre-reset/adr/`](../archive/v2/pre-reset/adr/). The
+`provider-gate` harness keeps the standalone provider evidence. Neither
+archive is current Core authority.

@@ -1,102 +1,54 @@
 # Host Boundary
 
-MiniCore Runtime owns execution for one loaded Session. The Host owns every collection, adapter, product policy, and ambient capability around it.
+## The Deal
 
-See the lifecycle and extension contracts: [`session-runtime-lifecycle.md`](../contracts/session-runtime-lifecycle.md) and [`extensions.md`](../contracts/extensions.md).
+The host owns everything durable and stateful; the runtime executes exactly
+one loop and returns control. Concretely:
 
-The failure-safe compiled integration shape is [`examples/session_runtime_lifecycle.rs`](../../examples/session_runtime_lifecycle.rs); README is checker-synchronized to its marked body. After load succeeds, that example captures operation errors, always shuts down, then always joins the event task before applying shutdown → event-task → operation error precedence.
+- **The host supplies** prior `HistoryItem`s (`LoopRequest::history`), the
+  fresh `UserInput`, and the immutable `ExecutionConfig` (model, reasoning,
+  tools, optional policy, prompt provider).
+- **The runtime supplies** `LoopReport` (outcome, `appended` in-memory items,
+  `usage`, `requests`, `tool_rounds`, final `ConfigRevision`) and an optional
+  best-effort `LoopEventStream`.
+- **The host persists** whatever it wants: the report, selected appended
+  items, or transcripts it built from streamed events. None of that happens
+  in the runtime.
 
-## Loaded Session Collection
+## One-Shot Contract
 
-A Host may keep its own map:
+- `AgentLoop` runs once. `join()` waits for the run and returns
+  `Arc<LoopReport>`; a second join or `wait` also returns the same report as
+  long as the runner has published it. If the runner task is gone before
+  publishing, waiters observe `LoopWaitError::CompletionClosed`.
+- Dropping the `AgentLoop` cancels the loop best-effort without blocking.
 
-```rust,ignore
-use std::collections::HashMap;
+## Events Are Best Effort
 
-use minicore_runtime::{SessionId, SessionRuntime};
+- `take_events()` hands the caller the single bounded stream for this loop.
+- Every emission is a `try_send`; a full or closed queue never blocks the
+  runner. `LoopEventEnvelope.dropped_before` counts what you missed.
+- **Events are not authoritative.** Do not reconcile your durable transcript
+  against the event stream, and never assume a Missing event means a tool
+  never ran: tool side effects and the on-disk log are not atomic. If the
+  host needs an atomic journal, it must own that transaction itself (for
+  example by only recording outcomes that the report or tool results prove).
 
-struct LoadedSessions {
-    runtimes: HashMap<SessionId, SessionRuntime>,
-}
-```
+## Concurrency Notes
 
-This is illustrative Host code, not a Core type. The Host decides duplicate-load policy, admission, eviction, tenancy, routing, and what to do when two independent instances use the same durable SessionId. Core provides no `Runtime`, `SessionManager`, `SessionRepository`, or shutdown-all facade.
+- Requires a Tokio context; `AgentLoop::start` spawns the single runner task.
+- `handle.steer` / `handle.update` / `handle.cancel` are callable from any
+  thread. They either linearize against the runner's mutex or fail fast with
+  `NotActive` / `QueueFull` / `WaitingForInput`.
+- `update` and `steer` stage for the **next model request**; the current tool
+  batch keeps the snapshot of the request that produced it.
+- Interactions: when the loop is waiting for user input (`WaitingForInput`),
+  `handle.answer` resolves the pending interaction; loop deadline still wins
+  over waiting.
 
-## Repository And Writer Lease
+## Migration Impact
 
-Listing, creating repository metadata, opening an existing Session, deleting/archiving a Session, and acquiring a writer lease happen before `SessionRuntime::create` or `load`.
-
-A typical Host flow is:
-
-1. authorize the product request;
-2. consult the Host repository;
-3. acquire an exclusive writer lease;
-4. open one concrete `Box<dyn SessionLog>` adapter;
-5. build immutable SessionBindings;
-6. create/load one SessionRuntime;
-7. retain the runtime and lease until explicit shutdown completes;
-8. release the lease and update repository metadata.
-
-Cross-process exclusion belongs to the repository/adapter. `SessionLog` expected-head append detects conflicts but is not a repository lease service.
-
-## Storage Adapter
-
-The Host selects the persistence technology and format. Core defines only the SessionLog Port for manifest initialization/load, paged Conversation reads, atomic expected-head append, and close.
-
-The adapter owns transaction boundaries, durability guarantees, migrations, backup, encryption, filesystem/database paths, corruption diagnostics, and known-versus-unknown outcome classification. No JSONL, filesystem, SQL, or cloud-store implementation ships in Core.
-
-## Workspace And Capabilities
-
-Core has no Workspace abstraction. A Host Tool or ContextProvider captures only the capability it needs when constructed:
-
-```text
-Host authorization
-→ construct capability-limited Tool/ContextProvider
-→ register Tool in ToolSet / bind ContextProvider
-→ pass immutable SessionBindings to SessionRuntime
-```
-
-ToolContext carries cancellation, deadline, and progress only. Filesystem roots, process launch rights, RPC clients, secrets, repositories, and product services remain inside Host adapters.
-
-MiniCore never starts a process on its own. A process-running Tool, if a product chooses to implement one, is a Host component and must define its own sandbox and process-tree cleanup claims.
-
-## Shared Ports
-
-A Host may share `Arc<dyn Model>`, `Arc<dyn ToolPolicy>`, `Arc<dyn ContextProvider>`, or `Arc<dyn CompactionStrategy>` across multiple SessionRuntime instances. ToolSet is immutable and cloneable. Shared adapters must use the request identity and child cancellation token rather than retaining mutable Session ownership.
-
-Core does not place a global lock around shared Ports. Host-level decorators may provide concurrency limits, pools, budgets, or rate limits.
-
-SessionLog is not shared this way: one mutable adapter instance is transferred to one owner.
-
-## Global Limits
-
-Global or tenant-wide scheduling remains outside Core, including:
-
-- maximum loaded sessions;
-- aggregate model/tool concurrency;
-- request quotas and billing budgets;
-- memory/disk pressure and idle eviction;
-- credential rotation;
-- provider failover policy;
-- workspace conflict policy;
-- shutdown ordering across many sessions.
-
-Per-session `KernelConfig`, SessionSpec, and semantic limits do not claim to enforce a process-global policy.
-
-## Shutdown-All
-
-The Host implements shutdown-all by draining its own collection and explicitly awaiting each owner:
-
-```rust,ignore
-for (_, runtime) in loaded_sessions.runtimes.drain() {
-    if let Err(error) = runtime.shutdown().await {
-        record_shutdown_failure(error);
-    }
-}
-```
-
-A production Host chooses concurrency, deadline, retry/reporting, and failure aggregation policy. Dropping the map only sends cancellation; it is not a durability barrier.
-
-## Product Boundary
-
-Servers, CLIs, GUIs, authentication, audit logs, telemetry export, model/provider installation, tool catalogs, workspace selection, session listing, and release policy are Host/product concerns. They may use the typed Ports but must not depend on private actor protocol or treat EventStream as durable truth.
+Old hosts that owned sessions via the v0.3 runtime lose session
+open/load/save and durable conversation. See
+[`docs/migrations/v0.3-to-v0.4.md`](../migrations/v0.3-to-v0.4.md) for the
+concrete upgrade path, including what is intentionally not migrated.
