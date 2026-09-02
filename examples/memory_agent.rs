@@ -45,6 +45,7 @@ impl Model for EchoModel {
         let user_text = request
             .messages()
             .iter()
+            .rev()
             .find_map(|message| match message {
                 minicore_runtime::model::ModelMessage::User(text) => Some(text.clone()),
                 _ => None,
@@ -130,6 +131,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut agent = MemoryAgent::new(config);
     for question in ["hello", "what is the time", "goodbye"] {
         let reply = agent.chat(question).await?;
+        assert!(
+            reply.contains(question),
+            "reply must echo the current turn, got {reply:?} for {question:?}"
+        );
         println!("user: {question}\nassistant: {reply}\n");
     }
     println!("host history now holds {} items", agent.history.len());

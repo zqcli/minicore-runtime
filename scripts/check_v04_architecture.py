@@ -47,12 +47,23 @@ FORBIDDEN_NAMES = [
     "SessionManager",
     "SessionStorage",
     "SessionRepository",
-    "ConversationLedger",
-    "ConversationStorage",
+    "SessionTranscript",
+    "SessionRecovery",
     "SessionOpener",
+    "ConversationLedger",
+    "ConversationStore",
+    "ConversationStorage",
+    "DurableState",
     "HookBus",
     "Supervisor",
     "Workspace",
+    # Non-type resilience markers for the deleted durable stack.
+    "JSONL",
+    "Jsonl",
+    "Transcript",
+    "Degraded",
+    "Recovery",
+    "Durability",
 ]
 
 FORBIDDEN_PATHS = [
@@ -190,7 +201,7 @@ def check_execution_config(root: Path) -> list[str]:
     for line_no, line in enumerate(text.splitlines(), start=1):
         if re.search(r"\bimpl ExecutionConfig\b", line):
             in_config = True
-        if in_config and re.search(r"pub fn set_\w+", line):
+        if in_config and re.search(r"pub(?:\(crate\))?\s+fn set_\w+", line):
             problems.append(f"src/execution.rs:{line_no}: setter on ExecutionConfig")
     return problems
 
@@ -316,7 +327,8 @@ def self_test() -> list[str]:
         )
         (src / "session.rs").write_text("struct SessionRuntime;\n", encoding="utf-8")
         (src / "execution.rs").write_text(
-            "impl ExecutionConfig { pub fn set_foo(&mut self) {} }\n", encoding="utf-8"
+            "impl ExecutionConfig { pub fn set_foo(&mut self) {} pub(crate) fn set_bar(&mut self) {} }\n",
+            encoding="utf-8",
         )
         (src / "mutex.rs").write_text(
             "fn m() { let _ = tokio::sync::Mutex::new(0); let _ = parking_lot::Mutex::new(0); }\n",
@@ -329,6 +341,14 @@ def self_test() -> list[str]:
         (agent_loop / "mod.rs").write_text(
             "pub fn start() { tokio::spawn(async {}); }\n", encoding="utf-8"
         )
+        # Event receiver must stay in event.rs; leak it and a non-unit try_emit.
+        (agent_loop / "event.rs").write_text(
+            "fn try_emit(&mut self, event: LoopEvent) -> bool { true }\n"
+            "struct Sink { rx: mpsc::Receiver<LoopEventEnvelope> }\n",
+            encoding="utf-8",
+        )
+        # A deleted-path marker must trip the scanner too.
+        (src / "bindings.rs").write_text("// old alias file\n", encoding="utf-8")
         # A #[cfg(test)] spawn that production scanning must ignore.
         (src / "portcall.rs").write_text(
             "#[cfg(test)]\nmod tests {\n    fn t() { tokio::spawn(async {}); }\n}\n",
@@ -350,6 +370,10 @@ def self_test() -> list[str]:
             problems.append("self-test: Cargo dependency scanner is vacuous")
         if not check_public_root(root):
             problems.append("self-test: public-root scanner is vacuous")
+        if not check_deleted_paths(root):
+            problems.append("self-test: deleted-path scanner is vacuous")
+        if not check_events_best_effort(root):
+            problems.append("self-test: event best-effort scanner is vacuous")
 
     after = run_checks(ROOT)
     if after:
