@@ -12,9 +12,8 @@ use tokio::sync::{Barrier, Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::config::{KernelConfig, RetryPolicy, SemanticLimits};
 use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
-use crate::ids::{SessionId, SessionInstanceId, ToolCallId, TurnId};
+use crate::ids::{LoopId, ToolCallId};
 use crate::model::{
     AssistantPart, ModelFinishReason, ModelLimits, ModelMessage, ModelRef, ModelStartFuture,
     ModelStream, ReasoningPreference, RetryHint, Usage,
@@ -36,16 +35,73 @@ mod semantics;
 #[cfg(test)]
 mod settlement;
 
-fn session_id() -> SessionId {
-    "ses_00000000000000000000000000000041".parse().unwrap()
+/// Test-local mirror of the removed session kernel config: the driver needs
+/// only a timeout, a retry budget, and the semantic limits tuple.
+#[derive(Clone)]
+struct RetryPolicy {
+    attempts: u8,
+    base_delay: Duration,
 }
 
-fn instance_id() -> SessionInstanceId {
-    "ins_00000000000000000000000000000041".parse().unwrap()
+impl RetryPolicy {
+    fn new(attempts: u8, base_delay: Duration) -> Result<Self, &'static str> {
+        Ok(Self {
+            attempts,
+            base_delay,
+        })
+    }
+
+    fn max_attempts(&self) -> u8 {
+        self.attempts
+    }
+
+    fn base_delay(&self) -> Duration {
+        self.base_delay
+    }
 }
 
-fn turn_id() -> TurnId {
-    "trn_00000000000000000000000000000041".parse().unwrap()
+#[derive(Clone)]
+struct SemanticLimits {
+    max_tool_count: usize,
+    max_tool_name_bytes: usize,
+    max_tool_schema_bytes: usize,
+    max_tool_input_bytes: usize,
+    max_model_text_bytes_per_round: usize,
+    max_model_reasoning_bytes_per_round: usize,
+}
+
+impl Default for SemanticLimits {
+    fn default() -> Self {
+        Self {
+            max_tool_count: 64,
+            max_tool_name_bytes: 64,
+            max_tool_schema_bytes: crate::value::MAX_JSON_BYTES,
+            max_tool_input_bytes: crate::value::MAX_JSON_BYTES,
+            max_model_text_bytes_per_round: BoundedText::MAX_BYTES,
+            max_model_reasoning_bytes_per_round: BoundedText::MAX_BYTES,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct KernelConfig {
+    model_call_timeout: Duration,
+    retry_policy: RetryPolicy,
+    limits: SemanticLimits,
+}
+
+impl KernelConfig {
+    fn default_checked() -> Result<Self, &'static str> {
+        Ok(Self {
+            model_call_timeout: Duration::from_secs(60),
+            retry_policy: RetryPolicy::new(2, Duration::ZERO).unwrap(),
+            limits: SemanticLimits::default(),
+        })
+    }
+}
+
+fn loop_id() -> LoopId {
+    "lup_00000000000000000000000000000041".parse().unwrap()
 }
 
 fn call_id(value: u8) -> ToolCallId {
@@ -97,14 +153,7 @@ fn tool_request() -> ModelRequest {
 }
 
 fn context(cancellation: CancellationToken, deadline_after: Duration) -> ModelCallContext {
-    ModelCallContext::new(
-        session_id(),
-        instance_id(),
-        turn_id(),
-        0,
-        cancellation,
-        Instant::now() + deadline_after,
-    )
+    ModelCallContext::new(loop_id(), 0, cancellation, Instant::now() + deadline_after)
 }
 
 fn kernel(retry_policy: RetryPolicy) -> KernelConfig {

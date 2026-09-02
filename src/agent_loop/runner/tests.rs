@@ -26,7 +26,7 @@ use crate::prompt_provider::{
 };
 use crate::tools::ToolSet;
 
-use super::{FailPath, LoopCtx, finish_loop, panic_report, port_identity};
+use super::{FailPath, LoopCtx, finish_loop, panic_report};
 
 /// A model whose stream never yields: the loop stays alive until aborted.
 struct HoldingModel {
@@ -90,7 +90,7 @@ fn holding_config() -> ExecutionConfig {
 async fn aborted_runner_makes_wait_return_completion_closed() {
     let request = LoopRequest::new(
         Arc::from([]),
-        crate::config::UserInput::text("hello").unwrap(),
+        crate::execution::UserInput::text("hello").unwrap(),
         holding_config(),
     );
     let agent = AgentLoop::start(request, LoopOptions::default_checked().unwrap()).unwrap();
@@ -126,11 +126,9 @@ async fn finish_loop_losing_the_seal_returns_the_published_arc() {
     assert_eq!(control.finish_once(), FinishSeal::Clean);
 
     let options = LoopOptions::default_checked().unwrap();
-    let identity = port_identity(id);
     let mut ctx = LoopCtx {
         id,
         control: &control,
-        identity: &identity,
         options: &options,
         sink: &mut sink,
         completion_tx: &completion_tx,

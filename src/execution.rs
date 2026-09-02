@@ -8,6 +8,43 @@ use crate::limits::LoopLimits;
 use crate::model::{Model, ModelDescriptor, ReasoningPreference};
 use crate::prompt_provider::PromptProvider;
 use crate::tools::{ToolPolicy, ToolSet};
+use crate::value::BoundedText;
+
+/// Errors constructing user input.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum UserInputError {
+    #[error("user input is empty or exceeds the absolute text limit")]
+    InvalidText,
+}
+
+/// User input for one agent loop (the initial request or a `LoopHandle::steer`).
+///
+/// Constructors enforce absolute structural bounds (`BoundedText::MAX_BYTES` and
+/// non-empty text). The live loop's `LoopLimits::max_user_input_bytes` is
+/// applied by `AgentLoop::start` and `LoopHandle::steer`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserInput {
+    Text(BoundedText),
+}
+
+impl UserInput {
+    /// Creates text user input within absolute structural bounds.
+    pub fn text(value: impl AsRef<str>) -> Result<Self, UserInputError> {
+        let text = BoundedText::new(value).map_err(|_| UserInputError::InvalidText)?;
+        if text.is_empty() {
+            return Err(UserInputError::InvalidText);
+        }
+        Ok(Self::Text(text))
+    }
+
+    /// Returns the input text as a string slice.
+    pub fn as_text(&self) -> &str {
+        match self {
+            Self::Text(text) => text.as_str(),
+        }
+    }
+}
 
 /// Monotonic revision of the active `ExecutionConfig` inside a loop.
 ///

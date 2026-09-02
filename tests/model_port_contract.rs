@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::{StreamExt, stream};
-use minicore_runtime::ids::{SessionId, SessionInstanceId, ToolCallId, TurnId};
 use minicore_runtime::model::{
     MAX_MODEL_EVENT_TEXT_BYTES, Model, ModelCallContext, ModelDescriptor, ModelEvent,
     ModelFinishReason, ModelLimits, ModelMessage, ModelRef, ModelRequest, ModelStartFuture,
@@ -12,18 +11,13 @@ use minicore_runtime::model::{
 };
 use minicore_runtime::tools::{ToolName, ToolSpec};
 use minicore_runtime::value::BoundedText;
+use minicore_runtime::{LoopId, ToolCallId};
 use serde_json::json;
 use tokio::sync::Barrier;
 use tokio_util::sync::CancellationToken;
 
-fn session_id() -> SessionId {
-    "ses_00000000000000000000000000000001".parse().unwrap()
-}
-fn instance_id() -> SessionInstanceId {
-    "ins_00000000000000000000000000000001".parse().unwrap()
-}
-fn turn_id() -> TurnId {
-    "trn_00000000000000000000000000000001".parse().unwrap()
+fn loop_id() -> LoopId {
+    "lup_00000000000000000000000000000001".parse().unwrap()
 }
 fn call_id() -> ToolCallId {
     "call_00000000000000000000000000000001".parse().unwrap()
@@ -61,14 +55,7 @@ fn request() -> ModelRequest {
 }
 
 fn context(cancellation: CancellationToken, deadline: Instant) -> ModelCallContext {
-    ModelCallContext::new(
-        session_id(),
-        instance_id(),
-        turn_id(),
-        0,
-        cancellation,
-        deadline,
-    )
+    ModelCallContext::new(loop_id(), 0, cancellation, deadline)
 }
 
 fn event_name(event: &ModelEvent) -> &'static str {
@@ -100,10 +87,8 @@ impl Model for ConcurrentModel {
         context: ModelCallContext,
     ) -> ModelStartFuture<'a> {
         assert_eq!(request.reasoning(), ReasoningPreference::High);
-        assert_eq!(context.session_id, session_id());
-        assert_eq!(context.instance_id, instance_id());
-        assert_eq!(context.turn_id, turn_id());
-        assert_eq!(context.round, 0);
+        assert_eq!(context.loop_id, loop_id());
+        assert_eq!(context.request_index, 0);
         let barrier = Arc::clone(&self.barrier);
         let starts = Arc::clone(&self.starts);
         Box::pin(async move {
@@ -222,18 +207,16 @@ fn call_context_is_zero_based_exact_and_owner_neutral() {
     let cancellation = CancellationToken::new();
     let deadline = Instant::now() + Duration::from_secs(9);
     let context = context(cancellation.clone(), deadline);
-    assert_eq!(context.session_id, session_id());
-    assert_eq!(context.instance_id, instance_id());
-    assert_eq!(context.turn_id, turn_id());
-    assert_eq!(context.round, 0);
+    assert_eq!(context.loop_id, loop_id());
+    assert_eq!(context.request_index, 0);
     assert_eq!(context.deadline, deadline);
     cancellation.cancel();
     assert!(context.cancellation.is_cancelled());
     let debug = format!("{context:?}");
-    assert!(debug.contains("round: 0"));
+    assert!(debug.contains("request_index: 0"));
 
     let source = include_str!("../src/model/model.rs");
-    assert!(source.contains("Zero-based model call round"));
+    assert!(source.contains("index of the loop request"));
     let context_source = source
         .split_once("pub struct ModelCallContext")
         .and_then(|(_, tail)| tail.split_once('}'))
@@ -244,7 +227,7 @@ fn call_context_is_zero_based_exact_and_owner_neutral() {
             .lines()
             .filter(|line| line.trim_start().starts_with("pub "))
             .count(),
-        6
+        4
     );
     for forbidden in ["SessionHandle", "Workspace", "Store", "ToolSet", "Runtime"] {
         assert!(!source.contains(forbidden));

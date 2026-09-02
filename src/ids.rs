@@ -26,74 +26,6 @@ pub enum ToolCallIdError {
     #[error("tool call ID must contain printable ASCII text")]
     NonPrintable,
 }
-
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum ContextSourceIdError {
-    #[error("context source ID must be 1..=128 bytes")]
-    InvalidLength,
-    #[error("context source ID violates the stable symbolic grammar")]
-    InvalidGrammar,
-}
-
-#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ContextSourceId(Box<str>);
-
-impl ContextSourceId {
-    pub fn new(value: impl AsRef<str>) -> Result<Self, ContextSourceIdError> {
-        value.as_ref().parse()
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FromStr for ContextSourceId {
-    type Err = ContextSourceIdError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.is_empty() || value.len() > 128 {
-            return Err(ContextSourceIdError::InvalidLength);
-        }
-        if !value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/')
-        }) {
-            return Err(ContextSourceIdError::InvalidGrammar);
-        }
-        Ok(Self(value.into()))
-    }
-}
-
-impl fmt::Display for ContextSourceId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl fmt::Debug for ContextSourceId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, formatter)
-    }
-}
-
-impl Serialize for ContextSourceId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ContextSourceId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserialize_from_str(deserializer)
-    }
-}
-
 fn random_nonzero_bytes() -> Result<[u8; 16], IdError> {
     loop {
         let mut bytes = [0; 16];
@@ -209,9 +141,6 @@ macro_rules! runtime_id {
     };
 }
 
-runtime_id!(SessionId, "ses_");
-runtime_id!(SessionInstanceId, "ins_");
-runtime_id!(TurnId, "trn_");
 runtime_id!(InteractionId, "int_");
 runtime_id!(LoopId, "lup_");
 

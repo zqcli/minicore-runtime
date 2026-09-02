@@ -16,7 +16,6 @@ pub struct ToolSet {
 #[derive(Clone)]
 pub(crate) struct EnabledTools {
     entries: Arc<BTreeMap<ToolName, EnabledTool>>,
-    specs: Arc<[ToolSpec]>,
 }
 
 #[derive(Clone)]
@@ -72,24 +71,20 @@ impl ToolSet {
 
     pub(crate) fn enabled_subset(&self, enabled: &BTreeSet<ToolName>) -> EnabledTools {
         let mut entries = BTreeMap::new();
-        let mut specs = Vec::with_capacity(enabled.len());
         for name in enabled {
             if let (Some(implementation), Some(spec)) = (self.tools.get(name), self.specs.get(name))
             {
-                let spec = spec.clone();
-                specs.push(spec.clone());
                 entries.insert(
                     name.clone(),
                     EnabledTool {
                         implementation: Arc::clone(implementation),
-                        spec,
+                        spec: spec.clone(),
                     },
                 );
             }
         }
         EnabledTools {
             entries: Arc::new(entries),
-            specs: specs.into(),
         }
     }
 }
@@ -97,10 +92,6 @@ impl ToolSet {
 impl EnabledTools {
     pub(crate) fn get(&self, name: &ToolName) -> Option<&EnabledTool> {
         self.entries.get(name)
-    }
-
-    pub(crate) fn specs(&self) -> &[ToolSpec] {
-        &self.specs
     }
 }
 

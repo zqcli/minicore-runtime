@@ -1,27 +1,16 @@
 use std::time::{Duration, Instant};
 
-use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, ToolCallId, TurnId};
-use minicore_runtime::session::{InteractionAnswer, InteractionKind, PendingInteraction};
 use minicore_runtime::tools::{
     ApprovalDecision, ApprovalRequest, ApprovalRisk, MAX_TOOL_POLICY_TEXT_BYTES, ToolDecision,
     ToolInputAnswer, ToolInputAnswerKind, ToolInputRequest, ToolInvocation, ToolPolicy,
     ToolPolicyError, ToolPolicyFuture, ToolPolicyRequest, ToolSpec, ToolValueError,
 };
 use minicore_runtime::value::BoundedText;
+use minicore_runtime::{
+    InteractionAnswer, InteractionId, InteractionKind, PendingInteraction, ToolCallId,
+};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
-
-fn session_id() -> SessionId {
-    "ses_00000000000000000000000000000001".parse().unwrap()
-}
-
-fn instance_id() -> SessionInstanceId {
-    "ins_00000000000000000000000000000001".parse().unwrap()
-}
-
-fn turn_id() -> TurnId {
-    "trn_00000000000000000000000000000001".parse().unwrap()
-}
 
 fn interaction_id() -> InteractionId {
     "int_00000000000000000000000000000001".parse().unwrap()
@@ -32,15 +21,7 @@ fn tool_call_id() -> ToolCallId {
 }
 
 fn invocation(arguments: serde_json::Value) -> ToolInvocation {
-    ToolInvocation::new(
-        session_id(),
-        instance_id(),
-        turn_id(),
-        tool_call_id(),
-        "deploy".parse().unwrap(),
-        arguments,
-    )
-    .unwrap()
+    ToolInvocation::new(tool_call_id(), "deploy".parse().unwrap(), arguments).unwrap()
 }
 
 fn spec(description: &str) -> ToolSpec {
@@ -232,7 +213,6 @@ fn policy_text_is_checked_at_the_exact_boundary_and_debug_is_redacted() {
 fn pending(kind: InteractionKind) -> PendingInteraction {
     PendingInteraction {
         interaction_id: interaction_id(),
-        turn_id: turn_id(),
         tool_call_id: tool_call_id(),
         tool_name: "deploy".parse().unwrap(),
         kind,
@@ -244,7 +224,6 @@ fn pending_interactions_keep_checked_ids_kinds_and_redacted_debug() {
     let approval = ApprovalRequest::new("approve secret deploy", ApprovalRisk::High).unwrap();
     let pending_approval = pending(InteractionKind::Approval(approval));
     assert_eq!(pending_approval.interaction_id, interaction_id());
-    assert_eq!(pending_approval.turn_id, turn_id());
     assert_eq!(pending_approval.tool_call_id, tool_call_id());
     assert_eq!(pending_approval.tool_name.as_str(), "deploy");
     assert!(!format!("{pending_approval:?}").contains("approve secret deploy"));
