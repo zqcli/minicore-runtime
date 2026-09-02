@@ -28,7 +28,7 @@ use minicore_runtime::value::BoundedText;
 use minicore_runtime::{
     AgentLoop, AnswerError, CancelReason, ConfigRevision, ExecutionConfig, HistoryItem,
     InteractionAnswer, LoopEvent, LoopOptions, LoopOutcome, LoopReport, LoopRequest,
-    LoopStartError, LoopStatus, ToolCallId, UpdateError, UserInput,
+    LoopStartError, LoopStatus, SteerError, ToolCallId, UpdateError, UserInput, UserMessageKind,
 };
 
 fn reasoning_set() -> BTreeSet<ReasoningPreference> {
@@ -2588,4 +2588,488 @@ async fn start_rejects_config_outside_loop_limits() {
     .err()
     .expect("oversized name must fail start");
     assert_eq!(error, LoopStartError::InvalidConfig);
+}
+
+// ===== Phase 4: steer active loops at request boundaries =====
+
+fn steerings(report: &LoopReport) -> Vec<String> {
+    report
+        .appended
+        .iter()
+        .filter_map(|item| match item {
+            HistoryItem::User(user) if user.kind == UserMessageKind::Steering => {
+                Some(user.input.as_text().to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// MC4-019: a steer accepted while a model request is in flight reaches the
+/// next request.
+#[tokio::test]
+async fn steer_during_model_reaches_the_next_request() {
+    let gate = Arc::new(Notify::new());
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::GatedTools {
+            calls: vec![("echo", "call_1")],
+            gate: Arc::clone(&gate),
+        }],
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = AgentLoop::start(
+        request(config(
+            model_a,
+            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
+            None,
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    let mut states = handle.watch_state();
+    states
+        .wait_for(|state| state.status == LoopStatus::RunningModel)
+        .await
+        .unwrap();
+    handle.steer(UserInput::text("turn left").unwrap()).unwrap();
+
+    gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.requests, 2, "the in-flight request still ran");
+    assert_eq!(steerings(&report), ["turn left"]);
+    let user_seq: Vec<(UserMessageKind, String)> = report
+        .appended
+        .iter()
+        .filter_map(|item| match item {
+            HistoryItem::User(user) => Some((user.kind, user.input.as_text().to_string())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        user_seq,
+        vec![
+            (UserMessageKind::Prompt, "Fix the parser".to_string()),
+            (UserMessageKind::Steering, "turn left".to_string()),
+        ]
+    );
+}
+
+/// MC4-020: a steer accepted while the tool batch is running does not disturb
+/// the batch; the next request sees it after the whole batch finished.
+#[tokio::test]
+async fn steer_during_tool_batch_reaches_the_next_request() {
+    let gate = Arc::new(Notify::new());
+    let entered = Arc::new(Notify::new());
+    let calls_a = Arc::new(Mutex::new(Vec::new()));
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::Tools {
+            calls: vec![("echo", "call_1")],
+        }],
+    );
+    let agent = AgentLoop::start(
+        request(config_full(
+            model_a,
+            ReasoningPreference::Auto,
+            tool_set_full(
+                "echo",
+                Arc::clone(&calls_a),
+                ToolBehavior::Gate(Arc::clone(&gate)),
+                Some(Arc::clone(&entered)),
+            ),
+            None,
+            project(),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    entered.notified().await;
+    handle
+        .steer(UserInput::text("keep going").unwrap())
+        .unwrap();
+
+    gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(recorded_calls(&calls_a), ["call_1"]);
+    assert_eq!(steerings(&report), ["keep going"]);
+    let marks: Vec<&'static str> = report
+        .appended
+        .iter()
+        .map(|item| match item {
+            HistoryItem::User(user) if user.kind == UserMessageKind::Steering => "steering",
+            HistoryItem::User(_) => "prompt",
+            HistoryItem::Assistant(_) => "assistant",
+            HistoryItem::ToolResult(_) => "toolresult",
+            HistoryItem::Summary(_) => "summary",
+        })
+        .collect();
+    assert_eq!(
+        marks,
+        ["prompt", "assistant", "toolresult", "steering", "assistant"],
+        "the batch finished before the steer is applied"
+    );
+}
+
+/// MC4-021: a steer accepted while the prompt is being prepared discards the
+/// stale PreparedPrompt; the rebuilt request sees the steer at index 0.
+#[tokio::test]
+async fn steer_during_prompt_discards_the_stale_prompt() {
+    let entered = Arc::new(Notify::new());
+    let prompt_gate = Arc::new(Notify::new());
+    let prompt_calls = Arc::new(AtomicUsize::new(0));
+    let (model_a, _) = scripted_model_named("fake/a", vec![Round::Final { text: "a" }]);
+    let prompt = Arc::new(GatedPrompt {
+        entered: Arc::clone(&entered),
+        gate: Some(Arc::clone(&prompt_gate)),
+        calls: Arc::clone(&prompt_calls),
+    });
+    let mut agent = AgentLoop::start(
+        request(config_full(
+            model_a,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            prompt,
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let mut events = agent.take_events().unwrap();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    entered.notified().await;
+    handle.steer(UserInput::text("ping").unwrap()).unwrap();
+    prompt_gate.notify_waiters();
+
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(
+        report.requests, 1,
+        "the stale prompt never became a request"
+    );
+    assert_eq!(steerings(&report), ["ping"]);
+
+    let started = collect_request_starts(&mut events).await;
+    assert_eq!(
+        started,
+        vec![(
+            0,
+            ConfigRevision::INITIAL,
+            "fake/a".to_string(),
+            ReasoningPreference::Auto
+        )],
+        "the rebuilt request is still index 0 and saw the steer"
+    );
+}
+
+/// MC4-022: multiple steers apply in accept order at the next boundary.
+#[tokio::test]
+async fn multiple_steers_apply_in_accept_order() {
+    let gate = Arc::new(Notify::new());
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::GatedTools {
+            calls: vec![("echo", "call_1")],
+            gate: Arc::clone(&gate),
+        }],
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent = AgentLoop::start(
+        request(config(
+            model_a,
+            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
+            None,
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    let mut states = handle.watch_state();
+    states
+        .wait_for(|state| state.status == LoopStatus::RunningModel)
+        .await
+        .unwrap();
+    handle.steer(UserInput::text("one").unwrap()).unwrap();
+    handle.steer(UserInput::text("two").unwrap()).unwrap();
+    handle.steer(UserInput::text("three").unwrap()).unwrap();
+
+    gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(steerings(&report), ["one", "two", "three"]);
+}
+
+/// MC4-023: the steer queue is bounded; accepted steers never drop and the
+/// overflow reports QueueFull.
+#[tokio::test]
+async fn steer_queue_is_bounded_and_full_reports_queue_full() {
+    let gate = Arc::new(Notify::new());
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::GatedTools {
+            calls: vec![("echo", "call_1")],
+            gate: Arc::clone(&gate),
+        }],
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.max_pending_steers = 2;
+    let agent = AgentLoop::start(
+        request(config(
+            model_a,
+            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
+            None,
+        )),
+        options,
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    let mut states = handle.watch_state();
+    states
+        .wait_for(|state| state.status == LoopStatus::RunningModel)
+        .await
+        .unwrap();
+    handle.steer(UserInput::text("s1").unwrap()).unwrap();
+    handle.steer(UserInput::text("s2").unwrap()).unwrap();
+    assert_eq!(
+        handle.steer(UserInput::text("s3").unwrap()),
+        Err(SteerError::QueueFull)
+    );
+
+    gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(
+        steerings(&report),
+        ["s1", "s2"],
+        "accepted steers are never lost"
+    );
+}
+
+/// MC4-024: a steer accepted before the final seal keeps the loop alive and
+/// becomes the next request.
+#[tokio::test]
+async fn final_race_steer_wins_and_keeps_the_loop_alive() {
+    let gate = Arc::new(Notify::new());
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::GatedFinal {
+            text: "first",
+            gate: Arc::clone(&gate),
+        }],
+    );
+    let agent = AgentLoop::start(
+        request(config(model_a, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    let mut states = handle.watch_state();
+    states
+        .wait_for(|state| state.status == LoopStatus::RunningModel)
+        .await
+        .unwrap();
+    handle.steer(UserInput::text("hello").unwrap()).unwrap();
+
+    gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.requests, 2, "the steer kept the final loop alive");
+    assert_eq!(steerings(&report), ["hello"]);
+    let assistants = report
+        .appended
+        .iter()
+        .filter(|item| matches!(item, HistoryItem::Assistant(_)))
+        .count();
+    assert_eq!(assistants, 2);
+}
+
+/// MC4-025: once the seal wins, steering a completed loop is NotActive and no
+/// steer enters the report.
+#[tokio::test]
+async fn final_race_seal_wins_returns_not_active() {
+    let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(steerings(&report), Vec::<String>::new());
+
+    let error = handle
+        .steer(UserInput::text("late").unwrap())
+        .expect_err("steer after seal must fail");
+    assert_eq!(error, SteerError::NotActive);
+}
+
+/// MC4-026: steering while an interaction is pending is rejected as
+/// WaitingForInput and accepted again once the interaction resolves.
+#[tokio::test]
+async fn steer_is_rejected_while_waiting_for_interaction() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (model, _) = scripted_model(vec![Round::Tools {
+        calls: vec![("echo", "call_1")],
+    }]);
+    let policy = Arc::new(ScriptedPolicy {
+        plan: Arc::new(vec![PolicyPlan::RequireApproval]),
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let agent = AgentLoop::start(
+        request(config(
+            model,
+            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
+            Some(policy),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    let mut states = handle.watch_state();
+    states
+        .wait_for(|state| state.pending_interaction.is_some())
+        .await
+        .unwrap();
+    assert_eq!(
+        handle.steer(UserInput::text("nudge").unwrap()),
+        Err(SteerError::WaitingForInput)
+    );
+
+    let pending = states.borrow().pending_interaction.clone().unwrap();
+    handle
+        .answer(
+            pending.interaction_id,
+            InteractionAnswer::Approval(ApprovalDecision::AllowOnce),
+        )
+        .unwrap();
+    handle
+        .steer(UserInput::text("after answer").unwrap())
+        .unwrap();
+
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(steerings(&report), ["after answer"]);
+}
+
+/// Update and steer accepted before one boundary combine on the next request:
+/// the new config serves it and the steer appears in its history.
+#[tokio::test]
+async fn update_and_steer_combine_on_the_next_request() {
+    let gate = Arc::new(Notify::new());
+    let (model_a, _) = scripted_model_named(
+        "fake/a",
+        vec![Round::GatedTools {
+            calls: vec![("echo", "call_1")],
+            gate: Arc::clone(&gate),
+        }],
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "from b" }]);
+    let mut agent = AgentLoop::start(
+        request(config(
+            model_a,
+            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
+            None,
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let mut events = agent.take_events().unwrap();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    let mut states = handle.watch_state();
+    states
+        .wait_for(|state| state.status == LoopStatus::RunningModel)
+        .await
+        .unwrap();
+    let revision = handle
+        .update(config_full(
+            model_b,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            project(),
+        ))
+        .unwrap();
+    assert_eq!(revision, ConfigRevision::new(1));
+    handle
+        .steer(UserInput::text("next topic").unwrap())
+        .unwrap();
+
+    gate.notify_waiters();
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.final_config_revision, ConfigRevision::new(1));
+    assert_eq!(steerings(&report), ["next topic"]);
+    assert_eq!(model_names(&report), ["fake/a", "fake/b"]);
+
+    let started = collect_request_starts(&mut events).await;
+    assert_eq!(
+        started,
+        vec![
+            (
+                0,
+                ConfigRevision::INITIAL,
+                "fake/a".to_string(),
+                ReasoningPreference::Auto
+            ),
+            (
+                1,
+                ConfigRevision::new(1),
+                "fake/b".to_string(),
+                ReasoningPreference::Auto
+            ),
+        ]
+    );
+}
+
+/// A steer accepted but never applied before cancellation must not enter the
+/// report.
+#[tokio::test]
+async fn steer_accepted_but_cancelled_before_application_stays_out_of_report() {
+    let (model_a, _) = scripted_model_named("fake/a", vec![Round::Hold]);
+    let agent = AgentLoop::start(
+        request(config(model_a, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let report_task = tokio::spawn(async move { agent.join().await });
+
+    let mut states = handle.watch_state();
+    states
+        .wait_for(|state| state.status == LoopStatus::RunningModel)
+        .await
+        .unwrap();
+    handle.steer(UserInput::text("lost").unwrap()).unwrap();
+    handle.cancel();
+
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Cancelled(CancelReason::User));
+    assert_eq!(
+        steerings(&report),
+        Vec::<String>::new(),
+        "an unapplied steer must never reach the report"
+    );
 }

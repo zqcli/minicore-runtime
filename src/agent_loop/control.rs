@@ -1,16 +1,20 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::UserInput;
 use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::ids::{InteractionId, LoopId};
 use crate::interaction::InteractionAnswer;
 use crate::limits::LoopLimits;
 
 use super::event::EventSinkError;
-use super::{AnswerError, CancelReason, LoopReport, LoopState, LoopStatus, UpdateError};
+use super::{
+    AnswerError, CancelReason, LoopReport, LoopState, LoopStatus, SteerError, UpdateError,
+};
 
 /// Single linearizable state machine for cancelling and sealing a loop.
 ///
@@ -36,6 +40,24 @@ pub(crate) enum FinishSeal {
     AlreadyFinished,
 }
 
+/// Everything a request boundary consumes in one atomic take: the latest
+/// config candidate (if any) plus every accepted steer in order.
+#[derive(Default)]
+pub(crate) struct BoundaryChanges {
+    pub(crate) config: Option<(ConfigRevision, Arc<ExecutionConfig>)>,
+    pub(crate) steers: Vec<UserInput>,
+}
+
+/// Outcome of the final-seal gate: whether the runner keeps the loop alive
+/// for pending steers or closes accepting and seals.
+pub(crate) enum FinalGate {
+    /// A steer was accepted before the seal; its changes feed the next
+    /// request and accepting stays open.
+    Continue(BoundaryChanges),
+    /// No steer is pending; accepting closes and the loop seals.
+    Seal,
+}
+
 /// Shared control plane for one agent loop.
 ///
 /// The runner task owns `LoopControl` alongside its single task plus the final
@@ -47,6 +69,7 @@ pub(crate) struct LoopControl {
     pub(crate) id: LoopId,
     pub(crate) cancel: CancellationToken,
     limits: LoopLimits,
+    max_pending_steers: usize,
 
     state_tx: watch::Sender<LoopState>,
     /// Seed receiver shared by all waiters. The sender is owned by the runner
@@ -59,8 +82,8 @@ pub(crate) struct LoopControl {
 
 struct ControlState {
     interaction: Option<InteractionSlot>,
-    /// False once the final seal closes: update (and, in Phase 4, steer and
-    /// seal races) linearize on this mutex through this flag.
+    /// False once the final seal closes: update, steer, and the seal races all
+    /// linearize on this mutex through this flag.
     accepting_updates: bool,
     /// Revision of the config the runner has actually applied.
     current_revision: ConfigRevision,
@@ -68,6 +91,8 @@ struct ControlState {
     next_revision: ConfigRevision,
     /// Latest accepted config, applied at the next request boundary.
     pending_config: Option<PendingConfig>,
+    /// Accepted steers awaiting the next request boundary, in accept order.
+    pending_steers: VecDeque<UserInput>,
 }
 
 /// Latest accepted config waiting for the next request boundary.
@@ -114,7 +139,12 @@ pub(crate) type ControlParts = Result<
 >;
 
 impl LoopControl {
-    pub(crate) fn new(id: LoopId, event_capacity: usize, limits: LoopLimits) -> ControlParts {
+    pub(crate) fn new(
+        id: LoopId,
+        event_capacity: usize,
+        limits: LoopLimits,
+        max_pending_steers: usize,
+    ) -> ControlParts {
         let initial = LoopState::new(
             id,
             LoopStatus::Starting,
@@ -129,6 +159,7 @@ impl LoopControl {
                 id,
                 cancel: CancellationToken::new(),
                 limits,
+                max_pending_steers,
                 state_tx,
                 completion_rx,
                 state: AtomicU8::new(STATE_NONE),
@@ -138,6 +169,7 @@ impl LoopControl {
                     current_revision: ConfigRevision::INITIAL,
                     next_revision: ConfigRevision::INITIAL.next(),
                     pending_config: None,
+                    pending_steers: VecDeque::new(),
                 }),
             },
             sink,
@@ -193,16 +225,66 @@ impl LoopControl {
         Ok(revision)
     }
 
-    /// Runner-side take of the latest accepted config at a request boundary.
-    /// Linearizes with `update` and the final seal on the same mutex. Taking
-    /// a config is only a *candidate*: the revision is not recorded until the
-    /// runner commits it right before a real Model Request goes out, so a
-    /// taken config whose preparation fails never counts as applied.
-    pub(crate) fn take_pending_config(&self) -> Option<(ConfigRevision, Arc<ExecutionConfig>)> {
-        lock_control(&self.inner)
-            .pending_config
-            .take()
-            .map(|pending| (pending.revision, pending.config))
+    /// Accepts a steer for the next request boundary. The input length is
+    /// checked against the loop's `max_user_input_bytes` *before* the lock;
+    /// an oversized steer fails without touching the queue. Acceptance
+    /// linearizes with the final seal, the interaction slot, and every other
+    /// steer on the same mutex.
+    pub(crate) fn steer(&self, input: UserInput) -> Result<(), SteerError> {
+        let input_bytes = input.as_text().len();
+        if input_bytes == 0 || input_bytes > self.limits.max_user_input_bytes {
+            return Err(SteerError::InvalidInput);
+        }
+        let mut guard = lock_control(&self.inner);
+        if !guard.accepting_updates {
+            return Err(SteerError::NotActive);
+        }
+        if guard.interaction.is_some() {
+            return Err(SteerError::WaitingForInput);
+        }
+        if guard.pending_steers.len() >= self.max_pending_steers {
+            return Err(SteerError::QueueFull);
+        }
+        guard.pending_steers.push_back(input);
+        Ok(())
+    }
+
+    /// Runner-side take of everything queued for the next request boundary:
+    /// the latest config candidate plus every accepted steer in accept order,
+    /// atomically. Linearizes with `update`/`steer` and the final seal on the
+    /// same mutex. Taking a config is only a *candidate*: the revision is not
+    /// recorded until the runner commits it right before a real Model Request
+    /// goes out, so a taken config whose preparation fails never counts as
+    /// applied.
+    pub(crate) fn take_boundary(&self) -> BoundaryChanges {
+        let mut guard = lock_control(&self.inner);
+        BoundaryChanges {
+            config: guard
+                .pending_config
+                .take()
+                .map(|pending| (pending.revision, pending.config)),
+            steers: guard.pending_steers.drain(..).collect(),
+        }
+    }
+
+    /// Final-seal gate, linearized with steer/update on the same mutex as the
+    /// seal decision. A steer accepted before the seal keeps accepting open
+    /// and returns its boundary changes so the loop continues; otherwise
+    /// accepting closes and the caller seals normally. A pending config alone
+    /// never extends a final.
+    pub(crate) fn begin_final(&self) -> FinalGate {
+        let mut guard = lock_control(&self.inner);
+        if guard.pending_steers.is_empty() {
+            guard.accepting_updates = false;
+            return FinalGate::Seal;
+        }
+        FinalGate::Continue(BoundaryChanges {
+            config: guard
+                .pending_config
+                .take()
+                .map(|pending| (pending.revision, pending.config)),
+            steers: guard.pending_steers.drain(..).collect(),
+        })
     }
 
     /// Records `revision` as the last actually issued/applied config revision.

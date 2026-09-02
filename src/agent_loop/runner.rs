@@ -34,7 +34,7 @@ use crate::tools::{
 use crate::value::BoundedText;
 
 use super::control::FinishSeal;
-use super::control::{InteractionSlot, LoopControl};
+use super::control::{BoundaryChanges, FinalGate, InteractionSlot, LoopControl};
 
 use crate::history::{AssistantHistory, ToolResultHistory, UserHistory, UserMessageKind};
 use crate::model::{ModelDriverProgress, ToolCall};
@@ -61,6 +61,29 @@ struct LoopCtx<'a> {
 impl LoopCtx<'_> {
     fn publish(&mut self, state: LoopState) {
         publish(self.control, &mut *self.sink, state);
+    }
+}
+
+/// Applies one boundary take to the runner: the config candidate becomes the
+/// working (still uncommitted) snapshot, and every accepted steer is appended
+/// to the working history in order as a `Steering` user item.
+fn apply_boundary(
+    ctx: &mut LoopCtx<'_>,
+    working: &mut WorkingHistory,
+    current_config: &mut Arc<ExecutionConfig>,
+    candidate_revision: &mut Option<ConfigRevision>,
+    changes: BoundaryChanges,
+) {
+    if let Some((revision, config)) = changes.config {
+        *current_config = config;
+        *candidate_revision = Some(revision);
+    }
+    for steer in changes.steers {
+        working.append_user(UserHistory {
+            loop_id: ctx.id,
+            kind: UserMessageKind::Steering,
+            input: steer,
+        });
     }
 }
 
@@ -145,15 +168,19 @@ async fn run_loop_inner(
             break FailPath::Deadline;
         }
 
-        // A. Pull the latest config accepted since the last boundary into the
-        // working slot. It is a *candidate* until the issue boundary: the
-        // snapshot below is pinned for the whole request (model call and its
-        // tool batch), but the revision is only recorded once a Model Request
-        // really goes out.
-        if let Some((revision, config)) = ctx.control.take_pending_config() {
-            current_config = config;
-            candidate_revision = Some(revision);
-        }
+        // A. Atomically pull the latest config candidate plus every accepted
+        // steer and apply them as the basis for this request attempt. The
+        // config is still only a *candidate*: its revision is recorded once a
+        // Model Request really goes out. The snapshot below is pinned for the
+        // whole request (model call and its tool batch).
+        let changes = ctx.control.take_boundary();
+        apply_boundary(
+            &mut ctx,
+            &mut working,
+            &mut current_config,
+            &mut candidate_revision,
+            changes,
+        );
 
         let snapshot = Arc::clone(&current_config);
         let messages = match prepare_prompt(
@@ -170,14 +197,20 @@ async fn run_loop_inner(
             PromptPrep::End(path) => break path,
         };
 
-        // F. A newer update may have landed while the prompt was being
+        // F. Newer config/steers may have landed while the prompt was being
         // prepared. Discard the stale prompt and rebuild with the latest
-        // config: request_index does not advance, no model request is ever
+        // changes: request_index does not advance, no model request is ever
         // issued for the stale snapshot, and the candidate revision keeps the
         // latest value (spec 15.1).
-        if let Some((revision, config)) = ctx.control.take_pending_config() {
-            current_config = config;
-            candidate_revision = Some(revision);
+        let changes = ctx.control.take_boundary();
+        if changes.config.is_some() || !changes.steers.is_empty() {
+            apply_boundary(
+                &mut ctx,
+                &mut working,
+                &mut current_config,
+                &mut candidate_revision,
+                changes,
+            );
             continue;
         }
 
@@ -246,7 +279,7 @@ async fn run_loop_inner(
             .filter_map(|part| part.as_tool_call())
             .collect();
         if tool_calls.is_empty() {
-            break match response.finish_reason() {
+            let path = match response.finish_reason() {
                 ModelFinishReason::Stop => FailPath::Completed,
                 ModelFinishReason::Length => FailPath::OutputLimit,
                 ModelFinishReason::ContentFiltered => FailPath::ContentFiltered,
@@ -255,6 +288,28 @@ async fn run_loop_inner(
                     FailPath::InvalidModelResponse
                 }
             };
+            if path == FailPath::Completed {
+                // Final-seal race (spec 20.6): steer/update and this seal
+                // decision linearize on the same mutex. A steer accepted
+                // before the seal keeps the loop alive and feeds the next
+                // request; otherwise accepting closes and the loop ends
+                // normally. A pending config alone never extends a final.
+                match ctx.control.begin_final() {
+                    FinalGate::Continue(changes) => {
+                        apply_boundary(
+                            &mut ctx,
+                            &mut working,
+                            &mut current_config,
+                            &mut candidate_revision,
+                            changes,
+                        );
+                        request_index = request_index.saturating_add(1);
+                        continue;
+                    }
+                    FinalGate::Seal => break FailPath::Completed,
+                }
+            }
+            break path;
         }
         if tool_rounds >= options.max_tool_rounds {
             for call in &tool_calls {
