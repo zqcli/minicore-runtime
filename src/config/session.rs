@@ -84,7 +84,8 @@ impl<'de> Deserialize<'de> for SessionManifest {
 ///
 /// Constructors enforce absolute structural bounds (`BoundedText::MAX_BYTES` and non-empty text).
 /// Runtime instance limits are enforced when submitting a turn via `SessionHandle::submit`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UserInput {
     Text(BoundedText),
 }

@@ -213,6 +213,7 @@ runtime_id!(SessionId, "ses_");
 runtime_id!(SessionInstanceId, "ins_");
 runtime_id!(TurnId, "trn_");
 runtime_id!(InteractionId, "int_");
+runtime_id!(LoopId, "lup_");
 
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ToolCallId(Box<str>);
