@@ -203,6 +203,8 @@ fn tool_spec_and_output_use_checked_bounded_content() {
     );
     assert!(!format!("{output:?}").contains("safe output"));
     assert!(serde_json::from_value::<ToolOutput>(json!({"is_error": false})).is_err());
+    assert!(ToolOutput::new("bad\0value").is_err());
+    assert!(serde_json::from_str::<ToolOutput>(r#"{"content":"bad\u0000value"}"#).is_err());
 }
 
 #[test]
