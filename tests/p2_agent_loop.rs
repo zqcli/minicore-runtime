@@ -28,7 +28,7 @@ use minicore_runtime::tools::{
     ApprovalDecision, ApprovalRequest, ApprovalRisk, Tool, ToolContext, ToolDecision, ToolError,
     ToolExecutionOutcome, ToolFuture, ToolInputAnswer, ToolInputAnswerKind, ToolInputRequest,
     ToolInvocation, ToolOutput, ToolPolicy, ToolPolicyError, ToolPolicyFuture, ToolPolicyRequest,
-    ToolResultOutcome, ToolSet, ToolSpec,
+    ToolProgress, ToolResultOutcome, ToolSet, ToolSpec,
 };
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{
@@ -109,6 +109,10 @@ enum Round {
         text: &'static str,
         gate: Arc<Notify>,
     },
+    BurstDeltas {
+        count: usize,
+        chunk: &'static str,
+    },
     Hold,
     Error(ModelError),
     StreamError {
@@ -175,6 +179,18 @@ fn round_stream(round: Round) -> ModelStream {
             ],
             gate,
         ),
+        Round::BurstDeltas { count, chunk } => {
+            let mut events = Vec::with_capacity(count + 1);
+            for _ in 0..count {
+                events.push(ModelEvent::text_delta(chunk).unwrap());
+            }
+            events.push(ModelEvent::Finish {
+                reason: ModelFinishReason::Stop,
+            });
+            Box::pin(futures_util::stream::iter(
+                events.into_iter().map(Ok::<_, ModelError>),
+            ))
+        }
         Round::StreamError { events, error } => {
             let items: Vec<Result<ModelEvent, ModelError>> = events
                 .into_iter()
@@ -250,6 +266,12 @@ enum ToolBehavior {
     RequestInput,
     RequestChoiceInput,
     RequestInvalidInput(ToolInputRequest),
+    ProgressBurst(usize),
+    GatedProgressBurst {
+        count: usize,
+        entered: Arc<Notify>,
+        gate: Arc<Notify>,
+    },
 }
 
 struct RecordingTool {
@@ -311,6 +333,36 @@ impl Tool for RecordingTool {
                 }
                 ToolBehavior::RequestInvalidInput(request) => {
                     Ok(ToolExecutionOutcome::RequestInput(request))
+                }
+                ToolBehavior::ProgressBurst(count) => {
+                    for i in 0..count {
+                        let msg = BoundedText::new(format!("progress-{i}")).unwrap();
+                        let _ = context.progress.emit(
+                            ToolProgress::new(Some(msg), Some(i as u64), Some(count as u64))
+                                .unwrap(),
+                        );
+                    }
+                    Ok(ToolExecutionOutcome::Completed(
+                        ToolOutput::new("burst completed").unwrap(),
+                    ))
+                }
+                ToolBehavior::GatedProgressBurst {
+                    count,
+                    entered,
+                    gate,
+                } => {
+                    for i in 0..count {
+                        let msg = BoundedText::new(format!("progress-{i}")).unwrap();
+                        let _ = context.progress.emit(
+                            ToolProgress::new(Some(msg), Some(i as u64), Some(count as u64))
+                                .unwrap(),
+                        );
+                    }
+                    entered.notify_one();
+                    gate.notified().await;
+                    Ok(ToolExecutionOutcome::Completed(
+                        ToolOutput::new("gated burst completed").unwrap(),
+                    ))
                 }
                 ToolBehavior::Hold => {
                     context.cancellation.cancelled().await;
@@ -5129,4 +5181,279 @@ async fn prompt_failure_emits_no_request_started_and_counts_zero_requests() {
         !request_started_emitted,
         "prompt failure must never emit RequestStarted event"
     );
+}
+
+/// FIX-04-T01: Model burst drops progress internally; delivered TextDelta plus dropped_before sum must equal 100.
+#[tokio::test]
+async fn model_burst_progress_drops_are_recorded_in_dropped_before() {
+    let (model, _) = scripted_model(vec![Round::BurstDeltas {
+        count: 100,
+        chunk: "x",
+    }]);
+
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.event_capacity = 256;
+
+    let mut agent =
+        AgentLoop::start(request(config(model, ToolSet::default(), None)), options).unwrap();
+    let mut events = agent.take_events().unwrap();
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+
+    let mut delivered_deltas = 0;
+    let mut dropped_before_sum = 0;
+    while let Some(envelope) = events.recv().await {
+        dropped_before_sum += envelope.dropped_before;
+        if matches!(
+            envelope.event,
+            LoopEvent::OutputDelta {
+                channel: minicore_runtime::OutputChannel::Text,
+                ..
+            }
+        ) {
+            delivered_deltas += 1;
+        }
+    }
+
+    assert_eq!(
+        delivered_deltas + dropped_before_sum,
+        100,
+        "delivered text deltas ({delivered_deltas}) + dropped_before sum ({dropped_before_sum}) must equal total generated deltas (100)"
+    );
+
+    let assistant = report
+        .appended
+        .iter()
+        .find_map(|item| match item {
+            HistoryItem::Assistant(a) => Some(a),
+            _ => None,
+        })
+        .expect("expected assistant history");
+    let full_text: String = assistant
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            minicore_runtime::model::AssistantPart::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(full_text, "x".repeat(100));
+}
+
+/// FIX-04-T02: Tool burst drops progress internally; delivered ToolProgress plus dropped_before sum must equal 100.
+#[tokio::test]
+async fn tool_burst_progress_drops_are_recorded_in_dropped_before() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (model, _) = scripted_model(vec![
+        Round::Tools {
+            calls: vec![("echo", "call_1")],
+        },
+        Round::Final { text: "done" },
+    ]);
+
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.event_capacity = 256;
+
+    let mut agent = AgentLoop::start(
+        request(config(
+            model,
+            tool_set(Arc::clone(&calls), ToolBehavior::ProgressBurst(100)),
+            None,
+        )),
+        options,
+    )
+    .unwrap();
+    let mut events = agent.take_events().unwrap();
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.requests, 2);
+    assert_eq!(report.tool_rounds, 1);
+
+    let mut delivered_progress = 0;
+    let mut dropped_before_sum = 0;
+    while let Some(envelope) = events.recv().await {
+        dropped_before_sum += envelope.dropped_before;
+        if matches!(envelope.event, LoopEvent::ToolProgress { .. }) {
+            delivered_progress += 1;
+        }
+    }
+
+    assert_eq!(
+        delivered_progress + dropped_before_sum,
+        100,
+        "delivered tool progresses ({delivered_progress}) + dropped_before sum ({dropped_before_sum}) must equal total generated progresses (100)"
+    );
+
+    let tool_result = report
+        .appended
+        .iter()
+        .find_map(|item| match item {
+            HistoryItem::ToolResult(r) => Some(r),
+            _ => None,
+        })
+        .expect("expected tool result history");
+    assert_eq!(tool_result.outcome, ToolResultOutcome::Success);
+    assert_eq!(tool_result.output.content().as_str(), "burst completed");
+}
+
+/// FIX-04-T03: Simultaneous internal and external progress queue overflow completes deterministically with dropped_before > 0.
+#[tokio::test]
+async fn both_inner_and_outer_queues_overflow_reports_dropped_before() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new(Notify::new());
+    let gate = Arc::new(Notify::new());
+
+    let (model, _) = scripted_model(vec![
+        Round::Tools {
+            calls: vec![("echo", "call_1")],
+        },
+        Round::Final { text: "done" },
+    ]);
+
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.event_capacity = 1;
+
+    let mut agent = AgentLoop::start(
+        request(config(
+            model,
+            tool_set(
+                Arc::clone(&calls),
+                ToolBehavior::GatedProgressBurst {
+                    count: 100,
+                    entered: Arc::clone(&entered),
+                    gate: Arc::clone(&gate),
+                },
+            ),
+            None,
+        )),
+        options,
+    )
+    .unwrap();
+
+    let mut events = agent.take_events().unwrap();
+
+    // 1. Wait until the tool has emitted all 100 progress updates and paused at gate.
+    entered.notified().await;
+
+    // 2. Consume at least one event so the outer channel has capacity to accept subsequent events.
+    let first = events
+        .recv()
+        .await
+        .expect("at least one event must be available");
+
+    // 3. Release the tool to complete.
+    gate.notify_one();
+
+    // 4. The loop must complete without blocking or deadlocks.
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+
+    let tool_result = report
+        .appended
+        .iter()
+        .find_map(|item| match item {
+            HistoryItem::ToolResult(r) => Some(r),
+            _ => None,
+        })
+        .expect("expected tool result history");
+    assert_eq!(tool_result.outcome, ToolResultOutcome::Success);
+    assert_eq!(
+        tool_result.output.content().as_str(),
+        "gated burst completed"
+    );
+
+    // 5. Accumulate dropped_before across all delivered envelopes.
+    let mut total_dropped = first.dropped_before;
+    while let Some(envelope) = events.recv().await {
+        total_dropped += envelope.dropped_before;
+    }
+
+    assert!(
+        total_dropped > 0,
+        "dropped_before must be greater than zero when both queues overflow (got {total_dropped})"
+    );
+}
+
+/// FIX-04-T04: Dropping the event receiver during model burst emissions allows loop to complete.
+#[tokio::test]
+async fn receiver_dropped_during_model_burst_allows_loop_to_complete() {
+    let (model, _) = scripted_model(vec![Round::BurstDeltas {
+        count: 100,
+        chunk: "z",
+    }]);
+
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.event_capacity = 256;
+
+    let mut agent =
+        AgentLoop::start(request(config(model, ToolSet::default(), None)), options).unwrap();
+
+    let events = agent.take_events().unwrap();
+    drop(events);
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+
+    let assistant = report
+        .appended
+        .iter()
+        .find_map(|item| match item {
+            HistoryItem::Assistant(a) => Some(a),
+            _ => None,
+        })
+        .expect("expected assistant history");
+    let full_text: String = assistant
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            minicore_runtime::model::AssistantPart::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(full_text, "z".repeat(100));
+}
+
+/// FIX-04-T05: Dropping the event receiver during tool burst emissions allows loop to complete with full results.
+#[tokio::test]
+async fn receiver_dropped_during_tool_burst_allows_loop_to_complete() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (model, _) = scripted_model(vec![
+        Round::Tools {
+            calls: vec![("echo", "call_1")],
+        },
+        Round::Final { text: "done" },
+    ]);
+
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.event_capacity = 256;
+
+    let mut agent = AgentLoop::start(
+        request(config(
+            model,
+            tool_set(Arc::clone(&calls), ToolBehavior::ProgressBurst(100)),
+            None,
+        )),
+        options,
+    )
+    .unwrap();
+
+    let events = agent.take_events().unwrap();
+    drop(events);
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.requests, 2);
+    assert_eq!(report.tool_rounds, 1);
+    let tool_result = report
+        .appended
+        .iter()
+        .find_map(|item| match item {
+            HistoryItem::ToolResult(r) => Some(r),
+            _ => None,
+        })
+        .expect("expected tool result history");
+    assert_eq!(tool_result.outcome, ToolResultOutcome::Success);
+    assert_eq!(tool_result.output.content().as_str(), "burst completed");
 }

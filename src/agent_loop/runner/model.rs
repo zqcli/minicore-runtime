@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use tokio::sync::mpsc;
@@ -128,8 +129,9 @@ pub(super) async fn run_model(
 
     let context = ModelCallContext::new(ctx.id, request_index, cancellation.clone(), turn_deadline);
 
+    let progress_dropped = AtomicU64::new(0);
     let (progress_tx, mut progress_rx) = mpsc::channel(MODEL_PROGRESS_CAPACITY);
-    let run = driver.run_detailed(request, context, &progress_tx);
+    let run = driver.run_detailed(request, context, &progress_tx, &progress_dropped);
     tokio::pin!(run);
     let result = loop {
         tokio::select! {
@@ -137,6 +139,8 @@ pub(super) async fn run_model(
             result = &mut run => break result,
             value = progress_rx.recv() => match value {
                 Some(ModelDriverProgress::TextDelta(delta)) => {
+                    ctx.sink
+                        .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
                     ctx.sink.try_emit(LoopEvent::OutputDelta {
                         loop_id: ctx.id,
                         request_index,
@@ -145,6 +149,8 @@ pub(super) async fn run_model(
                     });
                 }
                 Some(ModelDriverProgress::ReasoningDelta(delta)) => {
+                    ctx.sink
+                        .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
                     ctx.sink.try_emit(LoopEvent::OutputDelta {
                         loop_id: ctx.id,
                         request_index,
@@ -156,7 +162,11 @@ pub(super) async fn run_model(
             },
         }
     };
+    ctx.sink
+        .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
     while let Ok(value) = progress_rx.try_recv() {
+        ctx.sink
+            .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
         ctx.sink.try_emit(match value {
             ModelDriverProgress::TextDelta(delta) => LoopEvent::OutputDelta {
                 loop_id: ctx.id,

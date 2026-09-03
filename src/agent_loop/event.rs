@@ -153,6 +153,10 @@ impl LoopEventSink {
         ))
     }
 
+    pub(crate) fn record_dropped(&mut self, count: u64) {
+        self.dropped = self.dropped.saturating_add(count);
+    }
+
     pub(crate) fn try_emit(&mut self, event: LoopEvent) {
         if self.closed {
             return;
