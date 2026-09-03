@@ -51,10 +51,14 @@ The runner loops:
 
 ## Steering
 
-- `LoopHandle::steer(UserInput) -> Result<(), SteerError>`. Accepted steers
-  queue up to `max_pending_steers` (`QueueFull`), are rejected once the loop
-  has finalized (`NotActive`), and are applied as `Steering` user items at
-  the **next model request**.
+- `LoopHandle::steer(UserInput) -> Result<(), SteerError>`. A successful call
+  means the steer was accepted into this process-local queue. It is applied at
+  the next request boundary. If the loop is cancelled, shut down, or the
+  process exits before that boundary, the queued steer may be discarded and
+  will not appear in `LoopReport::appended`.
+  Steers queue up to `max_pending_steers` (`QueueFull`), are rejected if an
+  interaction is pending (`WaitingForInput`), or once the loop has finalized
+  (`NotActive`), and are applied as `Steering` user items at the **next model request**.
 - A final response with pending steers keeps the loop alive and advances
   `request_index`; the steers (not the pending config) are what extend the
   final.

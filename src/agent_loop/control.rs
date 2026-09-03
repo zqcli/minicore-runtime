@@ -212,17 +212,25 @@ impl LoopControl {
         config
             .validate_against_limits(&self.limits)
             .map_err(|_| UpdateError::InvalidConfig)?;
-        let mut guard = lock_control(&self.inner);
-        if !guard.accepting_updates {
-            return Err(UpdateError::NotActive);
-        }
-        let revision = guard.next_revision;
-        guard.next_revision = revision.next();
-        guard.pending_config = Some(PendingConfig {
-            revision,
-            config: Arc::new(config),
-        });
-        Ok(revision)
+        let mut candidate = Some(Arc::new(config));
+        let mut replaced = None;
+        let revision = {
+            let mut guard = lock_control(&self.inner);
+            if !guard.accepting_updates {
+                None
+            } else {
+                let revision = guard.next_revision;
+                guard.next_revision = revision.next();
+                let config = candidate.take().expect("candidate present");
+                replaced = guard
+                    .pending_config
+                    .replace(PendingConfig { revision, config });
+                Some(revision)
+            }
+        };
+        drop(replaced);
+        drop(candidate);
+        revision.ok_or(UpdateError::NotActive)
     }
 
     /// Accepts a steer for the next request boundary. The input length is
@@ -270,21 +278,29 @@ impl LoopControl {
     /// Final-seal gate, linearized with steer/update on the same mutex as the
     /// seal decision. A steer accepted before the seal keeps accepting open
     /// and returns its boundary changes so the loop continues; otherwise
-    /// accepting closes and the caller seals normally. A pending config alone
-    /// never extends a final.
+    /// accepting closes, any pending config is discarded outside the lock,
+    /// and the caller seals normally. A pending config alone never extends a
+    /// final.
     pub(crate) fn begin_final(&self) -> FinalGate {
-        let mut guard = lock_control(&self.inner);
-        if guard.pending_steers.is_empty() {
-            guard.accepting_updates = false;
-            return FinalGate::Seal;
-        }
-        FinalGate::Continue(BoundaryChanges {
-            config: guard
-                .pending_config
-                .take()
-                .map(|pending| (pending.revision, pending.config)),
-            steers: guard.pending_steers.drain(..).collect(),
-        })
+        let (gate, discarded) = {
+            let mut guard = lock_control(&self.inner);
+            if guard.pending_steers.is_empty() {
+                guard.accepting_updates = false;
+                let discarded = guard.pending_config.take();
+                (FinalGate::Seal, discarded)
+            } else {
+                let changes = BoundaryChanges {
+                    config: guard
+                        .pending_config
+                        .take()
+                        .map(|pending| (pending.revision, pending.config)),
+                    steers: guard.pending_steers.drain(..).collect(),
+                };
+                (FinalGate::Continue(changes), None)
+            }
+        };
+        drop(discarded);
+        gate
     }
 
     /// Records `revision` as the last actually issued/applied config revision.
@@ -315,31 +331,37 @@ impl LoopControl {
     /// Exactly-once completion seal. One winner flips the shared state to
     /// `FINISHED`; every later call returns `AlreadyFinished`. The state
     /// transition and `accepting_updates = false` happen in the same mutex
-    /// critical section, so `update` either lands entirely before the seal
+    /// critical section, taking any pending config which is then dropped
+    /// outside the lock, so `update` either lands entirely before the seal
     /// (it wins) or observes `NotActive` after it.
     pub(crate) fn finish_once(&self) -> FinishSeal {
-        let mut guard = lock_control(&self.inner);
-        let finish = match self.state.compare_exchange(
-            STATE_NONE,
-            STATE_FINISHED,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) => FinishSeal::Clean,
-            Err(STATE_NONE) => unreachable!("compare_exchange never reports its own value"),
-            Err(cancel @ (STATE_CANCEL_USER..=STATE_CANCEL_DEADLINE)) => {
-                let _ = self.state.compare_exchange(
-                    cancel,
-                    STATE_FINISHED,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                );
-                FinishSeal::CancelledPrior(cancel_reason_value(cancel))
-            }
-            Err(STATE_FINISHED) => FinishSeal::AlreadyFinished,
-            Err(_) => unreachable!("unknown loop state value"),
+        let (finish, discarded) = {
+            let mut guard = lock_control(&self.inner);
+            let finish = match self.state.compare_exchange(
+                STATE_NONE,
+                STATE_FINISHED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => FinishSeal::Clean,
+                Err(STATE_NONE) => unreachable!("compare_exchange never reports its own value"),
+                Err(cancel @ (STATE_CANCEL_USER..=STATE_CANCEL_DEADLINE)) => {
+                    let _ = self.state.compare_exchange(
+                        cancel,
+                        STATE_FINISHED,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                    FinishSeal::CancelledPrior(cancel_reason_value(cancel))
+                }
+                Err(STATE_FINISHED) => FinishSeal::AlreadyFinished,
+                Err(_) => unreachable!("unknown loop state value"),
+            };
+            guard.accepting_updates = false;
+            let discarded = guard.pending_config.take();
+            (finish, discarded)
         };
-        guard.accepting_updates = false;
+        drop(discarded);
         finish
     }
 
@@ -434,7 +456,8 @@ pub(crate) enum InteractionStateError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Weak};
 
     use crate::agent_loop::control::{FinalGate, FinishSeal, LoopControl};
     use crate::agent_loop::{CancelReason, SteerError, UpdateError};
@@ -445,6 +468,7 @@ mod tests {
         Model, ModelCallContext, ModelDescriptor, ModelRef, ModelRequest, ModelStartFuture,
         ModelStream, ReasoningPreference,
     };
+    use crate::prompt::{DefaultPromptProvider, PromptFuture, PromptProvider, PromptRequest};
     use crate::tools::ToolSet;
 
     struct NoopModel {
@@ -569,5 +593,138 @@ mod tests {
         assert_eq!(control.applied_revision(), ConfigRevision::INITIAL);
         control.commit_revision(revision);
         assert_eq!(control.applied_revision(), revision);
+    }
+
+    #[derive(Clone)]
+    struct ProbeTracker {
+        dropped: Arc<AtomicBool>,
+        mutex_available_on_drop: Arc<AtomicBool>,
+    }
+
+    impl ProbeTracker {
+        fn new() -> Self {
+            Self {
+                dropped: Arc::new(AtomicBool::new(false)),
+                mutex_available_on_drop: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn is_dropped(&self) -> bool {
+            self.dropped.load(Ordering::SeqCst)
+        }
+
+        fn was_unlocked(&self) -> bool {
+            self.mutex_available_on_drop.load(Ordering::SeqCst)
+        }
+    }
+
+    struct ProbePromptProvider {
+        control: Weak<LoopControl>,
+        tracker: ProbeTracker,
+        delegate: DefaultPromptProvider,
+    }
+
+    impl PromptProvider for ProbePromptProvider {
+        fn prepare<'a>(&'a self, request: PromptRequest<'a>) -> PromptFuture<'a> {
+            self.delegate.prepare(request)
+        }
+    }
+
+    impl Drop for ProbePromptProvider {
+        fn drop(&mut self) {
+            if let Some(control) = self.control.upgrade() {
+                let unlocked = control.inner.try_lock().is_ok();
+                self.tracker
+                    .mutex_available_on_drop
+                    .store(unlocked, Ordering::SeqCst);
+            }
+            self.tracker.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn probe_config(control: &Arc<LoopControl>) -> (ExecutionConfig, ProbeTracker) {
+        let tracker = ProbeTracker::new();
+        let descriptor = ModelDescriptor::new(
+            "fake/noop".parse::<ModelRef>().unwrap(),
+            8192,
+            BTreeSet::from([ReasoningPreference::Auto]),
+            false,
+        )
+        .unwrap();
+        let config = ExecutionConfig::new(
+            Arc::new(NoopModel { descriptor }),
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            Arc::new(ProbePromptProvider {
+                control: Arc::downgrade(control),
+                tracker: tracker.clone(),
+                delegate: DefaultPromptProvider::new(None),
+            }),
+        )
+        .unwrap();
+        (config, tracker)
+    }
+
+    /// FIX-08: A second update replacing an existing pending config must drop
+    /// the replaced config outside the control mutex.
+    #[test]
+    fn pending_config_drop_on_update_replace_occurs_outside_control_mutex() {
+        let control = Arc::new(control());
+        let (first_config, tracker) = probe_config(&control);
+        control.update(first_config).unwrap();
+        assert!(!tracker.is_dropped());
+
+        control.update(config()).unwrap();
+        assert!(
+            tracker.is_dropped(),
+            "replaced pending config must be dropped on second update"
+        );
+        assert!(
+            tracker.was_unlocked(),
+            "replaced pending config must be dropped outside control mutex"
+        );
+    }
+
+    /// FIX-08: begin_final sealing when no steer is pending must discard
+    /// the pending config outside the control mutex.
+    #[test]
+    fn pending_config_drop_on_begin_final_seal_occurs_outside_control_mutex() {
+        let control = Arc::new(control());
+        let (pending_config, tracker) = probe_config(&control);
+        control.update(pending_config).unwrap();
+        assert!(!tracker.is_dropped());
+
+        let gate = control.begin_final();
+        assert!(matches!(gate, FinalGate::Seal));
+        assert!(
+            tracker.is_dropped(),
+            "pending config must be discarded when begin_final seals"
+        );
+        assert!(
+            tracker.was_unlocked(),
+            "discarded pending config must be dropped outside control mutex"
+        );
+    }
+
+    /// FIX-08: finish_once must discard any pending config outside the
+    /// control mutex.
+    #[test]
+    fn pending_config_drop_on_finish_once_occurs_outside_control_mutex() {
+        let control = Arc::new(control());
+        let (pending_config, tracker) = probe_config(&control);
+        control.update(pending_config).unwrap();
+        assert!(!tracker.is_dropped());
+
+        let seal = control.finish_once();
+        assert_eq!(seal, FinishSeal::Clean);
+        assert!(
+            tracker.is_dropped(),
+            "pending config must be discarded on finish_once"
+        );
+        assert!(
+            tracker.was_unlocked(),
+            "discarded pending config must be dropped outside control mutex"
+        );
     }
 }

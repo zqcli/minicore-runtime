@@ -41,7 +41,13 @@ one loop and returns control. Concretely:
   thread. They either linearize against the runner's mutex or fail fast with
   `NotActive` / `QueueFull` / `WaitingForInput`.
 - `update` and `steer` stage for the **next model request**; the current tool
-  batch keeps the snapshot of the request that produced it.
+  batch keeps the snapshot of the request that produced it. A successful call
+  means the steer was accepted into this process-local queue and is applied at
+  the next request boundary; if the loop is cancelled, shut down, or the
+  process exits before that boundary, the queued steer may be discarded and
+  will not appear in `LoopReport::appended`. Steers are bounded by
+  `max_pending_steers` (`QueueFull`) and rejected on `WaitingForInput` or
+  `NotActive`.
 - Interactions: when the loop is waiting for user input (`WaitingForInput`),
   `handle.answer` resolves the pending interaction; loop deadline still wins
   over waiting.

@@ -14,7 +14,7 @@ An `AgentLoop` is a single, one-shot execution. The host owns everything around 
 - Tool side effects are not atomic with host logging. A tool can run successfully (with side effects) even when the host never sees the corresponding streamed event or persisted log.
 - `update` takes effect at the next model request. A config revision is committed only when a real model request is issued.
 - The current tool batch uses the snapshot of the request that produced it. A config `update` or `steer` never retroactively changes an in-flight batch.
-- `steer` takes effect at the next model request. Accepted steers are appended as `Steering` user items at the next request boundary.
+- `steer` takes effect at the next model request. A successful call means the steer was accepted into this process-local queue and is applied at the next request boundary; if the loop is cancelled, shut down, or the process exits before that boundary, the queued steer may be discarded and will not appear in `LoopReport::appended`. Steers queue up to `max_pending_steers` (`QueueFull`), are rejected if an interaction is pending (`WaitingForInput`) or after finalization (`NotActive`), and appear as `Steering` user items at the next request boundary.
 - A config `update` does not keep the loop alive. It only reconfigures the next request; whether the loop continues is decided by the model's final response and pending steers.
 - The Runtime needs a Tokio context. `AgentLoop::start` spawns its single runner task; call it from inside a Tokio runtime.
 
