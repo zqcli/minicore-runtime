@@ -119,6 +119,7 @@ async fn finish_loop_losing_the_seal_returns_the_published_arc() {
         WorkingHistory::new(Arc::from([])),
         Usage::default(),
         0,
+        None,
         0,
     );
     assert!(

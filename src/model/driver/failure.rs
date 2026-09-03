@@ -76,11 +76,11 @@ pub(crate) struct ModelDriverFailure {
 }
 
 impl ModelDriverFailure {
+    #[cfg(test)]
     pub(crate) fn error(&self) -> &ModelError {
         &self.error
     }
 
-    #[cfg(test)]
     pub(crate) fn into_error(self) -> ModelError {
         self.error
     }

@@ -176,18 +176,21 @@ pub(super) async fn run_model(
 }
 
 pub(super) fn map_model_failure(control: &LoopControl, failure: ModelDriverFailure) -> FailPath {
+    let deadline_source = failure.deadline_source();
+    let error = failure.into_error();
+
     if control.cancellation().is_cancelled() {
         return FailPath::Cancelled;
     }
-    if failure.deadline_source() == Some(DeadlineSource::Turn)
-        && failure.error().kind() == crate::model::ModelErrorKind::Timeout
+    if deadline_source == Some(DeadlineSource::Turn)
+        && error.kind() == crate::model::ModelErrorKind::Timeout
     {
         return FailPath::Deadline;
     }
-    match failure.error().kind() {
+    match error.kind() {
         crate::model::ModelErrorKind::InvalidProviderResponse
         | crate::model::ModelErrorKind::IncompleteResponse
-        | crate::model::ModelErrorKind::UnexpectedToolCall => FailPath::InvalidModelResponse,
-        _ => FailPath::Model,
+        | crate::model::ModelErrorKind::UnexpectedToolCall => FailPath::InvalidModelResponse(error),
+        _ => FailPath::Model(error),
     }
 }
