@@ -125,9 +125,24 @@ impl<'de> Deserialize<'de> for ToolSpec {
     }
 }
 
+/// A validated, bounded tool result body, safe to cross process boundaries.
+///
+/// Values must be built through [`ToolOutput::new`] (or deserialized), which
+/// enforces byte and control-character bounds. The `content` field is private
+/// so external callers cannot assemble a struct literal that bypasses that
+/// validation:
+///
+/// ```compile_fail
+/// use minicore_runtime::tools::ToolOutput;
+/// use minicore_runtime::BoundedText;
+///
+/// let _ = ToolOutput {
+///     content: BoundedText::new("bad\0value").unwrap(),
+/// };
+/// ```
 #[derive(Clone, Eq, PartialEq)]
 pub struct ToolOutput {
-    pub content: BoundedText,
+    content: BoundedText,
 }
 
 #[derive(Deserialize)]
