@@ -396,7 +396,9 @@
       "evidence": [
         "tests/p3_agent_loop_closeout.rs::missing_tool_call_terminal_is_invalid_and_not_appended",
         "tests/p3_agent_loop_closeout.rs::duplicate_tool_call_ids_are_rejected_and_not_appended",
-        "tests/p3_agent_loop_closeout.rs::partial_stream_failure_is_a_model_failure_without_an_assistant_item"
+        "tests/p3_agent_loop_closeout.rs::partial_stream_failure_is_a_model_failure_without_an_assistant_item",
+        "tests/p3_agent_loop_closeout.rs::unknown_finish_without_tool_call_fails_without_assistant_history",
+        "tests/p3_agent_loop_closeout.rs::tool_calls_finish_without_tool_call_is_invalid_and_not_appended"
       ]
     },
     {
