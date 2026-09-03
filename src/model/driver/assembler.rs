@@ -94,7 +94,7 @@ impl<'a> Assembler<'a> {
                 {
                     return Err(assembler_error(ModelErrorKind::UnexpectedToolCall));
                 }
-                if self.tools.len() >= self.limits.max_tool_count
+                if self.tools.len() >= self.limits.max_tool_calls_per_response
                     || self
                         .tools
                         .iter()

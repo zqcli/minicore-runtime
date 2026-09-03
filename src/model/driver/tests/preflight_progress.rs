@@ -116,30 +116,6 @@ async fn preflight_rejects_reasoning_tools_context_and_mutated_tool_specs_before
         ModelErrorKind::InvalidRequest
     );
     assert_eq!(model.starts(), 0);
-
-    let limits = SemanticLimits {
-        max_tool_count: 1,
-        ..SemanticLimits::default()
-    };
-    let driver = model.driver(&limits_kernel(limits));
-    let request = request_with(
-        ReasoningPreference::High,
-        vec![tool_spec("lookup"), tool_spec("search")],
-        Some(64),
-    );
-    assert_eq!(
-        driver
-            .run(
-                request,
-                context(CancellationToken::new(), Duration::from_secs(30)),
-                &progress,
-            )
-            .await
-            .unwrap_err()
-            .kind(),
-        ModelErrorKind::InvalidRequest
-    );
-    assert_eq!(model.starts(), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]

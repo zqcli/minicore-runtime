@@ -8,8 +8,7 @@ use crate::value::BoundedText;
 
 use super::super::model_port::ModelCallContext;
 use super::super::response::{DeliveryState, ModelError, ModelErrorKind, RetryHint};
-
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+use super::MAX_MODEL_RETRY_DELAY;
 
 #[derive(Clone, Copy)]
 pub(super) struct RetryPolicySnapshot {
@@ -34,11 +33,11 @@ impl RetryPolicySnapshot {
         for _ in 0..retry_index {
             exponential = exponential
                 .checked_mul(2)
-                .unwrap_or(MAX_RETRY_DELAY)
-                .min(MAX_RETRY_DELAY);
+                .unwrap_or(MAX_MODEL_RETRY_DELAY)
+                .min(MAX_MODEL_RETRY_DELAY);
         }
         match retry_after {
-            Some(value) if value > MAX_RETRY_DELAY => None,
+            Some(value) if value > MAX_MODEL_RETRY_DELAY => None,
             Some(value) => Some(value.max(exponential)),
             None => Some(exponential),
         }

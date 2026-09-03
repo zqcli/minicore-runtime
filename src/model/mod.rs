@@ -15,6 +15,7 @@ pub use types::{
 };
 
 pub(crate) use driver::{
-    ModelDriver, ModelDriverConfig, ModelDriverFailure, ModelDriverProgress, SemanticLimitsSnapshot,
+    MAX_MODEL_CALL_TIMEOUT, MAX_MODEL_RETRY_DELAY, ModelDriver, ModelDriverConfig,
+    ModelDriverFailure, ModelDriverProgress, SemanticLimitsSnapshot,
 };
 pub(crate) use types::MAX_MODEL_MESSAGE_TEXT_BYTES;
