@@ -1,5 +1,6 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::{FutureExt, StreamExt};
@@ -153,7 +154,8 @@ impl ModelDriver {
         context: ModelCallContext,
         progress: &mpsc::Sender<ModelDriverProgress>,
     ) -> Result<ModelResponse, ModelError> {
-        self.run_detailed(request, context, progress)
+        let progress_dropped = AtomicU64::new(0);
+        self.run_detailed(request, context, progress, &progress_dropped)
             .await
             .map_err(ModelDriverFailure::into_error)
     }
@@ -163,6 +165,7 @@ impl ModelDriver {
         request: ModelRequest,
         context: ModelCallContext,
         progress: &mpsc::Sender<ModelDriverProgress>,
+        progress_dropped: &AtomicU64,
     ) -> Result<ModelResponse, ModelDriverFailure> {
         let deadline =
             effective_deadline(context.deadline, self.model_call_timeout).map_err(|_| {
@@ -209,6 +212,7 @@ impl ModelDriver {
                     deadline.tokio(),
                     deadline.source(),
                     progress,
+                    progress_dropped,
                 )
                 .await
             {
@@ -271,6 +275,7 @@ impl ModelDriver {
         deadline: TokioInstant,
         deadline_source: DeadlineSource,
         progress: &mpsc::Sender<ModelDriverProgress>,
+        progress_dropped: &AtomicU64,
     ) -> Result<ModelResponse, AttemptFailure> {
         let cancellation = context.cancellation.clone();
         let start = catch_unwind(AssertUnwindSafe(|| {
@@ -344,7 +349,13 @@ impl ModelDriver {
                         .push(event)
                         .map_err(|error| AttemptFailure::new(error, assembler.observed_event))?;
                     if let Some(progress_event) = progress_event {
-                        let _ = progress.try_send(progress_event);
+                        match progress.try_send(progress_event) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                progress_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {}
+                        }
                     }
                 }
                 Ok(Some(Err(error))) => {

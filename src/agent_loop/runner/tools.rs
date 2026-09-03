@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
@@ -244,8 +245,10 @@ async fn run_tool_port(
 ) -> ToolPort {
     let call_id = invocation.tool_call_id().clone();
     let cancellation = ctx.control.cancellation();
+    let progress_dropped = Arc::new(AtomicU64::new(0));
     let (progress_tx, mut progress_rx) = mpsc::channel(TOOL_PROGRESS_CAPACITY);
 
+    let progress_dropped_clone = Arc::clone(&progress_dropped);
     let run = run_port_call(
         &cancellation,
         turn_deadline,
@@ -257,6 +260,7 @@ async fn run_tool_port(
                 progress: ToolProgressSink::from_emitter(LoopToolProgress {
                     call_id: call_id.clone(),
                     sender: progress_tx.clone(),
+                    dropped: Arc::clone(&progress_dropped_clone),
                 }),
             };
             implementation.execute(invocation.clone(), context)
@@ -269,6 +273,8 @@ async fn run_tool_port(
             result = &mut run => break result,
             value = progress_rx.recv() => match value {
                 Some((channel, progress)) => {
+                    ctx.sink
+                        .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
                     ctx.sink.try_emit(LoopEvent::ToolProgress {
                         loop_id: ctx.id,
                         request_index,
@@ -280,7 +286,11 @@ async fn run_tool_port(
             },
         }
     };
+    ctx.sink
+        .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
     while let Ok(value) = progress_rx.try_recv() {
+        ctx.sink
+            .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
         ctx.sink.try_emit(LoopEvent::ToolProgress {
             loop_id: ctx.id,
             request_index,
@@ -315,6 +325,7 @@ async fn run_tool_port(
 struct LoopToolProgress {
     call_id: ToolCallId,
     sender: mpsc::Sender<(ToolCallId, ToolProgress)>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl ToolProgressEmitter for LoopToolProgress {
@@ -322,9 +333,14 @@ impl ToolProgressEmitter for LoopToolProgress {
         if progress.validate().is_err() {
             return false;
         }
-        self.sender
-            .try_send((self.call_id.clone(), progress))
-            .is_ok()
+        match self.sender.try_send((self.call_id.clone(), progress)) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
     }
 }
 
