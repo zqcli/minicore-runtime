@@ -16,20 +16,19 @@ use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::WorkingHistory;
 use crate::ids::LoopId;
 use crate::model::{ModelFinishReason, Usage};
-use crate::tools::{EnabledTools, ToolInvocation, ToolOutput, ToolResultOutcome, ToolSet};
+use crate::tools::{EnabledTools, ToolInvocation, ToolResultOutcome, ToolSet};
 use crate::usage::UsageAccumulator;
 
 use super::control::FinishSeal;
 use super::control::{BoundaryChanges, FinalGate, LoopControl};
 
-use crate::history::{AssistantHistory, ToolResultHistory, UserHistory, UserMessageKind};
-use crate::model::ToolCall;
+use crate::history::{AssistantHistory, UserHistory, UserMessageKind};
 
 mod model;
 mod tools;
 
 use self::model::{PromptPrep, build_model_request, map_model_failure, prepare_prompt, run_model};
-use self::tools::{ToolStep, run_tool_call};
+use self::tools::{ToolStep, run_tool_call, terminal_tool_result};
 
 #[cfg(test)]
 mod tests;
@@ -303,9 +302,11 @@ async fn run_loop_inner(
                 working.append_tool_result(terminal_tool_result(
                     id,
                     request_index,
-                    call,
+                    call.tool_call_id(),
+                    call.name(),
                     ToolResultOutcome::Failed,
                     "tool round limit reached",
+                    ctx.options.limits.max_tool_output_bytes,
                 ));
             }
             break FailPath::MaxToolRounds;
@@ -329,9 +330,11 @@ async fn run_loop_inner(
                 working.append_tool_result(terminal_tool_result(
                     id,
                     request_index,
-                    call,
+                    call.tool_call_id(),
+                    call.name(),
                     ToolResultOutcome::Cancelled,
                     "tool batch interrupted",
+                    ctx.options.limits.max_tool_output_bytes,
                 ));
                 continue;
             }
@@ -340,9 +343,11 @@ async fn run_loop_inner(
                 working.append_tool_result(terminal_tool_result(
                     id,
                     request_index,
-                    call,
+                    call.tool_call_id(),
+                    call.name(),
                     ToolResultOutcome::Cancelled,
                     "tool batch interrupted",
+                    ctx.options.limits.max_tool_output_bytes,
                 ));
                 continue;
             }
@@ -350,9 +355,11 @@ async fn run_loop_inner(
                 working.append_tool_result(terminal_tool_result(
                     id,
                     request_index,
-                    call,
+                    call.tool_call_id(),
+                    call.name(),
                     ToolResultOutcome::Failed,
                     "tool unavailable",
+                    ctx.options.limits.max_tool_output_bytes,
                 ));
                 continue;
             };
@@ -366,9 +373,11 @@ async fn run_loop_inner(
                     working.append_tool_result(terminal_tool_result(
                         id,
                         request_index,
-                        call,
+                        call.tool_call_id(),
+                        call.name(),
                         ToolResultOutcome::Failed,
                         "invalid tool invocation",
+                        ctx.options.limits.max_tool_output_bytes,
                     ));
                     continue;
                 }
@@ -406,9 +415,11 @@ async fn run_loop_inner(
                     working.append_tool_result(terminal_tool_result(
                         id,
                         request_index,
-                        call,
+                        call.tool_call_id(),
+                        call.name(),
                         ToolResultOutcome::Cancelled,
                         "tool batch interrupted",
+                        ctx.options.limits.max_tool_output_bytes,
                     ));
                 }
             }
@@ -551,23 +562,6 @@ fn panic_report(
     let _ = completion_tx.send_replace(Some(Arc::clone(&report)));
     control.cancellation().cancel();
     report
-}
-
-fn terminal_tool_result(
-    id: LoopId,
-    request_index: u32,
-    call: &ToolCall,
-    outcome: ToolResultOutcome,
-    message: &str,
-) -> ToolResultHistory {
-    ToolResultHistory {
-        loop_id: id,
-        request_index,
-        call_id: call.tool_call_id().clone(),
-        tool_name: call.name().clone(),
-        outcome,
-        output: ToolOutput::new(message).expect("terminal tool message is valid text"),
-    }
 }
 
 fn turn_deadline(loop_deadline: Option<TokioInstant>) -> Instant {
