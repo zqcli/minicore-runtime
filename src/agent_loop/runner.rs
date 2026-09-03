@@ -15,7 +15,7 @@ use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::WorkingHistory;
 use crate::ids::LoopId;
-use crate::model::{ModelFinishReason, Usage};
+use crate::model::{ModelError, ModelFinishReason, Usage};
 use crate::tools::{EnabledTools, ToolInvocation, ToolResultOutcome, ToolSet};
 use crate::usage::UsageAccumulator;
 
@@ -144,6 +144,7 @@ async fn run_loop_inner(
     let mut request_index: u32 = 0;
     let mut tool_rounds: u16 = 0;
     let mut requests: u32 = 0;
+    let mut last_issued_request_index: Option<u32> = None;
     let mut usage = UsageAccumulator::default();
 
     let end = loop {
@@ -213,6 +214,9 @@ async fn run_loop_inner(
         issued_revision = revision;
         ctx.control.commit_revision(revision);
 
+        requests = requests.saturating_add(1);
+        last_issued_request_index = Some(request_index);
+
         ctx.sink.try_emit(LoopEvent::RequestStarted {
             loop_id: id,
             request_index,
@@ -257,7 +261,6 @@ async fn run_loop_inner(
             finish_reason: response.finish_reason(),
             usage: round_usage,
         });
-        requests = requests.saturating_add(1);
 
         let tool_calls: Vec<_> = response
             .parts()
@@ -271,7 +274,15 @@ async fn run_loop_inner(
                 ModelFinishReason::ContentFiltered => FailPath::ContentFiltered,
                 ModelFinishReason::Refused => FailPath::Refused,
                 ModelFinishReason::Unknown | ModelFinishReason::ToolCalls => {
-                    FailPath::InvalidModelResponse
+                    FailPath::InvalidModelResponse(ModelError::started(
+                        crate::model::ModelErrorKind::InvalidProviderResponse,
+                        DiagnosticSummary::bounded_static(
+                            DiagnosticCode::ModelMalformedResponse,
+                            DiagnosticCategory::Model,
+                            "model returned an invalid response",
+                            false,
+                        ),
+                    ))
                 }
             };
             if path == FailPath::Completed {
@@ -436,6 +447,7 @@ async fn run_loop_inner(
         working,
         usage.finish(),
         requests,
+        last_issued_request_index,
         tool_rounds,
     )
 }
@@ -446,14 +458,14 @@ fn finish_loop(
     working: WorkingHistory,
     usage: Usage,
     requests: u32,
+    last_issued_request_index: Option<u32>,
     tool_rounds: u16,
 ) -> Arc<LoopReport> {
     let id = ctx.id;
     // The revision of the config that was actually applied: a pending update
     // that never reached a request boundary does not show up here.
     let revision = ctx.control.applied_revision();
-    // The zero-based index of the last request actually issued, not the count.
-    let last_request_index = requests.saturating_sub(1);
+    let final_request_index = last_issued_request_index.unwrap_or(0);
     // Read cancellation intent before sealing: cancel_reason is only readable
     // while the shared state is still a cancel marker.
     let intended = outcome_for(ctx.control, path);
@@ -492,7 +504,7 @@ fn finish_loop(
         final_config_revision: revision,
     });
 
-    publish_final_states(ctx, id, last_request_index, revision);
+    publish_final_states(ctx, id, final_request_index, revision);
     let _ = ctx.completion_tx.send_replace(Some(Arc::clone(&report)));
     ctx.sink.try_emit(LoopEvent::Finished {
         loop_id: id,
@@ -587,18 +599,10 @@ fn outcome_for(control: &LoopControl, path: FailPath) -> LoopOutcome {
             DiagnosticCategory::Context,
             "prompt preparation failed",
         )),
-        FailPath::Model => LoopOutcome::Failed(failure(
-            LoopFailureKind::Model,
-            DiagnosticCode::ModelUnavailable,
-            DiagnosticCategory::Model,
-            "model request failed",
-        )),
-        FailPath::InvalidModelResponse => LoopOutcome::Failed(failure(
-            LoopFailureKind::InvalidModelResponse,
-            DiagnosticCode::ModelMalformedResponse,
-            DiagnosticCategory::Model,
-            "model returned an invalid response",
-        )),
+        FailPath::Model(error) => LoopOutcome::Failed(model_failure(LoopFailureKind::Model, error)),
+        FailPath::InvalidModelResponse(error) => {
+            LoopOutcome::Failed(model_failure(LoopFailureKind::InvalidModelResponse, error))
+        }
         FailPath::OutputLimit => LoopOutcome::Failed(failure(
             LoopFailureKind::OutputLimit,
             DiagnosticCode::ModelMalformedResponse,
@@ -653,6 +657,15 @@ fn failure(
     LoopFailure {
         kind,
         diagnostic: DiagnosticSummary::bounded_static(code, category, message, false),
+        model_error: None,
+    }
+}
+
+fn model_failure(kind: LoopFailureKind, error: ModelError) -> LoopFailure {
+    LoopFailure {
+        kind,
+        diagnostic: error.diagnostic().clone(),
+        model_error: Some(error),
     }
 }
 
@@ -661,14 +674,14 @@ fn publish(control: &LoopControl, sink: &mut LoopEventSink, state: LoopState) {
     sink.try_emit(LoopEvent::StateChanged { state });
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum FailPath {
     Completed,
     Cancelled,
     Deadline,
     Prompt,
-    Model,
-    InvalidModelResponse,
+    Model(ModelError),
+    InvalidModelResponse(ModelError),
     OutputLimit,
     Refused,
     ContentFiltered,

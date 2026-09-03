@@ -27,9 +27,9 @@ use minicore_runtime::tools::{
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{
     AssistantHistory, CancelReason, ConfigRevision, ExecutionConfig, ExecutionConfigError,
-    HistoryItem, HistoryView, LoopFailure, LoopFailureKind, LoopId, LoopLimits, LoopLimitsError,
-    LoopOptions, LoopOutcome, LoopReport, LoopStartError, SummaryHistory, ToolCallId,
-    ToolResultHistory, UserHistory, UserInput, UserMessageKind,
+    HistoryItem, HistoryView, LoopId, LoopLimits, LoopLimitsError, LoopOptions, LoopOutcome,
+    LoopReport, LoopStartError, SummaryHistory, ToolCallId, ToolResultHistory, UserHistory,
+    UserInput, UserMessageKind,
 };
 
 struct FakeModel {
@@ -512,21 +512,6 @@ fn loop_report_and_outcome_are_constructible() {
         final_config_revision: ConfigRevision::INITIAL,
     };
     assert_eq!(report.requests, 1);
-
-    let failure = LoopFailure {
-        kind: LoopFailureKind::Model,
-        diagnostic: DiagnosticSummary::new(
-            DiagnosticCode::ModelUnavailable,
-            DiagnosticCategory::Model,
-            BoundedText::new("provider down").unwrap(),
-            true,
-        ),
-    };
-    assert_eq!(
-        LoopOutcome::Failed(failure.clone()),
-        LoopOutcome::Failed(LoopFailure {
-            kind: LoopFailureKind::Model,
-            diagnostic: failure.diagnostic,
-        })
-    );
+    assert_eq!(report.outcome, LoopOutcome::Cancelled(CancelReason::User));
+    assert_ne!(report.outcome, LoopOutcome::Completed);
 }

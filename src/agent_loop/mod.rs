@@ -10,7 +10,7 @@ use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::{HistoryItem, estimate_history_bytes};
 use crate::ids::LoopId;
 use crate::limits::LoopLimits;
-use crate::model::{MAX_MODEL_CALL_TIMEOUT, MAX_MODEL_RETRY_DELAY, Usage};
+use crate::model::{MAX_MODEL_CALL_TIMEOUT, MAX_MODEL_RETRY_DELAY, ModelError, Usage};
 
 mod control;
 mod event;
@@ -235,10 +235,23 @@ pub enum CancelReason {
     Deadline,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoopFailure {
     pub kind: LoopFailureKind,
     pub diagnostic: DiagnosticSummary,
+    model_error: Option<ModelError>,
+}
+
+impl LoopFailure {
+    /// Structured request-level model failure, when this loop failed
+    /// because a Model request failed.
+    ///
+    /// This describes the failed request only. It does not guarantee
+    /// that replaying the whole loop is safe after prior tool side effects.
+    pub fn model_error(&self) -> Option<&ModelError> {
+        self.model_error.as_ref()
+    }
 }
 
 #[non_exhaustive]

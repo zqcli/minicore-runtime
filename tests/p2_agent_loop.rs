@@ -15,9 +15,11 @@ use futures_util::Stream;
 use serde_json::json;
 use tokio::sync::Notify;
 
+use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use minicore_runtime::model::{
-    Model, ModelCallContext, ModelDescriptor, ModelError, ModelEvent, ModelFinishReason,
-    ModelMessage, ModelRequest, ModelStartFuture, ModelStream, ReasoningPreference,
+    DeliveryState, Model, ModelCallContext, ModelDescriptor, ModelError, ModelErrorKind,
+    ModelEvent, ModelFinishReason, ModelMessage, ModelRequest, ModelStartFuture, ModelStream,
+    ReasoningPreference, RetryHint,
 };
 use minicore_runtime::prompt::{
     DefaultPromptProvider, PreparedPrompt, PromptError, PromptFuture, PromptProvider, PromptRequest,
@@ -31,9 +33,9 @@ use minicore_runtime::tools::{
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{
     AgentLoop, AnswerError, CancelReason, ConfigRevision, ExecutionConfig, HistoryItem,
-    HistoryView, InteractionAnswer, LoopEvent, LoopOptions, LoopOutcome, LoopReport, LoopRequest,
-    LoopStartError, LoopStatus, SteerError, ToolCallId, UpdateError, UserHistory, UserInput,
-    UserMessageKind,
+    HistoryView, InteractionAnswer, LoopEvent, LoopFailureKind, LoopOptions, LoopOutcome,
+    LoopReport, LoopRequest, LoopStartError, LoopStatus, SteerError, ToolCallId, UpdateError,
+    UserHistory, UserInput, UserMessageKind,
 };
 
 fn reasoning_set() -> BTreeSet<ReasoningPreference> {
@@ -48,6 +50,28 @@ fn scripted_model_named(name: &str, rounds: Vec<Round>) -> (Arc<dyn Model>, Arc<
     scripted_model_full(name, reasoning_set(), rounds)
 }
 
+fn scripted_model_counted(rounds: Vec<Round>) -> (Arc<dyn Model>, Arc<AtomicUsize>, Arc<Notify>) {
+    let descriptor = ModelDescriptor::new(
+        "fake/scripted-model".parse().unwrap(),
+        8192,
+        reasoning_set(),
+        true,
+    )
+    .unwrap();
+    let started = Arc::new(Notify::new());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    (
+        Arc::new(ScriptedModel {
+            descriptor,
+            rounds: Arc::new(rounds),
+            started: Arc::clone(&started),
+            attempts: Arc::clone(&attempts),
+        }),
+        attempts,
+        started,
+    )
+}
+
 fn scripted_model_full(
     name: &str,
     reasoning: BTreeSet<ReasoningPreference>,
@@ -55,11 +79,13 @@ fn scripted_model_full(
 ) -> (Arc<dyn Model>, Arc<Notify>) {
     let descriptor = ModelDescriptor::new(name.parse().unwrap(), 8192, reasoning, true).unwrap();
     let started = Arc::new(Notify::new());
+    let attempts = Arc::new(AtomicUsize::new(0));
     (
         Arc::new(ScriptedModel {
             descriptor,
             rounds: Arc::new(rounds),
             started: Arc::clone(&started),
+            attempts,
         }),
         started,
     )
@@ -84,12 +110,18 @@ enum Round {
         gate: Arc<Notify>,
     },
     Hold,
+    Error(ModelError),
+    StreamError {
+        events: Vec<ModelEvent>,
+        error: ModelError,
+    },
 }
 
 struct ScriptedModel {
     descriptor: ModelDescriptor,
     rounds: Arc<Vec<Round>>,
     started: Arc<Notify>,
+    attempts: Arc<AtomicUsize>,
 }
 
 impl Model for ScriptedModel {
@@ -102,6 +134,7 @@ impl Model for ScriptedModel {
         _request: ModelRequest,
         context: ModelCallContext,
     ) -> ModelStartFuture<'a> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
         let round = self
             .rounds
             .get(context.request_index as usize)
@@ -112,7 +145,10 @@ impl Model for ScriptedModel {
         let started = Arc::clone(&self.started);
         Box::pin(async move {
             started.notify_waiters();
-            Ok::<ModelStream, ModelError>(Box::pin(round_stream(round)))
+            match round {
+                Round::Error(err) => Err(err),
+                other => Ok::<ModelStream, ModelError>(Box::pin(round_stream(other))),
+            }
         })
     }
 }
@@ -139,6 +175,15 @@ fn round_stream(round: Round) -> ModelStream {
             ],
             gate,
         ),
+        Round::StreamError { events, error } => {
+            let items: Vec<Result<ModelEvent, ModelError>> = events
+                .into_iter()
+                .map(Ok)
+                .chain(std::iter::once(Err(error)))
+                .collect();
+            Box::pin(futures_util::stream::iter(items))
+        }
+        Round::Error(_) => unreachable!("Round::Error is handled in Model::start"),
     }
 }
 
@@ -324,6 +369,7 @@ enum PolicyPlan {
     Deny,
     DenyReason(BoundedText),
     RequireApproval,
+    Invalid,
     Hold,
     /// Panics when the decision future is polled (fail-closed Denied).
     Panic,
@@ -346,6 +392,12 @@ impl ToolPolicy for ScriptedPolicy {
                 PolicyPlan::RequireApproval => ToolDecision::require_approval(
                     ApprovalRequest::new("approve this call?", ApprovalRisk::High).unwrap(),
                 ),
+                PolicyPlan::Invalid => Ok(ToolDecision::RequireApproval {
+                    request: ApprovalRequest {
+                        prompt: BoundedText::new("").unwrap(),
+                        risk: ApprovalRisk::High,
+                    },
+                }),
                 PolicyPlan::Hold => {
                     request.cancellation.cancelled().await;
                     Err(ToolPolicyError::Cancelled)
@@ -589,13 +641,15 @@ async fn max_tool_rounds_ends_with_failed_budget_and_complete_results() {
     .unwrap();
 
     let report = agent.join().await.unwrap();
-    assert!(matches!(
-        report.outcome,
-        LoopOutcome::Failed(minicore_runtime::LoopFailure {
-            kind: minicore_runtime::LoopFailureKind::MaxToolRounds,
-            ..
-        })
-    ));
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(
+                failure.kind,
+                minicore_runtime::LoopFailureKind::MaxToolRounds
+            );
+        }
+        other => panic!("expected LoopOutcome::Failed(MaxToolRounds), got {other:?}"),
+    }
     let tool_results: Vec<_> = report
         .appended
         .iter()
@@ -2395,9 +2449,9 @@ async fn prompt_timeout_after_taken_update_keeps_the_last_issued_revision() {
     );
 }
 
-/// Several stale rebuilds under a flood of updates keep the latest candidate
+/// FIX-06-T06: Several stale rebuilds under a flood of updates keep the latest candidate
 /// revision, advance no request index, and finally issue exactly one request
-/// with the newest config.
+/// with the newest config. Only real issues increment requests count.
 #[tokio::test]
 async fn multiple_stale_rebuilds_issue_only_the_latest_revision() {
     let gate = Arc::new(Notify::new());
@@ -3171,7 +3225,8 @@ async fn model_start_panic_yields_model_failure_without_history() {
         model_failure_kind(&report),
         Some(minicore_runtime::LoopFailureKind::Model)
     );
-    assert_eq!(report.requests, 0);
+    assert_eq!(report.requests, 1);
+    assert_eq!(handle.state().request_index, 0);
     assert!(
         !report
             .appended
@@ -3209,12 +3264,15 @@ async fn model_stream_poll_panic_yields_model_failure_without_history() {
     )
     .unwrap();
 
+    let handle = agent.handle();
+
     let report = agent.join().await.unwrap();
     assert_eq!(
         model_failure_kind(&report),
         Some(minicore_runtime::LoopFailureKind::Model)
     );
-    assert_eq!(report.requests, 0);
+    assert_eq!(report.requests, 1);
+    assert_eq!(handle.state().request_index, 0);
     assert!(
         !report
             .appended
@@ -4463,4 +4521,612 @@ async fn tool_input_single_choice_interaction_feeds_an_input_provided_result() {
         minicore_runtime::tools::ToolResultOutcome::InputProvided
     );
     assert!(tool_results[0].output.content().as_str().contains("beta"));
+}
+
+/// FIX-03-T01: Fake Model returns AuthRejected; LoopFailure preserves kind and diagnostic.
+#[tokio::test]
+async fn model_error_auth_rejected_preserves_classification_and_diagnostic() {
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::InvalidConfiguration,
+        DiagnosticCategory::Model,
+        BoundedText::new("invalid credentials").unwrap(),
+        false,
+    );
+    let expected_error = ModelError::permanent(
+        ModelErrorKind::AuthRejected,
+        DeliveryState::NotStarted,
+        diagnostic.clone(),
+    );
+    let (model, _) = scripted_model(vec![Round::Error(expected_error.clone())]);
+
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let report = agent.join().await.unwrap();
+
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(failure.kind, LoopFailureKind::Model);
+            assert_eq!(failure.diagnostic, diagnostic);
+            assert_eq!(failure.model_error(), Some(&expected_error));
+            assert_eq!(
+                failure.model_error().unwrap().kind(),
+                ModelErrorKind::AuthRejected
+            );
+            assert_eq!(
+                failure.model_error().unwrap().delivery(),
+                DeliveryState::NotStarted
+            );
+            assert_eq!(
+                failure.model_error().unwrap().retry_hint(),
+                &RetryHint::Never
+            );
+        }
+        other => panic!("expected LoopOutcome::Failed, got {other:?}"),
+    }
+}
+
+/// FIX-03-T02: Fake Model returns RateLimited; after driver retry exhausted, preserves kind and diagnostic.
+#[tokio::test]
+async fn model_error_rate_limited_exhausting_retry_preserves_diagnostic() {
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::ModelTimeout,
+        DiagnosticCategory::Model,
+        BoundedText::new("rate limit exceeded").unwrap(),
+        true,
+    );
+    let expected_error = ModelError::not_started(
+        ModelErrorKind::RateLimited,
+        Some(Duration::from_millis(1)),
+        diagnostic.clone(),
+    );
+    let (model, attempts, _) = scripted_model_counted(vec![Round::Error(expected_error.clone())]);
+
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.model_retry_attempts = 2;
+    options.model_retry_base_delay = Duration::from_millis(1);
+
+    let mut agent =
+        AgentLoop::start(request(config(model, ToolSet::default(), None)), options).unwrap();
+    let handle = agent.handle();
+    let mut events = agent.take_events().unwrap();
+    let report = agent.join().await.unwrap();
+
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(failure.kind, LoopFailureKind::Model);
+            assert_eq!(failure.diagnostic, diagnostic);
+            assert_eq!(failure.model_error(), Some(&expected_error));
+            assert_eq!(
+                failure.model_error().unwrap().kind(),
+                ModelErrorKind::RateLimited
+            );
+            assert_eq!(
+                failure.model_error().unwrap().retry_hint(),
+                expected_error.retry_hint()
+            );
+        }
+        other => panic!("expected LoopOutcome::Failed, got {other:?}"),
+    }
+    assert_eq!(
+        report.requests, 1,
+        "exhausted retries must count as 1 logical request"
+    );
+    assert_eq!(handle.state().request_index, 0);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "model driver must attempt exactly twice before exhausting retries"
+    );
+
+    let mut request_started_count = 0;
+    while let Some(envelope) = events.recv().await {
+        if matches!(envelope.event, LoopEvent::RequestStarted { .. }) {
+            request_started_count += 1;
+        }
+    }
+    assert_eq!(
+        request_started_count, 1,
+        "driver retry must emit only one RequestStarted event for the logical request"
+    );
+}
+
+/// FIX-03-T03: Fake Model returns QuotaExceeded; preserves kind and diagnostic.
+#[tokio::test]
+async fn model_error_quota_exceeded_preserves_diagnostic() {
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::ToolFailed,
+        DiagnosticCategory::Model,
+        BoundedText::new("quota depleted").unwrap(),
+        false,
+    );
+    let expected_error = ModelError::permanent(
+        ModelErrorKind::QuotaExceeded,
+        DeliveryState::NotStarted,
+        diagnostic.clone(),
+    );
+    let (model, _) = scripted_model(vec![Round::Error(expected_error.clone())]);
+
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let report = agent.join().await.unwrap();
+
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(failure.kind, LoopFailureKind::Model);
+            assert_eq!(failure.diagnostic, diagnostic);
+            assert_eq!(failure.model_error(), Some(&expected_error));
+            assert_eq!(
+                failure.model_error().unwrap().kind(),
+                ModelErrorKind::QuotaExceeded
+            );
+        }
+        other => panic!("expected LoopOutcome::Failed, got {other:?}"),
+    }
+}
+
+/// FIX-03-T04: Fake Model returns ContextOverflow; preserves kind and diagnostic.
+#[tokio::test]
+async fn model_error_context_overflow_preserves_diagnostic() {
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::ContextFailed,
+        DiagnosticCategory::Model,
+        BoundedText::new("context length exceeded").unwrap(),
+        false,
+    );
+    let expected_error = ModelError::permanent(
+        ModelErrorKind::ContextOverflow,
+        DeliveryState::NotStarted,
+        diagnostic.clone(),
+    );
+    let (model, _) = scripted_model(vec![Round::Error(expected_error.clone())]);
+
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let report = agent.join().await.unwrap();
+
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(failure.kind, LoopFailureKind::Model);
+            assert_eq!(failure.diagnostic, diagnostic);
+            assert_eq!(failure.model_error(), Some(&expected_error));
+            assert_eq!(
+                failure.model_error().unwrap().kind(),
+                ModelErrorKind::ContextOverflow
+            );
+        }
+        other => panic!("expected LoopOutcome::Failed, got {other:?}"),
+    }
+}
+
+/// FIX-03-T05: Fake Model returns RequestOutcomeUnknown; preserves kind and diagnostic.
+#[tokio::test]
+async fn model_error_request_outcome_unknown_preserves_diagnostic() {
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::RuntimeTerminated,
+        DiagnosticCategory::Model,
+        BoundedText::new("network connection reset").unwrap(),
+        false,
+    );
+    let expected_error =
+        ModelError::unknown(ModelErrorKind::RequestOutcomeUnknown, diagnostic.clone());
+    let (model, _) = scripted_model(vec![Round::Error(expected_error.clone())]);
+
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let report = agent.join().await.unwrap();
+
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(failure.kind, LoopFailureKind::Model);
+            assert_eq!(failure.diagnostic, diagnostic);
+            assert_eq!(failure.model_error(), Some(&expected_error));
+            assert_eq!(
+                failure.model_error().unwrap().kind(),
+                ModelErrorKind::RequestOutcomeUnknown
+            );
+            assert_eq!(
+                failure.model_error().unwrap().delivery(),
+                DeliveryState::Unknown
+            );
+            assert_eq!(
+                failure.model_error().unwrap().retry_hint(),
+                &RetryHint::Never
+            );
+        }
+        other => panic!("expected LoopOutcome::Failed, got {other:?}"),
+    }
+}
+
+/// FIX-03-T06: Stream failure with Started delivery state preserves diagnostic and omits partial assistant from history.
+#[tokio::test]
+async fn model_error_stream_started_preserves_diagnostic_and_omits_partial_history() {
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::ModelUnavailable,
+        DiagnosticCategory::Model,
+        BoundedText::new("stream severed after partial chunk").unwrap(),
+        false,
+    );
+    let expected_error = ModelError::started(ModelErrorKind::Unavailable, diagnostic.clone());
+    let (model, _) = scripted_model(vec![Round::StreamError {
+        events: vec![ModelEvent::text_delta("partial response text").unwrap()],
+        error: expected_error.clone(),
+    }]);
+
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let report = agent.join().await.unwrap();
+
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(failure.kind, LoopFailureKind::Model);
+            assert_eq!(failure.diagnostic, diagnostic);
+            assert_eq!(failure.model_error(), Some(&expected_error));
+            assert_eq!(
+                failure.model_error().unwrap().delivery(),
+                DeliveryState::Started
+            );
+        }
+        other => panic!("expected LoopOutcome::Failed, got {other:?}"),
+    }
+    assert!(
+        report
+            .appended
+            .iter()
+            .all(|item| !matches!(item, HistoryItem::Assistant(_))),
+        "partial assistant must never be appended on stream failure"
+    );
+}
+
+/// FIX-03-T07: Fake Model returns InvalidProviderResponse; classifies as InvalidModelResponse and preserves diagnostic.
+#[tokio::test]
+async fn model_error_invalid_provider_response_preserves_diagnostic() {
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::ModelMalformedResponse,
+        DiagnosticCategory::Model,
+        BoundedText::new("corrupt json response payload").unwrap(),
+        false,
+    );
+    let expected_error = ModelError::permanent(
+        ModelErrorKind::InvalidProviderResponse,
+        DeliveryState::NotStarted,
+        diagnostic.clone(),
+    );
+    let (model, _) = scripted_model(vec![Round::Error(expected_error.clone())]);
+
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let report = agent.join().await.unwrap();
+
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(failure.kind, LoopFailureKind::InvalidModelResponse);
+            assert_eq!(failure.diagnostic, diagnostic);
+            assert_eq!(failure.model_error(), Some(&expected_error));
+            assert_eq!(
+                failure.model_error().unwrap().kind(),
+                ModelErrorKind::InvalidProviderResponse
+            );
+        }
+        other => panic!("expected LoopOutcome::Failed, got {other:?}"),
+    }
+}
+
+/// FIX-03-T08: Non-model failures (Prompt, MaxToolRounds, Policy) classify correctly as regression check.
+#[tokio::test]
+async fn non_model_failures_classify_correctly_regression() {
+    // Prompt failure
+    let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
+    let agent = AgentLoop::start(
+        request(config_full(
+            model,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            Arc::new(PanicPrompt),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let report = agent.join().await.unwrap();
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(failure.kind, LoopFailureKind::Prompt);
+            assert_eq!(failure.model_error(), None);
+        }
+        other => panic!("expected LoopOutcome::Failed(Prompt), got {other:?}"),
+    }
+
+    // MaxToolRounds failure
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (model, _) = scripted_model(vec![
+        Round::Tools {
+            calls: vec![("echo", "call_1")],
+        },
+        Round::Tools {
+            calls: vec![("echo", "call_2")],
+        },
+    ]);
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.max_tool_rounds = 1;
+    let agent = AgentLoop::start(
+        request(config(model, tool_set(calls, ToolBehavior::Succeed), None)),
+        options,
+    )
+    .unwrap();
+    let report = agent.join().await.unwrap();
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(failure.kind, LoopFailureKind::MaxToolRounds);
+            assert_eq!(failure.model_error(), None);
+        }
+        other => panic!("expected LoopOutcome::Failed(MaxToolRounds), got {other:?}"),
+    }
+
+    // Policy failure via invalid ToolDecision (fails decision.validate())
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (model, _) = scripted_model(vec![Round::Tools {
+        calls: vec![("echo", "call_1")],
+    }]);
+    let policy = Arc::new(ScriptedPolicy {
+        plan: Arc::new(vec![PolicyPlan::Invalid]),
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let agent = AgentLoop::start(
+        request(config(
+            model,
+            tool_set(calls, ToolBehavior::Succeed),
+            Some(policy),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let report = agent.join().await.unwrap();
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(failure.kind, LoopFailureKind::Policy);
+            assert_eq!(failure.model_error(), None);
+        }
+        other => panic!("expected LoopOutcome::Failed(Policy), got {other:?}"),
+    }
+}
+
+/// FIX-03-T09: LoopFailure Debug formatting does not expose raw diagnostic message text.
+#[tokio::test]
+async fn loop_failure_debug_does_not_leak_diagnostic_message() {
+    let secret = "very_sensitive_api_secret_token";
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::InvalidConfiguration,
+        DiagnosticCategory::Model,
+        BoundedText::new(secret).unwrap(),
+        false,
+    );
+    let error = ModelError::permanent(
+        ModelErrorKind::AuthRejected,
+        DeliveryState::NotStarted,
+        diagnostic,
+    );
+    let (model, _) = scripted_model(vec![Round::Error(error)]);
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let report = agent.join().await.unwrap();
+
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            let debug_repr = format!("{failure:?}");
+            assert!(
+                !debug_repr.contains(secret),
+                "LoopFailure Debug representation must not expose raw diagnostic text"
+            );
+        }
+        other => panic!("expected LoopOutcome::Failed, got {other:?}"),
+    }
+}
+
+/// FIX-06-T01: First request Model start error counts as 1 request, with final state index 0.
+#[tokio::test]
+async fn first_request_start_error_counts_as_one_request_with_state_zero() {
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::ModelUnavailable,
+        DiagnosticCategory::Model,
+        BoundedText::new("start rejected").unwrap(),
+        false,
+    );
+    let error = ModelError::permanent(
+        ModelErrorKind::Unavailable,
+        DeliveryState::NotStarted,
+        diagnostic,
+    );
+    let (model, _) = scripted_model(vec![Round::Error(error)]);
+    let mut agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let mut events = agent.take_events().unwrap();
+
+    let report = agent.join().await.unwrap();
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(failure.kind, LoopFailureKind::Model);
+        }
+        other => panic!("expected LoopOutcome::Failed(Model), got {other:?}"),
+    }
+    assert_eq!(report.requests, 1);
+    assert_eq!(handle.state().request_index, 0);
+
+    let mut start_count = 0;
+    while let Some(envelope) = events.recv().await {
+        if matches!(
+            envelope.event,
+            LoopEvent::RequestStarted {
+                request_index: 0,
+                ..
+            }
+        ) {
+            start_count += 1;
+        }
+    }
+    assert_eq!(
+        start_count, 1,
+        "exactly one RequestStarted(0) event must be emitted"
+    );
+}
+
+/// FIX-06-T02: First request stream failure counts as 1 request, with final state index 0.
+#[tokio::test]
+async fn first_request_stream_failure_counts_as_one_request_with_state_zero() {
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::ModelUnavailable,
+        DiagnosticCategory::Model,
+        BoundedText::new("stream aborted").unwrap(),
+        false,
+    );
+    let error = ModelError::started(ModelErrorKind::Unavailable, diagnostic);
+    let (model, _) = scripted_model(vec![Round::StreamError {
+        events: vec![],
+        error,
+    }]);
+    let mut agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let mut events = agent.take_events().unwrap();
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.requests, 1);
+    assert_eq!(handle.state().request_index, 0);
+
+    let mut start_count = 0;
+    while let Some(envelope) = events.recv().await {
+        if matches!(
+            envelope.event,
+            LoopEvent::RequestStarted {
+                request_index: 0,
+                ..
+            }
+        ) {
+            start_count += 1;
+        }
+    }
+    assert_eq!(start_count, 1);
+}
+
+/// FIX-06-T03: Second request fails after tool round: report.requests=2, final state index=1, exactly two RequestStarted events.
+#[tokio::test]
+async fn second_request_failure_counts_as_two_requests_with_state_one() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let diagnostic = DiagnosticSummary::new(
+        DiagnosticCode::ModelUnavailable,
+        DiagnosticCategory::Model,
+        BoundedText::new("fail on round 2").unwrap(),
+        false,
+    );
+    let error = ModelError::permanent(
+        ModelErrorKind::Unavailable,
+        DeliveryState::NotStarted,
+        diagnostic,
+    );
+    let (model, _) = scripted_model(vec![
+        Round::Tools {
+            calls: vec![("echo", "call_1")],
+        },
+        Round::Error(error),
+    ]);
+
+    let mut agent = AgentLoop::start(
+        request(config(
+            model,
+            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
+            None,
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let mut events = agent.take_events().unwrap();
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(
+        model_failure_kind(&report),
+        Some(minicore_runtime::LoopFailureKind::Model)
+    );
+    assert_eq!(
+        report.requests, 2,
+        "second failed request must still be counted"
+    );
+    assert_eq!(
+        handle.state().request_index,
+        1,
+        "final state request_index must reflect the last issued request (1)"
+    );
+
+    let mut start_indices = Vec::new();
+    while let Some(envelope) = events.recv().await {
+        if let LoopEvent::RequestStarted { request_index, .. } = envelope.event {
+            start_indices.push(request_index);
+        }
+    }
+    assert_eq!(start_indices, vec![0, 1]);
+}
+
+/// FIX-06-T04: Prompt failure before model request issues zero requests, final state index 0, and no RequestStarted.
+#[tokio::test]
+async fn prompt_failure_emits_no_request_started_and_counts_zero_requests() {
+    let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
+    let mut agent = AgentLoop::start(
+        request(config_full(
+            model,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            Arc::new(PanicPrompt),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    let mut events = agent.take_events().unwrap();
+
+    let report = agent.join().await.unwrap();
+    assert_eq!(
+        model_failure_kind(&report),
+        Some(minicore_runtime::LoopFailureKind::Prompt)
+    );
+    assert_eq!(report.requests, 0);
+    assert_eq!(handle.state().request_index, 0);
+
+    let mut request_started_emitted = false;
+    while let Some(envelope) = events.recv().await {
+        if matches!(envelope.event, LoopEvent::RequestStarted { .. }) {
+            request_started_emitted = true;
+        }
+    }
+    assert!(
+        !request_started_emitted,
+        "prompt failure must never emit RequestStarted event"
+    );
 }

@@ -885,8 +885,9 @@ async fn partial_stream_failure_is_a_model_failure_without_an_assistant_item() {
     );
 }
 
-/// The delivery-aware driver retries at the loop level: a first NotStarted
-/// error is retried and the loop completes on the second attempt.
+/// FIX-06-T05: The delivery-aware driver retries at the loop level: a first NotStarted
+/// error is retried and the loop completes on the second attempt. Single RequestStarted,
+/// report.requests = 1, attempts = 2.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn delivery_retry_recovers_at_the_loop_level() {
     struct RetryOnceModel {
@@ -935,11 +936,13 @@ async fn delivery_retry_recovers_at_the_loop_level() {
         attempts: AtomicUsize::new(0),
         started: Arc::clone(&started),
     });
-    let agent = start_with(
-        request(config(model, ToolSet::default(), None)),
+    let config_model: Arc<dyn Model> = model.clone();
+    let mut agent = start_with(
+        request(config(config_model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
+    let mut events = agent.take_events().unwrap();
     let report_task = tokio::spawn(async move { agent.join().await });
 
     // First attempt fails immediately; the driver sleeps one base delay
@@ -948,6 +951,19 @@ async fn delivery_retry_recovers_at_the_loop_level() {
     tokio::time::advance(Duration::from_millis(250)).await;
     let report = report_task.await.unwrap().unwrap();
     assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.requests, 1);
+    assert_eq!(model.attempts.load(Ordering::SeqCst), 2);
+
+    let mut request_started_count = 0;
+    while let Some(envelope) = events.recv().await {
+        if matches!(envelope.event, LoopEvent::RequestStarted { .. }) {
+            request_started_count += 1;
+        }
+    }
+    assert_eq!(
+        request_started_count, 1,
+        "driver retry must emit only one RequestStarted event"
+    );
     let has_recovered = report.appended.iter().any(|item| {
         matches!(
             item,
