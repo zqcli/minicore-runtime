@@ -62,9 +62,13 @@ impl LoopHandle {
     /// Queues a human steer for the next request boundary. The in-flight model
     /// and the tool batch it produced are not disturbed; the steer is applied
     /// (in accept order, alongside any pending config update) to the next
-    /// model request's prompt. Accepted steers are never lost; `QueueFull`
-    /// means the bounded queue is full, `WaitingForInput` that an interaction
-    /// is pending, and `NotActive` that the loop already sealed.
+    /// model request's prompt. A successful call means the steer was accepted
+    /// into this process-local queue. It is applied at the next request boundary.
+    /// If the loop is cancelled, shut down, or the process exits before that
+    /// boundary, the queued steer may be discarded and will not appear in
+    /// `LoopReport::appended`. `QueueFull` means the bounded queue is full,
+    /// `WaitingForInput` that an interaction is pending, and `NotActive` that
+    /// the loop already sealed.
     pub fn steer(&self, input: UserInput) -> Result<(), SteerError> {
         self.control.steer(input)
     }
