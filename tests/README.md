@@ -8,28 +8,38 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 | File | Tests | Scope |
 | --- | --- | --- |
 | `p1_dto.rs` | 9 | v0.1-era DTO contracts revalidated for the current surface |
-| `p1_value.rs` | 4 | bounded value types and validation |
-| `p1_v04_loop_dtos.rs` | 14 | loop history, `ExecutionConfig`, `PromptProvider`, `LoopReport` DTOs |
-| `p2_agent_loop.rs` | 72 | the flexible agent-loop contract end to end |
-| `p3_agent_loop_closeout.rs` | 14 | Phase 8 close-out: reasoning channels, event-free runs, multi-batch cancel, repeated answers, policy snapshot swaps, history limits, delta-only reports, malformed responses, loop-level retry, shared-resource isolation, steer-survives-prompt-failure |
-| `tool_set_contract.rs` | 11 | `ToolSet` registration, spec validation, enabled subsets |
-| `tool_policy_interaction_contract.rs` | 6 | policy decisions and interaction DTO contracts |
+| `model_error_contract.rs` | 1 | model error construction and retry hints |
 | `model_port_contract.rs` | 7 | model port wire / error contracts |
 | `model_driver_contract.rs` | 3 | driver delivery-state contracts |
-| `model_error_contract.rs` | 1 | model error construction and retry hints |
+| `p1_value.rs` | 4 | bounded value types and validation |
+| `p1_v04_loop_dtos.rs` | 14 | loop history, `ExecutionConfig`, `PromptProvider`, `LoopReport` DTOs |
+| `p2_agent_loop.rs` | 103 | the flexible agent-loop contract end to end: output bounding, model error preservation, request issue accounting, and progress drop loss |
+| `p3_agent_loop_closeout.rs` | 17 | Phase 8 close-out and correctness fixes: catalog/per-response call limits, timeout/retry bounds, reasoning channels, event-free runs, multi-batch cancel, repeated answers, policy snapshot swaps, history limits, delta-only reports, malformed responses, loop-level retry, shared-resource isolation, steer-survives-prompt-failure |
+| `tool_policy_interaction_contract.rs` | 8 | policy decisions, interaction DTO contracts, and ToolInputRequest validation |
+| `tool_set_contract.rs` | 11 | `ToolSet` registration, spec validation, enabled subsets |
 
 ## Unit (`src/**` inline and driver)
 
-- `src/agent_loop/control.rs` — control-layer CAS/seal unit tests
-  (`finish_once`/`mark_cancel`/`begin_final`/revision monotonicity, 5 tests).
-- `src/agent_loop/runner/tests.rs` — runner-slice unit tests (3).
-- `src/model/driver/tests/` — delivery-aware driver: retry (8), assembly (6),
-  cancellation (6), deadline (6), semantics (5), settlement (3),
-  preflight/progress (3).
+- 69 unit tests in `src/`:
+  - `src/agent_loop/control.rs` (8 tests): control-layer CAS/seal, revision monotonicity, and outside-lock config drop probes.
+  - `src/agent_loop/runner/tests.rs` (4 tests): runner-slice unit tests.
+  - `src/model/driver/tests/` (40 tests): assembly (6), retry (8), deadline (6), preflight/progress (3), settlement (3), semantics (8), cancellation (6).
+  - `src/tools/` (4 tests): input request validation (1) and progress channel semantics (3).
+  - `src/time.rs` (4 tests): monotonic clock and timeout math.
+  - `src/port_call.rs` (9 tests): port call execution and timeout isolation.
+
+Total test volume: **246 tests** in the main crate (69 unit + 177 integration across 10 targets); **25 tests** in `provider-gate`; **271 tests** total across the repository.
 
 ## Contract Coverage (`tests/p2_agent_loop.rs` + `tests/p3_agent_loop_closeout.rs`)
 
 - Text and tool loops, sequential tools, max tool rounds.
+- Tool catalog size is independent from per-response `ToolCall` limits; registration and start bounds enforced fail-fast.
+- All tool outputs (`Success`, `Failed`, `Denied`) bounded by `max_tool_output_bytes`; oversized successes downgraded to failed with matching `ToolFinished` byte reporting.
+- `ToolInputRequest` validated up front; malformed requests fail directly without entering `WaitingForInput`.
+- Request-level structured `ModelError` preserved in `LoopFailure::model_error()` for `Model` and `InvalidModelResponse` failures without leaking diagnostics via `Debug`.
+- Logical `LoopReport.requests` and state `request_index` aligned at the `RequestStarted` issue boundary; driver retries stay within a single logical request.
+- Internal model and tool progress channel drops merged into `LoopEventEnvelope.dropped_before`.
+- Replaced or discarded pending `ExecutionConfig` instances dropped outside the control mutex.
 - Steer / update request-boundary semantics, final-seal races, queue bounds.
 - Cancellation and deadline paths, owner drop, multi-waiter shared report.
 - Prompt: failures, panics, budget enforcement, default summary truncation.
@@ -55,4 +65,4 @@ cargo test --locked --all-targets --all-features
 
 The full gate is `./scripts/check.sh` (fmt, tests, clippy `-D warnings`,
 rustdoc `-D warnings`, docs/architecture/acceptance checks, provider-gate
-harness) plus `./scripts/check-msrv.sh` and `cargo metadata --locked`.
+harness) plus `./scripts/check-msrv.sh`.

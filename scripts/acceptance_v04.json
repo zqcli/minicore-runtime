@@ -119,7 +119,9 @@
       "evidence": [
         "src/tools/policy.rs",
         "docs/contracts/tool-policy-interaction.md",
-        "tests/p2_agent_loop.rs::approved_interaction_resumes_the_loop"
+        "tests/p2_agent_loop.rs::approved_interaction_resumes_the_loop",
+        "tests/tool_policy_interaction_contract.rs::invalid_tool_input_requests_rejected_by_validate",
+        "tests/p2_agent_loop.rs::invalid_tool_input_empty_prompt_fails_without_interaction"
       ]
     },
     {
@@ -204,7 +206,8 @@
       "summary": "latest update wins",
       "evidence": [
         "tests/p2_agent_loop.rs::multiple_updates_keep_only_the_latest",
-        "src/agent_loop/control.rs::updates_are_monotonic_and_latest_wins_until_commit"
+        "src/agent_loop/control.rs::updates_are_monotonic_and_latest_wins_until_commit",
+        "src/agent_loop/control.rs::pending_config_drop_on_update_replace_occurs_outside_control_mutex"
       ]
     },
     {
@@ -298,7 +301,8 @@
       "evidence": [
         "tests/p2_agent_loop.rs::final_race_steer_wins_and_keeps_the_loop_alive",
         "tests/p2_agent_loop.rs::final_race_seal_wins_returns_not_active",
-        "src/agent_loop/control.rs::begin_final_with_pending_steer_keeps_accepting_open"
+        "src/agent_loop/control.rs::begin_final_with_pending_steer_keeps_accepting_open",
+        "src/agent_loop/control.rs::pending_config_drop_on_begin_final_seal_occurs_outside_control_mutex"
       ]
     },
     {
@@ -332,7 +336,9 @@
       "summary": "当前Model Response严格验证",
       "evidence": [
         "tests/p2_agent_loop.rs::unknown_tool_call_closes_the_loop_with_invalid_response",
-        "tests/p3_agent_loop_closeout.rs::missing_tool_call_terminal_is_invalid_and_not_appended"
+        "tests/p3_agent_loop_closeout.rs::missing_tool_call_terminal_is_invalid_and_not_appended",
+        "src/model/driver/tests/semantics.rs::multiple_tool_specs_reject_second_tool_call_when_limit_is_one",
+        "tests/p3_agent_loop_closeout.rs::loop_completes_with_multiple_registered_tools_under_single_call_limit"
       ]
     },
     {
@@ -346,10 +352,12 @@
     {
       "id": "V4-039",
       "status": "Passed",
-      "summary": "当前ToolCall都有ToolResult",
+      "summary": "当前ToolCall都有受限且确定的ToolResult",
       "evidence": [
         "tests/p3_agent_loop_closeout.rs::cancelling_a_multi_tool_batch_settles_each_call_exactly_once",
-        "tests/p2_agent_loop.rs::cancel_during_tool_ends_cancelled_with_results_for_every_call"
+        "tests/p2_agent_loop.rs::cancel_during_tool_ends_cancelled_with_results_for_every_call",
+        "tests/p2_agent_loop.rs::tool_output_exceeding_limit_fails_and_original_content_omitted_from_history",
+        "tests/p2_agent_loop.rs::tool_finished_event_output_bytes_matches_history_bounded_bytes"
       ]
     },
     {
@@ -377,7 +385,8 @@
       "summary": "一个Loop只完成一次",
       "evidence": [
         "src/agent_loop/control.rs::finish_once_seals_exactly_once_and_closes_accepting",
-        "tests/p2_agent_loop.rs::late_subscriber_gets_the_same_report_immediately"
+        "tests/p2_agent_loop.rs::late_subscriber_gets_the_same_report_immediately",
+        "src/agent_loop/control.rs::pending_config_drop_on_finish_once_occurs_outside_control_mutex"
       ]
     },
     {
@@ -397,7 +406,9 @@
       "evidence": [
         "tests/p2_agent_loop.rs::prompt_error_is_a_prompt_failure",
         "tests/p2_agent_loop.rs::model_start_panic_yields_model_failure_without_history",
-        "tests/p2_agent_loop.rs::cancel_during_model_ends_cancelled_with_report"
+        "tests/p2_agent_loop.rs::cancel_during_model_ends_cancelled_with_report",
+        "tests/p2_agent_loop.rs::model_error_auth_rejected_preserves_classification_and_diagnostic",
+        "tests/p2_agent_loop.rs::loop_failure_debug_does_not_leak_diagnostic_message"
       ]
     },
     {
@@ -414,7 +425,8 @@
       "summary": "Starting/Model/Tools/Waiting/Finishing/Finished状态正确",
       "evidence": [
         "tests/p2_agent_loop.rs::tool_loop_final_state_request_index_is_last_issued",
-        "src/agent_loop/state.rs"
+        "src/agent_loop/state.rs",
+        "tests/p2_agent_loop.rs::first_request_start_error_counts_as_one_request_with_state_zero"
       ]
     },
     {
@@ -430,7 +442,9 @@
       "status": "Passed",
       "summary": "Event drop报告dropped_before",
       "evidence": [
-        "tests/p2_agent_loop.rs::bounded_event_queue_attaches_dropped_before_to_the_next_success"
+        "tests/p2_agent_loop.rs::bounded_event_queue_attaches_dropped_before_to_the_next_success",
+        "tests/p2_agent_loop.rs::model_burst_progress_drops_are_recorded_in_dropped_before",
+        "tests/p2_agent_loop.rs::tool_burst_progress_drops_are_recorded_in_dropped_before"
       ]
     },
     {
@@ -557,7 +571,7 @@
     {
       "id": "V4-063",
       "status": "Passed",
-      "summary": "Linux/macOS/Windows CI矩阵四job（macos/windows/stable/1.85）在run 33676282786全绿",
+      "summary": "Linux/macOS/Windows CI矩阵四job（macos/windows/stable/1.85）在run 33750189748全绿",
       "evidence": [
         ".github/workflows/ci.yml",
         "docs/release-v0.4.md"

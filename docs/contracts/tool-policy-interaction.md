@@ -31,18 +31,32 @@ snapshot of the request that produced the batch.
 
 ## Execution Outcomes
 
+- All tool outputs recorded into `ToolResultHistory` (`Success`, `Failed`,
+  `Denied`) are strictly bounded by `max_tool_output_bytes`.
 - `Completed(output)` appends a `Success` tool result and the model
-  continues.
+  continues. If completed tool output exceeds `max_tool_output_bytes`, it is
+  downgraded to a `Failed` result with diagnostic explanation rather than
+  corrupting history.
 - An ordinary tool error, timeout, or panic appends a `Failed` terminal
   result (the model continues); only cancellation, turn-deadline, or a
-  broken interaction end the batch.
+  broken interaction end the batch. Bounding limits apply uniformly across
+  all failure and denial textual outputs.
+- `ToolFinished` event output byte counts strictly match the bounded bytes
+  stored in `ToolResultHistory`.
 - `RequestInput(request)` stalls the call for a host interaction (see
-  below); oversized tool output is a `Failed` terminal result.
+  below).
 
 ## Interactions
 
 - `PendingInteraction`/`InteractionKind` describe what is being asked; the
   loop publishes `WaitingForInput` state and an `InteractionRequested` event.
+- `ToolInputRequest` enforces invariant validation (`validate(&self)`)
+  shared across its constructors, deserialization, and the port runner
+  boundary. If a tool returns `RequestInput(request)` with a malformed
+  request (empty prompt, empty SingleChoice choices, >32 choices, or
+  oversized choice text), the runtime rejects it immediately as an ordinary
+  tool failure (`Failed`) without generating an `InteractionId`, emitting
+  `InteractionRequested`, or entering `WaitingForInput`.
 - The host resolves via `LoopHandle::answer` (`InteractionAnswer::Approval`
   or `InteractionAnswer::ToolInput`). The runtime enforces the interaction
   type contract; a mismatched answer is an `Internal` failure.
