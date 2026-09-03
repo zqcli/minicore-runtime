@@ -16,7 +16,7 @@ use crate::port_call::{PortCallOutcome, run_port_call};
 use crate::time::DeadlineSource;
 use crate::tools::{
     ApprovalDecision, ApprovalRequest, EnabledTool, ToolContext, ToolDecision,
-    ToolExecutionOutcome, ToolInputRequest, ToolInvocation, ToolOutput, ToolPolicy,
+    ToolExecutionOutcome, ToolInputRequest, ToolInvocation, ToolName, ToolOutput, ToolPolicy,
     ToolPolicyRequest, ToolProgress, ToolProgressEmitter, ToolProgressSink, ToolResultOutcome,
     ToolSpec,
 };
@@ -55,7 +55,13 @@ pub(super) async fn run_tool_call(
     {
         PolicyStep::Allow => None,
         PolicyStep::Denied(reason) => {
-            return ToolStep::Result(denied_result(ctx.id, request_index, invocation, reason));
+            return ToolStep::Result(denied_result(
+                ctx.id,
+                request_index,
+                invocation,
+                reason,
+                ctx.options.limits.max_tool_output_bytes,
+            ));
         }
         PolicyStep::RequireApproval(request) => Some(request),
         PolicyStep::Cancelled => return ToolStep::End(FailPath::Cancelled),
@@ -86,7 +92,13 @@ pub(super) async fn run_tool_call(
         match answer {
             InteractionAnswer::Approval(ApprovalDecision::AllowOnce) => {}
             InteractionAnswer::Approval(ApprovalDecision::Deny) => {
-                return ToolStep::Result(denied_result(ctx.id, request_index, invocation, None));
+                return ToolStep::Result(denied_result(
+                    ctx.id,
+                    request_index,
+                    invocation,
+                    None,
+                    ctx.options.limits.max_tool_output_bytes,
+                ));
             }
             _ => return ToolStep::End(FailPath::Internal),
         }
@@ -101,9 +113,13 @@ pub(super) async fn run_tool_call(
     )
     .await
     {
-        ToolPort::Completed(output) => {
-            ToolStep::Result(completed_result(ctx.id, request_index, invocation, output))
-        }
+        ToolPort::Completed(output) => ToolStep::Result(completed_result(
+            ctx.id,
+            request_index,
+            invocation,
+            output,
+            ctx.options.limits.max_tool_output_bytes,
+        )),
         ToolPort::RequestInput(request) => {
             let interaction_id = match InteractionId::new() {
                 Ok(id) => id,
@@ -130,42 +146,25 @@ pub(super) async fn run_tool_call(
                         Ok(content) => content,
                         Err(_) => return ToolStep::End(FailPath::Internal),
                     };
-                    if content.len() > ctx.options.limits.max_tool_output_bytes {
-                        return ToolStep::Result(invocation_terminal_result(
-                            ctx.id,
-                            request_index,
-                            invocation,
-                            ToolResultOutcome::Failed,
-                            "tool output too large",
-                        ));
-                    }
-                    match ToolOutput::new(content) {
-                        Ok(output) => ToolStep::Result(ToolResultHistory {
-                            loop_id: ctx.id,
-                            request_index,
-                            call_id: invocation.tool_call_id().clone(),
-                            tool_name: invocation.tool_name().clone(),
-                            outcome: ToolResultOutcome::InputProvided,
-                            output,
-                        }),
-                        Err(_) => ToolStep::Result(invocation_terminal_result(
-                            ctx.id,
-                            request_index,
-                            invocation,
-                            ToolResultOutcome::Failed,
-                            "tool output too large",
-                        )),
-                    }
+                    ToolStep::Result(provided_input_result(
+                        ctx.id,
+                        request_index,
+                        invocation,
+                        content,
+                        ctx.options.limits.max_tool_output_bytes,
+                    ))
                 }
                 _ => ToolStep::End(FailPath::Internal),
             }
         }
-        ToolPort::Failed => ToolStep::Result(invocation_terminal_result(
+        ToolPort::Failed => ToolStep::Result(terminal_tool_result(
             ctx.id,
             request_index,
-            invocation,
+            invocation.tool_call_id(),
+            invocation.tool_name(),
             ToolResultOutcome::Failed,
             "tool failed",
+            ctx.options.limits.max_tool_output_bytes,
         )),
         ToolPort::End(path) => ToolStep::End(path),
     }
@@ -294,9 +293,12 @@ async fn run_tool_port(
         PortCallOutcome::Returned(Ok(ToolExecutionOutcome::Completed(output))) => {
             ToolPort::Completed(output)
         }
-        PortCallOutcome::Returned(Ok(ToolExecutionOutcome::RequestInput(request))) => {
+        PortCallOutcome::Returned(Ok(ToolExecutionOutcome::RequestInput(request)))
+            if request.validate().is_ok() =>
+        {
             ToolPort::RequestInput(request)
         }
+        PortCallOutcome::Returned(Ok(ToolExecutionOutcome::RequestInput(_))) => ToolPort::Failed,
         PortCallOutcome::Cancelled => ToolPort::End(FailPath::Cancelled),
         PortCallOutcome::DeadlineExceeded(DeadlineSource::Turn) => {
             ToolPort::End(FailPath::Deadline)
@@ -391,20 +393,73 @@ async fn wait_interaction(
     Ok(answer)
 }
 
+fn static_output(message: &'static str, max_bytes: usize) -> ToolOutput {
+    let value = if message.len() <= max_bytes {
+        message
+    } else {
+        ""
+    };
+
+    ToolOutput::new(value).expect("static or empty tool output fits absolute bounds")
+}
+
 fn completed_result(
     id: LoopId,
     request_index: u32,
     invocation: &ToolInvocation,
     output: ToolOutput,
+    max_output_bytes: usize,
 ) -> ToolResultHistory {
-    ToolResultHistory {
-        loop_id: id,
-        request_index,
-        call_id: invocation.tool_call_id().clone(),
-        tool_name: invocation.tool_name().clone(),
-        outcome: ToolResultOutcome::Success,
-        output,
+    if output.content().byte_len() <= max_output_bytes {
+        ToolResultHistory {
+            loop_id: id,
+            request_index,
+            call_id: invocation.tool_call_id().clone(),
+            tool_name: invocation.tool_name().clone(),
+            outcome: ToolResultOutcome::Success,
+            output,
+        }
+    } else {
+        terminal_tool_result(
+            id,
+            request_index,
+            invocation.tool_call_id(),
+            invocation.tool_name(),
+            ToolResultOutcome::Failed,
+            "tool output too large",
+            max_output_bytes,
+        )
     }
+}
+
+fn provided_input_result(
+    id: LoopId,
+    request_index: u32,
+    invocation: &ToolInvocation,
+    content: String,
+    max_output_bytes: usize,
+) -> ToolResultHistory {
+    if content.len() <= max_output_bytes {
+        if let Ok(output) = ToolOutput::new(content) {
+            return ToolResultHistory {
+                loop_id: id,
+                request_index,
+                call_id: invocation.tool_call_id().clone(),
+                tool_name: invocation.tool_name().clone(),
+                outcome: ToolResultOutcome::InputProvided,
+                output,
+            };
+        }
+    }
+    terminal_tool_result(
+        id,
+        request_index,
+        invocation.tool_call_id(),
+        invocation.tool_name(),
+        ToolResultOutcome::Failed,
+        "tool output too large",
+        max_output_bytes,
+    )
 }
 
 fn denied_result(
@@ -412,33 +467,39 @@ fn denied_result(
     request_index: u32,
     invocation: &ToolInvocation,
     reason: Option<BoundedText>,
+    max_output_bytes: usize,
 ) -> ToolResultHistory {
-    let content = reason
-        .map(|reason| reason.into_string())
-        .unwrap_or_else(|| "tool denied".to_owned());
+    let output = match reason {
+        Some(reason) if reason.byte_len() <= max_output_bytes => {
+            ToolOutput::new(reason.as_str()).expect("denial reason fits tool output bounds")
+        }
+        _ => static_output("tool denied", max_output_bytes),
+    };
     ToolResultHistory {
         loop_id: id,
         request_index,
         call_id: invocation.tool_call_id().clone(),
         tool_name: invocation.tool_name().clone(),
         outcome: ToolResultOutcome::Denied,
-        output: ToolOutput::new(content).expect("denial reason fits tool output bounds"),
+        output,
     }
 }
 
-fn invocation_terminal_result(
+pub(super) fn terminal_tool_result(
     id: LoopId,
     request_index: u32,
-    invocation: &ToolInvocation,
+    call_id: &ToolCallId,
+    tool_name: &ToolName,
     outcome: ToolResultOutcome,
-    message: &str,
+    message: &'static str,
+    max_output_bytes: usize,
 ) -> ToolResultHistory {
     ToolResultHistory {
         loop_id: id,
         request_index,
-        call_id: invocation.tool_call_id().clone(),
-        tool_name: invocation.tool_name().clone(),
+        call_id: call_id.clone(),
+        tool_name: tool_name.clone(),
         outcome,
-        output: ToolOutput::new(message).expect("terminal tool message is valid text"),
+        output: static_output(message, max_output_bytes),
     }
 }

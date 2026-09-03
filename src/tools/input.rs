@@ -113,20 +113,28 @@ impl ToolInputRequest {
     ) -> Result<Self, ToolValueError> {
         let prompt = BoundedText::new_with_max_bytes(prompt.as_ref(), 8_192)
             .map_err(|_| ToolValueError::InvalidText)?;
-        if !valid_input_text(prompt.as_str(), 8_192, false)
-            || choices.len() > 32
-            || choices
-                .iter()
-                .any(|choice| !valid_input_text(choice.as_str(), 1_024, false))
-            || (matches!(answer_kind, ToolInputAnswerKind::SingleChoice) && choices.is_empty())
-        {
-            return Err(ToolValueError::InvalidText);
-        }
-        Ok(Self {
+        let request = Self {
             prompt,
             choices,
             answer_kind,
-        })
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> Result<(), ToolValueError> {
+        if !valid_input_text(self.prompt.as_str(), 8_192, false)
+            || self.choices.len() > 32
+            || self
+                .choices
+                .iter()
+                .any(|choice| !valid_input_text(choice.as_str(), 1_024, false))
+            || (matches!(self.answer_kind, ToolInputAnswerKind::SingleChoice)
+                && self.choices.is_empty())
+        {
+            return Err(ToolValueError::InvalidText);
+        }
+        Ok(())
     }
 
     pub const fn prompt(&self) -> &BoundedText {

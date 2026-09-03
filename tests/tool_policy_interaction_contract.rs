@@ -355,3 +355,89 @@ fn policy_and_interaction_sources_are_process_local_and_owner_neutral() {
     assert!(tools.contains("pub use policy::{"));
     assert!(!tools.contains("legacy_"));
 }
+
+/// FIX-05-T06: Valid Text and SingleChoice constructors and interactions are preserved.
+#[test]
+fn valid_tool_input_constructors_and_interactions_regression() {
+    let text_req = ToolInputRequest::new("enter text", vec![], ToolInputAnswerKind::Text);
+    assert!(text_req.is_ok());
+
+    let single_choice_min = ToolInputRequest::new(
+        "choose one",
+        vec![BoundedText::new("only_choice").unwrap()],
+        ToolInputAnswerKind::SingleChoice,
+    );
+    assert!(single_choice_min.is_ok());
+
+    let boundary_choices: Vec<_> = (0..32)
+        .map(|i| BoundedText::new(format!("choice_{i}")).unwrap())
+        .collect();
+    let single_choice_max = ToolInputRequest::new(
+        "choose one",
+        boundary_choices,
+        ToolInputAnswerKind::SingleChoice,
+    );
+    assert!(single_choice_max.is_ok());
+
+    let req = single_choice_min.unwrap();
+    let valid_answer = ToolInputAnswer::Choice { index: 0 };
+    assert!(valid_answer.validate(&req).is_ok());
+
+    let text_req = text_req.unwrap();
+    let valid_text_answer = ToolInputAnswer::Text(BoundedText::new("some answer").unwrap());
+    assert!(valid_text_answer.validate(&text_req).is_ok());
+}
+
+/// FIX-05-T01..T04: Direct struct literal ToolInputRequest validation rejects invalid shapes.
+#[test]
+fn invalid_tool_input_requests_rejected_by_validate() {
+    // FIX-05-T01: SingleChoice with empty choices
+    let empty_choices_single_choice = ToolInputRequest {
+        prompt: BoundedText::new("choose").unwrap(),
+        choices: vec![],
+        answer_kind: ToolInputAnswerKind::SingleChoice,
+    };
+    assert_eq!(
+        empty_choices_single_choice.validate(),
+        Err(ToolValueError::InvalidText),
+        "SingleChoice with empty choices must be rejected"
+    );
+
+    // FIX-05-T02: Empty prompt
+    let empty_prompt = ToolInputRequest {
+        prompt: BoundedText::new("").unwrap(),
+        choices: vec![BoundedText::new("choice_1").unwrap()],
+        answer_kind: ToolInputAnswerKind::SingleChoice,
+    };
+    assert_eq!(
+        empty_prompt.validate(),
+        Err(ToolValueError::InvalidText),
+        "Empty prompt must be rejected"
+    );
+
+    // FIX-05-T03: Too many choices (33 choices > 32 max)
+    let too_many_choices = ToolInputRequest {
+        prompt: BoundedText::new("choose").unwrap(),
+        choices: (0..33)
+            .map(|i| BoundedText::new(format!("choice_{i}")).unwrap())
+            .collect(),
+        answer_kind: ToolInputAnswerKind::SingleChoice,
+    };
+    assert_eq!(
+        too_many_choices.validate(),
+        Err(ToolValueError::InvalidText),
+        "More than 32 choices must be rejected"
+    );
+
+    // FIX-05-T04: Oversized choice (1025 bytes > 1024 max)
+    let oversized_choice = ToolInputRequest {
+        prompt: BoundedText::new("choose").unwrap(),
+        choices: vec![BoundedText::new("x".repeat(1025)).unwrap()],
+        answer_kind: ToolInputAnswerKind::SingleChoice,
+    };
+    assert_eq!(
+        oversized_choice.validate(),
+        Err(ToolValueError::InvalidText),
+        "Choice exceeding 1024 bytes must be rejected"
+    );
+}

@@ -8,6 +8,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use serde_json::json;
+
 use crate::agent_loop::control::{FinishSeal, LoopControl};
 use crate::agent_loop::{
     AgentLoop, CancelReason, LoopHandle, LoopOptions, LoopOutcome, LoopReport, LoopRequest,
@@ -15,13 +17,13 @@ use crate::agent_loop::{
 };
 use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::WorkingHistory;
-use crate::ids::LoopId;
+use crate::ids::{LoopId, ToolCallId};
 use crate::limits::LoopLimits;
 use crate::model::{
     Model, ModelCallContext, ModelDescriptor, ModelError, ModelRequest, ModelStartFuture,
-    ModelStream, ReasoningPreference, Usage,
+    ModelStream, ReasoningPreference, ToolCall, Usage,
 };
-use crate::tools::ToolSet;
+use crate::tools::{ToolResultOutcome, ToolSet};
 
 use super::{FailPath, LoopCtx, finish_loop, panic_report};
 
@@ -172,4 +174,41 @@ async fn completion_is_exactly_once_and_token_cancel_is_terminal() {
     assert!(!control.mark_cancel(CancelReason::User));
     assert!(!control.mark_cancel(CancelReason::Shutdown));
     assert!(control.is_finished());
+}
+
+/// FIX-02-T05: Runner terminal tool result messages must be bounded to max_output_bytes.
+#[test]
+fn terminal_tool_result_messages_are_bounded_to_max_output_bytes() {
+    let loop_id = LoopId::new().unwrap();
+    let call = ToolCall::new(
+        ToolCallId::new("call_1").unwrap(),
+        "echo".parse().unwrap(),
+        json!({}),
+        0,
+    )
+    .unwrap();
+
+    let messages = [
+        "tool unavailable",
+        "invalid tool invocation",
+        "tool batch interrupted",
+        "tool round limit reached",
+    ];
+
+    for message in messages {
+        let result = super::tools::terminal_tool_result(
+            loop_id,
+            0,
+            call.tool_call_id(),
+            call.name(),
+            ToolResultOutcome::Failed,
+            message,
+            1,
+        );
+        assert!(
+            result.output.content().byte_len() <= 1,
+            "message '{message}' byte len {} exceeds expected max 1",
+            result.output.content().byte_len(),
+        );
+    }
 }
