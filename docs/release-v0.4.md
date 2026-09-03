@@ -11,8 +11,11 @@ and dropped the v0.3 durable session-runtime surface.
 - **v0.3 saved tag**: `v0.3.0-durable-session-runtime` (the durable
   session-runtime baseline was also preserved as commit `1492865` on this
   branch).
-- **v0.4 final HEAD**: this commit — `test(v0.4): close the flexible agent
-  loop contract` (Phase 8). Its SHA lands when the parent push is recorded.
+- **v0.4 Phase 8 base HEAD**: `f8711de` (`f8711de43ca3ce30efee5e9c121a47966e1ef1ad`).
+- **v0.4 correctness closeout code HEAD**: `8336b3c` (`8336b3cd6a256dd75e3c4ec5e216215468a32660`).
+- **v0.4 final docs/acceptance freeze**: this commit — documentation and
+  acceptance evidence freeze only (no runtime, test, or workflow changes).
+  Its SHA lands when the parent push is recorded.
 - **Branch**: `refactor/v0.4-flex-agent-loop`.
 
 ## Commit List
@@ -27,7 +30,13 @@ and dropped the v0.3 durable session-runtime surface.
 | 5 | `refactor(v0.4): remove session storage and durable conversation ownership` | `d717944` |
 | 6 | `refactor(v0.4): replace context and durable compaction with prompt providers` | `20e536a` |
 | 7 | `refactor(v0.4): converge modules around the agent loop boundary` | `ca93c58` |
-| 8 | `test(v0.4): close the flexible agent loop contract` | this commit (final HEAD) |
+| 8 | `test(v0.4): close the flexible agent loop contract` | `f8711de` |
+| closeout-1 | `fix(model): separate tool catalog size from response call limits` | `1d1e880` |
+| closeout-2 | `fix(tools): enforce loop output limits and validate input requests` | `e1c1e19` |
+| closeout-3 | `fix(loop): preserve model errors and count issued requests` | `1c4d385` |
+| closeout-4 | `fix(events): account for internal progress loss` | `e9760e0` |
+| closeout-5 | `refactor(control): release pending configs outside the control lock` | `8336b3c` |
+| closeout-6 | `docs(v0.4): close correctness findings and refresh acceptance evidence` | final docs commit |
 
 ## Deleted
 
@@ -70,7 +79,9 @@ tag and `docs/archive/` hold every v0.3-era artifact.
   `CancelReason`, `LoopOutcome(Summary)`, `LoopFailure(Kind)`,
   `ExecutionConfig`, `ConfigRevision`, `UserInput`, `HistoryItem`/`HistoryView`
   and the per-item structs, `InteractionAnswer`/`Kind`/`PendingInteraction`,
-  `LoopLimits`, `BoundedText`.
+  `LoopLimits`, `BoundedText`. `LoopFailure` exposes `model_error()` to
+  preserve structured request-level `ModelError` metadata without leaking
+  diagnostics via `Debug`.
 - **Deleted**: every session-era public type (session runtime/state/log,
   manifest, conversation, durable store, agent definitions, bindings), the
   old adapter surface, and all v0.3 aliases. No compatibility layer remains.
@@ -83,8 +94,18 @@ tag and `docs/archive/` hold every v0.3-era artifact.
   and interactions keep their contracts (see
   [`docs/contracts/model.md`](contracts/model.md) and
   [`docs/contracts/tool-policy-interaction.md`](contracts/tool-policy-interaction.md)).
+- Tool catalog size is independent from per-response `ToolCall` limits
+  (`max_tool_calls_per_response`).
+- `LoopOptions::validate` and `ModelDriver` enforce consistent upper bounds
+  on model timeouts (<= 24h) and retry delays (<= 30s).
+- All `ToolResultHistory` textual outputs are strictly bounded by
+  `max_tool_output_bytes`; oversized successes are downgraded to failures.
+- `ToolInputRequest` enforces unified validation across constructors,
+  deserialization, and runner boundaries; malformed requests fail immediately
+  without entering `WaitingForInput`.
 - The delivery-aware `ModelDriver` still retries only delivery-safe failures
-  (`MAX_MODEL_RETRY_ATTEMPTS`, driven per-loop by `LoopOptions`).
+  (`MAX_MODEL_RETRY_ATTEMPTS`, driven per-loop by `LoopOptions`). Driver
+  retries remain internal to a single logical request attempt.
 - `PromptProvider` is the new context/compaction boundary; the built-in
   `DefaultPromptProvider` projects host history strictly (see
   [`docs/contracts/prompt.md`](contracts/prompt.md)).
@@ -103,18 +124,26 @@ Nothing in the runtime persists or merges history (see
 
 - **update** — full atomic `ExecutionConfig` replacement; committed revision
   only at a true model-request issue boundary; takes effect at the next
-  request; never keeps a final alive; latest wins.
-- **steer** — appends `Steering` user items at the next request boundary;
-  bounded queue; rejected while waiting for input; the only thing that can
-  extend a final.
+  request; never keeps a final alive; latest wins; replaced or discarded
+  configs are dropped outside the control lock.
+- **steer** — accepted into process-local queue; applies as `Steering` user
+  items at the next request boundary; bounded queue; rejected while waiting
+  for input; discarded without appearing in `appended` if cancelled or shut
+  down before reaching the boundary; the only thing that can extend a final.
 - **interaction** — one pending slot; `answer` validates id and kind;
-  loop deadline and cancel still win while waiting.
+  invalid input requests fail fast; loop deadline and cancel still win while
+  waiting.
 - **event** — best-effort bounded single-consumer stream; `try_send` only;
-  `dropped_before` counts loss; events are never authoritative.
+  `dropped_before` counts event queue and internal model/tool progress queue
+  loss; events are never authoritative.
 - **cancel/final** — one `AtomicU8` CAS (`mark_cancel`/`finish_once`) plus a
   short `std::sync::Mutex` shared with update/steer/begin-final;
   exactly-once seal; `wait`/`join` return the same `Arc<LoopReport>` for the
   lifetime of the completion channel.
+- **request counting** — `LoopReport.requests` and final `request_index` count
+  at the real `RequestStarted` issue boundary; failed issued requests are
+  counted; driver-internal retries remain one logical request; no automatic
+  whole-loop retry.
 
 ## Size
 
@@ -127,29 +156,31 @@ Using raw line counts (`wc -l`, same口径 as the recorded baseline):
 
 ## Test Results (this commit, remote Linux)
 
-Full gate chain green under `/root/minicore-runtime-v04-build/phase8`:
-`./scripts/check.sh`, `./scripts/check-msrv.sh`, `cargo metadata --locked`,
-plus a live run of both examples. **203 tests pass across 13 test targets**
-(unit tests in `src/` plus the integration suites in `tests/`), all clippy
-`-D warnings` / rustdoc `-D warnings` / fmt checks pass. The new close-out
-suite adds 14 deterministic integration tests
-(`tests/p3_agent_loop_closeout.rs`) and 5 control-layer unit tests
-(`src/agent_loop/control.rs`) with zero sleeps.
+Full gate chain green under `./scripts/check.sh` and `./scripts/check-msrv.sh`.
+**271 tests pass across the repository**:
+- **246 tests in the main crate** across 69 unit tests in `src/` and 177
+  integration tests in `tests/` across 10 targets (`p1_dto.rs` (9),
+  `model_error_contract.rs` (1), `model_port_contract.rs` (7),
+  `model_driver_contract.rs` (3), `p1_value.rs` (4), `p1_v04_loop_dtos.rs` (14),
+  `p2_agent_loop.rs` (103), `p3_agent_loop_closeout.rs` (17),
+  `tool_policy_interaction_contract.rs` (8), `tool_set_contract.rs` (11)).
+- **25 tests in `provider-gate`**.
+
+All clippy `-D warnings` / rustdoc `-D warnings` / fmt / architecture checks
+pass; all tests are deterministic with no long sleeps.
 
 ## CI Status
 
 `.github/workflows/ci.yml` configures Linux (stable + Rust 1.85, full gate)
-plus native macOS and Windows `cargo test` jobs. A pre-completion run against
-this branch's work passed all four jobs — [run 33676282786](https://github.com/zqcli/minicore-runtime/actions/runs/33676282786),
-macOS / Windows / Rust stable / Rust 1.85 all success, running SHA
-`019eff1` (`019eff172fc5b66cfeef5acec78f0c62fec19867`). That run executed the
-full code and test surface.
+plus native macOS and Windows `cargo test` jobs. GitHub Actions
+[run 33750189748](https://github.com/zqcli/minicore-runtime/actions/runs/33750189748)
+passed all four jobs — macOS, Windows, Rust stable quality gate, and Rust
+1.85.0 — executing code revision `8336b3c` (`8336b3cd6a256dd75e3c4ec5e216215468a32660`).
+That run executed the complete code and test surface with all 271 tests green.
 
-The final complete amendment changes only acceptance/release metadata (the
-manifest phase and V4-063 row); it does not touch runtime or test code. The
-parent will re-run the same workflow against the final SHA, and the precise
-terminal run is reported in the final delivery answer rather than assumed
-here.
+The final documentation and acceptance freeze commit touches only
+documentation and generated acceptance metadata; it does not alter runtime,
+test, or workflow code.
 
 ## Acceptance
 

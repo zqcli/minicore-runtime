@@ -10,12 +10,17 @@ An `AgentLoop` is a single, one-shot execution. The host owns everything around 
 - Sessions are owned by the host. The runtime has no session type, no session lifecycle, and no open/load/save surface.
 - History is passed in by the host. The runtime reads `HistoryItem`s, appends its in-memory results to `LoopReport::appended`, and never persists anything.
 - `LoopReport` is saved by the host. `wait`/`join` return the same `Arc<LoopReport>`: the report stays available through the loop's completion channel for as long as the owner or any handle lives, and every waiter receives the same `Arc`.
-- Events are not authoritative. The event stream is a best-effort, bounded, single-consumer channel; dropped events are counted, never reconstructed. The report is the only authoritative outcome.
+- Events are not authoritative. The event stream is a best-effort, bounded, single-consumer channel; dropped events (including internal model/tool progress loss) are counted in `dropped_before`, never reconstructed. The report is the only authoritative outcome.
 - Tool side effects are not atomic with host logging. A tool can run successfully (with side effects) even when the host never sees the corresponding streamed event or persisted log.
-- `update` takes effect at the next model request. A config revision is committed only when a real model request is issued.
+- All tool outputs in history are bounded by `max_tool_output_bytes`. Oversized tool outputs are downgraded to failure results rather than corrupting history.
+- Tool input requests are strictly validated at the port boundary; invalid requests fail immediately as ordinary tool errors without entering `WaitingForInput`.
+- `update` takes effect at the next model request. A config revision is committed only when a real model request is issued; replaced or discarded configurations are dropped outside the control lock.
 - The current tool batch uses the snapshot of the request that produced it. A config `update` or `steer` never retroactively changes an in-flight batch.
 - `steer` takes effect at the next model request. A successful call means the steer was accepted into this process-local queue and is applied at the next request boundary; if the loop is cancelled, shut down, or the process exits before that boundary, the queued steer may be discarded and will not appear in `LoopReport::appended`. Steers queue up to `max_pending_steers` (`QueueFull`), are rejected if an interaction is pending (`WaitingForInput`) or after finalization (`NotActive`), and appear as `Steering` user items at the next request boundary.
 - A config `update` does not keep the loop alive. It only reconfigures the next request; whether the loop continues is decided by the model's final response and pending steers.
+- `LoopReport.requests` and final `request_index` count issued requests at the `RequestStarted` boundary. Failed issued requests are counted; prompt rebuilds and driver-internal retries do not increment logical request count. The runtime never automatically retries an entire loop.
+- `LoopFailure::model_error()` preserves structured `ModelError` metadata for model and invalid-response failures without leaking diagnostics via `Debug`.
+- Tool catalog size is independent from per-response `ToolCall` limits (`max_tool_calls_per_response`).
 - The Runtime needs a Tokio context. `AgentLoop::start` spawns its single runner task; call it from inside a Tokio runtime.
 
 ## Public Surface

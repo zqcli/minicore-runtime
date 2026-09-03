@@ -33,7 +33,12 @@ The runner loops:
    prompt and rebuild; `request_index` does not advance and no model request
    is issued for the stale snapshot.
 5. Issue boundary: build the `ModelRequest`, commit the candidate revision,
-   stamp `RequestStarted` with it, run the model.
+   stamp `RequestStarted` with it, increment the `requests` count and record
+   `last_issued_request_index`, then run the model. If the issued model
+   request fails, it is counted in `LoopReport.requests` and the final
+   `LoopState.request_index` matches the last issued `RequestStarted`.
+   Driver-internal retries execute within that single logical request; the
+   runtime does not perform automatic whole-loop retries.
 6. On a response with tool calls, execute the tool batch pinned to the
    snapshot of the producing request; then loop back.
 7. On a no-tool-call `Stop`, run the final-seal decision (below) and end.
@@ -48,6 +53,10 @@ The runner loops:
   between keeps the last issued revision.
 - A pending config update **does not** keep the loop alive: a final response
   with no pending steers seals even if an update is queued.
+- Displaced configurations (from a replacing `update` or discarded during
+  `begin_final`/`finish_once`) are dropped outside the `control` mutex,
+  ensuring external capabilities and providers do not execute drop logic
+  while holding the lock.
 
 ## Steering
 
@@ -73,6 +82,13 @@ The runner loops:
 - A failed inner port (model/prompt/policy/tool) maps to a `LoopOutcome:
   Failed(LoopFailure { kind, diagnostic })`; cancellation maps to
   `Cancelled(CancelReason)`.
+- For `Model` and `InvalidModelResponse` failures, `LoopFailure::model_error()`
+  preserves the original structured request-level `ModelError` (kind, delivery
+  outcome, and retry hint). Non-model failures return `None`. `LoopFailure`'s
+  derived `Debug` representation (via `DiagnosticSummary` and `ModelError`)
+  omits the diagnostic message to avoid leaking prompt or payload details.
+  Preserving `ModelError` provides diagnostic fidelity for host decisions
+  and does not imply that the loop can or should be automatically retried.
 
 ## Determinism of Control
 

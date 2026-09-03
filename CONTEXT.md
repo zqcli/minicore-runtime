@@ -31,19 +31,34 @@ library type.
 - Completion is owned by the runner task; its drop surfaces as
   `LoopWaitError::CompletionClosed` to waiters.
 - Update/steer and the final seal linearize on one short `std::sync::Mutex`;
-  cancel/finish use a single `AtomicU8` single-CAS state machine.
-- Revision commits happen only at a true issue boundary; a config update
-  never extends a final; a pending config alone never keeps the loop alive.
+  cancel/finish use a single `AtomicU8` single-CAS state machine; replaced or
+  discarded `ExecutionConfig` instances are dropped outside the mutex.
+- Revision commits and `LoopReport.requests` accounting happen at the real
+  `RequestStarted` issue boundary; failed issued requests are counted while
+  stale rebuilds are not; driver-internal retries remain one logical request.
+- `LoopFailure::model_error()` preserves structured request-level `ModelError`
+  for model/invalid-response failures; this does not indicate whole-loop auto-retry.
+- Tool outputs in history are bounded by `max_tool_output_bytes`; invalid tool
+  input requests fail fast without entering `WaitingForInput`.
+- Internal model and tool progress queue drops are merged into `dropped_before`.
+- Steer accepted means queued in the process-local queue for the next request
+  boundary; cancelled/shutdown loops may discard queued steers without appending them.
+- Tool catalog size is independent from per-response `ToolCall` limits.
 - MSRV is 1.85; production code forbids `unsafe`; no async mutex, no
   `parking_lot`.
+- Negative scope preserved: no session runtime, no session logs/manifests,
+  no durable store, no whole-loop auto-retry, no ACK/replay event stream.
 
 ## Gates
 
 `./scripts/check.sh` (main crate fmt/test all-targets all-features/clippy
 `-D warnings`/rustdoc `-D warnings`, provider-gate fmt/test/clippy,
 `check_docs.py`, `check_v04_architecture.py`, git diff/show checks) and
-`./scripts/check-msrv.sh` must stay green. Phase 8 (test work and migration
-docs close-out, acceptance/release) is the only remaining plan item.
+`./scripts/check-msrv.sh` must stay green. The v0.4 reset is complete with
+the correctness closeout applied across five code commits (`1d1e880`, `e1c1e19`,
+`1c4d385`, `e9760e0`, `8336b3c`). All 271 tests (246 in main crate across
+69 unit and 10 integration targets, 25 in provider-gate) and GitHub Actions
+CI run 33750189748 pass.
 
 ## Authority
 
