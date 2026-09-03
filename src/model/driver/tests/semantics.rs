@@ -79,7 +79,7 @@ async fn eof_with_open_tool_and_provider_tool_count_overflow_are_rejected() {
     assert_eq!(error.delivery(), DeliveryState::Started);
 
     let limits = SemanticLimits {
-        max_tool_count: 1,
+        max_tool_calls_per_response: 1,
         ..SemanticLimits::default()
     };
     let first = call_id(24);
@@ -164,4 +164,101 @@ async fn refused_and_filtered_require_nonempty_text_not_reasoning_only() {
         assert_eq!(error.kind(), ModelErrorKind::InvalidProviderResponse);
         assert_eq!(error.delivery(), DeliveryState::Started);
     }
+}
+
+/// FIX-01-T01: Multiple tool specs configured, max tool calls per response is 1,
+/// model response emits text only, Model::start is called exactly once and succeeds.
+#[tokio::test(flavor = "current_thread")]
+async fn multiple_tool_specs_allow_text_response_when_limit_is_one() {
+    let limits = SemanticLimits {
+        max_tool_calls_per_response: 1,
+        ..SemanticLimits::default()
+    };
+    let model = ScriptModel::new(descriptor(), vec![Behavior::Events(text_success("done"))]);
+    let driver = model.driver(&limits_kernel(limits));
+    let (progress, _receiver) = progress_channel();
+    let request = request_with(
+        ReasoningPreference::High,
+        vec![tool_spec("lookup"), tool_spec("search")],
+        Some(64),
+    );
+    let response = driver
+        .run(
+            request,
+            context(CancellationToken::new(), Duration::from_secs(30)),
+            &progress,
+        )
+        .await
+        .expect("multiple tool specs should not be rejected when max tool calls per response is 1");
+    assert_text(&response, "done");
+    assert_eq!(model.starts(), 1);
+}
+
+/// FIX-01-T02: Multiple tool specs configured, max tool calls per response is 1,
+/// model response emits a single tool call and succeeds.
+#[tokio::test(flavor = "current_thread")]
+async fn multiple_tool_specs_allow_single_tool_call_when_limit_is_one() {
+    let id = call_id(30);
+    let limits = SemanticLimits {
+        max_tool_calls_per_response: 1,
+        ..SemanticLimits::default()
+    };
+    let request = request_with(
+        ReasoningPreference::High,
+        vec![tool_spec("lookup"), tool_spec("search")],
+        Some(64),
+    );
+    let response = run_events(
+        request,
+        vec![
+            Ok(start(id.clone(), "lookup")),
+            Ok(args(id.clone(), "{\"query\":\"rust\"}")),
+            Ok(end(id.clone())),
+            Ok(finish(ModelFinishReason::ToolCalls)),
+        ],
+        limits_kernel(limits),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.finish_reason(), ModelFinishReason::ToolCalls);
+    assert!(matches!(
+        response.parts(),
+        [AssistantPart::ToolCall(call)]
+            if call.tool_call_id() == &id
+                && call.call_index() == 0
+                && call.arguments() == &json!({"query": "rust"})
+    ));
+}
+
+/// FIX-01-T03: Multiple tool specs configured, max tool calls per response is 1,
+/// model response emits two tool calls and is rejected by the assembler as InvalidProviderResponse.
+#[tokio::test(flavor = "current_thread")]
+async fn multiple_tool_specs_reject_second_tool_call_when_limit_is_one() {
+    let limits = SemanticLimits {
+        max_tool_calls_per_response: 1,
+        ..SemanticLimits::default()
+    };
+    let first = call_id(31);
+    let second = call_id(32);
+    let request = request_with(
+        ReasoningPreference::High,
+        vec![tool_spec("lookup"), tool_spec("search")],
+        Some(64),
+    );
+    let error = run_events(
+        request,
+        vec![
+            Ok(start(first.clone(), "lookup")),
+            Ok(args(first.clone(), "{}")),
+            Ok(end(first)),
+            Ok(start(second, "search")),
+        ],
+        limits_kernel(limits),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.kind(), ModelErrorKind::InvalidProviderResponse);
+    assert_eq!(error.delivery(), DeliveryState::Started);
 }

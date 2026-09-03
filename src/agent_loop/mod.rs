@@ -10,7 +10,7 @@ use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::{HistoryItem, estimate_history_bytes};
 use crate::ids::LoopId;
 use crate::limits::LoopLimits;
-use crate::model::Usage;
+use crate::model::{MAX_MODEL_CALL_TIMEOUT, MAX_MODEL_RETRY_DELAY, Usage};
 
 mod control;
 mod event;
@@ -75,11 +75,13 @@ impl LoopOptions {
             || !(1..=MAX_EVENT_CAPACITY).contains(&self.event_capacity)
             || self.prompt_timeout.is_zero()
             || self.model_timeout.is_zero()
+            || self.model_timeout > MAX_MODEL_CALL_TIMEOUT
             || self.policy_timeout.is_zero()
             || self.tool_timeout.is_zero()
             || self.model_retry_attempts == 0
             || self.model_retry_attempts > MAX_MODEL_RETRY_ATTEMPTS
             || self.model_retry_base_delay.is_zero()
+            || self.model_retry_base_delay > MAX_MODEL_RETRY_DELAY
             || self
                 .deadline
                 .is_some_and(|deadline| deadline <= tokio::time::Instant::now())

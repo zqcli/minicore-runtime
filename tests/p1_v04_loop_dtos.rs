@@ -309,6 +309,22 @@ fn loop_options_default_checked_and_rejects_out_of_bounds_fields() {
             .unwrap(),
     );
     assert_eq!(invalid.validate(), Err(LoopStartError::InvalidOptions));
+
+    let mut boundary = options.clone();
+    boundary.model_timeout = Duration::from_secs(24 * 60 * 60);
+    assert!(boundary.validate().is_ok());
+
+    let mut invalid = options.clone();
+    invalid.model_timeout = Duration::from_secs(24 * 60 * 60 + 1);
+    assert_eq!(invalid.validate(), Err(LoopStartError::InvalidOptions));
+
+    let mut boundary = options.clone();
+    boundary.model_retry_base_delay = Duration::from_secs(30);
+    assert!(boundary.validate().is_ok());
+
+    let mut invalid = options.clone();
+    invalid.model_retry_base_delay = Duration::from_secs(31);
+    assert_eq!(invalid.validate(), Err(LoopStartError::InvalidOptions));
 }
 
 #[test]

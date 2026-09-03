@@ -26,8 +26,8 @@ use failure::{
     wait_for_retry,
 };
 
-const MAX_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+pub(crate) const MAX_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+pub(crate) const MAX_MODEL_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(crate) struct ModelDriverConfig {
@@ -38,7 +38,7 @@ pub(crate) struct ModelDriverConfig {
 
 #[derive(Clone)]
 pub(crate) struct SemanticLimitsSnapshot {
-    max_tool_count: usize,
+    max_tool_calls_per_response: usize,
     max_tool_name_bytes: usize,
     max_tool_schema_bytes: usize,
     max_tool_input_bytes: usize,
@@ -64,14 +64,14 @@ impl ModelDriverConfig {
         !self.model_call_timeout.is_zero()
             && self.model_call_timeout <= MAX_MODEL_CALL_TIMEOUT
             && (1..=4).contains(&self.retry_policy.max_attempts)
-            && self.retry_policy.base_delay <= MAX_RETRY_DELAY
+            && self.retry_policy.base_delay <= MAX_MODEL_RETRY_DELAY
             && self.limits.valid()
     }
 }
 
 impl SemanticLimitsSnapshot {
     pub(crate) fn from_kernel_values(
-        max_tool_count: usize,
+        max_tool_calls_per_response: usize,
         max_tool_name_bytes: usize,
         max_tool_schema_bytes: usize,
         max_tool_input_bytes: usize,
@@ -79,7 +79,7 @@ impl SemanticLimitsSnapshot {
         max_model_reasoning_bytes_per_round: usize,
     ) -> Self {
         Self {
-            max_tool_count,
+            max_tool_calls_per_response,
             max_tool_name_bytes,
             max_tool_schema_bytes,
             max_tool_input_bytes,
@@ -89,7 +89,7 @@ impl SemanticLimitsSnapshot {
     }
 
     fn valid(&self) -> bool {
-        (1..=4_096).contains(&self.max_tool_count)
+        (1..=4_096).contains(&self.max_tool_calls_per_response)
             && (1..=64).contains(&self.max_tool_name_bytes)
             && (1..=MAX_JSON_BYTES).contains(&self.max_tool_schema_bytes)
             && (1..=MAX_JSON_BYTES).contains(&self.max_tool_input_bytes)
@@ -239,9 +239,7 @@ impl ModelDriver {
         if !self.descriptor.supports_reasoning(request.reasoning()) {
             return Err(invalid());
         }
-        if request.tools().len() > self.limits.max_tool_count
-            || (!request.tools().is_empty() && !self.descriptor.supports_tools)
-        {
+        if !request.tools().is_empty() && !self.descriptor.supports_tools {
             return Err(invalid());
         }
         if request

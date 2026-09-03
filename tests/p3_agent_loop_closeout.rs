@@ -1157,3 +1157,86 @@ async fn wait_for_request(events: &mut minicore_runtime::LoopEventStream, index:
     }
     panic!("loop ended before request {index}");
 }
+
+/// FIX-01-T04: Registering multiple tools succeeds in AgentLoop when max_tool_calls_per_response is 1.
+#[tokio::test]
+async fn loop_completes_with_multiple_registered_tools_under_single_call_limit() {
+    let mut builder = ToolSet::builder();
+    builder.register(RecordingTool {
+        spec: ToolSpec::new(
+            "lookup".parse().unwrap(),
+            "lookup tool",
+            json!({"type": "object"}),
+        )
+        .unwrap(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+        behavior: ToolBehavior::Succeed,
+    });
+    builder.register(RecordingTool {
+        spec: ToolSpec::new(
+            "search".parse().unwrap(),
+            "search tool",
+            json!({"type": "object"}),
+        )
+        .unwrap(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+        behavior: ToolBehavior::Succeed,
+    });
+    let tools = builder.build().unwrap();
+
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.limits.max_tool_calls_per_response = 1;
+
+    let agent = start_with(
+        request(config(
+            model(vec![Round::Final { text: "completed" }]),
+            tools,
+            None,
+        )),
+        options,
+    )
+    .unwrap();
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.requests, 1);
+}
+
+/// FIX-01-T05: Model timeout exceeding 24 hours fails in AgentLoop::start.
+#[tokio::test]
+async fn loop_rejects_model_timeout_exceeding_maximum_on_start() {
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.model_timeout = Duration::from_secs(24 * 60 * 60 + 1);
+
+    let result = start_with(
+        request(config(
+            model(vec![Round::Final { text: "completed" }]),
+            ToolSet::default(),
+            None,
+        )),
+        options,
+    );
+    let Err(error) = result else {
+        panic!("loop start unexpectedly succeeded with model timeout exceeding 24 hours");
+    };
+    assert_eq!(error, LoopStartError::InvalidOptions);
+}
+
+/// FIX-01-T06: Model retry base delay exceeding 30 seconds fails in AgentLoop::start.
+#[tokio::test]
+async fn loop_rejects_model_retry_delay_exceeding_maximum_on_start() {
+    let mut options = LoopOptions::default_checked().unwrap();
+    options.model_retry_base_delay = Duration::from_secs(31);
+
+    let result = start_with(
+        request(config(
+            model(vec![Round::Final { text: "completed" }]),
+            ToolSet::default(),
+            None,
+        )),
+        options,
+    );
+    let Err(error) = result else {
+        panic!("loop start unexpectedly succeeded with retry delay exceeding 30 seconds");
+    };
+    assert_eq!(error, LoopStartError::InvalidOptions);
+}

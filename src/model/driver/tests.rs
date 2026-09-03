@@ -62,7 +62,7 @@ impl RetryPolicy {
 
 #[derive(Clone)]
 struct SemanticLimits {
-    max_tool_count: usize,
+    max_tool_calls_per_response: usize,
     max_tool_name_bytes: usize,
     max_tool_schema_bytes: usize,
     max_tool_input_bytes: usize,
@@ -73,7 +73,7 @@ struct SemanticLimits {
 impl Default for SemanticLimits {
     fn default() -> Self {
         Self {
-            max_tool_count: 64,
+            max_tool_calls_per_response: 64,
             max_tool_name_bytes: 64,
             max_tool_schema_bytes: crate::value::MAX_JSON_BYTES,
             max_tool_input_bytes: crate::value::MAX_JSON_BYTES,
@@ -178,7 +178,7 @@ fn driver_config(kernel: &KernelConfig) -> ModelDriverConfig {
         kernel.retry_policy.max_attempts(),
         kernel.retry_policy.base_delay(),
         SemanticLimitsSnapshot::from_kernel_values(
-            kernel.limits.max_tool_count,
+            kernel.limits.max_tool_calls_per_response,
             kernel.limits.max_tool_name_bytes,
             kernel.limits.max_tool_schema_bytes,
             kernel.limits.max_tool_input_bytes,
