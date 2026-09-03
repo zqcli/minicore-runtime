@@ -252,6 +252,35 @@ async fn run_loop_inner(
             break FailPath::Internal;
         }
 
+        let tool_calls: Vec<_> = response
+            .parts()
+            .iter()
+            .filter_map(|part| part.as_tool_call())
+            .collect();
+        let no_tool_finish = if tool_calls.is_empty() {
+            match response.finish_reason() {
+                ModelFinishReason::Stop => Some(FailPath::Completed),
+                ModelFinishReason::Length => Some(FailPath::OutputLimit),
+                ModelFinishReason::Refused => Some(FailPath::Refused),
+                ModelFinishReason::ContentFiltered => Some(FailPath::ContentFiltered),
+                ModelFinishReason::Unknown | ModelFinishReason::ToolCalls => {
+                    // An unsupported finish without tool calls is detected
+                    // before the response ever enters Assistant history.
+                    break FailPath::InvalidModelResponse(ModelError::started(
+                        crate::model::ModelErrorKind::InvalidProviderResponse,
+                        DiagnosticSummary::bounded_static(
+                            DiagnosticCode::ModelMalformedResponse,
+                            DiagnosticCategory::Model,
+                            "model returned an invalid response",
+                            false,
+                        ),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         working.append_assistant(AssistantHistory {
             loop_id: id,
             request_index,
@@ -262,29 +291,7 @@ async fn run_loop_inner(
             usage: round_usage,
         });
 
-        let tool_calls: Vec<_> = response
-            .parts()
-            .iter()
-            .filter_map(|part| part.as_tool_call())
-            .collect();
-        if tool_calls.is_empty() {
-            let path = match response.finish_reason() {
-                ModelFinishReason::Stop => FailPath::Completed,
-                ModelFinishReason::Length => FailPath::OutputLimit,
-                ModelFinishReason::ContentFiltered => FailPath::ContentFiltered,
-                ModelFinishReason::Refused => FailPath::Refused,
-                ModelFinishReason::Unknown | ModelFinishReason::ToolCalls => {
-                    FailPath::InvalidModelResponse(ModelError::started(
-                        crate::model::ModelErrorKind::InvalidProviderResponse,
-                        DiagnosticSummary::bounded_static(
-                            DiagnosticCode::ModelMalformedResponse,
-                            DiagnosticCategory::Model,
-                            "model returned an invalid response",
-                            false,
-                        ),
-                    ))
-                }
-            };
+        if let Some(path) = no_tool_finish {
             if path == FailPath::Completed {
                 // Final-seal race (spec 20.6): steer/update and this seal
                 // decision linearize on the same mutex. A steer accepted

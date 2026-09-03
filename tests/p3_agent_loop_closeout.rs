@@ -22,9 +22,9 @@ use tokio::sync::Notify;
 
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use minicore_runtime::model::{
-    Model, ModelCallContext, ModelDescriptor, ModelError, ModelErrorKind, ModelEvent,
-    ModelFinishReason, ModelMessage, ModelRequest, ModelStartFuture, ModelStream,
-    ReasoningPreference,
+    AssistantPart, Model, ModelCallContext, ModelDescriptor, ModelError, ModelErrorKind,
+    ModelEvent, ModelFinishReason, ModelMessage, ModelRequest, ModelStartFuture, ModelStream,
+    ReasoningPreference, Usage,
 };
 use minicore_runtime::prompt::{
     PreparedPrompt, PromptError, PromptFuture, PromptProvider, PromptRequest,
@@ -37,7 +37,7 @@ use minicore_runtime::tools::{
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{
     AgentLoop, AnswerError, ConfigRevision, ExecutionConfig, HistoryItem, InteractionAnswer,
-    LoopEvent, LoopFailureKind, LoopOptions, LoopOutcome, LoopRequest, LoopStartError,
+    LoopEvent, LoopFailureKind, LoopOptions, LoopOutcome, LoopReport, LoopRequest, LoopStartError,
     OutputChannel, ToolCallId, UserHistory, UserInput, UserMessageKind,
 };
 
@@ -883,6 +883,183 @@ async fn partial_stream_failure_is_a_model_failure_without_an_assistant_item() {
             .iter()
             .all(|item| !matches!(item, HistoryItem::Assistant(_)))
     );
+}
+
+fn assistant_texts(report: &LoopReport) -> Vec<&str> {
+    report
+        .appended
+        .iter()
+        .filter_map(|item| match item {
+            HistoryItem::Assistant(assistant) => Some(assistant),
+            _ => None,
+        })
+        .flat_map(|assistant| {
+            assistant.content.iter().filter_map(|part| match part {
+                AssistantPart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+async fn run_malformed(events: Vec<ModelEvent>) -> Arc<LoopReport> {
+    start_with(
+        request(config(
+            model(vec![Round::Malformed { events }]),
+            ToolSet::default(),
+            None,
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap()
+    .join()
+    .await
+    .unwrap()
+}
+
+/// An Unknown finish with no tool calls is an invalid model response. The
+/// streamed text never becomes Assistant history; the report keeps only the
+/// loop's own prompt, while the issued request's usage is still counted.
+#[tokio::test]
+async fn unknown_finish_without_tool_call_fails_without_assistant_history() {
+    let usage = Usage::new(12, 8, 4);
+    let report = run_malformed(vec![
+        ModelEvent::text_delta("invalid").unwrap(),
+        ModelEvent::Usage { usage },
+        ModelEvent::Finish {
+            reason: ModelFinishReason::Unknown,
+        },
+    ])
+    .await;
+    assert_eq!(report.requests, 1);
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(failure.kind, LoopFailureKind::InvalidModelResponse);
+            let model_error = failure
+                .model_error()
+                .expect("invalid model response carries a model error");
+            assert_eq!(model_error.kind(), ModelErrorKind::InvalidProviderResponse);
+        }
+        other => panic!("expected InvalidModelResponse, got {other:?}"),
+    }
+    let user_texts: Vec<String> = report
+        .appended
+        .iter()
+        .filter_map(|item| match item {
+            HistoryItem::User(user) => Some(user.input.as_text().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(user_texts, vec!["hello"], "the loop's own prompt is kept");
+    assert!(
+        report
+            .appended
+            .iter()
+            .all(|item| !matches!(item, HistoryItem::Assistant(_))),
+        "an invalid response must never enter Assistant history"
+    );
+    assert!(
+        report
+            .appended
+            .iter()
+            .all(|item| !matches!(item, HistoryItem::ToolResult(_)))
+    );
+    assert_eq!(report.usage, usage);
+}
+
+/// A ToolCalls finish with no tool call is rejected by the assembler before
+/// history is written. Regression guard: this path was already invalid, so it
+/// must stay that way.
+#[tokio::test]
+async fn tool_calls_finish_without_tool_call_is_invalid_and_not_appended() {
+    let report = run_malformed(vec![
+        ModelEvent::text_delta("stray").unwrap(),
+        ModelEvent::Finish {
+            reason: ModelFinishReason::ToolCalls,
+        },
+    ])
+    .await;
+    assert_eq!(report.requests, 1);
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(failure.kind, LoopFailureKind::InvalidModelResponse)
+        }
+        other => panic!("expected InvalidModelResponse, got {other:?}"),
+    }
+    assert!(
+        report
+            .appended
+            .iter()
+            .all(|item| !matches!(item, HistoryItem::Assistant(_))),
+        "an invalid response must never enter Assistant history"
+    );
+}
+
+/// Stop finishes the loop Completed and keeps the full text in Assistant
+/// history.
+#[tokio::test]
+async fn stop_finish_completes_and_keeps_the_assistant_text() {
+    let report = run_malformed(vec![
+        ModelEvent::text_delta("done").unwrap(),
+        ModelEvent::Finish {
+            reason: ModelFinishReason::Stop,
+        },
+    ])
+    .await;
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.requests, 1);
+    assert_eq!(assistant_texts(&report), vec!["done"]);
+}
+
+/// A Length finish fails as OutputLimit but keeps the partial text in
+/// Assistant history.
+#[tokio::test]
+async fn length_finish_fails_as_output_limit_and_keeps_assistant_text() {
+    let report = run_malformed(vec![
+        ModelEvent::text_delta("truncated").unwrap(),
+        ModelEvent::Finish {
+            reason: ModelFinishReason::Length,
+        },
+    ])
+    .await;
+    assert_eq!(report.requests, 1);
+    match &report.outcome {
+        LoopOutcome::Failed(failure) => {
+            assert_eq!(failure.kind, LoopFailureKind::OutputLimit)
+        }
+        other => panic!("expected OutputLimit, got {other:?}"),
+    }
+    assert_eq!(assistant_texts(&report), vec!["truncated"]);
+}
+
+/// Refused and ContentFiltered finishes map to their own failure kinds and
+/// keep the full Assistant text.
+#[tokio::test]
+async fn refused_and_content_filtered_finishes_keep_their_kinds_and_assistant_text() {
+    for (reason, text, expected_kind) in [
+        (
+            ModelFinishReason::Refused,
+            "refused",
+            LoopFailureKind::Refused,
+        ),
+        (
+            ModelFinishReason::ContentFiltered,
+            "filtered",
+            LoopFailureKind::ContentFiltered,
+        ),
+    ] {
+        let report = run_malformed(vec![
+            ModelEvent::text_delta(text).unwrap(),
+            ModelEvent::Finish { reason },
+        ])
+        .await;
+        assert_eq!(report.requests, 1);
+        match &report.outcome {
+            LoopOutcome::Failed(failure) => assert_eq!(failure.kind, expected_kind),
+            other => panic!("expected {expected_kind:?}, got {other:?}"),
+        }
+        assert_eq!(assistant_texts(&report), vec![text]);
+    }
 }
 
 /// FIX-06-T05: The delivery-aware driver retries at the loop level: a first NotStarted
