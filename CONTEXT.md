@@ -56,8 +56,8 @@ library type.
 `check_docs.py`, `check_v04_architecture.py`, git diff/show checks) and
 `./scripts/check-msrv.sh` must stay green. The v0.4 reset is complete with
 the correctness closeout applied across five code commits (`1d1e880`, `e1c1e19`,
-`1c4d385`, `e9760e0`, `8336b3c`). The current suite is 276 tests (251 in main
-crate across 69 unit and 182 integration tests across 10 targets, plus 25 in
+`1c4d385`, `e9760e0`, `8336b3c`). The current suite is 278 tests (253 in main
+crate across 69 unit and 184 integration tests across 10 targets, plus 25 in
 provider-gate). GitHub Actions CI run 33750189748 is the historical
 code-closeout run and passed the then-current closeout suite.
 

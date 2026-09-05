@@ -15,7 +15,8 @@ use tokio_util::sync::CancellationToken;
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use minicore_runtime::model::{
     AssistantPart, Model, ModelCallContext, ModelDescriptor, ModelError, ModelErrorKind,
-    ModelFinishReason, ModelMessage, ModelRequest, ModelStartFuture, ReasoningPreference, Usage,
+    ModelFinishReason, ModelLimits, ModelMessage, ModelRequest, ModelStartFuture,
+    ReasoningPreference, Usage,
 };
 use minicore_runtime::prompt::{
     PreparedPrompt, PromptError, PromptFuture, PromptProvider, PromptRequest,
@@ -27,9 +28,9 @@ use minicore_runtime::tools::{
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{
     AssistantHistory, CancelReason, ConfigRevision, ExecutionConfig, ExecutionConfigError,
-    HistoryItem, HistoryView, LoopId, LoopLimits, LoopLimitsError, LoopOptions, LoopOutcome,
-    LoopReport, LoopStartError, SummaryHistory, ToolCallId, ToolResultHistory, UserHistory,
-    UserInput, UserMessageKind,
+    HistoryItem, HistoryView, LoopEvent, LoopId, LoopLimits, LoopLimitsError, LoopOptions,
+    LoopOutcome, LoopReport, LoopStartError, SummaryHistory, ToolCallId, ToolResultHistory,
+    UserHistory, UserInput, UserMessageKind,
 };
 
 struct FakeModel {
@@ -336,6 +337,108 @@ fn config_revision_is_initial_zero_and_round_trips() {
         serde_json::from_str::<ConfigRevision>(&json).unwrap(),
         ConfigRevision::new(7)
     );
+}
+
+#[test]
+fn extended_reasoning_preferences_have_exact_wire_names_and_order() {
+    let values = [
+        (ReasoningPreference::XHigh, "xhigh"),
+        (ReasoningPreference::Max, "max"),
+        (ReasoningPreference::Ultra, "ultra"),
+    ];
+    for (preference, wire) in values {
+        let encoded = serde_json::to_string(&preference).unwrap();
+        assert_eq!(encoded, format!("\"{wire}\""));
+        assert_eq!(
+            serde_json::from_str::<ReasoningPreference>(&encoded).unwrap(),
+            preference
+        );
+    }
+
+    let ordered = [
+        ReasoningPreference::Auto,
+        ReasoningPreference::Disabled,
+        ReasoningPreference::Low,
+        ReasoningPreference::Medium,
+        ReasoningPreference::High,
+        ReasoningPreference::XHigh,
+        ReasoningPreference::Max,
+        ReasoningPreference::Ultra,
+    ];
+    assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+#[test]
+fn extended_reasoning_preferences_flow_through_runtime_boundaries() {
+    let preferences = [
+        ReasoningPreference::XHigh,
+        ReasoningPreference::Max,
+        ReasoningPreference::Ultra,
+    ];
+    let model = text_model(&preferences, false);
+    let loop_id = LoopId::new().unwrap();
+
+    for preference in preferences {
+        assert!(model.descriptor().supported_reasoning.contains(&preference));
+        let config = ExecutionConfig::new(
+            Arc::clone(&model),
+            preference,
+            ToolSet::default(),
+            None,
+            Arc::new(CapturingPrompt { system: None }),
+        )
+        .unwrap();
+        assert_eq!(config.reasoning(), preference);
+
+        let request = ModelRequest::new(
+            vec![ModelMessage::user("request").unwrap()],
+            Vec::new(),
+            ModelLimits::default(),
+            config.reasoning(),
+        )
+        .unwrap();
+        assert_eq!(request.reasoning(), preference);
+        let request_wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            request_wire["reasoning"],
+            serde_json::to_value(preference).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_value::<ModelRequest>(request_wire).unwrap(),
+            request
+        );
+
+        let history = HistoryItem::Assistant(AssistantHistory {
+            loop_id,
+            request_index: 0,
+            model: "fake/text-model".parse().unwrap(),
+            reasoning: preference,
+            content: vec![AssistantPart::Text("done".into())],
+            finish_reason: ModelFinishReason::Stop,
+            usage: Usage::new(1, 2, 0),
+        });
+        let history_wire = serde_json::to_value(&history).unwrap();
+        assert_eq!(
+            history_wire["data"]["reasoning"],
+            serde_json::to_value(preference).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_value::<HistoryItem>(history_wire).unwrap(),
+            history
+        );
+
+        let event = LoopEvent::RequestStarted {
+            loop_id,
+            request_index: 0,
+            config_revision: ConfigRevision::INITIAL,
+            model: "fake/text-model".parse().unwrap(),
+            reasoning: preference,
+        };
+        assert!(matches!(
+            event,
+            LoopEvent::RequestStarted { reasoning, .. } if reasoning == preference
+        ));
+    }
 }
 
 #[test]
