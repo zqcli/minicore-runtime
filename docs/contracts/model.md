@@ -18,6 +18,9 @@ pub trait Model: Send + Sync + 'static {
   support) is validated at `ExecutionConfig::new`; a model that claims no
   reasoning or zero context window is rejected, and a tool set with any tool
   requires `supports_tools`.
+- `ReasoningPreference` is ordered as `Auto`, `Disabled`, `Low`, `Medium`,
+  `High`, `XHigh`, `Max`, `Ultra`, and its serde wire values are respectively
+  `auto`, `disabled`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
 
 ## Request Semantics
 

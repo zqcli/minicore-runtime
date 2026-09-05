@@ -12,7 +12,7 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 | `model_port_contract.rs` | 7 | model port wire / error contracts |
 | `model_driver_contract.rs` | 3 | driver delivery-state contracts |
 | `p1_value.rs` | 4 | bounded value types and validation |
-| `p1_v04_loop_dtos.rs` | 14 | loop history, `ExecutionConfig`, `PromptProvider`, `LoopReport` DTOs |
+| `p1_v04_loop_dtos.rs` | 16 | loop history, `ExecutionConfig`, `PromptProvider`, `LoopReport` DTOs |
 | `p2_agent_loop.rs` | 103 | the flexible agent-loop contract end to end: output bounding, model error preservation, request issue accounting, and progress drop loss |
 | `p3_agent_loop_closeout.rs` | 22 | Phase 8 close-out and correctness fixes: catalog/per-response call limits, timeout/retry bounds, reasoning channels, event-free runs, multi-batch cancel, repeated answers, policy snapshot swaps, history limits, delta-only reports, malformed responses, invalid no-tool finish, loop-level retry, shared-resource isolation, steer-survives-prompt-failure |
 | `tool_policy_interaction_contract.rs` | 8 | policy decisions, interaction DTO contracts, and ToolInputRequest validation |
@@ -28,7 +28,7 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
   - `src/time.rs` (4 tests): monotonic clock and timeout math.
   - `src/port_call.rs` (9 tests): port call execution and timeout isolation.
 
-Total test volume: **251 tests** in the main crate (69 unit + 182 integration across 10 targets); **25 tests** in `provider-gate`; **276 tests** total across the repository.
+Total test volume: **253 tests** in the main crate (69 unit + 184 integration across 10 targets); **25 tests** in `provider-gate`; **278 tests** total across the repository.
 
 ## Contract Coverage (`tests/p2_agent_loop.rs` + `tests/p3_agent_loop_closeout.rs`)
 
