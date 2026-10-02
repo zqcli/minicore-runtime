@@ -670,6 +670,32 @@ async fn sequential_tool_calls_execute_in_order() {
 }
 
 #[tokio::test]
+async fn default_tool_rounds_continue_past_legacy_limit() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut rounds: Vec<_> = (0..40)
+        .map(|_| Round::Tools {
+            calls: vec![("echo", "call_1")],
+        })
+        .collect();
+    rounds.push(Round::Final { text: "done" });
+    let (model, _) = scripted_model(rounds);
+    let options = LoopOptions::default_checked().unwrap();
+    assert_eq!(options.max_tool_rounds, 0);
+    let agent = AgentLoop::start(
+        request(config(
+            model,
+            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
+            None,
+        )),
+        options,
+    )
+    .unwrap();
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(calls.lock().unwrap().len(), 40);
+}
+
+#[tokio::test]
 async fn max_tool_rounds_ends_with_failed_budget_and_complete_results() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![
@@ -714,6 +740,57 @@ async fn max_tool_rounds_ends_with_failed_budget_and_complete_results() {
         !tool_results.is_empty(),
         "round-limit calls receive results"
     );
+}
+
+#[tokio::test]
+async fn second_prompt_reports_starting_and_cancel_settles() {
+    struct HoldSecondPrompt(Arc<Notify>);
+    impl PromptProvider for HoldSecondPrompt {
+        fn prepare<'a>(&'a self, request: PromptRequest<'a>) -> PromptFuture<'a> {
+            Box::pin(async move {
+                if request.request_index == 1 {
+                    self.0.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                DefaultPromptProvider::new(None).prepare(request).await
+            })
+        }
+    }
+
+    let entered = Arc::new(Notify::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (model, _) = scripted_model(vec![Round::Tools {
+        calls: vec![("echo", "call_1")],
+    }]);
+    let agent = AgentLoop::start(
+        request(config_full(
+            model,
+            ReasoningPreference::Auto,
+            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
+            None,
+            Arc::new(HoldSecondPrompt(Arc::clone(&entered))),
+        )),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let handle = agent.handle();
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(handle.state().status, LoopStatus::Starting);
+    assert_eq!(handle.state().request_index, 1);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert!(handle.cancel());
+    let report = tokio::time::timeout(Duration::from_secs(2), agent.join())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Cancelled(CancelReason::User));
+    assert_eq!(
+        report.requests, 1,
+        "preparation never issued another model request"
+    );
+    assert!(handle.is_finished());
 }
 
 #[tokio::test]

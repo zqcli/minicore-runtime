@@ -38,6 +38,7 @@ const MAX_MODEL_RETRY_ATTEMPTS: u8 = 4;
 #[derive(Clone, Debug)]
 pub struct LoopOptions {
     pub deadline: Option<tokio::time::Instant>,
+    /// Zero disables the round limit. Positive values opt into a finite budget.
     pub max_tool_rounds: u16,
     pub max_pending_steers: usize,
     pub event_capacity: usize,
@@ -54,7 +55,7 @@ impl LoopOptions {
     pub fn default_checked() -> Result<Self, LoopStartError> {
         let options = Self {
             deadline: None,
-            max_tool_rounds: 32,
+            max_tool_rounds: 0,
             max_pending_steers: 16,
             event_capacity: 256,
             prompt_timeout: Duration::from_secs(30),
@@ -70,7 +71,7 @@ impl LoopOptions {
     }
 
     pub fn validate(&self) -> Result<(), LoopStartError> {
-        if !(1..=MAX_TOOL_ROUNDS).contains(&self.max_tool_rounds)
+        if self.max_tool_rounds > MAX_TOOL_ROUNDS
             || !(1..=MAX_PENDING_STEERS).contains(&self.max_pending_steers)
             || !(1..=MAX_EVENT_CAPACITY).contains(&self.event_capacity)
             || self.prompt_timeout.is_zero()

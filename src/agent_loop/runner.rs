@@ -170,6 +170,15 @@ async fn run_loop_inner(
         );
 
         let snapshot = Arc::clone(&current_config);
+        // Preparation can run a utility model after every tool round, not
+        // only at turn admission. Do not leave the public state claiming that
+        // already-completed tools are still running during this await.
+        ctx.publish(LoopState::new(
+            id,
+            LoopStatus::Starting,
+            request_index,
+            issued_revision,
+        ));
         let messages = match prepare_prompt(
             &mut ctx,
             request_index,
@@ -315,7 +324,7 @@ async fn run_loop_inner(
             }
             break path;
         }
-        if tool_rounds >= options.max_tool_rounds {
+        if options.max_tool_rounds != 0 && tool_rounds >= options.max_tool_rounds {
             for call in &tool_calls {
                 working.append_tool_result(terminal_tool_result(
                     id,
