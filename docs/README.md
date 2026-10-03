@@ -1,6 +1,8 @@
 # Documentation Authority
 
-The v0.4 core is documented by the current source tree and these pages:
+The current v0.6.0 core retains the v0.4 one-loop architecture and is documented
+by the current source tree and these pages. The root README records current
+compatibility changes; versioned v0.4 acceptance/release pages remain historical evidence:
 
 1. [Architecture](architecture.md) for the one-loop boundary, ownership, and dependency direction.
 2. [Canonical module map](modules/README.md) for physical source ownership and public/private boundaries.

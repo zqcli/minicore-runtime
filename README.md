@@ -2,6 +2,14 @@
 
 MiniCore Runtime is a small Rust execution core for one live agent loop. It runs model/tool iterations, streaming, cancellation, interaction, steering, and request-boundary configuration updates. It does not own sessions, persistence, transcripts, providers, or workspaces.
 
+## 0.6.0 Compatibility Notes
+
+- `LoopReport.tool_rounds` is now `u64`. Hosts that expose this count through JSON or storage must preserve the wider integer; clients limited to `u16` cannot read values above 65,535.
+- `LoopOptions.max_tool_rounds` remains `u16`, with zero (the default) meaning unlimited. Cancellation, deadlines, and other resource limits still apply.
+- Each actual prompt preparation emits one `Starting` state, including preparation after tools and stale-prompt rebuilds; the redundant initial event is removed.
+- There is no Runtime compaction scheduler. Post-turn summaries and bounded request-level context recovery are Agent policies built on the existing generic interfaces.
+- MSRV remains Rust 1.85. Historical v0.4 acceptance and release records below are preserved; they are not new 0.6.0 verification claims.
+
 ## What the Runtime Does Not Own
 
 An `AgentLoop` is a single, one-shot execution. The host owns everything around it:
