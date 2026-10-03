@@ -53,11 +53,12 @@ pub struct PreparedPrompt {
 pub type PromptFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PreparedPrompt, PromptError>> + Send + 'a>>;
 
-/// The request-time context and compaction boundary of an agent loop.
+/// The host's request-time context projection boundary for an agent loop.
 ///
-/// Replaces session-level prompt builders and durable compaction: everything
-/// the host injects for one request (AGENTS.md, memory, RAG, skills, summary)
-/// happens inside `prepare`.
+/// The host injects request context (instructions, memory, retrieved content,
+/// or an existing summary) through `prepare`. Session lifecycle, summary
+/// generation policy, and durable compaction remain host responsibilities;
+/// this interface does not schedule them.
 pub trait PromptProvider: Send + Sync + 'static {
     fn prepare<'a>(&'a self, request: PromptRequest<'a>) -> PromptFuture<'a>;
 }

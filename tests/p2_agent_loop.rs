@@ -635,6 +635,35 @@ async fn tool_loop_runs_model_tool_model_to_completion() {
 }
 
 #[tokio::test]
+async fn each_request_preparation_emits_one_starting_state() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (model, _) = scripted_model(vec![
+        Round::Tools {
+            calls: vec![("echo", "call_1")],
+        },
+        Round::Final { text: "done" },
+    ]);
+    let mut agent = AgentLoop::start(
+        request(config(model, tool_set(calls, ToolBehavior::Succeed), None)),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let mut events = agent.take_events().unwrap();
+    let report = agent.join().await.unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    let mut preparations = Vec::new();
+    while let Some(envelope) = events.recv().await {
+        assert_eq!(envelope.dropped_before, 0);
+        if let LoopEvent::StateChanged { state } = envelope.event {
+            if state.status == LoopStatus::Starting {
+                preparations.push(state.request_index);
+            }
+        }
+    }
+    assert_eq!(preparations, vec![0, 1]);
+}
+
+#[tokio::test]
 async fn sequential_tool_calls_execute_in_order() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![
@@ -693,6 +722,7 @@ async fn default_tool_rounds_continue_past_legacy_limit() {
     let report = agent.join().await.unwrap();
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(calls.lock().unwrap().len(), 40);
+    assert_eq!(report.tool_rounds, 40);
 }
 
 #[tokio::test]

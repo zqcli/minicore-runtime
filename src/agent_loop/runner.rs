@@ -117,12 +117,6 @@ async fn run_loop_inner(
         completion_tx: &completion_tx,
     };
 
-    ctx.publish(LoopState::new(
-        id,
-        LoopStatus::Starting,
-        0,
-        ConfigRevision::INITIAL,
-    ));
     ctx.sink.try_emit(LoopEvent::Started { loop_id: id });
 
     let mut working = WorkingHistory::new(request.history.clone());
@@ -142,7 +136,7 @@ async fn run_loop_inner(
     // while request_index stays put.
     let mut candidate_revision: Option<ConfigRevision> = None;
     let mut request_index: u32 = 0;
-    let mut tool_rounds: u16 = 0;
+    let mut tool_rounds: u64 = 0;
     let mut requests: u32 = 0;
     let mut last_issued_request_index: Option<u32> = None;
     let mut usage = UsageAccumulator::default();
@@ -170,9 +164,9 @@ async fn run_loop_inner(
         );
 
         let snapshot = Arc::clone(&current_config);
-        // Preparation can run a utility model after every tool round, not
-        // only at turn admission. Do not leave the public state claiming that
-        // already-completed tools are still running during this await.
+        // Every real preparation (including a stale-prompt rebuild) is
+        // observable. Completed tools must not appear to keep running while
+        // the host prepares the next request.
         ctx.publish(LoopState::new(
             id,
             LoopStatus::Starting,
@@ -324,7 +318,7 @@ async fn run_loop_inner(
             }
             break path;
         }
-        if options.max_tool_rounds != 0 && tool_rounds >= options.max_tool_rounds {
+        if options.max_tool_rounds != 0 && tool_rounds >= u64::from(options.max_tool_rounds) {
             for call in &tool_calls {
                 working.append_tool_result(terminal_tool_result(
                     id,
@@ -338,7 +332,21 @@ async fn run_loop_inner(
             }
             break FailPath::MaxToolRounds;
         }
-        tool_rounds = tool_rounds.saturating_add(1);
+        let Some(next_tool_rounds) = tool_rounds.checked_add(1) else {
+            for call in &tool_calls {
+                working.append_tool_result(terminal_tool_result(
+                    id,
+                    request_index,
+                    call.tool_call_id(),
+                    call.name(),
+                    ToolResultOutcome::Failed,
+                    "tool round count overflow",
+                    ctx.options.limits.max_tool_output_bytes,
+                ));
+            }
+            break FailPath::Internal;
+        };
+        tool_rounds = next_tool_rounds;
 
         let enabled = all_enabled(snapshot.tools());
         let policy = snapshot.policy().cloned();
@@ -475,7 +483,7 @@ fn finish_loop(
     usage: Usage,
     requests: u32,
     last_issued_request_index: Option<u32>,
-    tool_rounds: u16,
+    tool_rounds: u64,
 ) -> Arc<LoopReport> {
     let id = ctx.id;
     // The revision of the config that was actually applied: a pending update

@@ -217,7 +217,8 @@ pub struct LoopReport {
     pub appended: Arc<[HistoryItem]>,
     pub usage: Usage,
     pub requests: u32,
-    pub tool_rounds: u16,
+    /// Number of tool batches entered; independent of the optional u16 budget.
+    pub tool_rounds: u64,
     pub final_config_revision: ConfigRevision,
 }
 

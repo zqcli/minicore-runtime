@@ -26,7 +26,9 @@ The runner loops:
 1. Cancel / deadline pre-checks.
 2. A-step: atomically pull the latest config candidate and every accepted
    steer (`take_boundary`), apply them to the working state.
-3. Prompt preparation under cancel/timeout/panic isolation. Empty prompts or
+3. Publish `Starting` once for this preparation attempt, then prepare under
+   cancel/timeout/panic isolation. Stale rebuilds and requests after tool
+   batches each have their own preparation state. Empty prompts or
    prompts over `max_prompt_messages` fail as `Prompt` regardless of
    provider.
 4. F-step: if newer config/steers landed while preparing, discard the stale
@@ -76,7 +78,10 @@ The runner loops:
 
 - `LoopReport` carries `outcome`, `appended` (only in-memory items this loop
   produced), `usage`, `requests`, `tool_rounds`, and the final
-  `ConfigRevision`.
+  `ConfigRevision`. `tool_rounds` is a `u64` count of entered tool batches,
+  not a saturated `u16` budget counter. `LoopOptions.max_tool_rounds` remains
+  `u16`: zero (the default) disables that optional limit; positive values
+  retain the existing finite-budget validation.
 - `appended` is the only host-worthy record; the host decides whether and
   where to persist it. Nothing is durable in the runtime.
 - A failed inner port (model/prompt/policy/tool) maps to a `LoopOutcome:

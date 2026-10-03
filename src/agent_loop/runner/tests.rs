@@ -133,6 +133,37 @@ async fn finish_loop_losing_the_seal_returns_the_published_arc() {
     assert!(Arc::ptr_eq(&waited, &published));
 }
 
+#[tokio::test]
+async fn completion_preserves_tool_round_counts_beyond_u16() {
+    for tool_rounds in [65_535_u64, 65_536, 70_000] {
+        let id = LoopId::new().unwrap();
+        let (control, mut sink, _stream, completion_tx) =
+            LoopControl::new(id, 8, LoopLimits::default(), 16).unwrap();
+        let control = Arc::new(control);
+        let options = LoopOptions::default_checked().unwrap();
+        let mut ctx = LoopCtx {
+            id,
+            control: &control,
+            options: &options,
+            sink: &mut sink,
+            completion_tx: &completion_tx,
+        };
+        let report = finish_loop(
+            &mut ctx,
+            FailPath::Completed,
+            WorkingHistory::new(Arc::from([])),
+            Usage::default(),
+            0,
+            None,
+            tool_rounds,
+        );
+        assert_eq!(report.tool_rounds, tool_rounds);
+        let waited = LoopHandle::new(Arc::clone(&control)).wait().await.unwrap();
+        assert_eq!(waited.tool_rounds, tool_rounds);
+        assert!(Arc::ptr_eq(&report, &waited));
+    }
+}
+
 /// M2/L3: completing once cancels the root token, seals the loop, makes later
 /// cancels return false, and a second completion attempt never overwrites the
 /// delivered report.
@@ -194,6 +225,7 @@ fn terminal_tool_result_messages_are_bounded_to_max_output_bytes() {
         "invalid tool invocation",
         "tool batch interrupted",
         "tool round limit reached",
+        "tool round count overflow",
     ];
 
     for message in messages {
