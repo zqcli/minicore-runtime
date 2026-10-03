@@ -8,6 +8,7 @@ use crate::ids::ToolCallId;
 use crate::tools::ToolName;
 use crate::value::BoundedText;
 
+use super::ProviderReplay;
 use super::types::{ModelFinishReason, ModelValueError, Usage};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -253,6 +254,10 @@ pub enum ModelEvent {
     Usage {
         usage: Usage,
     },
+    /// Opaque metadata, accepted once before Finish; never emitted as display progress.
+    ProviderReplay {
+        replay: ProviderReplay,
+    },
     Finish {
         reason: ModelFinishReason,
     },
@@ -289,6 +294,7 @@ impl ModelEvent {
             Self::ToolCallStart { .. }
             | Self::ToolCallEnd { .. }
             | Self::Usage { .. }
+            | Self::ProviderReplay { .. }
             | Self::Finish { .. } => Ok(()),
         }
     }
@@ -326,6 +332,10 @@ impl fmt::Debug for ModelEvent {
                 .field("tool_call_id", tool_call_id)
                 .finish(),
             Self::Usage { usage } => formatter.debug_tuple("Usage").field(usage).finish(),
+            Self::ProviderReplay { replay } => formatter
+                .debug_tuple("ProviderReplay")
+                .field(replay)
+                .finish(),
             Self::Finish { reason } => formatter.debug_tuple("Finish").field(reason).finish(),
         }
     }

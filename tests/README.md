@@ -66,3 +66,11 @@ cargo test --locked --all-targets --all-features
 The full gate is `./scripts/check.sh` (fmt, tests, clippy `-D warnings`,
 rustdoc `-D warnings`, docs/architecture/acceptance checks, provider-gate
 harness) plus `./scripts/check-msrv.sh`.
+### v0.6.1 provider replay evidence
+
+`provider_replay.rs` covers full-envelope byte/depth/node bounds, validated serde,
+redacted Debug, legacy constructors/wire formats, and replay-only content.
+Driver assembly/settlement tests cover single metadata delivery, duplicate and
+post-Finish rejection, missing Finish, EOF/error/cancellation settlement, and no
+progress forwarding. `p2_agent_loop.rs` covers runner/history/projection retention,
+old history serde, exact history-byte accounting, and the 2 MiB absolute ceiling.

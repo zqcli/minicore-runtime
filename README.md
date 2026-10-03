@@ -2,6 +2,20 @@
 
 MiniCore Runtime is a small Rust execution core for one live agent loop. It runs model/tool iterations, streaming, cancellation, interaction, steering, and request-boundary configuration updates. It does not own sessions, persistence, transcripts, providers, or workspaces.
 
+## 0.6.1 Compatibility Notes
+
+- Provider replay is bounded opaque metadata carried by `ModelEvent::ProviderReplay`,
+  `ModelResponse`, `AssistantHistory`, and `ModelMessage::AssistantWithReplay`.
+  Existing assistant tuple construction, constructors, and legacy JSON remain valid.
+  History struct literals must initialize the new optional `provider_replay` field.
+- A replay envelope is at most 256 KiB of compact JSON, with depth 32 and 16,384
+  payload nodes. Runtime does not interpret its provider format or truncate it.
+  Host history's 2 MiB ceiling includes the full replay envelope byte count.
+- Replay-only assistant content is accepted only with validated metadata; legacy
+  empty constructors remain invalid. Replay never creates display text/tool calls.
+  Its payload is accessible to the host and serialized in history, but redacted
+  from Debug and never forwarded as a loop output event.
+
 ## 0.6.0 Compatibility Notes
 
 - `LoopReport.tool_rounds` is now `u64`. Hosts that expose this count through JSON or storage must preserve the wider integer; clients limited to `u16` cannot read values above 65,535.

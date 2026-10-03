@@ -9,6 +9,13 @@ async fn finish_then_stream_error_is_not_success_or_retryable_after_observation(
             Behavior::ProbedStream {
                 events: vec![
                     Ok(ModelEvent::text_delta("complete-looking").unwrap()),
+                    Ok(ModelEvent::ProviderReplay {
+                        replay: crate::model::ProviderReplay::new(
+                            "test/v1",
+                            json!({"opaque":"secret"}),
+                        )
+                        .unwrap(),
+                    }),
                     Ok(finish(ModelFinishReason::Stop)),
                     Err(retryable_error(None)),
                 ],
@@ -44,6 +51,13 @@ async fn finish_then_pending_requires_eof_and_drops_on_cancel_or_observed_timeou
         vec![Behavior::ProbedStream {
             events: vec![
                 Ok(ModelEvent::text_delta("complete-looking").unwrap()),
+                Ok(ModelEvent::ProviderReplay {
+                    replay: crate::model::ProviderReplay::new(
+                        "test/v1",
+                        json!({"opaque":"secret"}),
+                    )
+                    .unwrap(),
+                }),
                 Ok(finish(ModelFinishReason::Stop)),
             ],
             terminal: StreamTerminal::Pending,
@@ -79,6 +93,13 @@ async fn finish_then_pending_requires_eof_and_drops_on_cancel_or_observed_timeou
         vec![Behavior::ProbedStream {
             events: vec![
                 Ok(ModelEvent::text_delta("complete-looking").unwrap()),
+                Ok(ModelEvent::ProviderReplay {
+                    replay: crate::model::ProviderReplay::new(
+                        "test/v1",
+                        json!({"opaque":"secret"}),
+                    )
+                    .unwrap(),
+                }),
                 Ok(finish(ModelFinishReason::Stop)),
             ],
             terminal: StreamTerminal::Pending,

@@ -93,6 +93,7 @@ fn scripted_model_full(
 
 #[derive(Clone)]
 enum Round {
+    Events(Vec<ModelEvent>),
     Final {
         text: &'static str,
     },
@@ -159,6 +160,7 @@ impl Model for ScriptedModel {
 
 fn round_stream(round: Round) -> ModelStream {
     match round {
+        Round::Events(events) => Box::pin(futures_util::stream::iter(events.into_iter().map(Ok))),
         Round::Hold => Box::pin(futures_util::stream::pending()),
         Round::Final { text } => Box::pin(futures_util::stream::iter(vec![
             Ok(ModelEvent::text_delta(text).unwrap()),
@@ -3678,6 +3680,7 @@ fn user_item(kind: UserMessageKind, text: &str) -> HistoryItem {
 
 fn assistant_item(model: &str, text: &str) -> HistoryItem {
     HistoryItem::Assistant(minicore_runtime::history::AssistantHistory {
+        provider_replay: None,
         loop_id: minicore_runtime::LoopId::new().unwrap(),
         request_index: 0,
         model: model.parse().unwrap(),
@@ -5563,4 +5566,127 @@ async fn receiver_dropped_during_tool_burst_allows_loop_to_complete() {
         .expect("expected tool result history");
     assert_eq!(tool_result.outcome, ToolResultOutcome::Success);
     assert_eq!(tool_result.output.content().as_str(), "burst completed");
+}
+
+#[tokio::test]
+async fn replay_survives_runner_history_serde_and_default_projection() {
+    use minicore_runtime::model::ProviderReplay;
+    let replay = ProviderReplay::new("test/v1", json!({"opaque":"secret-ciphertext", "tool_calls":[{"name":"must_not_execute","arguments":{}}]})).unwrap();
+    for with_text in [false, true] {
+        let mut events = vec![ModelEvent::ProviderReplay {
+            replay: replay.clone(),
+        }];
+        if with_text {
+            events.push(ModelEvent::text_delta("answer").unwrap());
+        }
+        events.push(ModelEvent::Finish {
+            reason: ModelFinishReason::Stop,
+        });
+        let (model, _) = scripted_model(vec![Round::Events(events)]);
+        let agent = AgentLoop::start(
+            request(config(model, ToolSet::default(), None)),
+            LoopOptions::default_checked().unwrap(),
+        )
+        .unwrap();
+        let report = agent.join().await.unwrap();
+        assert_eq!(report.outcome, LoopOutcome::Completed);
+        let assistant = report
+            .appended
+            .iter()
+            .find_map(|item| match item {
+                HistoryItem::Assistant(a) => Some(a),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(report.tool_rounds, 0);
+        assert_eq!(assistant.provider_replay.as_ref(), Some(&replay));
+        assert_eq!(assistant.content.is_empty(), !with_text);
+        let restored: Vec<HistoryItem> =
+            serde_json::from_value(serde_json::to_value(&*report.appended).unwrap()).unwrap();
+        let descriptor = default_descriptor();
+        let projected = DefaultPromptProvider::new(None)
+            .prepare(default_request(
+                HistoryView::new(&restored, &[]),
+                false,
+                &descriptor,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert!(projected.messages.iter().any(|message| matches!(message, ModelMessage::AssistantWithReplay { parts, provider_replay } if provider_replay == &replay && parts == &assistant.content)));
+        let mut old = serde_json::to_value(assistant).unwrap();
+        old.as_object_mut().unwrap().remove("provider_replay");
+        assert!(
+            serde_json::from_value::<minicore_runtime::AssistantHistory>(old)
+                .unwrap()
+                .provider_replay
+                .is_none()
+        );
+        assert!(!format!("{report:?}").contains("secret-ciphertext"));
+    }
+}
+
+#[tokio::test]
+async fn history_limit_counts_opaque_replay_at_the_exact_boundary() {
+    use minicore_runtime::model::ProviderReplay;
+    let mut item = assistant_item("test/model", "answer");
+    let replay = ProviderReplay::new("test/v1", json!("a".repeat(1024))).unwrap();
+    let bytes = "answer".len() + replay.byte_len();
+    let HistoryItem::Assistant(ref mut assistant) = item else {
+        unreachable!()
+    };
+    assistant.provider_replay = Some(replay);
+    for (limit, accept) in [(bytes, true), (bytes - 1, false)] {
+        let (model, _) = scripted_model(vec![Round::Final { text: "ok" }]);
+        let mut req = request(config(model, ToolSet::default(), None));
+        req.history = vec![item.clone()].into();
+        let mut options = LoopOptions::default_checked().unwrap();
+        options.limits.max_history_bytes = limit;
+        match AgentLoop::start(req, options) {
+            Ok(agent) => {
+                assert!(accept);
+                assert_eq!(agent.join().await.unwrap().outcome, LoopOutcome::Completed);
+            }
+            Err(error) => {
+                assert!(!accept);
+                assert!(matches!(error, LoopStartError::HistoryTooLarge));
+            }
+        }
+    }
+    assert_eq!(
+        LoopOptions::default_checked()
+            .unwrap()
+            .limits
+            .max_history_bytes,
+        2 * 1024 * 1024
+    );
+}
+
+#[tokio::test]
+async fn replay_only_history_enforces_two_mib_absolute_ceiling() {
+    use minicore_runtime::model::ProviderReplay;
+    let overhead = ProviderReplay::new("x", json!("")).unwrap().byte_len();
+    let replay =
+        ProviderReplay::new("x", json!("a".repeat(ProviderReplay::MAX_BYTES - overhead))).unwrap();
+    let mut item = assistant_item("test/model", "unused");
+    let HistoryItem::Assistant(ref mut assistant) = item else {
+        unreachable!()
+    };
+    assistant.content.clear();
+    assistant.provider_replay = Some(replay);
+    for (count, accept) in [(8, true), (9, false)] {
+        let (model, _) = scripted_model(vec![Round::Final { text: "ok" }]);
+        let mut req = request(config(model, ToolSet::default(), None));
+        req.history = vec![item.clone(); count].into();
+        match AgentLoop::start(req, LoopOptions::default_checked().unwrap()) {
+            Ok(agent) => {
+                assert!(accept);
+                assert_eq!(agent.join().await.unwrap().outcome, LoopOutcome::Completed);
+            }
+            Err(error) => {
+                assert!(!accept);
+                assert!(matches!(error, LoopStartError::HistoryTooLarge));
+            }
+        }
+    }
 }

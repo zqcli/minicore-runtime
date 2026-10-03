@@ -409,3 +409,70 @@ async fn aggregate_text_reasoning_and_arguments_enforce_exact_semantic_boundarie
         ModelErrorKind::InvalidProviderResponse
     );
 }
+
+fn replay_event() -> ModelEvent {
+    ModelEvent::ProviderReplay {
+        replay: crate::model::ProviderReplay::new("test/v1", json!({"opaque": "secret"})).unwrap(),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_is_retained_once_never_forwarded_and_requires_finish() {
+    for with_text in [false, true] {
+        let mut events = vec![Ok(replay_event())];
+        if with_text {
+            events.push(Ok(ModelEvent::text_delta("answer").unwrap()));
+        }
+        events.push(Ok(finish(ModelFinishReason::Stop)));
+        let model = ScriptModel::new(descriptor(), vec![Behavior::Events(events)]);
+        let driver = model.driver(&kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()));
+        let (progress, mut receiver) = progress_channel();
+        let response = driver
+            .run(
+                request(),
+                context(CancellationToken::new(), Duration::from_secs(30)),
+                &progress,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.provider_replay().unwrap().payload(),
+            &json!({"opaque":"secret"})
+        );
+        if with_text {
+            assert!(matches!(
+                receiver.try_recv(),
+                Ok(ModelDriverProgress::TextDelta(_))
+            ));
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+    for (events, kind) in [
+        (vec![Ok(replay_event())], ModelErrorKind::IncompleteResponse),
+        (
+            vec![
+                Ok(replay_event()),
+                Ok(replay_event()),
+                Ok(finish(ModelFinishReason::Stop)),
+            ],
+            ModelErrorKind::InvalidProviderResponse,
+        ),
+        (
+            vec![
+                Ok(ModelEvent::text_delta("ok").unwrap()),
+                Ok(finish(ModelFinishReason::Stop)),
+                Ok(replay_event()),
+            ],
+            ModelErrorKind::InvalidProviderResponse,
+        ),
+    ] {
+        let error = run_events(
+            request(),
+            events,
+            kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), kind);
+    }
+}

@@ -1,7 +1,9 @@
 mod driver;
 #[path = "model.rs"]
 mod model_port;
+mod replay;
 mod response;
+pub use replay::ProviderReplay;
 mod types;
 
 pub use model_port::{Model, ModelCallContext, ModelDescriptor, ModelStartFuture, ModelStream};

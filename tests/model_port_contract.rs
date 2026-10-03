@@ -67,6 +67,7 @@ fn event_name(event: &ModelEvent) -> &'static str {
         ModelEvent::ToolCallEnd { .. } => "tool_call_end",
         ModelEvent::Usage { .. } => "usage",
         ModelEvent::Finish { .. } => "finish",
+        ModelEvent::ProviderReplay { .. } => "provider_replay",
     }
 }
 

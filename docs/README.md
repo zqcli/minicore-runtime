@@ -1,6 +1,6 @@
 # Documentation Authority
 
-The current v0.6.0 core retains the v0.4 one-loop architecture and is documented
+The current v0.6.1 core retains the v0.4 one-loop architecture and is documented
 by the current source tree and these pages. The root README records current
 compatibility changes; versioned v0.4 acceptance/release pages remain historical evidence:
 

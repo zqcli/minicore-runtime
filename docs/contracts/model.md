@@ -68,3 +68,30 @@ bounds on model timeout (<= 24h) and retry base delay (<= 30s) aligned with
 `ModelDriver` constants. The per-message text ceiling
 is the shared crate-private `MAX_MODEL_MESSAGE_TEXT_BYTES` constant used by
 both `ModelMessage` validation and default prompt projection.
+
+## Opaque provider replay (v0.6.1)
+
+`ProviderReplay::new(format, payload)` validates a provider-owned JSON envelope:
+format is 1–128 symbolic ASCII bytes, compact serialized envelope at most 256 KiB,
+payload depth at most 32 (root zero), and at most 16,384 nodes. Deserialization
+runs the same validation. Runtime never interprets or truncates provider content.
+`byte_len()` includes all envelope keys and punctuation, and history accounting
+includes these bytes within the existing 2 MiB host-history ceiling.
+
+Adapters emit at most one `ModelEvent::ProviderReplay { replay }` before `Finish`.
+Duplicate replay, post-Finish events, missing Finish, cancellation, and incomplete
+streams retain normal assembly/settlement failure semantics. Metadata is never
+forwarded as progress or a display event. Only successfully settled responses enter
+history. The runner and `DefaultPromptProvider` retain it verbatim through
+`ModelResponse`, `AssistantHistory`, and `ModelMessage::AssistantWithReplay`.
+
+Canonical parts remain the only text/tool authority. Validated replay can accompany
+an empty canonical part list, while `ModelResponse::new([])` and
+`ModelMessage::assistant([])` still reject empty content. This permits opaque
+provider-only output without manufacturing text, tools, or new loop policies.
+Provider-format meaning and cross-provider compatibility belong to host adapters.
+
+Old assistant message content arrays and absent history/response metadata still
+round-trip unchanged. Replay-bearing messages use an assistant content object
+with `parts` and `provider_replay`. Debug shows only replay byte counts; host API
+access and explicit serde serialization intentionally retain the full payload.

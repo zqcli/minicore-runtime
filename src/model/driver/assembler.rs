@@ -1,3 +1,4 @@
+use crate::model::ProviderReplay;
 use serde_json::Value;
 
 use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
@@ -19,6 +20,7 @@ pub(super) struct Assembler<'a> {
     reasoning: String,
     tools: Vec<ToolAssembly>,
     usage: Option<Usage>,
+    provider_replay: Option<ProviderReplay>,
     finish_reason: Option<ModelFinishReason>,
     pub(super) observed_event: bool,
 }
@@ -48,6 +50,7 @@ impl<'a> Assembler<'a> {
             reasoning: String::new(),
             tools: Vec::new(),
             usage: None,
+            provider_replay: None,
             finish_reason: None,
             observed_event: false,
         }
@@ -146,6 +149,12 @@ impl<'a> Assembler<'a> {
                 }
                 Ok(None)
             }
+            ModelEvent::ProviderReplay { replay } => {
+                if self.provider_replay.replace(replay).is_some() {
+                    return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
+                }
+                Ok(None)
+            }
             ModelEvent::Finish { reason } => {
                 if self.tools.iter().any(|tool| tool.arguments.is_none()) {
                     return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
@@ -209,8 +218,13 @@ impl<'a> Assembler<'a> {
                 }
             }
         }
-        ModelResponse::new(parts, reason, Some(self.usage.unwrap_or_default()))
-            .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))
+        ModelResponse::new_with_provider_replay(
+            parts,
+            reason,
+            Some(self.usage.unwrap_or_default()),
+            self.provider_replay,
+        )
+        .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))
     }
 
     fn tool_mut(&mut self, tool_call_id: &ToolCallId) -> Result<&mut ToolAssembly, ModelError> {

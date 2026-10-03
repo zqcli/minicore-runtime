@@ -145,15 +145,18 @@ impl PromptProvider for DefaultPromptProvider {
     }
 }
 
-/// Assistant messages reuse their typed parts verbatim; an empty part list is
-/// structurally inconsistent history.
+/// Assistant messages reuse typed parts and provider metadata verbatim. Empty
+/// parts require validated replay metadata; no display content is synthesized.
 fn assistant_message(
     assistant: &crate::history::AssistantHistory,
 ) -> Result<ModelMessage, crate::model::ModelValueError> {
-    if assistant.content.is_empty() {
+    if assistant.content.is_empty() && assistant.provider_replay.is_none() {
         return Err(crate::model::ModelValueError::EmptyAssistantParts);
     }
-    ModelMessage::assistant(assistant.content.clone())
+    ModelMessage::assistant_with_provider_replay(
+        assistant.content.clone(),
+        assistant.provider_replay.clone(),
+    )
 }
 
 /// Fixed leading text of a projected summary; always preserved verbatim.

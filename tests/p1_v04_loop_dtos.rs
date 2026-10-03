@@ -150,6 +150,7 @@ fn sample_items(loop_id: LoopId) -> (HistoryItem, HistoryItem, HistoryItem, Hist
         input: UserInput::text("Fix the parser").unwrap(),
     });
     let assistant = HistoryItem::Assistant(AssistantHistory {
+        provider_replay: None,
         loop_id,
         request_index: 0,
         model: "fake/text-model".parse().unwrap(),
@@ -409,6 +410,7 @@ fn extended_reasoning_preferences_flow_through_runtime_boundaries() {
         );
 
         let history = HistoryItem::Assistant(AssistantHistory {
+            provider_replay: None,
             loop_id,
             request_index: 0,
             model: "fake/text-model".parse().unwrap(),

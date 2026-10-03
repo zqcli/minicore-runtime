@@ -1,6 +1,6 @@
 # Current Implementation Context
 
-The current package is v0.6.0. It retains the one-loop boundary from the
+The current package is v0.6.1. It retains the one-loop boundary from the
 v0.4 reset. Tool-batch statistics are now `u64` end to end within Runtime;
 the optional legacy `u16` round budget still defaults to zero (unlimited).
 Each real prompt preparation publishes one `Starting` event. Session-owned
@@ -76,3 +76,11 @@ code-closeout run and passed the then-current closeout suite.
 `docs/migrations/v0.3-to-v0.4.md` are the current authority set (see
 `docs/README.md`). The tracked `minicore-runtime-v0.4-flex-agent-loop-reset-spec.md`
 is a non-authority implementation record.
+## v0.6.1 Opaque Replay Transport
+
+The existing response/history/prompt path carries bounded `ProviderReplay` metadata
+without provider logic or a second state owner. It is non-display and redacted in
+Debug; only host API/explicit serde expose its payload. Canonical parts remain the
+execution authority. The legacy assistant tuple and old JSON are retained, with
+`AssistantWithReplay` for metadata-bearing requests. See the model contract for
+bounds, stream ordering, and the narrow replay-only empty-content case.

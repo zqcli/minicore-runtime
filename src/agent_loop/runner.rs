@@ -290,6 +290,7 @@ async fn run_loop_inner(
             model: snapshot.descriptor().model_ref.clone(),
             reasoning: snapshot.reasoning(),
             content: response.parts().to_vec(),
+            provider_replay: response.provider_replay().cloned(),
             finish_reason: response.finish_reason(),
             usage: round_usage,
         });

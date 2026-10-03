@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use thiserror::Error;
 
+use super::ProviderReplay;
 use crate::ids::ToolCallId;
 pub(crate) use crate::tools::ToolSpec;
 use crate::tools::{ToolName, ToolOutput, ToolResultOutcome, validate_json_shape};
@@ -110,6 +111,8 @@ pub enum ModelValueError {
     InvalidDescriptor,
     #[error("model stream event is invalid")]
     InvalidEvent,
+    #[error("provider replay format or payload exceeds its bounds")]
+    InvalidProviderReplay,
     #[error("model request tools are invalid or not strictly ordered")]
     InvalidTools,
 }
@@ -484,12 +487,16 @@ impl<'de> Deserialize<'de> for ToolCall {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Serialize)]
-#[serde(tag = "role", content = "content", rename_all = "snake_case")]
+#[derive(Clone, Eq, PartialEq)]
 pub enum ModelMessage {
     System(String),
     User(String),
     Assistant(Vec<AssistantPart>),
+    /// Canonical assistant parts plus non-display provider-owned metadata.
+    AssistantWithReplay {
+        parts: Vec<AssistantPart>,
+        provider_replay: ProviderReplay,
+    },
     Tool {
         tool_call_id: ToolCallId,
         output: ToolOutput,
@@ -503,12 +510,75 @@ pub enum ModelMessage {
 enum ModelMessageWire {
     System(String),
     User(String),
-    Assistant(Vec<AssistantPart>),
+    Assistant(AssistantMessageWire),
     Tool {
         tool_call_id: ToolCallId,
         output: ToolOutput,
         outcome: ToolResultOutcome,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AssistantMessageWire {
+    Legacy(Vec<AssistantPart>),
+    Replay(AssistantReplayWire),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssistantReplayWire {
+    parts: Vec<AssistantPart>,
+    #[serde(default)]
+    provider_replay: Option<ProviderReplay>,
+}
+
+impl Serialize for ModelMessage {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(tag = "role", content = "content", rename_all = "snake_case")]
+        enum Wire<'a> {
+            System(&'a str),
+            User(&'a str),
+            Assistant(Content<'a>),
+            Tool {
+                tool_call_id: &'a ToolCallId,
+                output: &'a ToolOutput,
+                outcome: ToolResultOutcome,
+            },
+        }
+        #[derive(Serialize)]
+        #[serde(untagged)]
+        enum Content<'a> {
+            Legacy(&'a [AssistantPart]),
+            Replay {
+                parts: &'a [AssistantPart],
+                provider_replay: &'a ProviderReplay,
+            },
+        }
+        let wire = match self {
+            Self::System(text) => Wire::System(text),
+            Self::User(text) => Wire::User(text),
+            Self::Assistant(parts) => Wire::Assistant(Content::Legacy(parts)),
+            Self::AssistantWithReplay {
+                parts,
+                provider_replay: replay,
+            } => Wire::Assistant(Content::Replay {
+                parts,
+                provider_replay: replay,
+            }),
+            Self::Tool {
+                tool_call_id,
+                output,
+                outcome,
+            } => Wire::Tool {
+                tool_call_id,
+                output,
+                outcome: *outcome,
+            },
+        };
+        wire.serialize(serializer)
+    }
 }
 
 impl fmt::Debug for ModelMessage {
@@ -524,6 +594,15 @@ impl fmt::Debug for ModelMessage {
                 .finish(),
             Self::Assistant(parts) => formatter
                 .debug_struct("ModelMessage::Assistant")
+                .field("part_count", &parts.len())
+                .field("parts", parts)
+                .finish(),
+            Self::AssistantWithReplay {
+                parts,
+                provider_replay,
+            } => formatter
+                .debug_struct("ModelMessage::Assistant")
+                .field("provider_replay", provider_replay)
                 .field("part_count", &parts.len())
                 .field("parts", parts)
                 .finish(),
@@ -559,7 +638,21 @@ impl ModelMessage {
     }
 
     pub fn assistant(parts: Vec<AssistantPart>) -> Result<Self, ModelValueError> {
-        let message = Self::Assistant(parts);
+        Self::assistant_with_provider_replay(parts, None)
+    }
+
+    /// Preserves opaque replay; empty parts require metadata.
+    pub fn assistant_with_provider_replay(
+        parts: Vec<AssistantPart>,
+        provider_replay: Option<ProviderReplay>,
+    ) -> Result<Self, ModelValueError> {
+        let message = match provider_replay {
+            Some(provider_replay) => Self::AssistantWithReplay {
+                parts,
+                provider_replay,
+            },
+            None => Self::Assistant(parts),
+        };
         message.validate()?;
         Ok(message)
     }
@@ -591,6 +684,7 @@ impl ModelMessage {
                 }
                 validate_tool_call_order(parts)
             }
+            Self::AssistantWithReplay { parts, .. } => validate_tool_call_order(parts),
             Self::Tool { .. } => Ok(()),
         }
     }
@@ -604,7 +698,13 @@ impl<'de> Deserialize<'de> for ModelMessage {
         let value = match ModelMessageWire::deserialize(deserializer)? {
             ModelMessageWire::System(text) => Self::System(text),
             ModelMessageWire::User(text) => Self::User(text),
-            ModelMessageWire::Assistant(parts) => Self::Assistant(parts),
+            ModelMessageWire::Assistant(content) => match content {
+                AssistantMessageWire::Legacy(parts) => Self::Assistant(parts),
+                AssistantMessageWire::Replay(content) => {
+                    Self::assistant_with_provider_replay(content.parts, content.provider_replay)
+                        .map_err(serde::de::Error::custom)?
+                }
+            },
             ModelMessageWire::Tool {
                 tool_call_id,
                 output,
@@ -810,6 +910,8 @@ pub struct ModelResponse {
     parts: Vec<AssistantPart>,
     finish_reason: ModelFinishReason,
     usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_replay: Option<ProviderReplay>,
 }
 
 #[derive(Deserialize)]
@@ -818,6 +920,8 @@ struct ModelResponseWire {
     parts: Vec<AssistantPart>,
     finish_reason: ModelFinishReason,
     usage: Option<Usage>,
+    #[serde(default)]
+    provider_replay: Option<ProviderReplay>,
 }
 
 impl ModelResponse {
@@ -826,7 +930,17 @@ impl ModelResponse {
         finish_reason: ModelFinishReason,
         usage: impl Into<Option<Usage>>,
     ) -> Result<Self, ModelValueError> {
-        if parts.is_empty() {
+        Self::new_with_provider_replay(parts, finish_reason, usage, None)
+    }
+
+    /// Constructs a response, permitting no canonical parts only when replay exists.
+    pub fn new_with_provider_replay(
+        parts: Vec<AssistantPart>,
+        finish_reason: ModelFinishReason,
+        usage: impl Into<Option<Usage>>,
+        provider_replay: Option<ProviderReplay>,
+    ) -> Result<Self, ModelValueError> {
+        if parts.is_empty() && provider_replay.is_none() {
             return Err(ModelValueError::EmptyResponseParts);
         }
         validate_tool_call_order(&parts)?;
@@ -834,7 +948,18 @@ impl ModelResponse {
             parts,
             finish_reason,
             usage: usage.into(),
+            provider_replay,
         })
+    }
+
+    /// Attaches validated opaque metadata without changing canonical response parts.
+    pub fn with_provider_replay(mut self, replay: ProviderReplay) -> Self {
+        self.provider_replay = Some(replay);
+        self
+    }
+
+    pub const fn provider_replay(&self) -> Option<&ProviderReplay> {
+        self.provider_replay.as_ref()
     }
 
     pub fn parts(&self) -> &[AssistantPart] {
@@ -856,6 +981,7 @@ impl fmt::Debug for ModelResponse {
             .debug_struct("ModelResponse")
             .field("part_count", &self.parts.len())
             .field("parts", &self.parts)
+            .field("provider_replay", &self.provider_replay)
             .field("finish_reason", &self.finish_reason)
             .field("usage", &self.usage)
             .finish()
@@ -868,7 +994,13 @@ impl<'de> Deserialize<'de> for ModelResponse {
         D: Deserializer<'de>,
     {
         let value = ModelResponseWire::deserialize(deserializer)?;
-        Self::new(value.parts, value.finish_reason, value.usage).map_err(serde::de::Error::custom)
+        Self::new_with_provider_replay(
+            value.parts,
+            value.finish_reason,
+            value.usage,
+            value.provider_replay,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -901,7 +1033,7 @@ fn validate_tool_exchange(messages: &[ModelMessage]) -> Result<(), ModelValueErr
     let mut completed = BTreeSet::new();
     for message in messages {
         match message {
-            ModelMessage::Assistant(parts) => {
+            ModelMessage::Assistant(parts) | ModelMessage::AssistantWithReplay { parts, .. } => {
                 if !pending.is_empty() {
                     return Err(ModelValueError::IncompleteToolExchange);
                 }

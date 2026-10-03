@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::execution::UserInput;
 use crate::ids::{LoopId, ToolCallId};
-use crate::model::{AssistantPart, ModelFinishReason, ModelRef, ReasoningPreference, Usage};
+use crate::model::{
+    AssistantPart, ModelFinishReason, ModelRef, ProviderReplay, ReasoningPreference, Usage,
+};
 use crate::tools::{ToolName, ToolOutput, ToolResultOutcome};
 use crate::value::BoundedText;
 
@@ -49,6 +51,9 @@ pub struct AssistantHistory {
     pub reasoning: ReasoningPreference,
     /// Reuses the existing typed assistant parts; no second part vocabulary.
     pub content: Vec<AssistantPart>,
+    /// Provider-owned metadata. Never used for display or tool execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_replay: Option<ProviderReplay>,
     pub finish_reason: ModelFinishReason,
     pub usage: Usage,
 }
@@ -146,15 +151,26 @@ impl WorkingHistory {
 /// ceiling checked at `AgentLoop::start`. This is a conservative upper bound,
 /// not a serialized-size guarantee.
 pub(crate) fn estimate_history_bytes(items: &[HistoryItem]) -> usize {
-    items.iter().map(estimate_item_bytes).sum()
+    items
+        .iter()
+        .map(estimate_item_bytes)
+        .fold(0, usize::saturating_add)
 }
 
 fn estimate_item_bytes(item: &HistoryItem) -> usize {
     match item {
         HistoryItem::User(user) => user.input.as_text().len(),
-        HistoryItem::Assistant(assistant) => {
-            assistant.content.iter().map(estimate_part_bytes).sum()
-        }
+        HistoryItem::Assistant(assistant) => assistant
+            .content
+            .iter()
+            .map(estimate_part_bytes)
+            .fold(0, usize::saturating_add)
+            .saturating_add(
+                assistant
+                    .provider_replay
+                    .as_ref()
+                    .map_or(0, ProviderReplay::byte_len),
+            ),
         HistoryItem::ToolResult(result) => {
             result.call_id.as_str().len()
                 + result.tool_name.as_str().len()

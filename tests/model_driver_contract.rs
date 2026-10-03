@@ -118,7 +118,7 @@ fn assembler_uses_checked_dtos_and_centralized_json_validation() {
         "validate_json_size(&arguments, maximum)",
         "ToolCall::new(",
         "ReasoningContent::new(",
-        "ModelResponse::new(",
+        "ModelResponse::new_with_provider_replay(",
         "ModelErrorKind::IncompleteResponse",
         "ModelErrorKind::UnexpectedToolCall",
         "ModelFinishReason::ToolCalls | ModelFinishReason::Unknown",
