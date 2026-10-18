@@ -4,11 +4,12 @@
 Checks, against an injectable root (stdlib only, no LOC budgets):
 
   1. The current authority set exists and is complete.
-  2. Every non-archive Markdown file is authority or the tracked
-     non-authority implementation spec.
+  2. Every non-archive Markdown file is authority or a listed non-authority
+     guide (AGENTS.md).
   3. The root README states the exact v0.4 positioning sentence first and
      covers the ten mandatory runtime properties.
-  4. docs/README.md links every contract and core page (real parsed links).
+  4. docs/README.md links every contract and core page (real parsed links)
+     and classifies each non-authority guide.
   5. No stale session-era page is kept current (no removed contract/migration
      named as authority).
   6. The compile-gate examples exist and exercise AgentLoop,
@@ -58,7 +59,8 @@ AUTHORITY = [
     "docs/release-v0.7.md",
 ]
 
-NON_AUTHORITY_SPEC = ["minicore-runtime-v0.4-flex-agent-loop-reset-spec.md"]
+# Non-authority guides: allowed current Markdown that defers to the authority set.
+NON_AUTHORITY = ["AGENTS.md"]
 
 POSITIONING = "MiniCore Runtime is a small Rust execution core for one live agent loop."
 
@@ -119,7 +121,7 @@ def markdown_files(root: Path) -> list[Path]:
 
 
 def known_files(root: Path) -> set[Path]:
-    return {(root / relative).resolve() for relative in [*AUTHORITY, *NON_AUTHORITY_SPEC]}
+    return {(root / relative).resolve() for relative in [*AUTHORITY, *NON_AUTHORITY]}
 
 
 def _strip_fences(text: str) -> list[str]:
@@ -249,8 +251,9 @@ def check_docs_index(root: Path) -> list[str]:
     for name, link in {**CONTRACT_LINKS, **CORE_LINKS}.items():
         if link not in targets:
             problems.append(f"docs/README does not link {name!r} ({link})")
-    if "non-authority" not in text or "v0.4-flex-agent-loop-reset-spec" not in text:
-        problems.append("docs/README must classify the spec file as non-authority")
+    for guide in NON_AUTHORITY:
+        if "non-authority" not in text or guide not in text:
+            problems.append(f"docs/README must classify {guide} as non-authority")
     return problems
 
 

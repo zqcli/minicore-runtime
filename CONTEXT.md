@@ -77,8 +77,7 @@ code-closeout run and passed the then-current closeout suite.
 `docs/modules/README.md`, `docs/development-plan.md`, all files under
 `docs/contracts/`, `docs/integration/host-boundary.md`, and
 `docs/migrations/v0.3-to-v0.4.md` are the current authority set (see
-`docs/README.md`). The tracked `minicore-runtime-v0.4-flex-agent-loop-reset-spec.md`
-is a non-authority implementation record.
+`docs/README.md`). `AGENTS.md` is non-authority guidance for coding agents.
 ## v0.7.0 Runtime Refactor
 
 Model output text is normalized by Runtime, empty deltas are ignored, and model

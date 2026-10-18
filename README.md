@@ -141,4 +141,4 @@ Compiled, runnable examples live in [`examples/`](examples):
 
 ## Documentation
 
-For the full picture see [`docs/README.md`](docs/README.md): architecture, module map, contracts, host boundary, and the v0.3-to-v0.4 migration. The tracked [v0.4 implementation spec](minicore-runtime-v0.4-flex-agent-loop-reset-spec.md) is a non-authority record of the reset work.
+For the full picture see [`docs/README.md`](docs/README.md): architecture, module map, contracts, host boundary, and the v0.3-to-v0.4 migration. Coding agents should also read [`AGENTS.md`](AGENTS.md).

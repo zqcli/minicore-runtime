@@ -25,12 +25,11 @@ this index, `architecture.md`, `modules/README.md`, `development-plan.md`,
 `acceptance-v0.4.md`, `release-v0.4.md`, and `release-v0.7.md`. The checker compares that set
 to every non-archive Markdown file.
 
-The tracked root `minicore-runtime-v0.4-flex-agent-loop-reset-spec.md` is the
-sole explicitly allowed non-authority current Markdown file. It records the
-implementation spec and review baseline; it does not override current source,
-contracts, migration, or release status. The checker classifies it separately
-from the current authority set. No other unlisted current Markdown is
-permitted.
+The root [`AGENTS.md`](../AGENTS.md) is the sole allowed non-authority current
+Markdown file. It guides coding agents and defers to the pages above; it does
+not override current source, contracts, migration, or release status. No other
+unlisted current Markdown is permitted. The v0.4 implementation spec was removed
+from the tree in 0.7.0 and remains in Git history.
 
 The v0.3 acceptance and release records are preserved by the
 `v0.3.0-durable-session-runtime` tag and are not part of the current tree;
