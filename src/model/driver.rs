@@ -38,14 +38,16 @@ pub(crate) struct ModelDriverConfig {
 }
 
 impl ModelDriverConfig {
-    pub(crate) fn from_options(options: &crate::LoopOptions) -> Self {
+    pub(crate) fn new(
+        model_call_timeout: Duration,
+        max_attempts: u8,
+        base_delay: Duration,
+        limits: LoopLimits,
+    ) -> Self {
         Self {
-            model_call_timeout: options.model_timeout,
-            retry_policy: RetryPolicySnapshot::new(
-                options.model_retry_attempts,
-                options.model_retry_base_delay,
-            ),
-            limits: options.limits,
+            model_call_timeout,
+            retry_policy: RetryPolicySnapshot::new(max_attempts, base_delay),
+            limits,
         }
     }
 }

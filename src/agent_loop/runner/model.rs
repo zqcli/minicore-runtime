@@ -110,7 +110,12 @@ pub(super) async fn run_model(
     let driver = crate::model::ModelDriver::from_validated(
         snapshot.model().clone(),
         snapshot.descriptor().clone(),
-        crate::model::ModelDriverConfig::from_options(ctx.options),
+        crate::model::ModelDriverConfig::new(
+            ctx.options.model_timeout,
+            ctx.options.model_retry_attempts,
+            ctx.options.model_retry_base_delay,
+            ctx.options.limits,
+        ),
     );
 
     let context = ModelCallContext::new(ctx.id, request_index, cancellation.clone(), turn_deadline);
