@@ -11,7 +11,7 @@ async fn complete_tool_response_accepts_unknown_finish_reason() {
             Ok(end(id.clone())),
             Ok(finish(ModelFinishReason::Unknown)),
         ],
-        kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()),
+        with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
     )
     .await
     .unwrap();
@@ -48,7 +48,7 @@ async fn interleaved_open_tools_allow_out_of_order_matching_ends() {
             Ok(end(first.clone())),
             Ok(finish(ModelFinishReason::ToolCalls)),
         ],
-        kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()),
+        with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
     )
     .await
     .unwrap();
@@ -71,16 +71,16 @@ async fn eof_with_open_tool_and_provider_tool_count_overflow_are_rejected() {
     let error = run_events(
         tool_request(),
         vec![Ok(start(open.clone(), "search")), Ok(args(open, "{}"))],
-        kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()),
+        with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
     )
     .await
     .unwrap_err();
     assert_eq!(error.kind(), ModelErrorKind::IncompleteResponse);
     assert_eq!(error.delivery(), DeliveryState::Started);
 
-    let limits = SemanticLimits {
+    let limits = LoopLimits {
         max_tool_calls_per_response: 1,
-        ..SemanticLimits::default()
+        ..LoopLimits::default()
     };
     let first = call_id(24);
     let second = call_id(25);
@@ -92,7 +92,7 @@ async fn eof_with_open_tool_and_provider_tool_count_overflow_are_rejected() {
             Ok(end(first)),
             Ok(start(second, "search")),
         ],
-        limits_kernel(limits),
+        with_limits(limits),
     )
     .await
     .unwrap_err();
@@ -115,7 +115,7 @@ async fn repeated_text_and_reasoning_aggregate_in_first_occurrence_order() {
             Ok(end(id.clone())),
             Ok(finish(ModelFinishReason::ToolCalls)),
         ],
-        kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()),
+        with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
     )
     .await
     .unwrap();
@@ -144,7 +144,7 @@ async fn refused_and_filtered_require_nonempty_text_not_reasoning_only() {
                 Ok(ModelEvent::text_delta("provider message").unwrap()),
                 Ok(finish(reason)),
             ],
-            kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()),
+            with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
         )
         .await
         .unwrap();
@@ -157,7 +157,7 @@ async fn refused_and_filtered_require_nonempty_text_not_reasoning_only() {
                 Ok(ModelEvent::reasoning_delta("internal reason").unwrap()),
                 Ok(finish(reason)),
             ],
-            kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()),
+            with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
         )
         .await
         .unwrap_err();
@@ -170,12 +170,12 @@ async fn refused_and_filtered_require_nonempty_text_not_reasoning_only() {
 /// model response emits text only, Model::start is called exactly once and succeeds.
 #[tokio::test(flavor = "current_thread")]
 async fn multiple_tool_specs_allow_text_response_when_limit_is_one() {
-    let limits = SemanticLimits {
+    let limits = LoopLimits {
         max_tool_calls_per_response: 1,
-        ..SemanticLimits::default()
+        ..LoopLimits::default()
     };
     let model = ScriptModel::new(descriptor(), vec![Behavior::Events(text_success("done"))]);
-    let driver = model.driver(&limits_kernel(limits));
+    let driver = model.driver(&with_limits(limits));
     let (progress, _receiver) = progress_channel();
     let request = request_with(
         ReasoningPreference::High,
@@ -199,9 +199,9 @@ async fn multiple_tool_specs_allow_text_response_when_limit_is_one() {
 #[tokio::test(flavor = "current_thread")]
 async fn multiple_tool_specs_allow_single_tool_call_when_limit_is_one() {
     let id = call_id(30);
-    let limits = SemanticLimits {
+    let limits = LoopLimits {
         max_tool_calls_per_response: 1,
-        ..SemanticLimits::default()
+        ..LoopLimits::default()
     };
     let request = request_with(
         ReasoningPreference::High,
@@ -216,7 +216,7 @@ async fn multiple_tool_specs_allow_single_tool_call_when_limit_is_one() {
             Ok(end(id.clone())),
             Ok(finish(ModelFinishReason::ToolCalls)),
         ],
-        limits_kernel(limits),
+        with_limits(limits),
     )
     .await
     .unwrap();
@@ -235,9 +235,9 @@ async fn multiple_tool_specs_allow_single_tool_call_when_limit_is_one() {
 /// model response emits two tool calls and is rejected by the assembler as InvalidProviderResponse.
 #[tokio::test(flavor = "current_thread")]
 async fn multiple_tool_specs_reject_second_tool_call_when_limit_is_one() {
-    let limits = SemanticLimits {
+    let limits = LoopLimits {
         max_tool_calls_per_response: 1,
-        ..SemanticLimits::default()
+        ..LoopLimits::default()
     };
     let first = call_id(31);
     let second = call_id(32);
@@ -254,7 +254,7 @@ async fn multiple_tool_specs_reject_second_tool_call_when_limit_is_one() {
             Ok(end(first)),
             Ok(start(second, "search")),
         ],
-        limits_kernel(limits),
+        with_limits(limits),
     )
     .await
     .unwrap_err();

@@ -1,3 +1,6 @@
+mod support;
+use support::{invocation, spec};
+
 use std::time::{Duration, Instant};
 
 use minicore_runtime::tools::{
@@ -18,19 +21,6 @@ fn interaction_id() -> InteractionId {
 
 fn tool_call_id() -> ToolCallId {
     "call_00000000000000000000000000000001".parse().unwrap()
-}
-
-fn invocation(arguments: serde_json::Value) -> ToolInvocation {
-    ToolInvocation::new(tool_call_id(), "deploy".parse().unwrap(), arguments).unwrap()
-}
-
-fn spec(description: &str) -> ToolSpec {
-    ToolSpec::new(
-        "deploy".parse().unwrap(),
-        description,
-        json!({"type": "object"}),
-    )
-    .unwrap()
 }
 
 fn decision_kind(decision: &ToolDecision) -> &'static str {
@@ -86,8 +76,8 @@ impl ToolPolicy for InspectPolicy {
 
 fn policy_request(cancellation: CancellationToken, deadline: Instant) -> ToolPolicyRequest {
     ToolPolicyRequest {
-        invocation: invocation(json!({"target": "production"})),
-        spec: spec("deploy one release"),
+        invocation: invocation("deploy", json!({"target": "production"})),
+        spec: spec("deploy", "deploy one release"),
         cancellation,
         deadline,
     }

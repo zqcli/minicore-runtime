@@ -1,3 +1,4 @@
+use crate::limits::LoopLimits;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,11 +11,11 @@ use tokio::time::Instant as TokioInstant;
 use crate::time::{DeadlineSource, effective_deadline};
 use crate::value::BoundedText;
 
-use super::model_port::{Model, ModelCallContext, ModelDescriptor};
+use super::port::{Model, ModelCallContext, ModelDescriptor};
 #[cfg(test)]
 use super::response::ModelEvent;
-use super::response::{DeliveryState, ModelError, ModelErrorKind};
-use super::types::{ModelRequest, ModelResponse};
+use super::{DeliveryState, ModelError, ModelErrorKind};
+use super::{ModelRequest, ModelResponse};
 
 mod assembler;
 mod failure;
@@ -33,50 +34,18 @@ pub(crate) const MAX_MODEL_RETRY_DELAY: Duration = Duration::from_secs(30);
 pub(crate) struct ModelDriverConfig {
     model_call_timeout: Duration,
     retry_policy: RetryPolicySnapshot,
-    limits: SemanticLimitsSnapshot,
-}
-
-#[derive(Clone)]
-pub(crate) struct SemanticLimitsSnapshot {
-    max_tool_calls_per_response: usize,
-    max_tool_name_bytes: usize,
-    max_tool_schema_bytes: usize,
-    max_tool_input_bytes: usize,
-    max_model_text_bytes_per_round: usize,
-    max_model_reasoning_bytes_per_round: usize,
+    limits: LoopLimits,
 }
 
 impl ModelDriverConfig {
-    pub(crate) fn from_kernel_values(
-        model_call_timeout: Duration,
-        max_attempts: u8,
-        base_delay: Duration,
-        limits: SemanticLimitsSnapshot,
-    ) -> Self {
+    pub(crate) fn from_options(options: &crate::LoopOptions) -> Self {
         Self {
-            model_call_timeout,
-            retry_policy: RetryPolicySnapshot::new(max_attempts, base_delay),
-            limits,
-        }
-    }
-}
-
-impl SemanticLimitsSnapshot {
-    pub(crate) fn from_kernel_values(
-        max_tool_calls_per_response: usize,
-        max_tool_name_bytes: usize,
-        max_tool_schema_bytes: usize,
-        max_tool_input_bytes: usize,
-        max_model_text_bytes_per_round: usize,
-        max_model_reasoning_bytes_per_round: usize,
-    ) -> Self {
-        Self {
-            max_tool_calls_per_response,
-            max_tool_name_bytes,
-            max_tool_schema_bytes,
-            max_tool_input_bytes,
-            max_model_text_bytes_per_round,
-            max_model_reasoning_bytes_per_round,
+            model_call_timeout: options.model_timeout,
+            retry_policy: RetryPolicySnapshot::new(
+                options.model_retry_attempts,
+                options.model_retry_base_delay,
+            ),
+            limits: options.limits,
         }
     }
 }
@@ -92,7 +61,7 @@ pub(crate) struct ModelDriver {
     descriptor: ModelDescriptor,
     model_call_timeout: Duration,
     retry_policy: RetryPolicySnapshot,
-    limits: SemanticLimitsSnapshot,
+    limits: LoopLimits,
 }
 
 impl ModelDriver {
@@ -103,24 +72,24 @@ impl ModelDriver {
     ) -> Result<Self, ModelError> {
         let descriptor = catch_unwind(AssertUnwindSafe(|| model.descriptor().clone()))
             .map_err(|_| generated_error(ModelErrorKind::Panicked, DeliveryState::NotStarted))?;
-        Self::from_validated(model, descriptor, config)
+        descriptor.validate().map_err(|_| {
+            generated_error(ModelErrorKind::InvalidRequest, DeliveryState::NotStarted)
+        })?;
+        Ok(Self::from_validated(model, descriptor, config))
     }
 
     pub(crate) fn from_validated(
         model: Arc<dyn Model>,
         descriptor: ModelDescriptor,
         config: ModelDriverConfig,
-    ) -> Result<Self, ModelError> {
-        descriptor.validate().map_err(|_| {
-            generated_error(ModelErrorKind::InvalidRequest, DeliveryState::NotStarted)
-        })?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             model,
             descriptor,
             model_call_timeout: config.model_call_timeout,
             retry_policy: config.retry_policy,
             limits: config.limits,
-        })
+        }
     }
 
     #[cfg(test)]

@@ -121,13 +121,8 @@ impl ExecutionConfig {
         if !descriptor.supports_reasoning(reasoning) {
             return Err(ExecutionConfigError::UnsupportedReasoning);
         }
-        let tool_specs: Vec<_> = tools.frozen_specs().collect();
-        if !tool_specs.is_empty() && !descriptor.supports_tools {
+        if tools.frozen_specs().len() != 0 && !descriptor.supports_tools {
             return Err(ExecutionConfigError::ToolsUnsupported);
-        }
-        for spec in &tool_specs {
-            spec.validate()
-                .map_err(|_| ExecutionConfigError::InvalidTools)?;
         }
         Ok(Self {
             model,

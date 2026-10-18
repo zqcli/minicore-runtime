@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn not_started_errors_retry_with_exact_attempts_and_delays() {
-    let policy = RetryPolicy::new(3, Duration::from_secs(2)).unwrap();
+    let policy = RetryPolicySnapshot::new(3, Duration::from_secs(2));
     let model = ScriptModel::new(
         descriptor(),
         vec![
@@ -11,7 +11,7 @@ async fn not_started_errors_retry_with_exact_attempts_and_delays() {
             Behavior::Events(text_success("done")),
         ],
     );
-    let driver = model.driver(&kernel(policy));
+    let driver = model.driver(&with_retry(policy));
     let (progress, _receiver) = progress_channel();
     let run = tokio::spawn(async move {
         driver
@@ -69,7 +69,7 @@ async fn excessive_retry_after_started_unknown_and_nonretryable_do_not_retry() {
                 Behavior::Events(text_success("unexpected")),
             ],
         );
-        let driver = model.driver(&kernel(RetryPolicy::new(4, Duration::ZERO).unwrap()));
+        let driver = model.driver(&with_retry(RetryPolicySnapshot::new(4, Duration::ZERO)));
         let (progress, _receiver) = progress_channel();
         let actual = driver
             .run(
@@ -96,7 +96,7 @@ async fn semantic_event_blocks_retry_and_normalizes_lying_not_started_error() {
             Behavior::Events(text_success("unexpected")),
         ],
     );
-    let driver = model.driver(&kernel(RetryPolicy::new(4, Duration::ZERO).unwrap()));
+    let driver = model.driver(&with_retry(RetryPolicySnapshot::new(4, Duration::ZERO)));
     let (progress, mut progress_rx) = progress_channel();
     let error = driver
         .run(
@@ -126,7 +126,7 @@ async fn no_event_stream_error_can_retry_but_retry_must_fit_overall_deadline() {
             Behavior::Events(text_success("retried")),
         ],
     );
-    let driver = model.driver(&kernel(RetryPolicy::new(2, Duration::ZERO).unwrap()));
+    let driver = model.driver(&with_retry(RetryPolicySnapshot::new(2, Duration::ZERO)));
     let (progress, _receiver) = progress_channel();
     let response = driver
         .run(
@@ -146,9 +146,10 @@ async fn no_event_stream_error_can_retry_but_retry_must_fit_overall_deadline() {
             Behavior::Events(text_success("unexpected")),
         ],
     );
-    let driver = model.driver(&kernel(
-        RetryPolicy::new(2, Duration::from_secs(10)).unwrap(),
-    ));
+    let driver = model.driver(&with_retry(RetryPolicySnapshot::new(
+        2,
+        Duration::from_secs(10),
+    )));
     let error = driver
         .run(
             request(),
@@ -180,7 +181,7 @@ async fn retryable_event_free_stream_is_dropped_before_next_attempt_starts() {
             },
         ],
     );
-    let driver = model.driver(&kernel(RetryPolicy::new(2, Duration::ZERO).unwrap()));
+    let driver = model.driver(&with_retry(RetryPolicySnapshot::new(2, Duration::ZERO)));
     let (progress, _receiver) = progress_channel();
     let response = driver
         .run(
@@ -206,9 +207,10 @@ async fn overall_deadline_can_expire_during_retry_sleep() {
             Behavior::Events(text_success("unexpected")),
         ],
     );
-    let driver = model.driver(&kernel(
-        RetryPolicy::new(2, Duration::from_secs(5)).unwrap(),
-    ));
+    let driver = model.driver(&with_retry(RetryPolicySnapshot::new(
+        2,
+        Duration::from_secs(5),
+    )));
     let (progress, _receiver) = progress_channel();
     let run = tokio::spawn(async move {
         driver
@@ -238,9 +240,10 @@ async fn cancellation_interrupts_retry_sleep_without_another_attempt() {
             Behavior::Events(text_success("unexpected")),
         ],
     );
-    let driver = model.driver(&kernel(
-        RetryPolicy::new(2, Duration::from_secs(10)).unwrap(),
-    ));
+    let driver = model.driver(&with_retry(RetryPolicySnapshot::new(
+        2,
+        Duration::from_secs(10),
+    )));
     let cancellation = CancellationToken::new();
     let task_cancel = cancellation.clone();
     let (progress, _receiver) = progress_channel();
@@ -271,7 +274,7 @@ async fn one_driver_allows_true_concurrent_model_calls() {
             Behavior::Barrier(Arc::clone(&barrier), text_success("second")),
         ],
     );
-    let driver = Arc::new(model.driver(&kernel(RetryPolicy::new(1, Duration::ZERO).unwrap())));
+    let driver = Arc::new(model.driver(&with_retry(RetryPolicySnapshot::new(1, Duration::ZERO))));
     let (first_progress, _first_rx) = progress_channel();
     let (second_progress, _second_rx) = progress_channel();
     let first_driver = Arc::clone(&driver);

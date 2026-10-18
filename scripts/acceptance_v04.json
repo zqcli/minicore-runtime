@@ -98,7 +98,7 @@
       "status": "Passed",
       "summary": "Model接口保留",
       "evidence": [
-        "src/model/model.rs",
+        "src/model/port.rs",
         "tests/p1_v04_loop_dtos.rs::execution_config_accepts_a_text_only_model"
       ]
     },

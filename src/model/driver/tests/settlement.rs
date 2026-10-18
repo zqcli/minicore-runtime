@@ -25,7 +25,7 @@ async fn finish_then_stream_error_is_not_success_or_retryable_after_observation(
             Behavior::Events(text_success("unexpected retry")),
         ],
     );
-    let driver = model.driver(&kernel(RetryPolicy::new(4, Duration::ZERO).unwrap()));
+    let driver = model.driver(&with_retry(RetryPolicySnapshot::new(4, Duration::ZERO)));
     let (progress, _receiver) = progress_channel();
     let error = driver
         .run(
@@ -65,7 +65,7 @@ async fn finish_then_pending_requires_eof_and_drops_on_cancel_or_observed_timeou
         }],
     );
     let cancelled_driver =
-        cancelled_model.driver(&kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()));
+        cancelled_model.driver(&with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)));
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
     let (progress, _receiver) = progress_channel();
@@ -106,9 +106,9 @@ async fn finish_then_pending_requires_eof_and_drops_on_cancel_or_observed_timeou
             probe: Arc::clone(&deadline_probe),
         }],
     );
-    let config = KernelConfig {
+    let config = ModelDriverConfig {
         model_call_timeout: Duration::from_secs(5),
-        ..kernel(RetryPolicy::new(1, Duration::ZERO).unwrap())
+        ..with_retry(RetryPolicySnapshot::new(1, Duration::ZERO))
     };
     let deadline_driver = deadline_model.driver(&config);
     let (progress, _receiver) = progress_channel();
@@ -145,7 +145,7 @@ async fn event_then_stream_poll_panic_is_started_dropped_and_never_retried() {
             Behavior::Events(text_success("unexpected retry")),
         ],
     );
-    let driver = model.driver(&kernel(RetryPolicy::new(4, Duration::ZERO).unwrap()));
+    let driver = model.driver(&with_retry(RetryPolicySnapshot::new(4, Duration::ZERO)));
     let (progress, mut progress_rx) = progress_channel();
     let error = driver
         .run(

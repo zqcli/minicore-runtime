@@ -1,163 +1,15 @@
+use super::{ModelValueError, ProviderReplay};
+use crate::ids::ToolCallId;
+use crate::tools::{ToolName, ToolOutput, ToolResultOutcome};
 use crate::value::{normalize_model_text, valid_text};
-use std::collections::BTreeSet;
-use std::fmt;
-use std::str::FromStr;
-use std::sync::Arc;
-
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use thiserror::Error;
-
-use super::ProviderReplay;
-use crate::ids::ToolCallId;
-pub(crate) use crate::tools::ToolSpec;
-use crate::tools::{ToolName, ToolOutput, ToolResultOutcome};
-
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum ModelRefError {
-    #[error("model reference must be 1..=256 bytes")]
-    InvalidLength,
-    #[error("model reference violates its stable symbolic grammar")]
-    InvalidGrammar,
-}
-
-#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ModelRef(Box<str>);
-
-impl ModelRef {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FromStr for ModelRef {
-    type Err = ModelRefError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.is_empty() || value.len() > 256 {
-            return Err(ModelRefError::InvalidLength);
-        }
-        if !value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/')
-        }) {
-            return Err(ModelRefError::InvalidGrammar);
-        }
-        Ok(Self(value.into()))
-    }
-}
-
-crate::value::string_newtype_serde!(ModelRef);
-
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum ModelLimitsError {
-    #[error("model limit values must be non-zero")]
-    Zero,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
-pub enum ModelValueError {
-    #[error("model text is empty, unsafe, or exceeds its limit")]
-    InvalidText,
-    #[error("reasoning content has no artifact")]
-    EmptyReasoningContent,
-    #[error("model message list must not be empty")]
-    EmptyMessages,
-    #[error("assistant parts must not be empty")]
-    EmptyAssistantParts,
-    #[error("tool call arguments must be a JSON object")]
-    InvalidToolArguments,
-    #[error("tool result does not match a pending assistant tool call")]
-    OrphanToolResult,
-    #[error("tool result id is duplicated in the current exchange")]
-    DuplicateToolResult,
-    #[error("assistant tool calls must be completed before the next message")]
-    IncompleteToolExchange,
-    #[error("model response parts must not be empty")]
-    EmptyResponseParts,
-    #[error("assistant tool call IDs must be unique")]
-    DuplicateToolCallId,
-    #[error("assistant tool call indices must be unique")]
-    DuplicateToolCallIndex,
-    #[error("assistant tool call indices must be contiguous and ordered")]
-    InvalidToolCallOrder,
-    #[error("model descriptor is invalid")]
-    InvalidDescriptor,
-    #[error("model stream event is invalid")]
-    InvalidEvent,
-    #[error("provider replay format or payload exceeds its bounds")]
-    InvalidProviderReplay,
-    #[error("model request tools are invalid or not strictly ordered")]
-    InvalidTools,
-}
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
 /// Absolute ceiling for a single `ModelMessage` text payload (system, user,
 /// or an assistant text part). Default prompt projection truncates summary
 /// tails so this bound is always satisfied.
 pub(crate) const MAX_MODEL_MESSAGE_TEXT_BYTES: usize = 262_144;
-
-#[derive(
-    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum ReasoningPreference {
-    #[default]
-    Auto,
-    Disabled,
-    Low,
-    Medium,
-    High,
-    #[serde(rename = "xhigh")]
-    XHigh,
-    Max,
-    Ultra,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct ModelLimits {
-    context_window_tokens: Option<u32>,
-    max_output_tokens: Option<u32>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ModelLimitsWire {
-    context_window_tokens: Option<u32>,
-    max_output_tokens: Option<u32>,
-}
-
-impl ModelLimits {
-    pub fn new(
-        context_window_tokens: Option<u32>,
-        max_output_tokens: Option<u32>,
-    ) -> Result<Self, ModelLimitsError> {
-        if context_window_tokens == Some(0) || max_output_tokens == Some(0) {
-            return Err(ModelLimitsError::Zero);
-        }
-        Ok(Self {
-            context_window_tokens,
-            max_output_tokens,
-        })
-    }
-
-    pub const fn context_window_tokens(&self) -> Option<u32> {
-        self.context_window_tokens
-    }
-
-    pub const fn max_output_tokens(&self) -> Option<u32> {
-        self.max_output_tokens
-    }
-}
-
-impl<'de> Deserialize<'de> for ModelLimits {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = ModelLimitsWire::deserialize(deserializer)?;
-        Self::new(value.context_window_tokens, value.max_output_tokens)
-            .map_err(serde::de::Error::custom)
-    }
-}
 
 #[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
@@ -320,8 +172,7 @@ impl AssistantPart {
                     Err(ModelValueError::InvalidText)
                 }
             }
-            Self::Reasoning(_) => Ok(()),
-            Self::ToolCall(call) => call.validate(),
+            Self::Reasoning(_) | Self::ToolCall(_) => Ok(()),
         }
     }
 
@@ -386,8 +237,24 @@ impl ToolCall {
         arguments: Value,
         call_index: u32,
     ) -> Result<Self, ModelValueError> {
+        Self::new_with_max_bytes(
+            tool_call_id,
+            name,
+            arguments,
+            call_index,
+            crate::value::MAX_JSON_BYTES,
+        )
+    }
+
+    pub(crate) fn new_with_max_bytes(
+        tool_call_id: ToolCallId,
+        name: ToolName,
+        arguments: Value,
+        call_index: u32,
+        max_bytes: usize,
+    ) -> Result<Self, ModelValueError> {
         if !arguments.is_object()
-            || crate::value::validate_json_size(&arguments, crate::value::MAX_JSON_BYTES).is_err()
+            || crate::value::validate_json_size(&arguments, max_bytes).is_err()
         {
             return Err(ModelValueError::InvalidToolArguments);
         }
@@ -397,14 +264,6 @@ impl ToolCall {
             arguments: Arc::new(arguments),
             call_index,
         })
-    }
-
-    pub fn validate(&self) -> Result<(), ModelValueError> {
-        if self.arguments.is_object() {
-            Ok(())
-        } else {
-            Err(ModelValueError::InvalidToolArguments)
-        }
     }
 
     pub const fn tool_call_id(&self) -> &ToolCallId {
@@ -674,290 +533,7 @@ impl<'de> Deserialize<'de> for ModelMessage {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Serialize)]
-pub struct ModelRequest {
-    messages: Arc<[ModelMessage]>,
-    tools: Arc<[ToolSpec]>,
-    limits: ModelLimits,
-    reasoning: ReasoningPreference,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ModelRequestWire {
-    messages: Vec<ModelMessage>,
-    tools: Vec<ToolSpec>,
-    limits: ModelLimits,
-    reasoning: ReasoningPreference,
-}
-
-impl ModelRequest {
-    pub fn new(
-        messages: Vec<ModelMessage>,
-        tools: impl Into<Arc<[ToolSpec]>>,
-        limits: ModelLimits,
-        reasoning: ReasoningPreference,
-    ) -> Result<Self, ModelValueError> {
-        if messages.is_empty() {
-            return Err(ModelValueError::EmptyMessages);
-        }
-        let tools = tools.into();
-        validate_tool_exchange(&messages)?;
-        validate_request_tools(&tools)?;
-        Ok(Self {
-            messages: messages.into(),
-            tools,
-            limits,
-            reasoning,
-        })
-    }
-
-    pub fn messages(&self) -> &[ModelMessage] {
-        &self.messages
-    }
-
-    pub fn tools(&self) -> &[ToolSpec] {
-        &self.tools
-    }
-
-    pub const fn limits(&self) -> &ModelLimits {
-        &self.limits
-    }
-
-    pub const fn reasoning(&self) -> ReasoningPreference {
-        self.reasoning
-    }
-}
-
-impl fmt::Debug for ModelRequest {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ModelRequest")
-            .field("message_count", &self.messages.len())
-            .field("tool_count", &self.tools.len())
-            .field("limits", &self.limits)
-            .field("reasoning", &self.reasoning)
-            .finish()
-    }
-}
-
-impl<'de> Deserialize<'de> for ModelRequest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = ModelRequestWire::deserialize(deserializer)?;
-        Self::new(value.messages, value.tools, value.limits, value.reasoning)
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelFinishReason {
-    Stop,
-    ToolCalls,
-    Length,
-    ContentFiltered,
-    Refused,
-    Unknown,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Usage {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    input_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    output_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    reasoning_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cache_read_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cache_write_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    provider_total_tokens: Option<u64>,
-}
-
-impl Usage {
-    pub const fn new(input_tokens: u64, output_tokens: u64, reasoning_tokens: u64) -> Self {
-        Self::from_optional(
-            Some(input_tokens),
-            Some(output_tokens),
-            Some(reasoning_tokens),
-        )
-    }
-
-    pub const fn from_optional(
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
-        reasoning_tokens: Option<u64>,
-    ) -> Self {
-        Self {
-            input_tokens,
-            output_tokens,
-            reasoning_tokens,
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            provider_total_tokens: None,
-        }
-    }
-
-    pub const fn with_cache_read_tokens(mut self, value: Option<u64>) -> Self {
-        self.cache_read_tokens = value;
-        self
-    }
-
-    pub const fn with_cache_write_tokens(mut self, value: Option<u64>) -> Self {
-        self.cache_write_tokens = value;
-        self
-    }
-
-    pub const fn with_provider_total_tokens(mut self, value: Option<u64>) -> Self {
-        self.provider_total_tokens = value;
-        self
-    }
-
-    pub const fn input_tokens(&self) -> Option<u64> {
-        self.input_tokens
-    }
-
-    pub const fn output_tokens(&self) -> Option<u64> {
-        self.output_tokens
-    }
-
-    pub const fn reasoning_tokens(&self) -> Option<u64> {
-        self.reasoning_tokens
-    }
-
-    pub const fn cache_read_tokens(&self) -> Option<u64> {
-        self.cache_read_tokens
-    }
-
-    pub const fn cache_write_tokens(&self) -> Option<u64> {
-        self.cache_write_tokens
-    }
-
-    pub const fn provider_total_tokens(&self) -> Option<u64> {
-        self.provider_total_tokens
-    }
-
-    /// Sums only when all three core token counts are reported and the sum fits.
-    pub const fn total_tokens(&self) -> Option<u64> {
-        let (Some(input), Some(output), Some(reasoning)) =
-            (self.input_tokens, self.output_tokens, self.reasoning_tokens)
-        else {
-            return None;
-        };
-        let Some(total) = input.checked_add(output) else {
-            return None;
-        };
-        total.checked_add(reasoning)
-    }
-}
-
-#[derive(Clone, Eq, PartialEq, Serialize)]
-pub struct ModelResponse {
-    parts: Vec<AssistantPart>,
-    finish_reason: ModelFinishReason,
-    usage: Option<Usage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    provider_replay: Option<ProviderReplay>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ModelResponseWire {
-    parts: Vec<AssistantPart>,
-    finish_reason: ModelFinishReason,
-    usage: Option<Usage>,
-    #[serde(default)]
-    provider_replay: Option<ProviderReplay>,
-}
-
-impl ModelResponse {
-    pub fn new(
-        parts: Vec<AssistantPart>,
-        finish_reason: ModelFinishReason,
-        usage: impl Into<Option<Usage>>,
-    ) -> Result<Self, ModelValueError> {
-        Self::new_with_provider_replay(parts, finish_reason, usage, None)
-    }
-
-    /// Constructs a response, permitting no canonical parts only when replay exists.
-    pub fn new_with_provider_replay(
-        parts: Vec<AssistantPart>,
-        finish_reason: ModelFinishReason,
-        usage: impl Into<Option<Usage>>,
-        provider_replay: Option<ProviderReplay>,
-    ) -> Result<Self, ModelValueError> {
-        let parts = normalize_parts(parts);
-        if parts.is_empty() && provider_replay.is_none() {
-            return Err(ModelValueError::EmptyResponseParts);
-        }
-        validate_tool_call_order(&parts)?;
-        Ok(Self {
-            parts,
-            finish_reason,
-            usage: usage.into(),
-            provider_replay,
-        })
-    }
-
-    /// Attaches validated opaque metadata without changing canonical response parts.
-    pub fn with_provider_replay(mut self, replay: ProviderReplay) -> Self {
-        self.provider_replay = Some(replay);
-        self
-    }
-
-    pub const fn provider_replay(&self) -> Option<&ProviderReplay> {
-        self.provider_replay.as_ref()
-    }
-
-    pub fn parts(&self) -> &[AssistantPart] {
-        &self.parts
-    }
-
-    pub const fn finish_reason(&self) -> ModelFinishReason {
-        self.finish_reason
-    }
-
-    pub const fn usage(&self) -> Option<&Usage> {
-        self.usage.as_ref()
-    }
-}
-
-impl fmt::Debug for ModelResponse {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ModelResponse")
-            .field("part_count", &self.parts.len())
-            .field("parts", &self.parts)
-            .field("provider_replay", &self.provider_replay)
-            .field("finish_reason", &self.finish_reason)
-            .field("usage", &self.usage)
-            .finish()
-    }
-}
-
-impl<'de> Deserialize<'de> for ModelResponse {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = ModelResponseWire::deserialize(deserializer)?;
-        Self::new_with_provider_replay(
-            value.parts,
-            value.finish_reason,
-            value.usage,
-            value.provider_replay,
-        )
-        .map_err(serde::de::Error::custom)
-    }
-}
-
-fn validate_tool_call_order(parts: &[AssistantPart]) -> Result<(), ModelValueError> {
+pub(super) fn validate_tool_call_order(parts: &[AssistantPart]) -> Result<(), ModelValueError> {
     let mut ids = BTreeSet::new();
     let mut indices = BTreeSet::new();
     let mut expected_index = 0_u32;
@@ -981,61 +557,7 @@ fn validate_tool_call_order(parts: &[AssistantPart]) -> Result<(), ModelValueErr
     Ok(())
 }
 
-fn validate_tool_exchange(messages: &[ModelMessage]) -> Result<(), ModelValueError> {
-    let mut pending = BTreeSet::new();
-    let mut completed = BTreeSet::new();
-    for message in messages {
-        match message {
-            ModelMessage::Assistant(parts) | ModelMessage::AssistantWithReplay { parts, .. } => {
-                if !pending.is_empty() {
-                    return Err(ModelValueError::IncompleteToolExchange);
-                }
-                message.validate()?;
-                completed.clear();
-                for part in parts {
-                    if let Some(call) = part.as_tool_call() {
-                        pending.insert(call.tool_call_id().clone());
-                    }
-                }
-            }
-            ModelMessage::Tool { tool_call_id, .. } => {
-                if completed.contains(tool_call_id) {
-                    return Err(ModelValueError::DuplicateToolResult);
-                }
-                if pending.is_empty() || !pending.remove(tool_call_id) {
-                    return Err(ModelValueError::OrphanToolResult);
-                }
-                completed.insert(tool_call_id.clone());
-            }
-            ModelMessage::System(_) | ModelMessage::User(_) => {
-                if !pending.is_empty() {
-                    return Err(ModelValueError::IncompleteToolExchange);
-                }
-                message.validate()?;
-                completed.clear();
-            }
-        }
-    }
-    if pending.is_empty() {
-        Ok(())
-    } else {
-        Err(ModelValueError::IncompleteToolExchange)
-    }
-}
-
-fn validate_request_tools(tools: &[ToolSpec]) -> Result<(), ModelValueError> {
-    let mut previous: Option<&ToolName> = None;
-    for tool in tools {
-        tool.validate().map_err(|_| ModelValueError::InvalidTools)?;
-        if previous.is_some_and(|previous| previous >= tool.name()) {
-            return Err(ModelValueError::InvalidTools);
-        }
-        previous = Some(tool.name());
-    }
-    Ok(())
-}
-
-fn normalize_parts(mut parts: Vec<AssistantPart>) -> Vec<AssistantPart> {
+pub(super) fn normalize_parts(mut parts: Vec<AssistantPart>) -> Vec<AssistantPart> {
     for part in &mut parts {
         if let AssistantPart::Text(text) = part {
             if let std::borrow::Cow::Owned(normalized) = normalize_model_text(text) {

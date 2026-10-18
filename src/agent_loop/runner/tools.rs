@@ -130,7 +130,7 @@ pub(super) async fn run_tool_call(
     let decision = match decide_policy(
         policy,
         invocation,
-        enabled.spec.clone(),
+        &enabled.spec,
         super::turn_deadline(ctx.options.deadline),
         &cancellation,
         ctx.options.policy_timeout,
@@ -264,7 +264,7 @@ enum PolicyStep {
 async fn decide_policy(
     policy: Option<Arc<dyn ToolPolicy>>,
     invocation: &ToolInvocation,
-    spec: ToolSpec,
+    spec: &ToolSpec,
     turn_deadline: Instant,
     cancellation: &CancellationToken,
     policy_timeout: Duration,
@@ -280,7 +280,7 @@ async fn decide_policy(
         |child, deadline| {
             let request = ToolPolicyRequest {
                 invocation: invocation.clone(),
-                spec,
+                spec: spec.clone(),
                 cancellation: child,
                 deadline,
             };

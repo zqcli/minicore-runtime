@@ -78,7 +78,6 @@ FORBIDDEN_PATHS = [
     "src/bindings.rs",
     "src/prompt_provider.rs",
     "examples/session_runtime_lifecycle.rs",
-    "tests/support",
 ]
 
 FORBIDDEN_DEPENDENCIES = [

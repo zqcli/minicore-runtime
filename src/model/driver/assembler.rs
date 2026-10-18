@@ -4,17 +4,17 @@ use serde_json::Value;
 use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::ids::ToolCallId;
 use crate::tools::{ToolName, ToolSpec};
-use crate::value::{BoundedText, MAX_JSON_BYTES, validate_json_size};
+use crate::value::{BoundedText, MAX_JSON_BYTES};
 
-use super::super::response::{ModelError, ModelErrorKind, ModelEvent};
-use super::super::types::{
+use super::super::{
     AssistantPart, ModelFinishReason, ModelResponse, ReasoningContent, ToolCall, Usage,
 };
-use super::{ModelDriverProgress, SemanticLimitsSnapshot};
+use super::super::{ModelError, ModelErrorKind, ModelEvent};
+use super::{LoopLimits, ModelDriverProgress};
 
 pub(super) struct Assembler<'a> {
     request_tools: &'a [ToolSpec],
-    limits: &'a SemanticLimitsSnapshot,
+    limits: &'a LoopLimits,
     slots: Vec<PartSlot>,
     text: String,
     reasoning: String,
@@ -36,12 +36,12 @@ struct ToolAssembly {
     tool_call_id: ToolCallId,
     name: ToolName,
     arguments_text: String,
-    arguments: Option<Value>,
+    call: Option<ToolCall>,
     call_index: u32,
 }
 
 impl<'a> Assembler<'a> {
-    pub(super) fn new(request_tools: &'a [ToolSpec], limits: &'a SemanticLimitsSnapshot) -> Self {
+    pub(super) fn new(request_tools: &'a [ToolSpec], limits: &'a LoopLimits) -> Self {
         Self {
             request_tools,
             limits,
@@ -75,7 +75,7 @@ impl<'a> Assembler<'a> {
                 append_bounded(
                     &mut self.text,
                     delta.as_str(),
-                    self.limits.max_model_text_bytes_per_round,
+                    self.limits.max_model_text_bytes,
                 )?;
                 Ok(Some(ModelDriverProgress::TextDelta(delta)))
             }
@@ -90,7 +90,7 @@ impl<'a> Assembler<'a> {
                 append_bounded(
                     &mut self.reasoning,
                     delta.as_str(),
-                    self.limits.max_model_reasoning_bytes_per_round,
+                    self.limits.max_model_reasoning_bytes,
                 )?;
                 Ok(Some(ModelDriverProgress::ReasoningDelta(delta)))
             }
@@ -120,7 +120,7 @@ impl<'a> Assembler<'a> {
                     tool_call_id,
                     name: tool_name,
                     arguments_text: String::new(),
-                    arguments: None,
+                    call: None,
                     call_index,
                 });
                 self.slots.push(PartSlot::Tool(index));
@@ -131,24 +131,30 @@ impl<'a> Assembler<'a> {
                 delta,
             } => {
                 let tool = self.tool_mut(&tool_call_id)?;
-                if tool.arguments.is_some() {
+                if tool.call.is_some() {
                     return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
                 }
                 append_bounded(&mut tool.arguments_text, delta.as_str(), MAX_JSON_BYTES)?;
                 Ok(None)
             }
             ModelEvent::ToolCallEnd { tool_call_id } => {
-                let maximum = self.limits.max_tool_input_bytes;
+                let maximum = self.limits.max_tool_arguments_bytes;
                 let tool = self.tool_mut(&tool_call_id)?;
-                if tool.arguments.is_some() || tool.arguments_text.is_empty() {
+                if tool.call.is_some() || tool.arguments_text.is_empty() {
                     return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
                 }
                 let arguments: Value = serde_json::from_str(&tool.arguments_text)
                     .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
-                if !arguments.is_object() || validate_json_size(&arguments, maximum).is_err() {
-                    return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
-                }
-                tool.arguments = Some(arguments);
+                tool.call = Some(
+                    ToolCall::new_with_max_bytes(
+                        tool.tool_call_id.clone(),
+                        tool.name.clone(),
+                        arguments,
+                        tool.call_index,
+                        maximum,
+                    )
+                    .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))?,
+                );
                 Ok(None)
             }
             ModelEvent::Usage { usage } => {
@@ -164,7 +170,7 @@ impl<'a> Assembler<'a> {
                 Ok(None)
             }
             ModelEvent::Finish { reason } => {
-                if self.tools.iter().any(|tool| tool.arguments.is_none()) {
+                if self.tools.iter().any(|tool| tool.call.is_none()) {
                     return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
                 }
                 self.finish_reason = Some(reason);
@@ -211,18 +217,10 @@ impl<'a> Assembler<'a> {
                     parts.push(AssistantPart::Reasoning(reasoning));
                 }
                 PartSlot::Tool(index) => {
-                    let tool = &mut self.tools[index];
-                    let arguments = tool
-                        .arguments
+                    let call = self.tools[index]
+                        .call
                         .take()
                         .expect("Finish requires completed tools");
-                    let call = ToolCall::new(
-                        tool.tool_call_id.clone(),
-                        tool.name.clone(),
-                        arguments,
-                        tool.call_index,
-                    )
-                    .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
                     parts.push(AssistantPart::ToolCall(call));
                 }
             }

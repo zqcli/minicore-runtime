@@ -77,13 +77,15 @@ impl ToolSpec {
         max_name_bytes: usize,
         max_schema_bytes: usize,
     ) -> Result<(), ToolValueError> {
-        if self.name.as_str().len() > max_name_bytes {
+        if self.name.as_str().len() > max_name_bytes
+            || self.description.byte_len() > max_schema_bytes.min(MAX_TOOL_DESCRIPTION_BYTES)
+        {
             return Err(ToolValueError::InvalidText);
         }
-        self.validate_with_budgets(
-            max_schema_bytes.min(MAX_TOOL_DESCRIPTION_BYTES),
-            max_schema_bytes,
-        )
+        if crate::value::json_bytes(&self.input_schema) > max_schema_bytes {
+            return Err(ToolValueError::InvalidSchema);
+        }
+        Ok(())
     }
 
     fn validate_with_budgets(

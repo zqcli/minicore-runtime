@@ -3,11 +3,14 @@ use std::sync::atomic::AtomicU64;
 use super::*;
 use crate::time::DeadlineSource;
 
-fn deadline_kernel(model_timeout: Duration, retry_policy: RetryPolicy) -> KernelConfig {
-    KernelConfig {
+fn deadline_with_retry(
+    model_timeout: Duration,
+    retry_policy: RetryPolicySnapshot,
+) -> ModelDriverConfig {
+    ModelDriverConfig {
         model_call_timeout: model_timeout,
         retry_policy,
-        ..KernelConfig::default_checked().unwrap()
+        ..ModelDriverConfig::default()
     }
 }
 
@@ -34,9 +37,9 @@ async fn pending_stream_reports_exact_turn_or_port_deadline_source() {
                 probe: Arc::clone(&probe),
             }],
         );
-        let driver = model.driver(&deadline_kernel(
+        let driver = model.driver(&deadline_with_retry(
             model_timeout,
-            RetryPolicy::new(1, Duration::ZERO).unwrap(),
+            RetryPolicySnapshot::new(1, Duration::ZERO),
         ));
         let (progress, _receiver) = progress_channel();
         let dropped = AtomicU64::new(0);
@@ -65,9 +68,9 @@ async fn adapter_timeout_has_no_core_deadline_provenance() {
         descriptor(),
         vec![Behavior::StartError(test_error(ModelErrorKind::Timeout))],
     );
-    let driver = model.driver(&deadline_kernel(
+    let driver = model.driver(&deadline_with_retry(
         Duration::from_secs(5),
-        RetryPolicy::new(1, Duration::ZERO).unwrap(),
+        RetryPolicySnapshot::new(1, Duration::ZERO),
     ));
     let (progress, _receiver) = progress_channel();
     let failure = driver
@@ -86,9 +89,9 @@ async fn adapter_timeout_has_no_core_deadline_provenance() {
 #[tokio::test(flavor = "current_thread")]
 async fn expired_turn_deadline_is_reported_before_model_invocation() {
     let model = ScriptModel::new(descriptor(), Vec::new());
-    let driver = model.driver(&deadline_kernel(
+    let driver = model.driver(&deadline_with_retry(
         Duration::from_secs(30),
-        RetryPolicy::new(1, Duration::ZERO).unwrap(),
+        RetryPolicySnapshot::new(1, Duration::ZERO),
     ));
     let mut call_context = context(CancellationToken::new(), Duration::from_secs(30));
     call_context.deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
@@ -105,9 +108,9 @@ async fn expired_turn_deadline_is_reported_before_model_invocation() {
 #[tokio::test(flavor = "current_thread")]
 async fn cancellation_and_panic_have_no_deadline_provenance() {
     let model = ScriptModel::new(descriptor(), Vec::new());
-    let driver = model.driver(&deadline_kernel(
+    let driver = model.driver(&deadline_with_retry(
         Duration::from_secs(5),
-        RetryPolicy::new(1, Duration::ZERO).unwrap(),
+        RetryPolicySnapshot::new(1, Duration::ZERO),
     ));
     let cancellation = CancellationToken::new();
     cancellation.cancel();
@@ -125,9 +128,9 @@ async fn cancellation_and_panic_have_no_deadline_provenance() {
     assert_eq!(failure.deadline_source(), None);
 
     let model = ScriptModel::new(descriptor(), vec![Behavior::StartPanic]);
-    let driver = model.driver(&deadline_kernel(
+    let driver = model.driver(&deadline_with_retry(
         Duration::from_secs(5),
-        RetryPolicy::new(1, Duration::ZERO).unwrap(),
+        RetryPolicySnapshot::new(1, Duration::ZERO),
     ));
     let failure = driver
         .run_detailed(
@@ -150,9 +153,9 @@ async fn retry_timeout_source(turn_after: Duration, model_timeout: Duration) -> 
             Behavior::Events(text_success("unexpected")),
         ],
     );
-    let driver = model.driver(&deadline_kernel(
+    let driver = model.driver(&deadline_with_retry(
         model_timeout,
-        RetryPolicy::new(2, Duration::from_secs(5)).unwrap(),
+        RetryPolicySnapshot::new(2, Duration::from_secs(5)),
     ));
     let (progress, _receiver) = progress_channel();
     let dropped = AtomicU64::new(0);

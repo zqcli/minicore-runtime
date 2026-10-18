@@ -3,6 +3,9 @@
 //! All synchronization is deterministic (Notify / watch / oneshot); no test
 //! relies on sleeping to prove ordering.
 
+mod support;
+use support::loops::*;
+
 use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,10 +28,8 @@ use minicore_runtime::prompt::{
     DefaultPromptProvider, PreparedPrompt, PromptError, PromptFuture, PromptProvider, PromptRequest,
 };
 use minicore_runtime::tools::{
-    ApprovalDecision, ApprovalRequest, ApprovalRisk, Tool, ToolContext, ToolDecision, ToolError,
-    ToolExecutionOutcome, ToolFuture, ToolInputAnswer, ToolInputAnswerKind, ToolInputRequest,
-    ToolInvocation, ToolOutput, ToolPolicy, ToolPolicyError, ToolPolicyFuture, ToolPolicyRequest,
-    ToolProgress, ToolResultOutcome, ToolSet, ToolSpec,
+    ApprovalDecision, ToolInputAnswer, ToolInputAnswerKind, ToolInputRequest, ToolPolicy,
+    ToolResultOutcome, ToolSet, ToolSpec,
 };
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{
@@ -37,430 +38,6 @@ use minicore_runtime::{
     LoopReport, LoopRequest, LoopStartError, LoopStatus, SteerError, ToolCallId, UpdateError,
     UserHistory, UserInput, UserMessageKind,
 };
-
-fn reasoning_set() -> BTreeSet<ReasoningPreference> {
-    BTreeSet::from([ReasoningPreference::Auto])
-}
-
-fn scripted_model(rounds: Vec<Round>) -> (Arc<dyn Model>, Arc<Notify>) {
-    scripted_model_named("fake/scripted-model", rounds)
-}
-
-fn scripted_model_named(name: &str, rounds: Vec<Round>) -> (Arc<dyn Model>, Arc<Notify>) {
-    scripted_model_full(name, reasoning_set(), rounds)
-}
-
-fn scripted_model_counted(rounds: Vec<Round>) -> (Arc<dyn Model>, Arc<AtomicUsize>, Arc<Notify>) {
-    let descriptor = ModelDescriptor::new(
-        "fake/scripted-model".parse().unwrap(),
-        8192,
-        reasoning_set(),
-        true,
-    )
-    .unwrap();
-    let started = Arc::new(Notify::new());
-    let attempts = Arc::new(AtomicUsize::new(0));
-    (
-        Arc::new(ScriptedModel {
-            descriptor,
-            rounds: Arc::new(rounds),
-            started: Arc::clone(&started),
-            attempts: Arc::clone(&attempts),
-        }),
-        attempts,
-        started,
-    )
-}
-
-fn scripted_model_full(
-    name: &str,
-    reasoning: BTreeSet<ReasoningPreference>,
-    rounds: Vec<Round>,
-) -> (Arc<dyn Model>, Arc<Notify>) {
-    let descriptor = ModelDescriptor::new(name.parse().unwrap(), 8192, reasoning, true).unwrap();
-    let started = Arc::new(Notify::new());
-    let attempts = Arc::new(AtomicUsize::new(0));
-    (
-        Arc::new(ScriptedModel {
-            descriptor,
-            rounds: Arc::new(rounds),
-            started: Arc::clone(&started),
-            attempts,
-        }),
-        started,
-    )
-}
-
-#[derive(Clone)]
-enum Round {
-    Events(Vec<ModelEvent>),
-    Final {
-        text: &'static str,
-    },
-    Tools {
-        calls: Vec<(&'static str, &'static str)>,
-    },
-    /// Like `Tools` but the stream awaits a Notify before its first event.
-    GatedTools {
-        calls: Vec<(&'static str, &'static str)>,
-        gate: Arc<Notify>,
-    },
-    /// Like `Final` but the stream awaits a Notify before its first event.
-    GatedFinal {
-        text: &'static str,
-        gate: Arc<Notify>,
-    },
-    BurstDeltas {
-        count: usize,
-        chunk: &'static str,
-    },
-    Hold,
-    Error(ModelError),
-    StreamError {
-        events: Vec<ModelEvent>,
-        error: ModelError,
-    },
-}
-
-struct ScriptedModel {
-    descriptor: ModelDescriptor,
-    rounds: Arc<Vec<Round>>,
-    started: Arc<Notify>,
-    attempts: Arc<AtomicUsize>,
-}
-
-impl Model for ScriptedModel {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn start<'a>(
-        &'a self,
-        _request: ModelRequest,
-        context: ModelCallContext,
-    ) -> ModelStartFuture<'a> {
-        self.attempts.fetch_add(1, Ordering::SeqCst);
-        let round = self
-            .rounds
-            .get(context.request_index as usize)
-            .cloned()
-            .unwrap_or(Round::Final {
-                text: "default final",
-            });
-        let started = Arc::clone(&self.started);
-        Box::pin(async move {
-            started.notify_waiters();
-            match round {
-                Round::Error(err) => Err(err),
-                other => Ok::<ModelStream, ModelError>(Box::pin(round_stream(other))),
-            }
-        })
-    }
-}
-
-fn round_stream(round: Round) -> ModelStream {
-    match round {
-        Round::Events(events) => Box::pin(futures_util::stream::iter(events.into_iter().map(Ok))),
-        Round::Hold => Box::pin(futures_util::stream::pending()),
-        Round::Final { text } => Box::pin(futures_util::stream::iter(vec![
-            Ok(ModelEvent::text_delta(text).unwrap()),
-            Ok(ModelEvent::Finish {
-                reason: ModelFinishReason::Stop,
-            }),
-        ])),
-        Round::Tools { calls } => Box::pin(futures_util::stream::iter(
-            tool_call_events(calls).into_iter().map(Ok::<_, ModelError>),
-        )),
-        Round::GatedTools { calls, gate } => gated_stream(tool_call_events(calls), gate),
-        Round::GatedFinal { text, gate } => gated_stream(
-            vec![
-                ModelEvent::text_delta(text).unwrap(),
-                ModelEvent::Finish {
-                    reason: ModelFinishReason::Stop,
-                },
-            ],
-            gate,
-        ),
-        Round::BurstDeltas { count, chunk } => {
-            let mut events = Vec::with_capacity(count + 1);
-            for _ in 0..count {
-                events.push(ModelEvent::text_delta(chunk).unwrap());
-            }
-            events.push(ModelEvent::Finish {
-                reason: ModelFinishReason::Stop,
-            });
-            Box::pin(futures_util::stream::iter(
-                events.into_iter().map(Ok::<_, ModelError>),
-            ))
-        }
-        Round::StreamError { events, error } => {
-            let items: Vec<Result<ModelEvent, ModelError>> = events
-                .into_iter()
-                .map(Ok)
-                .chain(std::iter::once(Err(error)))
-                .collect();
-            Box::pin(futures_util::stream::iter(items))
-        }
-        Round::Error(_) => unreachable!("Round::Error is handled in Model::start"),
-    }
-}
-
-fn tool_call_events(calls: Vec<(&'static str, &'static str)>) -> Vec<ModelEvent> {
-    let mut events = Vec::new();
-    for (name, call_id) in calls {
-        let call_id: ToolCallId = call_id.parse().unwrap();
-        events.push(ModelEvent::ToolCallStart {
-            tool_call_id: call_id.clone(),
-            tool_name: name.parse().unwrap(),
-        });
-        events.push(ModelEvent::tool_call_arguments_delta(call_id.clone(), "{}").unwrap());
-        events.push(ModelEvent::ToolCallEnd {
-            tool_call_id: call_id,
-        });
-    }
-    events.push(ModelEvent::Finish {
-        reason: ModelFinishReason::ToolCalls,
-    });
-    events
-}
-
-struct GatedSeq {
-    events: Vec<ModelEvent>,
-    next: usize,
-    gate: Option<Arc<Notify>>,
-}
-
-/// Emits `events`, awaiting `gate` (once) before the first one.
-fn gated_stream(events: Vec<ModelEvent>, gate: Arc<Notify>) -> ModelStream {
-    Box::pin(futures_util::stream::unfold(
-        GatedSeq {
-            events,
-            next: 0,
-            gate: Some(gate),
-        },
-        |mut state| async move {
-            if state.next == 0 {
-                if let Some(gate) = state.gate.take() {
-                    gate.notified().await;
-                }
-            }
-            if state.next < state.events.len() {
-                let event = state.events[state.next].clone();
-                state.next += 1;
-                Some((Ok::<ModelEvent, ModelError>(event), state))
-            } else {
-                None
-            }
-        },
-    ))
-}
-
-#[derive(Clone)]
-enum ToolBehavior {
-    Succeed,
-    Output(String),
-    Fail,
-    Hold,
-    /// Succeeds after a Notify is released (deterministic mid-batch update).
-    Gate(Arc<Notify>),
-    /// Panics when the tool future is polled (isolated and treated as Failed).
-    Panic,
-    RequestInput,
-    RequestChoiceInput,
-    RequestInvalidInput(ToolInputRequest),
-    ProgressBurst(usize),
-    GatedProgressBurst {
-        count: usize,
-        entered: Arc<Notify>,
-        gate: Arc<Notify>,
-    },
-}
-
-struct RecordingTool {
-    spec: ToolSpec,
-    calls: Arc<Mutex<Vec<ToolCallId>>>,
-    behavior: ToolBehavior,
-    entered: Option<Arc<Notify>>,
-}
-
-impl RecordingTool {}
-
-impl Tool for RecordingTool {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
-    }
-
-    fn execute<'a>(&'a self, invocation: ToolInvocation, context: ToolContext) -> ToolFuture<'a> {
-        let calls = Arc::clone(&self.calls);
-        let recorded = invocation.tool_call_id().clone();
-        let behavior = self.behavior.clone();
-        let entered = self.entered.clone();
-        Box::pin(async move {
-            calls.lock().unwrap().push(recorded);
-            if let Some(entered) = entered {
-                entered.notify_waiters();
-            }
-            match behavior {
-                ToolBehavior::Succeed => Ok(ToolExecutionOutcome::Completed(
-                    ToolOutput::new("tool result").unwrap(),
-                )),
-                ToolBehavior::Output(content) => Ok(ToolExecutionOutcome::Completed(
-                    ToolOutput::new(content).unwrap(),
-                )),
-                ToolBehavior::Fail => Err(ToolError::Failed),
-                ToolBehavior::Gate(gate) => {
-                    gate.notified().await;
-                    Ok(ToolExecutionOutcome::Completed(
-                        ToolOutput::new("tool result").unwrap(),
-                    ))
-                }
-                ToolBehavior::Panic => panic!("scripted tool execute panic"),
-                ToolBehavior::RequestInput => {
-                    let request =
-                        ToolInputRequest::new("type the answer", vec![], ToolInputAnswerKind::Text)
-                            .unwrap();
-                    Ok(ToolExecutionOutcome::RequestInput(request))
-                }
-                ToolBehavior::RequestChoiceInput => {
-                    let request = ToolInputRequest::new(
-                        "choose the option",
-                        vec![
-                            BoundedText::new("alpha").unwrap(),
-                            BoundedText::new("beta").unwrap(),
-                        ],
-                        ToolInputAnswerKind::SingleChoice,
-                    )
-                    .unwrap();
-                    Ok(ToolExecutionOutcome::RequestInput(request))
-                }
-                ToolBehavior::RequestInvalidInput(request) => {
-                    Ok(ToolExecutionOutcome::RequestInput(request))
-                }
-                ToolBehavior::ProgressBurst(count) => {
-                    for i in 0..count {
-                        let msg = BoundedText::new(format!("progress-{i}")).unwrap();
-                        let _ = context.progress.emit(
-                            ToolProgress::new(Some(msg), Some(i as u64), Some(count as u64))
-                                .unwrap(),
-                        );
-                    }
-                    Ok(ToolExecutionOutcome::Completed(
-                        ToolOutput::new("burst completed").unwrap(),
-                    ))
-                }
-                ToolBehavior::GatedProgressBurst {
-                    count,
-                    entered,
-                    gate,
-                } => {
-                    for i in 0..count {
-                        let msg = BoundedText::new(format!("progress-{i}")).unwrap();
-                        let _ = context.progress.emit(
-                            ToolProgress::new(Some(msg), Some(i as u64), Some(count as u64))
-                                .unwrap(),
-                        );
-                    }
-                    entered.notify_one();
-                    gate.notified().await;
-                    Ok(ToolExecutionOutcome::Completed(
-                        ToolOutput::new("gated burst completed").unwrap(),
-                    ))
-                }
-                ToolBehavior::Hold => {
-                    context.cancellation.cancelled().await;
-                    Err(ToolError::Cancelled)
-                }
-            }
-        })
-    }
-}
-
-fn echo_spec() -> ToolSpec {
-    ToolSpec::new(
-        "echo".parse().unwrap(),
-        "echo tool",
-        json!({"type": "object"}),
-    )
-    .unwrap()
-}
-
-fn tool_set(calls: Arc<Mutex<Vec<ToolCallId>>>, behavior: ToolBehavior) -> ToolSet {
-    tool_set_full("echo", calls, behavior, None)
-}
-
-fn tool_set_with_entered(
-    calls: Arc<Mutex<Vec<ToolCallId>>>,
-    behavior: ToolBehavior,
-    entered: Option<Arc<Notify>>,
-) -> ToolSet {
-    tool_set_full("echo", calls, behavior, entered)
-}
-
-fn tool_set_full(
-    name: &str,
-    calls: Arc<Mutex<Vec<ToolCallId>>>,
-    behavior: ToolBehavior,
-    entered: Option<Arc<Notify>>,
-) -> ToolSet {
-    let mut builder = ToolSet::builder();
-    builder.register(RecordingTool {
-        spec: ToolSpec::new(
-            name.parse().unwrap(),
-            "echo tool",
-            json!({"type": "object"}),
-        )
-        .unwrap(),
-        calls,
-        behavior,
-        entered,
-    });
-    builder.build().unwrap()
-}
-
-#[derive(Clone)]
-enum PolicyPlan {
-    Allow,
-    Deny,
-    DenyReason(BoundedText),
-    RequireApproval,
-    Invalid,
-    Hold,
-    /// Panics when the decision future is polled (fail-closed Denied).
-    Panic,
-}
-
-struct ScriptedPolicy {
-    plan: Arc<Vec<PolicyPlan>>,
-    calls: Arc<AtomicUsize>,
-}
-
-impl ToolPolicy for ScriptedPolicy {
-    fn decide<'a>(&'a self, request: ToolPolicyRequest) -> ToolPolicyFuture<'a> {
-        let index = self.calls.fetch_add(1, Ordering::SeqCst);
-        let plan = self.plan.get(index).cloned().unwrap_or(PolicyPlan::Allow);
-        Box::pin(async move {
-            match plan {
-                PolicyPlan::Allow => Ok(ToolDecision::Allow),
-                PolicyPlan::Deny => ToolDecision::deny("not today"),
-                PolicyPlan::DenyReason(reason) => Ok(ToolDecision::Deny { reason }),
-                PolicyPlan::RequireApproval => ToolDecision::require_approval(
-                    ApprovalRequest::new("approve this call?", ApprovalRisk::High).unwrap(),
-                ),
-                PolicyPlan::Invalid => Ok(ToolDecision::RequireApproval {
-                    request: ApprovalRequest {
-                        prompt: BoundedText::new("").unwrap(),
-                        risk: ApprovalRisk::High,
-                    },
-                }),
-                PolicyPlan::Hold => {
-                    request.cancellation.cancelled().await;
-                    Err(ToolPolicyError::Cancelled)
-                }
-                PolicyPlan::Panic => panic!("scripted policy decide panic"),
-            }
-        })
-    }
-}
 
 struct GatedPrompt {
     entered: Arc<Notify>,
@@ -514,61 +91,6 @@ impl PromptProvider for GatedPrompt {
     }
 }
 
-fn config(
-    model: Arc<dyn Model>,
-    tools: ToolSet,
-    policy: Option<Arc<dyn ToolPolicy>>,
-) -> ExecutionConfig {
-    config_full(
-        model,
-        ReasoningPreference::Auto,
-        tools,
-        policy,
-        Arc::new(DefaultPromptProvider::new(None)),
-    )
-}
-
-fn config_full(
-    model: Arc<dyn Model>,
-    reasoning: ReasoningPreference,
-    tools: ToolSet,
-    policy: Option<Arc<dyn ToolPolicy>>,
-    prompt: Arc<dyn PromptProvider>,
-) -> ExecutionConfig {
-    ExecutionConfig::new(model, reasoning, tools, policy, prompt)
-        .expect("test config must validate")
-}
-
-fn project() -> Arc<dyn PromptProvider> {
-    Arc::new(DefaultPromptProvider::new(None))
-}
-
-fn request(config: ExecutionConfig) -> LoopRequest {
-    LoopRequest::new(
-        Arc::from([]),
-        UserInput::text("Fix the parser").unwrap(),
-        config,
-    )
-}
-
-fn assert_completed_with_text(report: &LoopReport, expected_text: &str) {
-    assert_eq!(report.outcome, LoopOutcome::Completed);
-    let assistant = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::Assistant(assistant) => Some(assistant),
-            _ => None,
-        })
-        .next_back()
-        .expect("completed loop appends an assistant");
-    let has_text = assistant
-        .content
-        .iter()
-        .any(|part| matches!(part, minicore_runtime::model::AssistantPart::Text(text) if text.as_ref() == expected_text));
-    assert!(has_text, "expected assistant text {expected_text:?}");
-}
-
 #[tokio::test]
 async fn text_loop_runs_to_completion() {
     let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
@@ -578,7 +100,7 @@ async fn text_loop_runs_to_completion() {
     )
     .unwrap();
     let handle = agent.handle();
-    let joined = agent.join().await.unwrap();
+    let joined = finish(agent).await;
     let waited = handle.wait().await.unwrap();
     assert!(Arc::ptr_eq(&joined, &waited));
 
@@ -597,37 +119,25 @@ async fn text_loop_runs_to_completion() {
 
 #[tokio::test]
 async fn tool_loop_runs_model_tool_model_to_completion() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![
         Round::Tools {
             calls: vec![("echo", "call_1")],
         },
         Round::Final { text: "done" },
     ]);
-    let agent = AgentLoop::start(
-        request(config(
-            model,
-            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
-            None,
-        )),
+    let (agent, calls) = start_echo(
+        model,
+        ToolBehavior::Succeed,
         LoopOptions::default_checked().unwrap(),
-    )
-    .unwrap();
+    );
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(report.requests, 2);
     assert_eq!(report.tool_rounds, 1);
     assert_eq!(calls.lock().unwrap().len(), 1, "tool executed once");
 
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
     assert_eq!(
         tool_results[0].outcome,
@@ -651,7 +161,7 @@ async fn each_request_preparation_emits_one_starting_state() {
     )
     .unwrap();
     let mut events = agent.take_events().unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     let mut preparations = Vec::new();
     while let Some(envelope) = events.recv().await {
@@ -667,42 +177,29 @@ async fn each_request_preparation_emits_one_starting_state() {
 
 #[tokio::test]
 async fn sequential_tool_calls_execute_in_order() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![
         Round::Tools {
             calls: vec![("echo", "call_1"), ("echo", "call_2")],
         },
         Round::Final { text: "done" },
     ]);
-    let agent = AgentLoop::start(
-        request(config(
-            model,
-            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
-            None,
-        )),
+    let (agent, calls) = start_echo(
+        model,
+        ToolBehavior::Succeed,
         LoopOptions::default_checked().unwrap(),
-    )
-    .unwrap();
+    );
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     let guard = calls.lock().unwrap();
     let recorded: Vec<_> = guard.iter().map(ToolCallId::as_str).collect();
     assert_eq!(recorded, vec!["call_1", "call_2"]);
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 2);
 }
 
 #[tokio::test]
 async fn default_tool_rounds_continue_past_legacy_limit() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
     let mut rounds: Vec<_> = (0..40)
         .map(|_| Round::Tools {
             calls: vec![("echo", "call_1")],
@@ -712,16 +209,8 @@ async fn default_tool_rounds_continue_past_legacy_limit() {
     let (model, _) = scripted_model(rounds);
     let options = LoopOptions::default_checked().unwrap();
     assert_eq!(options.max_tool_rounds, 0);
-    let agent = AgentLoop::start(
-        request(config(
-            model,
-            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
-            None,
-        )),
-        options,
-    )
-    .unwrap();
-    let report = agent.join().await.unwrap();
+    let (agent, calls) = start_echo(model, ToolBehavior::Succeed, options);
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(calls.lock().unwrap().len(), 40);
     assert_eq!(report.tool_rounds, 40);
@@ -729,7 +218,6 @@ async fn default_tool_rounds_continue_past_legacy_limit() {
 
 #[tokio::test]
 async fn max_tool_rounds_ends_with_failed_budget_and_complete_results() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![
         Round::Tools {
             calls: vec![("echo", "call_1")],
@@ -740,17 +228,9 @@ async fn max_tool_rounds_ends_with_failed_budget_and_complete_results() {
     ]);
     let mut options = LoopOptions::default_checked().unwrap();
     options.max_tool_rounds = 1;
-    let agent = AgentLoop::start(
-        request(config(
-            model,
-            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
-            None,
-        )),
-        options,
-    )
-    .unwrap();
+    let (agent, _) = start_echo(model, ToolBehavior::Succeed, options);
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     match &report.outcome {
         LoopOutcome::Failed(failure) => {
             assert_eq!(
@@ -760,14 +240,7 @@ async fn max_tool_rounds_ends_with_failed_budget_and_complete_results() {
         }
         other => panic!("expected LoopOutcome::Failed(MaxToolRounds), got {other:?}"),
     }
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert!(
         !tool_results.is_empty(),
         "round-limit calls receive results"
@@ -834,7 +307,7 @@ async fn cancel_during_model_ends_cancelled_with_report() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     started.notified().await;
     assert!(handle.cancel());
@@ -866,20 +339,13 @@ async fn cancel_during_tool_ends_cancelled_with_results_for_every_call() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     entered.notified().await;
     handle.cancel();
     let report = report_task.await.unwrap().unwrap();
     assert_eq!(report.outcome, LoopOutcome::Cancelled(CancelReason::User));
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
     assert_eq!(
         tool_results[0].outcome,
@@ -949,7 +415,7 @@ async fn approved_interaction_resumes_the_loop() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -1019,7 +485,7 @@ async fn interactions_without_a_deadline_outlive_twenty_four_hours() {
             ))
         };
         handle.answer(pending.interaction_id, answer).unwrap();
-        assert_completed_with_text(&agent.join().await.unwrap(), "done");
+        assert_completed_with_text(finish(agent).await.as_ref(), "done");
     }
 }
 
@@ -1036,7 +502,7 @@ async fn handle_shutdown_and_dropped_join_record_distinct_cancel_reasons() {
         if shutdown {
             assert!(handle.shutdown());
             assert!(!handle.cancel());
-            let report = agent.join().await.unwrap();
+            let report = finish(agent).await;
             assert_eq!(
                 report.outcome,
                 LoopOutcome::Cancelled(CancelReason::Shutdown)
@@ -1081,7 +547,7 @@ async fn wrong_interaction_answers_are_rejected_and_loop_stays_waiting() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -1146,7 +612,7 @@ async fn cancel_while_waiting_for_input_ends_the_loop() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     handle.cancel();
     let report = report_task.await.unwrap().unwrap();
@@ -1155,24 +621,19 @@ async fn cancel_while_waiting_for_input_ends_the_loop() {
 
 #[tokio::test]
 async fn tool_input_interaction_feeds_an_input_provided_result() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![
         Round::Tools {
             calls: vec![("echo", "call_1")],
         },
         Round::Final { text: "done" },
     ]);
-    let agent = AgentLoop::start(
-        request(config(
-            model,
-            tool_set(Arc::clone(&calls), ToolBehavior::RequestInput),
-            None,
-        )),
+    let (agent, _) = start_echo(
+        model,
+        ToolBehavior::RequestInput,
         LoopOptions::default_checked().unwrap(),
-    )
-    .unwrap();
+    );
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -1191,14 +652,7 @@ async fn tool_input_interaction_feeds_an_input_provided_result() {
 
     let report = report_task.await.unwrap().unwrap();
     assert_completed_with_text(&report, "done");
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
     assert_eq!(
         tool_results[0].outcome,
@@ -1224,7 +678,7 @@ async fn multiple_waiters_receive_the_same_report() {
         let handle = handle.clone();
         async move { handle.wait().await.unwrap() }
     });
-    let joined = agent.join().await.unwrap();
+    let joined = finish(agent).await;
 
     let a = w1.await.unwrap();
     let b = w2.await.unwrap();
@@ -1246,7 +700,7 @@ async fn event_stream_is_takeable_once_and_best_effort() {
         minicore_runtime::TakeEventsError::AlreadyTaken
     );
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     started.notified().await;
     handle.cancel();
@@ -1276,7 +730,7 @@ async fn closing_the_event_stream_does_not_stop_the_loop() {
     .unwrap();
     let stream = agent.take_events().unwrap();
     drop(stream);
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
 }
 
@@ -1318,16 +772,9 @@ async fn denied_tool_calls_produce_denied_results_and_the_loop_continues() {
         LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_completed_with_text(&report, "done");
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
     assert_eq!(
         tool_results[0].outcome,
@@ -1340,32 +787,20 @@ async fn denied_tool_calls_produce_denied_results_and_the_loop_continues() {
 /// continue asking the model.
 #[tokio::test]
 async fn failed_tool_call_is_a_result_not_a_loop_failure() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![
         Round::Tools {
             calls: vec![("echo", "call_1")],
         },
         Round::Final { text: "done" },
     ]);
-    let agent = AgentLoop::start(
-        request(config(
-            model,
-            tool_set(Arc::clone(&calls), ToolBehavior::Fail),
-            None,
-        )),
+    let (agent, _) = start_echo(
+        model,
+        ToolBehavior::Fail,
         LoopOptions::default_checked().unwrap(),
-    )
-    .unwrap();
-    let report = agent.join().await.unwrap();
+    );
+    let report = finish(agent).await;
     assert_completed_with_text(&report, "done");
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
     assert_eq!(
         tool_results[0].outcome,
@@ -1384,7 +819,7 @@ async fn output_delta_events_are_streamed_inline() {
     )
     .unwrap();
     let mut events = agent.take_events().unwrap();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut saw_delta = false;
     while let Some(envelope) = events.recv().await {
@@ -1486,7 +921,7 @@ async fn late_subscriber_gets_the_same_report_immediately() {
     )
     .unwrap();
     let handle = agent.handle();
-    let joined = agent.join().await.unwrap();
+    let joined = finish(agent).await;
     let late = handle.wait().await.unwrap();
     assert!(Arc::ptr_eq(&joined, &late));
     assert_eq!(
@@ -1561,7 +996,7 @@ async fn cancel_while_interaction_is_pending_ends_the_loop() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -1594,7 +1029,7 @@ async fn prompt_error_is_a_prompt_failure() {
     )
     .unwrap();
     let agent = AgentLoop::start(request(config), LoopOptions::default_checked().unwrap()).unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert!(matches!(
         &report.outcome,
         LoopOutcome::Failed(failure)
@@ -1617,7 +1052,7 @@ async fn prompt_timeout_is_a_prompt_failure() {
     options.prompt_timeout = Duration::from_millis(100);
     let agent = AgentLoop::start(request(config), options).unwrap();
     tokio::time::advance(Duration::from_millis(300)).await;
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert!(matches!(
         &report.outcome,
         LoopOutcome::Failed(failure)
@@ -1633,7 +1068,7 @@ async fn loop_deadline_during_a_model_call_cancels() {
     let agent =
         AgentLoop::start(request(config(model, ToolSet::default(), None)), options).unwrap();
     tokio::time::advance(Duration::from_secs(2)).await;
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(
         report.outcome,
         LoopOutcome::Cancelled(CancelReason::Deadline)
@@ -1642,23 +1077,14 @@ async fn loop_deadline_during_a_model_call_cancels() {
 
 #[tokio::test(start_paused = true)]
 async fn loop_deadline_during_a_tool_call_cancels() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![Round::Tools {
         calls: vec![("echo", "call_1")],
     }]);
     let mut options = LoopOptions::default_checked().unwrap();
     options.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
-    let agent = AgentLoop::start(
-        request(config(
-            model,
-            tool_set(Arc::clone(&calls), ToolBehavior::Hold),
-            None,
-        )),
-        options,
-    )
-    .unwrap();
+    let (agent, _) = start_echo(model, ToolBehavior::Hold, options);
     tokio::time::advance(Duration::from_secs(2)).await;
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(
         report.outcome,
         LoopOutcome::Cancelled(CancelReason::Deadline)
@@ -1675,7 +1101,7 @@ async fn unknown_tool_call_closes_the_loop_with_invalid_response() {
         LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert!(matches!(
         &report.outcome,
         LoopOutcome::Failed(failure)
@@ -1707,7 +1133,7 @@ async fn bounded_event_queue_attaches_dropped_before_to_the_next_success() {
     options.event_capacity = 1;
     let mut agent = AgentLoop::start(request(config), options).unwrap();
     let mut events = agent.take_events().unwrap();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     // Phase 1: let the first delta and its surrounding states flow, then drain
     // one event so the bounded queue has room again.
@@ -1727,24 +1153,19 @@ async fn bounded_event_queue_attaches_dropped_before_to_the_next_success() {
 
 #[tokio::test]
 async fn tool_loop_final_state_request_index_is_last_issued() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![
         Round::Tools {
             calls: vec![("echo", "call_1")],
         },
         Round::Final { text: "done" },
     ]);
-    let agent = AgentLoop::start(
-        request(config(
-            model,
-            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
-            None,
-        )),
+    let (agent, _) = start_echo(
+        model,
+        ToolBehavior::Succeed,
         LoopOptions::default_checked().unwrap(),
-    )
-    .unwrap();
+    );
     let handle = agent.handle();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(
         handle.state().request_index,
@@ -1775,7 +1196,7 @@ async fn interaction_wait_deadline_cancels_and_settles_the_pending_call() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -1896,7 +1317,7 @@ async fn update_during_model_reaches_the_next_request() {
     .unwrap();
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -1974,7 +1395,7 @@ async fn update_during_tools_keeps_the_batch_on_the_old_snapshot() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     entered.notified().await;
     let revision = handle
@@ -2023,7 +1444,7 @@ async fn multiple_updates_keep_only_the_latest() {
     .unwrap();
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -2118,7 +1539,7 @@ async fn update_during_prompt_prep_is_rebuilt_without_advancing_the_index() {
     .unwrap();
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     entered.notified().await;
     assert_eq!(prompt_a_calls.load(Ordering::SeqCst), 1);
@@ -2168,7 +1589,7 @@ async fn update_after_completion_returns_not_active() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
 
     let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "x" }]);
@@ -2197,7 +1618,7 @@ async fn update_alone_does_not_extend_the_final_request() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -2262,7 +1683,7 @@ async fn toolset_switch_applies_to_the_next_request() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     entered.notified().await;
     let revision = handle
@@ -2329,7 +1750,7 @@ async fn prompt_provider_switch_applies_to_the_next_request() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     entered.notified().await;
     let revision = handle
@@ -2389,7 +1810,7 @@ async fn request_started_records_the_actual_snapshot_revision_and_reasoning() {
     .unwrap();
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     entered.notified().await;
     let revision = handle
@@ -2446,7 +1867,7 @@ async fn invalid_config_update_does_not_consume_a_revision() {
     let agent =
         AgentLoop::start(request(config(model_a, ToolSet::default(), None)), options).unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -2519,7 +1940,7 @@ async fn update_during_interaction_waits_takes_effect_after_the_interaction() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -2589,7 +2010,7 @@ async fn failed_prompt_after_taken_update_keeps_the_last_issued_revision() {
     .unwrap();
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     entered.notified().await;
     let revision = handle
@@ -2664,7 +2085,7 @@ async fn prompt_timeout_after_taken_update_keeps_the_last_issued_revision() {
     .unwrap();
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     entered.notified().await;
     let revision = handle
@@ -2753,7 +2174,7 @@ async fn multiple_stale_rebuilds_issue_only_the_latest_revision() {
     .unwrap();
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     entered.notified().await;
     assert_eq!(
@@ -2923,7 +2344,7 @@ async fn steer_during_model_reaches_the_next_request() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -2984,7 +2405,7 @@ async fn steer_during_tool_batch_reaches_the_next_request() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     entered.notified().await;
     handle
@@ -3040,7 +2461,7 @@ async fn steer_during_prompt_discards_the_stale_prompt() {
     .unwrap();
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     entered.notified().await;
     handle.steer(UserInput::text("ping").unwrap()).unwrap();
@@ -3089,7 +2510,7 @@ async fn multiple_steers_apply_in_accept_order() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -3131,7 +2552,7 @@ async fn steer_queue_is_bounded_and_full_reports_queue_full() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -3173,7 +2594,7 @@ async fn final_race_steer_wins_and_keeps_the_loop_alive() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -3206,7 +2627,7 @@ async fn final_race_seal_wins_returns_not_active() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(steerings(&report), Vec::<String>::new());
 
@@ -3238,7 +2659,7 @@ async fn steer_is_rejected_while_waiting_for_interaction() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -3291,7 +2712,7 @@ async fn update_and_steer_combine_on_the_next_request() {
     .unwrap();
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -3350,7 +2771,7 @@ async fn steer_accepted_but_cancelled_before_application_stays_out_of_report() {
     )
     .unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -3473,7 +2894,7 @@ async fn model_start_panic_yields_model_failure_without_history() {
     .unwrap();
     let handle = agent.handle();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(
         model_failure_kind(&report),
         Some(minicore_runtime::LoopFailureKind::Model)
@@ -3519,7 +2940,7 @@ async fn model_stream_poll_panic_yields_model_failure_without_history() {
 
     let handle = agent.handle();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(
         model_failure_kind(&report),
         Some(minicore_runtime::LoopFailureKind::Model)
@@ -3538,24 +2959,19 @@ async fn model_stream_poll_panic_yields_model_failure_without_history() {
 /// and the loop continues to the next model request.
 #[tokio::test]
 async fn tool_execute_panic_is_a_failed_result_and_the_loop_continues() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![
         Round::Tools {
             calls: vec![("echo", "call_1")],
         },
         Round::Final { text: "done" },
     ]);
-    let agent = AgentLoop::start(
-        request(config(
-            model,
-            tool_set(Arc::clone(&calls), ToolBehavior::Panic),
-            None,
-        )),
+    let (agent, calls) = start_echo(
+        model,
+        ToolBehavior::Panic,
         LoopOptions::default_checked().unwrap(),
-    )
-    .unwrap();
+    );
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(
         report.requests, 2,
@@ -3596,7 +3012,7 @@ async fn prompt_provider_panic_yields_prompt_failure() {
     )
     .unwrap();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(
         model_failure_kind(&report),
         Some(minicore_runtime::LoopFailureKind::Prompt)
@@ -3629,7 +3045,7 @@ async fn policy_panic_is_denied_and_the_loop_continues() {
     )
     .unwrap();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(report.requests, 2);
     assert!(
@@ -3690,7 +3106,7 @@ async fn tool_timeout_port_deadline_fails_the_call_and_the_batch_continues() {
         options,
     )
     .unwrap();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     // Let request 0 reach the first (holding) tool call, then expire only the
     // tool port deadline.
@@ -3894,7 +3310,7 @@ async fn default_provider_accepts_mixed_model_refs_in_the_base() {
         LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
 }
 
@@ -3920,7 +3336,7 @@ async fn inconsistent_old_tool_history_fails_as_prompt_but_start_succeeds() {
     )
     .unwrap();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(
         model_failure_kind(&report),
         Some(minicore_runtime::LoopFailureKind::Prompt)
@@ -3963,7 +3379,7 @@ async fn prompt_message_limit_applies_to_custom_providers() {
     )
     .unwrap();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(
         model_failure_kind(&report),
         Some(minicore_runtime::LoopFailureKind::Prompt)
@@ -4020,7 +3436,7 @@ async fn default_provider_runs_a_loop_end_to_end_with_system_prompt() {
         LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_completed_with_text(&report, "done");
     assert_eq!(report.requests, 1);
@@ -4139,7 +3555,7 @@ async fn invalid_message_from_public_variant_fails_as_prompt() {
     )
     .unwrap();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(
         model_failure_kind(&report),
         Some(minicore_runtime::LoopFailureKind::Prompt)
@@ -4175,18 +3591,11 @@ async fn tool_output_exceeding_limit_fails_and_original_content_omitted_from_his
     )
     .unwrap();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(report.requests, 2);
 
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0].outcome, ToolResultOutcome::Failed);
     assert!(tool_results[0].output.content().byte_len() <= 16);
@@ -4225,18 +3634,11 @@ async fn tool_output_within_limit_succeeds_with_unchanged_content() {
     )
     .unwrap();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(report.requests, 2);
 
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0].outcome, ToolResultOutcome::Success);
     assert_eq!(tool_results[0].output.content().as_str(), "success!");
@@ -4246,7 +3648,6 @@ async fn tool_output_within_limit_succeeds_with_unchanged_content() {
 /// FIX-02-T03: ToolInput answer whose encoded result exceeds limit becomes Failed and bounded.
 #[tokio::test]
 async fn tool_input_answer_exceeding_limit_fails_and_bounded() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![
         Round::Tools {
             calls: vec![("echo", "call_1")],
@@ -4256,17 +3657,9 @@ async fn tool_input_answer_exceeding_limit_fails_and_bounded() {
     let mut options = LoopOptions::default_checked().unwrap();
     options.limits.max_tool_output_bytes = 16;
 
-    let agent = AgentLoop::start(
-        request(config(
-            model,
-            tool_set(Arc::clone(&calls), ToolBehavior::RequestInput),
-            None,
-        )),
-        options,
-    )
-    .unwrap();
+    let (agent, _) = start_echo(model, ToolBehavior::RequestInput, options);
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -4287,14 +3680,7 @@ async fn tool_input_answer_exceeding_limit_fails_and_bounded() {
     let report = report_task.await.unwrap().unwrap();
     assert_eq!(report.outcome, LoopOutcome::Completed);
 
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0].outcome, ToolResultOutcome::Failed);
     assert_ne!(tool_results[0].outcome, ToolResultOutcome::InputProvided);
@@ -4338,18 +3724,11 @@ async fn policy_denied_reason_exceeding_limit_remains_denied_and_bounded() {
     )
     .unwrap();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(report.requests, 2);
 
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0].outcome, ToolResultOutcome::Denied);
     assert!(tool_results[0].output.content().byte_len() <= 16);
@@ -4366,7 +3745,6 @@ async fn policy_denied_reason_exceeding_limit_remains_denied_and_bounded() {
 /// and output byte len is <= 1.
 #[tokio::test]
 async fn minimal_limit_one_byte_bounds_max_tool_rounds_terminal_result() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![
         Round::Tools {
             calls: vec![("echo", "call_1")],
@@ -4379,31 +3757,16 @@ async fn minimal_limit_one_byte_bounds_max_tool_rounds_terminal_result() {
     options.max_tool_rounds = 1;
     options.limits.max_tool_output_bytes = 1;
 
-    let agent = AgentLoop::start(
-        request(config(
-            model,
-            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
-            None,
-        )),
-        options,
-    )
-    .unwrap();
+    let (agent, _) = start_echo(model, ToolBehavior::Succeed, options);
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert!(matches!(
         report.outcome,
         LoopOutcome::Failed(ref failure)
             if failure.kind == minicore_runtime::LoopFailureKind::MaxToolRounds
     ));
 
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 2);
     assert_eq!(tool_results[1].outcome, ToolResultOutcome::Failed);
     for result in &tool_results {
@@ -4419,7 +3782,6 @@ async fn minimal_limit_one_byte_bounds_max_tool_rounds_terminal_result() {
 /// allows the loop to continue and bounds the Failed ToolResult output to <= 1 byte.
 #[tokio::test]
 async fn minimal_limit_one_byte_bounds_tool_failure_result() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![
         Round::Tools {
             calls: vec![("echo", "call_1")],
@@ -4429,28 +3791,13 @@ async fn minimal_limit_one_byte_bounds_tool_failure_result() {
     let mut options = LoopOptions::default_checked().unwrap();
     options.limits.max_tool_output_bytes = 1;
 
-    let agent = AgentLoop::start(
-        request(config(
-            model,
-            tool_set(Arc::clone(&calls), ToolBehavior::Fail),
-            None,
-        )),
-        options,
-    )
-    .unwrap();
+    let (agent, _) = start_echo(model, ToolBehavior::Fail, options);
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(report.requests, 2);
 
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0].call_id.as_str(), "call_1");
     assert_eq!(tool_results[0].outcome, ToolResultOutcome::Failed);
@@ -4499,7 +3846,7 @@ async fn minimal_limit_one_byte_bounds_cancelled_tool_batch() {
 
     let agent = AgentLoop::start(request(config(model, tools, None)), options).unwrap();
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     entered.as_mut().await;
     handle.cancel();
@@ -4507,14 +3854,7 @@ async fn minimal_limit_one_byte_bounds_cancelled_tool_batch() {
     let report = report_task.await.unwrap().unwrap();
     assert_eq!(report.outcome, LoopOutcome::Cancelled(CancelReason::User));
 
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 2);
     assert_eq!(tool_results[0].call_id.as_str(), "call_1");
     assert_eq!(tool_results[0].outcome, ToolResultOutcome::Cancelled);
@@ -4555,7 +3895,7 @@ async fn tool_finished_event_output_bytes_matches_history_bounded_bytes() {
     )
     .unwrap();
     let mut events = agent.take_events().unwrap();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut finished_events = Vec::new();
     while let Some(envelope) = events.recv().await {
@@ -4573,14 +3913,7 @@ async fn tool_finished_event_output_bytes_matches_history_bounded_bytes() {
     let report = report_task.await.unwrap().unwrap();
     assert_eq!(report.outcome, LoopOutcome::Completed);
 
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
     assert_eq!(finished_events.len(), 1);
 
@@ -4621,7 +3954,7 @@ async fn assert_invalid_tool_input_request_fails(invalid_request: ToolInputReque
     .unwrap();
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -4661,14 +3994,7 @@ async fn assert_invalid_tool_input_request_fails(invalid_request: ToolInputReque
         "invalid tool input request must not emit InteractionRequested event",
     );
 
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0].call_id.as_str(), "call_1");
     assert_eq!(tool_results[0].outcome, ToolResultOutcome::Failed);
@@ -4725,24 +4051,19 @@ async fn invalid_tool_input_oversized_choice_fails_without_interaction() {
 /// FIX-05-T06: Valid SingleChoice tool input interaction feeds an InputProvided result and loop completes.
 #[tokio::test]
 async fn tool_input_single_choice_interaction_feeds_an_input_provided_result() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![
         Round::Tools {
             calls: vec![("echo", "call_1")],
         },
         Round::Final { text: "done" },
     ]);
-    let agent = AgentLoop::start(
-        request(config(
-            model,
-            tool_set(Arc::clone(&calls), ToolBehavior::RequestChoiceInput),
-            None,
-        )),
+    let (agent, _) = start_echo(
+        model,
+        ToolBehavior::RequestChoiceInput,
         LoopOptions::default_checked().unwrap(),
-    )
-    .unwrap();
+    );
     let handle = agent.handle();
-    let report_task = tokio::spawn(async move { agent.join().await });
+    let report_task = spawn_join(agent);
 
     let mut states = handle.watch_state();
     states
@@ -4759,14 +4080,7 @@ async fn tool_input_single_choice_interaction_feeds_an_input_provided_result() {
 
     let report = report_task.await.unwrap().unwrap();
     assert_completed_with_text(&report, "done");
-    let tool_results: Vec<_> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect();
+    let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
     assert_eq!(
         tool_results[0].outcome,
@@ -4797,7 +4111,7 @@ async fn model_error_auth_rejected_preserves_classification_and_diagnostic() {
         LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
 
     match &report.outcome {
         LoopOutcome::Failed(failure) => {
@@ -4846,7 +4160,7 @@ async fn model_error_rate_limited_exhausting_retry_preserves_diagnostic() {
         AgentLoop::start(request(config(model, ToolSet::default(), None)), options).unwrap();
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
 
     match &report.outcome {
         LoopOutcome::Failed(failure) => {
@@ -4909,7 +4223,7 @@ async fn model_error_quota_exceeded_preserves_diagnostic() {
         LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
 
     match &report.outcome {
         LoopOutcome::Failed(failure) => {
@@ -4947,7 +4261,7 @@ async fn model_error_context_overflow_preserves_diagnostic() {
         LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
 
     match &report.outcome {
         LoopOutcome::Failed(failure) => {
@@ -4982,7 +4296,7 @@ async fn model_error_request_outcome_unknown_preserves_diagnostic() {
         LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
 
     match &report.outcome {
         LoopOutcome::Failed(failure) => {
@@ -5027,7 +4341,7 @@ async fn model_error_stream_started_preserves_diagnostic_and_omits_partial_histo
         LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
 
     match &report.outcome {
         LoopOutcome::Failed(failure) => {
@@ -5072,7 +4386,7 @@ async fn model_error_invalid_provider_response_preserves_diagnostic() {
         LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
 
     match &report.outcome {
         LoopOutcome::Failed(failure) => {
@@ -5104,7 +4418,7 @@ async fn non_model_failures_classify_correctly_regression() {
         LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     match &report.outcome {
         LoopOutcome::Failed(failure) => {
             assert_eq!(failure.kind, LoopFailureKind::Prompt);
@@ -5130,7 +4444,7 @@ async fn non_model_failures_classify_correctly_regression() {
         options,
     )
     .unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     match &report.outcome {
         LoopOutcome::Failed(failure) => {
             assert_eq!(failure.kind, LoopFailureKind::MaxToolRounds);
@@ -5157,7 +4471,7 @@ async fn non_model_failures_classify_correctly_regression() {
         LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     match &report.outcome {
         LoopOutcome::Failed(failure) => {
             assert_eq!(failure.kind, LoopFailureKind::Policy);
@@ -5189,7 +4503,7 @@ async fn loop_failure_debug_does_not_leak_diagnostic_message() {
         LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
 
     match &report.outcome {
         LoopOutcome::Failed(failure) => {
@@ -5227,7 +4541,7 @@ async fn first_request_start_error_counts_as_one_request_with_state_zero() {
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     match &report.outcome {
         LoopOutcome::Failed(failure) => {
             assert_eq!(failure.kind, LoopFailureKind::Model);
@@ -5278,7 +4592,7 @@ async fn first_request_stream_failure_counts_as_one_request_with_state_zero() {
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.requests, 1);
     assert_eq!(handle.state().request_index, 0);
 
@@ -5300,7 +4614,6 @@ async fn first_request_stream_failure_counts_as_one_request_with_state_zero() {
 /// FIX-06-T03: Second request fails after tool round: report.requests=2, final state index=1, exactly two RequestStarted events.
 #[tokio::test]
 async fn second_request_failure_counts_as_two_requests_with_state_one() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::ModelUnavailable,
         DiagnosticCategory::Model,
@@ -5320,19 +4633,15 @@ async fn second_request_failure_counts_as_two_requests_with_state_one() {
         Round::Error(error),
     ]);
 
-    let mut agent = AgentLoop::start(
-        request(config(
-            model,
-            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
-            None,
-        )),
+    let (mut agent, _) = start_echo(
+        model,
+        ToolBehavior::Succeed,
         LoopOptions::default_checked().unwrap(),
-    )
-    .unwrap();
+    );
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(
         model_failure_kind(&report),
         Some(minicore_runtime::LoopFailureKind::Model)
@@ -5374,7 +4683,7 @@ async fn prompt_failure_emits_no_request_started_and_counts_zero_requests() {
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(
         model_failure_kind(&report),
         Some(minicore_runtime::LoopFailureKind::Prompt)
@@ -5409,7 +4718,7 @@ async fn model_burst_progress_drops_are_recorded_in_dropped_before() {
         AgentLoop::start(request(config(model, ToolSet::default(), None)), options).unwrap();
     let mut events = agent.take_events().unwrap();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
 
     let mut delivered_deltas = 0;
@@ -5477,7 +4786,7 @@ async fn tool_burst_progress_drops_are_recorded_in_dropped_before() {
     .unwrap();
     let mut events = agent.take_events().unwrap();
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(report.requests, 2);
     assert_eq!(report.tool_rounds, 1);
@@ -5558,7 +4867,7 @@ async fn both_inner_and_outer_queues_overflow_reports_dropped_before() {
     gate.notify_one();
 
     // 4. The loop must complete without blocking or deadlocks.
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
 
     let tool_result = report
@@ -5604,7 +4913,7 @@ async fn receiver_dropped_during_model_burst_allows_loop_to_complete() {
     let events = agent.take_events().unwrap();
     drop(events);
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
 
     let assistant = report
@@ -5653,7 +4962,7 @@ async fn receiver_dropped_during_tool_burst_allows_loop_to_complete() {
     let events = agent.take_events().unwrap();
     drop(events);
 
-    let report = agent.join().await.unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(report.requests, 2);
     assert_eq!(report.tool_rounds, 1);
@@ -5689,7 +4998,7 @@ async fn replay_survives_runner_history_serde_and_default_projection() {
             LoopOptions::default_checked().unwrap(),
         )
         .unwrap();
-        let report = agent.join().await.unwrap();
+        let report = finish(agent).await;
         assert_eq!(report.outcome, LoopOutcome::Completed);
         let assistant = report
             .appended
@@ -5746,7 +5055,7 @@ async fn history_limit_counts_opaque_replay_at_the_exact_boundary() {
         match AgentLoop::start(req, options) {
             Ok(agent) => {
                 assert!(accept);
-                assert_eq!(agent.join().await.unwrap().outcome, LoopOutcome::Completed);
+                assert_eq!(finish(agent).await.outcome, LoopOutcome::Completed);
             }
             Err(error) => {
                 assert!(!accept);
@@ -5782,7 +5091,7 @@ async fn replay_only_history_enforces_two_mib_absolute_ceiling() {
         match AgentLoop::start(req, LoopOptions::default_checked().unwrap()) {
             Ok(agent) => {
                 assert!(accept);
-                assert_eq!(agent.join().await.unwrap().outcome, LoopOutcome::Completed);
+                assert_eq!(finish(agent).await.outcome, LoopOutcome::Completed);
             }
             Err(error) => {
                 assert!(!accept);

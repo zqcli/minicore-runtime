@@ -177,7 +177,7 @@ fn descriptor_has_exact_host_neutral_fields_and_checked_invariants() {
         assert!(!debug.contains(forbidden));
     }
 
-    let source = include_str!("../src/model/model.rs");
+    let source = include_str!("../src/model/port.rs");
     let descriptor_source = source
         .split_once("pub struct ModelDescriptor")
         .and_then(|(_, tail)| tail.split_once('}'))
@@ -216,7 +216,7 @@ fn call_context_is_zero_based_exact_and_owner_neutral() {
     let debug = format!("{context:?}");
     assert!(debug.contains("request_index: 0"));
 
-    let source = include_str!("../src/model/model.rs");
+    let source = include_str!("../src/model/port.rs");
     assert!(source.contains("index of the loop request"));
     let context_source = source
         .split_once("pub struct ModelCallContext")
@@ -330,12 +330,7 @@ fn model_request_is_checked_host_neutral_and_redacted() {
         assert!(!debug.contains(secret));
     }
 
-    let source = include_str!("../src/model/types.rs");
-    let request_source = source
-        .split_once("pub struct ModelRequest")
-        .and_then(|(_, tail)| tail.split_once("pub enum ModelFinishReason"))
-        .map(|(body, _)| body)
-        .unwrap();
+    let request_source = include_str!("../src/model/request.rs");
     for forbidden in ["ProviderId", "ModelSelection", "endpoint", "credential"] {
         assert!(!request_source.contains(forbidden));
     }
@@ -343,7 +338,7 @@ fn model_request_is_checked_host_neutral_and_redacted() {
 
 #[test]
 fn stream_panic_and_cancellation_catching_live_only_in_internal_model_driver() {
-    let port = include_str!("../src/model/model.rs");
+    let port = include_str!("../src/model/port.rs");
     assert!(port.contains("pub cancellation: CancellationToken"));
     for forbidden in [
         "catch_unwind",
@@ -369,12 +364,11 @@ fn stream_panic_and_cancellation_catching_live_only_in_internal_model_driver() {
 #[test]
 fn model_module_has_no_legacy_or_concrete_adapter_exports() {
     let module = include_str!("../src/model/mod.rs");
-    assert!(module.contains("#[path = \"model.rs\"]\nmod model_port;"));
+    assert!(module.contains("mod port;"));
     assert!(module.contains("mod driver;"));
     assert!(module.contains("pub(crate) use driver::{"));
     assert!(!module.contains("pub mod driver;"));
-    assert!(module.contains("pub use model_port::{Model, ModelCallContext, ModelDescriptor"));
-    assert!(!module.contains("mod port;"));
+    assert!(module.contains("pub use port::{Model, ModelCallContext, ModelDescriptor"));
     assert!(!module.contains("legacy_"));
     for forbidden in [
         "pub use legacy_",

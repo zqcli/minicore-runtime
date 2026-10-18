@@ -18,7 +18,7 @@ Phase: complete (all rows Passed).
 | V4-008 | Passed | 多轮由上层多次创建AgentLoop（MemoryAgent） | `examples/memory_agent.rs`; `docs/contracts/agent-loop.md` |
 | V4-009 | Passed | 不提供旧v0.3 API兼容层 | `scripts/check_v04_architecture.py`; `src/lib.rs` |
 | V4-010 | Passed | crate不依赖具体Provider/Workspace/Storage | `scripts/check_v04_architecture.py`; `Cargo.toml` |
-| V4-011 | Passed | Model接口保留 | `src/model/model.rs`; `tests/p1_v04_loop_dtos.rs::execution_config_accepts_a_text_only_model` |
+| V4-011 | Passed | Model接口保留 | `src/model/port.rs`; `tests/p1_v04_loop_dtos.rs::execution_config_accepts_a_text_only_model` |
 | V4-012 | Passed | Tool/ToolSet接口保留 | `src/tools/tool.rs`; `src/tools/set.rs`; `tests/p1_v04_loop_dtos.rs::execution_config_accepts_tool_capable_model_with_tools` |
 | V4-013 | Passed | ToolPolicy/Interaction保留 | `src/tools/policy.rs`; `docs/contracts/tool-policy-interaction.md`; `tests/p2_agent_loop.rs::approved_interaction_resumes_the_loop`; `tests/tool_policy_interaction_contract.rs::invalid_tool_input_requests_rejected_by_validate`; `tests/p2_agent_loop.rs::invalid_tool_input_empty_prompt_fails_without_interaction` |
 | V4-014 | Passed | PromptProvider替代Context/Compaction | `src/prompt.rs`; `docs/contracts/prompt.md`; `tests/p2_agent_loop.rs::default_provider_projects_history_in_order_with_summary_and_optional_system` |

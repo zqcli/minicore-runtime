@@ -110,21 +110,8 @@ pub(super) async fn run_model(
     let driver = crate::model::ModelDriver::from_validated(
         snapshot.model().clone(),
         snapshot.descriptor().clone(),
-        crate::model::ModelDriverConfig::from_kernel_values(
-            ctx.options.model_timeout,
-            ctx.options.model_retry_attempts,
-            ctx.options.model_retry_base_delay,
-            crate::model::SemanticLimitsSnapshot::from_kernel_values(
-                ctx.options.limits.max_tool_calls_per_response,
-                ctx.options.limits.max_tool_name_bytes,
-                ctx.options.limits.max_tool_schema_bytes,
-                ctx.options.limits.max_tool_arguments_bytes,
-                ctx.options.limits.max_model_text_bytes,
-                ctx.options.limits.max_model_reasoning_bytes,
-            ),
-        ),
-    )
-    .map_err(ModelDriverFailure::ordinary)?;
+        crate::model::ModelDriverConfig::from_options(ctx.options),
+    );
 
     let context = ModelCallContext::new(ctx.id, request_index, cancellation.clone(), turn_deadline);
 

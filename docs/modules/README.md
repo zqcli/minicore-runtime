@@ -1,6 +1,6 @@
 # Module Map
 
-Physical source ownership for the v0.4 core. Public re-exports are listed at
+Physical source ownership for the v0.7.0 core. Public re-exports are listed at
 the crate root (`src/lib.rs`); every other module is reached through them.
 
 | Source path | Owns | Public boundary |
@@ -19,7 +19,8 @@ the crate root (`src/lib.rs`); every other module is reached through them.
 | `src/model/` | `Model` seam, `ModelDriver`, typed request/response | `model` module |
 | `src/tools/` | `Tool` seam, `ToolSet`, policies, interactions | `tools` module |
 | `src/limits.rs` | `LoopLimits` | Re-exported at root |
-| `src/usage.rs` | `Usage` / `UsageAccumulator` | `Usage` re-exported |
+| `src/model/usage.rs` | `Usage` | `model::Usage` |
+| `src/usage.rs` | `UsageAccumulator` | crate-private |
 | `src/interaction.rs` | `PendingInteraction`, `InteractionAnswer`/`Kind` | Re-exported at root |
 | `src/ids.rs` | `LoopId`, `InteractionId`, `ToolCallId` | Re-exported at root |
 | `src/value.rs` | `BoundedText`, byte budgets | `value` module |
@@ -27,7 +28,16 @@ the crate root (`src/lib.rs`); every other module is reached through them.
 | `src/error.rs` | `DiagnosticCategory/Code/Summary` | Re-exported at root |
 | `src/port_call.rs` | per-port cancel/timeout/panic isolation | crate-private |
 
+The model module separates the adapter seam (`port.rs`), symbolic references
+(`model_ref.rs`), messages/parts (`message.rs`), requests/limits (`request.rs`),
+responses/events (`response.rs`), errors (`error.rs`), replay (`replay.rs`) and
+usage DTO (`usage.rs`). Public `model::*` paths are unchanged. Driver config
+uses the already-validated `LoopLimits`; it does not mirror their validation.
+
 ## Test Ownership
+
+- `tests/support/` — shared scripted models, tools, policy plans, request/start/join
+  helpers and report projections. Test binaries and acceptance test names stay separate.
 
 - `src/*/tests.rs` / `src/agent_loop/runner/tests.rs` — unit tests inside
   the owning module.

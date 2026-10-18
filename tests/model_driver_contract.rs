@@ -18,7 +18,7 @@ fn canonical_driver_is_private_bounded_and_adapter_neutral() {
         "model: Arc<dyn Model>",
         "model_call_timeout: Duration",
         "retry_policy: RetryPolicySnapshot",
-        "limits: SemanticLimitsSnapshot",
+        "limits: LoopLimits",
         "pub(crate) fn new(",
         "pub(crate) fn from_validated(",
         "pub(crate) async fn run(",
@@ -93,7 +93,7 @@ fn canonical_driver_is_private_bounded_and_adapter_neutral() {
 
 #[test]
 fn public_model_port_remains_free_of_driver_implementation() {
-    let port = include_str!("../src/model/model.rs");
+    let port = include_str!("../src/model/port.rs");
     for forbidden in [
         "ModelDriver",
         "catch_unwind",
@@ -114,8 +114,7 @@ fn public_model_port_remains_free_of_driver_implementation() {
 fn assembler_uses_checked_dtos_and_centralized_json_validation() {
     let assembler = include_str!("../src/model/driver/assembler.rs");
     for required in [
-        "validate_json_size(&arguments, maximum)",
-        "ToolCall::new(",
+        "ToolCall::new_with_max_bytes(",
         "ReasoningContent::new(",
         "ModelResponse::new_with_provider_replay(",
         "ModelErrorKind::IncompleteResponse",
@@ -125,6 +124,8 @@ fn assembler_uses_checked_dtos_and_centralized_json_validation() {
     ] {
         assert!(assembler.contains(required), "assembler misses {required}");
     }
+    let message = include_str!("../src/model/message.rs");
+    assert!(message.contains("validate_json_size(&arguments, max_bytes)"));
     for forbidden in ["unsafe", "serde_json::from_slice", "unwrap_unchecked"] {
         assert!(!assembler.contains(forbidden));
     }

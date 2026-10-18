@@ -6,8 +6,8 @@ use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::time::DeadlineSource;
 use crate::value::BoundedText;
 
-use super::super::model_port::ModelCallContext;
-use super::super::response::{DeliveryState, ModelError, ModelErrorKind, RetryHint};
+use super::super::port::ModelCallContext;
+use super::super::{DeliveryState, ModelError, ModelErrorKind, RetryHint};
 use super::MAX_MODEL_RETRY_DELAY;
 
 #[derive(Clone, Copy)]

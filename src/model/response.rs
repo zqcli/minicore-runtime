@@ -1,234 +1,121 @@
-use std::fmt;
-use std::time::Duration;
-
-use serde::{Deserialize, Deserializer, Serialize};
-
-use crate::error::DiagnosticSummary;
+use super::message::{normalize_parts, validate_tool_call_order};
+use super::{AssistantPart, ModelValueError, ProviderReplay, Usage};
 use crate::ids::ToolCallId;
 use crate::tools::ToolName;
 use crate::value::{BoundedText, normalize_model_text};
-
-use super::ProviderReplay;
-use super::types::{ModelFinishReason, ModelValueError, Usage};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DeliveryState {
-    NotStarted,
-    Started,
+pub enum ModelFinishReason {
+    Stop,
+    ToolCalls,
+    Length,
+    ContentFiltered,
+    Refused,
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelErrorKind {
-    InvalidRequest,
-    Unavailable,
-    ProviderUnavailable,
-    AuthMissing,
-    AuthRejected,
-    RateLimited,
-    QuotaExceeded,
-    ContextOverflow,
-    Timeout,
-    TransportUnavailable,
-    Cancelled,
-    InvalidProviderResponse,
-    IncompleteResponse,
-    StreamInterrupted,
-    RequestOutcomeUnknown,
-    UnexpectedToolCall,
-    Panicked,
-    Internal,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RetryHint {
-    Never,
-    Retryable {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        retry_after: Option<Duration>,
-    },
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RetryableWire {
-    #[serde(default)]
-    retry_after: Option<Duration>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-enum RetryHintWire {
-    Never,
-    Retryable(RetryableWire),
-}
-
-impl<'de> Deserialize<'de> for RetryHint {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = RetryHintWire::deserialize(deserializer)?;
-        match wire {
-            RetryHintWire::Never => Ok(Self::Never),
-            RetryHintWire::Retryable(RetryableWire { retry_after }) => {
-                Ok(Self::Retryable { retry_after })
-            }
-        }
-    }
-}
-
-/// Structured model error carrying explicit delivery state, retry hint, and diagnostic.
-///
-/// Deserialization strictly rejects unknown fields and rejects `RetryHint::Retryable`
-/// if `delivery` is not `DeliveryState::NotStarted`. In both constructors and
-/// deserialization, the inner `diagnostic.retryable` flag is automatically normalized
-/// to match `retry_hint` (`true` for `Retryable`, `false` for `Never`).
 #[derive(Clone, Eq, PartialEq, Serialize)]
-pub struct ModelError {
-    kind: ModelErrorKind,
-    delivery: DeliveryState,
-    retry_hint: RetryHint,
-    diagnostic: DiagnosticSummary,
+pub struct ModelResponse {
+    parts: Vec<AssistantPart>,
+    finish_reason: ModelFinishReason,
+    usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_replay: Option<ProviderReplay>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ModelErrorWire {
-    kind: ModelErrorKind,
-    delivery: DeliveryState,
-    retry_hint: RetryHint,
-    diagnostic: DiagnosticSummary,
+struct ModelResponseWire {
+    parts: Vec<AssistantPart>,
+    finish_reason: ModelFinishReason,
+    usage: Option<Usage>,
+    #[serde(default)]
+    provider_replay: Option<ProviderReplay>,
 }
 
-impl<'de> Deserialize<'de> for ModelError {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = ModelErrorWire::deserialize(deserializer)?;
-        match wire.retry_hint {
-            RetryHint::Retryable { .. } if wire.delivery != DeliveryState::NotStarted => {
-                Err(serde::de::Error::custom(
-                    "retryable model error requires delivery state NotStarted",
-                ))
-            }
-            RetryHint::Retryable { retry_after } => {
-                Ok(Self::not_started(wire.kind, retry_after, wire.diagnostic))
-            }
-            RetryHint::Never => Ok(Self::permanent(wire.kind, wire.delivery, wire.diagnostic)),
+impl ModelResponse {
+    pub fn new(
+        parts: Vec<AssistantPart>,
+        finish_reason: ModelFinishReason,
+        usage: impl Into<Option<Usage>>,
+    ) -> Result<Self, ModelValueError> {
+        Self::new_with_provider_replay(parts, finish_reason, usage, None)
+    }
+
+    /// Constructs a response, permitting no canonical parts only when replay exists.
+    pub fn new_with_provider_replay(
+        parts: Vec<AssistantPart>,
+        finish_reason: ModelFinishReason,
+        usage: impl Into<Option<Usage>>,
+        provider_replay: Option<ProviderReplay>,
+    ) -> Result<Self, ModelValueError> {
+        let parts = normalize_parts(parts);
+        if parts.is_empty() && provider_replay.is_none() {
+            return Err(ModelValueError::EmptyResponseParts);
         }
-    }
-}
-
-impl ModelError {
-    /// Constructs a retryable model error with `NotStarted` delivery state.
-    ///
-    /// The inner diagnostic summary's `retryable` flag is normalized to `true`
-    /// to remain strictly consistent with `RetryHint::Retryable`.
-    pub fn not_started(
-        kind: ModelErrorKind,
-        retry_after: Option<Duration>,
-        mut diagnostic: DiagnosticSummary,
-    ) -> Self {
-        diagnostic.retryable = true;
-        Self {
-            kind,
-            delivery: DeliveryState::NotStarted,
-            retry_hint: RetryHint::Retryable { retry_after },
-            diagnostic,
-        }
+        validate_tool_call_order(&parts)?;
+        Ok(Self {
+            parts,
+            finish_reason,
+            usage: usage.into(),
+            provider_replay,
+        })
     }
 
-    /// Constructs a non-retryable model error with `Started` delivery state.
-    ///
-    /// The inner diagnostic summary's `retryable` flag is normalized to `false`
-    /// to remain strictly consistent with `RetryHint::Never`.
-    pub fn started(kind: ModelErrorKind, mut diagnostic: DiagnosticSummary) -> Self {
-        diagnostic.retryable = false;
-        Self {
-            kind,
-            delivery: DeliveryState::Started,
-            retry_hint: RetryHint::Never,
-            diagnostic,
-        }
+    /// Attaches validated opaque metadata without changing canonical response parts.
+    pub fn with_provider_replay(mut self, replay: ProviderReplay) -> Self {
+        self.provider_replay = Some(replay);
+        self
     }
 
-    /// Constructs a non-retryable model error with `Unknown` delivery state.
-    ///
-    /// The inner diagnostic summary's `retryable` flag is normalized to `false`
-    /// to remain strictly consistent with `RetryHint::Never`.
-    pub fn unknown(kind: ModelErrorKind, mut diagnostic: DiagnosticSummary) -> Self {
-        diagnostic.retryable = false;
-        Self {
-            kind,
-            delivery: DeliveryState::Unknown,
-            retry_hint: RetryHint::Never,
-            diagnostic,
-        }
+    pub const fn provider_replay(&self) -> Option<&ProviderReplay> {
+        self.provider_replay.as_ref()
     }
 
-    /// Constructs a permanent non-retryable model error with explicit delivery.
-    ///
-    /// The inner diagnostic summary's `retryable` flag is normalized to `false`
-    /// to remain strictly consistent with `RetryHint::Never`.
-    pub fn permanent(
-        kind: ModelErrorKind,
-        delivery: DeliveryState,
-        mut diagnostic: DiagnosticSummary,
-    ) -> Self {
-        diagnostic.retryable = false;
-        Self {
-            kind,
-            delivery,
-            retry_hint: RetryHint::Never,
-            diagnostic,
-        }
+    pub fn parts(&self) -> &[AssistantPart] {
+        &self.parts
     }
 
-    pub const fn kind(&self) -> ModelErrorKind {
-        self.kind
+    pub const fn finish_reason(&self) -> ModelFinishReason {
+        self.finish_reason
     }
 
-    pub const fn delivery(&self) -> DeliveryState {
-        self.delivery
-    }
-
-    pub const fn retry_hint(&self) -> &RetryHint {
-        &self.retry_hint
-    }
-
-    pub const fn diagnostic(&self) -> &DiagnosticSummary {
-        &self.diagnostic
+    pub const fn usage(&self) -> Option<&Usage> {
+        self.usage.as_ref()
     }
 }
 
-impl fmt::Debug for ModelError {
+impl fmt::Debug for ModelResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ModelError")
-            .field("kind", &self.kind)
-            .field("delivery", &self.delivery)
-            .field("retry_hint", &self.retry_hint)
-            .field("diagnostic", &self.diagnostic)
+            .debug_struct("ModelResponse")
+            .field("part_count", &self.parts.len())
+            .field("parts", &self.parts)
+            .field("provider_replay", &self.provider_replay)
+            .field("finish_reason", &self.finish_reason)
+            .field("usage", &self.usage)
             .finish()
     }
 }
 
-impl fmt::Display for ModelError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "model error: kind={:?}, delivery={:?}, retry_hint={:?}",
-            self.kind, self.delivery, self.retry_hint
+impl<'de> Deserialize<'de> for ModelResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = ModelResponseWire::deserialize(deserializer)?;
+        Self::new_with_provider_replay(
+            value.parts,
+            value.finish_reason,
+            value.usage,
+            value.provider_replay,
         )
+        .map_err(serde::de::Error::custom)
     }
 }
-
-impl std::error::Error for ModelError {}
 
 pub const MAX_MODEL_EVENT_TEXT_BYTES: usize = 64 * 1024;
 

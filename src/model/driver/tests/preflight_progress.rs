@@ -3,8 +3,8 @@ use super::*;
 #[test]
 fn constructor_catches_descriptor_panic_and_rejects_invalid_descriptor() {
     let model: Arc<dyn Model> = Arc::new(DescriptorPanicModel);
-    let kernel = KernelConfig::default_checked().unwrap();
-    let error = match ModelDriver::new(model, driver_config(&kernel)) {
+    let kernel = ModelDriverConfig::default();
+    let error = match ModelDriver::new(model, kernel.clone()) {
         Err(error) => error,
         Ok(_) => panic!("panicking descriptor unexpectedly constructed a driver"),
     };
@@ -14,7 +14,7 @@ fn constructor_catches_descriptor_panic_and_rejects_invalid_descriptor() {
     invalid.context_window = 0;
     let model = ScriptModel::new(invalid, Vec::new());
     let model: Arc<dyn Model> = model;
-    let error = match ModelDriver::new(model, driver_config(&kernel)) {
+    let error = match ModelDriver::new(model, kernel.clone()) {
         Err(error) => error,
         Ok(_) => panic!("invalid descriptor unexpectedly constructed a driver"),
     };
@@ -26,7 +26,7 @@ async fn preflight_rejects_reasoning_tools_context_and_mutated_tool_specs_before
     let mut no_reasoning = descriptor();
     no_reasoning.supported_reasoning = BTreeSet::from([ReasoningPreference::Auto]);
     let no_reasoning = ScriptModel::new(no_reasoning, Vec::new());
-    let driver = no_reasoning.driver(&KernelConfig::default_checked().unwrap());
+    let driver = no_reasoning.driver(&ModelDriverConfig::default());
     let (progress, _receiver) = progress_channel();
     assert_eq!(
         driver
@@ -45,7 +45,7 @@ async fn preflight_rejects_reasoning_tools_context_and_mutated_tool_specs_before
     let mut no_tools = descriptor();
     no_tools.supports_tools = false;
     let no_tools = ScriptModel::new(no_tools, Vec::new());
-    let driver = no_tools.driver(&KernelConfig::default_checked().unwrap());
+    let driver = no_tools.driver(&ModelDriverConfig::default());
     assert_eq!(
         driver
             .run(
@@ -61,7 +61,7 @@ async fn preflight_rejects_reasoning_tools_context_and_mutated_tool_specs_before
     assert_eq!(no_tools.starts(), 0);
 
     let model = ScriptModel::new(descriptor(), Vec::new());
-    let driver = model.driver(&KernelConfig::default_checked().unwrap());
+    let driver = model.driver(&ModelDriverConfig::default());
     let too_large = request_with(ReasoningPreference::High, Vec::new(), Some(129));
     assert_eq!(
         driver
@@ -85,11 +85,11 @@ async fn preflight_rejects_reasoning_tools_context_and_mutated_tool_specs_before
         ReasoningPreference::High,
     )
     .unwrap();
-    let limits = SemanticLimits {
+    let limits = LoopLimits {
         max_tool_schema_bytes: 8,
-        ..SemanticLimits::default()
+        ..LoopLimits::default()
     };
-    let driver = model.driver(&limits_kernel(limits));
+    let driver = model.driver(&with_limits(limits));
     assert_eq!(
         driver
             .run(
@@ -123,7 +123,7 @@ async fn progress_is_best_effort_for_accepted_full_and_closed_channels() {
             Behavior::Events(events()),
         ],
     );
-    let driver = model.driver(&kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()));
+    let driver = model.driver(&with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)));
 
     let (accepted, mut accepted_rx) = mpsc::channel(2);
     assert!(

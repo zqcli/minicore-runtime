@@ -35,68 +35,13 @@ mod semantics;
 #[cfg(test)]
 mod settlement;
 
-/// Test-local mirror of the removed session kernel config: the driver needs
-/// only a timeout, a retry budget, and the semantic limits tuple.
-#[derive(Clone)]
-struct RetryPolicy {
-    attempts: u8,
-    base_delay: Duration,
-}
-
-impl RetryPolicy {
-    fn new(attempts: u8, base_delay: Duration) -> Result<Self, &'static str> {
-        Ok(Self {
-            attempts,
-            base_delay,
-        })
-    }
-
-    fn max_attempts(&self) -> u8 {
-        self.attempts
-    }
-
-    fn base_delay(&self) -> Duration {
-        self.base_delay
-    }
-}
-
-#[derive(Clone)]
-struct SemanticLimits {
-    max_tool_calls_per_response: usize,
-    max_tool_name_bytes: usize,
-    max_tool_schema_bytes: usize,
-    max_tool_input_bytes: usize,
-    max_model_text_bytes_per_round: usize,
-    max_model_reasoning_bytes_per_round: usize,
-}
-
-impl Default for SemanticLimits {
+impl Default for ModelDriverConfig {
     fn default() -> Self {
         Self {
-            max_tool_calls_per_response: 64,
-            max_tool_name_bytes: 64,
-            max_tool_schema_bytes: crate::value::MAX_JSON_BYTES,
-            max_tool_input_bytes: crate::value::MAX_JSON_BYTES,
-            max_model_text_bytes_per_round: BoundedText::MAX_BYTES,
-            max_model_reasoning_bytes_per_round: BoundedText::MAX_BYTES,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct KernelConfig {
-    model_call_timeout: Duration,
-    retry_policy: RetryPolicy,
-    limits: SemanticLimits,
-}
-
-impl KernelConfig {
-    fn default_checked() -> Result<Self, &'static str> {
-        Ok(Self {
             model_call_timeout: Duration::from_secs(60),
-            retry_policy: RetryPolicy::new(2, Duration::ZERO).unwrap(),
-            limits: SemanticLimits::default(),
-        })
+            retry_policy: RetryPolicySnapshot::new(2, Duration::ZERO),
+            limits: LoopLimits::default(),
+        }
     }
 }
 
@@ -156,36 +101,20 @@ fn context(cancellation: CancellationToken, deadline_after: Duration) -> ModelCa
     ModelCallContext::new(loop_id(), 0, cancellation, Instant::now() + deadline_after)
 }
 
-fn kernel(retry_policy: RetryPolicy) -> KernelConfig {
-    KernelConfig {
+fn with_retry(retry_policy: RetryPolicySnapshot) -> ModelDriverConfig {
+    ModelDriverConfig {
         model_call_timeout: Duration::from_secs(60),
         retry_policy,
-        ..KernelConfig::default_checked().unwrap()
+        ..ModelDriverConfig::default()
     }
 }
 
-fn limits_kernel(limits: SemanticLimits) -> KernelConfig {
-    KernelConfig {
+fn with_limits(limits: LoopLimits) -> ModelDriverConfig {
+    ModelDriverConfig {
         model_call_timeout: Duration::from_secs(60),
         limits,
-        ..KernelConfig::default_checked().unwrap()
+        ..ModelDriverConfig::default()
     }
-}
-
-fn driver_config(kernel: &KernelConfig) -> ModelDriverConfig {
-    ModelDriverConfig::from_kernel_values(
-        kernel.model_call_timeout,
-        kernel.retry_policy.max_attempts(),
-        kernel.retry_policy.base_delay(),
-        SemanticLimitsSnapshot::from_kernel_values(
-            kernel.limits.max_tool_calls_per_response,
-            kernel.limits.max_tool_name_bytes,
-            kernel.limits.max_tool_schema_bytes,
-            kernel.limits.max_tool_input_bytes,
-            kernel.limits.max_model_text_bytes_per_round,
-            kernel.limits.max_model_reasoning_bytes_per_round,
-        ),
-    )
 }
 
 fn finish(reason: ModelFinishReason) -> ModelEvent {
@@ -246,7 +175,7 @@ fn progress_channel() -> (
 async fn run_events(
     request: ModelRequest,
     events: Vec<Result<ModelEvent, ModelError>>,
-    kernel: KernelConfig,
+    kernel: ModelDriverConfig,
 ) -> Result<ModelResponse, ModelError> {
     let model = ScriptModel::new(descriptor(), vec![Behavior::Events(events)]);
     let driver = model.driver(&kernel);
@@ -285,10 +214,10 @@ impl ScriptModel {
         })
     }
 
-    fn driver(self: &Arc<Self>, kernel: &KernelConfig) -> ModelDriver {
+    fn driver(self: &Arc<Self>, kernel: &ModelDriverConfig) -> ModelDriver {
         let model = Arc::clone(self);
         let model: Arc<dyn Model> = model;
-        ModelDriver::from_validated(model, self.descriptor.clone(), driver_config(kernel)).unwrap()
+        ModelDriver::from_validated(model, self.descriptor.clone(), kernel.clone())
     }
 
     fn starts(&self) -> usize {

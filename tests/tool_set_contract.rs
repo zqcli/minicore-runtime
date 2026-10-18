@@ -1,3 +1,7 @@
+mod support;
+use support::tools::FakeTool;
+use support::{invocation, spec};
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,30 +15,6 @@ use minicore_runtime::tools::{
 use minicore_runtime::value::{BoundedText, MAX_JSON_BYTES, MAX_JSON_DEPTH, MAX_JSON_NODES};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
-
-fn invocation(name: &str, arguments: serde_json::Value) -> ToolInvocation {
-    ToolInvocation::new(
-        "call_00000000000000000000000000000001".parse().unwrap(),
-        name.parse().unwrap(),
-        arguments,
-    )
-    .unwrap()
-}
-
-fn spec(name: &str, description: &str) -> ToolSpec {
-    ToolSpec::new(
-        name.parse().unwrap(),
-        description,
-        json!({"type": "object"}),
-    )
-    .unwrap()
-}
-
-struct FakeTool {
-    spec: ToolSpec,
-    calls: Arc<AtomicUsize>,
-    request_input: bool,
-}
 
 struct MutableSpecTool {
     specs: [ToolSpec; 2],
@@ -74,47 +54,6 @@ impl Tool for MutableSpecTool {
             Ok(ToolExecutionOutcome::Completed(
                 ToolOutput::new("ok").unwrap(),
             ))
-        })
-    }
-}
-
-impl FakeTool {
-    fn new(name: &str, request_input: bool) -> Self {
-        Self {
-            spec: spec(name, name),
-            calls: Arc::new(AtomicUsize::new(0)),
-            request_input,
-        }
-    }
-}
-
-impl Tool for FakeTool {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
-    }
-
-    fn execute<'a>(&'a self, _invocation: ToolInvocation, context: ToolContext) -> ToolFuture<'a> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let request_input = self.request_input;
-        Box::pin(async move {
-            assert!(context.deadline > Instant::now() - Duration::from_secs(1));
-            if context.cancellation.is_cancelled() {
-                return Err(ToolError::Cancelled);
-            }
-            if request_input {
-                Ok(ToolExecutionOutcome::RequestInput(
-                    ToolInputRequest::new(
-                        "choose",
-                        vec![BoundedText::new("yes").unwrap()],
-                        ToolInputAnswerKind::SingleChoice,
-                    )
-                    .unwrap(),
-                ))
-            } else {
-                Ok(ToolExecutionOutcome::Completed(
-                    ToolOutput::new("done").unwrap(),
-                ))
-            }
         })
     }
 }

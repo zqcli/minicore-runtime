@@ -9,7 +9,6 @@ use super::types::ToolName;
 
 #[derive(Clone, Default)]
 pub struct ToolSet {
-    tools: Arc<BTreeMap<ToolName, Arc<dyn Tool>>>,
     specs: Arc<[ToolSpec]>,
     enabled: EnabledTools,
 }
@@ -52,11 +51,13 @@ impl ToolSet {
     }
 
     pub fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
-        self.tools.get(name).map(Arc::clone)
+        self.enabled
+            .get(name)
+            .map(|tool| Arc::clone(&tool.implementation))
     }
 
     pub fn contains(&self, name: &ToolName) -> bool {
-        self.tools.contains_key(name)
+        self.enabled.entries.contains_key(name)
     }
 
     pub fn specs_for(&self, enabled: &BTreeSet<ToolName>) -> Vec<ToolSpec> {
@@ -121,11 +122,9 @@ impl ToolSetBuilder {
         if let Some(error) = self.error {
             return Err(error);
         }
-        let mut tools = BTreeMap::new();
         let mut specs = Vec::with_capacity(self.tools.len());
         let mut entries = BTreeMap::new();
         for (name, registered) in self.tools {
-            tools.insert(name.clone(), Arc::clone(&registered.tool));
             specs.push(registered.spec.clone());
             entries.insert(
                 name,
@@ -136,7 +135,6 @@ impl ToolSetBuilder {
             );
         }
         Ok(ToolSet {
-            tools: Arc::new(tools),
             specs: specs.into(),
             enabled: EnabledTools {
                 entries: Arc::new(entries),

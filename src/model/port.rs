@@ -10,8 +10,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ids::LoopId;
 
-use super::response::{ModelError, ModelEvent};
-use super::types::{ModelRef, ModelRequest, ModelValueError, ReasoningPreference};
+use super::{ModelError, ModelEvent};
+use super::{ModelRef, ModelRequest, ModelValueError, ReasoningPreference};
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct ModelDescriptor {

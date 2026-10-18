@@ -14,7 +14,7 @@ async fn model_text_is_normalized_and_empty_deltas_do_not_emit_progress() {
             Ok(finish(ModelFinishReason::Stop)),
         ])],
     );
-    let driver = model.driver(&KernelConfig::default_checked().unwrap());
+    let driver = model.driver(&ModelDriverConfig::default());
     let (progress, mut receiver) = progress_channel();
     let parent = CancellationToken::new();
     let response = driver
@@ -55,7 +55,7 @@ async fn assembles_text_reasoning_tool_usage_and_preserves_first_slot_order() {
         Ok(finish(ModelFinishReason::ToolCalls)),
     ];
     let model = ScriptModel::new(descriptor(), vec![Behavior::Events(events)]);
-    let driver = model.driver(&kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()));
+    let driver = model.driver(&with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)));
     let (progress, mut progress_rx) = progress_channel();
     let response = driver
         .run(
@@ -96,7 +96,7 @@ async fn absent_usage_defaults_and_refusal_requires_text() {
     let response = run_events(
         request(),
         text_success("ok"),
-        kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()),
+        with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
     )
     .await
     .unwrap();
@@ -105,7 +105,7 @@ async fn absent_usage_defaults_and_refusal_requires_text() {
     let error = run_events(
         request(),
         vec![Ok(finish(ModelFinishReason::Refused))],
-        kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()),
+        with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
     )
     .await
     .unwrap_err();
@@ -132,7 +132,7 @@ async fn tool_call_indices_follow_start_order_not_request_order() {
             Ok(end(call_id(7))),
             Ok(finish(ModelFinishReason::ToolCalls)),
         ],
-        kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()),
+        with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
     )
     .await
     .unwrap();
@@ -308,7 +308,7 @@ async fn rejects_every_malformed_stream_sequence() {
         let error = run_events(
             request,
             events,
-            kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()),
+            with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
         )
         .await
         .expect_err(name);
@@ -337,7 +337,7 @@ async fn tool_arguments_use_centralized_json_depth_and_node_validation() {
                 Ok(args(id.clone(), &arguments)),
                 Ok(end(id)),
             ],
-            kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()),
+            with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
         )
         .await
         .unwrap_err();
@@ -347,13 +347,13 @@ async fn tool_arguments_use_centralized_json_depth_and_node_validation() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn aggregate_text_reasoning_and_arguments_enforce_exact_semantic_boundaries() {
-    let limits = SemanticLimits {
-        max_model_text_bytes_per_round: 3,
-        max_model_reasoning_bytes_per_round: 3,
-        max_tool_input_bytes: 7,
-        ..SemanticLimits::default()
+    let limits = LoopLimits {
+        max_model_text_bytes: 3,
+        max_model_reasoning_bytes: 3,
+        max_tool_arguments_bytes: 7,
+        ..LoopLimits::default()
     };
-    let kernel = limits_kernel(limits);
+    let kernel = with_limits(limits);
 
     assert!(
         run_events(
@@ -456,7 +456,7 @@ async fn replay_is_retained_once_never_forwarded_and_requires_finish() {
         }
         events.push(Ok(finish(ModelFinishReason::Stop)));
         let model = ScriptModel::new(descriptor(), vec![Behavior::Events(events)]);
-        let driver = model.driver(&kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()));
+        let driver = model.driver(&with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)));
         let (progress, mut receiver) = progress_channel();
         let response = driver
             .run(
@@ -500,7 +500,7 @@ async fn replay_is_retained_once_never_forwarded_and_requires_finish() {
         let error = run_events(
             request(),
             events,
-            kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()),
+            with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
         )
         .await
         .unwrap_err();

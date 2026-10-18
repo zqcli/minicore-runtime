@@ -13,7 +13,7 @@ async fn each_attempt_cancels_its_child_without_cancelling_the_parent() {
         ],
     ] {
         let model = ScriptModel::new(descriptor(), behaviors);
-        let driver = model.driver(&KernelConfig::default_checked().unwrap());
+        let driver = model.driver(&ModelDriverConfig::default());
         let parent = CancellationToken::new();
         let (progress, _receiver) = progress_channel();
         let _ = driver
@@ -35,7 +35,7 @@ async fn each_attempt_cancels_its_child_without_cancelling_the_parent() {
         descriptor(),
         vec![Behavior::PendingStart(Arc::new(AtomicBool::new(false)))],
     );
-    let driver = model.driver(&KernelConfig::default_checked().unwrap());
+    let driver = model.driver(&ModelDriverConfig::default());
     let parent = CancellationToken::new();
     let (progress, _receiver) = progress_channel();
     {
@@ -58,7 +58,7 @@ async fn each_attempt_cancels_its_child_without_cancelling_the_parent() {
 #[tokio::test(flavor = "current_thread")]
 async fn cancellation_and_timeout_before_invocation_are_not_started() {
     let model = ScriptModel::new(descriptor(), vec![Behavior::Events(text_success("unused"))]);
-    let driver = model.driver(&kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()));
+    let driver = model.driver(&with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)));
     let (progress, _receiver) = progress_channel();
 
     let cancellation = CancellationToken::new();
@@ -95,7 +95,7 @@ async fn cancellation_during_start_drops_future_and_reports_unknown() {
         descriptor(),
         vec![Behavior::PendingStart(Arc::clone(&dropped))],
     );
-    let driver = model.driver(&kernel(RetryPolicy::new(1, Duration::ZERO).unwrap()));
+    let driver = model.driver(&with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)));
     let cancellation = CancellationToken::new();
     let task_cancel = cancellation.clone();
     let (progress, _receiver) = progress_channel();
@@ -123,9 +123,9 @@ async fn timeout_during_start_drops_future_and_reports_unknown() {
         descriptor(),
         vec![Behavior::PendingStart(Arc::clone(&dropped))],
     );
-    let config = KernelConfig {
+    let config = ModelDriverConfig {
         model_call_timeout: Duration::from_secs(5),
-        ..kernel(RetryPolicy::new(1, Duration::ZERO).unwrap())
+        ..with_retry(RetryPolicySnapshot::new(1, Duration::ZERO))
     };
     let driver = model.driver(&config);
     let (progress, _receiver) = progress_channel();
@@ -165,7 +165,7 @@ async fn cancellation_during_stream_drops_stream_and_tracks_delivery() {
             },
         ],
     );
-    let driver = Arc::new(model.driver(&kernel(RetryPolicy::new(1, Duration::ZERO).unwrap())));
+    let driver = Arc::new(model.driver(&with_retry(RetryPolicySnapshot::new(1, Duration::ZERO))));
 
     let cancellation = CancellationToken::new();
     let task_cancel = cancellation.clone();
@@ -222,9 +222,9 @@ async fn timeout_during_stream_drops_stream_and_reports_unknown() {
             probe: Arc::clone(&dropped),
         }],
     );
-    let config = KernelConfig {
+    let config = ModelDriverConfig {
         model_call_timeout: Duration::from_secs(5),
-        ..kernel(RetryPolicy::new(1, Duration::ZERO).unwrap())
+        ..with_retry(RetryPolicySnapshot::new(1, Duration::ZERO))
     };
     let driver = model.driver(&config);
     let (progress, _receiver) = progress_channel();
@@ -249,7 +249,7 @@ async fn timeout_during_stream_drops_stream_and_reports_unknown() {
 async fn start_and_stream_panics_become_unknown_nonretryable_errors() {
     for behavior in [Behavior::StartPanic, Behavior::FuturePanic] {
         let model = ScriptModel::new(descriptor(), vec![behavior]);
-        let driver = model.driver(&kernel(RetryPolicy::new(4, Duration::ZERO).unwrap()));
+        let driver = model.driver(&with_retry(RetryPolicySnapshot::new(4, Duration::ZERO)));
         let (progress, _receiver) = progress_channel();
         let error = driver
             .run(
@@ -274,7 +274,7 @@ async fn start_and_stream_panics_become_unknown_nonretryable_errors() {
             probe: Arc::clone(&dropped),
         }],
     );
-    let driver = model.driver(&kernel(RetryPolicy::new(4, Duration::ZERO).unwrap()));
+    let driver = model.driver(&with_retry(RetryPolicySnapshot::new(4, Duration::ZERO)));
     let (progress, _receiver) = progress_channel();
     let error = driver
         .run(

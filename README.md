@@ -11,6 +11,8 @@ MiniCore Runtime is a small Rust execution core for one live agent loop. It runs
   share immutable storage. `ModelRequest` clones share message/tool slices;
   `ModelRequest::new` accepts a tool `Vec` or `Arc<[ToolSpec]>`.
   `ToolCall::arguments()` and `ProviderReplay::payload()` are no longer `const`.
+  Redundant `ToolCall::validate()` is removed: constructors and deserialization
+  already guarantee valid arguments.
 - `DiagnosticSummary::new` now returns `Result<_, ValueError>` and its `message`
   field is private (read through `message()`). Diagnostics and tool progress
   reject controls other than LF/TAB; `ToolProgressError::InvalidText` and
