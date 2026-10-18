@@ -21,8 +21,8 @@ host.
 
 ## Features
 
-- **One-shot loop.** `AgentLoop::start` runs exactly once and resolves to an
-  `Arc<LoopReport>`. Every waiter receives the same report.
+- **One-shot loop.** An `AgentLoop` runs exactly once. `join` and every
+  handle's `wait` return the same `Arc<LoopReport>`.
 - **Live control.** `LoopHandle` steers or updates the next request, answers
   approval and tool-input interactions, and cancels or shuts down the loop.
 - **Pluggable seams.** Models, tools, tool policies, and prompt projection are
@@ -61,7 +61,7 @@ use minicore_runtime::{AgentLoop, ExecutionConfig, LoopOptions, LoopRequest, Use
 let config = ExecutionConfig::new(
     model,                         // Arc<dyn Model>
     ReasoningPreference::Auto,
-    ToolSet::default(),            // or ToolSet::builder().register(tool).build()?
+    ToolSet::default(),            // or a set assembled with ToolSet::builder()
     None,                          // optional Arc<dyn ToolPolicy>
     Arc::new(DefaultPromptProvider::new(None)),
 )?;
@@ -114,8 +114,9 @@ The Runtime executes one loop. The host owns everything around it:
   snapshot of the request that produced it.
 - `steer` takes effect at the next model request. An accepted steer is queued in
   memory and discarded if the loop ends any other way than `Completed` before
-  that boundary. Steers fail with `QueueFull`, `WaitingForInput` while an
-  interaction is pending, or `NotActive` after cancellation or completion.
+  that boundary. Steers fail with `InvalidInput` beyond `max_user_input_bytes`,
+  `QueueFull`, `WaitingForInput` while an interaction is pending, or `NotActive`
+  after cancellation or completion.
 - An `update` does not keep the loop alive. The model's final response and any
   pending steers decide whether another request runs.
 - `LoopReport.requests` counts issued requests. Driver retries stay inside one
