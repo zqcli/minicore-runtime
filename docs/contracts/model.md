@@ -41,16 +41,28 @@ pub trait Model: Send + Sync + 'static {
 
 ## Outcomes
 
-Runtime owns model-text normalization. Text/reasoning/argument deltas, assistant
-text in response constructors, and reasoning text/summary constructors accept control
-characters: within each payload CRLF and lone CR become LF, and other controls
-except LF/TAB become U+FFFD. Byte limits apply after normalization. Empty deltas
-are valid and ignored by assembly (no part or progress event). Public event
-variants receive the same normalization at the adapter boundary, including
-CRLF contraction and U+FFFD expansion before checking the event byte ceiling.
-Opaque replay,
-encrypted reasoning and signatures retain their own validation rules. Tool
-arguments must still assemble into a bounded JSON object.
+Runtime owns model-text normalization: CRLF and lone CR become LF; every other
+control character except LF/TAB becomes one ASCII space. Normalization never
+increases UTF-8 byte length. Assistant text and reasoning text/summary constructors
+apply this policy to their whole payloads.
+
+Model delta constructors preserve raw text and enforce `MAX_MODEL_EVENT_TEXT_BYTES`
+on its raw byte length; direct event variants receive the same size check at the
+adapter boundary. Hosts can chunk raw text at any UTF-8 character boundary up to
+that limit, without reserving expansion space or avoiding CRLF boundaries.
+
+Assembly normalizes text and reasoning independently across events. A trailing CR
+is emitted immediately as LF; a leading LF in the next non-empty delta of that
+same channel is dropped. Empty deltas and events in another channel leave this
+state unchanged. Canonical text equals normalization of the concatenated raw
+text, regardless of chunk boundaries. Forwarded progress uses those same
+normalized deltas, omitting empty ones. Per-round text/reasoning budgets count
+normalized bytes, not raw bytes.
+
+Tool-argument deltas use the same character replacements before JSON assembly,
+but are never forwarded as progress; arguments must still form a bounded JSON
+object. Opaque replay, encrypted reasoning and signatures retain their own
+validation rules.
 
 Each model attempt receives a child cancellation token, cancelled on every
 attempt ending, including successful EOF, failure, timeout and dropped futures.

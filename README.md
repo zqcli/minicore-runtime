@@ -17,8 +17,12 @@ MiniCore Runtime is a small Rust execution core for one live agent loop. It runs
   field is private (read through `message()`). Diagnostics and tool progress
   reject controls other than LF/TAB; `ToolProgressError::InvalidText` and
   `ValueError::InvalidText` are new variants. Input prompts/answers now allow LF/TAB.
-- Model display text normalizes CRLF/CR to LF and other controls to U+FFFD.
-  Empty deltas are accepted and ignored; byte limits still apply after normalization.
+- Model text normalizes CRLF/CR to LF and other controls except LF/TAB to a
+  single space, never increasing byte length. Delta constructors retain raw text
+  and cap its bytes; assembly handles split CRLF independently for text/reasoning,
+  producing matching canonical text and progress. Hosts may chunk at any UTF-8
+  boundary up to `MAX_MODEL_EVENT_TEXT_BYTES`, without expansion headroom or CRLF
+  workarounds. Empty deltas are ignored without breaking CRLF continuity.
 - `LoopStatus`, `CancelReason`, and `LoopOutcome` are non-exhaustive: downstream
   matches need a wildcard arm. Usage sums known values per field instead of
   losing them when another request omits that field.

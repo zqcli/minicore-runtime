@@ -85,7 +85,7 @@ pub(crate) fn valid_text(value: &str, maximum: usize, allow_empty: bool) -> bool
             .all(|c| !c.is_control() || matches!(c, '\n' | '\t'))
 }
 
-/// Normalize display text, leaving opaque metadata and JSON interpretation to their owners.
+/// Normalize model text without increasing its UTF-8 byte length.
 pub(crate) fn normalize_model_text(value: &str) -> std::borrow::Cow<'_, str> {
     if valid_text(value, usize::MAX, true) {
         return std::borrow::Cow::Borrowed(value);
@@ -101,7 +101,7 @@ pub(crate) fn normalize_model_text(value: &str) -> std::borrow::Cow<'_, str> {
                 '\n'
             }
             '\n' | '\t' => c,
-            c if c.is_control() => '\u{fffd}',
+            c if c.is_control() => ' ',
             c => c,
         });
     }

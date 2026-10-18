@@ -7,8 +7,9 @@ remain unchanged. Public Rust API changes are listed in the
 ## Changes
 
 - Runtime normalizes model display text (CRLF/CR to LF, other controls except
-  LF/TAB to U+FFFD), and ignores empty deltas. Tool text validation is consistent
-  across input, progress and diagnostics.
+  LF/TAB to a space), without expanding bytes. Assembly preserves CRLF continuity
+  across text/reasoning deltas and ignores empty deltas. Tool text validation is
+  consistent across input, progress and diagnostics.
 - Large immutable text, reasoning, tool arguments and replay payloads share
   storage. Requests share message/tool slices and reuse the frozen tool catalog;
   history projection copies item handles rather than payload bytes.
@@ -37,7 +38,7 @@ bash scripts/check-architecture.sh
 bash scripts/check-msrv.sh
 ```
 
-The main suite has 272 tests: 76 unit and 196 integration tests in 11 binaries.
+The main suite has 273 tests: 77 unit and 196 integration tests in 11 binaries.
 The two examples compile as test targets. The acceptance checker preserves all
 70 Passed rows and validates their source/test references. See the
 [test inventory](../tests/README.md) for per-target counts.
@@ -50,7 +51,9 @@ retain the gate and counts that applied at that release.
 ## Host Adaptation
 
 Besides the Rust API updates in README, adapters should remove their own rejection
-of CR/ESC model display text and let Runtime normalize it. Hosts can replace
+of CR/ESC model display text and let Runtime normalize it. Delta constructors
+preserve raw text: adapters can chunk at the raw event byte limit on UTF-8
+boundaries without expansion headroom or special CRLF handling. Hosts can replace
 mirrored history-size accounting with the exported estimator and use handle
 shutdown when closing a session. See the [adapter obligations](integration/host-boundary.md#adapter-obligations)
 for cooperative futures, panic unwinding, dropped work and deadline ties.

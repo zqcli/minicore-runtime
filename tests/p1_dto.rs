@@ -77,7 +77,7 @@ fn request_payload_clones_share_storage_and_output_constructors_normalize_text()
     )
     .unwrap();
     assert!(
-        matches!(response.parts(), [AssistantPart::Text(text), AssistantPart::Reasoning(reason)] if text.as_ref() == "a\nb\nc�" && reason.text() == Some("r\n�") && reason.summary() == Some("�"))
+        matches!(response.parts(), [AssistantPart::Text(text), AssistantPart::Reasoning(reason)] if text.as_ref() == "a\nb\nc " && reason.text() == Some("r\n ") && reason.summary() == Some(" "))
     );
     assert_json_round_trip(&response);
 }

@@ -1,18 +1,82 @@
 use super::*;
 
+#[test]
+fn split_crlf_matches_whole_text_in_each_channel_and_progress() {
+    let raw = "é\r\nA\rB\r\r\n\tend\r";
+    let expected = "é\nA\nB\n\n\tend\n";
+    assert_eq!(crate::value::normalize_model_text(raw), expected);
+    let limits = LoopLimits::default();
+    for split in (0..=raw.len()).filter(|&split| raw.is_char_boundary(split)) {
+        for direct in [false, true] {
+            let mut assembler = Assembler::new(&[], &limits);
+            let mut text = String::new();
+            let mut reasoning = String::new();
+            // Empty deltas and the other channel must not consume a pending CR.
+            for (index, chunk) in [&raw[..split], "", &raw[split..]].into_iter().enumerate() {
+                let events = if direct {
+                    [
+                        ModelEvent::TextDelta {
+                            delta: BoundedText::new(chunk).unwrap(),
+                        },
+                        ModelEvent::ReasoningDelta {
+                            delta: BoundedText::new(chunk).unwrap(),
+                        },
+                    ]
+                } else {
+                    [
+                        ModelEvent::text_delta(chunk).unwrap(),
+                        ModelEvent::reasoning_delta(chunk).unwrap(),
+                    ]
+                };
+                for event in events {
+                    match assembler.push(event).unwrap() {
+                        Some(ModelDriverProgress::TextDelta(delta)) => {
+                            assert!(!delta.is_empty());
+                            text.push_str(delta.as_str());
+                        }
+                        Some(ModelDriverProgress::ReasoningDelta(delta)) => {
+                            assert!(!delta.is_empty());
+                            reasoning.push_str(delta.as_str());
+                        }
+                        None => {}
+                    }
+                }
+                if index == 0 {
+                    // A trailing CR is emitted immediately, not buffered until the next event.
+                    assert_eq!(text, crate::value::normalize_model_text(chunk));
+                    assert_eq!(reasoning, text);
+                }
+            }
+            assert_eq!(text, expected, "split={split}, direct={direct}");
+            assert_eq!(reasoning, expected, "split={split}, direct={direct}");
+            assembler.push(finish(ModelFinishReason::Stop)).unwrap();
+            let response = assembler.finish().unwrap();
+            assert!(
+                matches!(response.parts(), [AssistantPart::Text(text), AssistantPart::Reasoning(reasoning)]
+                if text.as_ref() == expected && reasoning.text() == Some(expected))
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn direct_and_constructed_deltas_enforce_normalized_byte_limits() {
     let limit = crate::model::MAX_MODEL_EVENT_TEXT_BYTES;
-    let controls = "\0".repeat(limit / 3);
-    let replacements = "�".repeat(limit / 3);
     for (raw, normalized, accepted) in [
-        ("\r\n".repeat(40_000), "\n".repeat(40_000), true),
-        ("\r\n".repeat(limit), "\n".repeat(limit), true),
-        ("\r\n".repeat(limit + 1), "\n".repeat(limit + 1), false),
-        (format!("{controls}a"), format!("{replacements}a"), true),
-        (format!("{controls}aa"), format!("{replacements}aa"), false),
+        ("\0".repeat(limit), " ".repeat(limit), true),
+        ("\x1b".repeat(limit), " ".repeat(limit), true),
+        ("\u{85}".repeat(limit / 2), " ".repeat(limit / 2), true),
+        ("\r\n".repeat(limit / 2), "\n".repeat(limit / 2), true),
+        ("a".repeat(limit), "a".repeat(limit), true),
+        ("\0".repeat(limit + 1), " ".repeat(limit + 1), false),
+        (
+            "\r\n".repeat(limit / 2 + 1),
+            "\n".repeat(limit / 2 + 1),
+            false,
+        ),
         ("a".repeat(limit + 1), "a".repeat(limit + 1), false),
     ] {
+        assert!(normalized.len() <= raw.len());
         for reasoning in [false, true] {
             let delta = BoundedText::new(&raw).unwrap();
             let (direct, constructed) = if reasoning {
@@ -96,13 +160,13 @@ async fn model_text_is_normalized_and_empty_deltas_do_not_emit_progress() {
         .unwrap();
     assert!(
         matches!(response.parts(), [AssistantPart::Text(text), AssistantPart::Reasoning(reason), AssistantPart::ToolCall(call)]
-        if text.as_ref() == "a\nb\nc��\t" && reason.text() == Some("r\n�") && call.arguments() == &json!({"q": "a�b"}))
+        if text.as_ref() == "a\nb\nc  \t" && reason.text() == Some("r\n ") && call.arguments() == &json!({"q": "a b"}))
     );
     assert!(
-        matches!(receiver.try_recv(), Ok(ModelDriverProgress::TextDelta(text)) if text.as_str() == "a\nb\nc��\t")
+        matches!(receiver.try_recv(), Ok(ModelDriverProgress::TextDelta(text)) if text.as_str() == "a\nb\nc  \t")
     );
     assert!(
-        matches!(receiver.try_recv(), Ok(ModelDriverProgress::ReasoningDelta(text)) if text.as_str() == "r\n�")
+        matches!(receiver.try_recv(), Ok(ModelDriverProgress::ReasoningDelta(text)) if text.as_str() == "r\n ")
     );
     assert!(receiver.try_recv().is_err());
     assert!(!parent.is_cancelled());

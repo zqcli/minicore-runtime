@@ -2,7 +2,7 @@ use super::message::{normalize_parts, validate_tool_call_order};
 use super::{AssistantPart, ModelValueError, ProviderReplay, Usage};
 use crate::ids::ToolCallId;
 use crate::tools::ToolName;
-use crate::value::{BoundedText, normalize_model_text};
+use crate::value::BoundedText;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
@@ -117,8 +117,10 @@ impl<'de> Deserialize<'de> for ModelResponse {
     }
 }
 
+/// Maximum raw UTF-8 bytes in one model delta.
 pub const MAX_MODEL_EVENT_TEXT_BYTES: usize = 64 * 1024;
 
+/// Deltas retain raw text; assembly normalizes text and reasoning across events.
 #[derive(Clone, Eq, PartialEq)]
 pub enum ModelEvent {
     TextDelta {
@@ -178,7 +180,11 @@ impl ModelEvent {
             Self::TextDelta { delta }
             | Self::ReasoningDelta { delta }
             | Self::ToolCallArgumentsDelta { delta, .. } => {
-                normalized_event_text(delta.as_str()).map(|_| ())
+                if delta.byte_len() <= MAX_MODEL_EVENT_TEXT_BYTES {
+                    Ok(())
+                } else {
+                    Err(ModelValueError::InvalidEvent)
+                }
             }
             Self::ToolCallStart { .. }
             | Self::ToolCallEnd { .. }
@@ -231,16 +237,6 @@ impl fmt::Debug for ModelEvent {
 }
 
 fn checked_event_text(value: &str) -> Result<BoundedText, ModelValueError> {
-    BoundedText::new(normalized_event_text(value)?).map_err(|_| ModelValueError::InvalidEvent)
-}
-
-pub(super) fn normalized_event_text(
-    value: &str,
-) -> Result<std::borrow::Cow<'_, str>, ModelValueError> {
-    let text = normalize_model_text(value);
-    if text.len() <= MAX_MODEL_EVENT_TEXT_BYTES {
-        Ok(text)
-    } else {
-        Err(ModelValueError::InvalidEvent)
-    }
+    BoundedText::new_with_max_bytes(value, MAX_MODEL_EVENT_TEXT_BYTES)
+        .map_err(|_| ModelValueError::InvalidEvent)
 }

@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::ids::ToolCallId;
 use crate::tools::{ToolName, ToolSpec};
-use crate::value::{BoundedText, MAX_JSON_BYTES};
+use crate::value::{BoundedText, MAX_JSON_BYTES, normalize_model_text};
 
 use super::super::{
     AssistantPart, ModelFinishReason, ModelResponse, ReasoningContent, ToolCall, Usage,
@@ -18,6 +18,8 @@ pub(super) struct Assembler<'a> {
     slots: Vec<PartSlot>,
     text: String,
     reasoning: String,
+    text_ended_with_cr: bool,
+    reasoning_ended_with_cr: bool,
     tools: Vec<ToolAssembly>,
     usage: Option<Usage>,
     provider_replay: Option<ProviderReplay>,
@@ -48,6 +50,8 @@ impl<'a> Assembler<'a> {
             slots: Vec::new(),
             text: String::new(),
             reasoning: String::new(),
+            text_ended_with_cr: false,
+            reasoning_ended_with_cr: false,
             tools: Vec::new(),
             usage: None,
             provider_replay: None,
@@ -60,12 +64,12 @@ impl<'a> Assembler<'a> {
         &mut self,
         event: ModelEvent,
     ) -> Result<Option<ModelDriverProgress>, ModelError> {
-        if self.finish_reason.is_some() {
+        if self.finish_reason.is_some() || event.validate().is_err() {
             return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
         }
         match event {
             ModelEvent::TextDelta { delta } => {
-                let delta = normalized_delta(delta)?;
+                let delta = normalized_delta(delta, &mut self.text_ended_with_cr);
                 if delta.is_empty() {
                     return Ok(None);
                 }
@@ -80,7 +84,7 @@ impl<'a> Assembler<'a> {
                 Ok(Some(ModelDriverProgress::TextDelta(delta)))
             }
             ModelEvent::ReasoningDelta { delta } => {
-                let delta = normalized_delta(delta)?;
+                let delta = normalized_delta(delta, &mut self.reasoning_ended_with_cr);
                 if delta.is_empty() {
                     return Ok(None);
                 }
@@ -130,12 +134,12 @@ impl<'a> Assembler<'a> {
                 tool_call_id,
                 delta,
             } => {
-                let delta = normalized_delta(delta)?;
+                let delta = normalize_model_text(delta.as_str());
                 let tool = self.tool_mut(&tool_call_id)?;
                 if tool.call.is_some() {
                     return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
                 }
-                append_bounded(&mut tool.arguments_text, delta.as_str(), MAX_JSON_BYTES)?;
+                append_bounded(&mut tool.arguments_text, &delta, MAX_JSON_BYTES)?;
                 Ok(None)
             }
             ModelEvent::ToolCallEnd { tool_call_id } => {
@@ -243,13 +247,20 @@ impl<'a> Assembler<'a> {
     }
 }
 
-fn normalized_delta(delta: BoundedText) -> Result<BoundedText, ModelError> {
-    let text = super::super::response::normalized_event_text(delta.as_str())
-        .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
-    match text {
-        std::borrow::Cow::Borrowed(_) => Ok(delta),
-        std::borrow::Cow::Owned(text) => BoundedText::new(text)
-            .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse)),
+fn normalized_delta(delta: BoundedText, ended_with_cr: &mut bool) -> BoundedText {
+    if delta.is_empty() {
+        return delta;
+    }
+    let raw = delta.as_str();
+    let text = if *ended_with_cr {
+        raw.strip_prefix('\n').unwrap_or(raw)
+    } else {
+        raw
+    };
+    *ended_with_cr = raw.ends_with('\r');
+    match normalize_model_text(text) {
+        std::borrow::Cow::Borrowed(text) if text.len() == raw.len() => delta,
+        text => BoundedText::new(text).expect("normalization cannot expand bounded text"),
     }
 }
 
