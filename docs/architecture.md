@@ -59,7 +59,7 @@ decides what to persist, where, and when.
 - One `tokio::spawn` per loop; the completion sender lives in that task.
 - `runner.rs` keeps the main loop, control/final handling, and finish
   reporting; `runner/model.rs` holds prompt preparation and the model
-  driver; `runner/tools.rs` holds policy, interaction, and tool execution.
+  driver; `runner/tools.rs` holds batch settlement, policy, interaction, and tool execution.
 - Every control touch is a short critical section; every event is a
   best-effort `try_send`.
 
@@ -69,6 +69,14 @@ decides what to persist, where, and when.
 `execution`, `limits`, `usage`, `interaction`, `ids`, `value`, `time`,
 `error`, `port_call`. None of those modules depends on `agent_loop`. Every
 seam points outward: the runtime defines traits, hosts implement adapters.
+
+## Quality Gates
+
+`./scripts/check.sh` covers the runtime, documentation and architecture;
+`./scripts/check-msrv.sh` verifies Rust 1.85 separately. The standalone provider
+harness has no production dependency edge: use `./scripts/check-provider-gate.sh`
+when changing provider evidence or its dependency, on its own Rust >= 1.88 toolchain.
+It is intentionally outside the runtime gate.
 
 ## What v0.3 Had That v0.4 Removed
 

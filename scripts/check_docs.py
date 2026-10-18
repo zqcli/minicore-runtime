@@ -55,6 +55,7 @@ AUTHORITY = [
     "docs/migrations/v0.3-to-v0.4.md",
     "docs/acceptance-v0.4.md",
     "docs/release-v0.4.md",
+    "docs/release-v0.7.md",
 ]
 
 NON_AUTHORITY_SPEC = ["minicore-runtime-v0.4-flex-agent-loop-reset-spec.md"]

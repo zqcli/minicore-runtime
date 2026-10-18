@@ -1,6 +1,6 @@
 # Current Implementation Context
 
-The current package is v0.6.1. It retains the one-loop boundary from the
+The current package is v0.7.0. It retains the one-loop boundary from the
 v0.4 reset. Tool-batch statistics are now `u64` end to end within Runtime;
 the optional legacy `u16` round budget still defaults to zero (unlimited).
 Each real prompt preparation publishes one `Starting` event. Session-owned
@@ -28,7 +28,7 @@ library type.
   `PromptProvider` seam with `DefaultPromptProvider`.
 - `src/model`, `src/tools`, `src/limits`, `src/usage`, `src/interaction`,
   `src/ids`, `src/value`, `src/time`, `src/error`, `src/port_call` carry the
-  typed seams and validation the loop builds on. No builder, no sessions.
+  typed seams and validation the loop builds on. No sessions or durable state.
 - The public root re-exports only loop, execution, history, model, prompt,
   tools, interaction, ids, limits, value, and error types (see `src/lib.rs`).
 
@@ -39,7 +39,8 @@ library type.
   `LoopWaitError::CompletionClosed` to waiters.
 - Update/steer and the final seal linearize on one short `std::sync::Mutex`;
   cancel/finish use a single `AtomicU8` single-CAS state machine; replaced or
-  discarded `ExecutionConfig` instances are dropped outside the mutex.
+  discarded `ExecutionConfig` instances are dropped outside the mutex. Finalization
+  returns discarded configs to the runner for panic-isolated drop after publication.
 - Revision commits and `LoopReport.requests` accounting happen at the real
   `RequestStarted` issue boundary; failed issued requests are counted while
   stale rebuilds are not; driver-internal retries remain one logical request.
@@ -49,7 +50,7 @@ library type.
   input requests fail fast without entering `WaitingForInput`.
 - Internal model and tool progress queue drops are merged into `dropped_before`.
 - Steer accepted means queued in the process-local queue for the next request
-  boundary; cancelled/shutdown loops may discard queued steers without appending them.
+  boundary; every non-`Completed` ending discards unapplied queued steers.
 - Tool catalog size is independent from per-response `ToolCall` limits.
 - MSRV is 1.85; production code forbids `unsafe`; no async mutex, no
   `parking_lot`.
@@ -59,9 +60,11 @@ library type.
 ## Gates
 
 `./scripts/check.sh` (main crate fmt/test all-targets all-features/clippy
-`-D warnings`/rustdoc `-D warnings`, provider-gate fmt/test/clippy,
-`check_docs.py`, `check_v04_architecture.py`, git diff/show checks) and
-`./scripts/check-msrv.sh` must stay green. The v0.4 reset is complete with
+`-D warnings`/rustdoc `-D warnings`, `check_docs.py`, `check_v04_architecture.py`,
+acceptance and git diff/show checks) and `./scripts/check-msrv.sh` must stay green.
+The standalone provider evidence is opt-in through `./scripts/check-provider-gate.sh`
+(Rust >= 1.88); run it when changing that harness or its provider dependency,
+not on every runtime change. The v0.4 reset is complete with
 the correctness closeout applied across five code commits (`f6a9e3e`, `9caae19`,
 `b4ca0fa`, `04c3f22`, `a4cbf60`). The historical v0.4 closeout suite was 278 tests (253 in main
 crate across 69 unit and 184 integration tests across 10 targets, plus 25 in
@@ -76,6 +79,16 @@ code-closeout run and passed the then-current closeout suite.
 `docs/migrations/v0.3-to-v0.4.md` are the current authority set (see
 `docs/README.md`). The tracked `minicore-runtime-v0.4-flex-agent-loop-reset-spec.md`
 is a non-authority implementation record.
+## v0.7.0 Runtime Refactor
+
+Model output text is normalized by Runtime, empty deltas are ignored, and model
+attempt child tokens are cancelled at settlement. Requests, history payloads,
+and frozen tool catalogs share immutable storage. Usage sums known counts per field.
+Interactions have no fabricated deadline; handles expose shutdown cancellation.
+The model modules are split by responsibility, and integration tests share fixtures
+without merging binaries or changing acceptance names. See
+[release notes](docs/release-v0.7.md) and README compatibility notes.
+
 ## v0.6.1 Opaque Replay Transport
 
 The existing response/history/prompt path carries bounded `ProviderReplay` metadata

@@ -1,6 +1,6 @@
 # Documentation Authority
 
-The current v0.6.1 core retains the v0.4 one-loop architecture and is documented
+The current v0.7.0 core retains the v0.4 one-loop architecture and is documented
 by the current source tree and these pages. The root README records current
 compatibility changes; versioned v0.4 acceptance/release pages remain historical evidence:
 
@@ -12,6 +12,7 @@ compatibility changes; versioned v0.4 acceptance/release pages remain historical
 6. [Acceptance matrix](acceptance-v0.4.md), generated from [`scripts/acceptance_v04.json`](../scripts/acceptance_v04.json), and the [v0.4 release note](release-v0.4.md) for reviewed acceptance traceability, size, CI status, and known limits.
 7. [Development plan](development-plan.md) for completed phases and maintenance gates.
 8. [Test inventory](../tests/README.md) for current contract and integration evidence.
+9. [v0.7.0 release notes](release-v0.7.md) for this refactor and the separated provider gate.
 
 The [current implementation context](../CONTEXT.md) is a short maintainer
 checkpoint. The [root README](../README.md) is the Host-facing introduction
@@ -21,7 +22,7 @@ The exhaustive authority set is `README.md`, `CONTEXT.md`, `tests/README.md`,
 this index, `architecture.md`, `modules/README.md`, `development-plan.md`,
 `adr/README.md` and the current ADR, all files under `docs/contracts/`,
 `integration/host-boundary.md`, `migrations/v0.3-to-v0.4.md`,
-`acceptance-v0.4.md`, and `release-v0.4.md`. The checker compares that set
+`acceptance-v0.4.md`, `release-v0.4.md`, and `release-v0.7.md`. The checker compares that set
 to every non-archive Markdown file.
 
 The tracked root `minicore-runtime-v0.4-flex-agent-loop-reset-spec.md` is the

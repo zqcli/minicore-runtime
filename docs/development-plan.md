@@ -11,6 +11,13 @@
 - **Phase 7** `refactor(v0.4): converge modules around the agent loop boundary` — runner split (`runner/model.rs`, `runner/tools.rs`), v0.4 documentation and examples, architecture-gate rewrite, dead code and dependency cleanup.
 - **Phase 8** `test(v0.4): close the flexible agent loop contract` — contract close-out (reasoning channels, event-free and multi-batch cancel semantics, policy snapshot swaps, history limits and delta-only reports, malformed-response rejection, loop-level retry, shared-resource isolation, control-layer CAS tests), the V4-001..V4-070 [acceptance matrix](acceptance-v0.4.md) with its gate, and the [release documentation](release-v0.4.md).
 
+## v0.7.0
+
+Completed runtime text normalization, shared request/history payloads, per-attempt
+cancellation, unbounded interaction waits without a loop deadline, post-publication
+config disposal, usage accounting, shutdown handles, model module separation and
+shared test fixtures. See [release notes](release-v0.7.md) for compatibility and gates.
+
 ## Remaining
 
 No planned phases remain. Maintenance keeps the gates in the next section
@@ -26,7 +33,8 @@ Every phase ships green against:
 - `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features`
 - `./scripts/check-msrv.sh` (Rust 1.85)
 - `cargo metadata --locked`
-- `./scripts/check.sh` (includes docs/architecture gates and provider-gate harness)
+- `./scripts/check.sh` (includes docs/architecture/acceptance gates)
 
-Provider-gate remains a standalone evidence harness and is exercised by
-`check.sh` without modifying its source.
+Provider-gate is independent: `./scripts/check-provider-gate.sh` runs its fmt,
+tests and clippy on Rust >= 1.88. Run it when changing provider evidence or
+upgrading its dependency; it is not part of the main runtime or MSRV gate.
