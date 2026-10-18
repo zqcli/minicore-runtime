@@ -226,7 +226,7 @@ async fn overall_deadline_can_expire_during_retry_sleep() {
     tokio::time::advance(Duration::from_secs(10)).await;
     let error = run.await.unwrap().unwrap_err();
 
-    assert_eq!(error.kind(), ModelErrorKind::Timeout);
+    assert_eq!(error, retryable_error(None));
     assert_eq!(error.delivery(), DeliveryState::NotStarted);
     assert_eq!(model.starts(), 1);
 }
@@ -259,7 +259,7 @@ async fn cancellation_interrupts_retry_sleep_without_another_attempt() {
     model.wait_for_completions(1).await;
     cancellation.cancel();
     let error = run.await.unwrap().unwrap_err();
-    assert_eq!(error.kind(), ModelErrorKind::Cancelled);
+    assert_eq!(error, retryable_error(None));
     assert_eq!(error.delivery(), DeliveryState::NotStarted);
     assert_eq!(model.starts(), 1);
 }

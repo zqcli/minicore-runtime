@@ -4135,6 +4135,52 @@ async fn model_error_auth_rejected_preserves_classification_and_diagnostic() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn retry_backoff_keeps_the_model_cause_and_honors_loop_deadlines() {
+    let error = ModelError::not_started(
+        ModelErrorKind::RateLimited,
+        None,
+        DiagnosticSummary::new(
+            DiagnosticCode::ModelUnavailable,
+            DiagnosticCategory::Model,
+            BoundedText::new("provider rate limited").unwrap(),
+            true,
+        )
+        .unwrap(),
+    );
+    for loop_deadline in [false, true] {
+        let (model, attempts, _) = scripted_model_counted(vec![Round::Error(error.clone())]);
+        let mut options = LoopOptions::default_checked().unwrap();
+        options.model_retry_attempts = 2;
+        options.model_retry_base_delay = Duration::from_secs(5);
+        options.model_timeout = Duration::from_secs(if loop_deadline { 30 } else { 9 });
+        options.deadline =
+            loop_deadline.then(|| tokio::time::Instant::now() + Duration::from_secs(9));
+        let agent =
+            AgentLoop::start(request(config(model, ToolSet::default(), None)), options).unwrap();
+        let handle = agent.handle();
+        let mut states = handle.watch_state();
+        states
+            .wait_for(|state| state.status == LoopStatus::RunningModel)
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let report = finish(agent).await;
+        if loop_deadline {
+            assert_eq!(
+                report.outcome,
+                LoopOutcome::Cancelled(CancelReason::Deadline)
+            );
+        } else {
+            assert!(matches!(&report.outcome, LoopOutcome::Failed(failure)
+                if failure.kind == LoopFailureKind::Model && failure.model_error() == Some(&error)));
+        }
+        assert_eq!(report.requests, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+}
+
 /// FIX-03-T02: Fake Model returns RateLimited; after driver retry exhausted, preserves kind and diagnostic.
 #[tokio::test]
 async fn model_error_rate_limited_exhausting_retry_preserves_diagnostic() {
@@ -4703,7 +4749,7 @@ async fn prompt_failure_emits_no_request_started_and_counts_zero_requests() {
     );
 }
 
-/// FIX-04-T01: Model burst drops progress internally; delivered TextDelta plus dropped_before sum must equal 100.
+/// Back-to-back deltas must not overflow the internal queue while the event sink has room.
 #[tokio::test]
 async fn model_burst_progress_drops_are_recorded_in_dropped_before() {
     let (model, _) = scripted_model(vec![Round::BurstDeltas {
@@ -4736,11 +4782,8 @@ async fn model_burst_progress_drops_are_recorded_in_dropped_before() {
         }
     }
 
-    assert_eq!(
-        delivered_deltas + dropped_before_sum,
-        100,
-        "delivered text deltas ({delivered_deltas}) + dropped_before sum ({dropped_before_sum}) must equal total generated deltas (100)"
-    );
+    assert_eq!(delivered_deltas, 100);
+    assert_eq!(dropped_before_sum, 0);
 
     let assistant = report
         .appended

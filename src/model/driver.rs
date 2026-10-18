@@ -125,8 +125,8 @@ impl ModelDriver {
         self.validate_request(&request)
             .map_err(ModelDriverFailure::ordinary)?;
 
-        let max_attempts = self.retry_policy.max_attempts;
-        for attempt in 0..max_attempts {
+        let mut attempt = 0;
+        loop {
             precheck(&context, deadline.tokio(), deadline.source())?;
             let mut attempt_context = context.clone();
             attempt_context.deadline = deadline.standard();
@@ -144,24 +144,27 @@ impl ModelDriver {
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(failure) => match self.retry_policy.evaluate_retry(
-                    attempt,
-                    max_attempts,
-                    &failure,
-                    deadline.tokio(),
-                ) {
-                    Some(delay) => {
-                        wait_for_retry(&context, deadline.tokio(), deadline.source(), delay)
+                Err(failure) => {
+                    match self
+                        .retry_policy
+                        .evaluate_retry(attempt, &failure, deadline.tokio())
+                    {
+                        Some(delay) => {
+                            wait_for_retry(
+                                &context,
+                                deadline.tokio(),
+                                deadline.source(),
+                                delay,
+                                failure.error,
+                            )
                             .await?;
+                            attempt += 1;
+                        }
+                        None => return Err(failure.into_driver_failure()),
                     }
-                    None => return Err(failure.into_driver_failure()),
-                },
+                }
             }
         }
-        Err(ModelDriverFailure::ordinary(generated_error(
-            ModelErrorKind::Internal,
-            DeliveryState::NotStarted,
-        )))
     }
 
     fn validate_request(&self, request: &ModelRequest) -> Result<(), ModelError> {
@@ -274,6 +277,8 @@ impl ModelDriver {
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {}
                         }
+                        // Let the runner forward this delta before polling another ready event.
+                        tokio::task::yield_now().await;
                     }
                 }
                 Ok(Some(Err(error))) => {

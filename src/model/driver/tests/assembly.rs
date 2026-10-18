@@ -1,5 +1,32 @@
 use super::*;
 
+#[tokio::test]
+async fn eof_delivery_depends_on_whether_an_event_was_observed() {
+    for (events, delivery) in [
+        (vec![], DeliveryState::Unknown),
+        (
+            vec![Ok(ModelEvent::text_delta("partial").unwrap())],
+            DeliveryState::Started,
+        ),
+    ] {
+        let model = ScriptModel::new(descriptor(), vec![Behavior::Events(events)]);
+        let driver = model.driver(&ModelDriverConfig::default());
+        let (progress, _receiver) = progress_channel();
+        let error = driver
+            .run(
+                request(),
+                context(CancellationToken::new(), Duration::from_secs(30)),
+                &progress,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ModelErrorKind::IncompleteResponse);
+        assert_eq!(error.delivery(), delivery);
+        assert_eq!(*error.retry_hint(), RetryHint::Never);
+        assert_eq!(model.starts(), 1);
+    }
+}
+
 #[test]
 fn split_crlf_matches_whole_text_in_each_channel_and_progress() {
     let raw = "é\r\nA\rB\r\r\n\tend\r";

@@ -46,11 +46,10 @@ impl RetryPolicySnapshot {
     pub(super) fn evaluate_retry(
         self,
         attempt: u8,
-        max_attempts: u8,
         failure: &AttemptFailure,
         deadline: TokioInstant,
     ) -> Option<Duration> {
-        if attempt + 1 >= max_attempts
+        if attempt + 1 >= self.max_attempts
             || failure.observed_event
             || failure.error.delivery() != DeliveryState::NotStarted
         {
@@ -205,23 +204,17 @@ pub(super) async fn wait_for_retry(
     deadline: TokioInstant,
     deadline_source: DeadlineSource,
     delay: Duration,
+    error: ModelError,
 ) -> Result<(), ModelDriverFailure> {
-    let retry_at = TokioInstant::now().checked_add(delay).ok_or_else(|| {
-        ModelDriverFailure::ordinary(generated_error(
-            ModelErrorKind::InvalidRequest,
-            DeliveryState::NotStarted,
-        ))
-    })?;
-    tokio::select! {
+    let retry_at = TokioInstant::now() + delay;
+    let deadline_source = tokio::select! {
         biased;
-        _ = context.cancellation.cancelled() => Err(ModelDriverFailure::ordinary(generated_error(
-            ModelErrorKind::Cancelled,
-            DeliveryState::NotStarted,
-        ))),
-        _ = tokio::time::sleep_until(deadline) => Err(ModelDriverFailure::deadline(
-            generated_error(ModelErrorKind::Timeout, DeliveryState::NotStarted),
-            deadline_source,
-        )),
-        _ = tokio::time::sleep_until(retry_at) => Ok(()),
-    }
+        _ = context.cancellation.cancelled() => None,
+        _ = tokio::time::sleep_until(deadline) => Some(deadline_source),
+        _ = tokio::time::sleep_until(retry_at) => return Ok(()),
+    };
+    Err(ModelDriverFailure {
+        error,
+        deadline_source,
+    })
 }

@@ -179,13 +179,13 @@ async fn retry_timeout_source(turn_after: Duration, model_timeout: Duration) -> 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn retry_sleep_timeout_reports_turn_source() {
     let failure = retry_timeout_source(Duration::from_secs(9), Duration::from_secs(30)).await;
-    assert_eq!(failure.error().kind(), ModelErrorKind::Timeout);
+    assert_eq!(failure.error(), &retryable_error(None));
     assert_eq!(failure.deadline_source(), Some(DeadlineSource::Turn));
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn retry_sleep_timeout_reports_port_source() {
     let failure = retry_timeout_source(Duration::from_secs(30), Duration::from_secs(9)).await;
-    assert_eq!(failure.error().kind(), ModelErrorKind::Timeout);
+    assert_eq!(failure.error(), &retryable_error(None));
     assert_eq!(failure.deadline_source(), Some(DeadlineSource::Port));
 }

@@ -185,9 +185,12 @@ impl<'a> Assembler<'a> {
     }
 
     pub(super) fn finish(mut self) -> Result<ModelResponse, ModelError> {
-        let reason = self
-            .finish_reason
-            .ok_or_else(|| assembler_error(ModelErrorKind::IncompleteResponse))?;
+        let reason = self.finish_reason.ok_or_else(|| {
+            super::failure::generated_error(
+                ModelErrorKind::IncompleteResponse,
+                super::failure::observed_delivery(self.observed_event),
+            )
+        })?;
         let has_tools = !self.tools.is_empty();
         if (has_tools
             && !matches!(
@@ -267,7 +270,6 @@ fn normalized_delta(delta: BoundedText, ended_with_cr: &mut bool) -> BoundedText
 fn assembler_error(kind: ModelErrorKind) -> ModelError {
     let message = match kind {
         ModelErrorKind::UnexpectedToolCall => "unexpected tool call in model response",
-        ModelErrorKind::IncompleteResponse => "incomplete model response",
         _ => "invalid model provider response",
     };
     let diagnostic = DiagnosticSummary::new(

@@ -67,14 +67,23 @@ validation rules.
 Each model attempt receives a child cancellation token, cancelled on every
 attempt ending, including successful EOF, failure, timeout and dropped futures.
 The driver waits for EOF after Finish; a pending stream remains subject to its
-deadline, and any event after Finish is invalid.
+deadline, and any event after Finish is invalid. EOF before any event is
+`IncompleteResponse` with `Unknown` delivery; EOF after an event but without
+Finish has `Started` delivery. Neither is retryable.
+
+If cancellation or a timeout interrupts retry backoff, the driver retains the
+previous model error (kind, diagnostic, delivery and retry hint) as the cause.
+The runtime still honors loop cancellation and loop-deadline provenance; a
+model-only timeout during backoff reports `Failed(Model)` with that prior cause.
 
 - `ModelFinishReason::Stop` with no tool calls ends the loop (subject to the
   final-seal decision). `Length` / `ContentFiltered` / `Refused` map to the
   corresponding failure kinds; `Unknown`/`ToolCalls` mislabels are
   `InvalidModelResponse`.
-- Streaming: `TextDelta` and `ReasoningDelta` are forwarded as best-effort
-  events; they carry no correctness weight. Tool-argument deltas are assembled
+- Streaming: the driver yields after progress and the runner drains ready
+  progress before polling the driver again, so back-to-back deltas do not
+  starve forwarding. `TextDelta` and `ReasoningDelta` remain best-effort
+  events; a full host event queue may still drop them and they carry no correctness weight. Tool-argument deltas are assembled
   privately and are never forwarded as progress.
 - Model timeouts, retry exhaustion, panics, and malformed responses surface
   as `Failed(Model)` or `Failed(InvalidModelResponse)` (or the specific

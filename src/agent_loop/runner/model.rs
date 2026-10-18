@@ -127,53 +127,37 @@ pub(super) async fn run_model(
     let result = loop {
         tokio::select! {
             biased;
+            Some(value) = progress_rx.recv() => {
+                forward_progress(ctx, request_index, value, &progress_dropped);
+            }
             result = &mut run => break result,
-            value = progress_rx.recv() => match value {
-                Some(ModelDriverProgress::TextDelta(delta)) => {
-                    ctx.sink
-                        .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
-                    ctx.sink.try_emit(LoopEvent::OutputDelta {
-                        loop_id: ctx.id,
-                        request_index,
-                        channel: OutputChannel::Text,
-                        delta,
-                    });
-                }
-                Some(ModelDriverProgress::ReasoningDelta(delta)) => {
-                    ctx.sink
-                        .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
-                    ctx.sink.try_emit(LoopEvent::OutputDelta {
-                        loop_id: ctx.id,
-                        request_index,
-                        channel: OutputChannel::Reasoning,
-                        delta,
-                    });
-                }
-                None => continue,
-            },
         }
     };
     ctx.sink
         .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
     while let Ok(value) = progress_rx.try_recv() {
-        ctx.sink
-            .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
-        ctx.sink.try_emit(match value {
-            ModelDriverProgress::TextDelta(delta) => LoopEvent::OutputDelta {
-                loop_id: ctx.id,
-                request_index,
-                channel: OutputChannel::Text,
-                delta,
-            },
-            ModelDriverProgress::ReasoningDelta(delta) => LoopEvent::OutputDelta {
-                loop_id: ctx.id,
-                request_index,
-                channel: OutputChannel::Reasoning,
-                delta,
-            },
-        });
+        forward_progress(ctx, request_index, value, &progress_dropped);
     }
     result
+}
+
+fn forward_progress(
+    ctx: &mut LoopCtx<'_>,
+    request_index: u32,
+    value: ModelDriverProgress,
+    dropped: &AtomicU64,
+) {
+    let (channel, delta) = match value {
+        ModelDriverProgress::TextDelta(delta) => (OutputChannel::Text, delta),
+        ModelDriverProgress::ReasoningDelta(delta) => (OutputChannel::Reasoning, delta),
+    };
+    ctx.sink.record_dropped(dropped.swap(0, Ordering::Relaxed));
+    ctx.sink.try_emit(LoopEvent::OutputDelta {
+        loop_id: ctx.id,
+        request_index,
+        channel,
+        delta,
+    });
 }
 
 pub(super) fn map_model_failure(control: &LoopControl, failure: ModelDriverFailure) -> FailPath {
@@ -183,9 +167,7 @@ pub(super) fn map_model_failure(control: &LoopControl, failure: ModelDriverFailu
     if control.cancellation().is_cancelled() {
         return FailPath::Cancelled;
     }
-    if deadline_source == Some(DeadlineSource::Turn)
-        && error.kind() == crate::model::ModelErrorKind::Timeout
-    {
+    if deadline_source == Some(DeadlineSource::Turn) {
         return FailPath::Deadline;
     }
     match error.kind() {
