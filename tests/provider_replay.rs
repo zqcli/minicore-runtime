@@ -53,6 +53,7 @@ fn old_constructors_wire_and_debug_remain_compatible() {
     let parts = vec![AssistantPart::Text("answer".into())];
     let old = ModelMessage::assistant(parts.clone()).unwrap();
     assert!(matches!(&old, ModelMessage::Assistant(_)));
+    assert!(format!("{old:?}").starts_with("ModelMessage::Assistant {"));
     let wire = serde_json::to_value(&old).unwrap();
     assert!(wire["content"].is_array());
     assert_eq!(serde_json::from_value::<ModelMessage>(wire).unwrap(), old);
@@ -69,6 +70,7 @@ fn old_constructors_wire_and_debug_remain_compatible() {
     for parts in [parts, vec![]] {
         let message =
             ModelMessage::assistant_with_provider_replay(parts.clone(), Some(replay())).unwrap();
+        assert!(format!("{message:?}").starts_with("ModelMessage::AssistantWithReplay {"));
         let response = ModelResponse::new_with_provider_replay(
             parts,
             ModelFinishReason::Stop,

@@ -60,20 +60,6 @@ impl Tool for MutableSpecTool {
 
 struct PanicSpecTool;
 
-struct InvalidSpecTool {
-    spec: ToolSpec,
-}
-
-impl Tool for InvalidSpecTool {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
-    }
-
-    fn execute<'a>(&'a self, _invocation: ToolInvocation, _context: ToolContext) -> ToolFuture<'a> {
-        Box::pin(async { Err(ToolError::InvalidInvocation) })
-    }
-}
-
 impl Tool for PanicSpecTool {
     fn spec(&self) -> &ToolSpec {
         panic!("spec panic")
@@ -126,9 +112,8 @@ impl Tool for OverlapTool {
 #[test]
 fn tool_spec_and_output_use_checked_bounded_content() {
     let tool_spec = spec("read_file", "Read one file");
-    assert_eq!(tool_spec.name.as_str(), "read_file");
-    assert_eq!(tool_spec.description.as_str(), "Read one file");
-    assert_eq!(tool_spec.input_schema, json!({"type": "object"}));
+    assert_eq!(tool_spec.name().as_str(), "read_file");
+    assert_eq!(tool_spec.input_schema(), &json!({"type": "object"}));
     assert_eq!(tool_spec.description().as_str(), "Read one file");
     assert!(serde_json::to_value(&tool_spec).unwrap()["description"] == "Read one file");
     assert!(ToolSpec::new("read_file".parse().unwrap(), "", json!({})).is_err());
@@ -386,14 +371,6 @@ fn tool_set_is_immutable_sorted_and_rejects_duplicate_or_panicking_specs() {
     let mut panicking = ToolSet::builder();
     panicking.register(PanicSpecTool);
     assert!(matches!(panicking.build(), Err(ToolSetError::Panicked)));
-    let mut invalid = spec("invalid", "invalid");
-    invalid.input_schema = json!("not an object");
-    let mut invalid_builder = ToolSet::builder();
-    invalid_builder.register(InvalidSpecTool { spec: invalid });
-    assert!(matches!(
-        invalid_builder.build(),
-        Err(ToolSetError::InvalidSpec)
-    ));
     assert!(ToolSet::default().specs_for(&BTreeSet::new()).is_empty());
 }
 

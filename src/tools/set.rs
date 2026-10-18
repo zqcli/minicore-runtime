@@ -41,8 +41,6 @@ pub enum ToolSetError {
     DuplicateTool,
     #[error("tool specification panicked")]
     Panicked,
-    #[error("tool specification is invalid")]
-    InvalidSpec,
 }
 
 impl ToolSet {
@@ -105,10 +103,6 @@ impl ToolSetBuilder {
                 return self;
             }
         };
-        if spec.validate().is_err() {
-            self.error = Some(ToolSetError::InvalidSpec);
-            return self;
-        }
         let name = spec.name().clone();
         if self.tools.contains_key(&name) {
             self.error = Some(ToolSetError::DuplicateTool);

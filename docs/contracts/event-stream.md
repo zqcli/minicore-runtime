@@ -20,6 +20,14 @@ Best-effort observation of a live loop. **Events are not authoritative.**
 
 ## Non-Authoritative Guarantees
 
+- Lifecycle events are not paired even when no events are dropped. Calls settled
+  without execution (remaining calls synthesized after a batch interruption or a
+  tool-round limit) have no `ToolStarted` or `ToolFinished`. An unavailable tool
+  name in model output is rejected before execution and has no tool lifecycle
+  events. An in-flight interrupted call may have `ToolStarted` without `ToolFinished`.
+- Cancelled or timed-out interactions have no `InteractionResolved`. Consumers
+  must use final state/report settlement rather than wait for a matching event.
+
 - Events can be dropped under load, so a missing `ToolStarted`/`ToolFinished`
   pair does **not** imply a tool did not execute. A tool may have side
   effects even if the host never logs the corresponding event (tool side

@@ -80,17 +80,9 @@ async fn preflight_rejects_reasoning_tools_context_and_mutated_tool_specs_before
         json!([]),
         json!({"padding": "x".repeat(crate::value::MAX_JSON_BYTES)}),
     ] {
-        let mut invalid_schema = tool_spec("search");
-        invalid_schema.input_schema = schema;
-        assert_eq!(
-            ModelRequest::new(
-                vec![ModelMessage::user("request").unwrap()],
-                vec![invalid_schema],
-                ModelLimits::default(),
-                ReasoningPreference::High,
-            ),
-            Err(crate::model::ModelValueError::InvalidTools)
-        );
+        let mut wire = serde_json::to_value(tool_spec("search")).unwrap();
+        wire["input_schema"] = schema;
+        assert!(serde_json::from_value::<ToolSpec>(wire).is_err());
     }
     assert_eq!(model.starts(), 0);
 }

@@ -48,6 +48,8 @@ one loop and returns control. Concretely:
   will not appear in `LoopReport::appended`. Steers are bounded by
   `max_pending_steers` (`QueueFull`) and rejected on `WaitingForInput` or
   `NotActive`.
+- After cancellation, `steer`, `update` and `answer` return `NotActive` even if
+  finalization has not yet run.
 - Interactions: when the loop is waiting for user input (`WaitingForInput`),
   `handle.answer` resolves the pending interaction; loop deadline still wins
   over waiting.
@@ -60,8 +62,9 @@ open/load/save and durable conversation. See
 concrete upgrade path, including what is intentionally not migrated.
 ## Adapter Obligations
 
-- Futures and streams must cooperate with the executor and must not block its
-  threads. Offload blocking work; runtime timeouts cannot preempt synchronous code.
+- Futures and streams, including host tools, must cooperate with the executor
+  and must not block its threads. Offload blocking work; runtime timeouts cannot
+  preempt synchronous code. Tool calls run sequentially in response order.
 - Enable unwinding (`panic = "unwind"`) for panic isolation. Abort-mode panics
   terminate the process and cannot produce a report.
 - Futures/streams are dropped on cancellation or timeout. Make them cancellation

@@ -13,10 +13,15 @@ pub trait Tool: Send + Sync + 'static {
 }
 ```
 
-`ToolSpec` (name, description, JSON schema) is registered into a `ToolSet`
-and validated at `ExecutionConfig::new`. The runtime executes only the
-tools the model asked for, in the order of the response, pinned to the
-snapshot of the request that produced the batch.
+`ToolSpec` has private fields and read-only accessors for its name, description
+and JSON schema. Constructors and deserialization validate it; `ToolSet` freezes
+that checked value at registration. `ExecutionConfig` checks model compatibility,
+and loop start/update applies per-tool budgets.
+
+The runtime executes tools sequentially in response order, pinned to the snapshot
+of the request that produced the batch. Host tools must not block executor threads:
+use asynchronous work or offload blocking operations, since cancellation and
+deadlines cannot preempt synchronous code.
 
 ## Policy
 
@@ -62,7 +67,8 @@ snapshot of the request that produced the batch.
   type contract; a mismatched answer returns `AnswerError::WrongInteraction`
   to the caller and leaves the interaction waiting.
 - While waiting, the loop deadline still wins; cancellation also ends the
-  wait. One interaction slot is outstanding at a time.
+  wait without an `InteractionResolved` event. After cancellation, `answer`
+  returns `NotActive`. One interaction slot is outstanding at a time.
 
 ## Progress
 

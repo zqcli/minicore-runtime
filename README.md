@@ -4,6 +4,13 @@ MiniCore Runtime is a small Rust execution core for one live agent loop. It runs
 
 ## 0.7.0 Compatibility Notes
 
+- `ToolSpec` fields are private. Construct with `ToolSpec::new` (or deserialize)
+  and read through `name()`, `description()` and `input_schema()`. The now-impossible
+  `ToolSetError::InvalidSpec` variant is removed. Serialized tool specs are unchanged.
+- `steer`, `update` and `answer` return `NotActive` after cancellation, without
+  waiting for finalization. EOF before any model event reports `Unknown` delivery;
+  interrupted retry backoff preserves the previous model error as its cause.
+
 - `AssistantPart::Text`, `ModelMessage::System` and `ModelMessage::User` now
   carry `Arc<str>` instead of `String`. Use `.into()` for enum construction and
   `.as_ref()` for string comparisons. Constructors and JSON formats are unchanged.
@@ -67,7 +74,7 @@ An `AgentLoop` is a single, one-shot execution. The host owns everything around 
 - Tool input requests are strictly validated at the port boundary; invalid requests fail immediately as ordinary tool errors without entering `WaitingForInput`.
 - `update` takes effect at the next model request. A config revision is committed only when a real model request is issued; replaced or discarded configurations are dropped outside the control lock.
 - The current tool batch uses the snapshot of the request that produced it. A config `update` or `steer` never retroactively changes an in-flight batch.
-- `steer` takes effect at the next model request. A successful call means the steer was accepted into this process-local queue and is applied at the next request boundary; on any non-`Completed` ending or process exit before that boundary, the queued steer is discarded and will not appear in `LoopReport::appended`. Steers queue up to `max_pending_steers` (`QueueFull`), are rejected if an interaction is pending (`WaitingForInput`) or after finalization (`NotActive`), and appear as `Steering` user items at the next request boundary.
+- `steer` takes effect at the next model request. A successful call means the steer was accepted into this process-local queue and is applied at the next request boundary; on any non-`Completed` ending or process exit before that boundary, the queued steer is discarded and will not appear in `LoopReport::appended`. Steers queue up to `max_pending_steers` (`QueueFull`), are rejected if an interaction is pending (`WaitingForInput`) or after cancellation/finalization (`NotActive`), and appear as `Steering` user items at the next request boundary.
 - A config `update` does not keep the loop alive. It only reconfigures the next request; whether the loop continues is decided by the model's final response and pending steers.
 - `LoopReport.requests` and final `request_index` count issued requests at the `RequestStarted` boundary. Failed issued requests are counted; prompt rebuilds and driver-internal retries do not increment logical request count. The runtime never automatically retries an entire loop.
 - `LoopReport.tool_rounds` counts tool batches with `u64` precision. The optional `LoopOptions.max_tool_rounds` remains `u16`; zero (the default) means no tool-round limit, not a limit on statistics.

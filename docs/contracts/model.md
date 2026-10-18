@@ -27,9 +27,9 @@ pub trait Model: Send + Sync + 'static {
 - Public `ModelRequest::new` validates non-empty messages, per-message text
   validity (`MAX_MODEL_MESSAGE_TEXT_BYTES`), tool-exchange consistency (a
   `ToolCall` is balanced with a `ToolResult` carrying the same id), and tool
-  schemas/order. The runner uses a crate-private construction path that reuses
-  the frozen `ToolSet` catalog without revalidating it. Registration checks
-  schemas; loop start/update checks catalog budgets. Host-produced prompt
+  catalog order. `ToolSpec` constructors/deserialization already validate schemas.
+  The runner uses a crate-private path that reuses the frozen `ToolSet` catalog
+  without revalidating it; loop start/update checks catalog budgets. Host-produced prompt
   messages are still validated on every request; failures take the `Prompt` path.
 - `ModelCallContext { loop_id, request_index, cancellation, deadline }` is
   per request; the driver uses it for cancel/timeout/panic isolation.
@@ -83,9 +83,10 @@ model-only timeout during backoff reports `Failed(Model)` with that prior cause.
 - Streaming: the driver yields after progress and the runner drains ready
   progress before polling the driver again, so back-to-back deltas do not
   starve forwarding. `TextDelta` and `ReasoningDelta` remain best-effort
-  events; a full host event queue may still drop them and they carry no correctness weight. Tool-argument deltas are assembled
+  events; a full host event queue may still drop them and they carry no correctness
+  weight. Tool-argument deltas are assembled
   privately and are never forwarded as progress.
-- Model timeouts, retry exhaustion, panics, and malformed responses surface
+- Model timeouts, retry exhaustion, start/poll panics, and malformed responses surface
   as `Failed(Model)` or `Failed(InvalidModelResponse)` (or the specific
   mapping in the loop contract), never as a hang. In both model and
   invalid-response failure paths, the runtime preserves the structured
@@ -102,7 +103,9 @@ are enforced by the driver and the assembler. Crucially,
 `max_tool_calls_per_response` limits only the number of tool calls permitted
 in a single model response; it does not restrict the tool catalog size in
 `ModelRequest::tools` (`max_tool_schema_bytes` is a per-tool bound, not a total
-catalog bound). `LoopOptions::validate` fail-fast enforces upper
+catalog bound). For N registered tools, compact schema payloads total at most
+N × `max_tool_schema_bytes` (at most 64 KiB per tool); the runtime does not cap N,
+so hosts own catalog-count limits. `LoopOptions::validate` fail-fast enforces upper
 bounds on model timeout (<= 24h) and retry base delay (<= 30s) aligned with
 `ModelDriver` constants. The per-message text ceiling
 is the shared crate-private `MAX_MODEL_MESSAGE_TEXT_BYTES` constant used by

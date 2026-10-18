@@ -18,6 +18,13 @@ remain unchanged. Public Rust API changes are listed in the
   answered or cancelled, including beyond 24 hours.
 - Finalization drops discarded configurations only after publishing the report.
   Destructor-panic regression tests preserve appended history and report identity.
+- Cancellation immediately rejects later steering, updates and answers. Randomized
+  multi-thread control races and a real runner panic verify completion identity.
+- Ready model progress is drained fairly. Empty-stream EOF has Unknown delivery,
+  and retry-backoff interruption preserves the previous model cause.
+- `ToolSpec` fields are private with existing read-only accessors; registration and
+  request construction trust checked specs instead of validating schemas again.
+  `ToolSetError::InvalidSpec` is removed. Debug distinguishes replay-bearing assistants.
 - Usage sums reported values independently per field; omitted values do not erase
   known counts. `LoopHandle::shutdown()` records host shutdown.
 - `history::estimate_history_bytes` exposes the exact admission estimate, with
@@ -38,7 +45,8 @@ bash scripts/check-architecture.sh
 bash scripts/check-msrv.sh
 ```
 
-The main suite has 273 tests: 77 unit and 196 integration tests in 11 binaries.
+The main suite has 278 tests: 81 unit and 197 integration tests in 11 binaries.
+Two compile-fail doctests additionally protect the checked tool DTO boundaries.
 The two examples compile as test targets. The acceptance checker preserves all
 70 Passed rows and validates their source/test references. See the
 [test inventory](../tests/README.md) for per-target counts.

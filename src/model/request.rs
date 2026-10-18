@@ -1,5 +1,5 @@
 use super::{ModelMessage, ModelValueError};
-use crate::tools::{ToolName, ToolSpec};
+use crate::tools::ToolSpec;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{collections::BTreeSet, fmt, sync::Arc};
 use thiserror::Error;
@@ -99,7 +99,12 @@ impl ModelRequest {
         reasoning: ReasoningPreference,
     ) -> Result<Self, ModelValueError> {
         let tools = tools.into();
-        validate_request_tools(&tools)?;
+        if tools
+            .windows(2)
+            .any(|pair| pair[0].name() >= pair[1].name())
+        {
+            return Err(ModelValueError::InvalidTools);
+        }
         Self::with_validated_tools(messages, tools, limits, reasoning)
     }
 
@@ -203,16 +208,4 @@ fn validate_tool_exchange(messages: &[ModelMessage]) -> Result<(), ModelValueErr
     } else {
         Err(ModelValueError::IncompleteToolExchange)
     }
-}
-
-fn validate_request_tools(tools: &[ToolSpec]) -> Result<(), ModelValueError> {
-    let mut previous: Option<&ToolName> = None;
-    for tool in tools {
-        tool.validate().map_err(|_| ModelValueError::InvalidTools)?;
-        if previous.is_some_and(|previous| previous >= tool.name()) {
-            return Err(ModelValueError::InvalidTools);
-        }
-        previous = Some(tool.name());
-    }
-    Ok(())
 }

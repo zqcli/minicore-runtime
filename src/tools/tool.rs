@@ -18,11 +18,18 @@ use super::types::{ToolError, ToolName, ToolValueError};
 
 const MAX_TOOL_DESCRIPTION_BYTES: usize = 4_096;
 
+/// Immutable tool metadata, checked by construction and deserialization.
+///
+/// ```compile_fail
+/// use minicore_runtime::tools::ToolSpec;
+/// let mut spec = ToolSpec::new("read".parse().unwrap(), "read a file", serde_json::json!({})).unwrap();
+/// spec.input_schema = serde_json::json!([]);
+/// ```
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ToolSpec {
-    pub name: ToolName,
-    pub description: BoundedText,
-    pub input_schema: Value,
+    name: ToolName,
+    description: BoundedText,
+    input_schema: Value,
 }
 
 impl fmt::Debug for ToolSpec {
@@ -31,7 +38,8 @@ impl fmt::Debug for ToolSpec {
         let schema_object_keys = self
             .input_schema
             .as_object()
-            .map_or(0, |object| object.len());
+            .expect("validated tool schema is an object")
+            .len();
         formatter
             .debug_struct("ToolSpec")
             .field("name", &self.name)

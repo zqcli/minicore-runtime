@@ -48,7 +48,7 @@ The runner loops:
 ## Configuration Updates
 
 - `LoopHandle::update(ExecutionConfig) -> Result<ConfigRevision, UpdateError>`.
-  Accepted while the loop is not finalizing (`NotActive` otherwise), and
+  Accepted while the loop is active and not finalizing (`NotActive` after cancellation or sealing), and
   invalid configs are rejected without effect.
 - An update takes effect at the **next model request**; the revision is
   committed only at the true issue boundary. A `Prompt`/timeout/cancel in
@@ -68,7 +68,7 @@ The runner loops:
   before that boundary, the queued steer is discarded and
   will not appear in `LoopReport::appended`.
   Steers queue up to `max_pending_steers` (`QueueFull`), are rejected if an
-  interaction is pending (`WaitingForInput`), or once the loop has finalized
+  interaction is pending (`WaitingForInput`), or after cancellation or sealing
   (`NotActive`), and are applied as `Steering` user items at the **next model request**.
 - A final response with pending steers keeps the loop alive and advances
   `request_index`; the steers (not the pending config) are what extend the

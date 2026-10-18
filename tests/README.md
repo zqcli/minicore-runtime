@@ -13,7 +13,7 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 | `model_driver_contract.rs` | 3 | driver delivery-state contracts |
 | `p1_value.rs` | 4 | bounded value types and validation |
 | `p1_v04_loop_dtos.rs` | 16 | loop history, `ExecutionConfig`, `PromptProvider`, `LoopReport` DTOs |
-| `p2_agent_loop.rs` | 111 | the flexible agent-loop contract end to end: output bounding, model error preservation, request issue accounting, and progress drop loss |
+| `p2_agent_loop.rs` | 112 | the flexible agent-loop contract end to end: output bounding, model error preservation, request issue accounting, and progress drop loss |
 | `p3_agent_loop_closeout.rs` | 22 | Phase 8 close-out and correctness fixes: catalog/per-response call limits, timeout/retry bounds, reasoning channels, event-free runs, multi-batch cancel, repeated answers, policy snapshot swaps, history limits, delta-only reports, malformed responses, invalid no-tool finish, loop-level retry, shared-resource isolation, steer-survives-prompt-failure |
 | `tool_policy_interaction_contract.rs` | 8 | policy decisions, interaction DTO contracts, and ToolInputRequest validation |
 | `tool_set_contract.rs` | 11 | `ToolSet` registration, spec validation, enabled subsets |
@@ -21,17 +21,18 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 
 ## Unit (`src/**` inline and driver)
 
-- 77 unit tests in `src/`:
-  - `src/agent_loop/control.rs` (8 tests): control-layer CAS/seal, revision monotonicity, and outside-lock config drop probes.
-  - `src/agent_loop/runner/tests.rs` (6 tests): completion identity, wide counts, bounded settlement and post-publication config-destructor panics.
-  - `src/model/driver/tests/` (45 tests): assembly (10), retry (8), deadline (6), preflight/progress (3), settlement (3), semantics (8), cancellation (7).
+- 81 unit tests in `src/`:
+  - `src/agent_loop/control.rs` (10 tests): control-layer CAS/seal, post-cancel rejection, 512 randomized multi-thread cancel/finish/steer/update races, revision monotonicity, and outside-lock config drop probes.
+  - `src/agent_loop/runner/tests.rs` (7 tests): real runner panic with one published report, completion identity, wide counts, bounded settlement and post-publication config-destructor panics.
+  - `src/model/driver/tests/` (46 tests): assembly (11), retry (8), deadline (6), preflight/progress (3), settlement (3), semantics (8), cancellation (7).
   - `src/tools/` (4 tests): input request validation (1) and progress channel semantics (3).
   - `src/time.rs` (4 tests): monotonic clock and timeout math.
   - `src/port_call.rs` (9 tests): port call execution and timeout isolation.
 
   - `src/usage.rs` (1 test): partial usage accumulates reported fields.
 
-Total main-crate volume: **273 tests** (77 unit + 196 integration across 11 targets).
+Total main-crate volume: **278 tests** (81 unit + 197 integration across 11 targets).
+Two compile-fail doctests protect private `ToolSpec` and `ToolOutput` fields.
 `tests/support/` shares scripted model/tool/policy builders, config/start/join helpers
 and report extractors across separate binaries. Driver tests use the actual
 `ModelDriverConfig` and `LoopLimits`, not mirrored config types.
@@ -45,7 +46,10 @@ The standalone provider harness has 25 tests and is not included in this runtime
 - `ToolInputRequest` validated up front; malformed requests fail directly without entering `WaitingForInput`.
 - Request-level structured `ModelError` preserved in `LoopFailure::model_error()` for `Model` and `InvalidModelResponse` failures without leaking diagnostics via `Debug`.
 - Logical `LoopReport.requests` and state `request_index` aligned at the `RequestStarted` issue boundary; driver retries stay within a single logical request.
-- Internal model and tool progress channel drops merged into `LoopEventEnvelope.dropped_before`.
+- Ready model progress is forwarded without internal starvation; best-effort
+  queue loss is still merged into `LoopEventEnvelope.dropped_before`.
+- EOF without any event has Unknown delivery; interrupted retry backoff preserves
+  the previous model cause while loop deadlines still cancel the loop.
 - Replaced pending configs drop outside the control mutex; finalization-discarded
   configs drop after publication, with host destructor panics isolated.
 - Steer / update request-boundary semantics, final-seal races, queue bounds.

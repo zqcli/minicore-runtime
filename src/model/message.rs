@@ -413,7 +413,7 @@ impl fmt::Debug for ModelMessage {
                 parts,
                 provider_replay,
             } => formatter
-                .debug_struct("ModelMessage::Assistant")
+                .debug_struct("ModelMessage::AssistantWithReplay")
                 .field("provider_replay", provider_replay)
                 .field("part_count", &parts.len())
                 .field("parts", parts)
