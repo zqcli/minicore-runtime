@@ -2,7 +2,7 @@
 
 The one-loop host boundary, JSON representations and storage-independent design
 remain unchanged. Public Rust API changes are listed in the
-[README compatibility notes](../README.md#070-compatibility-notes).
+[README compatibility notes](../README.md#070).
 
 ## Changes
 

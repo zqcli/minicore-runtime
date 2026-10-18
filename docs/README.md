@@ -15,8 +15,7 @@ compatibility changes; versioned v0.4 acceptance/release pages remain historical
 9. [v0.7.0 release notes](release-v0.7.md) for this refactor and the separated provider gate.
 
 The [current implementation context](../CONTEXT.md) is a short maintainer
-checkpoint. The [root README](../README.md) is the Host-facing introduction
-and the only place that states the v0.4 positioning in prose.
+checkpoint. The [root README](../README.md) is the Host-facing introduction.
 
 The exhaustive authority set is `README.md`, `CONTEXT.md`, `tests/README.md`,
 this index, `architecture.md`, `modules/README.md`, `development-plan.md`,

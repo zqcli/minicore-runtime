@@ -1,112 +1,70 @@
 # MiniCore Runtime
 
-MiniCore Runtime is a small Rust execution core for one live agent loop. It runs model/tool iterations, streaming, cancellation, interaction, steering, and request-boundary configuration updates. It does not own sessions, persistence, transcripts, providers, or workspaces.
+[![CI](https://github.com/zqcli/minicore-runtime/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/zqcli/minicore-runtime/actions/workflows/ci.yml)
 
-## 0.7.0 Compatibility Notes
+MiniCore Runtime is a small Rust execution core for one live agent loop. Give
+it host-owned history, one user input, a model, and a tool set. It runs model
+requests and tool batches until the model finishes, streams progress, accepts
+steering, configuration updates, cancellation, and interaction answers while
+running, and returns one authoritative `LoopReport`. Sessions, persistence,
+transcripts, providers, and workspaces stay with the host.
+[MiniCore Agent](https://github.com/zqcli/minicore-agent) is the reference
+host.
 
-- `ToolSpec` fields are private. Construct with `ToolSpec::new` (or deserialize)
-  and read through `name()`, `description()` and `input_schema()`. The now-impossible
-  `ToolSetError::InvalidSpec` variant is removed. Serialized tool specs are unchanged.
-- `steer`, `update` and `answer` return `NotActive` after cancellation, without
-  waiting for finalization. EOF before any model event reports `Unknown` delivery;
-  interrupted retry backoff preserves the previous model error as its cause.
+| | |
+|---|---|
+| Version | 0.7.0 |
+| Rust | edition 2024, MSRV 1.85 |
+| Async runtime | Tokio (the loop spawns one task) |
+| Production dependencies | serde, serde_json, tokio, tokio-util, futures-util, thiserror, getrandom |
+| License | MIT OR Apache-2.0 |
 
-- `AssistantPart::Text`, `ModelMessage::System` and `ModelMessage::User` now
-  carry `Arc<str>` instead of `String`. Use `.into()` for enum construction and
-  `.as_ref()` for string comparisons. Constructors and JSON formats are unchanged.
-- `BoundedText`, reasoning payloads, tool-call arguments and provider replay
-  share immutable storage. `ModelRequest` clones share message/tool slices;
-  `ModelRequest::new` accepts a tool `Vec` or `Arc<[ToolSpec]>`.
-  `ToolCall::arguments()` and `ProviderReplay::payload()` are no longer `const`.
-  Redundant `ToolCall::validate()` is removed: constructors and deserialization
-  already guarantee valid arguments.
-- `DiagnosticSummary::new` now returns `Result<_, ValueError>` and its `message`
-  field is private (read through `message()`). Diagnostics and tool progress
-  reject controls other than LF/TAB; `ToolProgressError::InvalidText` and
-  `ValueError::InvalidText` are new variants. Input prompts/answers now allow LF/TAB.
-- Model text normalizes CRLF/CR to LF and other controls except LF/TAB to a
-  single space, never increasing byte length. Delta constructors retain raw text
-  and cap its bytes; assembly handles split CRLF independently for text/reasoning,
-  producing matching canonical text and progress. Hosts may chunk at any UTF-8
-  boundary up to `MAX_MODEL_EVENT_TEXT_BYTES`, without expansion headroom or CRLF
-  workarounds. Empty deltas are ignored without breaking CRLF continuity.
-- `LoopStatus`, `CancelReason`, and `LoopOutcome` are non-exhaustive: downstream
-  matches need a wildcard arm. Usage sums known values per field instead of
-  losing them when another request omits that field.
-- `LoopHandle::shutdown()` records shutdown cancellation. Interactions without a
-  loop deadline wait indefinitely. Dropping a `join()` future cancels its loop.
-- `history::estimate_history_bytes` exposes the exact start-admission estimate.
-  Configs discarded by finalization are dropped only after report publication.
+## Features
 
-## 0.6.1 Compatibility Notes
+- **One-shot loop.** `AgentLoop::start` runs exactly once and resolves to an
+  `Arc<LoopReport>`. Every waiter receives the same report.
+- **Live control.** `LoopHandle` steers or updates the next request, answers
+  approval and tool-input interactions, and cancels or shuts down the loop.
+- **Pluggable seams.** Models, tools, tool policies, and prompt projection are
+  traits (`Model`, `Tool`, `ToolPolicy`, `PromptProvider`). No provider SDK is
+  bundled.
+- **Model driver.** Bounded retries that honor provider retry hints, request and
+  turn deadlines, and text normalization that never grows a delta.
+- **Bounded by construction.** Limits cover messages, tool calls per response,
+  tool output bytes, history size, and the event queue. Oversized tool output
+  becomes a failed tool result instead of corrupting history.
+- **Best-effort events.** A bounded stream reports dropped events in
+  `dropped_before` and never blocks the loop.
 
-- Provider replay is bounded opaque metadata carried by `ModelEvent::ProviderReplay`,
-  `ModelResponse`, `AssistantHistory`, and `ModelMessage::AssistantWithReplay`.
-  Existing assistant tuple construction, constructors, and legacy JSON remain valid.
-  History struct literals must initialize the new optional `provider_replay` field.
-- A replay envelope is at most 256 KiB of compact JSON, with depth 32 and 16,384
-  payload nodes. Runtime does not interpret its provider format or truncate it.
-  Host history's 2 MiB ceiling includes the full replay envelope byte count.
-- Replay-only assistant content is accepted only with validated metadata; legacy
-  empty constructors remain invalid. Replay never creates display text/tool calls.
-  Its payload is accessible to the host and serialized in history, but redacted
-  from Debug and never forwarded as a loop output event.
+## Installation
 
-## 0.6.0 Compatibility Notes
+The crate is not published to crates.io. Depend on it by Git revision:
 
-- `LoopReport.tool_rounds` is now `u64`. Hosts that expose this count through JSON or storage must preserve the wider integer; clients limited to `u16` cannot read values above 65,535.
-- `LoopOptions.max_tool_rounds` remains `u16`, with zero (the default) meaning unlimited. Cancellation, deadlines, and other resource limits still apply.
-- Each actual prompt preparation emits one `Starting` state, including preparation after tools and stale-prompt rebuilds; the redundant initial event is removed.
-- There is no Runtime compaction scheduler. Post-turn summaries and bounded request-level context recovery are Agent policies built on the existing generic interfaces.
-- MSRV remains Rust 1.85. Historical v0.4 acceptance and release records below are preserved; they are not new 0.6.0 verification claims.
+```toml
+[dependencies]
+minicore-runtime = { git = "https://github.com/zqcli/minicore-runtime", rev = "<commit>" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
 
-## What the Runtime Does Not Own
+## Usage
 
-An `AgentLoop` is a single, one-shot execution. The host owns everything around it:
-
-- An `AgentLoop` runs exactly once; it cannot be resumed, loaded, or reopened.
-- Sessions are owned by the host. The runtime has no session type, no session lifecycle, and no open/load/save surface.
-- History is passed in by the host. The runtime reads `HistoryItem`s, appends its in-memory results to `LoopReport::appended`, and never persists anything.
-- `LoopReport` is saved by the host. `wait`/`join` return the same `Arc<LoopReport>`: the report stays available through the loop's completion channel for as long as the owner or any handle lives, and every waiter receives the same `Arc`.
-- Events are not authoritative. The event stream is a best-effort, bounded, single-consumer channel; dropped events (including internal model/tool progress loss) are counted in `dropped_before`, never reconstructed. The report is the only authoritative outcome.
-- Tool side effects are not atomic with host logging. A tool can run successfully (with side effects) even when the host never sees the corresponding streamed event or persisted log.
-- All tool outputs in history are bounded by `max_tool_output_bytes`. Oversized tool outputs are downgraded to failure results rather than corrupting history.
-- Tool input requests are strictly validated at the port boundary; invalid requests fail immediately as ordinary tool errors without entering `WaitingForInput`.
-- `update` takes effect at the next model request. A config revision is committed only when a real model request is issued; replaced or discarded configurations are dropped outside the control lock.
-- The current tool batch uses the snapshot of the request that produced it. A config `update` or `steer` never retroactively changes an in-flight batch.
-- `steer` takes effect at the next model request. A successful call means the steer was accepted into this process-local queue and is applied at the next request boundary; on any non-`Completed` ending or process exit before that boundary, the queued steer is discarded and will not appear in `LoopReport::appended`. Steers queue up to `max_pending_steers` (`QueueFull`), are rejected if an interaction is pending (`WaitingForInput`) or after cancellation/finalization (`NotActive`), and appear as `Steering` user items at the next request boundary.
-- A config `update` does not keep the loop alive. It only reconfigures the next request; whether the loop continues is decided by the model's final response and pending steers.
-- `LoopReport.requests` and final `request_index` count issued requests at the `RequestStarted` boundary. Failed issued requests are counted; prompt rebuilds and driver-internal retries do not increment logical request count. The runtime never automatically retries an entire loop.
-- `LoopReport.tool_rounds` counts tool batches with `u64` precision. The optional `LoopOptions.max_tool_rounds` remains `u16`; zero (the default) means no tool-round limit, not a limit on statistics.
-- `PromptProvider` projects host-owned context at each request boundary. Summary generation, compaction timing, and persistence are host policies, not Runtime scheduling responsibilities.
-- `LoopFailure::model_error()` preserves structured `ModelError` metadata for model and invalid-response failures without leaking diagnostics via `Debug`.
-- Tool catalog size is independent from per-response `ToolCall` limits (`max_tool_calls_per_response`).
-- The Runtime needs a Tokio context. `AgentLoop::start` spawns its single runner task; call it from inside a Tokio runtime.
-
-## Public Surface
-
-The crate exports the loop types at the root and keeps the rest under focused modules:
-
-- `AgentLoop`, `LoopHandle`, `LoopRequest`, `LoopOptions`, `LoopReport`, `LoopState`, `LoopEvent(Stream)`, plus `UpdateError` / `SteerError` / cancel reasons and failure kinds.
-- `execution`: `ExecutionConfig`, `ConfigRevision`, `UserInput`.
-- `history`: `HistoryItem` (user / assistant / tool result / summary) and `HistoryView`.
-- `model`: the `Model` seam, `ModelRequest` / `ModelMessage`, typed responses.
-- `prompt`: the `PromptProvider` seam and `DefaultPromptProvider`.
-- `tools`: the `Tool` seam, `ToolSet`, policies, interactions, progress.
-- `limits`, `interaction`, `ids`, `value`, `error`.
-
-## API Sketch
-
-A simple text loop:
+A text loop:
 
 ```rust
+use std::sync::Arc;
+use minicore_runtime::history::HistoryItem;
+use minicore_runtime::model::ReasoningPreference;
+use minicore_runtime::prompt::DefaultPromptProvider;
+use minicore_runtime::tools::ToolSet;
+use minicore_runtime::{AgentLoop, ExecutionConfig, LoopOptions, LoopRequest, UserInput};
+
 let config = ExecutionConfig::new(
     model,                         // Arc<dyn Model>
     ReasoningPreference::Auto,
     ToolSet::default(),            // or ToolSet::builder().register(tool).build()?
-    None,                          // Optional Arc<dyn ToolPolicy>
+    None,                          // optional Arc<dyn ToolPolicy>
     Arc::new(DefaultPromptProvider::new(None)),
-)?;                                // ExecutionConfigError
+)?;
 
 let request = LoopRequest::new(
     Arc::from(Vec::<HistoryItem>::new()), // host-owned prior history
@@ -116,29 +74,153 @@ let request = LoopRequest::new(
 
 let mut agent = AgentLoop::start(request, LoopOptions::default_checked()?)?;
 let events = agent.take_events()?; // optional best-effort stream
-let report = agent.join().await?; // Arc<LoopReport>; host keeps it
+let report = agent.join().await?; // Arc<LoopReport>; the host keeps it
 ```
 
-Steering, updating, and cancelling a live loop:
+Controlling a running loop (before `join`):
 
 ```rust
-let handle = agent.handle().clone();
-handle.steer(UserInput::text("focus on the time")?)?;   // next request
-let revision = handle.update(new_config)?;              // next request
-handle.cancel();                                         // best-effort
+let handle = agent.handle();
+handle.steer(UserInput::text("focus on the time")?)?; // applied at the next request
+let revision = handle.update(new_config)?;            // applied at the next request
+handle.cancel();                                       // or handle.shutdown()
 ```
 
-## Examples
+Two runnable examples use fake adapters:
 
-Compiled, runnable examples live in [`examples/`](examples):
+```bash
+cargo run --example agent_loop    # text, tools, events, steer + update, cancel
+cargo run --example memory_agent  # a multi-turn host built from one-shot loops
+```
 
-- [`examples/agent_loop.rs`](examples/agent_loop.rs): a simple text loop, a
-  tool loop, live event streaming, a deterministic steer+update demo that
-  runs a second request under the updated config (proved via `requests == 2`
-  and the second `RequestStarted` revision), and a separate held loop that is
-  cancelled, all against fake adapters.
-- [`examples/memory_agent.rs`](examples/memory_agent.rs): a host-owned `MemoryAgent` that builds a multi-turn conversation from repeated one-shot loops.
+## Host Boundary
+
+The Runtime executes one loop. The host owns everything around it:
+
+- An `AgentLoop` runs exactly once; it cannot be resumed, loaded, or reopened.
+- Sessions are owned by the host. There is no session type, lifecycle, or
+  open/load/save surface.
+- History is passed in by the host. The Runtime reads `HistoryItem`s, returns
+  its new items in `LoopReport::appended`, and never persists anything.
+- `LoopReport` is saved by the host. `wait` and `join` return the same
+  `Arc<LoopReport>` for as long as the owner or any handle lives.
+- Events are not authoritative. The stream is bounded and single-consumer;
+  lost events, including internal model and tool progress, are counted in
+  `dropped_before` and never reconstructed.
+- Tool side effects are not atomic with host logging. A tool can succeed even
+  when the host never sees its event or persists its result.
+- `update` takes effect at the next model request. A revision is committed only
+  when a real request is issued. The current tool batch always uses the
+  snapshot of the request that produced it.
+- `steer` takes effect at the next model request. An accepted steer is queued in
+  memory and discarded if the loop ends any other way than `Completed` before
+  that boundary. Steers fail with `QueueFull`, `WaitingForInput` while an
+  interaction is pending, or `NotActive` after cancellation or completion.
+- An `update` does not keep the loop alive. The model's final response and any
+  pending steers decide whether another request runs.
+- `LoopReport.requests` counts issued requests. Driver retries stay inside one
+  logical request, and the Runtime never retries a whole loop.
+- Summaries, compaction timing, and persistence are host policies implemented
+  through `PromptProvider`; the Runtime has no compaction scheduler.
+- The Runtime needs a Tokio context: call `AgentLoop::start` inside a Tokio
+  runtime.
+
+## Public Surface
+
+The crate root exports the loop types: `AgentLoop`, `LoopHandle`,
+`LoopRequest`, `LoopOptions`, `LoopReport`, `LoopState`, `LoopEvent`,
+`LoopEventStream`, outcomes, and their error types. Everything else lives in
+focused modules:
+
+| Module | Contents |
+|---|---|
+| `execution` | `ExecutionConfig`, `ConfigRevision`, `UserInput` |
+| `history` | `HistoryItem` (user, assistant, tool result, summary), `HistoryView`, `estimate_history_bytes` |
+| `model` | The `Model` trait, `ModelRequest`/`ModelMessage`, events, errors, provider replay |
+| `prompt` | The `PromptProvider` trait and `DefaultPromptProvider` |
+| `tools` | The `Tool` trait, `ToolSpec`, `ToolSet`, policies, interactions, progress |
+| `limits`, `interaction`, `value`, `error` | Bounds, interaction DTOs, bounded text, diagnostics |
+
+Generate the API docs with `cargo doc --no-deps --open`.
+
+## Development
+
+```bash
+./scripts/check.sh       # fmt, tests, Clippy, rustdoc, docs and architecture gates
+./scripts/check-msrv.sh  # the test suite on Rust 1.85.0
+```
+
+`check.sh` needs `python3` and `rg`. CI runs both scripts on Ubuntu and the tests
+on macOS and Windows. `./scripts/check-provider-gate.sh` runs the standalone
+provider evidence harness in `provider-gate/` (Rust 1.88+); run it only when that
+harness or its provider dependency changes. See [tests/README.md](tests/README.md)
+for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
+
+## Compatibility Notes
+
+### 0.7.0
+
+- `ToolSpec` fields are private. Construct one with `ToolSpec::new` (or
+  deserialize it) and read it through `name()`, `description()`, and
+  `input_schema()`. `ToolSetError::InvalidSpec` is removed. Serialized tool
+  specs are unchanged.
+- `steer`, `update`, and `answer` return `NotActive` after cancellation, without
+  waiting for finalization. EOF before any model event reports `Unknown`
+  delivery. Interrupted retry backoff keeps the previous model error as its
+  cause.
+- `AssistantPart::Text`, `ModelMessage::System`, and `ModelMessage::User` carry
+  `Arc<str>` instead of `String`. Use `.into()` to construct and `.as_ref()` to
+  compare. Constructors and JSON formats are unchanged.
+- `BoundedText`, reasoning payloads, tool-call arguments, and provider replay
+  share immutable storage. `ModelRequest` clones share message and tool slices;
+  `ModelRequest::new` accepts a tool `Vec` or `Arc<[ToolSpec]>`.
+  `ToolCall::arguments()` and `ProviderReplay::payload()` are no longer `const`,
+  and the redundant `ToolCall::validate()` is removed.
+- `DiagnosticSummary::new` returns `Result<_, ValueError>`, and its `message`
+  field is private (read it through `message()`). Diagnostics and tool progress
+  reject controls other than LF and TAB, through the new
+  `ToolProgressError::InvalidText` and `ValueError::InvalidText` variants.
+  Input prompts and answers now allow LF and TAB.
+- Model text normalizes CRLF and CR to LF, and other controls except LF and TAB
+  to one space, never increasing byte length. Assembly handles CRLF split across
+  deltas separately for text and reasoning. Hosts may chunk at any UTF-8
+  boundary up to `MAX_MODEL_EVENT_TEXT_BYTES`. Empty deltas are ignored.
+- `LoopStatus`, `CancelReason`, and `LoopOutcome` are `#[non_exhaustive]`;
+  downstream matches need a wildcard arm. Usage sums known values per field.
+- `LoopHandle::shutdown()` records shutdown cancellation. Interactions without
+  a loop deadline wait indefinitely. Dropping a `join()` future cancels its loop.
+- `history::estimate_history_bytes` exposes the exact start-admission estimate.
+  Configs discarded by finalization are dropped after report publication.
+
+### 0.6.1
+
+- Provider replay is bounded opaque metadata carried by
+  `ModelEvent::ProviderReplay`, `ModelResponse`, `AssistantHistory`, and
+  `ModelMessage::AssistantWithReplay`. Existing constructors and legacy JSON
+  remain valid; history struct literals must initialize `provider_replay`.
+- A replay envelope is at most 256 KiB of compact JSON, with depth 32 and 16,384
+  payload nodes. The Runtime neither interprets nor truncates it. The host's
+  2 MiB history ceiling includes the envelope.
+- Replay never creates display text or tool calls. Its payload is visible to the
+  host and serialized in history, but redacted from `Debug` and never emitted as
+  an output event.
+
+### 0.6.0
+
+- `LoopReport.tool_rounds` is `u64`. Hosts exposing it through JSON or storage
+  must keep the wider integer.
+- `LoopOptions.max_tool_rounds` stays `u16`; zero (the default) means unlimited.
+- Each real prompt preparation emits one `Starting` state.
 
 ## Documentation
 
-For the full picture see [`docs/README.md`](docs/README.md): architecture, module map, contracts, host boundary, and the v0.3-to-v0.4 migration. Coding agents should also read [`AGENTS.md`](AGENTS.md).
+[docs/README.md](docs/README.md) indexes the authority set:
+[architecture](docs/architecture.md), the [module map](docs/modules/README.md),
+the [agent-loop contract](docs/contracts/agent-loop.md) and its focused
+contracts, the [host boundary](docs/integration/host-boundary.md), the
+[v0.3-to-v0.4 migration](docs/migrations/v0.3-to-v0.4.md), and the
+[0.7.0 release notes](docs/release-v0.7.md).
+
+## License
+
+Licensed under `MIT OR Apache-2.0`, as declared in `Cargo.toml`.

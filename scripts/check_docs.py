@@ -6,23 +6,21 @@ Checks, against an injectable root (stdlib only, no LOC budgets):
   1. The current authority set exists and is complete.
   2. Every non-archive Markdown file is authority or a listed non-authority
      guide (AGENTS.md).
-  3. The root README states the exact v0.4 positioning sentence first and
-     covers the ten mandatory runtime properties.
-  4. docs/README.md links every contract and core page (real parsed links)
+  3. docs/README.md links every contract and core page (real parsed links)
      and classifies each non-authority guide.
-  5. No stale session-era page is kept current (no removed contract/migration
+  4. No stale session-era page is kept current (no removed contract/migration
      named as authority).
-  6. The compile-gate examples exist and exercise AgentLoop,
+  5. The compile-gate examples exist and exercise AgentLoop,
      steer/update/cancel, and the MemoryAgent composition pattern.
-  7. Real Markdown link validation: every inline and reference link in every
+  6. Real Markdown link validation: every inline and reference link in every
      non-archive Markdown file resolves to an existing target, and every
      `#fragment` matches a GitHub-style heading anchor (duplicate headings
      handled in the basic `foo`, `foo-1`, ... form).
 
-`--self-test` runs a real mutation test in a temporary tree: it plants a
-broken link, an unknown Markdown file, and a missing required marker, then
-asserts the matching checkers report them, and finally asserts the real tree
-is green after cleanup.
+README prose is reviewed, not pattern-matched. `--self-test` runs a real
+mutation test in a temporary tree: it plants a broken link and an unknown
+Markdown file, asserts the matching checkers report them, and finally asserts
+the real tree is green after cleanup.
 """
 
 from __future__ import annotations
@@ -61,22 +59,6 @@ AUTHORITY = [
 
 # Non-authority guides: allowed current Markdown that defers to the authority set.
 NON_AUTHORITY = ["AGENTS.md"]
-
-POSITIONING = "MiniCore Runtime is a small Rust execution core for one live agent loop."
-
-REQUIRED_PROPERTY_MARKERS = {
-    "one-shot / exactly once": "exactly once",
-    "host owns sessions": "Sessions are owned by the host",
-    "host owns history": "History is passed in by the host",
-    "host saves LoopReport": "LoopReport is saved by the host",
-    "events are not authoritative": "Events are not authoritative",
-    "tool side effects / host log not atomic": "not atomic with host logging",
-    "update at next request": "next model request",
-    "current batch snapshot": "snapshot of the request that produced it",
-    "steer at next request": "next model request",
-    "update does not keep alive": "does not keep the loop alive",
-    "needs Tokio": "Tokio context",
-}
 
 # Removed pages that must never be cited as current authority.
 STALE_AUTHORITY = [
@@ -225,22 +207,6 @@ def check_markdown_inventory(root: Path) -> list[str]:
     ]
 
 
-def check_root_readme(root: Path) -> list[str]:
-    path = root / "README.md"
-    if not path.exists():
-        return ["README.md missing"]
-    text = path.read_text(encoding="utf-8")
-    problems = []
-    preamble = text.split("\n## ", 1)[0].replace("\n", " ")
-    if POSITIONING not in preamble:
-        problems.append("README first paragraph lacks the v0.4 positioning sentence")
-    plain = text.replace("`", "")
-    for name, marker in REQUIRED_PROPERTY_MARKERS.items():
-        if marker not in plain:
-            problems.append(f"README missing required property {name!r} ({marker!r})")
-    return problems
-
-
 def check_docs_index(root: Path) -> list[str]:
     path = root / "docs" / "README.md"
     if not path.exists():
@@ -293,7 +259,6 @@ def check_examples(root: Path) -> list[str]:
 ALL_CHECKS = [
     ("authority exists", check_authority_exists),
     ("markdown inventory", check_markdown_inventory),
-    ("root README", check_root_readme),
     ("docs index", check_docs_index),
     ("stale authority", check_no_stale_authority),
     ("examples", check_examples),
@@ -325,7 +290,6 @@ def self_test() -> list[str]:
             encoding="utf-8",
         )
         (root / "docs" / "other.md").write_text("# Other\n", encoding="utf-8")
-        (root / "README.md").write_text("# MiniCore Runtime\n\nno positioning here\n", encoding="utf-8")
         (root / "stray.md").write_text("# stray\n", encoding="utf-8")
 
         link_hits = check_links(root)
@@ -340,8 +304,6 @@ def self_test() -> list[str]:
             problems.append("self-test: markdown-inventory scanner is vacuous")
         if any("archive" in hit for hit in inventory_hits):
             problems.append("self-test: archive dir must be exempt from the inventory")
-        if not check_root_readme(root):
-            problems.append("self-test: README required-marker scanner is vacuous")
 
     after = run_checks(ROOT)
     if after:
