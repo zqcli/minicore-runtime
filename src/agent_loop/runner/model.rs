@@ -88,7 +88,7 @@ pub(super) fn build_model_request(
     snapshot: &ExecutionConfig,
 ) -> Result<ModelRequest, ModelValueError> {
     let tools = snapshot.tools().shared_specs();
-    ModelRequest::new(
+    ModelRequest::with_validated_tools(
         messages,
         tools,
         ModelLimits::default(),

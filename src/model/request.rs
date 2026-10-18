@@ -98,12 +98,23 @@ impl ModelRequest {
         limits: ModelLimits,
         reasoning: ReasoningPreference,
     ) -> Result<Self, ModelValueError> {
+        let tools = tools.into();
+        validate_request_tools(&tools)?;
+        Self::with_validated_tools(messages, tools, limits, reasoning)
+    }
+
+    /// Reuses a checked catalog (the runner's frozen ToolSet), while validating
+    /// messages produced by the host prompt provider on every request.
+    pub(crate) fn with_validated_tools(
+        messages: Vec<ModelMessage>,
+        tools: Arc<[ToolSpec]>,
+        limits: ModelLimits,
+        reasoning: ReasoningPreference,
+    ) -> Result<Self, ModelValueError> {
         if messages.is_empty() {
             return Err(ModelValueError::EmptyMessages);
         }
-        let tools = tools.into();
         validate_tool_exchange(&messages)?;
-        validate_request_tools(&tools)?;
         Ok(Self {
             messages: messages.into(),
             tools,

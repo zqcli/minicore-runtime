@@ -24,11 +24,13 @@ pub trait Model: Send + Sync + 'static {
 
 ## Request Semantics
 
-- `ModelRequest` validates: non-empty messages, per-message text validity
-  (single source: `MAX_MODEL_MESSAGE_TEXT_BYTES`), tool-exchange consistency
-  (a `ToolCall` is balanced with a `ToolResult` carrying the same id), and
-  a tool schema budget. Construction failure is a `Prompt`-path failure for
-  the loop.
+- Public `ModelRequest::new` validates non-empty messages, per-message text
+  validity (`MAX_MODEL_MESSAGE_TEXT_BYTES`), tool-exchange consistency (a
+  `ToolCall` is balanced with a `ToolResult` carrying the same id), and tool
+  schemas/order. The runner uses a crate-private construction path that reuses
+  the frozen `ToolSet` catalog without revalidating it. Registration checks
+  schemas; loop start/update checks catalog budgets. Host-produced prompt
+  messages are still validated on every request; failures take the `Prompt` path.
 - `ModelCallContext { loop_id, request_index, cancellation, deadline }` is
   per request; the driver uses it for cancel/timeout/panic isolation.
 - One `ModelRequest` maps to one streamed response (`ToolCall`s + finish
@@ -44,7 +46,9 @@ text in response constructors, and reasoning text/summary constructors accept co
 characters: within each payload CRLF and lone CR become LF, and other controls
 except LF/TAB become U+FFFD. Byte limits apply after normalization. Empty deltas
 are valid and ignored by assembly (no part or progress event). Public event
-variants receive the same normalization at the adapter boundary. Opaque replay,
+variants receive the same normalization at the adapter boundary, including
+CRLF contraction and U+FFFD expansion before checking the event byte ceiling.
+Opaque replay,
 encrypted reasoning and signatures retain their own validation rules. Tool
 arguments must still assemble into a bounded JSON object.
 

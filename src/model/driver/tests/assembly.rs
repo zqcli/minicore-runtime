@@ -1,6 +1,68 @@
 use super::*;
 
 #[tokio::test]
+async fn direct_and_constructed_deltas_enforce_normalized_byte_limits() {
+    let limit = crate::model::MAX_MODEL_EVENT_TEXT_BYTES;
+    let controls = "\0".repeat(limit / 3);
+    let replacements = "�".repeat(limit / 3);
+    for (raw, normalized, accepted) in [
+        ("\r\n".repeat(40_000), "\n".repeat(40_000), true),
+        ("\r\n".repeat(limit), "\n".repeat(limit), true),
+        ("\r\n".repeat(limit + 1), "\n".repeat(limit + 1), false),
+        (format!("{controls}a"), format!("{replacements}a"), true),
+        (format!("{controls}aa"), format!("{replacements}aa"), false),
+        ("a".repeat(limit + 1), "a".repeat(limit + 1), false),
+    ] {
+        for reasoning in [false, true] {
+            let delta = BoundedText::new(&raw).unwrap();
+            let (direct, constructed) = if reasoning {
+                (
+                    ModelEvent::ReasoningDelta { delta },
+                    ModelEvent::reasoning_delta(&raw),
+                )
+            } else {
+                (
+                    ModelEvent::TextDelta { delta },
+                    ModelEvent::text_delta(&raw),
+                )
+            };
+            assert_eq!(constructed.is_ok(), accepted);
+            assert_eq!(direct.validate().is_ok(), accepted);
+            let direct_result = run_events(
+                request(),
+                vec![Ok(direct), Ok(finish(ModelFinishReason::Stop))],
+                ModelDriverConfig::default(),
+            )
+            .await;
+            if accepted {
+                let constructed_result = run_events(
+                    request(),
+                    vec![
+                        Ok(constructed.unwrap()),
+                        Ok(finish(ModelFinishReason::Stop)),
+                    ],
+                    ModelDriverConfig::default(),
+                )
+                .await;
+                assert_eq!(direct_result, constructed_result);
+                let response = direct_result.unwrap();
+                let text = match &response.parts()[0] {
+                    AssistantPart::Text(text) => text.as_ref(),
+                    AssistantPart::Reasoning(reasoning) => reasoning.text().unwrap(),
+                    _ => panic!("expected model text"),
+                };
+                assert_eq!(text, normalized);
+            } else {
+                assert_eq!(
+                    direct_result.unwrap_err().kind(),
+                    ModelErrorKind::InvalidProviderResponse
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn model_text_is_normalized_and_empty_deltas_do_not_emit_progress() {
     let model = ScriptModel::new(
         descriptor(),

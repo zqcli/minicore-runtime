@@ -177,7 +177,9 @@ impl ModelEvent {
         match self {
             Self::TextDelta { delta }
             | Self::ReasoningDelta { delta }
-            | Self::ToolCallArgumentsDelta { delta, .. } => validate_event_text(delta.as_str()),
+            | Self::ToolCallArgumentsDelta { delta, .. } => {
+                normalized_event_text(delta.as_str()).map(|_| ())
+            }
             Self::ToolCallStart { .. }
             | Self::ToolCallEnd { .. }
             | Self::Usage { .. }
@@ -229,13 +231,15 @@ impl fmt::Debug for ModelEvent {
 }
 
 fn checked_event_text(value: &str) -> Result<BoundedText, ModelValueError> {
-    BoundedText::new_with_max_bytes(normalize_model_text(value), MAX_MODEL_EVENT_TEXT_BYTES)
-        .map_err(|_| ModelValueError::InvalidEvent)
+    BoundedText::new(normalized_event_text(value)?).map_err(|_| ModelValueError::InvalidEvent)
 }
 
-fn validate_event_text(value: &str) -> Result<(), ModelValueError> {
-    if value.len() <= MAX_MODEL_EVENT_TEXT_BYTES {
-        Ok(())
+pub(super) fn normalized_event_text(
+    value: &str,
+) -> Result<std::borrow::Cow<'_, str>, ModelValueError> {
+    let text = normalize_model_text(value);
+    if text.len() <= MAX_MODEL_EVENT_TEXT_BYTES {
+        Ok(text)
     } else {
         Err(ModelValueError::InvalidEvent)
     }

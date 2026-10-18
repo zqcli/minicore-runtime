@@ -60,7 +60,7 @@ impl<'a> Assembler<'a> {
         &mut self,
         event: ModelEvent,
     ) -> Result<Option<ModelDriverProgress>, ModelError> {
-        if self.finish_reason.is_some() || event.validate().is_err() {
+        if self.finish_reason.is_some() {
             return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
         }
         match event {
@@ -244,12 +244,12 @@ impl<'a> Assembler<'a> {
 }
 
 fn normalized_delta(delta: BoundedText) -> Result<BoundedText, ModelError> {
-    match crate::value::normalize_model_text(delta.as_str()) {
+    let text = super::super::response::normalized_event_text(delta.as_str())
+        .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
+    match text {
         std::borrow::Cow::Borrowed(_) => Ok(delta),
-        std::borrow::Cow::Owned(text) => {
-            BoundedText::new_with_max_bytes(text, crate::model::MAX_MODEL_EVENT_TEXT_BYTES)
-                .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))
-        }
+        std::borrow::Cow::Owned(text) => BoundedText::new(text)
+            .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse)),
     }
 }
 

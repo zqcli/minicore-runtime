@@ -21,17 +21,17 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 
 ## Unit (`src/**` inline and driver)
 
-- 75 unit tests in `src/`:
+- 76 unit tests in `src/`:
   - `src/agent_loop/control.rs` (8 tests): control-layer CAS/seal, revision monotonicity, and outside-lock config drop probes.
   - `src/agent_loop/runner/tests.rs` (6 tests): completion identity, wide counts, bounded settlement and post-publication config-destructor panics.
-  - `src/model/driver/tests/` (43 tests): assembly (8), retry (8), deadline (6), preflight/progress (3), settlement (3), semantics (8), cancellation (7).
+  - `src/model/driver/tests/` (44 tests): assembly (9), retry (8), deadline (6), preflight/progress (3), settlement (3), semantics (8), cancellation (7).
   - `src/tools/` (4 tests): input request validation (1) and progress channel semantics (3).
   - `src/time.rs` (4 tests): monotonic clock and timeout math.
   - `src/port_call.rs` (9 tests): port call execution and timeout isolation.
 
   - `src/usage.rs` (1 test): partial usage accumulates reported fields.
 
-Total main-crate volume: **271 tests** (75 unit + 196 integration across 11 targets).
+Total main-crate volume: **272 tests** (76 unit + 196 integration across 11 targets).
 `tests/support/` shares scripted model/tool/policy builders, config/start/join helpers
 and report extractors across separate binaries. Driver tests use the actual
 `ModelDriverConfig` and `LoopLimits`, not mirrored config types.
@@ -55,7 +55,8 @@ The standalone provider harness has 25 tests and is not included in this runtime
   consumer, mid-close.
 - Interactions: approval and tool-input flows, wrong id/kind, repeated
   answers, deadline while waiting, and no fabricated 24-hour deadline.
-- Model text normalization and empty-delta suppression; per-attempt child-token
+- Model text normalization, direct/constructed delta byte-limit parity and
+  empty-delta suppression; per-attempt child-token
   cleanup; handle shutdown versus dropped-join cancellation.
 - History: item/byte limits, delta-only reports, mixed model refs.
 - Malformed model responses never enter Assistant history.

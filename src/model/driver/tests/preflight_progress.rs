@@ -76,32 +76,22 @@ async fn preflight_rejects_reasoning_tools_context_and_mutated_tool_specs_before
         ModelErrorKind::InvalidRequest
     );
 
-    let mut oversized_schema = tool_spec("search");
-    oversized_schema.input_schema = json!({"padding": "123456789"});
-    let request = ModelRequest::new(
-        vec![ModelMessage::user("request").unwrap()],
-        vec![oversized_schema],
-        ModelLimits::default(),
-        ReasoningPreference::High,
-    )
-    .unwrap();
-    let limits = LoopLimits {
-        max_tool_schema_bytes: 8,
-        ..LoopLimits::default()
-    };
-    let driver = model.driver(&with_limits(limits));
-    assert_eq!(
-        driver
-            .run(
-                request,
-                context(CancellationToken::new(), Duration::from_secs(30)),
-                &progress,
-            )
-            .await
-            .unwrap_err()
-            .kind(),
-        ModelErrorKind::InvalidRequest
-    );
+    for schema in [
+        json!([]),
+        json!({"padding": "x".repeat(crate::value::MAX_JSON_BYTES)}),
+    ] {
+        let mut invalid_schema = tool_spec("search");
+        invalid_schema.input_schema = schema;
+        assert_eq!(
+            ModelRequest::new(
+                vec![ModelMessage::user("request").unwrap()],
+                vec![invalid_schema],
+                ModelLimits::default(),
+                ReasoningPreference::High,
+            ),
+            Err(crate::model::ModelValueError::InvalidTools)
+        );
+    }
     assert_eq!(model.starts(), 0);
 }
 

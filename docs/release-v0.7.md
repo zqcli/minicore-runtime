@@ -37,7 +37,7 @@ bash scripts/check-architecture.sh
 bash scripts/check-msrv.sh
 ```
 
-The main suite has 271 tests: 75 unit and 196 integration tests in 11 binaries.
+The main suite has 272 tests: 76 unit and 196 integration tests in 11 binaries.
 The two examples compile as test targets. The acceptance checker preserves all
 70 Passed rows and validates their source/test references. See the
 [test inventory](../tests/README.md) for per-target counts.

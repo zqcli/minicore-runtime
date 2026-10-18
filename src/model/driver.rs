@@ -179,13 +179,6 @@ impl ModelDriver {
         {
             return Err(invalid());
         }
-        for tool in request.tools() {
-            tool.validate_for_bindings(
-                self.limits.max_tool_name_bytes,
-                self.limits.max_tool_schema_bytes,
-            )
-            .map_err(|_| invalid())?;
-        }
         Ok(())
     }
 
