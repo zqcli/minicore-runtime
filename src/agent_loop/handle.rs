@@ -34,6 +34,7 @@ impl LoopHandle {
         self.control.subscribe_state()
     }
 
+    /// Answers a pending interaction, or returns `NotActive` after cancellation or sealing.
     pub fn answer(
         &self,
         interaction_id: InteractionId,
@@ -59,7 +60,7 @@ impl LoopHandle {
     /// Atomically replaces the loop's execution config. The new config takes
     /// effect at the next model-request boundary (the in-flight model and the
     /// tool batch it produced keep the previous snapshot); `Ok` carries the
-    /// monotonic revision handed to this update. After the loop completes
+    /// monotonic revision handed to this update. After cancellation or sealing
     /// this returns `NotActive`; a config that violates the loop limits is
     /// rejected as `InvalidConfig` without consuming a revision.
     pub fn update(&self, config: ExecutionConfig) -> Result<ConfigRevision, UpdateError> {
@@ -75,7 +76,7 @@ impl LoopHandle {
     /// the queued steer is discarded and will not appear in
     /// `LoopReport::appended`. `QueueFull` means the bounded queue is full,
     /// `WaitingForInput` that an interaction is pending, and `NotActive` that
-    /// the loop already sealed.
+    /// cancellation or sealing already closed the loop.
     pub fn steer(&self, input: UserInput) -> Result<(), SteerError> {
         self.control.steer(input)
     }

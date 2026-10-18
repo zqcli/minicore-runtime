@@ -16,6 +16,10 @@ Cancellation and deadline behavior of one loop.
 
 ## Semantics
 
+- After cancellation returns, `steer`, `update`, and `answer` return `NotActive`,
+  even before the runner publishes its report. Calls overlapping cancellation
+  may already have been accepted; acceptance does not guarantee application.
+
 - Cancel/finish uses a single-CAS `AtomicU8` state machine: `mark_cancel`
   and `finish_once` each perform one compare-and-swap, so cancel and report
   sealing cannot race or double-publish.

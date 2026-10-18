@@ -207,6 +207,9 @@ impl LoopControl {
     /// pending slot. Repeated updates before a boundary each hand out a
     /// monotonic revision while the runner only ever applies the latest.
     pub(crate) fn update(&self, config: ExecutionConfig) -> Result<ConfigRevision, UpdateError> {
+        if !self.is_active() {
+            return Err(UpdateError::NotActive);
+        }
         config
             .validate_against_limits(&self.limits)
             .map_err(|_| UpdateError::InvalidConfig)?;
@@ -214,7 +217,7 @@ impl LoopControl {
         let mut replaced = None;
         let revision = {
             let mut guard = lock_control(&self.inner);
-            if !guard.accepting_updates {
+            if !guard.accepting_updates || !self.is_active() {
                 None
             } else {
                 let revision = guard.next_revision;
@@ -232,18 +235,18 @@ impl LoopControl {
     }
 
     /// Accepts a steer for the next request boundary. The input length is
-    /// checked against the loop's `max_user_input_bytes` *before* the lock;
+    /// checked against the loop's `max_user_input_bytes` before enqueueing;
     /// an oversized steer fails without touching the queue. Acceptance
     /// linearizes with the final seal, the interaction slot, and every other
     /// steer on the same mutex.
     pub(crate) fn steer(&self, input: UserInput) -> Result<(), SteerError> {
+        let mut guard = lock_control(&self.inner);
+        if !guard.accepting_updates || !self.is_active() {
+            return Err(SteerError::NotActive);
+        }
         let input_bytes = input.as_text().len();
         if input_bytes == 0 || input_bytes > self.limits.max_user_input_bytes {
             return Err(SteerError::InvalidInput);
-        }
-        let mut guard = lock_control(&self.inner);
-        if !guard.accepting_updates {
-            return Err(SteerError::NotActive);
         }
         if guard.interaction.is_some() {
             return Err(SteerError::WaitingForInput);
@@ -338,6 +341,10 @@ impl LoopControl {
         (finish, discarded.map(|pending| pending.config))
     }
 
+    fn is_active(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == STATE_NONE
+    }
+
     pub(crate) fn is_finished(&self) -> bool {
         self.state.load(Ordering::SeqCst) == STATE_FINISHED
     }
@@ -391,10 +398,10 @@ impl LoopControl {
         interaction_id: InteractionId,
         answer: InteractionAnswer,
     ) -> Result<(), AnswerError> {
-        if self.is_finished() {
+        let mut guard = lock_control(&self.inner);
+        if !guard.accepting_updates || !self.is_active() {
             return Err(AnswerError::NotActive);
         }
-        let mut guard = lock_control(&self.inner);
         let Some(slot) = guard.interaction.as_ref() else {
             return Err(AnswerError::InteractionNotFound);
         };
@@ -404,10 +411,11 @@ impl LoopControl {
         answer
             .validate(&slot.expected)
             .map_err(|_| AnswerError::WrongInteraction)?;
-        // The slot was validated above; this take cannot fail.
-        if let Some(slot) = guard.interaction.take() {
-            let _ = slot.reply.send(answer);
-        }
+        let slot = guard
+            .interaction
+            .take()
+            .expect("validated interaction slot");
+        let _ = slot.reply.send(answer);
         Ok(())
     }
 }
@@ -504,6 +512,145 @@ mod tests {
 
     fn steering() -> UserInput {
         UserInput::text("focus").unwrap()
+    }
+
+    #[test]
+    fn cancellation_closes_mutations_before_the_final_seal() {
+        use super::InteractionSlot;
+        use crate::interaction::{InteractionAnswer, InteractionKind};
+        use crate::tools::{ApprovalDecision, ApprovalRequest, ApprovalRisk};
+
+        for source in [
+            CancelSource::User,
+            CancelSource::Shutdown,
+            CancelSource::OwnerDropped,
+        ] {
+            let control = control();
+            let id = crate::InteractionId::new().unwrap();
+            let (reply, mut receiver) = tokio::sync::oneshot::channel();
+            control
+                .set_interaction(InteractionSlot::new(
+                    id,
+                    InteractionKind::Approval(
+                        ApprovalRequest::new("approve?", ApprovalRisk::Low).unwrap(),
+                    ),
+                    reply,
+                ))
+                .unwrap();
+            assert!(control.mark_cancel(source));
+            assert!(!control.is_finished());
+            assert_eq!(control.steer(steering()), Err(SteerError::NotActive));
+            assert_eq!(control.update(config()), Err(UpdateError::NotActive));
+            assert_eq!(
+                control.answer(id, InteractionAnswer::Approval(ApprovalDecision::AllowOnce)),
+                Err(crate::AnswerError::NotActive)
+            );
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            let pending = control.take_boundary();
+            assert!(pending.config.is_none());
+            assert!(pending.steers.is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn randomized_cancel_finish_steer_update_races_preserve_linearization() {
+        use tokio::sync::Barrier;
+
+        async fn ready(barrier: &Barrier, turns: u8) {
+            barrier.wait().await;
+            for _ in 0..turns % 8 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let config = config();
+        for iteration in 0..512 {
+            let control = Arc::new(control());
+            let barrier = Arc::new(Barrier::new(4));
+            let cancel_returned = Arc::new(AtomicBool::new(false));
+            let mut delays = [0; 4];
+            getrandom::fill(&mut delays).unwrap();
+            let cancel = {
+                let control = control.clone();
+                let barrier = barrier.clone();
+                let returned = cancel_returned.clone();
+                tokio::spawn(async move {
+                    ready(&barrier, delays[0]).await;
+                    let won = control.mark_cancel(CancelSource::User);
+                    returned.store(true, Ordering::SeqCst);
+                    won
+                })
+            };
+            let finish = {
+                let control = control.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    ready(&barrier, delays[1]).await;
+                    control.finish_once()
+                })
+            };
+            let steer = {
+                let control = control.clone();
+                let barrier = barrier.clone();
+                let returned = cancel_returned.clone();
+                tokio::spawn(async move {
+                    ready(&barrier, delays[2]).await;
+                    let stopped = returned.load(Ordering::SeqCst) || control.is_finished();
+                    (stopped, control.steer(steering()))
+                })
+            };
+            let update = {
+                let control = control.clone();
+                let barrier = barrier.clone();
+                let config = config.clone();
+                tokio::spawn(async move {
+                    ready(&barrier, delays[3]).await;
+                    let stopped = cancel_returned.load(Ordering::SeqCst) || control.is_finished();
+                    (stopped, control.update(config))
+                })
+            };
+            let (cancel, finish, steer, update) = tokio::join!(cancel, finish, steer, update);
+            let cancelled = cancel.unwrap();
+            let (seal, discarded) = finish.unwrap();
+            let (steer_after_stop, steered) = steer.unwrap();
+            let (update_after_stop, updated) = update.unwrap();
+            assert_eq!(
+                seal,
+                if cancelled {
+                    FinishSeal::CancelledPrior(CancelReason::User)
+                } else {
+                    FinishSeal::Clean
+                },
+                "iteration={iteration}, delays={delays:?}"
+            );
+            if steer_after_stop {
+                assert_eq!(steered, Err(SteerError::NotActive), "iteration={iteration}");
+            }
+            if update_after_stop {
+                assert_eq!(
+                    updated,
+                    Err(UpdateError::NotActive),
+                    "iteration={iteration}"
+                );
+            }
+            assert!(matches!(steered, Ok(()) | Err(SteerError::NotActive)));
+            assert!(matches!(updated, Ok(_) | Err(UpdateError::NotActive)));
+            assert_eq!(discarded.is_some(), updated.is_ok());
+            if let Ok(revision) = updated {
+                assert_eq!(revision, ConfigRevision::INITIAL.next());
+            }
+            let pending = control.take_boundary();
+            assert!(pending.config.is_none());
+            assert_eq!(pending.steers.len(), usize::from(steered.is_ok()));
+            assert_eq!(control.applied_revision(), ConfigRevision::INITIAL);
+            assert_eq!(control.finish_once().0, FinishSeal::AlreadyFinished);
+            assert!(!control.mark_cancel(CancelSource::User));
+            assert_eq!(control.steer(steering()), Err(SteerError::NotActive));
+            assert_eq!(control.update(config.clone()), Err(UpdateError::NotActive));
+        }
     }
 
     /// The finish CAS seals exactly once and, in the same mutex critical

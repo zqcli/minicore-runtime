@@ -1,9 +1,6 @@
 //! In-crate completion-semantics tests for the loop runner.
 //!
-//! These cover behavior the public API cannot reach deterministically:
-//! aborting the runner task's join handle, and the exactly-once panic
-//! fallback. Ports (model/prompt/tool/policy) isolate their own panics, so
-//! the runner-level panic path is exercised directly against its contract.
+//! Covers runner abort, completion races and real panics outside port polling.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -61,6 +58,101 @@ fn holding_config() -> ExecutionConfig {
         Arc::new(crate::prompt::DefaultPromptProvider::new(None)),
     )
     .expect("holding config must validate")
+}
+
+#[tokio::test]
+async fn a_real_runner_panic_publishes_one_report_for_join_and_all_waiters() {
+    use crate::model::{ModelEvent, ModelFinishReason};
+    use futures_util::Stream;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    struct DropStream {
+        events: std::vec::IntoIter<ModelEvent>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Stream for DropStream {
+        type Item = Result<ModelEvent, ModelError>;
+        fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.events.next().map(Ok))
+        }
+    }
+    impl Drop for DropStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+            panic!("stream destruction panics outside the port's poll isolation");
+        }
+    }
+    struct DropModel {
+        descriptor: ModelDescriptor,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Model for DropModel {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.descriptor
+        }
+        fn start<'a>(&'a self, _: ModelRequest, _: ModelCallContext) -> ModelStartFuture<'a> {
+            Box::pin(async move {
+                Ok(Box::pin(DropStream {
+                    events: vec![
+                        ModelEvent::text_delta("answer").unwrap(),
+                        ModelEvent::Finish {
+                            reason: ModelFinishReason::Stop,
+                        },
+                    ]
+                    .into_iter(),
+                    dropped: self.dropped.clone(),
+                }) as ModelStream)
+            })
+        }
+    }
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let config = ExecutionConfig::new(
+        Arc::new(DropModel {
+            descriptor: holding_config().descriptor().clone(),
+            dropped: dropped.clone(),
+        }),
+        ReasoningPreference::Auto,
+        ToolSet::default(),
+        None,
+        Arc::new(crate::prompt::DefaultPromptProvider::new(None)),
+    )
+    .unwrap();
+    let agent = AgentLoop::start(
+        LoopRequest::new(
+            Arc::from([]),
+            crate::UserInput::text("hello").unwrap(),
+            config,
+        ),
+        LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let first = agent.handle();
+    let second = agent.handle();
+    let cancellation = agent.control.cancellation();
+    let mut completion = agent.control.subscribe_completion();
+    assert!(completion.borrow_and_update().is_none());
+    let observe = async move {
+        let mut reports = Vec::new();
+        while completion.changed().await.is_ok() {
+            reports.push(completion.borrow_and_update().as_ref().unwrap().clone());
+        }
+        reports
+    };
+    let (joined, first, second, reports) =
+        tokio::join!(agent.join(), first.wait(), second.wait(), observe);
+    let report = joined.unwrap();
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(
+        matches!(&report.outcome, LoopOutcome::Failed(failure) if failure.kind == crate::LoopFailureKind::Internal)
+    );
+    assert_eq!(reports.len(), 1);
+    for observed in [first.unwrap(), second.unwrap(), reports[0].clone()] {
+        assert!(Arc::ptr_eq(&report, &observed));
+    }
+    assert!(cancellation.is_cancelled());
 }
 
 /// M1: when the runner task is aborted from outside, every waiter observes the
