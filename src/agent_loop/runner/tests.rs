@@ -142,7 +142,11 @@ async fn a_real_runner_panic_publishes_one_report_for_join_and_all_waiters() {
         reports
     };
     let (joined, first, second, reports) =
-        tokio::join!(agent.join(), first.wait(), second.wait(), observe);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(agent.join(), first.wait(), second.wait(), observe)
+        })
+        .await
+        .expect("a panicking runner must still release join and every waiter");
     let report = joined.unwrap();
     assert!(dropped.load(Ordering::SeqCst));
     assert!(

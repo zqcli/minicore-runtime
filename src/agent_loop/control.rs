@@ -612,7 +612,12 @@ mod tests {
                     (stopped, control.update(config))
                 })
             };
-            let (cancel, finish, steer, update) = tokio::join!(cancel, finish, steer, update);
+            let (cancel, finish, steer, update) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    tokio::join!(cancel, finish, steer, update)
+                })
+                .await
+                .unwrap_or_else(|_| panic!("iteration={iteration}, delays={delays:?} timed out"));
             let cancelled = cancel.unwrap();
             let (seal, discarded) = finish.unwrap();
             let (steer_after_stop, steered) = steer.unwrap();
