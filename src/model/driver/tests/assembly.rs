@@ -11,7 +11,14 @@ async fn model_text_is_normalized_and_empty_deltas_do_not_emit_progress() {
                 delta: BoundedText::new("a\r\nb\rc\0\x1b\t").unwrap(),
             }),
             Ok(ModelEvent::reasoning_delta("r\r\n\x7f").unwrap()),
-            Ok(finish(ModelFinishReason::Stop)),
+            Ok(start(call_id(1), "search")),
+            Ok(args(call_id(1), "")),
+            Ok(ModelEvent::ToolCallArgumentsDelta {
+                tool_call_id: call_id(1),
+                delta: BoundedText::new("{\r\n\"q\":\"a\x1bb\"}").unwrap(),
+            }),
+            Ok(end(call_id(1))),
+            Ok(finish(ModelFinishReason::ToolCalls)),
         ])],
     );
     let driver = model.driver(&ModelDriverConfig::default());
@@ -19,15 +26,15 @@ async fn model_text_is_normalized_and_empty_deltas_do_not_emit_progress() {
     let parent = CancellationToken::new();
     let response = driver
         .run(
-            request(),
+            tool_request(),
             context(parent.clone(), Duration::from_secs(30)),
             &progress,
         )
         .await
         .unwrap();
     assert!(
-        matches!(response.parts(), [AssistantPart::Text(text), AssistantPart::Reasoning(reason)]
-        if text.as_ref() == "a\nb\nc��\t" && reason.text() == Some("r\n�"))
+        matches!(response.parts(), [AssistantPart::Text(text), AssistantPart::Reasoning(reason), AssistantPart::ToolCall(call)]
+        if text.as_ref() == "a\nb\nc��\t" && reason.text() == Some("r\n�") && call.arguments() == &json!({"q": "a�b"}))
     );
     assert!(
         matches!(receiver.try_recv(), Ok(ModelDriverProgress::TextDelta(text)) if text.as_str() == "a\nb\nc��\t")

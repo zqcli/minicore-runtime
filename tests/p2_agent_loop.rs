@@ -5046,6 +5046,10 @@ async fn history_limit_counts_opaque_replay_at_the_exact_boundary() {
         unreachable!()
     };
     assistant.provider_replay = Some(replay);
+    assert_eq!(
+        minicore_runtime::history::estimate_history_bytes(std::slice::from_ref(&item)),
+        bytes
+    );
     for (limit, accept) in [(bytes, true), (bytes - 1, false)] {
         let (model, _) = scripted_model(vec![Round::Final { text: "ok" }]);
         let mut req = request(config(model, ToolSet::default(), None));

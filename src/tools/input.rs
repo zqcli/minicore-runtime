@@ -168,27 +168,18 @@ impl ToolInputAnswer {
         }
     }
 
-    pub(crate) fn encode_result(
-        &self,
-        request: &ToolInputRequest,
-    ) -> Result<String, ToolValueError> {
-        self.validate(request)?;
+    /// Encodes the answer already validated by the control plane against this request.
+    pub(crate) fn encode_result(&self, request: &ToolInputRequest) -> String {
         let result = match self {
             Self::Text(answer) => serde_json::to_string(&CanonicalTextResult {
                 answer: answer.as_str(),
             }),
-            Self::Choice { index } => {
-                let choice = request
-                    .choices()
-                    .get(*index)
-                    .ok_or(ToolValueError::InvalidAnswer)?;
-                serde_json::to_string(&CanonicalChoiceResult {
-                    choice_index: *index,
-                    choice: choice.as_str(),
-                })
-            }
+            Self::Choice { index } => serde_json::to_string(&CanonicalChoiceResult {
+                choice_index: *index,
+                choice: request.choices()[*index].as_str(),
+            }),
         };
-        result.map_err(|_| ToolValueError::InvalidAnswer)
+        result.expect("canonical input results contain only strings and integers")
     }
 }
 

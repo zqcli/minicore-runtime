@@ -27,7 +27,7 @@ pub struct ToolSpec {
 
 impl fmt::Debug for ToolSpec {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let schema_bytes = serde_json::to_vec(&self.input_schema).map_or(0, |bytes| bytes.len());
+        let schema_bytes = crate::value::json_bytes(&self.input_schema);
         let schema_object_keys = self
             .input_schema
             .as_object()
@@ -69,7 +69,15 @@ impl ToolSpec {
     }
 
     pub fn validate(&self) -> Result<(), ToolValueError> {
-        self.validate_with_budgets(MAX_TOOL_DESCRIPTION_BYTES, MAX_JSON_BYTES)
+        if !valid_text(self.description.as_str(), MAX_TOOL_DESCRIPTION_BYTES, false) {
+            return Err(ToolValueError::InvalidText);
+        }
+        if !self.input_schema.is_object()
+            || validate_json_size(&self.input_schema, MAX_JSON_BYTES).is_err()
+        {
+            return Err(ToolValueError::InvalidSchema);
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_for_bindings(
@@ -83,22 +91,6 @@ impl ToolSpec {
             return Err(ToolValueError::InvalidText);
         }
         if crate::value::json_bytes(&self.input_schema) > max_schema_bytes {
-            return Err(ToolValueError::InvalidSchema);
-        }
-        Ok(())
-    }
-
-    fn validate_with_budgets(
-        &self,
-        max_description_bytes: usize,
-        max_schema_bytes: usize,
-    ) -> Result<(), ToolValueError> {
-        if !valid_text(self.description.as_str(), max_description_bytes, false) {
-            return Err(ToolValueError::InvalidText);
-        }
-        if !self.input_schema.is_object()
-            || validate_json_size(&self.input_schema, max_schema_bytes).is_err()
-        {
             return Err(ToolValueError::InvalidSchema);
         }
         Ok(())

@@ -39,8 +39,8 @@ pub trait Model: Send + Sync + 'static {
 
 ## Outcomes
 
-Runtime owns display-text normalization. Text/reasoning deltas, assistant text
-in response constructors, and reasoning text/summary constructors accept control
+Runtime owns model-text normalization. Text/reasoning/argument deltas, assistant
+text in response constructors, and reasoning text/summary constructors accept control
 characters: within each payload CRLF and lone CR become LF, and other controls
 except LF/TAB become U+FFFD. Byte limits apply after normalization. Empty deltas
 are valid and ignored by assembly (no part or progress event). Public event
@@ -57,9 +57,9 @@ deadline, and any event after Finish is invalid.
   final-seal decision). `Length` / `ContentFiltered` / `Refused` map to the
   corresponding failure kinds; `Unknown`/`ToolCalls` mislabels are
   `InvalidModelResponse`.
-- Streaming: deltas (`TextDelta`, `ReasoningDelta`) and per-tool-call
-  argument deltas are forwarded as best-effort events; they carry no
-  correctness weight.
+- Streaming: `TextDelta` and `ReasoningDelta` are forwarded as best-effort
+  events; they carry no correctness weight. Tool-argument deltas are assembled
+  privately and are never forwarded as progress.
 - Model timeouts, retry exhaustion, panics, and malformed responses surface
   as `Failed(Model)` or `Failed(InvalidModelResponse)` (or the specific
   mapping in the loop contract), never as a hang. In both model and

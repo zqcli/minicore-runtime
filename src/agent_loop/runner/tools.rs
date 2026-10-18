@@ -224,10 +224,7 @@ pub(super) async fn run_tool_call(
             };
             match answer {
                 InteractionAnswer::ToolInput(answer) => {
-                    let content = match answer.encode_result(&request) {
-                        Ok(content) => content,
-                        Err(_) => return ToolStep::End(FailPath::Internal),
-                    };
+                    let content = answer.encode_result(&request);
                     ToolStep::Result(provided_input_result(
                         ctx.id,
                         request_index,

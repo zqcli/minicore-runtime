@@ -130,6 +130,7 @@ impl<'a> Assembler<'a> {
                 tool_call_id,
                 delta,
             } => {
+                let delta = normalized_delta(delta)?;
                 let tool = self.tool_mut(&tool_call_id)?;
                 if tool.call.is_some() {
                     return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
