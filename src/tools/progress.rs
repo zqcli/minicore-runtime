@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::value::BoundedText;
+use crate::value::{BoundedText, valid_text};
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct ToolProgress {
@@ -28,6 +28,8 @@ impl fmt::Debug for ToolProgress {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolProgressError {
+    #[error("tool progress contains disallowed control characters")]
+    InvalidText,
     #[error("tool progress completed value exceeds total")]
     CompletedExceedsTotal,
 }
@@ -48,6 +50,13 @@ impl ToolProgress {
     }
 
     pub fn validate(&self) -> Result<(), ToolProgressError> {
+        if self
+            .message
+            .as_ref()
+            .is_some_and(|message| !valid_text(message.as_str(), BoundedText::MAX_BYTES, true))
+        {
+            return Err(ToolProgressError::InvalidText);
+        }
         if let (Some(completed), Some(total)) = (self.completed, self.total) {
             if completed > total {
                 return Err(ToolProgressError::CompletedExceedsTotal);

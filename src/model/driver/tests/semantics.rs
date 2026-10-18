@@ -126,7 +126,7 @@ async fn repeated_text_and_reasoning_aggregate_in_first_occurrence_order() {
             AssistantPart::Text(text),
             AssistantPart::ToolCall(call),
             AssistantPart::Reasoning(reasoning),
-        ] if text == "answer-continued"
+        ] if text.as_ref() == "answer-continued"
             && call.tool_call_id() == &id
             && reasoning.text() == Some("reason-continued")
     ));

@@ -16,9 +16,10 @@ pub trait PromptProvider: Send + Sync + 'static {
 - The host supplies the provider; `DefaultPromptProvider` is the built-in
   strict projection. The runtime never rejects a `start` because of a
   provider; provider problems surface as `Failed(Prompt)`.
-- `prepare` runs under cancel/timeout/panic isolation. `PromptError::Cancelled`
-  and turn-deadline map to the respective ending paths; anything else is a
-  `Prompt` failure.
+- `prepare` runs under cancel/timeout/panic isolation. Every returned error,
+  including `PromptError::Cancelled`, is a `Prompt` failure. Cancellation or a
+  loop deadline observed by the runtime takes its respective ending path; a
+  prompt-only timeout is a `Prompt` failure.
 
 ## DefaultProjection
 

@@ -10,10 +10,11 @@ use super::types::ToolName;
 #[derive(Clone, Default)]
 pub struct ToolSet {
     tools: Arc<BTreeMap<ToolName, Arc<dyn Tool>>>,
-    specs: Arc<BTreeMap<ToolName, ToolSpec>>,
+    specs: Arc<[ToolSpec]>,
+    enabled: EnabledTools,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct EnabledTools {
     entries: Arc<BTreeMap<ToolName, EnabledTool>>,
 }
@@ -61,31 +62,20 @@ impl ToolSet {
     pub fn specs_for(&self, enabled: &BTreeSet<ToolName>) -> Vec<ToolSpec> {
         enabled
             .iter()
-            .filter_map(|name| self.specs.get(name).cloned())
+            .filter_map(|name| self.enabled.get(name).map(|tool| tool.spec.clone()))
             .collect()
     }
 
     pub(crate) fn frozen_specs(&self) -> impl ExactSizeIterator<Item = &ToolSpec> {
-        self.specs.values()
+        self.specs.iter()
     }
 
-    pub(crate) fn enabled_subset(&self, enabled: &BTreeSet<ToolName>) -> EnabledTools {
-        let mut entries = BTreeMap::new();
-        for name in enabled {
-            if let (Some(implementation), Some(spec)) = (self.tools.get(name), self.specs.get(name))
-            {
-                entries.insert(
-                    name.clone(),
-                    EnabledTool {
-                        implementation: Arc::clone(implementation),
-                        spec: spec.clone(),
-                    },
-                );
-            }
-        }
-        EnabledTools {
-            entries: Arc::new(entries),
-        }
+    pub(crate) fn shared_specs(&self) -> Arc<[ToolSpec]> {
+        Arc::clone(&self.specs)
+    }
+
+    pub(crate) fn all_enabled(&self) -> &EnabledTools {
+        &self.enabled
     }
 }
 
@@ -132,14 +122,25 @@ impl ToolSetBuilder {
             return Err(error);
         }
         let mut tools = BTreeMap::new();
-        let mut specs = BTreeMap::new();
+        let mut specs = Vec::with_capacity(self.tools.len());
+        let mut entries = BTreeMap::new();
         for (name, registered) in self.tools {
             tools.insert(name.clone(), Arc::clone(&registered.tool));
-            specs.insert(name, registered.spec);
+            specs.push(registered.spec.clone());
+            entries.insert(
+                name,
+                EnabledTool {
+                    implementation: registered.tool,
+                    spec: registered.spec,
+                },
+            );
         }
         Ok(ToolSet {
             tools: Arc::new(tools),
-            specs: Arc::new(specs),
+            specs: specs.into(),
+            enabled: EnabledTools {
+                entries: Arc::new(entries),
+            },
         })
     }
 }

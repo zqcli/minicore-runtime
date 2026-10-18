@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::value::BoundedText;
+use crate::value::{BoundedText, ValueError, valid_text};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,7 +40,7 @@ pub enum DiagnosticCode {
 pub struct DiagnosticSummary {
     pub code: DiagnosticCode,
     pub category: DiagnosticCategory,
-    pub message: BoundedText,
+    message: BoundedText,
     pub retryable: bool,
 }
 
@@ -57,18 +57,25 @@ impl fmt::Debug for DiagnosticSummary {
 }
 
 impl DiagnosticSummary {
-    pub const fn new(
+    pub const fn message(&self) -> &BoundedText {
+        &self.message
+    }
+
+    pub fn new(
         code: DiagnosticCode,
         category: DiagnosticCategory,
         message: BoundedText,
         retryable: bool,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ValueError> {
+        if !valid_text(message.as_str(), BoundedText::MAX_BYTES, true) {
+            return Err(ValueError::InvalidText);
+        }
+        Ok(Self {
             code,
             category,
             message,
             retryable,
-        }
+        })
     }
 
     pub(crate) fn bounded_static(
@@ -83,6 +90,7 @@ impl DiagnosticSummary {
             BoundedText::new(message).expect("static diagnostic must fit BoundedText"),
             retryable,
         )
+        .expect("static diagnostic text is valid")
     }
 }
 
@@ -101,11 +109,7 @@ impl<'de> Deserialize<'de> for DiagnosticSummary {
         D: serde::Deserializer<'de>,
     {
         let value = DiagnosticSummaryWire::deserialize(deserializer)?;
-        Ok(Self::new(
-            value.code,
-            value.category,
-            value.message,
-            value.retryable,
-        ))
+        Self::new(value.code, value.category, value.message, value.retryable)
+            .map_err(serde::de::Error::custom)
     }
 }

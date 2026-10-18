@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
 use super::{FailPath, LoopCtx};
@@ -30,6 +29,91 @@ pub(super) enum ToolStep {
     End(FailPath),
 }
 
+pub(super) fn settle_calls(
+    ctx: &LoopCtx<'_>,
+    working: &mut crate::history::WorkingHistory,
+    request_index: u32,
+    calls: &[&crate::model::ToolCall],
+    outcome: ToolResultOutcome,
+    message: &'static str,
+) {
+    for call in calls {
+        working.append_tool_result(terminal_tool_result(
+            ctx.id,
+            request_index,
+            call.tool_call_id(),
+            call.name(),
+            outcome,
+            message,
+            ctx.options.limits.max_tool_output_bytes,
+        ));
+    }
+}
+
+pub(super) async fn run_tool_batch(
+    ctx: &mut LoopCtx<'_>,
+    working: &mut crate::history::WorkingHistory,
+    request_index: u32,
+    snapshot: &crate::execution::ExecutionConfig,
+    calls: &[&crate::model::ToolCall],
+) -> Option<FailPath> {
+    let cancellation = ctx.control.cancellation();
+    for (index, call) in calls.iter().enumerate() {
+        let step = if cancellation.is_cancelled() {
+            ToolStep::End(FailPath::Cancelled)
+        } else {
+            let enabled = snapshot
+                .tools()
+                .all_enabled()
+                .get(call.name())
+                .expect("assembler accepts only tools from this request's frozen set");
+            let invocation = ToolInvocation {
+                tool_call_id: call.tool_call_id().clone(),
+                tool_name: call.name().clone(),
+                arguments: call.arguments().clone(),
+            };
+            ctx.sink.try_emit(LoopEvent::ToolStarted {
+                loop_id: ctx.id,
+                request_index,
+                call_id: call.tool_call_id().clone(),
+                tool_name: call.name().clone(),
+            });
+            run_tool_call(
+                ctx,
+                request_index,
+                &invocation,
+                enabled,
+                snapshot.policy().cloned(),
+            )
+            .await
+        };
+        match step {
+            ToolStep::Result(result) => {
+                ctx.sink.try_emit(LoopEvent::ToolFinished {
+                    loop_id: ctx.id,
+                    request_index,
+                    call_id: call.tool_call_id().clone(),
+                    outcome: result.outcome,
+                    output_bytes: result.output.content().byte_len(),
+                });
+                working.append_tool_result(result);
+            }
+            ToolStep::End(path) => {
+                settle_calls(
+                    ctx,
+                    working,
+                    request_index,
+                    &calls[index..],
+                    ToolResultOutcome::Cancelled,
+                    "tool batch interrupted",
+                );
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 /// Executes one tool call: policy decision, optional interaction, and the
 /// tool port itself. Ordinary tool failures become `Failed` results so the
 /// model can continue; only cancelled/deadline/broken interactions end the
@@ -40,7 +124,6 @@ pub(super) async fn run_tool_call(
     invocation: &ToolInvocation,
     enabled: &EnabledTool,
     policy: Option<Arc<dyn ToolPolicy>>,
-    turn_deadline: Instant,
 ) -> ToolStep {
     let cancellation = ctx.control.cancellation();
 
@@ -48,7 +131,7 @@ pub(super) async fn run_tool_call(
         policy,
         invocation,
         enabled.spec.clone(),
-        turn_deadline,
+        super::turn_deadline(ctx.options.deadline),
         &cancellation,
         ctx.options.policy_timeout,
     )
@@ -81,7 +164,6 @@ pub(super) async fn run_tool_call(
             invocation,
             interaction_id,
             InteractionKind::Approval(request),
-            turn_deadline,
             reply,
             receiver,
         )
@@ -110,7 +192,7 @@ pub(super) async fn run_tool_call(
         request_index,
         invocation,
         Arc::clone(&enabled.implementation),
-        turn_deadline,
+        super::turn_deadline(ctx.options.deadline),
     )
     .await
     {
@@ -132,7 +214,6 @@ pub(super) async fn run_tool_call(
                 invocation,
                 interaction_id,
                 InteractionKind::ToolInput(request.clone()),
-                turn_deadline,
                 reply,
                 receiver,
             )
@@ -330,9 +411,6 @@ struct LoopToolProgress {
 
 impl ToolProgressEmitter for LoopToolProgress {
     fn emit(&self, progress: ToolProgress) -> bool {
-        if progress.validate().is_err() {
-            return false;
-        }
         match self.sender.try_send((self.call_id.clone(), progress)) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -349,7 +427,6 @@ async fn wait_interaction(
     invocation: &ToolInvocation,
     interaction_id: InteractionId,
     kind: InteractionKind,
-    turn_deadline: Instant,
     reply: oneshot::Sender<InteractionAnswer>,
     mut receiver: oneshot::Receiver<InteractionAnswer>,
 ) -> Result<InteractionAnswer, FailPath> {
@@ -374,17 +451,19 @@ async fn wait_interaction(
     });
 
     let cancellation = ctx.control.cancellation();
-    // The loop deadline is a hard upper bound even while waiting for user
-    // input: when it wins, the loop ends as Cancelled(Deadline) through the
-    // same control linearization as every other ending path.
-    let deadline = TokioInstant::from_std(turn_deadline);
+    let timeout = async {
+        match ctx.options.deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
+    };
     let answer = tokio::select! {
         biased;
         _ = cancellation.cancelled() => {
             ctx.control.take_interaction();
             return Err(FailPath::Cancelled);
         }
-        _ = tokio::time::sleep_until(deadline) => {
+        _ = timeout => {
             ctx.control.take_interaction();
             return Err(FailPath::Deadline);
         }

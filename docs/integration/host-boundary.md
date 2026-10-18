@@ -18,7 +18,7 @@ one loop and returns control. Concretely:
 ## One-Shot Contract
 
 - `AgentLoop` runs once. `join()` waits for the run and returns
-  `Arc<LoopReport>`; a second join or `wait` also returns the same report as
+  `Arc<LoopReport>`; every handle `wait` returns the same report as
   long as the runner has published it. If the runner task is gone before
   publishing, waiters observe `LoopWaitError::CompletionClosed`.
 - Dropping the `AgentLoop` cancels the loop best-effort without blocking.
@@ -43,8 +43,8 @@ one loop and returns control. Concretely:
 - `update` and `steer` stage for the **next model request**; the current tool
   batch keeps the snapshot of the request that produced it. A successful call
   means the steer was accepted into this process-local queue and is applied at
-  the next request boundary; if the loop is cancelled, shut down, or the
-  process exits before that boundary, the queued steer may be discarded and
+  the next request boundary; on any non-`Completed` ending or process exit
+  before that boundary, the queued steer is discarded and
   will not appear in `LoopReport::appended`. Steers are bounded by
   `max_pending_steers` (`QueueFull`) and rejected on `WaitingForInput` or
   `NotActive`.
@@ -58,3 +58,14 @@ Old hosts that owned sessions via the v0.3 runtime lose session
 open/load/save and durable conversation. See
 [`docs/migrations/v0.3-to-v0.4.md`](../migrations/v0.3-to-v0.4.md) for the
 concrete upgrade path, including what is intentionally not migrated.
+## Adapter Obligations
+
+- Futures and streams must cooperate with the executor and must not block its
+  threads. Offload blocking work; runtime timeouts cannot preempt synchronous code.
+- Enable unwinding (`panic = "unwind"`) for panic isolation. Abort-mode panics
+  terminate the process and cannot produce a report.
+- Futures/streams are dropped on cancellation or timeout. Make them cancellation
+  safe, and arrange cleanup of any spawned work using the supplied child token.
+- Tool deadlines win ties with ready results. Side effects may already have
+  happened even when the report records failure; hosts own reconciliation and
+  must not assume that retrying the whole loop is safe.

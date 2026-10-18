@@ -1,5 +1,7 @@
 use std::fmt;
 use std::io::{self, Write};
+use std::str::FromStr;
+use std::sync::Arc;
 
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -12,6 +14,8 @@ pub const MAX_JSON_NODES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ValueError {
+    #[error("text contains disallowed control characters")]
+    InvalidText,
     #[error("bounded text limit exceeds the absolute cap")]
     TextLimitTooLarge,
     #[error("bounded text exceeds its byte limit")]
@@ -29,7 +33,7 @@ pub enum ValueError {
 }
 
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct BoundedText(String);
+pub struct BoundedText(Arc<str>);
 
 impl BoundedText {
     pub const MAX_BYTES: usize = MAX_TEXT_BYTES;
@@ -49,7 +53,7 @@ impl BoundedText {
         if value.len() > max_bytes {
             return Err(ValueError::TextTooLarge);
         }
-        Ok(Self(value.to_owned()))
+        Ok(Self(Arc::from(value)))
     }
 
     pub fn as_str(&self) -> &str {
@@ -57,7 +61,11 @@ impl BoundedText {
     }
 
     pub fn into_string(self) -> String {
-        self.0
+        self.0.to_string()
+    }
+
+    pub(crate) fn shared(&self) -> Arc<str> {
+        Arc::clone(&self.0)
     }
 
     pub fn byte_len(&self) -> usize {
@@ -67,6 +75,80 @@ impl BoundedText {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+pub(crate) fn valid_text(value: &str, maximum: usize, allow_empty: bool) -> bool {
+    (allow_empty || !value.is_empty())
+        && value.len() <= maximum
+        && value
+            .chars()
+            .all(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+}
+
+/// Normalize display text, leaving opaque metadata and JSON interpretation to their owners.
+pub(crate) fn normalize_model_text(value: &str) -> std::borrow::Cow<'_, str> {
+    if valid_text(value, usize::MAX, true) {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let mut text = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        text.push(match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                '\n'
+            }
+            '\n' | '\t' => c,
+            c if c.is_control() => '\u{fffd}',
+            c => c,
+        });
+    }
+    std::borrow::Cow::Owned(text)
+}
+
+pub(crate) fn deserialize_from_str<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    let value = String::deserialize(deserializer)?;
+    value.parse().map_err(de::Error::custom)
+}
+
+macro_rules! string_newtype_serde {
+    ($name:ident) => {
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Display::fmt(self, f)
+            }
+        }
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                crate::value::deserialize_from_str(deserializer)
+            }
+        }
+    };
+}
+pub(crate) use string_newtype_serde;
+
+pub(crate) fn json_bytes(value: &serde_json::Value) -> usize {
+    let mut sink = JsonCountingWriter::new(usize::MAX);
+    serde_json::to_writer(&mut sink, value)
+        .expect("JSON Value serialization to a counter cannot fail");
+    sink.written
 }
 
 impl AsRef<str> for BoundedText {

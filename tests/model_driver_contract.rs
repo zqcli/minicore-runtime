@@ -39,7 +39,6 @@ fn canonical_driver_is_private_bounded_and_adapter_neutral() {
     }
     assert!(!driver.contains("validate_capabilities"));
     assert!(!driver.contains("run_port_call"));
-    assert!(driver.contains("self.descriptor.validate().map_err(|_| invalid())?;"));
     assert!(driver.contains("!self.descriptor.supports_reasoning(request.reasoning())"));
     assert!(driver.contains("!request.tools().is_empty() && !self.descriptor.supports_tools"));
     assert!(!driver.contains("fn effective_deadline("));

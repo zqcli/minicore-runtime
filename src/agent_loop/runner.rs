@@ -16,7 +16,7 @@ use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::WorkingHistory;
 use crate::ids::LoopId;
 use crate::model::{ModelError, ModelFinishReason, Usage};
-use crate::tools::{EnabledTools, ToolInvocation, ToolResultOutcome, ToolSet};
+use crate::tools::ToolResultOutcome;
 use crate::usage::UsageAccumulator;
 
 use super::control::FinishSeal;
@@ -28,7 +28,7 @@ mod model;
 mod tools;
 
 use self::model::{PromptPrep, build_model_request, map_model_failure, prepare_prompt, run_model};
-use self::tools::{ToolStep, run_tool_call, terminal_tool_result};
+use self::tools::{run_tool_batch, settle_calls};
 
 #[cfg(test)]
 mod tests;
@@ -140,6 +140,7 @@ async fn run_loop_inner(
     let mut requests: u32 = 0;
     let mut last_issued_request_index: Option<u32> = None;
     let mut usage = UsageAccumulator::default();
+    let mut discarded_config = None;
 
     let end = loop {
         if cancellation.is_cancelled() {
@@ -314,43 +315,27 @@ async fn run_loop_inner(
                         request_index = request_index.saturating_add(1);
                         continue;
                     }
-                    FinalGate::Seal => break FailPath::Completed,
+                    FinalGate::Seal(discarded) => {
+                        discarded_config = discarded;
+                        break FailPath::Completed;
+                    }
                 }
             }
             break path;
         }
         if options.max_tool_rounds != 0 && tool_rounds >= u64::from(options.max_tool_rounds) {
-            for call in &tool_calls {
-                working.append_tool_result(terminal_tool_result(
-                    id,
-                    request_index,
-                    call.tool_call_id(),
-                    call.name(),
-                    ToolResultOutcome::Failed,
-                    "tool round limit reached",
-                    ctx.options.limits.max_tool_output_bytes,
-                ));
-            }
+            settle_calls(
+                &ctx,
+                &mut working,
+                request_index,
+                &tool_calls,
+                ToolResultOutcome::Failed,
+                "tool round limit reached",
+            );
             break FailPath::MaxToolRounds;
         }
-        let Some(next_tool_rounds) = tool_rounds.checked_add(1) else {
-            for call in &tool_calls {
-                working.append_tool_result(terminal_tool_result(
-                    id,
-                    request_index,
-                    call.tool_call_id(),
-                    call.name(),
-                    ToolResultOutcome::Failed,
-                    "tool round count overflow",
-                    ctx.options.limits.max_tool_output_bytes,
-                ));
-            }
-            break FailPath::Internal;
-        };
-        tool_rounds = next_tool_rounds;
+        tool_rounds = tool_rounds.saturating_add(1);
 
-        let enabled = all_enabled(snapshot.tools());
-        let policy = snapshot.policy().cloned();
         ctx.publish(LoopState {
             loop_id: id,
             status: LoopStatus::RunningTools,
@@ -360,113 +345,21 @@ async fn run_loop_inner(
             pending_interaction: None,
         });
 
-        let mut abort: Option<FailPath> = None;
-        for call in &tool_calls {
-            if abort.is_some() {
-                working.append_tool_result(terminal_tool_result(
-                    id,
-                    request_index,
-                    call.tool_call_id(),
-                    call.name(),
-                    ToolResultOutcome::Cancelled,
-                    "tool batch interrupted",
-                    ctx.options.limits.max_tool_output_bytes,
-                ));
-                continue;
-            }
-            if cancellation.is_cancelled() {
-                abort = Some(FailPath::Cancelled);
-                working.append_tool_result(terminal_tool_result(
-                    id,
-                    request_index,
-                    call.tool_call_id(),
-                    call.name(),
-                    ToolResultOutcome::Cancelled,
-                    "tool batch interrupted",
-                    ctx.options.limits.max_tool_output_bytes,
-                ));
-                continue;
-            }
-            let Some(enabled_tool) = enabled.get(call.name()) else {
-                working.append_tool_result(terminal_tool_result(
-                    id,
-                    request_index,
-                    call.tool_call_id(),
-                    call.name(),
-                    ToolResultOutcome::Failed,
-                    "tool unavailable",
-                    ctx.options.limits.max_tool_output_bytes,
-                ));
-                continue;
-            };
-            let invocation = match ToolInvocation::new(
-                call.tool_call_id().clone(),
-                call.name().clone(),
-                call.arguments().clone(),
-            ) {
-                Ok(invocation) => invocation,
-                Err(_) => {
-                    working.append_tool_result(terminal_tool_result(
-                        id,
-                        request_index,
-                        call.tool_call_id(),
-                        call.name(),
-                        ToolResultOutcome::Failed,
-                        "invalid tool invocation",
-                        ctx.options.limits.max_tool_output_bytes,
-                    ));
-                    continue;
-                }
-            };
-            ctx.sink.try_emit(LoopEvent::ToolStarted {
-                loop_id: id,
-                request_index,
-                call_id: call.tool_call_id().clone(),
-                tool_name: call.name().clone(),
-            });
-            match run_tool_call(
-                &mut ctx,
-                request_index,
-                &invocation,
-                enabled_tool,
-                policy.clone(),
-                turn_deadline(loop_deadline),
-            )
-            .await
-            {
-                ToolStep::Result(result) => {
-                    let output_bytes = result.output.content().byte_len();
-                    let outcome = result.outcome;
-                    working.append_tool_result(result);
-                    ctx.sink.try_emit(LoopEvent::ToolFinished {
-                        loop_id: id,
-                        request_index,
-                        call_id: call.tool_call_id().clone(),
-                        outcome,
-                        output_bytes,
-                    });
-                }
-                ToolStep::End(path) => {
-                    abort = Some(path);
-                    working.append_tool_result(terminal_tool_result(
-                        id,
-                        request_index,
-                        call.tool_call_id(),
-                        call.name(),
-                        ToolResultOutcome::Cancelled,
-                        "tool batch interrupted",
-                        ctx.options.limits.max_tool_output_bytes,
-                    ));
-                }
-            }
-        }
-        if let Some(path) = abort {
+        if let Some(path) = run_tool_batch(
+            &mut ctx,
+            &mut working,
+            request_index,
+            &snapshot,
+            &tool_calls,
+        )
+        .await
+        {
             break path;
         }
         request_index = request_index.saturating_add(1);
     };
 
-    finish_loop(
+    let report = finish_loop(
         &mut ctx,
         end,
         working,
@@ -474,7 +367,14 @@ async fn run_loop_inner(
         requests,
         last_issued_request_index,
         tool_rounds,
-    )
+    );
+    drop_config(discarded_config);
+    report
+}
+
+fn drop_config(config: Option<Arc<ExecutionConfig>>) {
+    // Destructors belong to the host. Never let them unwind across publication.
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| drop(config)));
 }
 
 fn finish_loop(
@@ -494,28 +394,16 @@ fn finish_loop(
     // Read cancellation intent before sealing: cancel_reason is only readable
     // while the shared state is still a cancel marker.
     let intended = outcome_for(ctx.control, path);
-    let finish = ctx.control.finish_once();
+    let (finish, discarded) = ctx.control.finish_once();
     let outcome = match finish {
         FinishSeal::Clean => intended,
         // A cancellation won the linearization point; it is authoritative.
         FinishSeal::CancelledPrior(reason) => LoopOutcome::Cancelled(reason),
         FinishSeal::AlreadyFinished => {
-            // Exactly-once: a prior completion already sealed the loop and
-            // published its report. Hand back the very same `Arc` so join/wait
-            // compare equal (panic-after-publish contract). Unreachable inside
-            // the single runner task; the fallback guards an as-yet-unpublished
-            // seal.
-            return ctx.control.published_report().unwrap_or_else(|| {
-                Arc::new(LoopReport {
-                    loop_id: id,
-                    outcome: intended,
-                    appended: working.into_appended(),
-                    usage,
-                    requests,
-                    tool_rounds,
-                    final_config_revision: revision,
-                })
-            });
+            return ctx
+                .control
+                .published_report()
+                .expect("sealed runner has published its report");
         }
     };
 
@@ -542,6 +430,7 @@ fn finish_loop(
     // Every ending path cancels the root token so provider temporary state is
     // released even when cancellation was not what ended the loop.
     ctx.control.cancellation().cancel();
+    drop_config(discarded);
     report
 }
 
@@ -588,29 +477,28 @@ fn panic_report(
         tool_rounds: 0,
         final_config_revision: ConfigRevision::INITIAL,
     });
-    if matches!(control.finish_once(), FinishSeal::AlreadyFinished) {
+    let (finish, discarded) = control.finish_once();
+    if matches!(finish, FinishSeal::AlreadyFinished) {
         // Exactly-once: never overwrite a report already delivered by the
         // normal completion path. Return that same `Arc` so waiters still
         // observe one report identity (panic-after-publish case).
-        return control.published_report().unwrap_or(report);
+        return control
+            .published_report()
+            .expect("sealed runner has published its report");
     }
     let state = LoopState::new(control.id, LoopStatus::Finished, 0, ConfigRevision::INITIAL);
     control.publish_state(state);
     let _ = completion_tx.send_replace(Some(Arc::clone(&report)));
     control.cancellation().cancel();
+    drop_config(discarded);
     report
 }
 
 fn turn_deadline(loop_deadline: Option<TokioInstant>) -> Instant {
     match loop_deadline {
         Some(deadline) => deadline.into_std(),
-        None => Instant::now() + LOOP_HORIZON,
+        None => (TokioInstant::now() + LOOP_HORIZON).into_std(),
     }
-}
-
-fn all_enabled(set: &ToolSet) -> EnabledTools {
-    let names = set.frozen_specs().map(|spec| spec.name().clone()).collect();
-    set.enabled_subset(&names)
 }
 
 fn outcome_for(control: &LoopControl, path: FailPath) -> LoopOutcome {

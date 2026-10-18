@@ -184,6 +184,8 @@ impl AgentLoop {
 
     /// Waits for the loop to finish without cancelling it. Returns the same
     /// `Arc<LoopReport>` as `LoopHandle::wait`.
+    /// Dropping this future cancels the loop with `OwnerDropped`. For a wait
+    /// that does not own the loop, use `LoopHandle::wait`.
     pub async fn join(mut self) -> Result<Arc<LoopReport>, LoopJoinError> {
         let Some(join) = self.join.take() else {
             return Err(LoopJoinError::TaskCancelled);
@@ -194,7 +196,7 @@ impl AgentLoop {
     /// Cancels and waits for the runner task, returning its final report.
     pub async fn shutdown(mut self) -> Result<Arc<LoopReport>, LoopJoinError> {
         self.control
-            .mark_cancel(crate::agent_loop::CancelReason::Shutdown);
+            .mark_cancel(crate::agent_loop::control::CancelSource::Shutdown);
         let join = self.join.take().ok_or(LoopJoinError::TaskCancelled)?;
         join.await.map_err(|_| LoopJoinError::TaskCancelled)
     }
@@ -202,7 +204,8 @@ impl AgentLoop {
 
 impl Drop for AgentLoop {
     fn drop(&mut self) {
-        self.control.mark_cancel(CancelReason::OwnerDropped);
+        self.control
+            .mark_cancel(crate::agent_loop::control::CancelSource::OwnerDropped);
     }
 }
 
@@ -223,6 +226,7 @@ pub struct LoopReport {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum LoopOutcome {
     Completed,
     Cancelled(CancelReason),
@@ -230,6 +234,7 @@ pub enum LoopOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum CancelReason {
     User,
     OwnerDropped,

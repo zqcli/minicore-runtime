@@ -1,3 +1,4 @@
+use crate::value::valid_text;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -10,7 +11,6 @@ use tokio_util::sync::CancellationToken;
 use crate::value::BoundedText;
 
 use super::tool::{ToolInvocation, ToolSpec};
-use super::types::valid_text;
 
 pub const MAX_TOOL_POLICY_TEXT_BYTES: usize = 8_192;
 

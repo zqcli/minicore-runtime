@@ -1,7 +1,7 @@
+use crate::value::deserialize_from_str;
 use std::fmt;
 use std::str::FromStr;
 
-use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
@@ -70,16 +70,6 @@ fn encode_runtime_id(prefix: &str, bytes: &[u8; 16]) -> String {
         write!(value, "{byte:02x}").expect("writing to String cannot fail");
     }
     value
-}
-
-fn deserialize_from_str<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: FromStr,
-    T::Err: fmt::Display,
-{
-    let value = String::deserialize(deserializer)?;
-    value.parse().map_err(D::Error::custom)
 }
 
 macro_rules! runtime_id {
@@ -175,32 +165,4 @@ impl FromStr for ToolCallId {
     }
 }
 
-impl fmt::Display for ToolCallId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl fmt::Debug for ToolCallId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, formatter)
-    }
-}
-
-impl Serialize for ToolCallId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for ToolCallId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserialize_from_str(deserializer)
-    }
-}
+crate::value::string_newtype_serde!(ToolCallId);

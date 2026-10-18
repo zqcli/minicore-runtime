@@ -44,7 +44,8 @@ async fn excessive_retry_after_started_unknown_and_nonretryable_do_not_retry() {
         DiagnosticCategory::Model,
         BoundedText::new("test model error").unwrap(),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     let cases = vec![
         ModelError::not_started(
             ModelErrorKind::ProviderUnavailable,

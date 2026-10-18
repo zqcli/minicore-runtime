@@ -1,3 +1,4 @@
+use crate::value::valid_text;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -123,12 +124,12 @@ impl ToolInputRequest {
     }
 
     pub fn validate(&self) -> Result<(), ToolValueError> {
-        if !valid_input_text(self.prompt.as_str(), 8_192, false)
+        if !valid_text(self.prompt.as_str(), 8_192, false)
             || self.choices.len() > 32
             || self
                 .choices
                 .iter()
-                .any(|choice| !valid_input_text(choice.as_str(), 1_024, false))
+                .any(|choice| !valid_text(choice.as_str(), 1_024, false))
             || (matches!(self.answer_kind, ToolInputAnswerKind::SingleChoice)
                 && self.choices.is_empty())
         {
@@ -191,14 +192,8 @@ impl ToolInputAnswer {
     }
 }
 
-fn valid_input_text(value: &str, maximum: usize, allow_empty: bool) -> bool {
-    (allow_empty || !value.is_empty())
-        && value.len() <= maximum
-        && value.chars().all(|character| !character.is_control())
-}
-
 fn validate_answer_text(value: &str) -> Result<(), ToolValueError> {
-    if valid_input_text(value, 8_192, false) {
+    if valid_text(value, 8_192, false) {
         Ok(())
     } else {
         Err(ToolValueError::InvalidAnswer)

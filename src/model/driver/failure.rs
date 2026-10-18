@@ -183,7 +183,8 @@ pub(super) fn generated_error(kind: ModelErrorKind, delivery: DeliveryState) -> 
         DiagnosticCategory::Model,
         BoundedText::new(msg).expect("static diagnostic must fit BoundedText"),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     match delivery {
         DeliveryState::NotStarted => {
             ModelError::permanent(kind, DeliveryState::NotStarted, diagnostic)

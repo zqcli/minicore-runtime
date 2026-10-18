@@ -39,6 +39,20 @@ pub trait Model: Send + Sync + 'static {
 
 ## Outcomes
 
+Runtime owns display-text normalization. Text/reasoning deltas, assistant text
+in response constructors, and reasoning text/summary constructors accept control
+characters: within each payload CRLF and lone CR become LF, and other controls
+except LF/TAB become U+FFFD. Byte limits apply after normalization. Empty deltas
+are valid and ignored by assembly (no part or progress event). Public event
+variants receive the same normalization at the adapter boundary. Opaque replay,
+encrypted reasoning and signatures retain their own validation rules. Tool
+arguments must still assemble into a bounded JSON object.
+
+Each model attempt receives a child cancellation token, cancelled on every
+attempt ending, including successful EOF, failure, timeout and dropped futures.
+The driver waits for EOF after Finish; a pending stream remains subject to its
+deadline, and any event after Finish is invalid.
+
 - `ModelFinishReason::Stop` with no tool calls ends the loop (subject to the
   final-seal decision). `Length` / `ContentFiltered` / `Refused` map to the
   corresponding failure kinds; `Unknown`/`ToolCalls` mislabels are
@@ -62,8 +76,8 @@ max tool name/schema/arguments bytes, max model text/reasoning bytes) and
 are enforced by the driver and the assembler. Crucially,
 `max_tool_calls_per_response` limits only the number of tool calls permitted
 in a single model response; it does not restrict the tool catalog size in
-`ModelRequest::tools` (catalog size is bounded by `max_tool_schema_bytes` and
-tool set registration). `LoopOptions::validate` fail-fast enforces upper
+`ModelRequest::tools` (`max_tool_schema_bytes` is a per-tool bound, not a total
+catalog bound). `LoopOptions::validate` fail-fast enforces upper
 bounds on model timeout (<= 24h) and retry base delay (<= 30s) aligned with
 `ModelDriver` constants. The per-message text ceiling
 is the shared crate-private `MAX_MODEL_MESSAGE_TEXT_BYTES` constant used by

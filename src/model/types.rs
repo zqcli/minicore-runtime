@@ -1,8 +1,9 @@
+use crate::value::{normalize_model_text, valid_text};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
-use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use thiserror::Error;
@@ -10,7 +11,7 @@ use thiserror::Error;
 use super::ProviderReplay;
 use crate::ids::ToolCallId;
 pub(crate) use crate::tools::ToolSpec;
-use crate::tools::{ToolName, ToolOutput, ToolResultOutcome, validate_json_shape};
+use crate::tools::{ToolName, ToolOutput, ToolResultOutcome};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ModelRefError {
@@ -45,35 +46,7 @@ impl FromStr for ModelRef {
     }
 }
 
-impl fmt::Display for ModelRef {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl fmt::Debug for ModelRef {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, formatter)
-    }
-}
-
-impl Serialize for ModelRef {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ModelRef {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserialize_from_str(deserializer)
-    }
-}
+crate::value::string_newtype_serde!(ModelRef);
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ModelLimitsError {
@@ -117,28 +90,10 @@ pub enum ModelValueError {
     InvalidTools,
 }
 
-fn deserialize_from_str<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: FromStr,
-    T::Err: fmt::Display,
-{
-    let value = String::deserialize(deserializer)?;
-    value.parse().map_err(D::Error::custom)
-}
-
 /// Absolute ceiling for a single `ModelMessage` text payload (system, user,
 /// or an assistant text part). Default prompt projection truncates summary
 /// tails so this bound is always satisfied.
 pub(crate) const MAX_MODEL_MESSAGE_TEXT_BYTES: usize = 262_144;
-
-fn valid_text(value: &str, maximum: usize) -> bool {
-    !value.is_empty()
-        && value.len() <= maximum
-        && value
-            .chars()
-            .all(|character| !character.is_control() || matches!(character, '\n' | '\t'))
-}
 
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
@@ -207,7 +162,7 @@ impl<'de> Deserialize<'de> for ModelLimits {
 #[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AssistantPart {
-    Text(String),
+    Text(Arc<str>),
     Reasoning(ReasoningContent),
     ToolCall(ToolCall),
 }
@@ -220,17 +175,17 @@ pub enum AssistantPart {
     deny_unknown_fields
 )]
 enum AssistantPartWire {
-    Text(String),
+    Text(Arc<str>),
     Reasoning(ReasoningContent),
     ToolCall(ToolCall),
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ReasoningContent {
-    text: Option<String>,
-    summary: Option<String>,
-    encrypted: Option<String>,
-    signature: Option<String>,
+    text: Option<Arc<str>>,
+    summary: Option<Arc<str>>,
+    encrypted: Option<Arc<str>>,
+    signature: Option<Arc<str>>,
 }
 
 #[derive(Deserialize)]
@@ -249,8 +204,8 @@ impl ReasoningContent {
         encrypted: Option<String>,
         signature: Option<String>,
     ) -> Result<Self, ModelValueError> {
-        validate_optional_text(&text, 262_144)?;
-        validate_optional_text(&summary, 131_072)?;
+        let text = normalize_optional_text(text, 262_144)?;
+        let summary = normalize_optional_text(summary, 131_072)?;
         validate_optional_opaque(&encrypted, 262_144)?;
         validate_optional_opaque(&signature, 16_384)?;
         if text.is_none() && summary.is_none() && encrypted.is_none() && signature.is_none() {
@@ -259,8 +214,8 @@ impl ReasoningContent {
         Ok(Self {
             text,
             summary,
-            encrypted,
-            signature,
+            encrypted: encrypted.map(Arc::from),
+            signature: signature.map(Arc::from),
         })
     }
 
@@ -304,8 +259,11 @@ impl fmt::Debug for ReasoningContent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ReasoningContent")
-            .field("text_bytes", &self.text.as_ref().map(String::len))
-            .field("summary_bytes", &self.summary.as_ref().map(String::len))
+            .field("text_bytes", &self.text.as_ref().map(|text| text.len()))
+            .field(
+                "summary_bytes",
+                &self.summary.as_ref().map(|text| text.len()),
+            )
             .field("has_encrypted", &self.encrypted.is_some())
             .field("has_signature", &self.signature.is_some())
             .finish()
@@ -323,18 +281,19 @@ impl<'de> Deserialize<'de> for ReasoningContent {
     }
 }
 
-fn validate_optional_text(value: &Option<String>, maximum: usize) -> Result<(), ModelValueError> {
-    if value.as_deref().is_some_and(|value| {
-        value.is_empty()
-            || value.len() > maximum
-            || value
-                .chars()
-                .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
-    }) {
-        Err(ModelValueError::InvalidText)
-    } else {
-        Ok(())
-    }
+fn normalize_optional_text(
+    value: Option<String>,
+    maximum: usize,
+) -> Result<Option<Arc<str>>, ModelValueError> {
+    value
+        .map(|value| {
+            let text = normalize_model_text(&value);
+            if text.len() > maximum {
+                return Err(ModelValueError::InvalidText);
+            }
+            Ok(Arc::from(text.as_ref()))
+        })
+        .transpose()
 }
 
 fn validate_optional_opaque(value: &Option<String>, maximum: usize) -> Result<(), ModelValueError> {
@@ -355,23 +314,13 @@ impl AssistantPart {
     pub fn validate(&self) -> Result<(), ModelValueError> {
         match self {
             Self::Text(text) => {
-                if valid_text(text, MAX_MODEL_MESSAGE_TEXT_BYTES) {
+                if valid_text(text, MAX_MODEL_MESSAGE_TEXT_BYTES, true) {
                     Ok(())
                 } else {
                     Err(ModelValueError::InvalidText)
                 }
             }
-            Self::Reasoning(reasoning) => {
-                if reasoning.text.is_some()
-                    || reasoning.summary.is_some()
-                    || reasoning.encrypted.is_some()
-                    || reasoning.signature.is_some()
-                {
-                    Ok(())
-                } else {
-                    Err(ModelValueError::EmptyReasoningContent)
-                }
-            }
+            Self::Reasoning(_) => Ok(()),
             Self::ToolCall(call) => call.validate(),
         }
     }
@@ -390,7 +339,9 @@ impl<'de> Deserialize<'de> for AssistantPart {
         D: Deserializer<'de>,
     {
         let value = match AssistantPartWire::deserialize(deserializer)? {
-            AssistantPartWire::Text(text) => Self::Text(text),
+            AssistantPartWire::Text(text) => {
+                Self::Text(Arc::from(normalize_model_text(&text).as_ref()))
+            }
             AssistantPartWire::Reasoning(reasoning) => Self::Reasoning(reasoning),
             AssistantPartWire::ToolCall(call) => Self::ToolCall(call),
         };
@@ -403,7 +354,7 @@ impl<'de> Deserialize<'de> for AssistantPart {
 pub struct ToolCall {
     tool_call_id: ToolCallId,
     name: ToolName,
-    arguments: Value,
+    arguments: Arc<Value>,
     call_index: u32,
 }
 
@@ -435,13 +386,15 @@ impl ToolCall {
         arguments: Value,
         call_index: u32,
     ) -> Result<Self, ModelValueError> {
-        if !arguments.is_object() || !validate_json_shape(&arguments) {
+        if !arguments.is_object()
+            || crate::value::validate_json_size(&arguments, crate::value::MAX_JSON_BYTES).is_err()
+        {
             return Err(ModelValueError::InvalidToolArguments);
         }
         Ok(Self {
             tool_call_id,
             name,
-            arguments,
+            arguments: Arc::new(arguments),
             call_index,
         })
     }
@@ -462,7 +415,7 @@ impl ToolCall {
         &self.name
     }
 
-    pub const fn arguments(&self) -> &Value {
+    pub fn arguments(&self) -> &Value {
         &self.arguments
     }
 
@@ -489,8 +442,8 @@ impl<'de> Deserialize<'de> for ToolCall {
 
 #[derive(Clone, Eq, PartialEq)]
 pub enum ModelMessage {
-    System(String),
-    User(String),
+    System(Arc<str>),
+    User(Arc<str>),
     Assistant(Vec<AssistantPart>),
     /// Canonical assistant parts plus non-display provider-owned metadata.
     AssistantWithReplay {
@@ -508,8 +461,8 @@ pub enum ModelMessage {
 #[serde(deny_unknown_fields)]
 #[serde(tag = "role", content = "content", rename_all = "snake_case")]
 enum ModelMessageWire {
-    System(String),
-    User(String),
+    System(Arc<str>),
+    User(Arc<str>),
     Assistant(AssistantMessageWire),
     Tool {
         tool_call_id: ToolCallId,
@@ -623,18 +576,18 @@ impl fmt::Debug for ModelMessage {
 impl ModelMessage {
     pub fn system(text: impl Into<String>) -> Result<Self, ModelValueError> {
         let text = text.into();
-        if !valid_text(&text, MAX_MODEL_MESSAGE_TEXT_BYTES) {
+        if !valid_text(&text, MAX_MODEL_MESSAGE_TEXT_BYTES, false) {
             return Err(ModelValueError::InvalidText);
         }
-        Ok(Self::System(text))
+        Ok(Self::System(text.into()))
     }
 
     pub fn user(text: impl Into<String>) -> Result<Self, ModelValueError> {
         let text = text.into();
-        if !valid_text(&text, MAX_MODEL_MESSAGE_TEXT_BYTES) {
+        if !valid_text(&text, MAX_MODEL_MESSAGE_TEXT_BYTES, false) {
             return Err(ModelValueError::InvalidText);
         }
-        Ok(Self::User(text))
+        Ok(Self::User(text.into()))
     }
 
     pub fn assistant(parts: Vec<AssistantPart>) -> Result<Self, ModelValueError> {
@@ -646,6 +599,7 @@ impl ModelMessage {
         parts: Vec<AssistantPart>,
         provider_replay: Option<ProviderReplay>,
     ) -> Result<Self, ModelValueError> {
+        let parts = normalize_parts(parts);
         let message = match provider_replay {
             Some(provider_replay) => Self::AssistantWithReplay {
                 parts,
@@ -672,7 +626,7 @@ impl ModelMessage {
     pub fn validate(&self) -> Result<(), ModelValueError> {
         match self {
             Self::System(text) | Self::User(text) => {
-                if valid_text(text, MAX_MODEL_MESSAGE_TEXT_BYTES) {
+                if valid_text(text, MAX_MODEL_MESSAGE_TEXT_BYTES, false) {
                     Ok(())
                 } else {
                     Err(ModelValueError::InvalidText)
@@ -722,8 +676,8 @@ impl<'de> Deserialize<'de> for ModelMessage {
 
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ModelRequest {
-    messages: Vec<ModelMessage>,
-    tools: Vec<ToolSpec>,
+    messages: Arc<[ModelMessage]>,
+    tools: Arc<[ToolSpec]>,
     limits: ModelLimits,
     reasoning: ReasoningPreference,
 }
@@ -740,20 +694,18 @@ struct ModelRequestWire {
 impl ModelRequest {
     pub fn new(
         messages: Vec<ModelMessage>,
-        tools: Vec<ToolSpec>,
+        tools: impl Into<Arc<[ToolSpec]>>,
         limits: ModelLimits,
         reasoning: ReasoningPreference,
     ) -> Result<Self, ModelValueError> {
         if messages.is_empty() {
             return Err(ModelValueError::EmptyMessages);
         }
-        for message in &messages {
-            message.validate()?;
-        }
+        let tools = tools.into();
         validate_tool_exchange(&messages)?;
         validate_request_tools(&tools)?;
         Ok(Self {
-            messages,
+            messages: messages.into(),
             tools,
             limits,
             reasoning,
@@ -940,6 +892,7 @@ impl ModelResponse {
         usage: impl Into<Option<Usage>>,
         provider_replay: Option<ProviderReplay>,
     ) -> Result<Self, ModelValueError> {
+        let parts = normalize_parts(parts);
         if parts.is_empty() && provider_replay.is_none() {
             return Err(ModelValueError::EmptyResponseParts);
         }
@@ -1080,4 +1033,15 @@ fn validate_request_tools(tools: &[ToolSpec]) -> Result<(), ModelValueError> {
         previous = Some(tool.name());
     }
     Ok(())
+}
+
+fn normalize_parts(mut parts: Vec<AssistantPart>) -> Vec<AssistantPart> {
+    for part in &mut parts {
+        if let AssistantPart::Text(text) = part {
+            if let std::borrow::Cow::Owned(normalized) = normalize_model_text(text) {
+                *text = normalized.into();
+            }
+        }
+    }
+    parts
 }

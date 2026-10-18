@@ -12,13 +12,15 @@ fn model_errors_enforce_delivery_retry_and_panic_invariants() {
         DiagnosticCategory::Model,
         BoundedText::new("rate limited").unwrap(),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     let diag_retryable = DiagnosticSummary::new(
         DiagnosticCode::ModelUnavailable,
         DiagnosticCategory::Model,
         BoundedText::new("rate limited").unwrap(),
         true,
-    );
+    )
+    .expect("valid diagnostic text");
 
     let not_started_retry = ModelError::not_started(
         ModelErrorKind::RateLimited,

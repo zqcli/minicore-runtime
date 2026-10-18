@@ -117,15 +117,15 @@ impl PromptProvider for DefaultPromptProvider {
                 Vec::with_capacity(request.history.len() + usize::from(system.is_some()));
             if let Some(system) = system {
                 if !system.is_empty() {
-                    messages.push(
-                        ModelMessage::system(system.as_str())
-                            .map_err(|_| PromptError::InvalidHistory)?,
-                    );
+                    messages.push(ModelMessage::System(system.shared()));
                 }
             }
             for item in request.history.iter() {
                 let message = match item {
-                    HistoryItem::User(user) => ModelMessage::user(user.input.as_text()),
+                    HistoryItem::User(user) => {
+                        let crate::execution::UserInput::Text(text) = &user.input;
+                        Ok(ModelMessage::User(text.shared()))
+                    }
                     HistoryItem::Assistant(assistant) => assistant_message(assistant),
                     HistoryItem::ToolResult(result) => ModelMessage::tool_with_outcome(
                         result.call_id.clone(),
@@ -150,9 +150,6 @@ impl PromptProvider for DefaultPromptProvider {
 fn assistant_message(
     assistant: &crate::history::AssistantHistory,
 ) -> Result<ModelMessage, crate::model::ModelValueError> {
-    if assistant.content.is_empty() && assistant.provider_replay.is_none() {
-        return Err(crate::model::ModelValueError::EmptyAssistantParts);
-    }
     ModelMessage::assistant_with_provider_replay(
         assistant.content.clone(),
         assistant.provider_replay.clone(),

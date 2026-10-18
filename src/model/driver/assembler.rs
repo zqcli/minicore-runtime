@@ -65,6 +65,10 @@ impl<'a> Assembler<'a> {
         }
         match event {
             ModelEvent::TextDelta { delta } => {
+                let delta = normalized_delta(delta)?;
+                if delta.is_empty() {
+                    return Ok(None);
+                }
                 if self.text.is_empty() {
                     self.slots.push(PartSlot::Text);
                 }
@@ -76,6 +80,10 @@ impl<'a> Assembler<'a> {
                 Ok(Some(ModelDriverProgress::TextDelta(delta)))
             }
             ModelEvent::ReasoningDelta { delta } => {
+                let delta = normalized_delta(delta)?;
+                if delta.is_empty() {
+                    return Ok(None);
+                }
                 if self.reasoning.is_empty() {
                     self.slots.push(PartSlot::Reasoning);
                 }
@@ -165,7 +173,7 @@ impl<'a> Assembler<'a> {
         }
     }
 
-    pub(super) fn finish(self) -> Result<ModelResponse, ModelError> {
+    pub(super) fn finish(mut self) -> Result<ModelResponse, ModelError> {
         let reason = self
             .finish_reason
             .ok_or_else(|| assembler_error(ModelErrorKind::IncompleteResponse))?;
@@ -189,24 +197,25 @@ impl<'a> Assembler<'a> {
         let mut parts = Vec::with_capacity(self.slots.len());
         for slot in self.slots {
             match slot {
-                PartSlot::Text => parts.push(AssistantPart::Text(self.text.clone())),
+                PartSlot::Text => {
+                    parts.push(AssistantPart::Text(std::mem::take(&mut self.text).into()))
+                }
                 PartSlot::Reasoning => {
-                    let reasoning =
-                        ReasoningContent::new(Some(self.reasoning.clone()), None, None, None)
-                            .map_err(|_| {
-                                assembler_error(ModelErrorKind::InvalidProviderResponse)
-                            })?;
+                    let reasoning = ReasoningContent::new(
+                        Some(std::mem::take(&mut self.reasoning)),
+                        None,
+                        None,
+                        None,
+                    )
+                    .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
                     parts.push(AssistantPart::Reasoning(reasoning));
                 }
                 PartSlot::Tool(index) => {
-                    let tool = self
-                        .tools
-                        .get(index)
-                        .ok_or_else(|| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
+                    let tool = &mut self.tools[index];
                     let arguments = tool
                         .arguments
-                        .clone()
-                        .ok_or_else(|| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
+                        .take()
+                        .expect("Finish requires completed tools");
                     let call = ToolCall::new(
                         tool.tool_call_id.clone(),
                         tool.name.clone(),
@@ -235,6 +244,16 @@ impl<'a> Assembler<'a> {
     }
 }
 
+fn normalized_delta(delta: BoundedText) -> Result<BoundedText, ModelError> {
+    match crate::value::normalize_model_text(delta.as_str()) {
+        std::borrow::Cow::Borrowed(_) => Ok(delta),
+        std::borrow::Cow::Owned(text) => {
+            BoundedText::new_with_max_bytes(text, crate::model::MAX_MODEL_EVENT_TEXT_BYTES)
+                .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))
+        }
+    }
+}
+
 fn assembler_error(kind: ModelErrorKind) -> ModelError {
     let message = match kind {
         ModelErrorKind::UnexpectedToolCall => "unexpected tool call in model response",
@@ -246,7 +265,8 @@ fn assembler_error(kind: ModelErrorKind) -> ModelError {
         DiagnosticCategory::Model,
         BoundedText::new(message).expect("static diagnostic must fit BoundedText"),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     ModelError::started(kind, diagnostic)
 }
 

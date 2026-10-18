@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::error::DiagnosticSummary;
 use crate::ids::ToolCallId;
 use crate::tools::ToolName;
-use crate::value::BoundedText;
+use crate::value::{BoundedText, normalize_model_text};
 
 use super::ProviderReplay;
 use super::types::{ModelFinishReason, ModelValueError, Usage};
@@ -342,18 +342,12 @@ impl fmt::Debug for ModelEvent {
 }
 
 fn checked_event_text(value: &str) -> Result<BoundedText, ModelValueError> {
-    validate_event_text(value)?;
-    BoundedText::new_with_max_bytes(value, MAX_MODEL_EVENT_TEXT_BYTES)
+    BoundedText::new_with_max_bytes(normalize_model_text(value), MAX_MODEL_EVENT_TEXT_BYTES)
         .map_err(|_| ModelValueError::InvalidEvent)
 }
 
 fn validate_event_text(value: &str) -> Result<(), ModelValueError> {
-    if !value.is_empty()
-        && value.len() <= MAX_MODEL_EVENT_TEXT_BYTES
-        && value
-            .chars()
-            .all(|character| !character.is_control() || matches!(character, '\n' | '\t'))
-    {
+    if value.len() <= MAX_MODEL_EVENT_TEXT_BYTES {
         Ok(())
     } else {
         Err(ModelValueError::InvalidEvent)

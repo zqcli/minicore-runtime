@@ -1,5 +1,44 @@
 use super::*;
 
+#[tokio::test]
+async fn model_text_is_normalized_and_empty_deltas_do_not_emit_progress() {
+    let model = ScriptModel::new(
+        descriptor(),
+        vec![Behavior::Events(vec![
+            Ok(ModelEvent::text_delta("").unwrap()),
+            Ok(ModelEvent::reasoning_delta("").unwrap()),
+            Ok(ModelEvent::TextDelta {
+                delta: BoundedText::new("a\r\nb\rc\0\x1b\t").unwrap(),
+            }),
+            Ok(ModelEvent::reasoning_delta("r\r\n\x7f").unwrap()),
+            Ok(finish(ModelFinishReason::Stop)),
+        ])],
+    );
+    let driver = model.driver(&KernelConfig::default_checked().unwrap());
+    let (progress, mut receiver) = progress_channel();
+    let parent = CancellationToken::new();
+    let response = driver
+        .run(
+            request(),
+            context(parent.clone(), Duration::from_secs(30)),
+            &progress,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(response.parts(), [AssistantPart::Text(text), AssistantPart::Reasoning(reason)]
+        if text.as_ref() == "a\nb\nc��\t" && reason.text() == Some("r\n�"))
+    );
+    assert!(
+        matches!(receiver.try_recv(), Ok(ModelDriverProgress::TextDelta(text)) if text.as_str() == "a\nb\nc��\t")
+    );
+    assert!(
+        matches!(receiver.try_recv(), Ok(ModelDriverProgress::ReasoningDelta(text)) if text.as_str() == "r\n�")
+    );
+    assert!(receiver.try_recv().is_err());
+    assert!(!parent.is_cancelled());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn assembles_text_reasoning_tool_usage_and_preserves_first_slot_order() {
     let id = call_id(1);
@@ -40,7 +79,7 @@ async fn assembles_text_reasoning_tool_usage_and_preserves_first_slot_order() {
             && call.name().as_str() == "search"
             && call.arguments() == &json!({"q": "rust"})
             && call.call_index() == 0
-            && text == "answer"
+            && text.as_ref() == "answer"
     ));
     assert!(matches!(
         progress_rx.try_recv(),
@@ -241,14 +280,6 @@ async fn rejects_every_malformed_stream_sequence() {
                 Ok(args(id.clone(), "[]")),
                 Ok(end(id.clone())),
             ],
-            ModelErrorKind::InvalidProviderResponse,
-        ),
-        (
-            "invalid control text",
-            request(),
-            vec![Ok(ModelEvent::TextDelta {
-                delta: BoundedText::new("bad\0text").unwrap(),
-            })],
             ModelErrorKind::InvalidProviderResponse,
         ),
         (

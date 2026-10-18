@@ -857,7 +857,8 @@ async fn partial_stream_failure_is_a_model_failure_without_an_assistant_item() {
                             DiagnosticCategory::Model,
                             BoundedText::new("stream died").unwrap(),
                             false,
-                        ),
+                        )
+                        .expect("valid diagnostic text"),
                     )),
                 ])))
             })
@@ -895,7 +896,7 @@ fn assistant_texts(report: &LoopReport) -> Vec<&str> {
         })
         .flat_map(|assistant| {
             assistant.content.iter().filter_map(|part| match part {
-                AssistantPart::Text(text) => Some(text.as_str()),
+                AssistantPart::Text(text) => Some(text.as_ref()),
                 _ => None,
             })
         })
@@ -1094,7 +1095,8 @@ async fn delivery_retry_recovers_at_the_loop_level() {
                             DiagnosticCategory::Model,
                             BoundedText::new("retry me").unwrap(),
                             true,
-                        ),
+                        )
+                        .expect("valid diagnostic text"),
                     ))
                 } else {
                     Ok::<ModelStream, ModelError>(Box::pin(stream::iter(vec![
@@ -1145,7 +1147,7 @@ async fn delivery_retry_recovers_at_the_loop_level() {
         matches!(
             item,
             HistoryItem::Assistant(assistant)
-                if assistant.content.iter().any(|part| matches!(part, minicore_runtime::model::AssistantPart::Text(text) if text == "recovered"))
+                if assistant.content.iter().any(|part| matches!(part, minicore_runtime::model::AssistantPart::Text(text) if text.as_ref() == "recovered"))
         )
     });
     assert!(

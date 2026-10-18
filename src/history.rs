@@ -147,10 +147,10 @@ impl WorkingHistory {
     }
 }
 
-/// Estimates the total text footprint of a host history for the resource
-/// ceiling checked at `AgentLoop::start`. This is a conservative upper bound,
-/// not a serialized-size guarantee.
-pub(crate) fn estimate_history_bytes(items: &[HistoryItem]) -> usize {
+/// Returns the exact admission estimate used by [`crate::AgentLoop::start`].
+/// Counts text, compact tool arguments, and replay envelopes; this is not the
+/// serialized history size or a heap-memory measurement. Sums saturate.
+pub fn estimate_history_bytes(items: &[HistoryItem]) -> usize {
     items
         .iter()
         .map(estimate_item_bytes)
@@ -190,7 +190,7 @@ fn estimate_part_bytes(part: &AssistantPart) -> usize {
             .saturating_add(reasoning.encrypted().map_or(0, str::len))
             .saturating_add(reasoning.signature().map_or(0, str::len)),
         AssistantPart::ToolCall(call) => {
-            call.name().as_str().len() + call.arguments().to_string().len()
+            call.name().as_str().len() + crate::value::json_bytes(call.arguments())
         }
     }
 }

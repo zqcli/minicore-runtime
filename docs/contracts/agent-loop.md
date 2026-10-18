@@ -64,8 +64,8 @@ The runner loops:
 
 - `LoopHandle::steer(UserInput) -> Result<(), SteerError>`. A successful call
   means the steer was accepted into this process-local queue. It is applied at
-  the next request boundary. If the loop is cancelled, shut down, or the
-  process exits before that boundary, the queued steer may be discarded and
+  the next request boundary. On any non-`Completed` ending or process exit
+  before that boundary, the queued steer is discarded and
   will not appear in `LoopReport::appended`.
   Steers queue up to `max_pending_steers` (`QueueFull`), are rejected if an
   interaction is pending (`WaitingForInput`), or once the loop has finalized
@@ -101,3 +101,5 @@ The runner loops:
 cancel/finish use a single-CAS `AtomicU8` state machine. All event
 emissions are best-effort `try_send`s and never block the loop. Waiting for
 input or events never affects loop correctness.
+Usage totals sum each reported field independently; a field is `None` only if
+no request reported it. Missing usage does not erase known counts.

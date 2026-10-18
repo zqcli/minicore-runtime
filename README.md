@@ -2,6 +2,29 @@
 
 MiniCore Runtime is a small Rust execution core for one live agent loop. It runs model/tool iterations, streaming, cancellation, interaction, steering, and request-boundary configuration updates. It does not own sessions, persistence, transcripts, providers, or workspaces.
 
+## 0.7.0 Compatibility Notes
+
+- `AssistantPart::Text`, `ModelMessage::System` and `ModelMessage::User` now
+  carry `Arc<str>` instead of `String`. Use `.into()` for enum construction and
+  `.as_ref()` for string comparisons. Constructors and JSON formats are unchanged.
+- `BoundedText`, reasoning payloads, tool-call arguments and provider replay
+  share immutable storage. `ModelRequest` clones share message/tool slices;
+  `ModelRequest::new` accepts a tool `Vec` or `Arc<[ToolSpec]>`.
+  `ToolCall::arguments()` and `ProviderReplay::payload()` are no longer `const`.
+- `DiagnosticSummary::new` now returns `Result<_, ValueError>` and its `message`
+  field is private (read through `message()`). Diagnostics and tool progress
+  reject controls other than LF/TAB; `ToolProgressError::InvalidText` and
+  `ValueError::InvalidText` are new variants. Input prompts/answers now allow LF/TAB.
+- Model display text normalizes CRLF/CR to LF and other controls to U+FFFD.
+  Empty deltas are accepted and ignored; byte limits still apply after normalization.
+- `LoopStatus`, `CancelReason`, and `LoopOutcome` are non-exhaustive: downstream
+  matches need a wildcard arm. Usage sums known values per field instead of
+  losing them when another request omits that field.
+- `LoopHandle::shutdown()` records shutdown cancellation. Interactions without a
+  loop deadline wait indefinitely. Dropping a `join()` future cancels its loop.
+- `history::estimate_history_bytes` exposes the exact start-admission estimate.
+  Configs discarded by finalization are dropped only after report publication.
+
 ## 0.6.1 Compatibility Notes
 
 - Provider replay is bounded opaque metadata carried by `ModelEvent::ProviderReplay`,
@@ -38,7 +61,7 @@ An `AgentLoop` is a single, one-shot execution. The host owns everything around 
 - Tool input requests are strictly validated at the port boundary; invalid requests fail immediately as ordinary tool errors without entering `WaitingForInput`.
 - `update` takes effect at the next model request. A config revision is committed only when a real model request is issued; replaced or discarded configurations are dropped outside the control lock.
 - The current tool batch uses the snapshot of the request that produced it. A config `update` or `steer` never retroactively changes an in-flight batch.
-- `steer` takes effect at the next model request. A successful call means the steer was accepted into this process-local queue and is applied at the next request boundary; if the loop is cancelled, shut down, or the process exits before that boundary, the queued steer may be discarded and will not appear in `LoopReport::appended`. Steers queue up to `max_pending_steers` (`QueueFull`), are rejected if an interaction is pending (`WaitingForInput`) or after finalization (`NotActive`), and appear as `Steering` user items at the next request boundary.
+- `steer` takes effect at the next model request. A successful call means the steer was accepted into this process-local queue and is applied at the next request boundary; on any non-`Completed` ending or process exit before that boundary, the queued steer is discarded and will not appear in `LoopReport::appended`. Steers queue up to `max_pending_steers` (`QueueFull`), are rejected if an interaction is pending (`WaitingForInput`) or after finalization (`NotActive`), and appear as `Steering` user items at the next request boundary.
 - A config `update` does not keep the loop alive. It only reconfigures the next request; whether the loop continues is decided by the model's final response and pending steers.
 - `LoopReport.requests` and final `request_index` count issued requests at the `RequestStarted` boundary. Failed issued requests are counted; prompt rebuilds and driver-internal retries do not increment logical request count. The runtime never automatically retries an entire loop.
 - `LoopReport.tool_rounds` counts tool batches with `u64` precision. The optional `LoopOptions.max_tool_rounds` remains `u16`; zero (the default) means no tool-round limit, not a limit on statistics.

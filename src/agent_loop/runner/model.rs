@@ -17,7 +17,6 @@ use crate::model::{
 use crate::port_call::{PortCallOutcome, run_port_call};
 use crate::prompt::PromptRequest;
 use crate::time::DeadlineSource;
-use crate::tools::ToolSpec;
 
 const MODEL_PROGRESS_CAPACITY: usize = 64;
 
@@ -39,7 +38,7 @@ pub(super) async fn prepare_prompt(
     let provider = snapshot.prompt().clone();
     let descriptor = snapshot.descriptor();
     let reasoning = snapshot.reasoning();
-    let tools: Vec<ToolSpec> = snapshot.tools().frozen_specs().cloned().collect();
+    let tools = snapshot.tools().shared_specs();
 
     let outcome = run_port_call(
         cancellation,
@@ -88,7 +87,7 @@ pub(super) fn build_model_request(
     messages: Vec<ModelMessage>,
     snapshot: &ExecutionConfig,
 ) -> Result<ModelRequest, ModelValueError> {
-    let tools: Vec<ToolSpec> = snapshot.tools().frozen_specs().cloned().collect();
+    let tools = snapshot.tools().shared_specs();
     ModelRequest::new(
         messages,
         tools,

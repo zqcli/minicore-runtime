@@ -370,7 +370,7 @@ async fn steer_update_boundaries() {
 
     // The update swapped the model: request 1 says "after-update", never
     // "first-again". The steer kept the loop alive through the final.
-    let texts: Vec<String> = report
+    let texts: Vec<&str> = report
         .appended
         .iter()
         .filter_map(|item| match item {
@@ -378,7 +378,7 @@ async fn steer_update_boundaries() {
             _ => None,
         })
         .filter_map(|part| match part {
-            minicore_runtime::model::AssistantPart::Text(text) => Some(text.clone()),
+            minicore_runtime::model::AssistantPart::Text(text) => Some(text.as_ref()),
             _ => None,
         })
         .collect();

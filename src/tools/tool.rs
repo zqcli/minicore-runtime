@@ -1,3 +1,4 @@
+use crate::value::valid_text;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -13,7 +14,7 @@ use crate::value::{BoundedText, MAX_JSON_BYTES, MAX_TEXT_BYTES, validate_json_si
 
 use super::context::ToolContext;
 use super::input::ToolInputRequest;
-use super::types::{ToolError, ToolName, ToolValueError, valid_text, validate_json_shape};
+use super::types::{ToolError, ToolName, ToolValueError};
 
 const MAX_TOOL_DESCRIPTION_BYTES: usize = 4_096;
 
@@ -220,7 +221,7 @@ impl ToolInvocation {
         tool_name: ToolName,
         arguments: Value,
     ) -> Result<Self, ToolError> {
-        if !arguments.is_object() || !validate_json_shape(&arguments) {
+        if !arguments.is_object() || validate_json_size(&arguments, MAX_JSON_BYTES).is_err() {
             return Err(ToolError::InvalidInvocation);
         }
         Ok(Self {

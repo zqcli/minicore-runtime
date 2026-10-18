@@ -13,6 +13,75 @@ use minicore_runtime::value::{MAX_JSON_BYTES, MAX_JSON_DEPTH, MAX_JSON_NODES, MA
 use minicore_runtime::{BoundedText, LoopId, ToolCallId};
 use serde_json::json;
 
+#[test]
+fn diagnostic_progress_and_input_text_share_the_control_policy() {
+    use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
+    for (text, accepted) in [
+        ("line one\n\tline two", true),
+        ("", true),
+        ("bad\r", false),
+        ("bad\0", false),
+        ("bad\x1b", false),
+    ] {
+        let text = BoundedText::new(text).unwrap();
+        assert_eq!(
+            DiagnosticSummary::new(
+                DiagnosticCode::Internal,
+                DiagnosticCategory::Internal,
+                text.clone(),
+                false
+            )
+            .is_ok(),
+            accepted
+        );
+        assert_eq!(
+            ToolProgress::new(Some(text.clone()), None, None).is_ok(),
+            accepted
+        );
+        let request = ToolInputRequest::new(text.as_str(), vec![], ToolInputAnswerKind::Text);
+        assert_eq!(request.is_ok(), accepted && !text.is_empty());
+        let prompt = ToolInputRequest::new("answer", vec![], ToolInputAnswerKind::Text).unwrap();
+        assert_eq!(
+            ToolInputAnswer::Text(text.clone())
+                .validate(&prompt)
+                .is_ok(),
+            accepted && !text.is_empty()
+        );
+    }
+}
+
+#[test]
+fn request_payload_clones_share_storage_and_output_constructors_normalize_text() {
+    use minicore_runtime::model::{ProviderReplay, ReasoningPreference};
+    let text = BoundedText::new("long history".repeat(1000)).unwrap();
+    assert!(std::ptr::eq(text.as_str(), text.clone().as_str()));
+    let replay = ProviderReplay::new("test", json!({"large": "x".repeat(1000)})).unwrap();
+    assert!(std::ptr::eq(replay.payload(), replay.clone().payload()));
+    let request = ModelRequest::new(
+        vec![ModelMessage::user("history").unwrap()],
+        vec![],
+        ModelLimits::default(),
+        ReasoningPreference::Auto,
+    )
+    .unwrap();
+    assert!(std::ptr::eq(request.messages(), request.clone().messages()));
+    let reasoning =
+        ReasoningContent::new(Some("r\r\n\x1b".into()), Some("\0".into()), None, None).unwrap();
+    let response = ModelResponse::new(
+        vec![
+            AssistantPart::Text("a\rb\r\nc\0".into()),
+            AssistantPart::Reasoning(reasoning),
+        ],
+        ModelFinishReason::Stop,
+        None,
+    )
+    .unwrap();
+    assert!(
+        matches!(response.parts(), [AssistantPart::Text(text), AssistantPart::Reasoning(reason)] if text.as_ref() == "a\nb\nc�" && reason.text() == Some("r\n�") && reason.summary() == Some("�"))
+    );
+    assert_json_round_trip(&response);
+}
+
 fn assert_json_round_trip<T>(value: &T)
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Eq + Debug,
@@ -339,7 +408,7 @@ fn model_and_progress_values_remain_checked() {
     )
     .unwrap();
     let response = ModelResponse::new(
-        vec![AssistantPart::Text("done".to_owned())],
+        vec![AssistantPart::Text("done".into())],
         ModelFinishReason::Stop,
         Usage::new(2, 1, 0),
     )
@@ -390,7 +459,7 @@ fn public_model_wires_reject_unknown_fields() {
 fn public_model_debug_redacts_nested_payloads() {
     let (_, call_id) = id_values();
     let parts = vec![
-        AssistantPart::Text("assistant-text-secret".to_owned()),
+        AssistantPart::Text("assistant-text-secret".into()),
         AssistantPart::Reasoning(
             ReasoningContent::new(
                 Some("reasoning-text-secret".to_owned()),

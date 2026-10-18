@@ -26,8 +26,7 @@ const STATE_NONE: u8 = 0;
 const STATE_CANCEL_USER: u8 = 1;
 const STATE_CANCEL_OWNER_DROPPED: u8 = 2;
 const STATE_CANCEL_SHUTDOWN: u8 = 3;
-const STATE_CANCEL_DEADLINE: u8 = 4;
-const STATE_FINISHED: u8 = 5;
+const STATE_FINISHED: u8 = 4;
 
 /// Outcome of the exactly-once completion seal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,7 +54,7 @@ pub(crate) enum FinalGate {
     /// request and accepting stays open.
     Continue(BoundaryChanges),
     /// No steer is pending; accepting closes and the loop seals.
-    Seal,
+    Seal(Option<Arc<ExecutionConfig>>),
 }
 
 /// Shared control plane for one agent loop.
@@ -184,12 +183,11 @@ impl LoopControl {
 
     /// Requests cancellation. Returns whether this call performed the actual
     /// transition; it is `false` once the loop is already cancelled or sealed.
-    pub(crate) fn mark_cancel(&self, reason: CancelReason) -> bool {
+    pub(crate) fn mark_cancel(&self, reason: CancelSource) -> bool {
         let target = match reason {
-            CancelReason::User => STATE_CANCEL_USER,
-            CancelReason::OwnerDropped => STATE_CANCEL_OWNER_DROPPED,
-            CancelReason::Shutdown => STATE_CANCEL_SHUTDOWN,
-            CancelReason::Deadline => STATE_CANCEL_DEADLINE,
+            CancelSource::User => STATE_CANCEL_USER,
+            CancelSource::OwnerDropped => STATE_CANCEL_OWNER_DROPPED,
+            CancelSource::Shutdown => STATE_CANCEL_SHUTDOWN,
         };
         if self
             .state
@@ -266,41 +264,23 @@ impl LoopControl {
     /// applied.
     pub(crate) fn take_boundary(&self) -> BoundaryChanges {
         let mut guard = lock_control(&self.inner);
-        BoundaryChanges {
-            config: guard
-                .pending_config
-                .take()
-                .map(|pending| (pending.revision, pending.config)),
-            steers: guard.pending_steers.drain(..).collect(),
-        }
+        drain_boundary(&mut guard)
     }
 
     /// Final-seal gate, linearized with steer/update on the same mutex as the
     /// seal decision. A steer accepted before the seal keeps accepting open
     /// and returns its boundary changes so the loop continues; otherwise
-    /// accepting closes, any pending config is discarded outside the lock,
-    /// and the caller seals normally. A pending config alone never extends a
+    /// accepting closes and the caller receives the pending config to drop
+    /// after publishing its report. A pending config alone never extends a
     /// final.
     pub(crate) fn begin_final(&self) -> FinalGate {
-        let (gate, discarded) = {
-            let mut guard = lock_control(&self.inner);
-            if guard.pending_steers.is_empty() {
-                guard.accepting_updates = false;
-                let discarded = guard.pending_config.take();
-                (FinalGate::Seal, discarded)
-            } else {
-                let changes = BoundaryChanges {
-                    config: guard
-                        .pending_config
-                        .take()
-                        .map(|pending| (pending.revision, pending.config)),
-                    steers: guard.pending_steers.drain(..).collect(),
-                };
-                (FinalGate::Continue(changes), None)
-            }
-        };
-        drop(discarded);
-        gate
+        let mut guard = lock_control(&self.inner);
+        if guard.pending_steers.is_empty() {
+            guard.accepting_updates = false;
+            FinalGate::Seal(guard.pending_config.take().map(|pending| pending.config))
+        } else {
+            FinalGate::Continue(drain_boundary(&mut guard))
+        }
     }
 
     /// Records `revision` as the last actually issued/applied config revision.
@@ -319,22 +299,16 @@ impl LoopControl {
     }
 
     pub(crate) fn cancel_reason(&self) -> CancelReason {
-        match self.state.load(Ordering::SeqCst) {
-            STATE_CANCEL_OWNER_DROPPED => CancelReason::OwnerDropped,
-            STATE_CANCEL_SHUTDOWN => CancelReason::Shutdown,
-            STATE_CANCEL_DEADLINE => CancelReason::Deadline,
-            STATE_CANCEL_USER => CancelReason::User,
-            _ => CancelReason::User,
-        }
+        cancel_reason_value(self.state.load(Ordering::SeqCst))
     }
 
     /// Exactly-once completion seal. One winner flips the shared state to
     /// `FINISHED`; every later call returns `AlreadyFinished`. The state
     /// transition and `accepting_updates = false` happen in the same mutex
-    /// critical section, taking any pending config which is then dropped
-    /// outside the lock, so `update` either lands entirely before the seal
+    /// critical section, returning any pending config for the runner to drop
+    /// after publication, so `update` either lands entirely before the seal
     /// (it wins) or observes `NotActive` after it.
-    pub(crate) fn finish_once(&self) -> FinishSeal {
+    pub(crate) fn finish_once(&self) -> (FinishSeal, Option<Arc<ExecutionConfig>>) {
         let (finish, discarded) = {
             let mut guard = lock_control(&self.inner);
             let finish = match self.state.compare_exchange(
@@ -345,7 +319,7 @@ impl LoopControl {
             ) {
                 Ok(_) => FinishSeal::Clean,
                 Err(STATE_NONE) => unreachable!("compare_exchange never reports its own value"),
-                Err(cancel @ (STATE_CANCEL_USER..=STATE_CANCEL_DEADLINE)) => {
+                Err(cancel @ (STATE_CANCEL_USER..=STATE_CANCEL_SHUTDOWN)) => {
                     let _ = self.state.compare_exchange(
                         cancel,
                         STATE_FINISHED,
@@ -361,8 +335,7 @@ impl LoopControl {
             let discarded = guard.pending_config.take();
             (finish, discarded)
         };
-        drop(discarded);
-        finish
+        (finish, discarded.map(|pending| pending.config))
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -439,11 +412,27 @@ impl LoopControl {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum CancelSource {
+    User,
+    OwnerDropped,
+    Shutdown,
+}
+
+fn drain_boundary(state: &mut ControlState) -> BoundaryChanges {
+    BoundaryChanges {
+        config: state
+            .pending_config
+            .take()
+            .map(|pending| (pending.revision, pending.config)),
+        steers: state.pending_steers.drain(..).collect(),
+    }
+}
+
 fn cancel_reason_value(value: u8) -> CancelReason {
     match value {
         STATE_CANCEL_OWNER_DROPPED => CancelReason::OwnerDropped,
         STATE_CANCEL_SHUTDOWN => CancelReason::Shutdown,
-        STATE_CANCEL_DEADLINE => CancelReason::Deadline,
         _ => CancelReason::User,
     }
 }
@@ -459,7 +448,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Weak};
 
-    use crate::agent_loop::control::{FinalGate, FinishSeal, LoopControl};
+    use crate::agent_loop::control::{CancelSource, FinalGate, FinishSeal, LoopControl};
     use crate::agent_loop::{CancelReason, SteerError, UpdateError};
     use crate::execution::{ConfigRevision, ExecutionConfig, UserInput};
     use crate::ids::LoopId;
@@ -523,10 +512,10 @@ mod tests {
     #[test]
     fn finish_once_seals_exactly_once_and_closes_accepting() {
         let control = control();
-        assert_eq!(control.finish_once(), FinishSeal::Clean);
-        assert_eq!(control.finish_once(), FinishSeal::AlreadyFinished);
+        assert_eq!(control.finish_once().0, FinishSeal::Clean);
+        assert_eq!(control.finish_once().0, FinishSeal::AlreadyFinished);
         assert!(control.is_finished());
-        assert!(!control.mark_cancel(CancelReason::User));
+        assert!(!control.mark_cancel(CancelSource::User));
         assert_eq!(control.update(config()), Err(UpdateError::NotActive));
         assert_eq!(control.steer(steering()), Err(SteerError::NotActive));
     }
@@ -536,13 +525,13 @@ mod tests {
     #[test]
     fn mark_cancel_then_finish_reports_cancelled_prior_and_locks() {
         let control = control();
-        assert!(control.mark_cancel(CancelReason::User));
+        assert!(control.mark_cancel(CancelSource::User));
         assert_eq!(
-            control.finish_once(),
+            control.finish_once().0,
             FinishSeal::CancelledPrior(CancelReason::User)
         );
-        assert_eq!(control.finish_once(), FinishSeal::AlreadyFinished);
-        assert!(!control.mark_cancel(CancelReason::Deadline));
+        assert_eq!(control.finish_once().0, FinishSeal::AlreadyFinished);
+        assert!(!control.mark_cancel(CancelSource::Shutdown));
         assert_eq!(control.cancel_reason(), CancelReason::User);
         assert_eq!(control.update(config()), Err(UpdateError::NotActive));
         assert_eq!(control.steer(steering()), Err(SteerError::NotActive));
@@ -559,13 +548,13 @@ mod tests {
                 assert_eq!(changes.steers.len(), 1);
                 assert!(changes.config.is_none());
             }
-            FinalGate::Seal => panic!("pending steer must continue the loop"),
+            FinalGate::Seal(_) => panic!("pending steer must continue the loop"),
         }
         // Accepting stays open during the continuation round; with no new
         // steer, the next final seals: begin_final closes accepting (the
         // runner-side finish_once then flips the cancelled/finished state).
         control.update(config()).unwrap();
-        assert!(matches!(control.begin_final(), FinalGate::Seal));
+        assert!(matches!(control.begin_final(), FinalGate::Seal(_)));
         assert_eq!(control.update(config()), Err(UpdateError::NotActive));
     }
 
@@ -574,7 +563,7 @@ mod tests {
     #[test]
     fn begin_final_without_steer_seals_and_closes_accepting() {
         let control = control();
-        assert!(matches!(control.begin_final(), FinalGate::Seal));
+        assert!(matches!(control.begin_final(), FinalGate::Seal(_)));
         assert_eq!(control.update(config()), Err(UpdateError::NotActive));
         assert_eq!(control.steer(steering()), Err(SteerError::NotActive));
     }
@@ -696,7 +685,9 @@ mod tests {
         assert!(!tracker.is_dropped());
 
         let gate = control.begin_final();
-        assert!(matches!(gate, FinalGate::Seal));
+        assert!(matches!(gate, FinalGate::Seal(_)));
+        assert!(!tracker.is_dropped());
+        drop(gate);
         assert!(
             tracker.is_dropped(),
             "pending config must be discarded when begin_final seals"
@@ -716,8 +707,10 @@ mod tests {
         control.update(pending_config).unwrap();
         assert!(!tracker.is_dropped());
 
-        let seal = control.finish_once();
+        let (seal, discarded) = control.finish_once();
         assert_eq!(seal, FinishSeal::Clean);
+        assert!(!tracker.is_dropped());
+        drop(discarded);
         assert!(
             tracker.is_dropped(),
             "pending config must be discarded on finish_once"

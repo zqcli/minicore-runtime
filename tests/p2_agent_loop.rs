@@ -565,7 +565,7 @@ fn assert_completed_with_text(report: &LoopReport, expected_text: &str) {
     let has_text = assistant
         .content
         .iter()
-        .any(|part| matches!(part, minicore_runtime::model::AssistantPart::Text(text) if text == expected_text));
+        .any(|part| matches!(part, minicore_runtime::model::AssistantPart::Text(text) if text.as_ref() == expected_text));
     assert!(has_text, "expected assistant text {expected_text:?}");
 }
 
@@ -967,6 +967,98 @@ async fn approved_interaction_resumes_the_loop() {
         .unwrap();
     let report = report_task.await.unwrap().unwrap();
     assert_completed_with_text(&report, "done");
+}
+
+#[tokio::test(start_paused = true)]
+async fn interactions_without_a_deadline_outlive_twenty_four_hours() {
+    for approval in [true, false] {
+        let (model, _) = scripted_model(vec![
+            Round::Tools {
+                calls: vec![("echo", "call_1")],
+            },
+            Round::Final { text: "done" },
+        ]);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let policy = approval.then(|| {
+            Arc::new(ScriptedPolicy {
+                plan: Arc::new(vec![PolicyPlan::RequireApproval]),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }) as Arc<dyn ToolPolicy>
+        });
+        let agent = AgentLoop::start(
+            request(config(
+                model,
+                tool_set(
+                    calls,
+                    if approval {
+                        ToolBehavior::Succeed
+                    } else {
+                        ToolBehavior::RequestInput
+                    },
+                ),
+                policy,
+            )),
+            LoopOptions::default_checked().unwrap(),
+        )
+        .unwrap();
+        let handle = agent.handle();
+        let mut states = handle.watch_state();
+        states
+            .wait_for(|state| state.status == LoopStatus::WaitingForInput)
+            .await
+            .unwrap();
+        let pending = handle.state().pending_interaction.unwrap();
+        tokio::time::advance(Duration::from_secs(25 * 60 * 60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(handle.state().status, LoopStatus::WaitingForInput);
+        let answer = if approval {
+            InteractionAnswer::Approval(ApprovalDecision::AllowOnce)
+        } else {
+            InteractionAnswer::ToolInput(ToolInputAnswer::Text(
+                BoundedText::new("line one\n\tline two").unwrap(),
+            ))
+        };
+        handle.answer(pending.interaction_id, answer).unwrap();
+        assert_completed_with_text(&agent.join().await.unwrap(), "done");
+    }
+}
+
+#[tokio::test]
+async fn handle_shutdown_and_dropped_join_record_distinct_cancel_reasons() {
+    for shutdown in [true, false] {
+        let (model, _) = scripted_model(vec![Round::Hold]);
+        let agent = AgentLoop::start(
+            request(config(model, ToolSet::default(), None)),
+            LoopOptions::default_checked().unwrap(),
+        )
+        .unwrap();
+        let handle = agent.handle();
+        if shutdown {
+            assert!(handle.shutdown());
+            assert!(!handle.cancel());
+            let report = agent.join().await.unwrap();
+            assert_eq!(
+                report.outcome,
+                LoopOutcome::Cancelled(CancelReason::Shutdown)
+            );
+            assert!(Arc::ptr_eq(&report, &handle.wait().await.unwrap()));
+        } else {
+            let mut states = handle.watch_state();
+            {
+                let join = agent.join();
+                tokio::pin!(join);
+                tokio::select! {
+                    biased;
+                    _ = &mut join => panic!("held model completed"),
+                    state = states.wait_for(|state| state.status == LoopStatus::RunningModel) => { state.unwrap(); },
+                }
+            }
+            assert_eq!(
+                handle.wait().await.unwrap().outcome,
+                LoopOutcome::Cancelled(CancelReason::OwnerDropped)
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -3685,9 +3777,7 @@ fn assistant_item(model: &str, text: &str) -> HistoryItem {
         request_index: 0,
         model: model.parse().unwrap(),
         reasoning: ReasoningPreference::Auto,
-        content: vec![minicore_runtime::model::AssistantPart::Text(
-            text.to_owned(),
-        )],
+        content: vec![minicore_runtime::model::AssistantPart::Text(text.into())],
         finish_reason: ModelFinishReason::Stop,
         usage: minicore_runtime::model::Usage::new(0, 0, 0),
     })
@@ -3727,7 +3817,7 @@ async fn default_provider_projects_history_in_order_with_summary_and_optional_sy
     let expected_without_system = vec![
         ModelMessage::user("base q").unwrap(),
         ModelMessage::assistant(vec![minicore_runtime::model::AssistantPart::Text(
-            "base a".to_owned(),
+            "base a".into(),
         )])
         .unwrap(),
         ModelMessage::system("Conversation summary:\ns1").unwrap(),
@@ -3739,7 +3829,7 @@ async fn default_provider_projects_history_in_order_with_summary_and_optional_sy
         )
         .unwrap(),
         ModelMessage::assistant(vec![minicore_runtime::model::AssistantPart::Text(
-            "append a".to_owned(),
+            "append a".into(),
         )])
         .unwrap(),
     ];
@@ -4026,7 +4116,7 @@ impl PromptProvider for InvalidTextPrompt {
     fn prepare<'a>(&'a self, _request: PromptRequest<'a>) -> PromptFuture<'a> {
         Box::pin(async {
             Ok(PreparedPrompt {
-                messages: vec![ModelMessage::User("\u{1}bad".to_string())],
+                messages: vec![ModelMessage::User("\u{1}bad".into())],
             })
         })
     }
@@ -4693,7 +4783,8 @@ async fn model_error_auth_rejected_preserves_classification_and_diagnostic() {
         DiagnosticCategory::Model,
         BoundedText::new("invalid credentials").unwrap(),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     let expected_error = ModelError::permanent(
         ModelErrorKind::AuthRejected,
         DeliveryState::NotStarted,
@@ -4738,7 +4829,8 @@ async fn model_error_rate_limited_exhausting_retry_preserves_diagnostic() {
         DiagnosticCategory::Model,
         BoundedText::new("rate limit exceeded").unwrap(),
         true,
-    );
+    )
+    .expect("valid diagnostic text");
     let expected_error = ModelError::not_started(
         ModelErrorKind::RateLimited,
         Some(Duration::from_millis(1)),
@@ -4803,7 +4895,8 @@ async fn model_error_quota_exceeded_preserves_diagnostic() {
         DiagnosticCategory::Model,
         BoundedText::new("quota depleted").unwrap(),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     let expected_error = ModelError::permanent(
         ModelErrorKind::QuotaExceeded,
         DeliveryState::NotStarted,
@@ -4840,7 +4933,8 @@ async fn model_error_context_overflow_preserves_diagnostic() {
         DiagnosticCategory::Model,
         BoundedText::new("context length exceeded").unwrap(),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     let expected_error = ModelError::permanent(
         ModelErrorKind::ContextOverflow,
         DeliveryState::NotStarted,
@@ -4877,7 +4971,8 @@ async fn model_error_request_outcome_unknown_preserves_diagnostic() {
         DiagnosticCategory::Model,
         BoundedText::new("network connection reset").unwrap(),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     let expected_error =
         ModelError::unknown(ModelErrorKind::RequestOutcomeUnknown, diagnostic.clone());
     let (model, _) = scripted_model(vec![Round::Error(expected_error.clone())]);
@@ -4919,7 +5014,8 @@ async fn model_error_stream_started_preserves_diagnostic_and_omits_partial_histo
         DiagnosticCategory::Model,
         BoundedText::new("stream severed after partial chunk").unwrap(),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     let expected_error = ModelError::started(ModelErrorKind::Unavailable, diagnostic.clone());
     let (model, _) = scripted_model(vec![Round::StreamError {
         events: vec![ModelEvent::text_delta("partial response text").unwrap()],
@@ -4962,7 +5058,8 @@ async fn model_error_invalid_provider_response_preserves_diagnostic() {
         DiagnosticCategory::Model,
         BoundedText::new("corrupt json response payload").unwrap(),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     let expected_error = ModelError::permanent(
         ModelErrorKind::InvalidProviderResponse,
         DeliveryState::NotStarted,
@@ -5079,7 +5176,8 @@ async fn loop_failure_debug_does_not_leak_diagnostic_message() {
         DiagnosticCategory::Model,
         BoundedText::new(secret).unwrap(),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     let error = ModelError::permanent(
         ModelErrorKind::AuthRejected,
         DeliveryState::NotStarted,
@@ -5113,7 +5211,8 @@ async fn first_request_start_error_counts_as_one_request_with_state_zero() {
         DiagnosticCategory::Model,
         BoundedText::new("start rejected").unwrap(),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     let error = ModelError::permanent(
         ModelErrorKind::Unavailable,
         DeliveryState::NotStarted,
@@ -5164,7 +5263,8 @@ async fn first_request_stream_failure_counts_as_one_request_with_state_zero() {
         DiagnosticCategory::Model,
         BoundedText::new("stream aborted").unwrap(),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     let error = ModelError::started(ModelErrorKind::Unavailable, diagnostic);
     let (model, _) = scripted_model(vec![Round::StreamError {
         events: vec![],
@@ -5206,7 +5306,8 @@ async fn second_request_failure_counts_as_two_requests_with_state_one() {
         DiagnosticCategory::Model,
         BoundedText::new("fail on round 2").unwrap(),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     let error = ModelError::permanent(
         ModelErrorKind::Unavailable,
         DeliveryState::NotStarted,
@@ -5344,7 +5445,7 @@ async fn model_burst_progress_drops_are_recorded_in_dropped_before() {
         .content
         .iter()
         .filter_map(|part| match part {
-            minicore_runtime::model::AssistantPart::Text(t) => Some(t.as_str()),
+            minicore_runtime::model::AssistantPart::Text(t) => Some(t.as_ref()),
             _ => None,
         })
         .collect();
@@ -5518,7 +5619,7 @@ async fn receiver_dropped_during_model_burst_allows_loop_to_complete() {
         .content
         .iter()
         .filter_map(|part| match part {
-            minicore_runtime::model::AssistantPart::Text(t) => Some(t.as_str()),
+            minicore_runtime::model::AssistantPart::Text(t) => Some(t.as_ref()),
             _ => None,
         })
         .collect();

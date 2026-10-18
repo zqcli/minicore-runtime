@@ -55,7 +55,8 @@ impl Model for FakeModel {
                     DiagnosticCategory::Internal,
                     BoundedText::new("fake model start is not exercised here").unwrap(),
                     false,
-                ),
+                )
+                .expect("valid diagnostic text"),
             ))
         })
     }
@@ -571,7 +572,7 @@ async fn prompt_provider_receives_the_full_history_view() {
     assert_eq!(prepared.messages.len(), 4);
     assert!(matches!(
         &prepared.messages[1],
-        ModelMessage::User(text) if text == "Fix the parser"
+        ModelMessage::User(text) if text.as_ref() == "Fix the parser"
     ));
     // base = [user, summary], appended = [assistant]; the summary lands between.
     assert!(

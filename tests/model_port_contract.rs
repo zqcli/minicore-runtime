@@ -275,7 +275,9 @@ fn stream_events_are_typed_bounded_complete_and_redacted() {
         )
         .is_err()
     );
-    assert!(ModelEvent::reasoning_delta("").is_err());
+    assert!(
+        matches!(ModelEvent::reasoning_delta("").unwrap(), ModelEvent::ReasoningDelta { delta } if delta.is_empty())
+    );
     let malformed = ModelEvent::TextDelta {
         delta: BoundedText::new("x".repeat(MAX_MODEL_EVENT_TEXT_BYTES + 1)).unwrap(),
     };

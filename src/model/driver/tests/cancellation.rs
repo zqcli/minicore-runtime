@@ -1,5 +1,60 @@
 use super::*;
 
+#[tokio::test]
+async fn each_attempt_cancels_its_child_without_cancelling_the_parent() {
+    for behaviors in [
+        vec![Behavior::Events(text_success("done"))],
+        vec![Behavior::StartPanic],
+        vec![Behavior::FuturePanic],
+        vec![Behavior::Events(vec![Ok(finish(ModelFinishReason::Stop))])],
+        vec![
+            Behavior::StartError(retryable_error(None)),
+            Behavior::Events(text_success("retry")),
+        ],
+    ] {
+        let model = ScriptModel::new(descriptor(), behaviors);
+        let driver = model.driver(&KernelConfig::default_checked().unwrap());
+        let parent = CancellationToken::new();
+        let (progress, _receiver) = progress_channel();
+        let _ = driver
+            .run(
+                request(),
+                context(parent.clone(), Duration::from_secs(30)),
+                &progress,
+            )
+            .await;
+        assert!(!parent.is_cancelled());
+        assert!(
+            lock(&model.tokens)
+                .iter()
+                .all(CancellationToken::is_cancelled)
+        );
+    }
+
+    let model = ScriptModel::new(
+        descriptor(),
+        vec![Behavior::PendingStart(Arc::new(AtomicBool::new(false)))],
+    );
+    let driver = model.driver(&KernelConfig::default_checked().unwrap());
+    let parent = CancellationToken::new();
+    let (progress, _receiver) = progress_channel();
+    {
+        let run = driver.run(
+            request(),
+            context(parent.clone(), Duration::from_secs(30)),
+            &progress,
+        );
+        tokio::pin!(run);
+        tokio::select! {
+            biased;
+            _ = &mut run => panic!("pending start completed"),
+            _ = model.wait_for_starts(1) => {},
+        }
+    }
+    assert!(!parent.is_cancelled());
+    assert!(lock(&model.tokens)[0].is_cancelled());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn cancellation_and_timeout_before_invocation_are_not_started() {
     let model = ScriptModel::new(descriptor(), vec![Behavior::Events(text_success("unused"))]);

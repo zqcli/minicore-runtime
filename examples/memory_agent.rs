@@ -105,13 +105,13 @@ impl MemoryAgent {
                 _ => None,
             })
             .map(|part| match part {
-                minicore_runtime::model::AssistantPart::Text(text) => text.clone(),
-                _ => String::new(),
+                minicore_runtime::model::AssistantPart::Text(text) => text.as_ref(),
+                _ => "",
             })
             .unwrap_or_default();
 
         self.history.extend(report.appended.iter().cloned());
-        Ok(reply)
+        Ok(reply.to_owned())
     }
 }
 

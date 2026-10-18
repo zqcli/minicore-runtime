@@ -220,7 +220,8 @@ fn retryable_error(retry_after: Option<Duration>) -> ModelError {
         DiagnosticCategory::Model,
         BoundedText::new("provider unavailable").unwrap(),
         true,
-    );
+    )
+    .expect("valid diagnostic text");
     ModelError::not_started(ModelErrorKind::ProviderUnavailable, retry_after, diagnostic)
 }
 
@@ -230,7 +231,8 @@ fn test_error(kind: ModelErrorKind) -> ModelError {
         DiagnosticCategory::Model,
         BoundedText::new("test model error").unwrap(),
         false,
-    );
+    )
+    .expect("valid diagnostic text");
     ModelError::permanent(kind, DeliveryState::NotStarted, diagnostic)
 }
 
@@ -262,6 +264,7 @@ struct ScriptModel {
     descriptor: ModelDescriptor,
     behaviors: Mutex<VecDeque<Behavior>>,
     requests: Mutex<Vec<ModelRequest>>,
+    tokens: Mutex<Vec<CancellationToken>>,
     starts: AtomicUsize,
     start_notify: Notify,
     completions: AtomicUsize,
@@ -274,6 +277,7 @@ impl ScriptModel {
             descriptor,
             behaviors: Mutex::new(behaviors.into()),
             requests: Mutex::new(Vec::new()),
+            tokens: Mutex::new(Vec::new()),
             starts: AtomicUsize::new(0),
             start_notify: Notify::new(),
             completions: AtomicUsize::new(0),
@@ -334,8 +338,9 @@ impl Model for ScriptModel {
     fn start<'a>(
         &'a self,
         request: ModelRequest,
-        _context: ModelCallContext,
+        context: ModelCallContext,
     ) -> ModelStartFuture<'a> {
+        lock(&self.tokens).push(context.cancellation);
         let behavior = self.take_behavior();
         if let Behavior::RequireDropThenEvents {
             dropped, confirmed, ..
@@ -524,6 +529,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn assert_text(response: &ModelResponse, expected: &str) {
     assert!(matches!(
         response.parts(),
-        [AssistantPart::Text(text)] if text == expected
+        [AssistantPart::Text(text)] if text.as_ref() == expected
     ));
 }

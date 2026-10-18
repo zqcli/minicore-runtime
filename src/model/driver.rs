@@ -8,8 +8,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant as TokioInstant;
 
 use crate::time::{DeadlineSource, effective_deadline};
-use crate::tools::ToolName;
-use crate::value::{BoundedText, MAX_JSON_BYTES};
+use crate::value::BoundedText;
 
 use super::model_port::{Model, ModelCallContext, ModelDescriptor};
 #[cfg(test)]
@@ -60,14 +59,6 @@ impl ModelDriverConfig {
             limits,
         }
     }
-
-    fn validate(&self) -> bool {
-        !self.model_call_timeout.is_zero()
-            && self.model_call_timeout <= MAX_MODEL_CALL_TIMEOUT
-            && (1..=4).contains(&self.retry_policy.max_attempts)
-            && self.retry_policy.base_delay <= MAX_MODEL_RETRY_DELAY
-            && self.limits.valid()
-    }
 }
 
 impl SemanticLimitsSnapshot {
@@ -87,15 +78,6 @@ impl SemanticLimitsSnapshot {
             max_model_text_bytes_per_round,
             max_model_reasoning_bytes_per_round,
         }
-    }
-
-    fn valid(&self) -> bool {
-        (1..=4_096).contains(&self.max_tool_calls_per_response)
-            && (1..=64).contains(&self.max_tool_name_bytes)
-            && (1..=MAX_JSON_BYTES).contains(&self.max_tool_schema_bytes)
-            && (1..=MAX_JSON_BYTES).contains(&self.max_tool_input_bytes)
-            && (1..=BoundedText::MAX_BYTES).contains(&self.max_model_text_bytes_per_round)
-            && (1..=BoundedText::MAX_BYTES).contains(&self.max_model_reasoning_bytes_per_round)
     }
 }
 
@@ -132,12 +114,6 @@ impl ModelDriver {
         descriptor.validate().map_err(|_| {
             generated_error(ModelErrorKind::InvalidRequest, DeliveryState::NotStarted)
         })?;
-        if !config.validate() {
-            return Err(generated_error(
-                ModelErrorKind::InvalidRequest,
-                DeliveryState::NotStarted,
-            ));
-        }
         Ok(Self {
             model,
             descriptor,
@@ -174,40 +150,20 @@ impl ModelDriver {
                     DeliveryState::NotStarted,
                 ))
             })?;
-        if context.cancellation.is_cancelled() {
-            return Err(ModelDriverFailure::ordinary(generated_error(
-                ModelErrorKind::Cancelled,
-                DeliveryState::NotStarted,
-            )));
-        }
-        if TokioInstant::now() >= deadline.tokio() {
-            return Err(ModelDriverFailure::deadline(
-                generated_error(ModelErrorKind::Timeout, DeliveryState::NotStarted),
-                deadline.source(),
-            ));
-        }
+        precheck(&context, deadline.tokio(), deadline.source())?;
         self.validate_request(&request)
             .map_err(ModelDriverFailure::ordinary)?;
 
         let max_attempts = self.retry_policy.max_attempts;
         for attempt in 0..max_attempts {
-            if context.cancellation.is_cancelled() {
-                return Err(ModelDriverFailure::ordinary(generated_error(
-                    ModelErrorKind::Cancelled,
-                    DeliveryState::NotStarted,
-                )));
-            }
-            if TokioInstant::now() >= deadline.tokio() {
-                return Err(ModelDriverFailure::deadline(
-                    generated_error(ModelErrorKind::Timeout, DeliveryState::NotStarted),
-                    deadline.source(),
-                ));
-            }
+            precheck(&context, deadline.tokio(), deadline.source())?;
             let mut attempt_context = context.clone();
             attempt_context.deadline = deadline.standard();
+            attempt_context.cancellation = context.cancellation.child_token();
+            let _attempt_cancel = attempt_context.cancellation.clone().drop_guard();
             match self
                 .run_attempt(
-                    request.clone(),
+                    &request,
                     attempt_context,
                     deadline.tokio(),
                     deadline.source(),
@@ -239,7 +195,6 @@ impl ModelDriver {
 
     fn validate_request(&self, request: &ModelRequest) -> Result<(), ModelError> {
         let invalid = || generated_error(ModelErrorKind::InvalidRequest, DeliveryState::NotStarted);
-        self.descriptor.validate().map_err(|_| invalid())?;
         if !self.descriptor.supports_reasoning(request.reasoning()) {
             return Err(invalid());
         }
@@ -253,24 +208,19 @@ impl ModelDriver {
         {
             return Err(invalid());
         }
-        let mut previous: Option<&ToolName> = None;
         for tool in request.tools() {
             tool.validate_for_bindings(
                 self.limits.max_tool_name_bytes,
                 self.limits.max_tool_schema_bytes,
             )
             .map_err(|_| invalid())?;
-            if previous.is_some_and(|previous| previous >= tool.name()) {
-                return Err(invalid());
-            }
-            previous = Some(tool.name());
         }
         Ok(())
     }
 
     async fn run_attempt(
         &self,
-        request: ModelRequest,
+        request: &ModelRequest,
         context: ModelCallContext,
         deadline: TokioInstant,
         deadline_source: DeadlineSource,
@@ -289,6 +239,9 @@ impl ModelDriver {
         })?;
         let start = AssertUnwindSafe(start).catch_unwind();
         tokio::pin!(start);
+        let _start_cancel = cancellation.clone().drop_guard();
+        let timeout = tokio::time::sleep_until(deadline);
+        tokio::pin!(timeout);
         let stream = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
@@ -297,7 +250,7 @@ impl ModelDriver {
                     false,
                 ));
             }
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = &mut timeout => {
                 return Err(AttemptFailure::deadline(
                     generated_error(ModelErrorKind::Timeout, DeliveryState::Unknown),
                     false,
@@ -315,6 +268,7 @@ impl ModelDriver {
         };
 
         let mut stream = stream;
+        let _stream_cancel = cancellation.clone().drop_guard();
         let mut assembler = Assembler::new(request.tools(), &self.limits);
         loop {
             let next = AssertUnwindSafe(stream.next()).catch_unwind();
@@ -330,7 +284,7 @@ impl ModelDriver {
                         assembler.observed_event,
                     ));
                 }
-                _ = tokio::time::sleep_until(deadline) => {
+                _ = &mut timeout => {
                     return Err(AttemptFailure::deadline(
                         generated_error(
                             ModelErrorKind::Timeout,
@@ -384,3 +338,23 @@ impl ModelDriver {
 
 #[cfg(test)]
 mod tests;
+
+fn precheck(
+    context: &ModelCallContext,
+    deadline: TokioInstant,
+    source: DeadlineSource,
+) -> Result<(), ModelDriverFailure> {
+    if context.cancellation.is_cancelled() {
+        return Err(ModelDriverFailure::ordinary(generated_error(
+            ModelErrorKind::Cancelled,
+            DeliveryState::NotStarted,
+        )));
+    }
+    if TokioInstant::now() >= deadline {
+        return Err(ModelDriverFailure::deadline(
+            generated_error(ModelErrorKind::Timeout, DeliveryState::NotStarted),
+            source,
+        ));
+    }
+    Ok(())
+}

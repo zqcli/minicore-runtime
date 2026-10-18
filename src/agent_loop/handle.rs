@@ -46,7 +46,14 @@ impl LoopHandle {
     /// loop; repeated calls return `false`.
     pub fn cancel(&self) -> bool {
         self.control
-            .mark_cancel(crate::agent_loop::CancelReason::User)
+            .mark_cancel(crate::agent_loop::control::CancelSource::User)
+    }
+
+    /// Requests host shutdown; the report records `CancelReason::Shutdown`.
+    /// Returns `false` if cancellation or completion already won.
+    pub fn shutdown(&self) -> bool {
+        self.control
+            .mark_cancel(crate::agent_loop::control::CancelSource::Shutdown)
     }
 
     /// Atomically replaces the loop's execution config. The new config takes
@@ -64,8 +71,8 @@ impl LoopHandle {
     /// (in accept order, alongside any pending config update) to the next
     /// model request's prompt. A successful call means the steer was accepted
     /// into this process-local queue. It is applied at the next request boundary.
-    /// If the loop is cancelled, shut down, or the process exits before that
-    /// boundary, the queued steer may be discarded and will not appear in
+    /// On any non-`Completed` ending (or process exit) before that boundary,
+    /// the queued steer is discarded and will not appear in
     /// `LoopReport::appended`. `QueueFull` means the bounded queue is full,
     /// `WaitingForInput` that an interaction is pending, and `NotActive` that
     /// the loop already sealed.

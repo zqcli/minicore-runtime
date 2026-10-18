@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -13,7 +14,7 @@ use super::ModelValueError;
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ProviderReplay {
     format: String,
-    payload: Value,
+    payload: Arc<Value>,
     #[serde(skip)]
     bytes: usize,
 }
@@ -46,7 +47,7 @@ impl ProviderReplay {
         validate_shape(&payload, 0, &mut 0)?;
         let mut replay = Self {
             format,
-            payload,
+            payload: Arc::new(payload),
             bytes: 0,
         };
         let mut sink = CountingWriter(0);
@@ -60,7 +61,7 @@ impl ProviderReplay {
         &self.format
     }
 
-    pub const fn payload(&self) -> &Value {
+    pub fn payload(&self) -> &Value {
         &self.payload
     }
 

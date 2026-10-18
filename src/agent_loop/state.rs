@@ -20,6 +20,7 @@ pub struct LoopState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum LoopStatus {
     Starting,
     RunningModel,

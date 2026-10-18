@@ -59,7 +59,8 @@ snapshot of the request that produced the batch.
   `InteractionRequested`, or entering `WaitingForInput`.
 - The host resolves via `LoopHandle::answer` (`InteractionAnswer::Approval`
   or `InteractionAnswer::ToolInput`). The runtime enforces the interaction
-  type contract; a mismatched answer is an `Internal` failure.
+  type contract; a mismatched answer returns `AnswerError::WrongInteraction`
+  to the caller and leaves the interaction waiting.
 - While waiting, the loop deadline still wins; cancellation also ends the
   wait. One interaction slot is outstanding at a time.
 
@@ -74,3 +75,5 @@ snapshot of the request that produced the batch.
 A config `update` or `steer` arriving mid-batch does **not** affect the
 current batch: the batch uses the snapshot of the request that produced it.
 New config/steers apply from the next model request.
+Tool text, including input prompts, choices, answers, progress messages and
+diagnostics, allows LF and TAB but rejects other control characters.

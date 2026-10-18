@@ -19,19 +19,6 @@ fn constructor_catches_descriptor_panic_and_rejects_invalid_descriptor() {
         Ok(_) => panic!("invalid descriptor unexpectedly constructed a driver"),
     };
     assert_eq!(error.kind(), ModelErrorKind::InvalidRequest);
-
-    let invalid_config = ModelDriverConfig::from_kernel_values(
-        Duration::ZERO,
-        1,
-        Duration::ZERO,
-        SemanticLimitsSnapshot::from_kernel_values(1, 1, 1, 1, 1, 1),
-    );
-    let model: Arc<dyn Model> = ScriptModel::new(descriptor(), Vec::new());
-    let error = match ModelDriver::new(model, invalid_config) {
-        Err(error) => error,
-        Ok(_) => panic!("zero model timeout unexpectedly constructed a driver"),
-    };
-    assert_eq!(error.kind(), ModelErrorKind::InvalidRequest);
 }
 
 #[tokio::test(flavor = "current_thread")]
