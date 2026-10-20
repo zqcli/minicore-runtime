@@ -1,6 +1,6 @@
 # Current Implementation Context
 
-The current package is v0.7.0. It retains the one-loop boundary from the
+The current package is v0.7.1. It retains the one-loop boundary from the
 v0.4 reset. Tool-batch statistics are now `u64` end to end within Runtime;
 the optional legacy `u16` round budget still defaults to zero (unlimited).
 Each real prompt preparation publishes one `Starting` event. Session-owned

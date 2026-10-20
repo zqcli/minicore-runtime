@@ -141,3 +141,53 @@ jobs:
           }
       - run: cargo test --all-targets --locked
       - run: cargo test --manifest-path provider-gate/Cargo.toml --all-targets --locked
+
+  package:
+    name: Package (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      - name: Select stable Rust toolchain
+        run: rustup override set stable
+      - name: Build the examples
+        run: cargo build --locked --release --examples --target ${{ matrix.target }}
+      - name: Stage
+        id: stage
+        shell: bash
+        env:
+          EXE: ${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          name="minicore-runtime-$version-${{ matrix.target }}"
+          mkdir -p "$name/examples"
+          for example in agent_loop memory_agent; do
+            cp "target/${{ matrix.target }}/release/examples/$example$EXE" "$name/examples/"
+          done
+          cp README.md "$name/"
+          # A tarball keeps the executable bit, which artifact zips drop.
+          if [ -z "$EXE" ]; then
+            tar -czf "$name.tar.gz" "$name"
+            echo "path=$name.tar.gz" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=$name" >> "$GITHUB_OUTPUT"
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.name }}
+          path: ${{ steps.stage.outputs.path }}
+          if-no-files-found: error

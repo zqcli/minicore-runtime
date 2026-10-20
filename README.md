@@ -13,7 +13,7 @@ host.
 
 | | |
 |---|---|
-| Version | 0.7.0 |
+| Version | 0.7.1 |
 | Rust | edition 2024, MSRV 1.85 |
 | Async runtime | Tokio (the loop spawns one task) |
 | Production dependencies | serde, serde_json, tokio, tokio-util, futures-util, thiserror, getrandom |
@@ -158,6 +158,11 @@ harness or its provider dependency changes. See [tests/README.md](tests/README.m
 for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 
 ## Compatibility Notes
+
+### 0.7.1
+
+- No API or behavior changes. CI uploads release builds of the examples for
+  Linux, macOS, and Windows as workflow artifacts.
 
 ### 0.7.0
 
