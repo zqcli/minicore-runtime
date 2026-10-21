@@ -31,10 +31,9 @@ Every phase ships green against:
 - `cargo test --locked --all-targets --all-features`
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features`
-- `./scripts/check-msrv.sh` (Rust 1.85)
 - `cargo metadata --locked`
 - `./scripts/check.sh` (includes docs/architecture/acceptance gates)
 
 Provider-gate is independent: `./scripts/check-provider-gate.sh` runs its fmt,
-tests and clippy on Rust >= 1.88. Run it when changing provider evidence or
-upgrading its dependency; it is not part of the main runtime or MSRV gate.
+tests and clippy. Run it when changing provider evidence or upgrading its
+dependency; it is not part of the main runtime gate.

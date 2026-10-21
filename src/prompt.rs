@@ -115,10 +115,10 @@ impl PromptProvider for DefaultPromptProvider {
         Box::pin(async move {
             let mut messages =
                 Vec::with_capacity(request.history.len() + usize::from(system.is_some()));
-            if let Some(system) = system {
-                if !system.is_empty() {
-                    messages.push(ModelMessage::System(system.shared()));
-                }
+            if let Some(system) = system
+                && !system.is_empty()
+            {
+                messages.push(ModelMessage::System(system.shared()));
             }
             for item in request.history.iter() {
                 let message = match item {

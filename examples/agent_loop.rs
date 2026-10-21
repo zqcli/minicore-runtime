@@ -318,10 +318,9 @@ async fn wait_for_request(events: &mut minicore_runtime::LoopEventStream, reques
             request_index: index,
             ..
         } = envelope.event
+            && index == request_index
         {
-            if index == request_index {
-                return;
-            }
+            return;
         }
     }
     panic!("loop ended before request {request_index}");

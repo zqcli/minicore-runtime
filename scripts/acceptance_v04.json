@@ -559,7 +559,7 @@
       "status": "Passed",
       "summary": "Rust 1.85通过",
       "evidence": [
-        "scripts/check-msrv.sh"
+        "docs/release-v0.4.md"
       ]
     },
     {
@@ -584,8 +584,7 @@
       "status": "Passed",
       "summary": "cargo fmt通过",
       "evidence": [
-        "scripts/check.sh",
-        "scripts/check-msrv.sh"
+        "scripts/check.sh"
       ]
     },
     {

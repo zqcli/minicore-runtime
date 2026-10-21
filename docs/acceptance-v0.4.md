@@ -68,10 +68,10 @@ Phase: complete (all rows Passed).
 | V4-058 | Passed | 同一Loop可记录多个Model | `tests/p2_agent_loop.rs::update_during_model_reaches_the_next_request`; `tests/p2_agent_loop.rs::default_provider_accepts_mixed_model_refs_in_the_base` |
 | V4-059 | Passed | Summary无durable boundary语义 | `src/history.rs`; `docs/contracts/history.md` |
 | V4-060 | Passed | DefaultPrompt可运行简单Agent | `tests/p2_agent_loop.rs::default_provider_runs_a_loop_end_to_end_with_system_prompt` |
-| V4-061 | Passed | Rust 1.85通过 | `scripts/check-msrv.sh` |
+| V4-061 | Passed | Rust 1.85通过 | `docs/release-v0.4.md` |
 | V4-062 | Passed | stable通过 | `scripts/check.sh` |
 | V4-063 | Passed | Linux/macOS/Windows CI矩阵四job（macos/windows/stable/1.85）在run 33750189748全绿 | `.github/workflows/ci.yml`; `docs/release-v0.4.md` |
-| V4-064 | Passed | cargo fmt通过 | `scripts/check.sh`; `scripts/check-msrv.sh` |
+| V4-064 | Passed | cargo fmt通过 | `scripts/check.sh` |
 | V4-065 | Passed | clippy -D warnings通过 | `scripts/check.sh` |
 | V4-066 | Passed | rustdoc -D warnings通过 | `scripts/check.sh` |
 | V4-067 | Passed | 无unsafe生产代码 | `scripts/check_v04_architecture.py`; `src/lib.rs` |

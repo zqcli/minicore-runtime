@@ -10,32 +10,20 @@ permissions:
 
 jobs:
   test:
-    name: Rust ${{ matrix.rust }}
+    name: quality gate (ubuntu, stable)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: ["1.85.0", "stable"]
-
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 2
       - name: Install Rust toolchain
-        run: rustup toolchain install "${{ matrix.rust }}" --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - name: Select Rust toolchain
-        run: rustup override set "${{ matrix.rust }}"
-      - name: Install stable quality gate tools
-        if: matrix.rust == 'stable'
+        run: rustup override set stable
+      - name: Install quality gate tools
         run: sudo apt-get update && sudo apt-get install --yes ripgrep
-      - name: Run stable quality gate
-        if: matrix.rust == 'stable'
+      - name: Run the quality gate
         run: ./scripts/check.sh
-      - name: Verify MSRV
-        if: matrix.rust == '1.85.0'
-        env:
-          MSRV_TOOLCHAIN: 1.85.0
-        run: ./scripts/check-msrv.sh
 
   native:
     name: cargo test (${{ matrix.os }})

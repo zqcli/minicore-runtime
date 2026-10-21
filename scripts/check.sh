@@ -13,9 +13,6 @@ RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features
 # Docs and v0.4 architecture gates.
 bash scripts/check-architecture.sh
 
-# MSRV is deliberately a separate opt-in script (needs a pinned toolchain).
-# Run it explicitly: ./scripts/check-msrv.sh
-
 if ! command -v rg >/dev/null 2>&1; then
   echo "rg is required by the quality gate" >&2
   exit 1

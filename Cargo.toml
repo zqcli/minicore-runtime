@@ -2,12 +2,11 @@
 name = "minicore-runtime"
 version = "0.7.1"
 edition = "2024"
-rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Small Rust execution core for one live agent loop"
 
 [dependencies]
-getrandom = "0.3.3"
+getrandom = "0.4"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = "1.0.140"
 thiserror = "2.0.12"

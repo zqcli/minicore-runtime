@@ -52,7 +52,7 @@ library type.
 - Steer accepted means queued in the process-local queue for the next request
   boundary; every non-`Completed` ending discards unapplied queued steers.
 - Tool catalog size is independent from per-response `ToolCall` limits.
-- MSRV is 1.85; production code forbids `unsafe`; no async mutex, no
+- Built with current stable Rust, no declared minimum; production code forbids `unsafe`; no async mutex, no
   `parking_lot`.
 - Negative scope preserved: no session runtime, no session logs/manifests,
   no durable store, no whole-loop auto-retry, no ACK/replay event stream.
@@ -61,9 +61,9 @@ library type.
 
 `./scripts/check.sh` (main crate fmt/test all-targets all-features/clippy
 `-D warnings`/rustdoc `-D warnings`, `check_docs.py`, `check_v04_architecture.py`,
-acceptance and git diff/show checks) and `./scripts/check-msrv.sh` must stay green.
-The standalone provider evidence is opt-in through `./scripts/check-provider-gate.sh`
-(Rust >= 1.88); run it when changing that harness or its provider dependency,
+acceptance and git diff/show checks) must stay green.
+The standalone provider evidence is opt-in through `./scripts/check-provider-gate.sh`;
+run it when changing that harness or its provider dependency,
 not on every runtime change. The v0.4 reset is complete with
 the correctness closeout applied across five code commits (`f6a9e3e`, `9caae19`,
 `b4ca0fa`, `04c3f22`, `a4cbf60`). The historical v0.4 closeout suite was 278 tests (253 in main

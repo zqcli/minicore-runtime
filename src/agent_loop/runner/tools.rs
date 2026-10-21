@@ -531,17 +531,17 @@ fn provided_input_result(
     content: String,
     max_output_bytes: usize,
 ) -> ToolResultHistory {
-    if content.len() <= max_output_bytes {
-        if let Ok(output) = ToolOutput::new(content) {
-            return ToolResultHistory {
-                loop_id: id,
-                request_index,
-                call_id: invocation.tool_call_id().clone(),
-                tool_name: invocation.tool_name().clone(),
-                outcome: ToolResultOutcome::InputProvided,
-                output,
-            };
-        }
+    if content.len() <= max_output_bytes
+        && let Ok(output) = ToolOutput::new(content)
+    {
+        return ToolResultHistory {
+            loop_id: id,
+            request_index,
+            call_id: invocation.tool_call_id().clone(),
+            tool_name: invocation.tool_name().clone(),
+            outcome: ToolResultOutcome::InputProvided,
+            output,
+        };
     }
     terminal_tool_result(
         id,

@@ -32,13 +32,12 @@ stays in that host.
 | `tests/*.rs`, `tests/support/` | Contract and integration targets with shared builders |
 | `examples/` | `agent_loop.rs` and `memory_agent.rs`, compiled by the gates and packaged by CI |
 | `scripts/` | Quality gates; `acceptance_v04.json` is the v0.4 acceptance manifest |
-| `provider-gate/` | Standalone opt-in provider evidence harness (Rust 1.88+) |
+| `provider-gate/` | Standalone opt-in provider evidence harness |
 
 ## Commands
 
 ```bash
 ./scripts/check.sh       # fmt, tests, Clippy -D warnings, rustdoc -D warnings, docs/architecture/acceptance gates
-./scripts/check-msrv.sh  # tests on Rust 1.85.0
 ```
 
 Focused runs: `cargo test --all-features --locked --test p2_agent_loop <name>` or
@@ -49,8 +48,11 @@ dependency changes.
 
 ## Code Rules
 
-- Rust edition 2024, MSRV 1.85. Do not use std APIs stabilized later. `unsafe`
-  is forbidden.
+- Rust edition 2024 on current stable; no minimum version is declared or
+  tested, so newer language features and std APIs are fine. `unsafe` is
+  forbidden.
+- Dependencies use plain version requirements (`"1"`, `"0.4"`), never `=`
+  pins; `Cargo.lock` and `--locked` make builds reproducible.
 - The only production `tokio::spawn` is the runner task in
   `AgentLoop::start`. Do not use `tokio::sync::Mutex` or `parking_lot`. Keep
   the control `std::sync::Mutex` critical sections short, and drop replaced or
@@ -109,12 +111,13 @@ byte-compared fixture (`.gitattributes` sets `eol=lf`).
 ## CI And Releases
 
 - `.github/workflows/ci.yml` runs on every push and tag: the stable quality
-  gate and MSRV on Ubuntu, tests on macOS and Windows, and a release build of
+  gate on Ubuntu, tests on macOS and Windows, and a release build of
   the examples per platform uploaded as `minicore-runtime-<version>-<target>`.
 - A release bumps `version` in `Cargo.toml` and the `minicore-runtime` entry in
   `Cargo.lock` only, the version in the README table and `CONTEXT.md`, and adds
   a README compatibility note for the version. Tag `vX.Y.Z` (annotated) only
-  after CI is green on that commit; `minicore-agent` then pins its full SHA.
+  after CI is green on that commit; `minicore-agent` then pins that tag
+  (`tag = "vX.Y.Z"`). Tags are never moved.
 
 ## Commits
 

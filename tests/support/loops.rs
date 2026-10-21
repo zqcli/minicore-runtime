@@ -234,10 +234,10 @@ pub fn gated_stream(events: Vec<ModelEvent>, gate: Arc<Notify>) -> ModelStream {
             gate: Some(gate),
         },
         |mut state| async move {
-            if state.next == 0 {
-                if let Some(gate) = state.gate.take() {
-                    gate.notified().await;
-                }
+            if state.next == 0
+                && let Some(gate) = state.gate.take()
+            {
+                gate.notified().await;
             }
             if state.next < state.events.len() {
                 let event = state.events[state.next].clone();

@@ -51,11 +51,9 @@ impl PromptProvider for GatedPrompt {
         let gate = self.gate.clone();
         let is_first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
         Box::pin(async move {
-            if is_first {
-                if let Some(gate) = gate {
-                    entered.notify_waiters();
-                    gate.notified().await;
-                }
+            if is_first && let Some(gate) = gate {
+                entered.notify_waiters();
+                gate.notified().await;
             }
             let mut messages = Vec::new();
             for item in request.history.iter() {
@@ -166,10 +164,10 @@ async fn each_request_preparation_emits_one_starting_state() {
     let mut preparations = Vec::new();
     while let Some(envelope) = events.recv().await {
         assert_eq!(envelope.dropped_before, 0);
-        if let LoopEvent::StateChanged { state } = envelope.event {
-            if state.status == LoopStatus::Starting {
-                preparations.push(state.request_index);
-            }
+        if let LoopEvent::StateChanged { state } = envelope.event
+            && state.status == LoopStatus::Starting
+        {
+            preparations.push(state.request_index);
         }
     }
     assert_eq!(preparations, vec![0, 1]);

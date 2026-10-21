@@ -72,10 +72,10 @@ seam points outward: the runtime defines traits, hosts implement adapters.
 
 ## Quality Gates
 
-`./scripts/check.sh` covers the runtime, documentation and architecture;
-`./scripts/check-msrv.sh` verifies Rust 1.85 separately. The standalone provider
-harness has no production dependency edge: use `./scripts/check-provider-gate.sh`
-when changing provider evidence or its dependency, on its own Rust >= 1.88 toolchain.
+`./scripts/check.sh` covers the runtime, documentation and architecture on
+current stable Rust. The standalone provider harness has no production
+dependency edge: use `./scripts/check-provider-gate.sh` when changing provider
+evidence or its dependency.
 It is intentionally outside the runtime gate.
 
 ## What v0.3 Had That v0.4 Removed

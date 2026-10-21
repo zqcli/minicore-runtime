@@ -80,9 +80,9 @@ cargo test --locked --all-targets --all-features
 ```
 
 The full gate is `./scripts/check.sh` (fmt, tests, clippy `-D warnings`,
-rustdoc `-D warnings`, docs/architecture/acceptance checks) plus
-`./scripts/check-msrv.sh`. Run `./scripts/check-provider-gate.sh` separately
-when changing provider evidence or its dependency (Rust >= 1.88).
+rustdoc `-D warnings`, docs/architecture/acceptance checks). Run
+`./scripts/check-provider-gate.sh` separately when changing provider evidence or
+its dependency.
 ### v0.6.1 provider replay evidence
 
 `provider_replay.rs` covers full-envelope byte/depth/node bounds, validated serde,

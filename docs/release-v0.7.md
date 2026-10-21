@@ -42,8 +42,9 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features
 bash scripts/check-architecture.sh
-bash scripts/check-msrv.sh
 ```
+
+Since 0.7.3 no minimum Rust version is tested; the gate runs on current stable.
 
 The main suite has 278 tests: 81 unit and 197 integration tests in 11 binaries.
 Two compile-fail doctests additionally protect the checked tool DTO boundaries.
@@ -52,7 +53,7 @@ The two examples compile as test targets. The acceptance checker preserves all
 [test inventory](../tests/README.md) for per-target counts.
 
 Provider evidence is separate: `./scripts/check-provider-gate.sh` runs its own
-fmt/test/clippy gate on Rust >= 1.88 when that harness or its dependency changes.
+fmt/test/clippy gate when that harness or its dependency changes.
 It is no longer invoked by `scripts/check.sh`. Historical v0.4 release records
 retain the gate and counts that applied at that release.
 

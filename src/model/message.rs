@@ -559,10 +559,10 @@ pub(super) fn validate_tool_call_order(parts: &[AssistantPart]) -> Result<(), Mo
 
 pub(super) fn normalize_parts(mut parts: Vec<AssistantPart>) -> Vec<AssistantPart> {
     for part in &mut parts {
-        if let AssistantPart::Text(text) = part {
-            if let std::borrow::Cow::Owned(normalized) = normalize_model_text(text) {
-                *text = normalized.into();
-            }
+        if let AssistantPart::Text(text) = part
+            && let std::borrow::Cow::Owned(normalized) = normalize_model_text(text)
+        {
+            *text = normalized.into();
         }
     }
     parts

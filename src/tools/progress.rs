@@ -57,10 +57,10 @@ impl ToolProgress {
         {
             return Err(ToolProgressError::InvalidText);
         }
-        if let (Some(completed), Some(total)) = (self.completed, self.total) {
-            if completed > total {
-                return Err(ToolProgressError::CompletedExceedsTotal);
-            }
+        if let (Some(completed), Some(total)) = (self.completed, self.total)
+            && completed > total
+        {
+            return Err(ToolProgressError::CompletedExceedsTotal);
         }
         Ok(())
     }

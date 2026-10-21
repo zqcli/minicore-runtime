@@ -14,7 +14,7 @@ host.
 | | |
 |---|---|
 | Version | 0.7.1 |
-| Rust | edition 2024, MSRV 1.85 |
+| Rust | edition 2024, current stable |
 | Async runtime | Tokio (the loop spawns one task) |
 | Production dependencies | serde, serde_json, tokio, tokio-util, futures-util, thiserror, getrandom |
 | License | MIT OR Apache-2.0 |
@@ -148,16 +148,22 @@ Generate the API docs with `cargo doc --no-deps --open`.
 
 ```bash
 ./scripts/check.sh       # fmt, tests, Clippy, rustdoc, docs and architecture gates
-./scripts/check-msrv.sh  # the test suite on Rust 1.85.0
 ```
 
-`check.sh` needs `python3` and `rg`. CI runs both scripts on Ubuntu and the tests
-on macOS and Windows. `./scripts/check-provider-gate.sh` runs the standalone
-provider evidence harness in `provider-gate/` (Rust 1.88+); run it only when that
-harness or its provider dependency changes. See [tests/README.md](tests/README.md)
+`check.sh` needs `python3` and `rg`. CI runs it on Ubuntu with stable Rust and
+the tests on macOS and Windows; no older toolchain is tested.
+`./scripts/check-provider-gate.sh` runs the standalone provider evidence harness
+in `provider-gate/`; run it only when that harness or its provider dependency
+changes. See [tests/README.md](tests/README.md)
 for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 
 ## Compatibility Notes
+
+### Unreleased
+
+- No minimum Rust version is declared or tested any more: build with current
+  stable. Edition 2024 still needs Rust 1.85 or newer.
+- `getrandom` 0.4, and every dependency updated to its latest release.
 
 ### 0.7.1
 
