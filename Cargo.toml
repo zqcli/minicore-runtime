@@ -1,6 +1,6 @@
 [package]
 name = "minicore-runtime"
-version = "0.7.1"
+version = "0.7.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Small Rust execution core for one live agent loop"

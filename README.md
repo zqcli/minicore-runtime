@@ -13,7 +13,7 @@ host.
 
 | | |
 |---|---|
-| Version | 0.7.1 |
+| Version | 0.7.3 |
 | Rust | edition 2024, current stable |
 | Async runtime | Tokio (the loop spawns one task) |
 | Production dependencies | serde, serde_json, tokio, tokio-util, futures-util, thiserror, getrandom |
@@ -159,8 +159,10 @@ for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 
 ## Compatibility Notes
 
-### Unreleased
+### 0.7.3
 
+- No API or behavior changes. The version follows `minicore-agent` 0.7.3; there
+  is no 0.7.2.
 - No minimum Rust version is declared or tested any more: build with current
   stable. Edition 2024 still needs Rust 1.85 or newer.
 - `getrandom` 0.4, and every dependency updated to its latest release.
