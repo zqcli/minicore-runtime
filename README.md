@@ -13,7 +13,7 @@ host.
 
 | | |
 |---|---|
-| Version | 0.7.3 |
+| Version | 0.7.4 |
 | Rust | edition 2024, current stable |
 | Async runtime | Tokio (the loop spawns one task) |
 | Production dependencies | serde, serde_json, tokio, tokio-util, futures-util, thiserror, getrandom |
