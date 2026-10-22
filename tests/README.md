@@ -90,4 +90,4 @@ redacted Debug, legacy constructors/wire formats, and replay-only content.
 Driver assembly/settlement tests cover single metadata delivery, duplicate and
 post-Finish rejection, missing Finish, EOF/error/cancellation settlement, and no
 progress forwarding. `p2_agent_loop.rs` covers runner/history/projection retention,
-old history serde, exact history-byte accounting, and the 2 MiB absolute ceiling.
+old history serde, exact history-byte accounting, and the 2 MiB default limit.

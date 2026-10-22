@@ -159,6 +159,11 @@ for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 
 ## Compatibility Notes
 
+### 0.7.4
+
+- `LoopLimits::max_history_bytes` accepts up to 32 MiB, so a host can size
+  history to a large model context. The default stays 2 MiB.
+
 ### 0.7.3
 
 - No API or behavior changes. The version follows `minicore-agent` 0.7.3; there
@@ -214,7 +219,7 @@ for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
   remain valid; history struct literals must initialize `provider_replay`.
 - A replay envelope is at most 256 KiB of compact JSON, with depth 32 and 16,384
   payload nodes. The Runtime neither interprets nor truncates it. The host's
-  2 MiB history ceiling includes the envelope.
+  history byte limit includes the envelope.
 - Replay never creates display text or tool calls. Its payload is visible to the
   host and serialized in history, but redacted from `Debug` and never emitted as
   an output event.

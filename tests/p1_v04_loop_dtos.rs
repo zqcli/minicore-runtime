@@ -305,6 +305,12 @@ fn loop_options_default_checked_and_rejects_out_of_bounds_fields() {
     invalid.limits.max_history_bytes = 0;
     assert_eq!(invalid.validate(), Err(LoopStartError::InvalidOptions));
 
+    let mut boundary = options.clone();
+    boundary.limits.max_history_bytes = 32 * 1024 * 1024;
+    assert!(boundary.validate().is_ok());
+    boundary.limits.max_history_bytes += 1;
+    assert_eq!(boundary.validate(), Err(LoopStartError::InvalidOptions));
+
     let mut invalid = options.clone();
     invalid.deadline = Some(
         tokio::time::Instant::now()

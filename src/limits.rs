@@ -3,7 +3,10 @@ use thiserror::Error;
 use crate::value::{BoundedText, MAX_JSON_BYTES};
 
 const MAX_HISTORY_ITEMS: usize = 4_096;
-const MAX_HISTORY_BYTES: usize = 8 * BoundedText::MAX_BYTES;
+const DEFAULT_HISTORY_BYTES: usize = 8 * BoundedText::MAX_BYTES;
+// Hosts size history to the model's context; 32 MiB covers million-token
+// windows with provider replay included.
+const MAX_HISTORY_BYTES: usize = 128 * BoundedText::MAX_BYTES;
 const MAX_TOOL_CALLS_PER_RESPONSE: usize = 64;
 const MAX_TOOL_NAME_BYTES: usize = 64;
 const MAX_PROMPT_MESSAGES: usize = 4_096;
@@ -31,7 +34,7 @@ impl Default for LoopLimits {
     fn default() -> Self {
         Self {
             max_history_items: MAX_HISTORY_ITEMS,
-            max_history_bytes: MAX_HISTORY_BYTES,
+            max_history_bytes: DEFAULT_HISTORY_BYTES,
             max_user_input_bytes: BoundedText::MAX_BYTES,
             max_model_text_bytes: BoundedText::MAX_BYTES,
             max_model_reasoning_bytes: BoundedText::MAX_BYTES,

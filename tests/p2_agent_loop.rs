@@ -5118,7 +5118,7 @@ async fn history_limit_counts_opaque_replay_at_the_exact_boundary() {
 }
 
 #[tokio::test]
-async fn replay_only_history_enforces_two_mib_absolute_ceiling() {
+async fn replay_only_history_enforces_the_two_mib_default_limit() {
     use minicore_runtime::model::ProviderReplay;
     let overhead = ProviderReplay::new("x", json!("")).unwrap().byte_len();
     let replay =
