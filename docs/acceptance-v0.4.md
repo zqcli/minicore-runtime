@@ -63,7 +63,7 @@ Phase: complete (all rows Passed).
 | V4-053 | Passed | 单spawn门禁+join完成/取消隔离无残留迹象 | `tests/p2_agent_loop.rs::concurrent_loops_finish_independently_without_extra_tasks`; `tests/p3_agent_loop_closeout.rs::shared_model_and_toolset_loops_cancel_isolated_without_orphans` |
 | V4-054 | Passed | Base history由Host拥有 | `docs/contracts/history.md`; `tests/p3_agent_loop_closeout.rs::report_appended_is_only_the_loop_delta_not_the_base_history` |
 | V4-055 | Passed | Core不做全局history ledger验证 | `tests/p2_agent_loop.rs::inconsistent_old_tool_history_fails_as_prompt_but_start_succeeds`; `docs/contracts/history.md` |
-| V4-056 | Passed | History超限安全失败 | `tests/p3_agent_loop_closeout.rs::start_rejects_history_over_item_and_byte_limits`; `src/agent_loop/mod.rs` |
+| V4-056 | Passed | History超限安全失败（该限制已移除：History与Prompt大小不再由Core限制） | `tests/p2_agent_loop.rs::loop_accepts_history_and_prompt_beyond_former_count_and_byte_caps`; `docs/contracts/history.md` |
 | V4-057 | Passed | Report不复制base history | `tests/p3_agent_loop_closeout.rs::report_appended_is_only_the_loop_delta_not_the_base_history` |
 | V4-058 | Passed | 同一Loop可记录多个Model | `tests/p2_agent_loop.rs::update_during_model_reaches_the_next_request`; `tests/p2_agent_loop.rs::default_provider_accepts_mixed_model_refs_in_the_base` |
 | V4-059 | Passed | Summary无durable boundary语义 | `src/history.rs`; `docs/contracts/history.md` |

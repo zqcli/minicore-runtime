@@ -39,5 +39,7 @@ The host-facing conversation vocabulary passed in and returned by the loop.
   produced; `ModelRequest` validates that every `ToolCall` is matched by a
   `ToolResult` with the same id.
 - Host-provided history is trusted for semantics; the loop only enforces the
-  message-budget and structural validation described in the
-  [prompt contract](prompt.md).
+  structural validation described in the [prompt contract](prompt.md).
+- The loop caps neither the number nor the total size of history items; the
+  host bounds history, for example by token-based compaction.
+  `estimate_history_bytes` is a host-side size estimate only.

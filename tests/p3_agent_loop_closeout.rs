@@ -421,42 +421,6 @@ async fn policy_update_applies_the_full_snapshot_at_the_next_request_batch() {
     assert_eq!(results[1].1, ToolResultOutcome::Denied);
 }
 
-/// Oversized base history (items or bytes) is rejected at start.
-#[tokio::test]
-async fn start_rejects_history_over_item_and_byte_limits() {
-    let loop_id = minicore_runtime::LoopId::new().unwrap();
-    let item = |input: &str| {
-        HistoryItem::User(UserHistory {
-            loop_id,
-            kind: UserMessageKind::Prompt,
-            input: UserInput::text(input).unwrap(),
-        })
-    };
-    let base = config(
-        model(vec![Round::Final { text: "hi" }]),
-        ToolSet::default(),
-        None,
-    );
-
-    // Item count over the limit.
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.limits.max_history_items = 2;
-    let too_many_items = vec![item("a"), item("b"), item("c")];
-    assert!(matches!(
-        start_with(request_with(base.clone(), too_many_items), options.clone()),
-        Err(LoopStartError::HistoryTooLarge)
-    ));
-
-    // Byte estimate over the limit.
-    options.limits.max_history_items = 100;
-    options.limits.max_history_bytes = 64;
-    let bloat = vec![item(&"x".repeat(200))];
-    assert!(matches!(
-        start_with(request_with(base, bloat), options),
-        Err(LoopStartError::HistoryTooLarge)
-    ));
-}
-
 /// The report carries only the loop's own in-memory delta, never a copy of
 /// the base history the host passed in.
 #[tokio::test]

@@ -74,10 +74,9 @@ impl<T: PromptProvider + ?Sized> PromptProvider for Arc<T> {
 ///
 /// The host is trusted for history semantics (no ledger revalidation here):
 /// per-message construction failures and structurally inconsistent history
-/// surface as `PromptError::InvalidHistory`. Core still runs every provider's
-/// output through the `max_prompt_messages` / non-empty budget at the request
-/// boundary, and `ModelRequest` construction validates exchange-level
-/// tool-result consistency.
+/// surface as `PromptError::InvalidHistory`. Core still rejects an empty
+/// provider output at the request boundary, and `ModelRequest` construction
+/// validates exchange-level tool-result consistency.
 ///
 /// The fixed summary prefix `Conversation summary:\n` is always preserved
 /// verbatim; when the summary content would push the projected message past

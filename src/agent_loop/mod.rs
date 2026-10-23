@@ -7,7 +7,7 @@ use tokio::task::JoinHandle;
 use crate::error::DiagnosticSummary;
 use crate::execution::UserInput;
 use crate::execution::{ConfigRevision, ExecutionConfig};
-use crate::history::{HistoryItem, estimate_history_bytes};
+use crate::history::HistoryItem;
 use crate::ids::LoopId;
 use crate::limits::LoopLimits;
 use crate::model::{MAX_MODEL_CALL_TIMEOUT, MAX_MODEL_RETRY_DELAY, ModelError, Usage};
@@ -137,11 +137,6 @@ impl AgentLoop {
         let input_bytes = request.input.as_text().len();
         if input_bytes == 0 || input_bytes > options.limits.max_user_input_bytes {
             return Err(LoopStartError::InvalidInput);
-        }
-        if request.history.len() > options.limits.max_history_items
-            || estimate_history_bytes(&request.history) > options.limits.max_history_bytes
-        {
-            return Err(LoopStartError::HistoryTooLarge);
         }
 
         let id = LoopId::new().map_err(|_| LoopStartError::IdGeneration)?;
@@ -288,8 +283,6 @@ pub enum LoopStartError {
     InvalidConfig,
     #[error("loop input is invalid")]
     InvalidInput,
-    #[error("history exceeds the configured loop limits")]
-    HistoryTooLarge,
     #[error("loop id generation failed")]
     IdGeneration,
 }

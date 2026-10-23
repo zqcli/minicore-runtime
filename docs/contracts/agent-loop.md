@@ -28,9 +28,8 @@ The runner loops:
    steer (`take_boundary`), apply them to the working state.
 3. Publish `Starting` once for this preparation attempt, then prepare under
    cancel/timeout/panic isolation. Stale rebuilds and requests after tool
-   batches each have their own preparation state. Empty prompts or
-   prompts over `max_prompt_messages` fail as `Prompt` regardless of
-   provider.
+   batches each have their own preparation state. Empty prompts fail as
+   `Prompt` regardless of provider; prompt size is otherwise unbounded.
 4. F-step: if newer config/steers landed while preparing, discard the stale
    prompt and rebuild; `request_index` does not advance and no model request
    is issued for the stale snapshot.

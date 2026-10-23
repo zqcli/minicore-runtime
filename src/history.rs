@@ -147,7 +147,7 @@ impl WorkingHistory {
     }
 }
 
-/// Returns the exact admission estimate used by [`crate::AgentLoop::start`].
+/// Estimates history size in bytes for host context budgeting.
 /// Counts text, compact tool arguments, and replay envelopes; this is not the
 /// serialized history size or a heap-memory measurement. Sums saturate.
 pub fn estimate_history_bytes(items: &[HistoryItem]) -> usize {

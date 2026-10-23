@@ -514,10 +514,10 @@
     {
       "id": "V4-056",
       "status": "Passed",
-      "summary": "History超限安全失败",
+      "summary": "History超限安全失败（该限制已移除：History与Prompt大小不再由Core限制）",
       "evidence": [
-        "tests/p3_agent_loop_closeout.rs::start_rejects_history_over_item_and_byte_limits",
-        "src/agent_loop/mod.rs"
+        "tests/p2_agent_loop.rs::loop_accepts_history_and_prompt_beyond_former_count_and_byte_caps",
+        "docs/contracts/history.md"
       ]
     },
     {

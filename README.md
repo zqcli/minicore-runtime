@@ -30,9 +30,10 @@ host.
   bundled.
 - **Model driver.** Bounded retries that honor provider retry hints, request and
   turn deadlines, and text normalization that never grows a delta.
-- **Bounded by construction.** Limits cover messages, tool calls per response,
-  tool output bytes, history size, and the event queue. Oversized tool output
-  becomes a failed tool result instead of corrupting history.
+- **Bounded by construction.** Limits cover each input, model text, tool call
+  and tool output, and the event queue. Oversized tool output becomes a failed
+  tool result instead of corrupting history. Whole-history size is the host's
+  to bound, for example by token-based compaction.
 - **Best-effort events.** A bounded stream reports dropped events in
   `dropped_before` and never blocks the loop.
 
@@ -159,6 +160,17 @@ for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 
 ## Compatibility Notes
 
+### Unreleased
+
+- **Breaking:** `LoopLimits::max_history_items`, `max_history_bytes` and
+  `max_prompt_messages` are removed, with `LoopStartError::HistoryTooLarge`.
+  `AgentLoop::start` no longer rejects large history, and a request may carry
+  any number of messages. Per-item bounds are unchanged. Hosts that construct
+  `LoopLimits` by struct literal or read these fields must drop them; a host
+  that matches `LoopStartError` exhaustively must drop the arm.
+- `history::estimate_history_bytes` stays as a host-side size estimate; the loop
+  no longer uses it.
+
 ### 0.7.4
 
 - `LoopLimits::max_history_bytes` accepts up to 32 MiB, so a host can size
@@ -208,7 +220,7 @@ for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
   downstream matches need a wildcard arm. Usage sums known values per field.
 - `LoopHandle::shutdown()` records shutdown cancellation. Interactions without
   a loop deadline wait indefinitely. Dropping a `join()` future cancels its loop.
-- `history::estimate_history_bytes` exposes the exact start-admission estimate.
+- `history::estimate_history_bytes` exposes the exact history size estimate.
   Configs discarded by finalization are dropped after report publication.
 
 ### 0.6.1
@@ -218,8 +230,8 @@ for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
   `ModelMessage::AssistantWithReplay`. Existing constructors and legacy JSON
   remain valid; history struct literals must initialize `provider_replay`.
 - A replay envelope is at most 256 KiB of compact JSON, with depth 32 and 16,384
-  payload nodes. The Runtime neither interprets nor truncates it. The host's
-  history byte limit includes the envelope.
+  payload nodes. The Runtime neither interprets nor truncates it. Hosts should
+  count the envelope in their own history size estimate.
 - Replay never creates display text or tool calls. Its payload is visible to the
   host and serialized in history, but redacted from `Debug` and never emitted as
   an output event.

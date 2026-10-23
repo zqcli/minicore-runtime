@@ -27,10 +27,18 @@ remain unchanged. Public Rust API changes are listed in the
   `ToolSetError::InvalidSpec` is removed. Debug distinguishes replay-bearing assistants.
 - Usage sums reported values independently per field; omitted values do not erase
   known counts. `LoopHandle::shutdown()` records host shutdown.
-- `history::estimate_history_bytes` exposes the exact admission estimate, with
+- `history::estimate_history_bytes` exposes the exact size estimate, with
   allocation-free counting of compact tool-argument JSON.
 - Model contracts are split by responsibility. Integration fixtures are shared
   under `tests/support/`; test binaries and acceptance function names are retained.
+
+## Unreleased
+
+- **Breaking:** `LoopLimits::max_history_items`, `max_history_bytes` and
+  `max_prompt_messages` and `LoopStartError::HistoryTooLarge` are removed.
+  History and prompt size are governed only by the host's token-based context
+  compaction; per-item bounds are unchanged. See the
+  [README compatibility notes](../README.md#unreleased).
 
 ## Gates
 
@@ -46,7 +54,7 @@ bash scripts/check-architecture.sh
 
 Since 0.7.3 no minimum Rust version is tested; the gate runs on current stable.
 
-The main suite has 278 tests: 81 unit and 197 integration tests in 11 binaries.
+The main suite has 276 tests: 81 unit and 195 integration tests in 11 binaries.
 Two compile-fail doctests additionally protect the checked tool DTO boundaries.
 The two examples compile as test targets. The acceptance checker preserves all
 70 Passed rows and validates their source/test references. See the

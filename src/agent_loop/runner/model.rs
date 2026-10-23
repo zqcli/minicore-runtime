@@ -62,12 +62,8 @@ pub(super) async fn prepare_prompt(
 
     match outcome {
         PortCallOutcome::Returned(Ok(prepared)) => {
-            // Core-enforced budget for every provider: an empty prompt or one
-            // over the loop's message ceiling is a Prompt failure, no matter
-            // which provider produced it.
-            if prepared.messages.is_empty()
-                || prepared.messages.len() > ctx.options.limits.max_prompt_messages
-            {
+            // Core-enforced for every provider: an empty prompt is a Prompt failure.
+            if prepared.messages.is_empty() {
                 return PromptPrep::End(FailPath::Prompt);
             }
             PromptPrep::Ready(prepared.messages)

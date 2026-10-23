@@ -40,9 +40,9 @@ always projects a legal message for any legal maximum `BoundedText`.
 
 ## Core Enforcement
 
-- Every provider's output is budget-checked at the request boundary: an
-  empty prompt or one over `max_prompt_messages` fails as `Prompt`, no
-  matter which provider produced it.
+- Every provider's output is checked at the request boundary: an empty
+  prompt fails as `Prompt`, no matter which provider produced it. The
+  number and total size of messages are not capped.
 - No messages from an empty history is `PromptError::EmptyPrompt` for the
   default provider.
 - `ModelRequest` construction performs per-message text validation and

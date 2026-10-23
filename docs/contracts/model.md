@@ -118,7 +118,8 @@ format is 1–128 symbolic ASCII bytes, compact serialized envelope at most 256 
 payload depth at most 32 (root zero), and at most 16,384 nodes. Deserialization
 runs the same validation. Runtime never interprets or truncates provider content.
 `byte_len()` includes all envelope keys and punctuation, and history accounting
-includes these bytes within the host-history byte limit (2 MiB by default).
+includes these bytes in its size estimate; the runtime does not cap total
+history size.
 
 Adapters emit at most one `ModelEvent::ProviderReplay { replay }` before `Finish`.
 Duplicate replay, post-Finish events, missing Finish, cancellation, and incomplete

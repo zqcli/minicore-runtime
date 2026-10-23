@@ -3342,49 +3342,6 @@ async fn inconsistent_old_tool_history_fails_as_prompt_but_start_succeeds() {
     assert_eq!(report.requests, 0);
 }
 
-struct ManyMessagesPrompt;
-
-impl PromptProvider for ManyMessagesPrompt {
-    fn prepare<'a>(&'a self, _request: PromptRequest<'a>) -> PromptFuture<'a> {
-        Box::pin(async {
-            Ok(PreparedPrompt {
-                messages: vec![
-                    ModelMessage::user("a").unwrap(),
-                    ModelMessage::user("b").unwrap(),
-                    ModelMessage::user("c").unwrap(),
-                ],
-            })
-        })
-    }
-}
-
-/// `max_prompt_messages` is enforced by Core for every provider, including
-/// custom ones that do not check it themselves.
-#[tokio::test]
-async fn prompt_message_limit_applies_to_custom_providers() {
-    let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.limits.max_prompt_messages = 2;
-    let agent = AgentLoop::start(
-        request(config_full(
-            model,
-            ReasoningPreference::Auto,
-            ToolSet::default(),
-            None,
-            Arc::new(ManyMessagesPrompt),
-        )),
-        options,
-    )
-    .unwrap();
-
-    let report = finish(agent).await;
-    assert_eq!(
-        model_failure_kind(&report),
-        Some(minicore_runtime::LoopFailureKind::Prompt)
-    );
-    assert_eq!(report.requests, 0);
-}
-
 /// The default provider answers Cancelled for an already-cancelled or expired
 /// request without touching history.
 #[tokio::test]
@@ -5077,8 +5034,8 @@ async fn replay_survives_runner_history_serde_and_default_projection() {
     }
 }
 
-#[tokio::test]
-async fn history_limit_counts_opaque_replay_at_the_exact_boundary() {
+#[test]
+fn history_estimate_counts_opaque_replay() {
     use minicore_runtime::model::ProviderReplay;
     let mut item = assistant_item("test/model", "answer");
     let replay = ProviderReplay::new("test/v1", json!("a".repeat(1024))).unwrap();
@@ -5091,57 +5048,20 @@ async fn history_limit_counts_opaque_replay_at_the_exact_boundary() {
         minicore_runtime::history::estimate_history_bytes(std::slice::from_ref(&item)),
         bytes
     );
-    for (limit, accept) in [(bytes, true), (bytes - 1, false)] {
-        let (model, _) = scripted_model(vec![Round::Final { text: "ok" }]);
-        let mut req = request(config(model, ToolSet::default(), None));
-        req.history = vec![item.clone()].into();
-        let mut options = LoopOptions::default_checked().unwrap();
-        options.limits.max_history_bytes = limit;
-        match AgentLoop::start(req, options) {
-            Ok(agent) => {
-                assert!(accept);
-                assert_eq!(finish(agent).await.outcome, LoopOutcome::Completed);
-            }
-            Err(error) => {
-                assert!(!accept);
-                assert!(matches!(error, LoopStartError::HistoryTooLarge));
-            }
-        }
-    }
-    assert_eq!(
-        LoopOptions::default_checked()
-            .unwrap()
-            .limits
-            .max_history_bytes,
-        2 * 1024 * 1024
-    );
 }
 
+/// Whole-history size is the host's concern: neither the item count nor the
+/// byte size of history or prompt is capped.
 #[tokio::test]
-async fn replay_only_history_enforces_the_two_mib_default_limit() {
-    use minicore_runtime::model::ProviderReplay;
-    let overhead = ProviderReplay::new("x", json!("")).unwrap().byte_len();
-    let replay =
-        ProviderReplay::new("x", json!("a".repeat(ProviderReplay::MAX_BYTES - overhead))).unwrap();
-    let mut item = assistant_item("test/model", "unused");
-    let HistoryItem::Assistant(ref mut assistant) = item else {
-        unreachable!()
-    };
-    assistant.content.clear();
-    assistant.provider_replay = Some(replay);
-    for (count, accept) in [(8, true), (9, false)] {
-        let (model, _) = scripted_model(vec![Round::Final { text: "ok" }]);
-        let mut req = request(config(model, ToolSet::default(), None));
-        req.history = vec![item.clone(); count].into();
-        match AgentLoop::start(req, LoopOptions::default_checked().unwrap()) {
-            Ok(agent) => {
-                assert!(accept);
-                assert_eq!(finish(agent).await.outcome, LoopOutcome::Completed);
-            }
-            Err(error) => {
-                assert!(!accept);
-                assert!(matches!(error, LoopStartError::HistoryTooLarge));
-            }
-        }
-    }
+async fn loop_accepts_history_and_prompt_beyond_former_count_and_byte_caps() {
+    let item = user_item(UserMessageKind::Prompt, &"x".repeat(520));
+    let history = vec![item; 4_097];
+    assert!(minicore_runtime::history::estimate_history_bytes(&history) > 2 * 1024 * 1024);
+    let (model, _) = scripted_model(vec![Round::Final { text: "ok" }]);
+    let mut req = request(config(model, ToolSet::default(), None));
+    req.history = history.into();
+    let agent = AgentLoop::start(req, LoopOptions::default_checked().unwrap()).unwrap();
+    let report = finish(agent).await;
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.requests, 1);
 }

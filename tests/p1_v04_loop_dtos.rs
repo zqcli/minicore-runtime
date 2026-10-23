@@ -267,12 +267,6 @@ fn history_view_projects_base_and_appended_in_order() {
 fn loop_limits_default_is_valid_and_bad_values_fail() {
     assert!(LoopLimits::default().validate().is_ok());
 
-    let zero_history = LoopLimits {
-        max_history_items: 0,
-        ..LoopLimits::default()
-    };
-    assert_eq!(zero_history.validate(), Err(LoopLimitsError::InvalidBounds));
-
     let zero_output = LoopLimits {
         max_tool_output_bytes: 0,
         ..LoopLimits::default()
@@ -300,16 +294,6 @@ fn loop_options_default_checked_and_rejects_out_of_bounds_fields() {
     let mut invalid = options.clone();
     invalid.tool_timeout = Duration::ZERO;
     assert_eq!(invalid.validate(), Err(LoopStartError::InvalidOptions));
-
-    let mut invalid = options.clone();
-    invalid.limits.max_history_bytes = 0;
-    assert_eq!(invalid.validate(), Err(LoopStartError::InvalidOptions));
-
-    let mut boundary = options.clone();
-    boundary.limits.max_history_bytes = 32 * 1024 * 1024;
-    assert!(boundary.validate().is_ok());
-    boundary.limits.max_history_bytes += 1;
-    assert_eq!(boundary.validate(), Err(LoopStartError::InvalidOptions));
 
     let mut invalid = options.clone();
     invalid.deadline = Some(

@@ -13,8 +13,8 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 | `model_driver_contract.rs` | 3 | driver delivery-state contracts |
 | `p1_value.rs` | 4 | bounded value types and validation |
 | `p1_v04_loop_dtos.rs` | 16 | loop history, `ExecutionConfig`, `PromptProvider`, `LoopReport` DTOs |
-| `p2_agent_loop.rs` | 112 | the flexible agent-loop contract end to end: output bounding, model error preservation, request issue accounting, and progress drop loss |
-| `p3_agent_loop_closeout.rs` | 22 | Phase 8 close-out and correctness fixes: catalog/per-response call limits, timeout/retry bounds, reasoning channels, event-free runs, multi-batch cancel, repeated answers, policy snapshot swaps, history limits, delta-only reports, malformed responses, invalid no-tool finish, loop-level retry, shared-resource isolation, steer-survives-prompt-failure |
+| `p2_agent_loop.rs` | 111 | the flexible agent-loop contract end to end: output bounding, model error preservation, request issue accounting, and progress drop loss |
+| `p3_agent_loop_closeout.rs` | 21 | Phase 8 close-out and correctness fixes: catalog/per-response call limits, timeout/retry bounds, reasoning channels, event-free runs, multi-batch cancel, repeated answers, policy snapshot swaps, delta-only reports, malformed responses, invalid no-tool finish, loop-level retry, shared-resource isolation, steer-survives-prompt-failure |
 | `tool_policy_interaction_contract.rs` | 8 | policy decisions, interaction DTO contracts, and ToolInputRequest validation |
 | `tool_set_contract.rs` | 11 | `ToolSet` registration, spec validation, enabled subsets |
 | `provider_replay.rs` | 2 | replay bounds, serde and legacy wire compatibility |
@@ -31,7 +31,7 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 
   - `src/usage.rs` (1 test): partial usage accumulates reported fields.
 
-Total main-crate volume: **278 tests** (81 unit + 197 integration across 11 targets).
+Total main-crate volume: **276 tests** (81 unit + 195 integration across 11 targets).
 Two compile-fail doctests protect private `ToolSpec` and `ToolOutput` fields.
 `tests/support/` shares scripted model/tool/policy builders, config/start/join helpers
 and report extractors across separate binaries. Driver tests use the actual
@@ -63,7 +63,7 @@ The standalone provider harness has 25 tests and is not included in this runtime
   delta parity, split-CRLF continuity in canonical text and progress, and
   empty-delta suppression; per-attempt child-token
   cleanup; handle shutdown versus dropped-join cancellation.
-- History: item/byte limits, delta-only reports, mixed model refs.
+- History: delta-only reports, mixed model refs, no history or prompt size cap.
 - Malformed model responses never enter Assistant history.
 - Loop-level delivery retry; shared model/toolset cancel isolation.
 
@@ -90,4 +90,4 @@ redacted Debug, legacy constructors/wire formats, and replay-only content.
 Driver assembly/settlement tests cover single metadata delivery, duplicate and
 post-Finish rejection, missing Finish, EOF/error/cancellation settlement, and no
 progress forwarding. `p2_agent_loop.rs` covers runner/history/projection retention,
-old history serde, exact history-byte accounting, and the 2 MiB default limit.
+old history serde, and exact history-byte estimation.
