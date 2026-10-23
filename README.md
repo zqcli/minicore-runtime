@@ -13,7 +13,7 @@ host.
 
 | | |
 |---|---|
-| Version | 0.7.4 |
+| Version | 0.8.0 |
 | Rust | edition 2024, current stable |
 | Async runtime | Tokio (the loop spawns one task) |
 | Production dependencies | serde, serde_json, tokio, tokio-util, futures-util, thiserror, getrandom |
@@ -160,7 +160,7 @@ for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 
 ## Compatibility Notes
 
-### Unreleased
+### 0.8.0
 
 - **Breaking:** `LoopLimits::max_history_items`, `max_history_bytes` and
   `max_prompt_messages` are removed, with `LoopStartError::HistoryTooLarge`.

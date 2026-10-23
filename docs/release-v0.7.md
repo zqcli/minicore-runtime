@@ -32,13 +32,13 @@ remain unchanged. Public Rust API changes are listed in the
 - Model contracts are split by responsibility. Integration fixtures are shared
   under `tests/support/`; test binaries and acceptance function names are retained.
 
-## Unreleased
+## 0.8.0
 
 - **Breaking:** `LoopLimits::max_history_items`, `max_history_bytes` and
   `max_prompt_messages` and `LoopStartError::HistoryTooLarge` are removed.
   History and prompt size are governed only by the host's token-based context
   compaction; per-item bounds are unchanged. See the
-  [README compatibility notes](../README.md#unreleased).
+  [README compatibility notes](../README.md#080).
 
 ## Gates
 
