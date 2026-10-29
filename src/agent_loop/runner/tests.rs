@@ -9,7 +9,8 @@ use serde_json::json;
 
 use crate::agent_loop::control::{FinishSeal, LoopControl};
 use crate::agent_loop::{
-    AgentLoop, LoopHandle, LoopOptions, LoopOutcome, LoopReport, LoopRequest, LoopWaitError,
+    AgentLoop, LoopHandle, LoopInputs, LoopOptions, LoopOutcome, LoopReport, LoopRequest,
+    LoopWaitError,
 };
 use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::WorkingHistory;
@@ -22,6 +23,14 @@ use crate::model::{
 use crate::tools::{ToolResultOutcome, ToolSet};
 
 use super::{FailPath, LoopCtx, finish_loop, panic_report};
+
+struct NoInputs;
+
+impl LoopInputs for NoInputs {
+    fn take(&self) -> Vec<crate::UserInput> {
+        Vec::new()
+    }
+}
 
 /// A model whose stream never yields: the loop stays alive until aborted.
 struct HoldingModel {
@@ -127,6 +136,7 @@ async fn a_real_runner_panic_publishes_one_report_for_join_and_all_waiters() {
             config,
         ),
         LoopOptions::default_checked().unwrap(),
+        Arc::new(NoInputs),
     )
     .unwrap();
     let first = agent.handle();
@@ -168,7 +178,12 @@ async fn aborted_runner_makes_wait_return_completion_closed() {
         crate::execution::UserInput::text("hello").unwrap(),
         holding_config(),
     );
-    let agent = AgentLoop::start(request, LoopOptions::default_checked().unwrap()).unwrap();
+    let agent = AgentLoop::start(
+        request,
+        LoopOptions::default_checked().unwrap(),
+        Arc::new(NoInputs),
+    )
+    .unwrap();
     let handle = agent.handle();
 
     // The runner task is spawned inside `start`; abort its join handle.
@@ -184,7 +199,7 @@ async fn aborted_runner_makes_wait_return_completion_closed() {
 async fn finish_loop_losing_the_seal_returns_the_published_arc() {
     let id = LoopId::new().unwrap();
     let (control, mut sink, _stream, completion_tx) =
-        LoopControl::new(id, 8, LoopLimits::default(), 16).unwrap();
+        LoopControl::new(id, 8, LoopLimits::default()).unwrap();
     let control = Arc::new(control);
 
     // Simulate a prior completion that won the seal and published its report.
@@ -233,7 +248,7 @@ async fn completion_preserves_tool_round_counts_beyond_u16() {
     for tool_rounds in [65_535_u64, 65_536, 70_000] {
         let id = LoopId::new().unwrap();
         let (control, mut sink, _stream, completion_tx) =
-            LoopControl::new(id, 8, LoopLimits::default(), 16).unwrap();
+            LoopControl::new(id, 8, LoopLimits::default()).unwrap();
         let control = Arc::new(control);
         let options = LoopOptions::default_checked().unwrap();
         let mut ctx = LoopCtx {
@@ -266,7 +281,7 @@ async fn completion_preserves_tool_round_counts_beyond_u16() {
 async fn completion_is_exactly_once_and_token_cancel_is_terminal() {
     let id = LoopId::new().unwrap();
     let (control, _sink, _stream, completion_tx) =
-        LoopControl::new(id, 8, LoopLimits::default(), 16).unwrap();
+        LoopControl::new(id, 8, LoopLimits::default()).unwrap();
     let control = Arc::new(control);
     let handle = LoopHandle::new(Arc::clone(&control));
 
@@ -390,7 +405,7 @@ async fn discarded_config_drop_panics_cannot_lose_or_replace_the_report() {
     for finish in [ModelFinishReason::Stop, ModelFinishReason::Length] {
         let id = LoopId::new().unwrap();
         let (control, sink, _events, completion_tx) =
-            LoopControl::new(id, 16, LoopLimits::default(), 4).unwrap();
+            LoopControl::new(id, 16, LoopLimits::default()).unwrap();
         let control = Arc::new(control);
         let published = Arc::new(AtomicBool::new(false));
         let base = holding_config();
@@ -427,6 +442,7 @@ async fn discarded_config_drop_panics_cannot_lose_or_replace_the_report() {
             request,
             Arc::new(LoopOptions::default_checked().unwrap()),
             control.clone(),
+            Arc::new(NoInputs),
             sink,
             completion_tx,
         )

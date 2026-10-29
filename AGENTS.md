@@ -8,8 +8,8 @@ non-authority guidance: the current source and the pages indexed by
 ## What This Project Is
 
 `minicore-runtime` is a Rust library that runs one live agent loop: model
-requests and tool batches, streaming, cancellation, interactions, steering,
-and request-boundary config updates. It deliberately has no sessions,
+requests and tool batches, streaming, cancellation, interactions, host-supplied
+inputs, and request-boundary config updates. It deliberately has no sessions,
 persistence, transcripts, providers, workspaces, or compaction scheduler. Those
 belong to hosts such as
 [minicore-agent](https://github.com/zqcli/minicore-agent), which pins this
@@ -24,7 +24,7 @@ stays in that host.
 
 | Path | Responsibility |
 |---|---|
-| `src/agent_loop/` | `AgentLoop` and `LoopHandle`. `control.rs` holds the linearized update/steer/seal state, `event.rs` the best-effort stream, and `runner.rs` with `runner/{model,tools}.rs` the loop itself |
+| `src/agent_loop/` | `AgentLoop` and `LoopHandle`. `control.rs` holds the linearized update/seal state, `event.rs` the best-effort stream, and `runner.rs` with `runner/{model,tools}.rs` the loop itself |
 | `src/model/` | The `Model` seam, request/message/response types, provider replay. `driver.rs` and `driver/` handle retries, deadlines, and stream assembly |
 | `src/tools/` | The `Tool` and `ToolPolicy` seams, `ToolSpec`, `ToolSet`, interactions, progress |
 | `src/execution.rs`, `src/history.rs`, `src/prompt.rs` | `ExecutionConfig`/`UserInput`, `HistoryItem`, the `PromptProvider` seam |
@@ -122,7 +122,7 @@ byte-compared fixture (`.gitattributes` sets `eol=lf`).
 ## Commits
 
 - Subject: `type(scope): summary`, scope required, for example
-  `fix(loop): reject steer after cancellation`. Lowercase, imperative, no
+  `fix(loop): reject update after cancellation`. Lowercase, imperative, no
   trailing period. Types: `feat`, `fix`, `refactor`, `perf`, `test`, `docs`,
   `build`, `ci`, `chore`. The scope is the module or area.
 - One logical change per commit, with its tests and docs. Stage explicit paths;

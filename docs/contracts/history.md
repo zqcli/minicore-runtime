@@ -7,8 +7,8 @@ The host-facing conversation vocabulary passed in and returned by the loop.
 `HistoryItem` is one of:
 
 - `User(UserHistory { loop_id, kind, input })` — `kind` is `Prompt` (the
-  input that started/extends the loop) or `Steering` (a host steer applied
-  at a request boundary). `input: UserInput` is bounded text.
+  input that started/extends the loop) or `Steering` (an input taken from
+  `LoopInputs` at a request boundary). `input: UserInput` is bounded text.
 - `Assistant(AssistantHistory { loop_id, request_index, model, reasoning,
   content, finish_reason, usage })` — a complete, locally validated model
   response with typed `AssistantPart`s (text / reasoning / tool call).

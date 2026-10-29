@@ -10,13 +10,13 @@
 //! ```
 //!
 //! The example shows a simple text loop, a tool loop, live event streaming,
-//! a deterministic steer+update demo (the second request proves both took
-//! effect), and a cancel on a separate held loop.
+//! a deterministic host-input+update demo (the second request proves both
+//! took effect), and a cancel on a separate held loop.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use tokio::sync::Notify;
 
 use minicore_runtime::execution::{ExecutionConfig, UserInput};
@@ -31,8 +31,49 @@ use minicore_runtime::tools::{
     ToolSpec,
 };
 use minicore_runtime::{
-    AgentLoop, CancelReason, LoopEvent, LoopOptions, LoopOutcome, LoopReport, LoopRequest,
+    AgentLoop, CancelReason, LoopEvent, LoopInputs, LoopOptions, LoopOutcome, LoopReport,
+    LoopRequest,
 };
+
+/// The host's input queue: `push` accepts an input, the loop takes it at its
+/// next request boundary.
+#[derive(Default)]
+struct HostInputs {
+    queue: Mutex<Vec<UserInput>>,
+}
+
+impl HostInputs {
+    fn push(&self, text: &str) {
+        self.queue
+            .lock()
+            .unwrap()
+            .push(UserInput::text(text).unwrap());
+    }
+}
+
+impl LoopInputs for HostInputs {
+    fn take(&self) -> Vec<UserInput> {
+        std::mem::take(&mut *self.queue.lock().unwrap())
+    }
+}
+
+fn clock_call_events() -> Vec<ModelEvent> {
+    let call_id: minicore_runtime::ToolCallId = "call_clock_0001".parse().unwrap();
+    vec![
+        ModelEvent::ToolCallStart {
+            tool_call_id: call_id.clone(),
+            tool_name: "clock".parse().unwrap(),
+        },
+        ModelEvent::tool_call_arguments_delta(call_id.clone(), r#"{"question":"what time is it"}"#)
+            .unwrap(),
+        ModelEvent::ToolCallEnd {
+            tool_call_id: call_id,
+        },
+        ModelEvent::Finish {
+            reason: ModelFinishReason::ToolCalls,
+        },
+    ]
+}
 
 /// Answers every request with one delta and a Stop.
 struct EchoModel {
@@ -76,24 +117,7 @@ impl Model for ToolModel {
         context: ModelCallContext,
     ) -> ModelStartFuture<'a> {
         let events: Vec<Result<ModelEvent, ModelError>> = if context.request_index == 0 {
-            let call_id: minicore_runtime::ToolCallId = "call_clock_0001".parse().unwrap();
-            vec![
-                Ok(ModelEvent::ToolCallStart {
-                    tool_call_id: call_id.clone(),
-                    tool_name: "clock".parse().unwrap(),
-                }),
-                Ok(ModelEvent::tool_call_arguments_delta(
-                    call_id.clone(),
-                    r#"{"question":"what time is it"}"#,
-                )
-                .unwrap()),
-                Ok(ModelEvent::ToolCallEnd {
-                    tool_call_id: call_id,
-                }),
-                Ok(ModelEvent::Finish {
-                    reason: ModelFinishReason::ToolCalls,
-                }),
-            ]
+            clock_call_events().into_iter().map(Ok).collect()
         } else {
             vec![
                 Ok(ModelEvent::text_delta("It is 12:00").unwrap()),
@@ -106,9 +130,9 @@ impl Model for ToolModel {
     }
 }
 
-/// Request 0 holds open until the Notify fires, then answers "first". Any
-/// request past 0 answers "first-again", which only ever appears if a config
-/// update did not actually replace this model for the second request.
+/// Request 0 holds open until the Notify fires, then issues one `clock` tool
+/// call. Any request past 0 answers "first-again", which only ever appears if
+/// a config update did not actually replace this model for the second request.
 struct FirstModel {
     descriptor: ModelDescriptor,
     release: Arc<Notify>,
@@ -127,24 +151,9 @@ impl Model for FirstModel {
         let release = Arc::clone(&self.release);
         if context.request_index == 0 {
             Box::pin(async move {
-                Ok::<ModelStream, _>(Box::pin(stream::unfold(Some(0u8), move |state| {
-                    let release = Arc::clone(&release);
-                    async move {
-                        match state {
-                            None => None,
-                            Some(0) => {
-                                release.notified().await;
-                                Some((Ok(ModelEvent::text_delta("first").unwrap()), Some(1)))
-                            }
-                            Some(1) => Some((
-                                Ok(ModelEvent::Finish {
-                                    reason: ModelFinishReason::Stop,
-                                }),
-                                None,
-                            )),
-                            Some(_) => unreachable!(),
-                        }
-                    }
+                let held = stream::once(async move { release.notified().await });
+                Ok::<ModelStream, _>(Box::pin(held.flat_map(|()| {
+                    stream::iter(clock_call_events().into_iter().map(Ok::<_, ModelError>))
                 })))
             })
         } else {
@@ -160,7 +169,7 @@ impl Model for FirstModel {
     }
 }
 
-/// Answers "after-update" and stops on every request. The steer+update demo
+/// Answers "after-update" and stops on every request. The input+update demo
 /// swaps the config for this model so request 1 proves the update applied.
 struct SecondModel {
     descriptor: ModelDescriptor,
@@ -248,13 +257,14 @@ fn config(
 fn start(
     model: Arc<dyn Model>,
     tools: ToolSet,
+    inputs: Arc<HostInputs>,
 ) -> Result<AgentLoop, minicore_runtime::LoopStartError> {
     let request = LoopRequest::new(
         Arc::from(Vec::<HistoryItem>::new()),
         UserInput::text("hello").unwrap(),
         config(model, tools).unwrap(),
     );
-    AgentLoop::start(request, LoopOptions::default_checked().unwrap())
+    AgentLoop::start(request, LoopOptions::default_checked().unwrap(), inputs)
 }
 
 fn printable(event: &LoopEvent) -> String {
@@ -291,7 +301,7 @@ async fn simple_text_loop() {
     let model = Arc::new(EchoModel {
         descriptor: descriptor("echo", false),
     });
-    let mut agent = start(model, ToolSet::default()).unwrap();
+    let mut agent = start(model, ToolSet::default(), Arc::default()).unwrap();
     let events = agent.take_events().unwrap();
     let report = agent.join().await.unwrap();
     stream_events(events).await;
@@ -303,7 +313,7 @@ async fn tool_loop() {
     let model = Arc::new(ToolModel {
         descriptor: descriptor("toolbot", true),
     });
-    let mut agent = start(model, clock_toolset()).unwrap();
+    let mut agent = start(model, clock_toolset(), Arc::default()).unwrap();
     let events = agent.take_events().unwrap();
     let report = agent.join().await.unwrap();
     stream_events(events).await;
@@ -326,32 +336,32 @@ async fn wait_for_request(events: &mut minicore_runtime::LoopEventStream, reques
     panic!("loop ended before request {request_index}");
 }
 
-/// Proves steer + update land at the next request: request 0 (held model)
-/// finishes with a pending steer, so the final-seal keeps the loop alive for
-/// request 1, which runs under the *updated* config and therefore answers
-/// "after-update". `report.requests == 2` plus the second request's
-/// `RequestStarted` revision prove both took effect.
-async fn steer_update_boundaries() {
-    println!("== steer + update at the next request");
+/// Proves a host input and an update land at the next request: request 0
+/// (held model) issues a tool call, so the loop continues with request 1,
+/// which runs under the *updated* config and therefore answers
+/// "after-update". The input is in request 1's history and the second
+/// request's `RequestStarted` carries the update's revision.
+async fn input_update_boundaries() {
+    println!("== host input + update at the next request");
     let release = Arc::new(Notify::new());
+    let inputs = Arc::new(HostInputs::default());
     let mut agent = start(
         Arc::new(FirstModel {
             descriptor: descriptor("first", true),
             release: Arc::clone(&release),
         }),
         clock_toolset(),
+        Arc::clone(&inputs),
     )
     .unwrap();
     let mut events = agent.take_events().unwrap();
     let handle = agent.handle().clone();
 
     // Wait until request 0 is issued and the model is holding. This makes the
-    // steer/update below deterministic: they cannot sneak into request 0.
+    // input/update below deterministic: they cannot sneak into request 0.
     wait_for_request(&mut events, 0).await;
 
-    handle
-        .steer(UserInput::text("please focus on the time").unwrap())
-        .expect("loop is live, steer is accepted");
+    inputs.push("please focus on the time");
     let revision = handle
         .update(
             config(
@@ -368,7 +378,7 @@ async fn steer_update_boundaries() {
     let report = agent.join().await.unwrap();
 
     // The update swapped the model: request 1 says "after-update", never
-    // "first-again". The steer kept the loop alive through the final.
+    // "first-again".
     let texts: Vec<&str> = report
         .appended
         .iter()
@@ -381,9 +391,13 @@ async fn steer_update_boundaries() {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        report.requests, 2,
-        "the pending steer must extend the final"
+    assert_eq!(report.requests, 2, "the tool round led to request 1");
+    assert!(
+        report.appended.iter().any(|item| matches!(
+            item,
+            HistoryItem::User(user) if user.input.as_text() == "please focus on the time"
+        )),
+        "the handed-over input must be in the report"
     );
     assert!(
         texts.iter().any(|text| text.contains("after-update")),
@@ -411,7 +425,7 @@ async fn steer_update_boundaries() {
         second_request_with_revision,
         "expected a RequestStarted for request 1"
     );
-    println!("  steer + update applied at request 1 (revision {revision:?})");
+    println!("  input + update applied at request 1 (revision {revision:?})");
 }
 
 /// Cancelling a held loop ends it as `Cancelled(User)`, deterministically.
@@ -424,6 +438,7 @@ async fn cancel_held_loop() {
             release: Arc::clone(&release),
         }),
         clock_toolset(),
+        Arc::default(),
     )
     .unwrap();
     let mut events = agent.take_events().unwrap();
@@ -466,7 +481,7 @@ fn summarize(report: &LoopReport) {
 async fn main() {
     simple_text_loop().await;
     tool_loop().await;
-    steer_update_boundaries().await;
+    input_update_boundaries().await;
     cancel_held_loop().await;
     println!("done");
 }

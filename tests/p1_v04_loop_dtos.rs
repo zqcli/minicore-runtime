@@ -280,14 +280,6 @@ fn loop_options_default_checked_and_rejects_out_of_bounds_fields() {
     assert!(options.validate().is_ok());
 
     let mut invalid = options.clone();
-    invalid.max_pending_steers = 0;
-    assert_eq!(invalid.validate(), Err(LoopStartError::InvalidOptions));
-
-    let mut invalid = options.clone();
-    invalid.max_pending_steers = 65;
-    assert_eq!(invalid.validate(), Err(LoopStartError::InvalidOptions));
-
-    let mut invalid = options.clone();
     invalid.model_retry_attempts = 0;
     assert_eq!(invalid.validate(), Err(LoopStartError::InvalidOptions));
 

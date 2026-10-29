@@ -5,9 +5,9 @@ the crate root (`src/lib.rs`); every other module is reached through them.
 
 | Source path | Owns | Public boundary |
 | --- | --- | --- |
-| `src/agent_loop/mod.rs` | `AgentLoop`, `LoopRequest`, `LoopOptions`, `LoopReport`, errors | Re-exported at root |
-| `src/agent_loop/handle.rs` | `LoopHandle` (steer/update/cancel/state/answer) | Re-exported at root |
-| `src/agent_loop/control.rs` | linearized update/steer/begin-final state, interaction slots | crate-private |
+| `src/agent_loop/mod.rs` | `AgentLoop`, `LoopRequest`, `LoopOptions`, `LoopInputs`, `LoopReport`, errors | Re-exported at root |
+| `src/agent_loop/handle.rs` | `LoopHandle` (update/cancel/state/answer) | Re-exported at root |
+| `src/agent_loop/control.rs` | linearized update/begin-final state, interaction slots | crate-private |
 | `src/agent_loop/event.rs` | `LoopEvent(Envelope/Stream)`, best-effort sink | Re-exported at root |
 | `src/agent_loop/state.rs` | `LoopState`, `LoopStatus` | Re-exported at root |
 | `src/agent_loop/runner.rs` | main loop, control, final, finish reporting | crate-private |
@@ -43,7 +43,7 @@ uses the already-validated `LoopLimits`; it does not mirror their validation.
   the owning module.
 - `tests/p1_v04_loop_dtos.rs` — DTO/serialization contract evidence.
 - `tests/p2_agent_loop.rs` — end-to-end loop contract evidence (text, tools,
-  steer/update/cancel, deadlines, report semantics).
+  host inputs/update/cancel, deadlines, report semantics).
 - `tests/p2_*` follow the same pattern for further contract domains, if
   added; integration test files live directly in `tests/`.
 

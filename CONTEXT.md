@@ -1,6 +1,7 @@
 # Current Implementation Context
 
-The current package is v0.8.0. It retains the one-loop boundary from the
+The current package is v0.8.0 (0.9.0 in development: see the README
+compatibility notes). It retains the one-loop boundary from the
 v0.4 reset. Tool-batch statistics are now `u64` end to end within Runtime;
 the optional legacy `u16` round budget still defaults to zero (unlimited).
 Each real prompt preparation publishes one `Starting` event. Session-owned
@@ -17,7 +18,7 @@ library type.
 
 ## Where the Core Stands
 
-- `src/agent_loop/` owns the loop: `control` (linearized update/steer/seal
+- `src/agent_loop/` owns the loop: `control` (linearized update/seal
   state), `event` (best-effort stream), `handle` (host control surface),
   `state`, and `runner` — split into `runner.rs` (main loop / control /
   final), `runner/model.rs` (prompt preparation + model driver), and
@@ -37,7 +38,7 @@ library type.
 - One runner task per loop; `wait`/`join` return the same `Arc<LoopReport>`.
 - Completion is owned by the runner task; its drop surfaces as
   `LoopWaitError::CompletionClosed` to waiters.
-- Update/steer and the final seal linearize on one short `std::sync::Mutex`;
+- Update and the final seal linearize on one short `std::sync::Mutex`;
   cancel/finish use a single `AtomicU8` single-CAS state machine; replaced or
   discarded `ExecutionConfig` instances are dropped outside the mutex. Finalization
   returns discarded configs to the runner for panic-isolated drop after publication.
@@ -49,8 +50,10 @@ library type.
 - Tool outputs in history are bounded by `max_tool_output_bytes`; invalid tool
   input requests fail fast without entering `WaitingForInput`.
 - Internal model and tool progress queue drops are merged into `dropped_before`.
-- Steer accepted means queued in the process-local queue for the next request
-  boundary; every non-`Completed` ending discards unapplied queued steers.
+- User inputs come from the host's `LoopInputs::take`, called on the runner
+  task at the A and F request boundaries; inputs the loop took are in the
+  report for every ending, the rest stay with the host. A no-tool answer
+  always ends the loop.
 - Tool catalog size is independent from per-response `ToolCall` limits.
 - Built with current stable Rust, no declared minimum; production code forbids `unsafe`; no async mutex, no
   `parking_lot`.

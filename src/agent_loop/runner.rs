@@ -8,8 +8,8 @@ use tokio::time::Instant as TokioInstant;
 
 use crate::agent_loop::event::{LoopEvent, LoopEventSink, LoopOutcomeSummary};
 use crate::agent_loop::{
-    CancelReason, LoopFailure, LoopFailureKind, LoopOptions, LoopOutcome, LoopReport, LoopRequest,
-    LoopState, LoopStatus,
+    CancelReason, LoopFailure, LoopFailureKind, LoopInputs, LoopOptions, LoopOutcome, LoopReport,
+    LoopRequest, LoopState, LoopStatus,
 };
 use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::execution::{ConfigRevision, ExecutionConfig};
@@ -19,8 +19,7 @@ use crate::model::{ModelError, ModelFinishReason, Usage};
 use crate::tools::ToolResultOutcome;
 use crate::usage::UsageAccumulator;
 
-use super::control::FinishSeal;
-use super::control::{BoundaryChanges, FinalGate, LoopControl};
+use super::control::{FinishSeal, LoopControl};
 
 use crate::history::{AssistantHistory, UserHistory, UserMessageKind};
 
@@ -52,27 +51,32 @@ impl LoopCtx<'_> {
     }
 }
 
-/// Applies one boundary take to the runner: the config candidate becomes the
-/// working (still uncommitted) snapshot, and every accepted steer is appended
-/// to the working history in order as a `Steering` user item.
-fn apply_boundary(
+/// Takes everything that landed since the last boundary: the config candidate
+/// becomes the working (still uncommitted) snapshot, and every input the host
+/// hands over is appended to the working history in order as a `Steering` user
+/// item. Returns whether anything was taken.
+fn take_boundary(
     ctx: &mut LoopCtx<'_>,
+    inputs: &dyn LoopInputs,
     working: &mut WorkingHistory,
     current_config: &mut Arc<ExecutionConfig>,
     candidate_revision: &mut Option<ConfigRevision>,
-    changes: BoundaryChanges,
-) {
-    if let Some((revision, config)) = changes.config {
+) -> bool {
+    let mut taken = false;
+    if let Some((revision, config)) = ctx.control.take_config() {
         *current_config = config;
         *candidate_revision = Some(revision);
+        taken = true;
     }
-    for steer in changes.steers {
+    for input in inputs.take() {
         working.append_user(UserHistory {
             loop_id: ctx.id,
             kind: UserMessageKind::Steering,
-            input: steer,
+            input,
         });
+        taken = true;
     }
+    taken
 }
 
 /// The single runner task for one agent loop. All control touches are short
@@ -83,6 +87,7 @@ pub(crate) async fn run_loop(
     request: LoopRequest,
     options: Arc<LoopOptions>,
     control: Arc<LoopControl>,
+    inputs: Arc<dyn LoopInputs>,
     events: LoopEventSink,
     completion_tx: watch::Sender<Option<Arc<LoopReport>>>,
 ) -> Arc<LoopReport> {
@@ -90,6 +95,7 @@ pub(crate) async fn run_loop(
         request,
         options,
         control.clone(),
+        inputs,
         events,
         completion_tx.clone(),
     );
@@ -103,6 +109,7 @@ async fn run_loop_inner(
     request: LoopRequest,
     options: Arc<LoopOptions>,
     control: Arc<LoopControl>,
+    inputs: Arc<dyn LoopInputs>,
     mut sink: LoopEventSink,
     completion_tx: watch::Sender<Option<Arc<LoopReport>>>,
 ) -> Arc<LoopReport> {
@@ -150,18 +157,17 @@ async fn run_loop_inner(
             break FailPath::Deadline;
         }
 
-        // A. Atomically pull the latest config candidate plus every accepted
-        // steer and apply them as the basis for this request attempt. The
+        // A. Pull the latest config candidate plus every input the host hands
+        // over and apply them as the basis for this request attempt. The
         // config is still only a *candidate*: its revision is recorded once a
         // Model Request really goes out. The snapshot below is pinned for the
         // whole request (model call and its tool batch).
-        let changes = ctx.control.take_boundary();
-        apply_boundary(
+        take_boundary(
             &mut ctx,
+            &*inputs,
             &mut working,
             &mut current_config,
             &mut candidate_revision,
-            changes,
         );
 
         let snapshot = Arc::clone(&current_config);
@@ -188,20 +194,18 @@ async fn run_loop_inner(
             PromptPrep::End(path) => break path,
         };
 
-        // F. Newer config/steers may have landed while the prompt was being
-        // prepared. Discard the stale prompt and rebuild with the latest
+        // F. A newer config or input may have landed while the prompt was
+        // being prepared. Discard the stale prompt and rebuild with the latest
         // changes: request_index does not advance, no model request is ever
         // issued for the stale snapshot, and the candidate revision keeps the
-        // latest value (spec 15.1).
-        let changes = ctx.control.take_boundary();
-        if changes.config.is_some() || !changes.steers.is_empty() {
-            apply_boundary(
-                &mut ctx,
-                &mut working,
-                &mut current_config,
-                &mut candidate_revision,
-                changes,
-            );
+        // latest value.
+        if take_boundary(
+            &mut ctx,
+            &*inputs,
+            &mut working,
+            &mut current_config,
+            &mut candidate_revision,
+        ) {
             continue;
         }
 
@@ -298,28 +302,9 @@ async fn run_loop_inner(
 
         if let Some(path) = no_tool_finish {
             if path == FailPath::Completed {
-                // Final-seal race (spec 20.6): steer/update and this seal
-                // decision linearize on the same mutex. A steer accepted
-                // before the seal keeps the loop alive and feeds the next
-                // request; otherwise accepting closes and the loop ends
-                // normally. A pending config alone never extends a final.
-                match ctx.control.begin_final() {
-                    FinalGate::Continue(changes) => {
-                        apply_boundary(
-                            &mut ctx,
-                            &mut working,
-                            &mut current_config,
-                            &mut candidate_revision,
-                            changes,
-                        );
-                        request_index = request_index.saturating_add(1);
-                        continue;
-                    }
-                    FinalGate::Seal(discarded) => {
-                        discarded_config = discarded;
-                        break FailPath::Completed;
-                    }
-                }
+                // Closes accepting in the same critical section as the seal
+                // decision; a pending config alone never extends a final.
+                discarded_config = ctx.control.begin_final();
             }
             break path;
         }

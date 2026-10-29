@@ -17,11 +17,11 @@ pub enum UserInputError {
     InvalidText,
 }
 
-/// User input for one agent loop (the initial request or a `LoopHandle::steer`).
+/// User input for one agent loop (the initial request or an input from `LoopInputs`).
 ///
 /// Constructors enforce absolute structural bounds (`BoundedText::MAX_BYTES` and
 /// non-empty text). The live loop's `LoopLimits::max_user_input_bytes` is
-/// applied by `AgentLoop::start` and `LoopHandle::steer`.
+/// applied by `AgentLoop::start`; the host checks the inputs it hands to `LoopInputs`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserInput {

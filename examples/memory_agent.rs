@@ -23,7 +23,16 @@ use minicore_runtime::model::{
 };
 use minicore_runtime::prompt::DefaultPromptProvider;
 use minicore_runtime::tools::ToolSet;
-use minicore_runtime::{AgentLoop, LoopOptions, LoopRequest};
+use minicore_runtime::{AgentLoop, LoopInputs, LoopOptions, LoopRequest};
+
+/// Each turn is one fresh loop; nothing reaches it after it starts.
+struct NoInputs;
+
+impl LoopInputs for NoInputs {
+    fn take(&self) -> Vec<UserInput> {
+        Vec::new()
+    }
+}
 
 /// Answers every request with the echoed user text plus a counter.
 struct EchoModel {
@@ -94,7 +103,7 @@ impl MemoryAgent {
             UserInput::text(input)?,
             self.config.clone(),
         );
-        let agent = AgentLoop::start(request, LoopOptions::default_checked()?)?;
+        let agent = AgentLoop::start(request, LoopOptions::default_checked()?, Arc::new(NoInputs))?;
         let report = agent.join().await?;
 
         let reply = report

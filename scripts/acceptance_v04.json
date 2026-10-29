@@ -147,11 +147,11 @@
     {
       "id": "V4-016",
       "status": "Passed",
-      "summary": "steer/update/answer/cancel/wait可用",
+      "summary": "inputs/update/answer/cancel/wait可用",
       "evidence": [
         "src/agent_loop/handle.rs",
         "examples/agent_loop.rs",
-        "tests/p2_agent_loop.rs::steer_during_model_reaches_the_next_request"
+        "tests/p2_agent_loop.rs::input_during_a_model_call_reaches_the_next_request"
       ]
     },
     {
@@ -257,77 +257,77 @@
     {
       "id": "V4-028",
       "status": "Passed",
-      "summary": "model中steer下一request生效",
+      "summary": "model中host input下一request生效",
       "evidence": [
-        "tests/p2_agent_loop.rs::steer_during_model_reaches_the_next_request"
+        "tests/p2_agent_loop.rs::input_during_a_model_call_reaches_the_next_request"
       ]
     },
     {
       "id": "V4-029",
       "status": "Passed",
-      "summary": "tool中steer在batch后生效",
+      "summary": "tool中host input在batch后生效",
       "evidence": [
-        "tests/p2_agent_loop.rs::steer_during_tool_batch_reaches_the_next_request"
+        "tests/p2_agent_loop.rs::input_during_a_tool_batch_reaches_the_next_request_after_the_batch"
       ]
     },
     {
       "id": "V4-030",
       "status": "Passed",
-      "summary": "prompt中steer导致rebuild",
+      "summary": "prompt中host input导致rebuild",
       "evidence": [
-        "tests/p2_agent_loop.rs::steer_during_prompt_discards_the_stale_prompt"
+        "tests/p2_agent_loop.rs::input_during_prompt_preparation_rebuilds_without_advancing_the_request_index"
       ]
     },
     {
       "id": "V4-031",
       "status": "Passed",
-      "summary": "多steer有序",
+      "summary": "多input有序",
       "evidence": [
-        "tests/p2_agent_loop.rs::multiple_steers_apply_in_accept_order"
+        "tests/p2_agent_loop.rs::several_inputs_stay_separate_user_items_in_order"
       ]
     },
     {
       "id": "V4-032",
       "status": "Passed",
-      "summary": "queue有界",
+      "summary": "queue有界（Runtime不再持有steer队列：队列由Host持有并限界，未取走的input留在Host）",
       "evidence": [
-        "tests/p2_agent_loop.rs::steer_queue_is_bounded_and_full_reports_queue_full"
+        "docs/contracts/agent-loop.md",
+        "tests/p2_agent_loop.rs::an_input_not_taken_before_cancellation_stays_out_of_the_report"
       ]
     },
     {
       "id": "V4-033",
       "status": "Passed",
-      "summary": "final race线性化（steer wins / seal wins）",
+      "summary": "final seal线性化（无tool答复总是seal，不再被steer延长）",
       "evidence": [
-        "tests/p2_agent_loop.rs::final_race_steer_wins_and_keeps_the_loop_alive",
-        "tests/p2_agent_loop.rs::final_race_seal_wins_returns_not_active",
-        "src/agent_loop/control.rs::begin_final_with_pending_steer_keeps_accepting_open",
+        "tests/p2_agent_loop.rs::a_no_tool_answer_ends_the_loop_without_asking_for_inputs",
+        "src/agent_loop/control.rs::begin_final_closes_accepting_and_returns_the_pending_config",
         "src/agent_loop/control.rs::pending_config_drop_on_begin_final_seal_occurs_outside_control_mutex"
       ]
     },
     {
       "id": "V4-034",
       "status": "Passed",
-      "summary": "applied steer进入LoopReport",
+      "summary": "已取走的input进入LoopReport",
       "evidence": [
-        "tests/p3_agent_loop_closeout.rs::steer_applied_before_a_prompt_failure_stays_in_the_report",
-        "tests/p2_agent_loop.rs::update_and_steer_combine_on_the_next_request"
+        "tests/p3_agent_loop_closeout.rs::input_taken_before_a_prompt_failure_stays_in_the_report",
+        "tests/p2_agent_loop.rs::update_and_input_combine_on_the_next_request"
       ]
     },
     {
       "id": "V4-035",
       "status": "Passed",
-      "summary": "未应用steer不持久化",
+      "summary": "未取走的input不进入LoopReport",
       "evidence": [
-        "tests/p2_agent_loop.rs::steer_accepted_but_cancelled_before_application_stays_out_of_report"
+        "tests/p2_agent_loop.rs::an_input_not_taken_before_cancellation_stays_out_of_the_report"
       ]
     },
     {
       "id": "V4-036",
       "status": "Passed",
-      "summary": "WaitingForInput拒绝steer",
+      "summary": "WaitingForInput期间无边界（拒绝steer已移除：input在answer后的请求生效）",
       "evidence": [
-        "tests/p2_agent_loop.rs::steer_is_rejected_while_waiting_for_interaction"
+        "tests/p2_agent_loop.rs::input_during_an_approval_wait_reaches_the_request_after_the_answer"
       ]
     },
     {

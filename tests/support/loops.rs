@@ -11,14 +11,65 @@ use minicore_runtime::tools::{
     ToolSet, ToolSpec,
 };
 use minicore_runtime::{
-    AgentLoop, ExecutionConfig, HistoryItem, LoopJoinError, LoopOptions, LoopOutcome, LoopReport,
-    LoopRequest, ToolCallId, UserInput,
+    AgentLoop, ExecutionConfig, HistoryItem, LoopInputs, LoopJoinError, LoopOptions, LoopOutcome,
+    LoopReport, LoopRequest, ToolCallId, UserInput,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
+
+/// A host with nothing to hand over.
+pub struct NoInputs;
+
+impl LoopInputs for NoInputs {
+    fn take(&self) -> Vec<UserInput> {
+        Vec::new()
+    }
+}
+
+pub fn no_inputs() -> Arc<dyn LoopInputs> {
+    Arc::new(NoInputs)
+}
+
+/// A host input queue: `push` is the host accepting an input, `take` hands
+/// over everything queued and counts the boundary calls.
+#[derive(Default)]
+pub struct QueuedInputs {
+    queue: Mutex<Vec<UserInput>>,
+    takes: AtomicUsize,
+}
+
+impl QueuedInputs {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn push(&self, text: &str) {
+        self.queue
+            .lock()
+            .unwrap()
+            .push(UserInput::text(text).unwrap());
+    }
+
+    /// Inputs the loop has not taken yet.
+    pub fn pending(&self) -> usize {
+        self.queue.lock().unwrap().len()
+    }
+
+    /// How often the loop has called `take`.
+    pub fn takes(&self) -> usize {
+        self.takes.load(Ordering::SeqCst)
+    }
+}
+
+impl LoopInputs for QueuedInputs {
+    fn take(&self) -> Vec<UserInput> {
+        self.takes.fetch_add(1, Ordering::SeqCst);
+        std::mem::take(&mut *self.queue.lock().unwrap())
+    }
+}
 
 pub fn reasoning_set() -> BTreeSet<ReasoningPreference> {
     BTreeSet::from([ReasoningPreference::Auto])
@@ -540,6 +591,7 @@ pub fn start_echo(
     let agent = AgentLoop::start(
         request(config(model, tool_set(calls.clone(), behavior), None)),
         options,
+        no_inputs(),
     )
     .unwrap();
     (agent, calls)

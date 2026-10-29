@@ -34,8 +34,8 @@ use minicore_runtime::tools::{
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{
     AgentLoop, AnswerError, CancelReason, ConfigRevision, ExecutionConfig, HistoryItem,
-    HistoryView, InteractionAnswer, LoopEvent, LoopFailureKind, LoopOptions, LoopOutcome,
-    LoopReport, LoopRequest, LoopStartError, LoopStatus, SteerError, ToolCallId, UpdateError,
+    HistoryView, InteractionAnswer, LoopEvent, LoopFailureKind, LoopInputs, LoopOptions,
+    LoopOutcome, LoopReport, LoopRequest, LoopStartError, LoopStatus, ToolCallId, UpdateError,
     UserHistory, UserInput, UserMessageKind,
 };
 
@@ -95,6 +95,7 @@ async fn text_loop_runs_to_completion() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -156,6 +157,7 @@ async fn each_request_preparation_emits_one_starting_state() {
     let mut agent = AgentLoop::start(
         request(config(model, tool_set(calls, ToolBehavior::Succeed), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let mut events = agent.take_events().unwrap();
@@ -274,6 +276,7 @@ async fn second_prompt_reports_starting_and_cancel_settles() {
             Arc::new(HoldSecondPrompt(Arc::clone(&entered))),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -302,6 +305,7 @@ async fn cancel_during_model_ends_cancelled_with_report() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -334,6 +338,7 @@ async fn cancel_during_tool_ends_cancelled_with_results_for_every_call() {
             None,
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -357,6 +362,7 @@ async fn owner_drop_cancels_the_running_loop() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -377,6 +383,7 @@ async fn shutdown_cancels_and_joins() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -410,6 +417,7 @@ async fn approved_interaction_resumes_the_loop() {
             Some(policy),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -463,6 +471,7 @@ async fn interactions_without_a_deadline_outlive_twenty_four_hours() {
                 policy,
             )),
             LoopOptions::default_checked().unwrap(),
+            no_inputs(),
         )
         .unwrap();
         let handle = agent.handle();
@@ -494,6 +503,7 @@ async fn handle_shutdown_and_dropped_join_record_distinct_cancel_reasons() {
         let agent = AgentLoop::start(
             request(config(model, ToolSet::default(), None)),
             LoopOptions::default_checked().unwrap(),
+            no_inputs(),
         )
         .unwrap();
         let handle = agent.handle();
@@ -542,6 +552,7 @@ async fn wrong_interaction_answers_are_rejected_and_loop_stays_waiting() {
             Some(policy),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -607,6 +618,7 @@ async fn cancel_while_waiting_for_input_ends_the_loop() {
             Some(policy),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -665,6 +677,7 @@ async fn multiple_waiters_receive_the_same_report() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -690,6 +703,7 @@ async fn event_stream_is_takeable_once_and_best_effort() {
     let mut agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let mut stream = agent.take_events().unwrap();
@@ -724,6 +738,7 @@ async fn closing_the_event_stream_does_not_stop_the_loop() {
     let mut agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let stream = agent.take_events().unwrap();
@@ -740,6 +755,7 @@ fn start_outside_a_tokio_runtime_is_rejected() {
             let error = AgentLoop::start(
                 request(config(model, ToolSet::default(), None)),
                 LoopOptions::default_checked().unwrap(),
+                no_inputs(),
             )
             .err()
             .unwrap();
@@ -768,6 +784,7 @@ async fn denied_tool_calls_produce_denied_results_and_the_loop_continues() {
             Some(policy),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let report = finish(agent).await;
@@ -814,6 +831,7 @@ async fn output_delta_events_are_streamed_inline() {
     let mut agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let mut events = agent.take_events().unwrap();
@@ -841,6 +859,7 @@ async fn concurrent_loops_finish_independently_without_extra_tasks() {
         let agent = AgentLoop::start(
             request(config(model, ToolSet::default(), None)),
             LoopOptions::default_checked().unwrap(),
+            no_inputs(),
         )
         .unwrap();
         join_set.spawn(async move { agent.join().await });
@@ -916,6 +935,7 @@ async fn late_subscriber_gets_the_same_report_immediately() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -935,6 +955,7 @@ async fn cancel_and_shutdown_after_completion_do_not_reopen_the_loop() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -961,6 +982,7 @@ async fn owner_drop_after_completion_keeps_the_completed_outcome() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -991,6 +1013,7 @@ async fn cancel_while_interaction_is_pending_ends_the_loop() {
             Some(policy),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -1026,7 +1049,12 @@ async fn prompt_error_is_a_prompt_failure() {
         Arc::new(FailingPrompt),
     )
     .unwrap();
-    let agent = AgentLoop::start(request(config), LoopOptions::default_checked().unwrap()).unwrap();
+    let agent = AgentLoop::start(
+        request(config),
+        LoopOptions::default_checked().unwrap(),
+        no_inputs(),
+    )
+    .unwrap();
     let report = finish(agent).await;
     assert!(matches!(
         &report.outcome,
@@ -1048,7 +1076,7 @@ async fn prompt_timeout_is_a_prompt_failure() {
     .unwrap();
     let mut options = LoopOptions::default_checked().unwrap();
     options.prompt_timeout = Duration::from_millis(100);
-    let agent = AgentLoop::start(request(config), options).unwrap();
+    let agent = AgentLoop::start(request(config), options, no_inputs()).unwrap();
     tokio::time::advance(Duration::from_millis(300)).await;
     let report = finish(agent).await;
     assert!(matches!(
@@ -1063,8 +1091,12 @@ async fn loop_deadline_during_a_model_call_cancels() {
     let (model, _) = scripted_model(vec![Round::Hold]);
     let mut options = LoopOptions::default_checked().unwrap();
     options.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
-    let agent =
-        AgentLoop::start(request(config(model, ToolSet::default(), None)), options).unwrap();
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        options,
+        no_inputs(),
+    )
+    .unwrap();
     tokio::time::advance(Duration::from_secs(2)).await;
     let report = finish(agent).await;
     assert_eq!(
@@ -1097,6 +1129,7 @@ async fn unknown_tool_call_closes_the_loop_with_invalid_response() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let report = finish(agent).await;
@@ -1129,7 +1162,7 @@ async fn bounded_event_queue_attaches_dropped_before_to_the_next_success() {
     .unwrap();
     let mut options = LoopOptions::default_checked().unwrap();
     options.event_capacity = 1;
-    let mut agent = AgentLoop::start(request(config), options).unwrap();
+    let mut agent = AgentLoop::start(request(config), options, no_inputs()).unwrap();
     let mut events = agent.take_events().unwrap();
     let report_task = spawn_join(agent);
 
@@ -1191,6 +1224,7 @@ async fn interaction_wait_deadline_cancels_and_settles_the_pending_call() {
             Some(policy),
         )),
         options,
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -1311,6 +1345,7 @@ async fn update_during_model_reaches_the_next_request() {
             None,
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -1390,6 +1425,7 @@ async fn update_during_tools_keeps_the_batch_on_the_old_snapshot() {
             project(),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -1438,6 +1474,7 @@ async fn multiple_updates_keep_only_the_latest() {
             None,
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -1533,6 +1570,7 @@ async fn update_during_prompt_prep_is_rebuilt_without_advancing_the_index() {
             prompt_a,
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -1584,6 +1622,7 @@ async fn update_after_completion_returns_not_active() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -1613,6 +1652,7 @@ async fn update_alone_does_not_extend_the_final_request() {
     let agent = AgentLoop::start(
         request(config(model_a, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -1678,6 +1718,7 @@ async fn toolset_switch_applies_to_the_next_request() {
             project(),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -1745,6 +1786,7 @@ async fn prompt_provider_switch_applies_to_the_next_request() {
             prompt_a,
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -1804,6 +1846,7 @@ async fn request_started_records_the_actual_snapshot_revision_and_reasoning() {
             project(),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -1862,8 +1905,12 @@ async fn invalid_config_update_does_not_consume_a_revision() {
     let mut options = LoopOptions::default_checked().unwrap();
     options.limits.max_tool_schema_bytes = 16;
 
-    let agent =
-        AgentLoop::start(request(config(model_a, ToolSet::default(), None)), options).unwrap();
+    let agent = AgentLoop::start(
+        request(config(model_a, ToolSet::default(), None)),
+        options,
+        no_inputs(),
+    )
+    .unwrap();
     let handle = agent.handle();
     let report_task = spawn_join(agent);
 
@@ -1935,6 +1982,7 @@ async fn update_during_interaction_waits_takes_effect_after_the_interaction() {
             project(),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -2004,6 +2052,7 @@ async fn failed_prompt_after_taken_update_keeps_the_last_issued_revision() {
             project(),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -2079,6 +2128,7 @@ async fn prompt_timeout_after_taken_update_keeps_the_last_issued_revision() {
             project(),
         )),
         options,
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -2168,6 +2218,7 @@ async fn multiple_stale_rebuilds_issue_only_the_latest_revision() {
             project(),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -2273,6 +2324,7 @@ async fn start_rejects_config_outside_loop_limits() {
             project(),
         )),
         options,
+        no_inputs(),
     )
     .err()
     .expect("oversized schema must fail start");
@@ -2298,13 +2350,14 @@ async fn start_rejects_config_outside_loop_limits() {
             project(),
         )),
         options,
+        no_inputs(),
     )
     .err()
     .expect("oversized name must fail start");
     assert_eq!(error, LoopStartError::InvalidConfig);
 }
 
-// ===== Phase 4: steer active loops at request boundaries =====
+// ===== Phase 4: host inputs reach a running loop at request boundaries =====
 
 fn steerings(report: &LoopReport) -> Vec<String> {
     report
@@ -2319,10 +2372,88 @@ fn steerings(report: &LoopReport) -> Vec<String> {
         .collect()
 }
 
-/// MC4-019: a steer accepted while a model request is in flight reaches the
-/// next request.
+fn history_marks(report: &LoopReport) -> Vec<&'static str> {
+    report
+        .appended
+        .iter()
+        .map(|item| match item {
+            HistoryItem::User(user) if user.kind == UserMessageKind::Steering => "steering",
+            HistoryItem::User(_) => "prompt",
+            HistoryItem::Assistant(_) => "assistant",
+            HistoryItem::ToolResult(_) => "toolresult",
+            HistoryItem::Summary(_) => "summary",
+        })
+        .collect()
+}
+
+/// Records the user texts of every prepared prompt and optionally holds the
+/// first preparation until released.
+struct RecordingPrompt {
+    entered: Arc<Notify>,
+    gate: Option<Arc<Notify>>,
+    seen: Mutex<Vec<Vec<String>>>,
+}
+
+impl RecordingPrompt {
+    fn open() -> Arc<Self> {
+        Arc::new(Self {
+            entered: Arc::new(Notify::new()),
+            gate: None,
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn gated(entered: Arc<Notify>, gate: Arc<Notify>) -> Arc<Self> {
+        Arc::new(Self {
+            entered,
+            gate: Some(gate),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn seen(&self) -> Vec<Vec<String>> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl PromptProvider for RecordingPrompt {
+    fn prepare<'a>(&'a self, request: PromptRequest<'a>) -> PromptFuture<'a> {
+        let users = request
+            .history
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::User(user) => Some(user.input.as_text().to_string()),
+                _ => None,
+            })
+            .collect();
+        let is_first = {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(users);
+            seen.len() == 1
+        };
+        Box::pin(async move {
+            if is_first && let Some(gate) = &self.gate {
+                self.entered.notify_one();
+                gate.notified().await;
+            }
+            DefaultPromptProvider::new(None).prepare(request).await
+        })
+    }
+}
+
+async fn wait_running_model(handle: &minicore_runtime::LoopHandle) {
+    handle
+        .watch_state()
+        .wait_for(|state| state.status == LoopStatus::RunningModel)
+        .await
+        .unwrap();
+}
+
+/// An input handed over while a model request streams reaches the next
+/// request; the streaming request never sees it and `take` is not called
+/// while it streams.
 #[tokio::test]
-async fn steer_during_model_reaches_the_next_request() {
+async fn input_during_a_model_call_reaches_the_next_request() {
     let gate = Arc::new(Notify::new());
     let (model_a, _) = scripted_model_named(
         "fake/a",
@@ -2332,60 +2463,61 @@ async fn steer_during_model_reaches_the_next_request() {
         }],
     );
     let calls = Arc::new(Mutex::new(Vec::new()));
+    let prompt = RecordingPrompt::open();
+    let inputs = QueuedInputs::new();
     let agent = AgentLoop::start(
-        request(config(
+        request(config_full(
             model_a,
+            ReasoningPreference::Auto,
             tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
             None,
+            prompt.clone(),
         )),
         LoopOptions::default_checked().unwrap(),
+        inputs.clone(),
     )
     .unwrap();
     let handle = agent.handle();
     let report_task = spawn_join(agent);
 
-    let mut states = handle.watch_state();
-    states
-        .wait_for(|state| state.status == LoopStatus::RunningModel)
-        .await
-        .unwrap();
-    handle.steer(UserInput::text("turn left").unwrap()).unwrap();
-
+    wait_running_model(&handle).await;
+    assert_eq!(inputs.takes(), 2, "A and F of request 0 ran, nothing since");
+    inputs.push("turn left");
     gate.notify_waiters();
+
     let report = report_task.await.unwrap().unwrap();
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(report.requests, 2, "the in-flight request still ran");
-    assert_eq!(steerings(&report), ["turn left"]);
-    let user_seq: Vec<(UserMessageKind, String)> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::User(user) => Some((user.kind, user.input.as_text().to_string())),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        user_seq,
-        vec![
-            (UserMessageKind::Prompt, "Fix the parser".to_string()),
-            (UserMessageKind::Steering, "turn left".to_string()),
-        ]
+        history_marks(&report),
+        ["prompt", "assistant", "toolresult", "steering", "assistant"]
     );
+    assert_eq!(steerings(&report), ["turn left"]);
+    assert_eq!(
+        prompt.seen(),
+        vec![
+            vec!["Fix the parser".to_string()],
+            vec!["Fix the parser".to_string(), "turn left".to_string()],
+        ],
+        "request 0 never saw the input"
+    );
+    assert_eq!(inputs.takes(), 4);
 }
 
-/// MC4-020: a steer accepted while the tool batch is running does not disturb
-/// the batch; the next request sees it after the whole batch finished.
+/// An input handed over while the tool batch runs does not disturb the batch;
+/// the next request sees it after the whole batch finished.
 #[tokio::test]
-async fn steer_during_tool_batch_reaches_the_next_request() {
+async fn input_during_a_tool_batch_reaches_the_next_request_after_the_batch() {
     let gate = Arc::new(Notify::new());
     let entered = Arc::new(Notify::new());
     let calls_a = Arc::new(Mutex::new(Vec::new()));
     let (model_a, _) = scripted_model_named(
         "fake/a",
         vec![Round::Tools {
-            calls: vec![("echo", "call_1")],
+            calls: vec![("echo", "call_1"), ("echo", "call_2")],
         }],
     );
+    let inputs = QueuedInputs::new();
     let agent = AgentLoop::start(
         request(config_full(
             model_a,
@@ -2400,70 +2532,64 @@ async fn steer_during_tool_batch_reaches_the_next_request() {
             project(),
         )),
         LoopOptions::default_checked().unwrap(),
+        inputs.clone(),
     )
     .unwrap();
-    let handle = agent.handle();
     let report_task = spawn_join(agent);
 
     entered.notified().await;
-    handle
-        .steer(UserInput::text("keep going").unwrap())
-        .unwrap();
-
+    assert_eq!(inputs.takes(), 2);
+    inputs.push("keep going");
+    // The second call of the batch waits on the gate again.
     gate.notify_waiters();
+    entered.notified().await;
+    assert_eq!(inputs.takes(), 2, "no boundary inside a tool batch");
+    gate.notify_waiters();
+
     let report = report_task.await.unwrap().unwrap();
     assert_eq!(report.outcome, LoopOutcome::Completed);
-    assert_eq!(recorded_calls(&calls_a), ["call_1"]);
-    assert_eq!(steerings(&report), ["keep going"]);
-    let marks: Vec<&'static str> = report
-        .appended
-        .iter()
-        .map(|item| match item {
-            HistoryItem::User(user) if user.kind == UserMessageKind::Steering => "steering",
-            HistoryItem::User(_) => "prompt",
-            HistoryItem::Assistant(_) => "assistant",
-            HistoryItem::ToolResult(_) => "toolresult",
-            HistoryItem::Summary(_) => "summary",
-        })
-        .collect();
+    assert_eq!(recorded_calls(&calls_a), ["call_1", "call_2"]);
     assert_eq!(
-        marks,
-        ["prompt", "assistant", "toolresult", "steering", "assistant"],
-        "the batch finished before the steer is applied"
+        history_marks(&report),
+        [
+            "prompt",
+            "assistant",
+            "toolresult",
+            "toolresult",
+            "steering",
+            "assistant"
+        ],
+        "the whole batch finished before the input is applied"
     );
 }
 
-/// MC4-021: a steer accepted while the prompt is being prepared discards the
-/// stale PreparedPrompt; the rebuilt request sees the steer at index 0.
+/// An input handed over while the prompt is being prepared discards the stale
+/// prompt; the rebuilt request keeps index 0 and sees the input.
 #[tokio::test]
-async fn steer_during_prompt_discards_the_stale_prompt() {
+async fn input_during_prompt_preparation_rebuilds_without_advancing_the_request_index() {
     let entered = Arc::new(Notify::new());
     let prompt_gate = Arc::new(Notify::new());
-    let prompt_calls = Arc::new(AtomicUsize::new(0));
     let (model_a, _) = scripted_model_named("fake/a", vec![Round::Final { text: "a" }]);
-    let prompt = Arc::new(GatedPrompt {
-        entered: Arc::clone(&entered),
-        gate: Some(Arc::clone(&prompt_gate)),
-        calls: Arc::clone(&prompt_calls),
-    });
+    let prompt = RecordingPrompt::gated(Arc::clone(&entered), Arc::clone(&prompt_gate));
+    let inputs = QueuedInputs::new();
     let mut agent = AgentLoop::start(
         request(config_full(
             model_a,
             ReasoningPreference::Auto,
             ToolSet::default(),
             None,
-            prompt,
+            prompt.clone(),
         )),
         LoopOptions::default_checked().unwrap(),
+        inputs.clone(),
     )
     .unwrap();
-    let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
     let report_task = spawn_join(agent);
 
     entered.notified().await;
-    handle.steer(UserInput::text("ping").unwrap()).unwrap();
-    prompt_gate.notify_waiters();
+    inputs.push("ping");
+    prompt_gate.notify_one();
 
     let report = report_task.await.unwrap().unwrap();
     assert_eq!(report.outcome, LoopOutcome::Completed);
@@ -2472,6 +2598,15 @@ async fn steer_during_prompt_discards_the_stale_prompt() {
         "the stale prompt never became a request"
     );
     assert_eq!(steerings(&report), ["ping"]);
+    assert_eq!(
+        prompt.seen(),
+        vec![
+            vec!["Fix the parser".to_string()],
+            vec!["Fix the parser".to_string(), "ping".to_string()],
+        ],
+        "the prompt was rebuilt with the input"
+    );
+    assert_eq!(inputs.takes(), 4, "A and F ran again after the rebuild");
 
     let started = collect_request_starts(&mut events).await;
     assert_eq!(
@@ -2482,13 +2617,13 @@ async fn steer_during_prompt_discards_the_stale_prompt() {
             "fake/a".to_string(),
             ReasoningPreference::Auto
         )],
-        "the rebuilt request is still index 0 and saw the steer"
+        "the rebuilt request is still index 0"
     );
 }
 
-/// MC4-022: multiple steers apply in accept order at the next boundary.
+/// Several inputs taken together stay separate user items in hand-over order.
 #[tokio::test]
-async fn multiple_steers_apply_in_accept_order() {
+async fn several_inputs_stay_separate_user_items_in_order() {
     let gate = Arc::new(Notify::new());
     let (model_a, _) = scripted_model_named(
         "fake/a",
@@ -2498,86 +2633,71 @@ async fn multiple_steers_apply_in_accept_order() {
         }],
     );
     let calls = Arc::new(Mutex::new(Vec::new()));
+    let prompt = RecordingPrompt::open();
+    let inputs = QueuedInputs::new();
     let agent = AgentLoop::start(
-        request(config(
+        request(config_full(
             model_a,
+            ReasoningPreference::Auto,
             tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
             None,
+            prompt.clone(),
         )),
         LoopOptions::default_checked().unwrap(),
+        inputs.clone(),
     )
     .unwrap();
     let handle = agent.handle();
     let report_task = spawn_join(agent);
 
-    let mut states = handle.watch_state();
-    states
-        .wait_for(|state| state.status == LoopStatus::RunningModel)
-        .await
-        .unwrap();
-    handle.steer(UserInput::text("one").unwrap()).unwrap();
-    handle.steer(UserInput::text("two").unwrap()).unwrap();
-    handle.steer(UserInput::text("three").unwrap()).unwrap();
-
+    wait_running_model(&handle).await;
+    inputs.push("one");
+    inputs.push("two");
+    inputs.push("three");
     gate.notify_waiters();
+
     let report = report_task.await.unwrap().unwrap();
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(steerings(&report), ["one", "two", "three"]);
+    assert_eq!(
+        prompt.seen()[1],
+        ["Fix the parser", "one", "two", "three"],
+        "the model sees one user message per input"
+    );
 }
 
-/// MC4-023: the steer queue is bounded; accepted steers never drop and the
-/// overflow reports QueueFull.
+/// The first request takes inputs the host already has ready.
 #[tokio::test]
-async fn steer_queue_is_bounded_and_full_reports_queue_full() {
-    let gate = Arc::new(Notify::new());
-    let (model_a, _) = scripted_model_named(
-        "fake/a",
-        vec![Round::GatedTools {
-            calls: vec![("echo", "call_1")],
-            gate: Arc::clone(&gate),
-        }],
-    );
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.max_pending_steers = 2;
+async fn the_first_request_takes_inputs_ready_at_start() {
+    let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
+    let prompt = RecordingPrompt::open();
+    let inputs = QueuedInputs::new();
+    inputs.push("early");
     let agent = AgentLoop::start(
-        request(config(
-            model_a,
-            tool_set(Arc::clone(&calls), ToolBehavior::Succeed),
+        request(config_full(
+            model,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
             None,
+            prompt.clone(),
         )),
-        options,
+        LoopOptions::default_checked().unwrap(),
+        inputs.clone(),
     )
     .unwrap();
-    let handle = agent.handle();
-    let report_task = spawn_join(agent);
 
-    let mut states = handle.watch_state();
-    states
-        .wait_for(|state| state.status == LoopStatus::RunningModel)
-        .await
-        .unwrap();
-    handle.steer(UserInput::text("s1").unwrap()).unwrap();
-    handle.steer(UserInput::text("s2").unwrap()).unwrap();
-    assert_eq!(
-        handle.steer(UserInput::text("s3").unwrap()),
-        Err(SteerError::QueueFull)
-    );
-
-    gate.notify_waiters();
-    let report = report_task.await.unwrap().unwrap();
+    let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
-    assert_eq!(
-        steerings(&report),
-        ["s1", "s2"],
-        "accepted steers are never lost"
-    );
+    assert_eq!(history_marks(&report), ["prompt", "steering", "assistant"]);
+    assert_eq!(steerings(&report), ["early"]);
+    assert_eq!(prompt.seen(), [["Fix the parser", "early"]]);
+    assert_eq!(report.requests, 1);
 }
 
-/// MC4-024: a steer accepted before the final seal keeps the loop alive and
-/// becomes the next request.
+/// A model answer without tool calls ends the loop even when the host has an
+/// input ready: `take` is not called after it and the input stays with the host.
 #[tokio::test]
-async fn final_race_steer_wins_and_keeps_the_loop_alive() {
+async fn a_no_tool_answer_ends_the_loop_without_asking_for_inputs() {
     let gate = Arc::new(Notify::new());
     let (model_a, _) = scripted_model_named(
         "fake/a",
@@ -2586,59 +2706,110 @@ async fn final_race_steer_wins_and_keeps_the_loop_alive() {
             gate: Arc::clone(&gate),
         }],
     );
+    let inputs = QueuedInputs::new();
     let agent = AgentLoop::start(
         request(config(model_a, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        inputs.clone(),
     )
     .unwrap();
     let handle = agent.handle();
     let report_task = spawn_join(agent);
 
-    let mut states = handle.watch_state();
-    states
-        .wait_for(|state| state.status == LoopStatus::RunningModel)
-        .await
-        .unwrap();
-    handle.steer(UserInput::text("hello").unwrap()).unwrap();
-
+    wait_running_model(&handle).await;
+    inputs.push("hello");
     gate.notify_waiters();
+
     let report = report_task.await.unwrap().unwrap();
     assert_eq!(report.outcome, LoopOutcome::Completed);
-    assert_eq!(report.requests, 2, "the steer kept the final loop alive");
-    assert_eq!(steerings(&report), ["hello"]);
-    let assistants = report
-        .appended
-        .iter()
-        .filter(|item| matches!(item, HistoryItem::Assistant(_)))
-        .count();
-    assert_eq!(assistants, 2);
+    assert_eq!(report.requests, 1);
+    assert_eq!(steerings(&report), Vec::<String>::new());
+    assert_eq!(inputs.takes(), 2, "A and F of the only request");
+    assert_eq!(inputs.pending(), 1, "the input stays with the host");
 }
 
-/// MC4-025: once the seal wins, steering a completed loop is NotActive and no
-/// steer enters the report.
+/// An input taken at the first boundary and then cancelled before any request
+/// was issued stays in the cancelled report.
 #[tokio::test]
-async fn final_race_seal_wins_returns_not_active() {
-    let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
+async fn an_input_taken_then_cancelled_before_any_request_stays_in_the_report() {
+    let entered = Arc::new(Notify::new());
+    let gate = Arc::new(Notify::new());
+    let (model, _) = scripted_model(vec![Round::Final { text: "never" }]);
+    let inputs = QueuedInputs::new();
+    inputs.push("early");
     let agent = AgentLoop::start(
-        request(config(model, ToolSet::default(), None)),
+        request(config_full(
+            model,
+            ReasoningPreference::Auto,
+            ToolSet::default(),
+            None,
+            RecordingPrompt::gated(Arc::clone(&entered), gate),
+        )),
         LoopOptions::default_checked().unwrap(),
+        inputs.clone(),
     )
     .unwrap();
     let handle = agent.handle();
-    let report = finish(agent).await;
-    assert_eq!(report.outcome, LoopOutcome::Completed);
-    assert_eq!(steerings(&report), Vec::<String>::new());
+    let report_task = spawn_join(agent);
 
-    let error = handle
-        .steer(UserInput::text("late").unwrap())
-        .expect_err("steer after seal must fail");
-    assert_eq!(error, SteerError::NotActive);
+    entered.notified().await;
+    assert!(handle.cancel());
+
+    let report = report_task.await.unwrap().unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Cancelled(CancelReason::User));
+    assert_eq!(report.requests, 0);
+    assert_eq!(history_marks(&report), ["prompt", "steering"]);
+    assert_eq!(steerings(&report), ["early"]);
 }
 
-/// MC4-026: steering while an interaction is pending is rejected as
-/// WaitingForInput and accepted again once the interaction resolves.
+/// A cancellation that lands while `take` hands over inputs still decides the
+/// outcome; the handed-over input stays in the report and no request follows.
 #[tokio::test]
-async fn steer_is_rejected_while_waiting_for_interaction() {
+async fn cancellation_wins_over_a_non_empty_take() {
+    struct CancelOnSecondTake {
+        handle: Mutex<Option<minicore_runtime::LoopHandle>>,
+        takes: AtomicUsize,
+    }
+    impl LoopInputs for CancelOnSecondTake {
+        fn take(&self) -> Vec<UserInput> {
+            if self.takes.fetch_add(1, Ordering::SeqCst) != 1 {
+                return Vec::new();
+            }
+            let handle = self.handle.lock().unwrap();
+            assert!(handle.as_ref().expect("handle is set").cancel());
+            vec![UserInput::text("late").unwrap()]
+        }
+    }
+
+    let (model, _) = scripted_model(vec![Round::Final { text: "never" }]);
+    let inputs = Arc::new(CancelOnSecondTake {
+        handle: Mutex::new(None),
+        takes: AtomicUsize::new(0),
+    });
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        LoopOptions::default_checked().unwrap(),
+        inputs.clone(),
+    )
+    .unwrap();
+    // The runner task cannot run before the first await on this single-threaded runtime.
+    *inputs.handle.lock().unwrap() = Some(agent.handle());
+
+    let report = finish(agent).await;
+    assert_eq!(report.outcome, LoopOutcome::Cancelled(CancelReason::User));
+    assert_eq!(report.requests, 0, "no request follows the cancelled take");
+    assert_eq!(steerings(&report), ["late"]);
+    assert_eq!(
+        inputs.takes.load(Ordering::SeqCst),
+        2,
+        "take is not called again once cancelled"
+    );
+}
+
+/// No request boundary happens while the loop waits for an approval, so an
+/// input handed over meanwhile reaches the request after the answer.
+#[tokio::test]
+async fn input_during_an_approval_wait_reaches_the_request_after_the_answer() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![Round::Tools {
         calls: vec![("echo", "call_1")],
@@ -2647,6 +2818,7 @@ async fn steer_is_rejected_while_waiting_for_interaction() {
         plan: Arc::new(vec![PolicyPlan::RequireApproval]),
         calls: Arc::new(AtomicUsize::new(0)),
     });
+    let inputs = QueuedInputs::new();
     let agent = AgentLoop::start(
         request(config(
             model,
@@ -2654,6 +2826,7 @@ async fn steer_is_rejected_while_waiting_for_interaction() {
             Some(policy),
         )),
         LoopOptions::default_checked().unwrap(),
+        inputs.clone(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -2664,10 +2837,8 @@ async fn steer_is_rejected_while_waiting_for_interaction() {
         .wait_for(|state| state.pending_interaction.is_some())
         .await
         .unwrap();
-    assert_eq!(
-        handle.steer(UserInput::text("nudge").unwrap()),
-        Err(SteerError::WaitingForInput)
-    );
+    inputs.push("after answer");
+    assert_eq!(inputs.takes(), 2, "waiting for an answer is no boundary");
 
     let pending = states.borrow().pending_interaction.clone().unwrap();
     handle
@@ -2676,19 +2847,20 @@ async fn steer_is_rejected_while_waiting_for_interaction() {
             InteractionAnswer::Approval(ApprovalDecision::AllowOnce),
         )
         .unwrap();
-    handle
-        .steer(UserInput::text("after answer").unwrap())
-        .unwrap();
 
     let report = report_task.await.unwrap().unwrap();
     assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(
+        history_marks(&report),
+        ["prompt", "assistant", "toolresult", "steering", "assistant"]
+    );
     assert_eq!(steerings(&report), ["after answer"]);
 }
 
-/// Update and steer accepted before one boundary combine on the next request:
-/// the new config serves it and the steer appears in its history.
+/// A config update and an input handed over before one boundary combine on
+/// the next request: the new config serves it and the input is in its history.
 #[tokio::test]
-async fn update_and_steer_combine_on_the_next_request() {
+async fn update_and_input_combine_on_the_next_request() {
     let gate = Arc::new(Notify::new());
     let (model_a, _) = scripted_model_named(
         "fake/a",
@@ -2699,6 +2871,7 @@ async fn update_and_steer_combine_on_the_next_request() {
     );
     let calls = Arc::new(Mutex::new(Vec::new()));
     let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "from b" }]);
+    let inputs = QueuedInputs::new();
     let mut agent = AgentLoop::start(
         request(config(
             model_a,
@@ -2706,17 +2879,14 @@ async fn update_and_steer_combine_on_the_next_request() {
             None,
         )),
         LoopOptions::default_checked().unwrap(),
+        inputs.clone(),
     )
     .unwrap();
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
     let report_task = spawn_join(agent);
 
-    let mut states = handle.watch_state();
-    states
-        .wait_for(|state| state.status == LoopStatus::RunningModel)
-        .await
-        .unwrap();
+    wait_running_model(&handle).await;
     let revision = handle
         .update(config_full(
             model_b,
@@ -2727,9 +2897,7 @@ async fn update_and_steer_combine_on_the_next_request() {
         ))
         .unwrap();
     assert_eq!(revision, ConfigRevision::new(1));
-    handle
-        .steer(UserInput::text("next topic").unwrap())
-        .unwrap();
+    inputs.push("next topic");
 
     gate.notify_waiters();
     let report = report_task.await.unwrap().unwrap();
@@ -2758,34 +2926,29 @@ async fn update_and_steer_combine_on_the_next_request() {
     );
 }
 
-/// A steer accepted but never applied before cancellation must not enter the
-/// report.
+/// An input the loop never took before cancellation stays with the host and
+/// never reaches the report.
 #[tokio::test]
-async fn steer_accepted_but_cancelled_before_application_stays_out_of_report() {
+async fn an_input_not_taken_before_cancellation_stays_out_of_the_report() {
     let (model_a, _) = scripted_model_named("fake/a", vec![Round::Hold]);
+    let inputs = QueuedInputs::new();
     let agent = AgentLoop::start(
         request(config(model_a, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        inputs.clone(),
     )
     .unwrap();
     let handle = agent.handle();
     let report_task = spawn_join(agent);
 
-    let mut states = handle.watch_state();
-    states
-        .wait_for(|state| state.status == LoopStatus::RunningModel)
-        .await
-        .unwrap();
-    handle.steer(UserInput::text("lost").unwrap()).unwrap();
+    wait_running_model(&handle).await;
+    inputs.push("kept");
     handle.cancel();
 
     let report = report_task.await.unwrap().unwrap();
     assert_eq!(report.outcome, LoopOutcome::Cancelled(CancelReason::User));
-    assert_eq!(
-        steerings(&report),
-        Vec::<String>::new(),
-        "an unapplied steer must never reach the report"
-    );
+    assert_eq!(steerings(&report), Vec::<String>::new());
+    assert_eq!(inputs.pending(), 1);
 }
 
 // ===== Phase 5 reviewer fixes: end-to-end panic/timeout isolation =====
@@ -2888,6 +3051,7 @@ async fn model_start_panic_yields_model_failure_without_history() {
             project(),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -2933,6 +3097,7 @@ async fn model_stream_poll_panic_yields_model_failure_without_history() {
             project(),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
 
@@ -3007,6 +3172,7 @@ async fn prompt_provider_panic_yields_prompt_failure() {
             Arc::new(PanicPrompt),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
 
@@ -3040,6 +3206,7 @@ async fn policy_panic_is_denied_and_the_loop_continues() {
             Some(policy),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
 
@@ -3102,6 +3269,7 @@ async fn tool_timeout_port_deadline_fails_the_call_and_the_batch_continues() {
             project(),
         )),
         options,
+        no_inputs(),
     )
     .unwrap();
     let report_task = spawn_join(agent);
@@ -3306,6 +3474,7 @@ async fn default_provider_accepts_mixed_model_refs_in_the_base() {
             ),
         ),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let report = finish(agent).await;
@@ -3331,6 +3500,7 @@ async fn inconsistent_old_tool_history_fails_as_prompt_but_start_succeeds() {
             ),
         ),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
 
@@ -3389,6 +3559,7 @@ async fn default_provider_runs_a_loop_end_to_end_with_system_prompt() {
             ))),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let report = finish(agent).await;
@@ -3507,6 +3678,7 @@ async fn invalid_message_from_public_variant_fails_as_prompt() {
             Arc::new(InvalidTextPrompt),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
 
@@ -3543,6 +3715,7 @@ async fn tool_output_exceeding_limit_fails_and_original_content_omitted_from_his
             None,
         )),
         options,
+        no_inputs(),
     )
     .unwrap();
 
@@ -3586,6 +3759,7 @@ async fn tool_output_within_limit_succeeds_with_unchanged_content() {
             None,
         )),
         options,
+        no_inputs(),
     )
     .unwrap();
 
@@ -3676,6 +3850,7 @@ async fn policy_denied_reason_exceeding_limit_remains_denied_and_bounded() {
             Some(policy),
         )),
         options,
+        no_inputs(),
     )
     .unwrap();
 
@@ -3799,7 +3974,8 @@ async fn minimal_limit_one_byte_bounds_cancelled_tool_batch() {
     tokio::pin!(entered);
     entered.as_mut().enable();
 
-    let agent = AgentLoop::start(request(config(model, tools, None)), options).unwrap();
+    let agent =
+        AgentLoop::start(request(config(model, tools, None)), options, no_inputs()).unwrap();
     let handle = agent.handle();
     let report_task = spawn_join(agent);
 
@@ -3847,6 +4023,7 @@ async fn tool_finished_event_output_bytes_matches_history_bounded_bytes() {
             None,
         )),
         options,
+        no_inputs(),
     )
     .unwrap();
     let mut events = agent.take_events().unwrap();
@@ -3905,6 +4082,7 @@ async fn assert_invalid_tool_input_request_fails(invalid_request: ToolInputReque
             None,
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -4064,6 +4242,7 @@ async fn model_error_auth_rejected_preserves_classification_and_diagnostic() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let report = finish(agent).await;
@@ -4111,8 +4290,12 @@ async fn retry_backoff_keeps_the_model_cause_and_honors_loop_deadlines() {
         options.model_timeout = Duration::from_secs(if loop_deadline { 30 } else { 9 });
         options.deadline =
             loop_deadline.then(|| tokio::time::Instant::now() + Duration::from_secs(9));
-        let agent =
-            AgentLoop::start(request(config(model, ToolSet::default(), None)), options).unwrap();
+        let agent = AgentLoop::start(
+            request(config(model, ToolSet::default(), None)),
+            options,
+            no_inputs(),
+        )
+        .unwrap();
         let handle = agent.handle();
         let mut states = handle.watch_state();
         states
@@ -4157,8 +4340,12 @@ async fn model_error_rate_limited_exhausting_retry_preserves_diagnostic() {
     options.model_retry_attempts = 2;
     options.model_retry_base_delay = Duration::from_millis(1);
 
-    let mut agent =
-        AgentLoop::start(request(config(model, ToolSet::default(), None)), options).unwrap();
+    let mut agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        options,
+        no_inputs(),
+    )
+    .unwrap();
     let handle = agent.handle();
     let mut events = agent.take_events().unwrap();
     let report = finish(agent).await;
@@ -4222,6 +4409,7 @@ async fn model_error_quota_exceeded_preserves_diagnostic() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let report = finish(agent).await;
@@ -4260,6 +4448,7 @@ async fn model_error_context_overflow_preserves_diagnostic() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let report = finish(agent).await;
@@ -4295,6 +4484,7 @@ async fn model_error_request_outcome_unknown_preserves_diagnostic() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let report = finish(agent).await;
@@ -4340,6 +4530,7 @@ async fn model_error_stream_started_preserves_diagnostic_and_omits_partial_histo
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let report = finish(agent).await;
@@ -4385,6 +4576,7 @@ async fn model_error_invalid_provider_response_preserves_diagnostic() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let report = finish(agent).await;
@@ -4417,6 +4609,7 @@ async fn non_model_failures_classify_correctly_regression() {
             Arc::new(PanicPrompt),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let report = finish(agent).await;
@@ -4443,6 +4636,7 @@ async fn non_model_failures_classify_correctly_regression() {
     let agent = AgentLoop::start(
         request(config(model, tool_set(calls, ToolBehavior::Succeed), None)),
         options,
+        no_inputs(),
     )
     .unwrap();
     let report = finish(agent).await;
@@ -4470,6 +4664,7 @@ async fn non_model_failures_classify_correctly_regression() {
             Some(policy),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let report = finish(agent).await;
@@ -4502,6 +4697,7 @@ async fn loop_failure_debug_does_not_leak_diagnostic_message() {
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let report = finish(agent).await;
@@ -4537,6 +4733,7 @@ async fn first_request_start_error_counts_as_one_request_with_state_zero() {
     let mut agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -4588,6 +4785,7 @@ async fn first_request_stream_failure_counts_as_one_request_with_state_zero() {
     let mut agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -4679,6 +4877,7 @@ async fn prompt_failure_emits_no_request_started_and_counts_zero_requests() {
             Arc::new(PanicPrompt),
         )),
         LoopOptions::default_checked().unwrap(),
+        no_inputs(),
     )
     .unwrap();
     let handle = agent.handle();
@@ -4715,8 +4914,12 @@ async fn model_burst_progress_drops_are_recorded_in_dropped_before() {
     let mut options = LoopOptions::default_checked().unwrap();
     options.event_capacity = 256;
 
-    let mut agent =
-        AgentLoop::start(request(config(model, ToolSet::default(), None)), options).unwrap();
+    let mut agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        options,
+        no_inputs(),
+    )
+    .unwrap();
     let mut events = agent.take_events().unwrap();
 
     let report = finish(agent).await;
@@ -4780,6 +4983,7 @@ async fn tool_burst_progress_drops_are_recorded_in_dropped_before() {
             None,
         )),
         options,
+        no_inputs(),
     )
     .unwrap();
     let mut events = agent.take_events().unwrap();
@@ -4847,6 +5051,7 @@ async fn both_inner_and_outer_queues_overflow_reports_dropped_before() {
             None,
         )),
         options,
+        no_inputs(),
     )
     .unwrap();
 
@@ -4905,8 +5110,12 @@ async fn receiver_dropped_during_model_burst_allows_loop_to_complete() {
     let mut options = LoopOptions::default_checked().unwrap();
     options.event_capacity = 256;
 
-    let mut agent =
-        AgentLoop::start(request(config(model, ToolSet::default(), None)), options).unwrap();
+    let mut agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        options,
+        no_inputs(),
+    )
+    .unwrap();
 
     let events = agent.take_events().unwrap();
     drop(events);
@@ -4954,6 +5163,7 @@ async fn receiver_dropped_during_tool_burst_allows_loop_to_complete() {
             None,
         )),
         options,
+        no_inputs(),
     )
     .unwrap();
 
@@ -4994,6 +5204,7 @@ async fn replay_survives_runner_history_serde_and_default_projection() {
         let agent = AgentLoop::start(
             request(config(model, ToolSet::default(), None)),
             LoopOptions::default_checked().unwrap(),
+            no_inputs(),
         )
         .unwrap();
         let report = finish(agent).await;
@@ -5060,7 +5271,8 @@ async fn loop_accepts_history_and_prompt_beyond_former_count_and_byte_caps() {
     let (model, _) = scripted_model(vec![Round::Final { text: "ok" }]);
     let mut req = request(config(model, ToolSet::default(), None));
     req.history = history.into();
-    let agent = AgentLoop::start(req, LoopOptions::default_checked().unwrap()).unwrap();
+    let agent =
+        AgentLoop::start(req, LoopOptions::default_checked().unwrap(), no_inputs()).unwrap();
     let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
     assert_eq!(report.requests, 1);

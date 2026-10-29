@@ -24,15 +24,16 @@ contract; the focused contracts ([model](model.md), [event-stream](event-stream.
 The runner loops:
 
 1. Cancel / deadline pre-checks.
-2. A-step: atomically pull the latest config candidate and every accepted
-   steer (`take_boundary`), apply them to the working state.
+2. A-step: pull the latest config candidate and call `LoopInputs::take`
+   (the first request included); apply both to the working state. Taken
+   inputs join the working history as `Steering` user items, in order.
 3. Publish `Starting` once for this preparation attempt, then prepare under
    cancel/timeout/panic isolation. Stale rebuilds and requests after tool
    batches each have their own preparation state. Empty prompts fail as
    `Prompt` regardless of provider; prompt size is otherwise unbounded.
-4. F-step: if newer config/steers landed while preparing, discard the stale
-   prompt and rebuild; `request_index` does not advance and no model request
-   is issued for the stale snapshot.
+4. F-step: take again. If a newer config or a non-empty `take` landed while
+   preparing, discard the stale prompt and rebuild; `request_index` does not
+   advance and no model request is issued for the stale snapshot.
 5. Issue boundary: build the `ModelRequest`, commit the candidate revision,
    stamp `RequestStarted` with it, increment the `requests` count and record
    `last_issued_request_index`, then run the model. If the issued model
@@ -42,7 +43,8 @@ The runner loops:
    runtime does not perform automatic whole-loop retries.
 6. On a response with tool calls, execute the tool batch pinned to the
    snapshot of the producing request; then loop back.
-7. On a no-tool-call `Stop`, run the final-seal decision (below) and end.
+7. On a response without tool calls, close accepting and end. The host's
+   inputs are not consulted: a no-tool answer always ends the loop.
 
 ## Configuration Updates
 
@@ -53,25 +55,29 @@ The runner loops:
   committed only at the true issue boundary. A `Prompt`/timeout/cancel in
   between keeps the last issued revision.
 - A pending config update **does not** keep the loop alive: a final response
-  with no pending steers seals even if an update is queued.
+  closes accepting and seals even if an update is queued.
 - Displaced configurations (from a replacing `update` or discarded during
   `begin_final`/`finish_once`) are dropped outside the `control` mutex,
   ensuring external capabilities and providers do not execute drop logic
   while holding the lock.
 
-## Steering
+## Inputs
 
-- `LoopHandle::steer(UserInput) -> Result<(), SteerError>`. A successful call
-  means the steer was accepted into this process-local queue. It is applied at
-  the next request boundary. On any non-`Completed` ending or process exit
-  before that boundary, the queued steer is discarded and
-  will not appear in `LoopReport::appended`.
-  Steers queue up to `max_pending_steers` (`QueueFull`), are rejected if an
-  interaction is pending (`WaitingForInput`), or after cancellation or sealing
-  (`NotActive`), and are applied as `Steering` user items at the **next model request**.
-- A final response with pending steers keeps the loop alive and advances
-  `request_index`; the steers (not the pending config) are what extend the
-  final.
+- `AgentLoop::start(request, options, inputs)` takes an `Arc<dyn LoopInputs>`
+  implemented by the host. `LoopInputs::take(&self) -> Vec<UserInput>` returns
+  the inputs to append before the next model request, in order, and hands them
+  over for good. The host owns the queue and validates each input (non-empty,
+  within `max_user_input_bytes`); the Runtime trusts `take`.
+- `take` runs synchronously on the runner task with no Runtime lock held. It
+  must not block, await or do IO. The loop calls it at the A-step and the
+  F-step only: never during a model call, a tool batch or an interaction wait.
+- Each taken input becomes its own `Steering` user item, in order, and is in
+  `LoopReport::appended` for every outcome, cancellation included. Inputs the
+  loop never took stay with the host.
+- A response without tool calls always ends the loop; `take` is not called
+  after it. Cancellation still decides the outcome when it lands while `take`
+  returns inputs: the loop ends `Cancelled` and keeps the handed-over inputs
+  in the report.
 
 ## Final Report
 
@@ -96,7 +102,7 @@ The runner loops:
 
 ## Determinism of Control
 
-`update`, `steer`, and the final seal linearize on one short mutex;
+`update`, `answer`, and the final seal linearize on one short mutex;
 cancel/finish use a single-CAS `AtomicU8` state machine. All event
 emissions are best-effort `try_send`s and never block the loop. Waiting for
 input or events never affects loop correctness.

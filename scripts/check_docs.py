@@ -11,7 +11,7 @@ Checks, against an injectable root (stdlib only, no LOC budgets):
   4. No stale session-era page is kept current (no removed contract/migration
      named as authority).
   5. The compile-gate examples exist and exercise AgentLoop,
-     steer/update/cancel, and the MemoryAgent composition pattern.
+     inputs/update/cancel, and the MemoryAgent composition pattern.
   6. Real Markdown link validation: every inline and reference link in every
      non-archive Markdown file resolves to an existing target, and every
      `#fragment` matches a GitHub-style heading anchor (duplicate headings
@@ -244,7 +244,7 @@ def check_examples(root: Path) -> list[str]:
         problems.append("examples/agent_loop.rs missing")
     else:
         text = agent_loop.read_text(encoding="utf-8")
-        for marker in ["AgentLoop::start", ".join()", ".steer(", ".update(", ".cancel("]:
+        for marker in ["AgentLoop::start", ".join()", "LoopInputs", ".update(", ".cancel("]:
             if marker not in text:
                 problems.append(f"examples/agent_loop.rs missing {marker!r}")
     if not memory_agent.exists():

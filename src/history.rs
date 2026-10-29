@@ -25,7 +25,7 @@ pub enum HistoryItem {
     Summary(SummaryHistory),
 }
 
-/// Host input and runtime steers belonging to this loop.
+/// Host input and mid-loop inputs belonging to this loop.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UserHistory {
     pub loop_id: LoopId,
@@ -38,7 +38,7 @@ pub struct UserHistory {
 pub enum UserMessageKind {
     /// The initial user input that started the loop.
     Prompt,
-    /// A `LoopHandle::steer` applied at a request boundary.
+    /// An input taken from `LoopInputs` at a request boundary.
     Steering,
 }
 

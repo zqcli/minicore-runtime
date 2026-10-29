@@ -37,18 +37,20 @@ one loop and returns control. Concretely:
 ## Concurrency Notes
 
 - Requires a Tokio context; `AgentLoop::start` spawns the single runner task.
-- `handle.steer` / `handle.update` / `handle.cancel` are callable from any
-  thread. They either linearize against the runner's mutex or fail fast with
-  `NotActive` / `QueueFull` / `WaitingForInput`.
-- `update` and `steer` stage for the **next model request**; the current tool
-  batch keeps the snapshot of the request that produced it. A successful call
-  means the steer was accepted into this process-local queue and is applied at
-  the next request boundary; on any non-`Completed` ending or process exit
-  before that boundary, the queued steer is discarded and
-  will not appear in `LoopReport::appended`. Steers are bounded by
-  `max_pending_steers` (`QueueFull`) and rejected on `WaitingForInput` or
-  `NotActive`.
-- After cancellation, `steer`, `update` and `answer` return `NotActive` even if
+- `handle.update` / `handle.cancel` are callable from any thread. They either
+  linearize against the runner's mutex or fail fast with `NotActive`.
+- `update` stages for the **next model request**; the current tool batch keeps
+  the snapshot of the request that produced it.
+- Inputs: the host implements `LoopInputs` and passes it to `AgentLoop::start`.
+  The loop calls `take` on the runner task before every request preparation
+  and again once a prompt is prepared; it must not block, await or do IO, and
+  runs with no Runtime lock held. The host validates inputs where it accepts
+  them and bounds its own queue. Handing inputs over is final: they are in
+  `LoopReport::appended` for every outcome. A model answer without tool
+  calls always ends the loop, so a host with queued inputs starts the next
+  loop itself. Hosts that want a loop-scoped view of their queue create the
+  `LoopInputs` before `start` and let it hand out entries only to that loop.
+- After cancellation, `update` and `answer` return `NotActive` even if
   finalization has not yet run.
 - Interactions: when the loop is waiting for user input (`WaitingForInput`),
   `handle.answer` resolves the pending interaction; loop deadline still wins

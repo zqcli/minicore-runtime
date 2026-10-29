@@ -2,13 +2,12 @@ use std::sync::Arc;
 
 use tokio::sync::watch;
 
-use crate::execution::UserInput;
 use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::ids::{InteractionId, LoopId};
 use crate::interaction::InteractionAnswer;
 
 use super::control::LoopControl;
-use super::{AnswerError, LoopReport, LoopState, LoopWaitError, SteerError, UpdateError};
+use super::{AnswerError, LoopReport, LoopState, LoopWaitError, UpdateError};
 
 /// Live handle to one agent loop. `LoopHandle` is cheap to clone and holds no
 /// history, store, or session metadata: only the shared `LoopControl`.
@@ -65,20 +64,6 @@ impl LoopHandle {
     /// rejected as `InvalidConfig` without consuming a revision.
     pub fn update(&self, config: ExecutionConfig) -> Result<ConfigRevision, UpdateError> {
         self.control.update(config)
-    }
-
-    /// Queues a human steer for the next request boundary. The in-flight model
-    /// and the tool batch it produced are not disturbed; the steer is applied
-    /// (in accept order, alongside any pending config update) to the next
-    /// model request's prompt. A successful call means the steer was accepted
-    /// into this process-local queue. It is applied at the next request boundary.
-    /// On any non-`Completed` ending (or process exit) before that boundary,
-    /// the queued steer is discarded and will not appear in
-    /// `LoopReport::appended`. `QueueFull` means the bounded queue is full,
-    /// `WaitingForInput` that an interaction is pending, and `NotActive` that
-    /// cancellation or sealing already closed the loop.
-    pub fn steer(&self, input: UserInput) -> Result<(), SteerError> {
-        self.control.steer(input)
     }
 
     pub fn is_finished(&self) -> bool {

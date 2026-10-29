@@ -1,20 +1,16 @@
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::execution::UserInput;
 use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::ids::{InteractionId, LoopId};
 use crate::interaction::InteractionAnswer;
 use crate::limits::LoopLimits;
 
 use super::event::EventSinkError;
-use super::{
-    AnswerError, CancelReason, LoopReport, LoopState, LoopStatus, SteerError, UpdateError,
-};
+use super::{AnswerError, CancelReason, LoopReport, LoopState, LoopStatus, UpdateError};
 
 /// Single linearizable state machine for cancelling and sealing a loop.
 ///
@@ -39,24 +35,6 @@ pub(crate) enum FinishSeal {
     AlreadyFinished,
 }
 
-/// Everything a request boundary consumes in one atomic take: the latest
-/// config candidate (if any) plus every accepted steer in order.
-#[derive(Default)]
-pub(crate) struct BoundaryChanges {
-    pub(crate) config: Option<(ConfigRevision, Arc<ExecutionConfig>)>,
-    pub(crate) steers: Vec<UserInput>,
-}
-
-/// Outcome of the final-seal gate: whether the runner keeps the loop alive
-/// for pending steers or closes accepting and seals.
-pub(crate) enum FinalGate {
-    /// A steer was accepted before the seal; its changes feed the next
-    /// request and accepting stays open.
-    Continue(BoundaryChanges),
-    /// No steer is pending; accepting closes and the loop seals.
-    Seal(Option<Arc<ExecutionConfig>>),
-}
-
 /// Shared control plane for one agent loop.
 ///
 /// The runner task owns `LoopControl` alongside its single task plus the final
@@ -68,7 +46,6 @@ pub(crate) struct LoopControl {
     pub(crate) id: LoopId,
     pub(crate) cancel: CancellationToken,
     limits: LoopLimits,
-    max_pending_steers: usize,
 
     state_tx: watch::Sender<LoopState>,
     /// Seed receiver shared by all waiters. The sender is owned by the runner
@@ -81,7 +58,7 @@ pub(crate) struct LoopControl {
 
 struct ControlState {
     interaction: Option<InteractionSlot>,
-    /// False once the final seal closes: update, steer, and the seal races all
+    /// False once the final seal closes: update, answer, and the seal races all
     /// linearize on this mutex through this flag.
     accepting_updates: bool,
     /// Revision of the config the runner has actually applied.
@@ -90,8 +67,6 @@ struct ControlState {
     next_revision: ConfigRevision,
     /// Latest accepted config, applied at the next request boundary.
     pending_config: Option<PendingConfig>,
-    /// Accepted steers awaiting the next request boundary, in accept order.
-    pending_steers: VecDeque<UserInput>,
 }
 
 /// Latest accepted config waiting for the next request boundary.
@@ -138,12 +113,7 @@ pub(crate) type ControlParts = Result<
 >;
 
 impl LoopControl {
-    pub(crate) fn new(
-        id: LoopId,
-        event_capacity: usize,
-        limits: LoopLimits,
-        max_pending_steers: usize,
-    ) -> ControlParts {
+    pub(crate) fn new(id: LoopId, event_capacity: usize, limits: LoopLimits) -> ControlParts {
         let initial = LoopState::new(
             id,
             LoopStatus::Starting,
@@ -158,7 +128,6 @@ impl LoopControl {
                 id,
                 cancel: CancellationToken::new(),
                 limits,
-                max_pending_steers,
                 state_tx,
                 completion_rx,
                 state: AtomicU8::new(STATE_NONE),
@@ -168,7 +137,6 @@ impl LoopControl {
                     current_revision: ConfigRevision::INITIAL,
                     next_revision: ConfigRevision::INITIAL.next(),
                     pending_config: None,
-                    pending_steers: VecDeque::new(),
                 }),
             },
             sink,
@@ -234,56 +202,26 @@ impl LoopControl {
         revision.ok_or(UpdateError::NotActive)
     }
 
-    /// Accepts a steer for the next request boundary. The input length is
-    /// checked against the loop's `max_user_input_bytes` before enqueueing;
-    /// an oversized steer fails without touching the queue. Acceptance
-    /// linearizes with the final seal, the interaction slot, and every other
-    /// steer on the same mutex.
-    pub(crate) fn steer(&self, input: UserInput) -> Result<(), SteerError> {
-        let mut guard = lock_control(&self.inner);
-        if !guard.accepting_updates || !self.is_active() {
-            return Err(SteerError::NotActive);
-        }
-        let input_bytes = input.as_text().len();
-        if input_bytes == 0 || input_bytes > self.limits.max_user_input_bytes {
-            return Err(SteerError::InvalidInput);
-        }
-        if guard.interaction.is_some() {
-            return Err(SteerError::WaitingForInput);
-        }
-        if guard.pending_steers.len() >= self.max_pending_steers {
-            return Err(SteerError::QueueFull);
-        }
-        guard.pending_steers.push_back(input);
-        Ok(())
-    }
-
-    /// Runner-side take of everything queued for the next request boundary:
-    /// the latest config candidate plus every accepted steer in accept order,
-    /// atomically. Linearizes with `update`/`steer` and the final seal on the
-    /// same mutex. Taking a config is only a *candidate*: the revision is not
+    /// Runner-side take of the latest config candidate for the next request
+    /// boundary. Linearizes with `update` and the final seal on the same
+    /// mutex. Taking a config is only a *candidate*: the revision is not
     /// recorded until the runner commits it right before a real Model Request
     /// goes out, so a taken config whose preparation fails never counts as
     /// applied.
-    pub(crate) fn take_boundary(&self) -> BoundaryChanges {
-        let mut guard = lock_control(&self.inner);
-        drain_boundary(&mut guard)
+    pub(crate) fn take_config(&self) -> Option<(ConfigRevision, Arc<ExecutionConfig>)> {
+        lock_control(&self.inner)
+            .pending_config
+            .take()
+            .map(|pending| (pending.revision, pending.config))
     }
 
-    /// Final-seal gate, linearized with steer/update on the same mutex as the
-    /// seal decision. A steer accepted before the seal keeps accepting open
-    /// and returns its boundary changes so the loop continues; otherwise
-    /// accepting closes and the caller receives the pending config to drop
-    /// after publishing its report. A pending config alone never extends a
-    /// final.
-    pub(crate) fn begin_final(&self) -> FinalGate {
+    /// Final-seal gate, linearized with update/answer on the same mutex as the
+    /// seal decision: accepting closes and the caller receives the pending
+    /// config to drop after publishing its report.
+    pub(crate) fn begin_final(&self) -> Option<Arc<ExecutionConfig>> {
         let mut guard = lock_control(&self.inner);
-        if guard.pending_steers.is_empty() {
-            guard.accepting_updates = false;
-            FinalGate::Seal(guard.pending_config.take().map(|pending| pending.config))
-        } else {
-            FinalGate::Continue(drain_boundary(&mut guard))
-        }
+        guard.accepting_updates = false;
+        guard.pending_config.take().map(|pending| pending.config)
     }
 
     /// Records `revision` as the last actually issued/applied config revision.
@@ -427,16 +365,6 @@ pub(crate) enum CancelSource {
     Shutdown,
 }
 
-fn drain_boundary(state: &mut ControlState) -> BoundaryChanges {
-    BoundaryChanges {
-        config: state
-            .pending_config
-            .take()
-            .map(|pending| (pending.revision, pending.config)),
-        steers: state.pending_steers.drain(..).collect(),
-    }
-}
-
 fn cancel_reason_value(value: u8) -> CancelReason {
     match value {
         STATE_CANCEL_OWNER_DROPPED => CancelReason::OwnerDropped,
@@ -456,9 +384,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Weak};
 
-    use crate::agent_loop::control::{CancelSource, FinalGate, FinishSeal, LoopControl};
-    use crate::agent_loop::{CancelReason, SteerError, UpdateError};
-    use crate::execution::{ConfigRevision, ExecutionConfig, UserInput};
+    use crate::agent_loop::control::{CancelSource, FinishSeal, LoopControl};
+    use crate::agent_loop::{CancelReason, UpdateError};
+    use crate::execution::{ConfigRevision, ExecutionConfig};
     use crate::ids::LoopId;
     use crate::limits::LoopLimits;
     use crate::model::{
@@ -505,13 +433,9 @@ mod tests {
     }
 
     fn control() -> LoopControl {
-        LoopControl::new(LoopId::new().unwrap(), 16, LoopLimits::default(), 4)
+        LoopControl::new(LoopId::new().unwrap(), 16, LoopLimits::default())
             .unwrap()
             .0
-    }
-
-    fn steering() -> UserInput {
-        UserInput::text("focus").unwrap()
     }
 
     #[test]
@@ -539,7 +463,6 @@ mod tests {
                 .unwrap();
             assert!(control.mark_cancel(source));
             assert!(!control.is_finished());
-            assert_eq!(control.steer(steering()), Err(SteerError::NotActive));
             assert_eq!(control.update(config()), Err(UpdateError::NotActive));
             assert_eq!(
                 control.answer(id, InteractionAnswer::Approval(ApprovalDecision::AllowOnce)),
@@ -549,14 +472,12 @@ mod tests {
                 receiver.try_recv(),
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty)
             ));
-            let pending = control.take_boundary();
-            assert!(pending.config.is_none());
-            assert!(pending.steers.is_empty());
+            assert!(control.take_config().is_none());
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn randomized_cancel_finish_steer_update_races_preserve_linearization() {
+    async fn randomized_cancel_finish_update_races_preserve_linearization() {
         use tokio::sync::Barrier;
 
         async fn ready(barrier: &Barrier, turns: u8) {
@@ -569,9 +490,9 @@ mod tests {
         let config = config();
         for iteration in 0..512 {
             let control = Arc::new(control());
-            let barrier = Arc::new(Barrier::new(4));
+            let barrier = Arc::new(Barrier::new(3));
             let cancel_returned = Arc::new(AtomicBool::new(false));
-            let mut delays = [0; 4];
+            let mut delays = [0; 3];
             getrandom::fill(&mut delays).unwrap();
             let cancel = {
                 let control = control.clone();
@@ -592,35 +513,24 @@ mod tests {
                     control.finish_once()
                 })
             };
-            let steer = {
-                let control = control.clone();
-                let barrier = barrier.clone();
-                let returned = cancel_returned.clone();
-                tokio::spawn(async move {
-                    ready(&barrier, delays[2]).await;
-                    let stopped = returned.load(Ordering::SeqCst) || control.is_finished();
-                    (stopped, control.steer(steering()))
-                })
-            };
             let update = {
                 let control = control.clone();
                 let barrier = barrier.clone();
                 let config = config.clone();
                 tokio::spawn(async move {
-                    ready(&barrier, delays[3]).await;
+                    ready(&barrier, delays[2]).await;
                     let stopped = cancel_returned.load(Ordering::SeqCst) || control.is_finished();
                     (stopped, control.update(config))
                 })
             };
-            let (cancel, finish, steer, update) =
+            let (cancel, finish, update) =
                 tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                    tokio::join!(cancel, finish, steer, update)
+                    tokio::join!(cancel, finish, update)
                 })
                 .await
                 .unwrap_or_else(|_| panic!("iteration={iteration}, delays={delays:?} timed out"));
             let cancelled = cancel.unwrap();
             let (seal, discarded) = finish.unwrap();
-            let (steer_after_stop, steered) = steer.unwrap();
             let (update_after_stop, updated) = update.unwrap();
             assert_eq!(
                 seal,
@@ -631,9 +541,6 @@ mod tests {
                 },
                 "iteration={iteration}, delays={delays:?}"
             );
-            if steer_after_stop {
-                assert_eq!(steered, Err(SteerError::NotActive), "iteration={iteration}");
-            }
             if update_after_stop {
                 assert_eq!(
                     updated,
@@ -641,25 +548,21 @@ mod tests {
                     "iteration={iteration}"
                 );
             }
-            assert!(matches!(steered, Ok(()) | Err(SteerError::NotActive)));
             assert!(matches!(updated, Ok(_) | Err(UpdateError::NotActive)));
             assert_eq!(discarded.is_some(), updated.is_ok());
             if let Ok(revision) = updated {
                 assert_eq!(revision, ConfigRevision::INITIAL.next());
             }
-            let pending = control.take_boundary();
-            assert!(pending.config.is_none());
-            assert_eq!(pending.steers.len(), usize::from(steered.is_ok()));
+            assert!(control.take_config().is_none());
             assert_eq!(control.applied_revision(), ConfigRevision::INITIAL);
             assert_eq!(control.finish_once().0, FinishSeal::AlreadyFinished);
             assert!(!control.mark_cancel(CancelSource::User));
-            assert_eq!(control.steer(steering()), Err(SteerError::NotActive));
             assert_eq!(control.update(config.clone()), Err(UpdateError::NotActive));
         }
     }
 
     /// The finish CAS seals exactly once and, in the same mutex critical
-    /// section, closes accepting: later update/steer are NotActive and a
+    /// section, closes accepting: a later update is NotActive and a
     /// later cancel cannot reopen the loop.
     #[test]
     fn finish_once_seals_exactly_once_and_closes_accepting() {
@@ -669,7 +572,6 @@ mod tests {
         assert!(control.is_finished());
         assert!(!control.mark_cancel(CancelSource::User));
         assert_eq!(control.update(config()), Err(UpdateError::NotActive));
-        assert_eq!(control.steer(steering()), Err(SteerError::NotActive));
     }
 
     /// The cancel CAS vs finish CAS window linearizes: whichever wins first
@@ -686,41 +588,24 @@ mod tests {
         assert!(!control.mark_cancel(CancelSource::Shutdown));
         assert_eq!(control.cancel_reason(), CancelReason::User);
         assert_eq!(control.update(config()), Err(UpdateError::NotActive));
-        assert_eq!(control.steer(steering()), Err(SteerError::NotActive));
     }
 
-    /// begin_final with a pending steer keeps accepting open and consumes the
-    /// steer; a second begin_final with nothing pending seals.
+    /// begin_final closes accepting in the same lock and hands the pending
+    /// config back: an update that races it observes NotActive.
     #[test]
-    fn begin_final_with_pending_steer_keeps_accepting_open() {
+    fn begin_final_closes_accepting_and_returns_the_pending_config() {
         let control = control();
-        control.steer(steering()).unwrap();
-        match control.begin_final() {
-            FinalGate::Continue(changes) => {
-                assert_eq!(changes.steers.len(), 1);
-                assert!(changes.config.is_none());
-            }
-            FinalGate::Seal(_) => panic!("pending steer must continue the loop"),
-        }
-        // Accepting stays open during the continuation round; with no new
-        // steer, the next final seals: begin_final closes accepting (the
-        // runner-side finish_once then flips the cancelled/finished state).
+        assert!(control.begin_final().is_none());
+        assert_eq!(control.update(config()), Err(UpdateError::NotActive));
+
+        let control = self::control();
         control.update(config()).unwrap();
-        assert!(matches!(control.begin_final(), FinalGate::Seal(_)));
+        assert!(control.begin_final().is_some());
+        assert!(control.take_config().is_none());
         assert_eq!(control.update(config()), Err(UpdateError::NotActive));
     }
 
-    /// begin_final with nothing pending closes accepting in the same lock:
-    /// update/steer that race it observe NotActive.
-    #[test]
-    fn begin_final_without_steer_seals_and_closes_accepting() {
-        let control = control();
-        assert!(matches!(control.begin_final(), FinalGate::Seal(_)));
-        assert_eq!(control.update(config()), Err(UpdateError::NotActive));
-        assert_eq!(control.steer(steering()), Err(SteerError::NotActive));
-    }
-
-    /// Updates hand out monotonic revisions; take_boundary returns only the
+    /// Updates hand out monotonic revisions; take_config returns only the
     /// latest, and applied_revision moves only on an explicit commit.
     #[test]
     fn updates_are_monotonic_and_latest_wins_until_commit() {
@@ -728,8 +613,9 @@ mod tests {
         let first = control.update(config()).unwrap();
         let second = control.update(config()).unwrap();
         assert!(first < second);
-        let changes = control.take_boundary();
-        let (revision, _config) = changes.config.expect("a config candidate is pending");
+        let (revision, _config) = control
+            .take_config()
+            .expect("a config candidate is pending");
         assert_eq!(revision, second, "the latest update wins");
         assert_eq!(control.applied_revision(), ConfigRevision::INITIAL);
         control.commit_revision(revision);
@@ -827,8 +713,8 @@ mod tests {
         );
     }
 
-    /// FIX-08: begin_final sealing when no steer is pending must discard
-    /// the pending config outside the control mutex.
+    /// FIX-08: begin_final must discard the pending config outside the
+    /// control mutex.
     #[test]
     fn pending_config_drop_on_begin_final_seal_occurs_outside_control_mutex() {
         let control = Arc::new(control());
@@ -836,10 +722,10 @@ mod tests {
         control.update(pending_config).unwrap();
         assert!(!tracker.is_dropped());
 
-        let gate = control.begin_final();
-        assert!(matches!(gate, FinalGate::Seal(_)));
+        let discarded = control.begin_final();
+        assert!(discarded.is_some());
         assert!(!tracker.is_dropped());
-        drop(gate);
+        drop(discarded);
         assert!(
             tracker.is_dropped(),
             "pending config must be discarded when begin_final seals"

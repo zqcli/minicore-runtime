@@ -4,7 +4,7 @@
 
 MiniCore Runtime is a small Rust execution core for **one live agent loop**.
 It runs model/tool iterations, streaming, cancellation, interaction,
-steering, and request-boundary configuration updates. It does not own
+host-supplied inputs, and request-boundary configuration updates. It does not own
 sessions, persistence, transcripts, providers, or workspaces.
 
 The single architectural invariant: **there is one boundary — the running
@@ -34,13 +34,16 @@ decides what to persist, where, and when.
 - **Host owns persistence.** Nothing in the runtime writes a file, a store,
   or a log. `LoopReport::usage` and `::appended` are the only durable-worthy
   outputs, and their persistence is entirely the host's call.
+- **Host owns user inputs.** The host implements `LoopInputs` and passes it to
+  `AgentLoop::start`; the loop pulls inputs at request boundaries and the
+  host's queue, ordering and validation stay on its side.
 - **Host owns providers and workspaces.** `Model`, `Tool`, `ToolPolicy` and
   `PromptProvider` are host- or host-adapter-supplied seams.
 
 ## Module Map
 
-- `agent_loop/` — the loop: `AgentLoop`, `LoopHandle`, `LoopRequest`,
-  `LoopOptions`, control linearization, best-effort events, state, and the
+- `agent_loop/` — the loop: `AgentLoop`, `LoopHandle`, `LoopInputs`,
+  `LoopRequest`, `LoopOptions`, control linearization, best-effort events, state, and the
   runner (`runner.rs`, `runner/model.rs`, `runner/tools.rs`).
 - `execution.rs` — immutable `ExecutionConfig` (model, reasoning, tools,
   policy, prompt provider) and `UserInput`.

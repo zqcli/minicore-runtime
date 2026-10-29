@@ -4,9 +4,9 @@
 
 MiniCore Runtime is a small Rust execution core for one live agent loop. Give
 it host-owned history, one user input, a model, and a tool set. It runs model
-requests and tool batches until the model finishes, streams progress, accepts
-steering, configuration updates, cancellation, and interaction answers while
-running, and returns one authoritative `LoopReport`. Sessions, persistence,
+requests and tool batches until the model finishes, streams progress, takes
+the host's inputs at request boundaries, accepts configuration updates,
+cancellation, and interaction answers while running, and returns one authoritative `LoopReport`. Sessions, persistence,
 transcripts, providers, and workspaces stay with the host.
 [MiniCore Agent](https://github.com/zqcli/minicore-agent) is the reference
 host.
@@ -23,8 +23,9 @@ host.
 
 - **One-shot loop.** An `AgentLoop` runs exactly once. `join` and every
   handle's `wait` return the same `Arc<LoopReport>`.
-- **Live control.** `LoopHandle` steers or updates the next request, answers
-  approval and tool-input interactions, and cancels or shuts down the loop.
+- **Live control.** The host's `LoopInputs` hands over user inputs before each
+  request, and `LoopHandle` updates the next request, answers approval and
+  tool-input interactions, and cancels or shuts down the loop.
 - **Pluggable seams.** Models, tools, tool policies, and prompt projection are
   traits (`Model`, `Tool`, `ToolPolicy`, `PromptProvider`). No provider SDK is
   bundled.
@@ -57,7 +58,16 @@ use minicore_runtime::history::HistoryItem;
 use minicore_runtime::model::ReasoningPreference;
 use minicore_runtime::prompt::DefaultPromptProvider;
 use minicore_runtime::tools::ToolSet;
-use minicore_runtime::{AgentLoop, ExecutionConfig, LoopOptions, LoopRequest, UserInput};
+use minicore_runtime::{
+    AgentLoop, ExecutionConfig, LoopInputs, LoopOptions, LoopRequest, UserInput,
+};
+
+struct NoInputs; // a real host returns the inputs it accepted since the last call
+impl LoopInputs for NoInputs {
+    fn take(&self) -> Vec<UserInput> {
+        Vec::new()
+    }
+}
 
 let config = ExecutionConfig::new(
     model,                         // Arc<dyn Model>
@@ -73,7 +83,7 @@ let request = LoopRequest::new(
     config,
 );
 
-let mut agent = AgentLoop::start(request, LoopOptions::default_checked()?)?;
+let mut agent = AgentLoop::start(request, LoopOptions::default_checked()?, Arc::new(NoInputs))?;
 let events = agent.take_events()?; // optional best-effort stream
 let report = agent.join().await?; // Arc<LoopReport>; the host keeps it
 ```
@@ -82,15 +92,18 @@ Controlling a running loop (before `join`):
 
 ```rust
 let handle = agent.handle();
-handle.steer(UserInput::text("focus on the time")?)?; // applied at the next request
-let revision = handle.update(new_config)?;            // applied at the next request
-handle.cancel();                                       // or handle.shutdown()
+let revision = handle.update(new_config)?; // applied at the next request
+handle.cancel();                           // or handle.shutdown()
 ```
+
+Inputs reach the running loop through the `LoopInputs` the host passed to
+`start`: the loop calls `take` before every request preparation (the first
+included), and the host returns the inputs it accepted since the last call.
 
 Two runnable examples use fake adapters:
 
 ```bash
-cargo run --example agent_loop    # text, tools, events, steer + update, cancel
+cargo run --example agent_loop    # text, tools, events, input + update, cancel
 cargo run --example memory_agent  # a multi-turn host built from one-shot loops
 ```
 
@@ -113,13 +126,22 @@ The Runtime executes one loop. The host owns everything around it:
 - `update` takes effect at the next model request. A revision is committed only
   when a real request is issued. The current tool batch always uses the
   snapshot of the request that produced it.
-- `steer` takes effect at the next model request. An accepted steer is queued in
-  memory and discarded if the loop ends any other way than `Completed` before
-  that boundary. Steers fail with `InvalidInput` beyond `max_user_input_bytes`,
-  `QueueFull`, `WaitingForInput` while an interaction is pending, or `NotActive`
-  after cancellation or completion.
-- An `update` does not keep the loop alive. The model's final response and any
-  pending steers decide whether another request runs.
+- Inputs come from the host's `LoopInputs::take`, called synchronously on the
+  runner task with no Runtime lock held, so it must not block, await or do IO.
+  The host owns the queue and validates each input (non-empty, within
+  `max_user_input_bytes`) where it accepts it; the Runtime does not re-check.
+  Returning inputs from `take` hands them over for good: they join the loop's
+  history as `UserMessageKind::Steering` items in order and appear in
+  `LoopReport::appended` for every outcome, cancellation included. Inputs the
+  loop never took stay with the host.
+- `take` is called at two points: before every request preparation, the first
+  request included, and again once a prompt is prepared. A non-empty second
+  call discards that prompt and rebuilds it without advancing `request_index`.
+  It is never called during a model call or a tool batch, nor while the loop
+  waits for an interaction answer.
+- A model answer without tool calls always ends the loop, and `take` is not
+  called after it. A host that wants to continue starts a new loop.
+- An `update` does not keep the loop alive.
 - `LoopReport.requests` counts issued requests. Driver retries stay inside one
   logical request, and the Runtime never retries a whole loop.
 - Summaries, compaction timing, and persistence are host policies implemented
@@ -130,7 +152,7 @@ The Runtime executes one loop. The host owns everything around it:
 ## Public Surface
 
 The crate root exports the loop types: `AgentLoop`, `LoopHandle`,
-`LoopRequest`, `LoopOptions`, `LoopReport`, `LoopState`, `LoopEvent`,
+`LoopRequest`, `LoopOptions`, `LoopInputs`, `LoopReport`, `LoopState`, `LoopEvent`,
 `LoopEventStream`, outcomes, and their error types. Everything else lives in
 focused modules:
 
@@ -159,6 +181,24 @@ changes. See [tests/README.md](tests/README.md)
 for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 
 ## Compatibility Notes
+
+### 0.9.0 (unreleased)
+
+- **Breaking:** `AgentLoop::start` takes a third argument, `Arc<dyn LoopInputs>`.
+  `LoopInputs::take(&self) -> Vec<UserInput>` is implemented by the host and
+  called before every request preparation and again after a prompt is
+  prepared; a host with nothing to hand over passes an implementation that
+  returns an empty `Vec`.
+- **Breaking:** `LoopHandle::steer`, `SteerError`, `LoopOptions::max_pending_steers`
+  and the interaction-time steer refusal are removed, along with the
+  `max_pending_steers` validation. Inputs are no longer pushed into the loop;
+  the host queues them and the loop pulls them.
+- **Breaking:** a model answer without tool calls always ends the loop. A steer
+  no longer extends a final answer; a host that has more input starts another
+  loop.
+- Handed-over inputs are appended as `UserMessageKind::Steering` items in the
+  order returned, one item per input, and stay in `LoopReport::appended` for
+  every outcome. `update`, `answer`, `cancel` and `shutdown` are unchanged.
 
 ### 0.8.0
 

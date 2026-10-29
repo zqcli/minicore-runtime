@@ -40,6 +40,17 @@ remain unchanged. Public Rust API changes are listed in the
   compaction; per-item bounds are unchanged. See the
   [README compatibility notes](../README.md#080).
 
+## 0.9.0
+
+- **Breaking:** `AgentLoop::start` takes an `Arc<dyn LoopInputs>`; the host's
+  `take` hands over user inputs before every request preparation and again
+  after a prompt is prepared (a non-empty answer rebuilds the prompt without
+  advancing `request_index`). `LoopHandle::steer`, `SteerError`,
+  `LoopOptions::max_pending_steers` and the interaction-time steer refusal are
+  removed, and a model answer without tool calls always ends the loop. See the
+  [README compatibility notes](../README.md#090-unreleased) and the
+  [agent-loop contract](contracts/agent-loop.md#inputs).
+
 ## Gates
 
 The runtime gate is:
@@ -54,7 +65,7 @@ bash scripts/check-architecture.sh
 
 Since 0.7.3 no minimum Rust version is tested; the gate runs on current stable.
 
-The main suite has 276 tests: 81 unit and 195 integration tests in 11 binaries.
+The main suite has 276 tests: 80 unit and 196 integration tests in 11 binaries.
 Two compile-fail doctests additionally protect the checked tool DTO boundaries.
 The two examples compile as test targets. The acceptance checker preserves all
 70 Passed rows and validates their source/test references. See the

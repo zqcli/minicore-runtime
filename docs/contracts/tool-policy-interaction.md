@@ -78,8 +78,9 @@ deadlines cannot preempt synchronous code.
 
 ## Snapshot Rule
 
-A config `update` or `steer` arriving mid-batch does **not** affect the
+A config `update` or a host input arriving mid-batch does **not** affect the
 current batch: the batch uses the snapshot of the request that produced it.
-New config/steers apply from the next model request.
+`LoopInputs::take` is not called inside a batch or while an interaction waits;
+the new config and inputs apply from the next model request.
 Tool text, including input prompts, choices, answers, progress messages and
 diagnostics, allows LF and TAB but rejects other control characters.

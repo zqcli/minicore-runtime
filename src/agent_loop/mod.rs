@@ -25,7 +25,6 @@ pub use state::{LoopState, LoopStatus};
 use control::LoopControl;
 
 const MAX_TOOL_ROUNDS: u16 = 1_024;
-const MAX_PENDING_STEERS: usize = 64;
 const MAX_EVENT_CAPACITY: usize = 4_096;
 /// The reused model driver only honors up to four delivery retries; the public
 /// validation below enforces the same ceiling as `start`.
@@ -40,7 +39,6 @@ pub struct LoopOptions {
     pub deadline: Option<tokio::time::Instant>,
     /// Zero disables the round limit. Positive values opt into a finite budget.
     pub max_tool_rounds: u16,
-    pub max_pending_steers: usize,
     pub event_capacity: usize,
     pub prompt_timeout: Duration,
     pub model_timeout: Duration,
@@ -56,7 +54,6 @@ impl LoopOptions {
         let options = Self {
             deadline: None,
             max_tool_rounds: 0,
-            max_pending_steers: 16,
             event_capacity: 256,
             prompt_timeout: Duration::from_secs(30),
             model_timeout: Duration::from_secs(10 * 60),
@@ -72,7 +69,6 @@ impl LoopOptions {
 
     pub fn validate(&self) -> Result<(), LoopStartError> {
         if self.max_tool_rounds > MAX_TOOL_ROUNDS
-            || !(1..=MAX_PENDING_STEERS).contains(&self.max_pending_steers)
             || !(1..=MAX_EVENT_CAPACITY).contains(&self.event_capacity)
             || self.prompt_timeout.is_zero()
             || self.model_timeout.is_zero()
@@ -115,6 +111,21 @@ impl LoopRequest {
     }
 }
 
+/// Supplies user inputs that reach a running loop; implemented by the host.
+///
+/// The loop calls `take` before every request preparation (the first one
+/// included) and again once a prompt is prepared; a non-empty answer rebuilds
+/// that prompt. A model answer without tool calls always ends the loop, so
+/// `take` is not called after it. Inputs are trusted: the host validates them
+/// (non-empty, within `max_user_input_bytes`) where it accepts them.
+///
+/// `take` runs synchronously on the runner task and must not block, await or
+/// do IO.
+pub trait LoopInputs: Send + Sync {
+    /// Inputs to append before the next model request, in order; returning them hands them over for good.
+    fn take(&self) -> Vec<UserInput>;
+}
+
 /// Owner of one running agent loop. A loop runs exactly once; dropping the
 /// owner cancels it best-effort without blocking.
 #[must_use = "dropping AgentLoop cancels the running loop"]
@@ -125,7 +136,11 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
-    pub fn start(request: LoopRequest, options: LoopOptions) -> Result<Self, LoopStartError> {
+    pub fn start(
+        request: LoopRequest,
+        options: LoopOptions,
+        inputs: Arc<dyn LoopInputs>,
+    ) -> Result<Self, LoopStartError> {
         tokio::runtime::Handle::try_current().map_err(|_| LoopStartError::NoTokioRuntime)?;
         options.validate()?;
         // Same config-vs-LoopLimits validation as `LoopHandle::update`: the
@@ -141,19 +156,16 @@ impl AgentLoop {
 
         let id = LoopId::new().map_err(|_| LoopStartError::IdGeneration)?;
         let options = Arc::new(options);
-        let (control, sink, events, completion_tx) = LoopControl::new(
-            id,
-            options.event_capacity,
-            options.limits,
-            options.max_pending_steers,
-        )
-        .map_err(|_| LoopStartError::InvalidOptions)?;
+        let (control, sink, events, completion_tx) =
+            LoopControl::new(id, options.event_capacity, options.limits)
+                .map_err(|_| LoopStartError::InvalidOptions)?;
         let control = Arc::new(control);
 
         let join = tokio::spawn(runner::run_loop(
             request,
             options,
             Arc::clone(&control),
+            inputs,
             sink,
             completion_tx,
         ));
@@ -306,20 +318,6 @@ pub enum UpdateError {
     #[error("config does not satisfy the loop limits")]
     InvalidConfig,
     #[error("the loop is not accepting config updates")]
-    NotActive,
-}
-
-/// Errors steering a running loop.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum SteerError {
-    #[error("steer input exceeds the loop limits")]
-    InvalidInput,
-    #[error("the steer queue is full")]
-    QueueFull,
-    #[error("the loop is waiting for an interaction answer")]
-    WaitingForInput,
-    #[error("the loop is not accepting steers")]
     NotActive,
 }
 

@@ -16,7 +16,7 @@ Cancellation and deadline behavior of one loop.
 
 ## Semantics
 
-- After cancellation returns, `steer`, `update`, and `answer` return `NotActive`,
+- After cancellation returns, `update` and `answer` return `NotActive`,
   even before the runner publishes its report. Calls overlapping cancellation
   may already have been accepted; acceptance does not guarantee application.
 
@@ -26,8 +26,9 @@ Cancellation and deadline behavior of one loop.
 - A cancel that lands after the report is published returns `false` (the
   loop already ended); a completed loop that is later cancelled stays
   `Completed`.
-- Every non-`Completed` ending discards unapplied pending steers: they never appear in the
-  report. The report reflects only what actually ran.
+- Inputs the loop already took from `LoopInputs` are in the report for every
+  ending, cancellation included; inputs it never took stay with the host. The
+  report reflects only what actually ran.
 - `wait`/`join` return the same `Arc<LoopReport>` regardless of who ended
   the loop; if the runner vanished before publishing, waiters see
   `LoopWaitError::CompletionClosed`.

@@ -5,7 +5,7 @@
 //! answers, policy snapshot swaps, history limits, report delta-only
 //! semantics, malformed model responses that must never enter Assistant
 //! history, loop-level delivery retry, shared-resource cancel isolation, and
-//! steers surviving a later prompt failure.
+//! inputs surviving a later prompt failure.
 //!
 //! All synchronization is deterministic (Notify / watch / oneshot /
 //! start_paused + advance); no test sleeps.
@@ -43,8 +43,8 @@ use minicore_runtime::{
 };
 
 use support::loops::{
-    PolicyPlan as Plan, RecordingTool, Round, ScriptedPolicy, ToolBehavior, config, finish,
-    round_stream, scripted_model_named, spawn_join, tool_set_full,
+    PolicyPlan as Plan, QueuedInputs, RecordingTool, Round, ScriptedPolicy, ToolBehavior, config,
+    finish, no_inputs, round_stream, scripted_model_named, spawn_join, tool_set_full,
 };
 
 fn descriptor(name: &str) -> ModelDescriptor {
@@ -87,7 +87,7 @@ fn tool_call_event(name: &str, call_id: &str) -> Vec<ModelEvent> {
 }
 
 fn start_with(request: LoopRequest, options: LoopOptions) -> Result<AgentLoop, LoopStartError> {
-    AgentLoop::start(request, options)
+    AgentLoop::start(request, options, no_inputs())
 }
 
 fn request_with(config: ExecutionConfig, history: Vec<HistoryItem>) -> LoopRequest {
@@ -1017,10 +1017,10 @@ async fn shared_model_and_toolset_loops_cancel_isolated_without_orphans() {
     assert_eq!(fresh_report.outcome, LoopOutcome::Completed);
 }
 
-/// A steer applied at a request boundary survives a later prompt failure and
+/// An input taken at a request boundary survives a later prompt failure and
 /// appears in the report as a Steering item.
 #[tokio::test]
-async fn steer_applied_before_a_prompt_failure_stays_in_the_report() {
+async fn input_taken_before_a_prompt_failure_stays_in_the_report() {
     struct FailSecondPrompt {
         calls: Arc<AtomicUsize>,
     }
@@ -1038,62 +1038,33 @@ async fn steer_applied_before_a_prompt_failure_stays_in_the_report() {
         }
     }
     let gate = Arc::new(Notify::new());
-    struct GatedFinalModel {
-        descriptor: ModelDescriptor,
-        gate: Arc<Notify>,
-    }
-    impl Model for GatedFinalModel {
-        fn descriptor(&self) -> &ModelDescriptor {
-            &self.descriptor
-        }
-        fn start<'a>(
-            &'a self,
-            _request: ModelRequest,
-            _context: ModelCallContext,
-        ) -> ModelStartFuture<'a> {
-            let gate = Arc::clone(&self.gate);
-            Box::pin(async move {
-                gate.notified().await;
-                Ok::<ModelStream, ModelError>(Box::pin(stream::iter(vec![
-                    Ok(ModelEvent::text_delta("first answer").unwrap()),
-                    Ok(ModelEvent::Finish {
-                        reason: ModelFinishReason::Stop,
-                    }),
-                ])))
-            })
-        }
-    }
+    let (model, _) = scripted_model_named(
+        "fake/gated-tools",
+        vec![Round::GatedTools {
+            calls: vec![("echo", "call_1")],
+            gate: Arc::clone(&gate),
+        }],
+    );
+    let (tools, _) = echo_toolset();
     let prompt = Arc::new(FailSecondPrompt {
         calls: Arc::new(AtomicUsize::new(0)),
     });
-    let mut agent = start_with(
-        LoopRequest::new(
-            Arc::from(Vec::<HistoryItem>::new()),
-            UserInput::text("hello").unwrap(),
-            ExecutionConfig::new(
-                Arc::new(GatedFinalModel {
-                    descriptor: descriptor("fake/gated-final"),
-                    gate: Arc::clone(&gate),
-                }) as Arc<dyn Model>,
-                ReasoningPreference::Auto,
-                ToolSet::default(),
-                None,
-                prompt,
-            )
-            .unwrap(),
+    let inputs = QueuedInputs::new();
+    let mut agent = AgentLoop::start(
+        request_with(
+            ExecutionConfig::new(model, ReasoningPreference::Auto, tools, None, prompt).unwrap(),
+            Vec::new(),
         ),
         LoopOptions::default_checked().unwrap(),
+        inputs.clone(),
     )
     .unwrap();
     let mut events = agent.take_events().unwrap();
-    let handle = agent.handle().clone();
     let report_task = spawn_join(agent);
 
-    // Request 0 is in flight (gated); steer lands for the next boundary.
+    // Request 0 is in flight (gated); the host accepts an input for the next boundary.
     wait_for_request(&mut events, 0).await;
-    handle
-        .steer(UserInput::text("focus").unwrap())
-        .expect("steer accepted while live");
+    inputs.push("focus");
     gate.notify_one();
 
     let report = report_task.await.unwrap().unwrap();
@@ -1106,12 +1077,13 @@ async fn steer_applied_before_a_prompt_failure_stays_in_the_report() {
     let has_steering = report.appended.iter().any(|item| {
         matches!(
             item,
-            HistoryItem::User(user) if user.kind == UserMessageKind::Steering
+            HistoryItem::User(user)
+                if user.kind == UserMessageKind::Steering && user.input.as_text() == "focus"
         )
     });
     assert!(
         has_steering,
-        "the applied steer must be in the failed report"
+        "the handed-over input must be in the failed report"
     );
 }
 
