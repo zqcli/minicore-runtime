@@ -48,7 +48,7 @@ remain unchanged. Public Rust API changes are listed in the
   advancing `request_index`). `LoopHandle::steer`, `SteerError`,
   `LoopOptions::max_pending_steers` and the interaction-time steer refusal are
   removed, and a model answer without tool calls always ends the loop. See the
-  [README compatibility notes](../README.md#090-unreleased) and the
+  [README compatibility notes](../README.md#090) and the
   [agent-loop contract](contracts/agent-loop.md#inputs).
 
 ## Gates

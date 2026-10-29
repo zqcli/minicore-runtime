@@ -13,7 +13,7 @@ host.
 
 | | |
 |---|---|
-| Version | 0.8.0 |
+| Version | 0.9.0 |
 | Rust | edition 2024, current stable |
 | Async runtime | Tokio (the loop spawns one task) |
 | Production dependencies | serde, serde_json, tokio, tokio-util, futures-util, thiserror, getrandom |
@@ -182,7 +182,7 @@ for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 
 ## Compatibility Notes
 
-### 0.9.0 (unreleased)
+### 0.9.0
 
 - **Breaking:** `AgentLoop::start` takes a third argument, `Arc<dyn LoopInputs>`.
   `LoopInputs::take(&self) -> Vec<UserInput>` is implemented by the host and
