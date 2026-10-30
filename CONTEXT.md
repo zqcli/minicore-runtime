@@ -1,7 +1,9 @@
 # Current Implementation Context
 
-The current package is v0.9.0. It retains the one-loop boundary from the
-v0.4 reset. Tool-batch statistics are now `u64` end to end within Runtime;
+The current package is v0.9.1 (0.9.1 is a version bump only: no Rust API or
+behavior change from 0.9.0). It retains the one-loop boundary from the
+v0.4 reset and the 0.9.0 input-pull semantics. Tool-batch statistics are now
+`u64` end to end within Runtime;
 the optional legacy `u16` round budget still defaults to zero (unlimited).
 Each real prompt preparation publishes one `Starting` event. Session-owned
 post-turn/manual summaries and emergency recovery remain Agent policies,

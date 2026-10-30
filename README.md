@@ -13,7 +13,7 @@ host.
 
 | | |
 |---|---|
-| Version | 0.9.0 |
+| Version | 0.9.1 |
 | Rust | edition 2024, current stable |
 | Async runtime | Tokio (the loop spawns one task) |
 | Production dependencies | serde, serde_json, tokio, tokio-util, futures-util, thiserror, getrandom |
@@ -181,6 +181,12 @@ changes. See [tests/README.md](tests/README.md)
 for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 
 ## Compatibility Notes
+
+### 0.9.1
+
+- No API or behavior changes. The version follows the 0.9.1 consistency work in
+  `minicore-agent`, which keeps 0.9.0 loop semantics. Runtime still gains no
+  session, storage, or provider surface.
 
 ### 0.9.0
 

@@ -51,6 +51,18 @@ remain unchanged. Public Rust API changes are listed in the
   [README compatibility notes](../README.md#090) and the
   [agent-loop contract](contracts/agent-loop.md#inputs).
 
+## 0.9.1
+
+- No API or behavior changes. Loop outcomes, `LoopInputs` pull semantics,
+  request-boundary accounting and event bounds are those of 0.9.0. The version
+  follows the 0.9.1 consistency work in `minicore-agent`; Runtime still has no
+  session, storage, transcript or provider surface.
+- `tests/runtime_w0_contract.rs` records the host-facing observation contracts
+  the Agent relies on: late `watch_state` subscriptions see actionable
+  interactions, a retained handle keeps the state sender open after `join`, a
+  final state and report survive complete event loss, and `take` is not a
+  request index.
+
 ## Gates
 
 The runtime gate is:
@@ -65,7 +77,7 @@ bash scripts/check-architecture.sh
 
 Since 0.7.3 no minimum Rust version is tested; the gate runs on current stable.
 
-The main suite has 276 tests: 80 unit and 196 integration tests in 11 binaries.
+The main suite has 282 tests: 80 unit and 202 integration tests in 12 binaries.
 Two compile-fail doctests additionally protect the checked tool DTO boundaries.
 The two examples compile as test targets. The acceptance checker preserves all
 70 Passed rows and validates their source/test references. See the
