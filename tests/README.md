@@ -58,7 +58,8 @@ The standalone provider harness has 25 tests and is not included in this runtime
 - Prompt: failures, panics, budget enforcement, default summary truncation.
 - Events: best-effort stream, dropped counts, reasoning/text channels, no
   consumer, mid-close. `runtime_w0_contract.rs` additionally covers terminal
-  loss without a subsequent gap and late, actionable watch observations.
+  loss without a subsequent gap, late and post-`join` watch observations, and
+  the take boundary a host needs for input identity.
 - Interactions: approval and tool-input flows, wrong id/kind, repeated
   answers, deadline while waiting, and no fabricated 24-hour deadline.
 - Non-expanding model text normalization at the raw byte limit, direct/constructed
