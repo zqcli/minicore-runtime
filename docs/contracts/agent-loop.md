@@ -88,10 +88,12 @@ The runner loops:
   - The index an input belongs to is the `request_index` the loop has reached
     when it appends that input, which is the index of the preparation the
     input joins. A host that must report it associates inputs at `take` time
-    with the index it observes itself: wrap the active `PromptProvider`
+    with the index it observes itself: wrap the `PromptProvider`
     (`PromptRequest::request_index`) and `Model` (the `request_index` of
-    `ModelCallContext`) for that loop. The Runtime guarantees the call sites,
-    not the association: `take` itself carries no request identity.
+    `ModelCallContext`) of every `ExecutionConfig` the loop serves, including
+    each replacement passed to `LoopHandle::update` — an update replaces both.
+    The Runtime guarantees the call sites, not the association: `take` itself
+    carries no request identity.
   - A candidate index is not proof that the request was issued.
     `LoopReport.requests` and the last `RequestStarted` are the issue
     accounting; cancellation or a preparation failure can leave taken inputs

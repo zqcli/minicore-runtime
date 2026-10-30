@@ -55,9 +55,11 @@ one loop and returns control. Concretely:
   per rebuild, retry and failure. A host that reports the request an input
   joined uses its own per-loop wrapper: `PromptRequest::request_index` when the
   prompt is prepared and `ModelCallContext::request_index` before the model
-  call; a taken input belongs to the index current at `take`. Issuance stays
-  host-visible through `LoopReport::requests` and `RequestStarted`, never the
-  candidate index alone. See the
+  call; a taken input belongs to the index current at `take`. Reinstall that
+  wrapper on every config the host gives the loop, `LoopHandle::update`
+  included, since an update replaces both the model and the prompt provider.
+  Issuance stays host-visible through `LoopReport::requests` and
+  `RequestStarted`, never the candidate index alone. See the
   [agent-loop contract](../contracts/agent-loop.md#inputs).
 - After cancellation, `update` and `answer` return `NotActive` even if
   finalization has not yet run.
