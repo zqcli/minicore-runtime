@@ -712,3 +712,31 @@ async fn a_config_update_keeps_the_take_boundary_index() {
     .await
     .expect("config update boundary test timed out");
 }
+
+/// A host watcher may start after a fast loop already finished; the first
+/// sample is then the final state and no `changed` wake-up is required.
+#[tokio::test]
+async fn a_watcher_started_after_join_reads_the_final_state_without_waiting() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
+        let agent = AgentLoop::start(
+            request(config(model, ToolSet::default(), None)),
+            LoopOptions::default_checked().unwrap(),
+            no_inputs(),
+        )
+        .unwrap();
+        let handle = agent.handle();
+        let report = agent.join().await.unwrap();
+        assert_completed_with_text(&report, "done");
+
+        let mut late = handle.watch_state();
+        let first = late.borrow_and_update().clone();
+        assert_eq!(first, handle.state());
+        assert_eq!(first.status, LoopStatus::Finished);
+        assert_eq!(first.loop_id, report.loop_id);
+        assert!(first.pending_interaction.is_none());
+        assert!(late.changed().now_or_never().is_none());
+    })
+    .await
+    .expect("late final watcher test timed out");
+}
