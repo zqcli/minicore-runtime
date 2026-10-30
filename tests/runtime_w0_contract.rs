@@ -8,17 +8,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::FutureExt;
+use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use minicore_runtime::model::{
-    Model, ModelCallContext, ModelDescriptor, ModelMessage, ModelRequest, ModelStartFuture,
-    ReasoningPreference,
+    Model, ModelCallContext, ModelDescriptor, ModelError, ModelErrorKind, ModelMessage,
+    ModelRequest, ModelStartFuture, ModelStream, ReasoningPreference,
 };
 use minicore_runtime::prompt::{
     DefaultPromptProvider, PromptFuture, PromptProvider, PromptRequest,
 };
 use minicore_runtime::tools::{ApprovalDecision, ToolInputAnswer, ToolInputAnswerKind, ToolSet};
+use minicore_runtime::value::BoundedText;
 use minicore_runtime::{
-    AgentLoop, CancelReason, HistoryItem, InteractionAnswer, InteractionKind, LoopEvent,
-    LoopHandle, LoopInputs, LoopOptions, LoopOutcome, LoopStatus, UserInput, UserMessageKind,
+    AgentLoop, CancelReason, ConfigRevision, HistoryItem, InteractionAnswer, InteractionKind,
+    LoopEvent, LoopHandle, LoopInputs, LoopOptions, LoopOutcome, LoopStatus, UserInput,
+    UserMessageKind,
 };
 use support::loops::*;
 use tokio::sync::Notify;
@@ -175,12 +178,14 @@ async fn final_state_and_report_survive_unreported_terminal_event_loss() {
 struct Delivery {
     id: &'static str,
     candidate_index: u32,
+    takes_at_delivery: usize,
     observed_state: Option<(LoopStatus, u32)>,
 }
 
 #[derive(Default)]
 struct BoundaryProbe {
     next_index: AtomicU32,
+    takes: AtomicUsize,
     queue: Mutex<VecDeque<(&'static str, UserInput)>>,
     deliveries: Mutex<Vec<Delivery>>,
     issued: Mutex<Vec<(u32, Vec<String>)>>,
@@ -195,10 +200,15 @@ impl BoundaryProbe {
             .unwrap()
             .push_back((id, UserInput::text("identical text").unwrap()));
     }
+
+    fn publish_index(&self, index: u32) {
+        self.next_index.store(index, Ordering::SeqCst);
+    }
 }
 
 impl LoopInputs for BoundaryProbe {
     fn take(&self) -> Vec<UserInput> {
+        self.takes.fetch_add(1, Ordering::SeqCst);
         let taken: Vec<_> = self.queue.lock().unwrap().drain(..).collect();
         if taken.is_empty() {
             return Vec::new();
@@ -209,12 +219,14 @@ impl LoopInputs for BoundaryProbe {
             (state.status, state.request_index)
         });
         let candidate_index = self.next_index.load(Ordering::SeqCst);
+        let takes_at_delivery = self.takes.load(Ordering::SeqCst);
         self.deliveries
             .lock()
             .unwrap()
             .extend(taken.iter().map(|(id, _)| Delivery {
                 id,
                 candidate_index,
+                takes_at_delivery,
                 observed_state,
             }));
         if self.cancel_on_delivery.swap(false, Ordering::SeqCst) {
@@ -361,16 +373,19 @@ async fn input_identity_and_candidate_index_can_be_mapped_across_request_boundar
                 Delivery {
                     id: "early",
                     candidate_index: 0,
+                    takes_at_delivery: 1,
                     observed_state: None,
                 },
                 Delivery {
                     id: "after-tool",
                     candidate_index: 1,
+                    takes_at_delivery: 3,
                     observed_state: Some((LoopStatus::RunningTools, 0)),
                 },
                 Delivery {
                     id: "during-prompt",
                     candidate_index: 1,
+                    takes_at_delivery: 4,
                     observed_state: Some((LoopStatus::Starting, 1)),
                 },
             ]
@@ -447,6 +462,7 @@ async fn taken_input_can_have_a_candidate_index_without_an_issued_request() {
             [Delivery {
                 id: "cancelled-before-issue",
                 candidate_index: 0,
+                takes_at_delivery: 2,
                 observed_state: Some((LoopStatus::Starting, 0)),
             }]
         );
@@ -492,4 +508,207 @@ async fn final_answer_does_not_consume_or_extend_for_a_pending_steer() {
     })
     .await
     .expect("final steer test timed out");
+}
+
+/// A driver retry stays inside one logical request: the host is not asked for
+/// inputs again, and the retried attempt keeps the same `request_index`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_driver_retry_is_one_request_and_reuses_the_candidate_index() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        struct RetryOnce {
+            descriptor: ModelDescriptor,
+            attempts: AtomicUsize,
+            probe: Arc<BoundaryProbe>,
+            started: Arc<Notify>,
+        }
+
+        impl Model for RetryOnce {
+            fn descriptor(&self) -> &ModelDescriptor {
+                &self.descriptor
+            }
+
+            fn start<'a>(
+                &'a self,
+                request: ModelRequest,
+                context: ModelCallContext,
+            ) -> ModelStartFuture<'a> {
+                let users = request
+                    .messages()
+                    .iter()
+                    .filter_map(|message| match message {
+                        ModelMessage::User(text) => Some(text.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                self.probe
+                    .issued
+                    .lock()
+                    .unwrap()
+                    .push((context.request_index, users));
+                self.probe
+                    .publish_index(context.request_index.saturating_add(1));
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                let started = Arc::clone(&self.started);
+                Box::pin(async move {
+                    started.notify_one();
+                    if attempt == 0 {
+                        Err(ModelError::not_started(
+                            ModelErrorKind::Unavailable,
+                            None,
+                            DiagnosticSummary::new(
+                                DiagnosticCode::ModelUnavailable,
+                                DiagnosticCategory::Model,
+                                BoundedText::new("retry me").unwrap(),
+                                true,
+                            )
+                            .unwrap(),
+                        ))
+                    } else {
+                        Ok::<ModelStream, ModelError>(Box::pin(futures_util::stream::iter(vec![
+                            Ok(minicore_runtime::model::ModelEvent::text_delta("done").unwrap()),
+                            Ok(minicore_runtime::model::ModelEvent::Finish {
+                                reason: minicore_runtime::model::ModelFinishReason::Stop,
+                            }),
+                        ])))
+                    }
+                })
+            }
+        }
+
+        let probe = Arc::new(BoundaryProbe::default());
+        probe.push("before-retry");
+        let prompt = index_prompt(probe.clone(), 1);
+        let started = Arc::new(Notify::new());
+        let inner: Arc<dyn Model> = Arc::new(RetryOnce {
+            descriptor: ModelDescriptor::new(
+                "fake/retry".parse().unwrap(),
+                8192,
+                reasoning_set(),
+                true,
+            )
+            .unwrap(),
+            attempts: AtomicUsize::new(0),
+            probe: probe.clone(),
+            started: Arc::clone(&started),
+        });
+        let agent = AgentLoop::start(
+            request(config_full(
+                inner,
+                ReasoningPreference::Auto,
+                ToolSet::default(),
+                None,
+                prompt.clone(),
+            )),
+            LoopOptions::default_checked().unwrap(),
+            probe.clone(),
+        )
+        .unwrap();
+
+        started.notified().await;
+        tokio::time::advance(Duration::from_millis(250)).await;
+        let report = agent.join().await.unwrap();
+        assert_completed_with_text(&report, "done");
+        assert_eq!(report.requests, 1, "the retry is not a second request");
+        assert_eq!(probe.takes.load(Ordering::SeqCst), 2, "A and F only");
+        let issued = probe.issued.lock().unwrap();
+        assert_eq!(issued.len(), 2, "two attempts share one logical request");
+        assert_eq!(issued[0].0, 0);
+        assert_eq!(issued[1].0, 0);
+        assert_eq!(issued[1].1, ["Fix the parser", "identical text"]);
+        assert_eq!(
+            *probe.deliveries.lock().unwrap(),
+            [Delivery {
+                id: "before-retry",
+                candidate_index: 0,
+                takes_at_delivery: 1,
+                observed_state: None,
+            }]
+        );
+    })
+    .await
+    .expect("retry boundary test timed out");
+}
+
+/// Replacing the config does not disturb the boundary index: a take after the
+/// update belongs to the request the new config will serve.
+#[tokio::test]
+async fn a_config_update_keeps_the_take_boundary_index() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let probe = Arc::new(BoundaryProbe::default());
+        let prompt = index_prompt(probe.clone(), 99);
+        let model_gate = Arc::new(Notify::new());
+        let (first, _) = scripted_model(vec![Round::GatedTools {
+            calls: vec![("echo", "call_1")],
+            gate: model_gate.clone(),
+        }]);
+        // Rounds are selected by `request_index`, so the replacement config
+        // needs an entry for the index it serves.
+        let (second, _) = scripted_model(vec![
+            Round::Final { text: "unused" },
+            Round::Final { text: "from b" },
+        ]);
+        let model = Arc::new(IndexModel {
+            inner: first,
+            probe: probe.clone(),
+        });
+        let agent = AgentLoop::start(
+            request(config_full(
+                model,
+                ReasoningPreference::Auto,
+                tool_set(Arc::default(), ToolBehavior::Succeed),
+                None,
+                prompt,
+            )),
+            LoopOptions::default_checked().unwrap(),
+            probe.clone(),
+        )
+        .unwrap();
+        let handle = agent.handle();
+        handle
+            .watch_state()
+            .wait_for(|state| state.status == LoopStatus::RunningModel)
+            .await
+            .unwrap();
+        *probe.handle.lock().unwrap() = Some(handle.clone());
+        let replacement: Arc<dyn Model> = Arc::new(IndexModel {
+            inner: second,
+            probe: probe.clone(),
+        });
+        let revision = handle
+            .update(config_full(
+                replacement,
+                ReasoningPreference::Auto,
+                ToolSet::default(),
+                None,
+                index_prompt(probe.clone(), 99),
+            ))
+            .unwrap();
+        assert_eq!(revision, ConfigRevision::new(1));
+        probe.push("after-update");
+        model_gate.notify_one();
+
+        let report = agent.join().await.unwrap();
+        assert_completed_with_text(&report, "from b");
+        assert_eq!(report.requests, 2);
+        assert_eq!(report.final_config_revision, ConfigRevision::new(1));
+        assert_eq!(
+            *probe.deliveries.lock().unwrap(),
+            [Delivery {
+                id: "after-update",
+                candidate_index: 1,
+                takes_at_delivery: 3,
+                observed_state: Some((LoopStatus::RunningTools, 0)),
+            }]
+        );
+        let issued = probe.issued.lock().unwrap();
+        assert_eq!(issued.len(), 2);
+        assert_eq!(issued[1].0, 1);
+        assert_eq!(
+            issued[1].1,
+            ["Fix the parser", "identical text"],
+            "the input landed in the request served by the new config"
+        );
+    })
+    .await
+    .expect("config update boundary test timed out");
 }

@@ -50,6 +50,15 @@ one loop and returns control. Concretely:
   calls always ends the loop, so a host with queued inputs starts the next
   loop itself. Hosts that want a loop-scoped view of their queue create the
   `LoopInputs` before `start` and let it hand out entries only to that loop.
+- `take` has no request identity. The state seen from inside `take` can predate
+  the handle or still describe the previous request, and call counting differs
+  per rebuild, retry and failure. A host that reports the request an input
+  joined uses its own per-loop wrapper: `PromptRequest::request_index` when the
+  prompt is prepared and `ModelCallContext::request_index` before the model
+  call; a taken input belongs to the index current at `take`. Issuance stays
+  host-visible through `LoopReport::requests` and `RequestStarted`, never the
+  candidate index alone. See the
+  [agent-loop contract](../contracts/agent-loop.md#inputs).
 - After cancellation, `update` and `answer` return `NotActive` even if
   finalization has not yet run.
 - Interactions: when the loop is waiting for user input (`WaitingForInput`),

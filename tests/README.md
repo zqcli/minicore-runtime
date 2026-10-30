@@ -14,7 +14,7 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 | `p1_value.rs` | 4 | bounded value types and validation |
 | `p1_v04_loop_dtos.rs` | 16 | loop history, `ExecutionConfig`, `PromptProvider`, `LoopReport` DTOs |
 | `p2_agent_loop.rs` | 112 | the flexible agent-loop contract end to end: output bounding, model error preservation, request issue accounting, and progress drop loss |
-| `runtime_w0_contract.rs` | 6 | late watch subscriptions, retained handles, terminal event loss, input identity and candidate request boundaries |
+| `runtime_w0_contract.rs` | 8 | late watch subscriptions, retained handles, terminal event loss, input identity and candidate request boundaries, driver retry and config-update boundary identity |
 | `p3_agent_loop_closeout.rs` | 21 | Phase 8 close-out and correctness fixes: catalog/per-response call limits, timeout/retry bounds, reasoning channels, event-free runs, multi-batch cancel, repeated answers, policy snapshot swaps, delta-only reports, malformed responses, invalid no-tool finish, loop-level retry, shared-resource isolation, input-survives-prompt-failure |
 | `tool_policy_interaction_contract.rs` | 8 | policy decisions, interaction DTO contracts, and ToolInputRequest validation |
 | `tool_set_contract.rs` | 11 | `ToolSet` registration, spec validation, enabled subsets |
@@ -32,7 +32,7 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 
   - `src/usage.rs` (1 test): partial usage accumulates reported fields.
 
-Total main-crate volume: **282 tests** (80 unit + 202 integration across 12 targets).
+Total main-crate volume: **284 tests** (80 unit + 204 integration across 12 targets).
 Two compile-fail doctests protect private `ToolSpec` and `ToolOutput` fields.
 `tests/support/` shares scripted model/tool/policy builders, config/start/join helpers
 and report extractors across separate binaries. Driver tests use the actual

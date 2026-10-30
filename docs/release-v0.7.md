@@ -77,7 +77,7 @@ bash scripts/check-architecture.sh
 
 Since 0.7.3 no minimum Rust version is tested; the gate runs on current stable.
 
-The main suite has 282 tests: 80 unit and 202 integration tests in 12 binaries.
+The main suite has 284 tests: 80 unit and 204 integration tests in 12 binaries.
 Two compile-fail doctests additionally protect the checked tool DTO boundaries.
 The two examples compile as test targets. The acceptance checker preserves all
 70 Passed rows and validates their source/test references. See the
