@@ -78,26 +78,17 @@ The runner loops:
   after it. Cancellation still decides the outcome when it lands while `take`
   returns inputs: the loop ends `Cancelled` and keeps the handed-over inputs
   in the report.
-- `take` carries no request identity, and the observation points it has are
-  not a substitute for one. A call can happen before any `LoopHandle` exists,
-  and the state visible during a post-tool call still describes the previous
-  request (`RunningTools` of the request whose batch just settled). Counting
-  calls is also wrong: A and F both run for one request, a stale rebuild runs
-  them again at the same index, and a cancelled or failed preparation runs
-  them without issuing anything.
-  - The index an input belongs to is the `request_index` the loop has reached
-    when it appends that input, which is the index of the preparation the
-    input joins. A host that must report it associates inputs at `take` time
-    with the index it observes itself: wrap the `PromptProvider`
-    (`PromptRequest::request_index`) and `Model` (the `request_index` of
-    `ModelCallContext`) of every `ExecutionConfig` the loop serves, including
-    each replacement passed to `LoopHandle::update` — an update replaces both.
-    The Runtime guarantees the call sites, not the association: `take` itself
-    carries no request identity.
-  - A candidate index is not proof that the request was issued.
-    `LoopReport.requests` and the last `RequestStarted` are the issue
-    accounting; cancellation or a preparation failure can leave taken inputs
-    in `appended` with no issued request for their index.
+- `take` carries no request identity: it can precede the handle, observe the
+  previous request's `RunningTools` state, or repeat during prompt rebuilds.
+  A host that records input boundaries observes `PromptRequest::request_index`
+  and `ModelCallContext::request_index` through wrappers on every config,
+  including replacements passed to `LoopHandle::update`. At `take`, a newer
+  prepared index wins; otherwise use the index after the last model call, or
+  zero before the first preparation. The Runtime guarantees these call sites;
+  the host owns the association.
+- This candidate index does not prove issuance. Use `LoopReport.requests` and
+  `RequestStarted` for that: cancellation or preparation failure can leave
+  taken inputs in `appended` without issuing their request.
 
 ## Final Report
 

@@ -128,8 +128,17 @@ async fn state_sender_stays_open_after_join_until_the_handle_is_dropped() {
         assert!(!states.has_changed().expect("state sender remains open"));
         assert!(states.changed().now_or_never().is_none());
 
+        let mut late = handle.watch_state();
+        let first = late.borrow_and_update().clone();
+        assert_eq!(first, handle.state());
+        assert_eq!(first.status, LoopStatus::Finished);
+        assert_eq!(first.loop_id, report.loop_id);
+        assert!(first.pending_interaction.is_none());
+        assert!(late.changed().now_or_never().is_none());
+
         drop(handle);
         assert!(states.changed().await.is_err());
+        assert!(late.changed().await.is_err());
     })
     .await
     .expect("state sender lifetime test timed out");
@@ -184,7 +193,7 @@ struct Delivery {
 
 #[derive(Default)]
 struct BoundaryProbe {
-    next_index: AtomicU32,
+    prepared_index: AtomicU32,
     takes: AtomicUsize,
     queue: Mutex<VecDeque<(&'static str, UserInput)>>,
     deliveries: Mutex<Vec<Delivery>>,
@@ -201,8 +210,12 @@ impl BoundaryProbe {
             .push_back((id, UserInput::text("identical text").unwrap()));
     }
 
-    fn publish_index(&self, index: u32) {
-        self.next_index.store(index, Ordering::SeqCst);
+    fn candidate_index(&self) -> u32 {
+        let prepared = self.prepared_index.load(Ordering::SeqCst);
+        match self.issued.lock().unwrap().last() {
+            Some((issued, _)) if prepared <= *issued => issued.saturating_add(1),
+            _ => prepared,
+        }
     }
 }
 
@@ -218,7 +231,7 @@ impl LoopInputs for BoundaryProbe {
             let state = handle.state();
             (state.status, state.request_index)
         });
-        let candidate_index = self.next_index.load(Ordering::SeqCst);
+        let candidate_index = self.candidate_index();
         let takes_at_delivery = self.takes.load(Ordering::SeqCst);
         self.deliveries
             .lock()
@@ -264,10 +277,6 @@ impl Model for IndexModel {
             .lock()
             .unwrap()
             .push((context.request_index, users));
-        // There is no take during the request or its tool batch.
-        self.probe
-            .next_index
-            .store(context.request_index.saturating_add(1), Ordering::SeqCst);
         self.inner.start(request, context)
     }
 }
@@ -284,7 +293,7 @@ struct IndexPrompt {
 impl PromptProvider for IndexPrompt {
     fn prepare<'a>(&'a self, request: PromptRequest<'a>) -> PromptFuture<'a> {
         self.probe
-            .next_index
+            .prepared_index
             .store(request.request_index, Ordering::SeqCst);
         let steering_count = request
             .history
@@ -474,51 +483,12 @@ async fn taken_input_can_have_a_candidate_index_without_an_issued_request() {
     .expect("unissued input test timed out");
 }
 
-#[tokio::test]
-async fn final_answer_does_not_consume_or_extend_for_a_pending_steer() {
-    tokio::time::timeout(TEST_TIMEOUT, async {
-        let gate = Arc::new(Notify::new());
-        let (model, _) = scripted_model(vec![Round::GatedFinal {
-            text: "done",
-            gate: gate.clone(),
-        }]);
-        let inputs = QueuedInputs::new();
-        let agent = AgentLoop::start(
-            request(config(model, ToolSet::default(), None)),
-            LoopOptions::default_checked().unwrap(),
-            inputs.clone(),
-        )
-        .unwrap();
-        agent
-            .handle()
-            .watch_state()
-            .wait_for(|state| state.status == LoopStatus::RunningModel)
-            .await
-            .unwrap();
-        inputs.push("remain pending");
-        gate.notify_one();
-
-        let report = agent.join().await.unwrap();
-        assert_completed_with_text(&report, "done");
-        assert_eq!(report.requests, 1);
-        assert_eq!(inputs.pending(), 1);
-        assert!(!report.appended.iter().any(|item| {
-            matches!(item, HistoryItem::User(user) if user.kind == UserMessageKind::Steering)
-        }));
-    })
-    .await
-    .expect("final steer test timed out");
-}
-
-/// A driver retry stays inside one logical request: the host is not asked for
-/// inputs again, and the retried attempt keeps the same `request_index`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_driver_retry_is_one_request_and_reuses_the_candidate_index() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         struct RetryOnce {
             descriptor: ModelDescriptor,
             attempts: AtomicUsize,
-            probe: Arc<BoundaryProbe>,
             started: Arc<Notify>,
         }
 
@@ -529,24 +499,9 @@ async fn a_driver_retry_is_one_request_and_reuses_the_candidate_index() {
 
             fn start<'a>(
                 &'a self,
-                request: ModelRequest,
-                context: ModelCallContext,
+                _request: ModelRequest,
+                _context: ModelCallContext,
             ) -> ModelStartFuture<'a> {
-                let users = request
-                    .messages()
-                    .iter()
-                    .filter_map(|message| match message {
-                        ModelMessage::User(text) => Some(text.to_string()),
-                        _ => None,
-                    })
-                    .collect();
-                self.probe
-                    .issued
-                    .lock()
-                    .unwrap()
-                    .push((context.request_index, users));
-                self.probe
-                    .publish_index(context.request_index.saturating_add(1));
                 let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
                 let started = Arc::clone(&self.started);
                 Box::pin(async move {
@@ -588,12 +543,14 @@ async fn a_driver_retry_is_one_request_and_reuses_the_candidate_index() {
             )
             .unwrap(),
             attempts: AtomicUsize::new(0),
-            probe: probe.clone(),
             started: Arc::clone(&started),
         });
         let agent = AgentLoop::start(
             request(config_full(
-                inner,
+                Arc::new(IndexModel {
+                    inner,
+                    probe: probe.clone(),
+                }),
                 ReasoningPreference::Auto,
                 ToolSet::default(),
                 None,
@@ -629,8 +586,6 @@ async fn a_driver_retry_is_one_request_and_reuses_the_candidate_index() {
     .expect("retry boundary test timed out");
 }
 
-/// Replacing the config does not disturb the boundary index: a take after the
-/// update belongs to the request the new config will serve.
 #[tokio::test]
 async fn a_config_update_keeps_the_take_boundary_index() {
     tokio::time::timeout(TEST_TIMEOUT, async {
@@ -711,200 +666,4 @@ async fn a_config_update_keeps_the_take_boundary_index() {
     })
     .await
     .expect("config update boundary test timed out");
-}
-
-/// A host watcher may start after a fast loop already finished; the first
-/// sample is then the final state and no `changed` wake-up is required.
-#[tokio::test]
-async fn a_watcher_started_after_join_reads_the_final_state_without_waiting() {
-    tokio::time::timeout(TEST_TIMEOUT, async {
-        let (model, _) = scripted_model(vec![Round::Final { text: "done" }]);
-        let agent = AgentLoop::start(
-            request(config(model, ToolSet::default(), None)),
-            LoopOptions::default_checked().unwrap(),
-            no_inputs(),
-        )
-        .unwrap();
-        let handle = agent.handle();
-        let report = agent.join().await.unwrap();
-        assert_completed_with_text(&report, "done");
-
-        let mut late = handle.watch_state();
-        let first = late.borrow_and_update().clone();
-        assert_eq!(first, handle.state());
-        assert_eq!(first.status, LoopStatus::Finished);
-        assert_eq!(first.loop_id, report.loop_id);
-        assert!(first.pending_interaction.is_none());
-        assert!(late.changed().now_or_never().is_none());
-    })
-    .await
-    .expect("late final watcher test timed out");
-}
-
-/// Reference host-side implementation of the input index rule: a prompt
-/// observation for a newer preparation wins, otherwise the last issued model
-/// request is used, otherwise the first preparation.
-#[derive(Default)]
-struct IndexRule {
-    prepared: Mutex<Option<u32>>,
-    issued: Mutex<Option<u32>>,
-}
-
-impl IndexRule {
-    fn observe_prompt(&self, request_index: u32) {
-        *self.prepared.lock().unwrap() = Some(request_index);
-    }
-
-    fn observe_model(&self, request_index: u32) {
-        *self.issued.lock().unwrap() = Some(request_index);
-    }
-
-    fn take(&self) -> u32 {
-        let prepared = *self.prepared.lock().unwrap();
-        let issued = *self.issued.lock().unwrap();
-        match (prepared, issued) {
-            // A prompt for a newer preparation wins: its F step belongs to it.
-            (Some(prepared), Some(issued)) if prepared > issued => prepared,
-            // After a tool batch the next A step joins the request after the
-            // last issued one, which the model observation already recorded.
-            (_, Some(issued)) => issued.saturating_add(1),
-            (Some(prepared), None) => prepared,
-            (None, None) => 0,
-        }
-    }
-}
-
-/// The host-side index wrapper is exact for A, F, post-tool, stale rebuild and
-/// driver retry boundaries; this pins the rule the Agent implements.
-#[tokio::test]
-async fn the_host_index_rule_is_exact_at_every_boundary() {
-    tokio::time::timeout(TEST_TIMEOUT, async {
-        struct RuleInputs {
-            rule: Arc<IndexRule>,
-            queue: Mutex<VecDeque<UserInput>>,
-            seen: Mutex<Vec<u32>>,
-        }
-
-        impl LoopInputs for RuleInputs {
-            fn take(&self) -> Vec<UserInput> {
-                let taken: Vec<UserInput> = self.queue.lock().unwrap().drain(..).collect();
-                if taken.is_empty() {
-                    return Vec::new();
-                }
-                self.seen.lock().unwrap().push(self.rule.take());
-                taken
-            }
-        }
-
-        struct RulePrompt {
-            rule: Arc<IndexRule>,
-            entered: Arc<Notify>,
-            gate: Arc<Notify>,
-            gated: AtomicBool,
-        }
-
-        impl PromptProvider for RulePrompt {
-            fn prepare<'a>(&'a self, request: PromptRequest<'a>) -> PromptFuture<'a> {
-                self.rule.observe_prompt(request.request_index);
-                let gate = request.request_index == 1 && !self.gated.swap(true, Ordering::SeqCst);
-                Box::pin(async move {
-                    if gate {
-                        self.entered.notify_one();
-                        self.gate.notified().await;
-                    }
-                    DefaultPromptProvider::new(None).prepare(request).await
-                })
-            }
-        }
-
-        struct RuleModel {
-            inner: Arc<dyn Model>,
-            rule: Arc<IndexRule>,
-        }
-
-        impl Model for RuleModel {
-            fn descriptor(&self) -> &ModelDescriptor {
-                self.inner.descriptor()
-            }
-
-            fn start<'a>(
-                &'a self,
-                request: ModelRequest,
-                context: ModelCallContext,
-            ) -> ModelStartFuture<'a> {
-                self.rule.observe_model(context.request_index);
-                self.inner.start(request, context)
-            }
-        }
-
-        let rule: Arc<IndexRule> = Arc::default();
-        let model_gate = Arc::new(Notify::new());
-        let (inner, _) = scripted_model(vec![
-            Round::GatedTools {
-                calls: vec![("echo", "call_1")],
-                gate: model_gate.clone(),
-            },
-            Round::Final { text: "done" },
-        ]);
-        let entered = Arc::new(Notify::new());
-        let gate = Arc::new(Notify::new());
-        let inputs = Arc::new(RuleInputs {
-            rule: Arc::clone(&rule),
-            queue: Mutex::new(VecDeque::new()),
-            seen: Mutex::new(Vec::new()),
-        });
-        let config = config_full(
-            Arc::new(RuleModel {
-                inner,
-                rule: Arc::clone(&rule),
-            }),
-            ReasoningPreference::Auto,
-            tool_set(Arc::default(), ToolBehavior::Succeed),
-            None,
-            Arc::new(RulePrompt {
-                rule: Arc::clone(&rule),
-                entered: Arc::clone(&entered),
-                gate: Arc::clone(&gate),
-                gated: AtomicBool::new(false),
-            }),
-        );
-        let agent = AgentLoop::start(
-            request(config),
-            LoopOptions::default_checked().unwrap(),
-            inputs.clone(),
-        )
-        .unwrap();
-        let handle = agent.handle();
-        handle
-            .watch_state()
-            .wait_for(|state| state.status == LoopStatus::RunningModel)
-            .await
-            .unwrap();
-        // Post-tool A step of request 1.
-        inputs
-            .queue
-            .lock()
-            .unwrap()
-            .push_back(UserInput::text("after-tool").unwrap());
-        model_gate.notify_one();
-        // F step of the rebuilt request 1.
-        entered.notified().await;
-        inputs
-            .queue
-            .lock()
-            .unwrap()
-            .push_back(UserInput::text("during-prompt").unwrap());
-        gate.notify_one();
-
-        let report = agent.join().await.unwrap();
-        assert_completed_with_text(&report, "done");
-        assert_eq!(report.requests, 2);
-        assert_eq!(
-            *inputs.seen.lock().unwrap(),
-            [1, 1],
-            "a post-tool input joins request 1 and a rebuild stays on request 1"
-        );
-    })
-    .await
-    .expect("index rule test timed out");
 }

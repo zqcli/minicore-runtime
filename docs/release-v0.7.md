@@ -57,7 +57,7 @@ remain unchanged. Public Rust API changes are listed in the
   request-boundary accounting and event bounds are those of 0.9.0. The version
   follows the 0.9.1 consistency work in `minicore-agent`; Runtime still has no
   session, storage, transcript or provider surface.
-- `tests/runtime_w0_contract.rs` records the host-facing observation contracts
+- `tests/host_observation_contract.rs` records the host-facing observation contracts
   the Agent relies on: late `watch_state` subscriptions see actionable
   interactions, a retained handle keeps the state sender open after `join`, a
   final state and report survive complete event loss, and `take` is not a
