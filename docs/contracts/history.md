@@ -7,13 +7,16 @@ The host-facing conversation vocabulary passed in and returned by the loop.
 `HistoryItem` is one of:
 
 - `User(UserHistory { loop_id, kind, input })` — `kind` is `Prompt` (the
-  input that started/extends the loop) or `Steering` (an input taken from
+  input that started the loop) or `Steering` (an input taken from
   `LoopInputs` at a request boundary). `input: UserInput` is bounded text.
 - `Assistant(AssistantHistory { loop_id, request_index, model, reasoning,
-  content, finish_reason, usage })` — a complete, locally validated model
-  response with typed `AssistantPart`s (text / reasoning / tool call).
-- `ToolResult(ToolResultHistory { call_id, tool_name, outcome, output })` —
-  the result of one tool call that ran in a loop.
+  content, provider_replay, finish_reason, usage })` — a complete, locally
+  validated model response with typed `AssistantPart`s (text / reasoning /
+  tool call) and optional opaque replay metadata. Replay is not display text;
+  see the [model contract](model.md).
+- `ToolResult(ToolResultHistory { loop_id, request_index, call_id, tool_name,
+  outcome, output })` — an executed call's result or a synthesized settlement
+  for a call that did not run, such as a denied or cancelled call.
 - `Summary(SummaryHistory { content })` — a host-authored compression
   marker with no durable boundary semantics.
 

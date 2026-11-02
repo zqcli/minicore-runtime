@@ -1,12 +1,12 @@
 # Module Map
 
-Physical source ownership for the v0.7.0 core. Public re-exports are listed at
+Physical source ownership for the current one-loop core. Public re-exports are listed at
 the crate root (`src/lib.rs`); every other module is reached through them.
 
 | Source path | Owns | Public boundary |
 | --- | --- | --- |
 | `src/agent_loop/mod.rs` | `AgentLoop`, `LoopRequest`, `LoopOptions`, `LoopInputs`, `LoopReport`, errors | Re-exported at root |
-| `src/agent_loop/handle.rs` | `LoopHandle` (update/cancel/state/answer) | Re-exported at root |
+| `src/agent_loop/handle.rs` | `LoopHandle` (update/cancel/shutdown/state/watch/answer/wait) | Re-exported at root |
 | `src/agent_loop/control.rs` | linearized update/begin-final state, interaction slots | crate-private |
 | `src/agent_loop/event.rs` | `LoopEvent(Envelope/Stream)`, best-effort sink | Re-exported at root |
 | `src/agent_loop/state.rs` | `LoopState`, `LoopStatus` | Re-exported at root |
@@ -44,6 +44,8 @@ uses the already-validated `LoopLimits`; it does not mirror their validation.
 - `tests/p1_v04_loop_dtos.rs` — DTO/serialization contract evidence.
 - `tests/p2_agent_loop.rs` — end-to-end loop contract evidence (text, tools,
   host inputs/update/cancel, deadlines, report semantics).
+- `tests/host_observation_contract.rs` — late and terminal state observation,
+  event loss, and host-owned input/request-boundary association.
 - `tests/p2_*` follow the same pattern for further contract domains, if
   added; integration test files live directly in `tests/`.
 

@@ -1,10 +1,15 @@
-# minicore-runtime 0.7.0
+# minicore-runtime Release Notes From 0.7.0
+
+Versioned sections describe changes at that version. Current behavior is
+defined by the contracts and the latest README compatibility notes.
+
+## 0.7.0
 
 The one-loop host boundary, JSON representations and storage-independent design
 remain unchanged. Public Rust API changes are listed in the
 [README compatibility notes](../README.md#070).
 
-## Changes
+### Changes
 
 - Runtime normalizes model display text (CRLF/CR to LF, other controls except
   LF/TAB to a space), without expanding bytes. Assembly preserves CRLF continuity
@@ -63,6 +68,16 @@ remain unchanged. Public Rust API changes are listed in the
   final state and report survive complete event loss, and `take` is not a
   request index.
 
+## 0.9.2
+
+- Documentation and test maintenance only: production code, APIs, dependency
+  versions and the 0.9.0 loop behavior are unchanged.
+- Consolidate the seven host-observation cases in one test target and document
+  initial/terminal watch observations, retained sender lifetime, lossy terminal
+  events and host-owned candidate input identities.
+- Align README, coding-agent guidance and the architecture/module/test indexes
+  with the current source; retain the earlier versioned compatibility record.
+
 ## Gates
 
 The runtime gate is:
@@ -77,7 +92,7 @@ bash scripts/check-architecture.sh
 
 Since 0.7.3 no minimum Rust version is tested; the gate runs on current stable.
 
-The main suite has 286 tests: 80 unit and 206 integration tests in 12 binaries.
+The main suite has 283 tests: 80 unit and 203 integration tests in 12 binaries.
 Two compile-fail doctests additionally protect the checked tool DTO boundaries.
 The two examples compile as test targets. The acceptance checker preserves all
 70 Passed rows and validates their source/test references. See the

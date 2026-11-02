@@ -1,8 +1,9 @@
 # Documentation Authority
 
-The current v0.7.0 core retains the v0.4 one-loop architecture and is documented
-by the current source tree and these pages. The root README records current
-compatibility changes; versioned v0.4 acceptance/release pages remain historical evidence:
+The current v0.9.2 package retains the v0.4 one-loop architecture and the
+v0.9.0 input-pull semantics. The current source tree and contracts define
+behavior; the root README records compatibility changes. Versioned v0.4
+acceptance/release pages remain historical evidence:
 
 1. [Architecture](architecture.md) for the one-loop boundary, ownership, and dependency direction.
 2. [Canonical module map](modules/README.md) for physical source ownership and public/private boundaries.
@@ -12,7 +13,7 @@ compatibility changes; versioned v0.4 acceptance/release pages remain historical
 6. [Acceptance matrix](acceptance-v0.4.md), generated from [`scripts/acceptance_v04.json`](../scripts/acceptance_v04.json), and the [v0.4 release note](release-v0.4.md) for reviewed acceptance traceability, size, CI status, and known limits.
 7. [Development plan](development-plan.md) for completed phases and maintenance gates.
 8. [Test inventory](../tests/README.md) for current contract and integration evidence.
-9. [v0.7.0 release notes](release-v0.7.md) for this refactor and the separated provider gate.
+9. [Release notes from v0.7.0 onward](release-v0.7.md) for versioned changes and current gates.
 
 The [current implementation context](../CONTEXT.md) is a short maintainer
 checkpoint. The [root README](../README.md) is the Host-facing introduction.

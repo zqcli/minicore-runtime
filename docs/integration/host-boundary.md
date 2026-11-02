@@ -2,15 +2,16 @@
 
 ## The Deal
 
-The host owns everything durable and stateful; the runtime executes exactly
+The host owns everything durable and session-scoped; the runtime executes exactly
 one loop and returns control. Concretely:
 
 - **The host supplies** prior `HistoryItem`s (`LoopRequest::history`), the
   fresh `UserInput`, and the immutable `ExecutionConfig` (model, reasoning,
   tools, optional policy, prompt provider).
 - **The runtime supplies** `LoopReport` (outcome, `appended` in-memory items,
-  `usage`, `requests`, `tool_rounds`, final `ConfigRevision`) and an optional
-  best-effort `LoopEventStream`.
+  `usage`, `requests`, `tool_rounds`, final `ConfigRevision`), current
+  `LoopState` through `state`/`watch_state`, and an optional best-effort
+  `LoopEventStream`.
 - **The host persists** whatever it wants: the report, selected appended
   items, or transcripts it built from streamed events. None of that happens
   in the runtime.
@@ -33,6 +34,10 @@ one loop and returns control. Concretely:
   never ran: tool side effects and the on-disk log are not atomic. If the
   host needs an atomic journal, it must own that transaction itself (for
   example by only recording outcomes that the report or tool results prove).
+- Control observation comes from `state`/`watch_state`, independently of event
+  delivery. Read the initial watch value, handle coalesced updates, and use
+  `wait`/`join` rather than state-channel closure for completion. See the
+  [current-state contract](../contracts/event-stream.md#current-state-observation).
 
 ## Concurrency Notes
 

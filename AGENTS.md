@@ -59,6 +59,12 @@ dependency changes.
   discarded configs outside the lock.
 - Events are best-effort: emit with `try_send`/`try_emit` and never branch
   correctness on delivery. The `LoopReport` is the only authoritative outcome.
+- `state`/`watch_state` expose the latest control observation, not an event log.
+  Read a watch's initial value and do not wait for channel closure to detect
+  completion: retained handles keep its sender alive after `join`.
+- `LoopInputs::take` has no request identity. Preserve the A/F handoff contract
+  and the host's prompt/model wrappers on every config replacement; do not
+  infer candidate indices from take counts or the last observed loop state.
 - `ExecutionConfig` is immutable: no `set_*` mutators.
 - Write the least code that solves the problem. No speculative abstractions,
   configuration or features, and no state for cases that cannot happen. Add a
@@ -66,7 +72,9 @@ dependency changes.
 - No defensive programming: validate once at construction or deserialization,
   and do not re-check invariants the types already guarantee.
 - Delete dead code, unused parameters and always-true flags.
-- Every queue, buffer and payload has an explicit bound (`src/limits.rs`).
+- Keep per-input, per-response, tool-payload and event-queue bounds explicit
+  (`src/limits.rs`). Whole-history size and prompt message count are host
+  policies; do not restore the Runtime limits removed in 0.8.0.
 - Comments:
   - `///` is one sentence, and only where the name and signature leave
     something unsaid.
@@ -74,8 +82,9 @@ dependency changes.
     Never narrate the code.
   - No citations of specs, reviews, findings or section numbers (`§`) in code.
 - Every public type change is an API decision. Record it in the README
-  compatibility notes and `docs/release-v0.7.md` (or the current release
-  notes), and update the affected page under `docs/contracts/`.
+  compatibility notes and a new version section of the cumulative
+  `docs/release-v0.7.md`, and update the affected page under `docs/contracts/`.
+  Preserve historical release descriptions rather than rewriting them as current behavior.
 
 ## Platforms
 
@@ -106,6 +115,8 @@ byte-compared fixture (`.gitattributes` sets `eol=lf`).
   stress test with an explicit timeout.
 - Reuse the scripted model, tool, and policy builders in `tests/support/`.
   Driver unit tests live under `src/model/driver/tests/`.
+- `tests/host_observation_contract.rs` owns late/terminal watch and input-boundary
+  regressions; preserve coverage when consolidating its fixtures.
 - Use fake adapters only. Real providers belong to `provider-gate/`.
 
 ## CI And Releases

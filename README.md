@@ -13,7 +13,7 @@ host.
 
 | | |
 |---|---|
-| Version | 0.9.1 |
+| Version | 0.9.2 |
 | Rust | edition 2024, current stable |
 | Async runtime | Tokio (the loop spawns one task) |
 | Production dependencies | serde, serde_json, tokio, tokio-util, futures-util, thiserror, getrandom |
@@ -37,6 +37,9 @@ host.
   to bound, for example by token-based compaction.
 - **Best-effort events.** A bounded stream reports dropped events in
   `dropped_before` and never blocks the loop.
+- **Current-state observation.** `LoopHandle::state` and `watch_state` expose
+  the latest loop state and pending interaction independently of event loss.
+  The watch coalesces updates; `wait`/`join` establish the final outcome.
 
 ## Installation
 
@@ -120,7 +123,12 @@ The Runtime executes one loop. The host owns everything around it:
   `Arc<LoopReport>` for as long as the owner or any handle lives.
 - Events are not authoritative. The stream is bounded and single-consumer;
   lost events, including internal model and tool progress, are counted in
-  `dropped_before` and never reconstructed.
+  the next delivered event's `dropped_before` and never reconstructed. A lost
+  terminal event may have no later event to carry that count.
+- Read a new `watch_state` receiver's initial value before waiting for changes;
+  it may already contain a pending interaction or the final state. Retained
+  handles keep the state channel open after `join`, so channel closure is not
+  a completion signal. See the [observation contract](docs/contracts/event-stream.md#current-state-observation).
 - Tool side effects are not atomic with host logging. A tool can succeed even
   when the host never sees its event or persists its result.
 - `update` takes effect at the next model request. A revision is committed only
@@ -141,6 +149,10 @@ The Runtime executes one loop. The host owns everything around it:
   waits for an interaction answer.
 - A model answer without tool calls always ends the loop, and `take` is not
   called after it. A host that wants to continue starts a new loop.
+- `take` has no request-identity argument. Hosts that associate accepted inputs
+  with candidate request indices observe both prompt preparation and model
+  issuance on every installed config, including updates; state snapshots and
+  take counts cannot supply that identity. See the [input contract](docs/contracts/agent-loop.md#inputs).
 - An `update` does not keep the loop alive.
 - `LoopReport.requests` counts issued requests. Driver retries stay inside one
   logical request, and the Runtime never retries a whole loop.
@@ -181,6 +193,16 @@ changes. See [tests/README.md](tests/README.md)
 for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 
 ## Compatibility Notes
+
+### 0.9.2
+
+- Documentation and test maintenance only; production code, public APIs,
+  dependencies and the 0.9.0 loop semantics are unchanged.
+- Document the distinction between current-state watch observation, lossy
+  events and authoritative completion; retain host-owned input-boundary
+  association rather than adding a Runtime identity API.
+- Align the current architecture, module and test indexes with the source.
+  The seven host-observation cases now share one contract test target.
 
 ### 0.9.1
 
@@ -296,7 +318,7 @@ for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 the [agent-loop contract](docs/contracts/agent-loop.md) and its focused
 contracts, the [host boundary](docs/integration/host-boundary.md), the
 [v0.3-to-v0.4 migration](docs/migrations/v0.3-to-v0.4.md), and the
-[0.7.0 release notes](docs/release-v0.7.md).
+[release notes from 0.7.0 onward](docs/release-v0.7.md).
 
 ## License
 

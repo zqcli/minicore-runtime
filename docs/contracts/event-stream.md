@@ -17,6 +17,26 @@ Best-effort observation of a live loop. **Events are not authoritative.**
   is full, as well as internal bursts dropped by the model driver and tool
   progress queues before reaching the loop sink. Drops on closed queues
   are not counted.
+- A drop count is attached only to a later delivered event. Losing the final
+  events can therefore leave no visible gap notification before stream EOF.
+
+## Current-State Observation
+
+- `LoopHandle::state()` reads the latest `LoopState`; `watch_state()` subscribes
+  to the same retained value independently of the event queue. A late
+  subscription can already contain an actionable `pending_interaction` or
+  `Finished` even when its corresponding event was lost.
+- Read the initial watch value before awaiting `changed()`. Clone the value
+  from `borrow_and_update()` and release the borrow before awaiting or
+  answering an interaction. Watch updates coalesce; they are not a history of
+  transitions or a replacement event replay stream.
+- The state sender lives with the shared control held by handles. A retained
+  handle keeps it open after `AgentLoop::join()`, including for subscriptions
+  created after completion. Do not wait for state-channel closure to decide
+  that the loop ended; use `wait`/`join` for the authoritative outcome.
+- `LoopState.request_index` is the current observation, not an identity handed
+  to `LoopInputs::take`. It can still describe the previous tool request at
+  the next input handoff; see the [input contract](agent-loop.md#inputs).
 
 ## Non-Authoritative Guarantees
 

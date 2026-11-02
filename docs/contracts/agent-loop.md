@@ -98,8 +98,9 @@ The runner loops:
   not a saturated `u16` budget counter. `LoopOptions.max_tool_rounds` remains
   `u16`: zero (the default) disables that optional limit; positive values
   retain the existing finite-budget validation.
-- `appended` is the only host-worthy record; the host decides whether and
-  where to persist it. Nothing is durable in the runtime.
+- `appended` is the loop's history delta. The host decides whether and where
+  to persist it and the report's outcome and counters. Nothing is durable in
+  the runtime.
 - A failed inner port (model/prompt/policy/tool) maps to a `LoopOutcome:
   Failed(LoopFailure { kind, diagnostic })`; cancellation maps to
   `Cancelled(CancelReason)`.

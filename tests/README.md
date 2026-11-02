@@ -1,6 +1,6 @@
 # Test Inventory
 
-Test targets for the v0.7.0 core. Every test is deterministic: notify /
+Test targets for the current one-loop core. Every test is deterministic: notify /
 oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 
 ## Integration (`tests/`)

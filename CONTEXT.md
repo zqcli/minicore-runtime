@@ -1,7 +1,8 @@
 # Current Implementation Context
 
-The current package is v0.9.1 (0.9.1 is a version bump only: no Rust API or
-behavior change from 0.9.0). It retains the one-loop boundary from the
+The current package is v0.9.2. The 0.9.1–0.9.2 work adds host-observation
+contract tests and aligns documentation; production code, dependencies,
+Rust APIs and behavior remain those of 0.9.0. It retains the one-loop boundary from the
 v0.4 reset and the 0.9.0 input-pull semantics. Tool-batch statistics are now
 `u64` end to end within Runtime;
 the optional legacy `u16` round budget still defaults to zero (unlimited).
@@ -37,6 +38,10 @@ library type.
 ## Engine Rules
 
 - One runner task per loop; `wait`/`join` return the same `Arc<LoopReport>`.
+- `state`/`watch_state` retain the latest control observation independently of
+  event delivery. Read an initial watch value before waiting; a retained handle
+  keeps the sender open after `join`. Watch changes can coalesce, and terminal
+  event loss need not produce a later `dropped_before` notification.
 - Completion is owned by the runner task; its drop surfaces as
   `LoopWaitError::CompletionClosed` to waiters.
 - Update and the final seal linearize on one short `std::sync::Mutex`;
@@ -55,6 +60,9 @@ library type.
   task at the A and F request boundaries; inputs the loop took are in the
   report for every ending, the rest stay with the host. A no-tool answer
   always ends the loop.
+- `take` carries no request identity. Host prompt/model wrappers observe the
+  candidate preparation and issued request on every installed config,
+  including updates; a candidate can remain unissued after cancellation.
 - Tool catalog size is independent from per-response `ToolCall` limits.
 - Built with current stable Rust, no declared minimum; production code forbids `unsafe`; no async mutex, no
   `parking_lot`.

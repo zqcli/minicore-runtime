@@ -2,6 +2,9 @@
 
 ## Completed Phases
 
+These phases describe the v0.4 implementation history, not the current public
+API. Later changes below remove its Runtime-owned steer queue and history limits.
+
 - **Phase 1** `feat(v0.4): introduce loop history and execution configuration` — `HistoryItem`/`HistoryView` and `ExecutionConfig` as the host boundary inputs.
 - **Phase 2** `feat(v0.4): run one agent loop without session ownership` — one-shot `AgentLoop`, runner-owned completion, single-CAS cancel/final state machine, `MAX_MODEL_RETRY_ATTEMPTS=4`.
 - **Phase 3** `feat(v0.4): apply execution updates at request boundaries` — `LoopHandle::update`, update/seal linearization, genuine issue-boundary revision commit.
@@ -17,6 +20,17 @@ Completed runtime text normalization, shared request/history payloads, per-attem
 cancellation, unbounded interaction waits without a loop deadline, post-publication
 config disposal, usage accounting, shutdown handles, model module separation and
 shared test fixtures. See [release notes](release-v0.7.md) for compatibility and gates.
+
+## v0.8.0–v0.9.2
+
+- 0.8.0 removed Runtime whole-history and prompt-message count limits; hosts
+  own context sizing and compaction while per-item limits remain.
+- 0.9.0 replaced `LoopHandle::steer` with host-owned `LoopInputs` pulled at the
+  A/F preparation boundaries. A no-tool response ends the loop; remaining
+  input belongs to a successor loop the host starts.
+- 0.9.1–0.9.2 preserve that production code and API. Host-observation tests
+  cover late watches, terminal event loss and input-boundary identity; current
+  documentation distinguishes those contracts from historical release work.
 
 ## Remaining
 

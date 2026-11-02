@@ -8,10 +8,10 @@ host-supplied inputs, and request-boundary configuration updates. It does not ow
 sessions, persistence, transcripts, providers, or workspaces.
 
 The single architectural invariant: **there is one boundary — the running
-`AgentLoop` — and everything durable or stateful lives on the host side of
+`AgentLoop` — and everything durable or session-scoped lives on the host side of
 it.** The runtime consumes host-provided history and a host-built execution
-configuration, and it returns a report plus best-effort events. The host
-decides what to persist, where, and when.
+configuration, and it exposes current state, a final report and best-effort
+events. The host decides what to persist, where, and when.
 
 ```
         host history            ExecutionConfig
@@ -29,11 +29,11 @@ decides what to persist, where, and when.
 - **Host owns sessions.** There is no session type anywhere in the crate.
   `AgentLoop::start` allocates a fresh `LoopId` and runs once.
 - **Host owns history.** `LoopRequest::history: Arc<[HistoryItem]>` is a
-  borrowed input. The loop appends only in-memory results, exposed as
+  shared immutable input. The loop appends only in-memory results, exposed as
   `LoopReport::appended`.
 - **Host owns persistence.** Nothing in the runtime writes a file, a store,
-  or a log. `LoopReport::usage` and `::appended` are the only durable-worthy
-  outputs, and their persistence is entirely the host's call.
+  or a log. The complete `LoopReport`, including outcome, counters and
+  appended items, is authoritative; its persistence is entirely the host's call.
 - **Host owns user inputs.** The host implements `LoopInputs` and passes it to
   `AgentLoop::start`; the loop pulls inputs at request boundaries and the
   host's queue, ordering and validation stay on its side.
@@ -65,6 +65,9 @@ decides what to persist, where, and when.
   driver; `runner/tools.rs` holds batch settlement, policy, interaction, and tool execution.
 - Every control touch is a short critical section; every event is a
   best-effort `try_send`.
+- `LoopControl` retains the latest `LoopState` in a watch channel shared by
+  `state` and `watch_state`; this is independent of the lossy event stream.
+  Completion has a separate runner-owned sender and returns the final report.
 
 ## Dependency Direction
 
