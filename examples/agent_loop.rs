@@ -286,11 +286,7 @@ fn printable(event: &LoopEvent) -> String {
 
 async fn stream_events(mut events: minicore_runtime::LoopEventStream) {
     while let Some(envelope) = events.recv().await {
-        println!(
-            "  {:>3} dropped, {}",
-            envelope.dropped_before,
-            printable(&envelope.event)
-        );
+        println!("  {}", printable(&envelope.event));
     }
     println!("  (event stream closed)");
 }
