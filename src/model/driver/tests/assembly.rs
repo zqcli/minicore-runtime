@@ -481,6 +481,29 @@ async fn tool_arguments_use_centralized_json_depth_and_node_validation() {
     .await
     .unwrap_err();
     assert_eq!(error.kind(), ModelErrorKind::InvalidProviderResponse);
+    for containers in [33, crate::value::MAX_JSON_NESTING] {
+        let nested = format!(
+            "{}0{}",
+            "{\"x\":".repeat(containers),
+            "}".repeat(containers)
+        );
+        let response = run_events(
+            tool_request(),
+            vec![
+                Ok(start(id.clone(), "search")),
+                Ok(args(id.clone(), &nested)),
+                Ok(end(id.clone())),
+                Ok(finish(ModelFinishReason::ToolCalls)),
+            ],
+            ModelDriverConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.parts()[0].as_tool_call().unwrap().arguments(),
+            &serde_json::from_str::<Value>(&nested).unwrap()
+        );
+    }
     let arguments = json!({"items": vec![Value::Null; 4097]});
     let response = run_events(
         tool_request(),

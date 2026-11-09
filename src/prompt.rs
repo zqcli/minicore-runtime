@@ -76,10 +76,7 @@ impl<T: PromptProvider + ?Sized> PromptProvider for Arc<T> {
 /// provider output at the request boundary, and `ModelRequest` construction
 /// validates exchange-level tool-result consistency.
 ///
-/// The fixed summary prefix `Conversation summary:\n` is always preserved
-/// verbatim; when the summary content would push the projected message past
-/// the absolute `ModelMessage` text ceiling, only the *tail* of the content is
-/// truncated at a UTF-8 character boundary (never mid-character).
+/// The fixed summary prefix and complete content are preserved without truncation.
 pub struct DefaultPromptProvider {
     system_prompt: Option<Text>,
 }
