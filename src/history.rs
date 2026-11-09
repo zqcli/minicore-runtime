@@ -8,7 +8,7 @@ use crate::model::{
     AssistantPart, ModelFinishReason, ModelRef, ProviderReplay, ReasoningPreference, Usage,
 };
 use crate::tools::{ToolName, ToolOutput, ToolResultOutcome};
-use crate::value::BoundedText;
+use crate::value::Text;
 
 /// Typed model-context history consumed and produced by one agent loop.
 ///
@@ -72,7 +72,7 @@ pub struct ToolResultHistory {
 /// Host-managed summary without durable boundary semantics.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SummaryHistory {
-    pub content: BoundedText,
+    pub content: Text,
 }
 
 /// Borrowed projection of the host base history plus the current loop delta.

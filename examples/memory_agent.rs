@@ -62,7 +62,9 @@ impl Model for EchoModel {
             .unwrap_or_default();
         Box::pin(async move {
             Ok::<ModelStream, _>(Box::pin(stream::iter(vec![
-                Ok(ModelEvent::text_delta(format!("[turn {turn}] you said: {user_text}")).unwrap()),
+                Ok(ModelEvent::text_delta(format!(
+                    "[turn {turn}] you said: {user_text}"
+                ))),
                 Ok(ModelEvent::Finish {
                     reason: ModelFinishReason::Stop,
                 }),

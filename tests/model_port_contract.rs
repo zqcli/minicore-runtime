@@ -10,7 +10,7 @@ use minicore_runtime::model::{
     ModelStream, ModelValueError, ReasoningPreference, Usage,
 };
 use minicore_runtime::tools::{ToolName, ToolSpec};
-use minicore_runtime::value::BoundedText;
+use minicore_runtime::value::Text;
 use minicore_runtime::{LoopId, ToolCallId};
 use serde_json::json;
 use tokio::sync::Barrier;
@@ -96,7 +96,7 @@ impl Model for ConcurrentModel {
             starts.fetch_add(1, Ordering::SeqCst);
             barrier.wait().await;
             let events = vec![
-                Ok(ModelEvent::text_delta("done").unwrap()),
+                Ok(ModelEvent::text_delta("done")),
                 Ok(ModelEvent::Usage {
                     usage: Usage::new(2, 1, 0),
                 }),
@@ -239,13 +239,13 @@ fn call_context_is_zero_based_exact_and_owner_neutral() {
 fn stream_events_are_typed_bounded_complete_and_redacted() {
     let name: ToolName = "search".parse().unwrap();
     let events = [
-        ModelEvent::text_delta("private text delta").unwrap(),
-        ModelEvent::reasoning_delta("private reasoning delta").unwrap(),
+        ModelEvent::text_delta("private text delta"),
+        ModelEvent::reasoning_delta("private reasoning delta"),
         ModelEvent::ToolCallStart {
             tool_call_id: call_id(),
             tool_name: name,
         },
-        ModelEvent::tool_call_arguments_delta(call_id(), "{\"private\":true}").unwrap(),
+        ModelEvent::tool_call_arguments_delta(call_id(), "{\"private\":true}"),
         ModelEvent::ToolCallEnd {
             tool_call_id: call_id(),
         },
@@ -276,10 +276,10 @@ fn stream_events_are_typed_bounded_complete_and_redacted() {
         .is_err()
     );
     assert!(
-        matches!(ModelEvent::reasoning_delta("").unwrap(), ModelEvent::ReasoningDelta { delta } if delta.is_empty())
+        matches!(ModelEvent::reasoning_delta(""), ModelEvent::ReasoningDelta { delta } if delta.is_empty())
     );
     let malformed = ModelEvent::TextDelta {
-        delta: BoundedText::new("x".repeat(MAX_MODEL_EVENT_TEXT_BYTES + 1)).unwrap(),
+        delta: Text::new("x".repeat(MAX_MODEL_EVENT_TEXT_BYTES + 1)),
     };
     assert_eq!(malformed.validate(), Err(ModelValueError::InvalidEvent));
 

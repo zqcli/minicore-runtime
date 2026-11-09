@@ -105,7 +105,7 @@ async fn a_real_runner_panic_publishes_one_report_for_join_and_all_waiters() {
             Box::pin(async move {
                 Ok(Box::pin(DropStream {
                     events: vec![
-                        ModelEvent::text_delta("answer").unwrap(),
+                        ModelEvent::text_delta("answer"),
                         ModelEvent::Finish {
                             reason: ModelFinishReason::Stop,
                         },
@@ -401,7 +401,7 @@ async fn discarded_config_drop_panics_cannot_lose_or_replace_the_report() {
                 .unwrap();
             Box::pin(async move {
                 Ok::<ModelStream, ModelError>(Box::pin(futures_util::stream::iter(vec![
-                    Ok(ModelEvent::text_delta("retained output").unwrap()),
+                    Ok(ModelEvent::text_delta("retained output")),
                     Ok(ModelEvent::Finish {
                         reason: self.finish,
                     }),

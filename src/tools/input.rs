@@ -3,22 +3,22 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::value::BoundedText;
+use crate::value::Text;
 
 use super::types::ToolValueError;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ToolInputRequest {
-    pub prompt: BoundedText,
-    pub choices: Vec<BoundedText>,
+    pub prompt: Text,
+    pub choices: Vec<Text>,
     pub answer_kind: ToolInputAnswerKind,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolInputRequestWire {
-    prompt: BoundedText,
-    choices: Vec<BoundedText>,
+    prompt: Text,
+    choices: Vec<Text>,
     answer_kind: ToolInputAnswerKind,
 }
 
@@ -32,7 +32,7 @@ pub enum ToolInputAnswerKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum ToolInputAnswer {
-    Text(BoundedText),
+    Text(Text),
     Choice { index: usize },
 }
 
@@ -83,9 +83,7 @@ impl<'de> Deserialize<'de> for ToolInputAnswer {
                     .as_str()
                     .ok_or_else(|| D::Error::custom("tool input text answer must be a string"))?;
                 validate_answer_text(text).map_err(D::Error::custom)?;
-                Ok(Self::Text(
-                    BoundedText::new_with_max_bytes(text, 8_192).map_err(D::Error::custom)?,
-                ))
+                Ok(Self::Text(Text::new(text)))
             }
             "choice" => {
                 let choice = data.as_object().ok_or_else(|| {
@@ -109,11 +107,10 @@ impl<'de> Deserialize<'de> for ToolInputAnswer {
 impl ToolInputRequest {
     pub fn new(
         prompt: impl AsRef<str>,
-        choices: Vec<BoundedText>,
+        choices: Vec<Text>,
         answer_kind: ToolInputAnswerKind,
     ) -> Result<Self, ToolValueError> {
-        let prompt = BoundedText::new_with_max_bytes(prompt.as_ref(), 8_192)
-            .map_err(|_| ToolValueError::InvalidText)?;
+        let prompt = Text::new(prompt);
         let request = Self {
             prompt,
             choices,
@@ -124,12 +121,11 @@ impl ToolInputRequest {
     }
 
     pub fn validate(&self) -> Result<(), ToolValueError> {
-        if !valid_text(self.prompt.as_str(), 8_192, false)
-            || self.choices.len() > 32
+        if !valid_text(self.prompt.as_str(), false)
             || self
                 .choices
                 .iter()
-                .any(|choice| !valid_text(choice.as_str(), 1_024, false))
+                .any(|choice| !valid_text(choice.as_str(), false))
             || (matches!(self.answer_kind, ToolInputAnswerKind::SingleChoice)
                 && self.choices.is_empty())
         {
@@ -138,11 +134,11 @@ impl ToolInputRequest {
         Ok(())
     }
 
-    pub const fn prompt(&self) -> &BoundedText {
+    pub const fn prompt(&self) -> &Text {
         &self.prompt
     }
 
-    pub fn choices(&self) -> &[BoundedText] {
+    pub fn choices(&self) -> &[Text] {
         &self.choices
     }
 
@@ -184,7 +180,7 @@ impl ToolInputAnswer {
 }
 
 fn validate_answer_text(value: &str) -> Result<(), ToolValueError> {
-    if valid_text(value, 8_192, false) {
+    if valid_text(value, false) {
         Ok(())
     } else {
         Err(ToolValueError::InvalidAnswer)

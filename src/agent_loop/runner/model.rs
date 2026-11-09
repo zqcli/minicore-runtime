@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use tokio::sync::mpsc;
@@ -17,8 +16,6 @@ use crate::model::{
 use crate::port_call::{PortCallOutcome, run_port_call};
 use crate::prompt::PromptRequest;
 use crate::time::DeadlineSource;
-
-const MODEL_PROGRESS_CAPACITY: usize = 64;
 
 pub(super) enum PromptPrep {
     Ready(Vec<ModelMessage>),
@@ -110,44 +107,34 @@ pub(super) async fn run_model(
             ctx.options.model_timeout,
             ctx.options.model_retry_attempts,
             ctx.options.model_retry_base_delay,
-            ctx.options.limits,
         ),
     );
 
     let context = ModelCallContext::new(ctx.id, request_index, cancellation.clone(), turn_deadline);
 
-    let progress_dropped = AtomicU64::new(0);
-    let (progress_tx, mut progress_rx) = mpsc::channel(MODEL_PROGRESS_CAPACITY);
-    let run = driver.run_detailed(request, context, &progress_tx, &progress_dropped);
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+    let run = driver.run_detailed(request, context, &progress_tx);
     tokio::pin!(run);
     let result = loop {
         tokio::select! {
             biased;
             Some(value) = progress_rx.recv() => {
-                forward_progress(ctx, request_index, value, &progress_dropped);
+                forward_progress(ctx, request_index, value);
             }
             result = &mut run => break result,
         }
     };
-    ctx.sink
-        .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
     while let Ok(value) = progress_rx.try_recv() {
-        forward_progress(ctx, request_index, value, &progress_dropped);
+        forward_progress(ctx, request_index, value);
     }
     result
 }
 
-fn forward_progress(
-    ctx: &mut LoopCtx<'_>,
-    request_index: u32,
-    value: ModelDriverProgress,
-    dropped: &AtomicU64,
-) {
+fn forward_progress(ctx: &mut LoopCtx<'_>, request_index: u32, value: ModelDriverProgress) {
     let (channel, delta) = match value {
         ModelDriverProgress::TextDelta(delta) => (OutputChannel::Text, delta),
         ModelDriverProgress::ReasoningDelta(delta) => (OutputChannel::Reasoning, delta),
     };
-    ctx.sink.record_dropped(dropped.swap(0, Ordering::Relaxed));
     ctx.sink.try_emit(LoopEvent::OutputDelta {
         loop_id: ctx.id,
         request_index,

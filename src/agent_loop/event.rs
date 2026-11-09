@@ -11,7 +11,7 @@ use crate::ids::{InteractionId, LoopId, ToolCallId};
 use crate::interaction::PendingInteraction;
 use crate::model::{ModelRef, ReasoningPreference};
 use crate::tools::{ToolName, ToolProgress, ToolResultOutcome};
-use crate::value::BoundedText;
+use crate::value::Text;
 
 /// Streaming channel of a model response, used to tag `OutputDelta` events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,7 +53,7 @@ pub enum LoopEvent {
         loop_id: LoopId,
         request_index: u32,
         channel: OutputChannel,
-        delta: BoundedText,
+        delta: Text,
     },
     ToolStarted {
         loop_id: LoopId,
@@ -88,29 +88,24 @@ pub enum LoopEvent {
     },
 }
 
-/// A best-effort live event with the number of events lost before it by the
-/// bounded event queue. Informational only; not a replay cursor.
+/// One optional live observation; it is not a replay cursor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoopEventEnvelope {
-    pub dropped_before: u64,
     pub event: LoopEvent,
 }
 
-/// The single-consumer, bounded, best-effort stream for live loop events.
+/// The single-consumer, unbounded, optional stream for live loop events.
 ///
 /// Dropping `LoopEventStream` has no execution effect; the runner keeps going
 /// and simply stops being observed.
 #[must_use = "LoopEventStream must be consumed or intentionally dropped"]
 pub struct LoopEventStream {
-    receiver: mpsc::Receiver<LoopEventEnvelope>,
+    receiver: mpsc::UnboundedReceiver<LoopEventEnvelope>,
 }
 
-/// Crate-private event sink owned by the runner task. Every emission is a
-/// `try_send`; a full or closed queue never blocks execution.
+/// Non-awaiting observation sender; a disconnected consumer never affects execution.
 pub(crate) struct LoopEventSink {
-    sender: mpsc::Sender<LoopEventEnvelope>,
-    dropped: u64,
-    closed: bool,
+    sender: mpsc::UnboundedSender<LoopEventEnvelope>,
 }
 
 impl LoopEventStream {
@@ -138,47 +133,12 @@ impl fmt::Debug for LoopEventStream {
 }
 
 impl LoopEventSink {
-    pub(crate) fn channel(capacity: usize) -> Result<(Self, LoopEventStream), EventSinkError> {
-        if capacity == 0 || capacity > MAX_EVENT_CAPACITY {
-            return Err(EventSinkError::InvalidCapacity);
-        }
-        let (sender, receiver) = mpsc::channel(capacity);
-        Ok((
-            Self {
-                sender,
-                dropped: 0,
-                closed: false,
-            },
-            LoopEventStream { receiver },
-        ))
-    }
-
-    pub(crate) fn record_dropped(&mut self, count: u64) {
-        self.dropped = self.dropped.saturating_add(count);
+    pub(crate) fn channel() -> (Self, LoopEventStream) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (Self { sender }, LoopEventStream { receiver })
     }
 
     pub(crate) fn try_emit(&mut self, event: LoopEvent) {
-        if self.closed {
-            return;
-        }
-        let dropped_before = self.dropped;
-        let envelope = LoopEventEnvelope {
-            dropped_before,
-            event,
-        };
-        match self.sender.try_send(envelope) {
-            Ok(()) => self.dropped = 0,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.dropped = self.dropped.saturating_add(1);
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => self.closed = true,
-        }
+        let _ = self.sender.send(LoopEventEnvelope { event });
     }
-}
-
-const MAX_EVENT_CAPACITY: usize = 4_096;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EventSinkError {
-    InvalidCapacity,
 }

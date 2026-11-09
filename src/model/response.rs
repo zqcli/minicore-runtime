@@ -2,7 +2,7 @@ use super::message::{normalize_parts, validate_tool_call_order};
 use super::{AssistantPart, ModelValueError, ProviderReplay, Usage};
 use crate::ids::ToolCallId;
 use crate::tools::ToolName;
-use crate::value::BoundedText;
+use crate::value::Text;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
@@ -152,17 +152,14 @@ impl<'de> Deserialize<'de> for ModelResponse {
     }
 }
 
-/// Maximum raw UTF-8 bytes in one model delta.
-pub const MAX_MODEL_EVENT_TEXT_BYTES: usize = 64 * 1024;
-
 /// Deltas retain raw text; assembly normalizes text and reasoning across events.
 #[derive(Clone, Eq, PartialEq)]
 pub enum ModelEvent {
     TextDelta {
-        delta: BoundedText,
+        delta: Text,
     },
     ReasoningDelta {
-        delta: BoundedText,
+        delta: Text,
     },
     ToolCallStart {
         tool_call_id: ToolCallId,
@@ -170,7 +167,7 @@ pub enum ModelEvent {
     },
     ToolCallArgumentsDelta {
         tool_call_id: ToolCallId,
-        delta: BoundedText,
+        delta: Text,
     },
     ToolCallEnd {
         tool_call_id: ToolCallId,
@@ -188,44 +185,22 @@ pub enum ModelEvent {
 }
 
 impl ModelEvent {
-    pub fn text_delta(delta: impl AsRef<str>) -> Result<Self, ModelValueError> {
-        Ok(Self::TextDelta {
-            delta: checked_event_text(delta.as_ref())?,
-        })
+    pub fn text_delta(delta: impl AsRef<str>) -> Self {
+        Self::TextDelta {
+            delta: Text::new(delta),
+        }
     }
 
-    pub fn reasoning_delta(delta: impl AsRef<str>) -> Result<Self, ModelValueError> {
-        Ok(Self::ReasoningDelta {
-            delta: checked_event_text(delta.as_ref())?,
-        })
+    pub fn reasoning_delta(delta: impl AsRef<str>) -> Self {
+        Self::ReasoningDelta {
+            delta: Text::new(delta),
+        }
     }
 
-    pub fn tool_call_arguments_delta(
-        tool_call_id: ToolCallId,
-        delta: impl AsRef<str>,
-    ) -> Result<Self, ModelValueError> {
-        Ok(Self::ToolCallArgumentsDelta {
+    pub fn tool_call_arguments_delta(tool_call_id: ToolCallId, delta: impl AsRef<str>) -> Self {
+        Self::ToolCallArgumentsDelta {
             tool_call_id,
-            delta: checked_event_text(delta.as_ref())?,
-        })
-    }
-
-    pub fn validate(&self) -> Result<(), ModelValueError> {
-        match self {
-            Self::TextDelta { delta }
-            | Self::ReasoningDelta { delta }
-            | Self::ToolCallArgumentsDelta { delta, .. } => {
-                if delta.byte_len() <= MAX_MODEL_EVENT_TEXT_BYTES {
-                    Ok(())
-                } else {
-                    Err(ModelValueError::InvalidEvent)
-                }
-            }
-            Self::ToolCallStart { .. }
-            | Self::ToolCallEnd { .. }
-            | Self::Usage { .. }
-            | Self::ProviderReplay { .. }
-            | Self::Finish { .. } => Ok(()),
+            delta: Text::new(delta),
         }
     }
 }
@@ -269,9 +244,4 @@ impl fmt::Debug for ModelEvent {
             Self::Finish { reason } => formatter.debug_tuple("Finish").field(reason).finish(),
         }
     }
-}
-
-fn checked_event_text(value: &str) -> Result<BoundedText, ModelValueError> {
-    BoundedText::new_with_max_bytes(value, MAX_MODEL_EVENT_TEXT_BYTES)
-        .map_err(|_| ModelValueError::InvalidEvent)
 }

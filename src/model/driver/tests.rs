@@ -129,7 +129,7 @@ fn start(id: ToolCallId, name: &str) -> ModelEvent {
 }
 
 fn args(id: ToolCallId, value: &str) -> ModelEvent {
-    ModelEvent::tool_call_arguments_delta(id, value).unwrap()
+    ModelEvent::tool_call_arguments_delta(id, value)
 }
 
 fn end(id: ToolCallId) -> ModelEvent {
@@ -138,7 +138,7 @@ fn end(id: ToolCallId) -> ModelEvent {
 
 fn text_success(value: &str) -> Vec<Result<ModelEvent, ModelError>> {
     vec![
-        Ok(ModelEvent::text_delta(value).unwrap()),
+        Ok(ModelEvent::text_delta(value)),
         Ok(finish(ModelFinishReason::Stop)),
     ]
 }
@@ -147,7 +147,7 @@ fn retryable_error(retry_after: Option<Duration>) -> ModelError {
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::ModelUnavailable,
         DiagnosticCategory::Model,
-        BoundedText::new("provider unavailable").unwrap(),
+        Text::new("provider unavailable"),
         true,
     )
     .expect("valid diagnostic text");
@@ -158,7 +158,7 @@ fn test_error(kind: ModelErrorKind) -> ModelError {
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::Internal,
         DiagnosticCategory::Model,
-        BoundedText::new("test model error").unwrap(),
+        Text::new("test model error"),
         false,
     )
     .expect("valid diagnostic text");

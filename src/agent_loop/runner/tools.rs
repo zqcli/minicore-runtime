@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
@@ -20,9 +19,7 @@ use crate::tools::{
     ToolPolicyRequest, ToolProgress, ToolProgressEmitter, ToolProgressSink, ToolResultOutcome,
     ToolSpec,
 };
-use crate::value::BoundedText;
-
-const TOOL_PROGRESS_CAPACITY: usize = 64;
+use crate::value::Text;
 
 pub(super) enum ToolStep {
     Result(ToolResultHistory),
@@ -45,7 +42,6 @@ pub(super) fn settle_calls(
             call.name(),
             outcome,
             message,
-            ctx.options.limits.max_tool_output_bytes,
         ));
     }
 }
@@ -139,13 +135,7 @@ pub(super) async fn run_tool_call(
     {
         PolicyStep::Allow => None,
         PolicyStep::Denied(reason) => {
-            return ToolStep::Result(denied_result(
-                ctx.id,
-                request_index,
-                invocation,
-                reason,
-                ctx.options.limits.max_tool_output_bytes,
-            ));
+            return ToolStep::Result(denied_result(ctx.id, request_index, invocation, reason));
         }
         PolicyStep::RequireApproval(request) => Some(request),
         PolicyStep::Cancelled => return ToolStep::End(FailPath::Cancelled),
@@ -175,13 +165,7 @@ pub(super) async fn run_tool_call(
         match answer {
             InteractionAnswer::Approval(ApprovalDecision::AllowOnce) => {}
             InteractionAnswer::Approval(ApprovalDecision::Deny) => {
-                return ToolStep::Result(denied_result(
-                    ctx.id,
-                    request_index,
-                    invocation,
-                    None,
-                    ctx.options.limits.max_tool_output_bytes,
-                ));
+                return ToolStep::Result(denied_result(ctx.id, request_index, invocation, None));
             }
             _ => return ToolStep::End(FailPath::Internal),
         }
@@ -196,13 +180,9 @@ pub(super) async fn run_tool_call(
     )
     .await
     {
-        ToolPort::Completed(output) => ToolStep::Result(completed_result(
-            ctx.id,
-            request_index,
-            invocation,
-            output,
-            ctx.options.limits.max_tool_output_bytes,
-        )),
+        ToolPort::Completed(output) => {
+            ToolStep::Result(completed_result(ctx.id, request_index, invocation, output))
+        }
         ToolPort::RequestInput(request) => {
             let interaction_id = match InteractionId::new() {
                 Ok(id) => id,
@@ -230,7 +210,6 @@ pub(super) async fn run_tool_call(
                         request_index,
                         invocation,
                         content,
-                        ctx.options.limits.max_tool_output_bytes,
                     ))
                 }
                 _ => ToolStep::End(FailPath::Internal),
@@ -243,7 +222,6 @@ pub(super) async fn run_tool_call(
             invocation.tool_name(),
             ToolResultOutcome::Failed,
             "tool failed",
-            ctx.options.limits.max_tool_output_bytes,
         )),
         ToolPort::End(path) => ToolStep::End(path),
     }
@@ -251,7 +229,7 @@ pub(super) async fn run_tool_call(
 
 enum PolicyStep {
     Allow,
-    Denied(Option<BoundedText>),
+    Denied(Option<Text>),
     RequireApproval(ApprovalRequest),
     Cancelled,
     TurnDeadline,
@@ -323,10 +301,8 @@ async fn run_tool_port(
 ) -> ToolPort {
     let call_id = invocation.tool_call_id().clone();
     let cancellation = ctx.control.cancellation();
-    let progress_dropped = Arc::new(AtomicU64::new(0));
-    let (progress_tx, mut progress_rx) = mpsc::channel(TOOL_PROGRESS_CAPACITY);
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
 
-    let progress_dropped_clone = Arc::clone(&progress_dropped);
     let run = run_port_call(
         &cancellation,
         turn_deadline,
@@ -338,7 +314,6 @@ async fn run_tool_port(
                 progress: ToolProgressSink::from_emitter(LoopToolProgress {
                     call_id: call_id.clone(),
                     sender: progress_tx.clone(),
-                    dropped: Arc::clone(&progress_dropped_clone),
                 }),
             };
             implementation.execute(invocation.clone(), context)
@@ -351,8 +326,7 @@ async fn run_tool_port(
             result = &mut run => break result,
             value = progress_rx.recv() => match value {
                 Some((channel, progress)) => {
-                    ctx.sink
-                        .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
+
                     ctx.sink.try_emit(LoopEvent::ToolProgress {
                         loop_id: ctx.id,
                         request_index,
@@ -364,11 +338,8 @@ async fn run_tool_port(
             },
         }
     };
-    ctx.sink
-        .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
+
     while let Ok(value) = progress_rx.try_recv() {
-        ctx.sink
-            .record_dropped(progress_dropped.swap(0, Ordering::Relaxed));
         ctx.sink.try_emit(LoopEvent::ToolProgress {
             loop_id: ctx.id,
             request_index,
@@ -402,20 +373,12 @@ async fn run_tool_port(
 
 struct LoopToolProgress {
     call_id: ToolCallId,
-    sender: mpsc::Sender<(ToolCallId, ToolProgress)>,
-    dropped: Arc<AtomicU64>,
+    sender: mpsc::UnboundedSender<(ToolCallId, ToolProgress)>,
 }
 
 impl ToolProgressEmitter for LoopToolProgress {
     fn emit(&self, progress: ToolProgress) -> bool {
-        match self.sender.try_send((self.call_id.clone(), progress)) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-                false
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        }
+        self.sender.send((self.call_id.clone(), progress)).is_ok()
     }
 }
 
@@ -485,42 +448,19 @@ async fn wait_interaction(
     Ok(answer)
 }
 
-fn static_output(message: &'static str, max_bytes: usize) -> ToolOutput {
-    let value = if message.len() <= max_bytes {
-        message
-    } else {
-        ""
-    };
-
-    ToolOutput::new(value).expect("static or empty tool output fits absolute bounds")
-}
-
 fn completed_result(
     id: LoopId,
     request_index: u32,
     invocation: &ToolInvocation,
     output: ToolOutput,
-    max_output_bytes: usize,
 ) -> ToolResultHistory {
-    if output.content().byte_len() <= max_output_bytes {
-        ToolResultHistory {
-            loop_id: id,
-            request_index,
-            call_id: invocation.tool_call_id().clone(),
-            tool_name: invocation.tool_name().clone(),
-            outcome: ToolResultOutcome::Success,
-            output,
-        }
-    } else {
-        terminal_tool_result(
-            id,
-            request_index,
-            invocation.tool_call_id(),
-            invocation.tool_name(),
-            ToolResultOutcome::Failed,
-            "tool output too large",
-            max_output_bytes,
-        )
+    ToolResultHistory {
+        loop_id: id,
+        request_index,
+        call_id: invocation.tool_call_id().clone(),
+        tool_name: invocation.tool_name().clone(),
+        outcome: ToolResultOutcome::Success,
+        output,
     }
 }
 
@@ -529,51 +469,31 @@ fn provided_input_result(
     request_index: u32,
     invocation: &ToolInvocation,
     content: String,
-    max_output_bytes: usize,
 ) -> ToolResultHistory {
-    if content.len() <= max_output_bytes
-        && let Ok(output) = ToolOutput::new(content)
-    {
-        return ToolResultHistory {
-            loop_id: id,
-            request_index,
-            call_id: invocation.tool_call_id().clone(),
-            tool_name: invocation.tool_name().clone(),
-            outcome: ToolResultOutcome::InputProvided,
-            output,
-        };
-    }
-    terminal_tool_result(
-        id,
+    ToolResultHistory {
+        loop_id: id,
         request_index,
-        invocation.tool_call_id(),
-        invocation.tool_name(),
-        ToolResultOutcome::Failed,
-        "tool output too large",
-        max_output_bytes,
-    )
+        call_id: invocation.tool_call_id().clone(),
+        tool_name: invocation.tool_name().clone(),
+        outcome: ToolResultOutcome::InputProvided,
+        output: ToolOutput::new(content).expect("validated answer has valid JSON text"),
+    }
 }
 
 fn denied_result(
     id: LoopId,
     request_index: u32,
     invocation: &ToolInvocation,
-    reason: Option<BoundedText>,
-    max_output_bytes: usize,
+    reason: Option<Text>,
 ) -> ToolResultHistory {
-    let output = match reason {
-        Some(reason) if reason.byte_len() <= max_output_bytes => {
-            ToolOutput::new(reason.as_str()).expect("denial reason fits tool output bounds")
-        }
-        _ => static_output("tool denied", max_output_bytes),
-    };
     ToolResultHistory {
         loop_id: id,
         request_index,
         call_id: invocation.tool_call_id().clone(),
         tool_name: invocation.tool_name().clone(),
         outcome: ToolResultOutcome::Denied,
-        output,
+        output: ToolOutput::new(reason.as_ref().map_or("tool denied", Text::as_str))
+            .expect("validated denial reason has valid text"),
     }
 }
 
@@ -584,7 +504,6 @@ pub(super) fn terminal_tool_result(
     tool_name: &ToolName,
     outcome: ToolResultOutcome,
     message: &'static str,
-    max_output_bytes: usize,
 ) -> ToolResultHistory {
     ToolResultHistory {
         loop_id: id,
@@ -592,6 +511,6 @@ pub(super) fn terminal_tool_result(
         call_id: call_id.clone(),
         tool_name: tool_name.clone(),
         outcome,
-        output: static_output(message, max_output_bytes),
+        output: ToolOutput::new(message).expect("static tool output has valid text"),
     }
 }

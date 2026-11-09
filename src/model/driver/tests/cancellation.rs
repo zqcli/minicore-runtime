@@ -159,7 +159,7 @@ async fn cancellation_during_stream_drops_stream_and_tracks_delivery() {
                 probe: Arc::clone(&pending),
             },
             Behavior::ProbedStream {
-                events: vec![Ok(ModelEvent::text_delta("seen").unwrap())],
+                events: vec![Ok(ModelEvent::text_delta("seen"))],
                 terminal: StreamTerminal::Pending,
                 probe: Arc::clone(&started),
             },

@@ -10,13 +10,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::ids::ToolCallId;
-use crate::value::{BoundedText, MAX_JSON_BYTES, MAX_TEXT_BYTES, validate_json_size};
+use crate::value::{Text, validate_json_nesting};
 
 use super::context::ToolContext;
 use super::input::ToolInputRequest;
 use super::types::{ToolError, ToolName, ToolValueError};
-
-const MAX_TOOL_DESCRIPTION_BYTES: usize = 4_096;
 
 /// Immutable tool metadata, checked by construction and deserialization.
 ///
@@ -28,7 +26,7 @@ const MAX_TOOL_DESCRIPTION_BYTES: usize = 4_096;
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ToolSpec {
     name: ToolName,
-    description: BoundedText,
+    description: Text,
     input_schema: Value,
 }
 
@@ -54,7 +52,7 @@ impl fmt::Debug for ToolSpec {
 #[serde(deny_unknown_fields)]
 struct ToolSpecWire {
     name: ToolName,
-    description: BoundedText,
+    description: Text,
     input_schema: Value,
 }
 
@@ -64,9 +62,7 @@ impl ToolSpec {
         description: impl AsRef<str>,
         input_schema: Value,
     ) -> Result<Self, ToolValueError> {
-        let description =
-            BoundedText::new_with_max_bytes(description.as_ref(), MAX_TOOL_DESCRIPTION_BYTES)
-                .map_err(|_| ToolValueError::InvalidText)?;
+        let description = Text::new(description);
         let spec = Self {
             name,
             description,
@@ -77,28 +73,10 @@ impl ToolSpec {
     }
 
     pub fn validate(&self) -> Result<(), ToolValueError> {
-        if !valid_text(self.description.as_str(), MAX_TOOL_DESCRIPTION_BYTES, false) {
+        if !valid_text(self.description.as_str(), false) {
             return Err(ToolValueError::InvalidText);
         }
-        if !self.input_schema.is_object()
-            || validate_json_size(&self.input_schema, MAX_JSON_BYTES).is_err()
-        {
-            return Err(ToolValueError::InvalidSchema);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn validate_for_bindings(
-        &self,
-        max_name_bytes: usize,
-        max_schema_bytes: usize,
-    ) -> Result<(), ToolValueError> {
-        if self.name.as_str().len() > max_name_bytes
-            || self.description.byte_len() > max_schema_bytes.min(MAX_TOOL_DESCRIPTION_BYTES)
-        {
-            return Err(ToolValueError::InvalidText);
-        }
-        if crate::value::json_bytes(&self.input_schema) > max_schema_bytes {
+        if !self.input_schema.is_object() || validate_json_nesting(&self.input_schema).is_err() {
             return Err(ToolValueError::InvalidSchema);
         }
         Ok(())
@@ -108,7 +86,7 @@ impl ToolSpec {
         &self.name
     }
 
-    pub const fn description(&self) -> &BoundedText {
+    pub const fn description(&self) -> &Text {
         &self.description
     }
 
@@ -128,45 +106,44 @@ impl<'de> Deserialize<'de> for ToolSpec {
     }
 }
 
-/// A validated, bounded tool result body, safe to cross process boundaries.
+/// A validated tool result body, safe to cross process boundaries.
 ///
 /// Values must be built through [`ToolOutput::new`] (or deserialized), which
-/// enforces byte and control-character bounds. The `content` field is private
+/// enforces control-character validation. The `content` field is private
 /// so external callers cannot assemble a struct literal that bypasses that
 /// validation:
 ///
 /// ```compile_fail
 /// use minicore_runtime::tools::ToolOutput;
-/// use minicore_runtime::BoundedText;
+/// use minicore_runtime::Text;
 ///
 /// let _ = ToolOutput {
-///     content: BoundedText::new("bad\0value").unwrap(),
+///     content: Text::new("bad\0value"),
 /// };
 /// ```
 #[derive(Clone, Eq, PartialEq)]
 pub struct ToolOutput {
-    content: BoundedText,
+    content: Text,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolOutputWire {
-    content: BoundedText,
+    content: Text,
 }
 
 impl ToolOutput {
     pub fn new(content: impl AsRef<str>) -> Result<Self, ToolValueError> {
         let content = content.as_ref();
-        if !valid_text(content, MAX_TEXT_BYTES, true) {
+        if !valid_text(content, true) {
             return Err(ToolValueError::InvalidText);
         }
         Ok(Self {
-            content: BoundedText::new_with_max_bytes(content, MAX_TEXT_BYTES)
-                .map_err(|_| ToolValueError::InvalidText)?,
+            content: Text::new(content),
         })
     }
 
-    pub const fn content(&self) -> &BoundedText {
+    pub const fn content(&self) -> &Text {
         &self.content
     }
 }
@@ -223,7 +200,7 @@ impl ToolInvocation {
         tool_name: ToolName,
         arguments: Value,
     ) -> Result<Self, ToolError> {
-        if !arguments.is_object() || validate_json_size(&arguments, MAX_JSON_BYTES).is_err() {
+        if !arguments.is_object() || validate_json_nesting(&arguments).is_err() {
             return Err(ToolError::InvalidInvocation);
         }
         Ok(Self {

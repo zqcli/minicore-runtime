@@ -29,7 +29,7 @@ pub enum ToolNameError {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolValueError {
-    #[error("tool value text is empty, unsafe, or exceeds its limit")]
+    #[error("tool value text is empty or contains disallowed control characters")]
     InvalidText,
     #[error("tool specification schema must be a JSON object")]
     InvalidSchema,

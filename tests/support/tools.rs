@@ -1,5 +1,5 @@
 use super::spec;
-use minicore_runtime::BoundedText;
+use minicore_runtime::Text;
 use minicore_runtime::tools::{
     Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolFuture, ToolInputAnswerKind,
     ToolInputRequest, ToolInvocation, ToolOutput, ToolSpec,
@@ -43,7 +43,7 @@ impl Tool for FakeTool {
                 Ok(ToolExecutionOutcome::RequestInput(
                     ToolInputRequest::new(
                         "choose",
-                        vec![BoundedText::new("yes").unwrap()],
+                        vec![Text::new("yes")],
                         ToolInputAnswerKind::SingleChoice,
                     )
                     .unwrap(),

@@ -4,7 +4,7 @@ use tokio::time::Instant as TokioInstant;
 
 use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::time::DeadlineSource;
-use crate::value::BoundedText;
+use crate::value::Text;
 
 use super::super::port::ModelCallContext;
 use super::super::{DeliveryState, ModelError, ModelErrorKind, ModelPartial, RetryHint};
@@ -189,13 +189,8 @@ pub(super) fn generated_error(kind: ModelErrorKind, delivery: DeliveryState) -> 
         ),
         _ => (DiagnosticCode::Internal, "model operation failed"),
     };
-    let diagnostic = DiagnosticSummary::new(
-        code,
-        DiagnosticCategory::Model,
-        BoundedText::new(msg).expect("static diagnostic must fit BoundedText"),
-        false,
-    )
-    .expect("valid diagnostic text");
+    let diagnostic = DiagnosticSummary::new(code, DiagnosticCategory::Model, Text::new(msg), false)
+        .expect("valid diagnostic text");
     match delivery {
         DeliveryState::NotStarted => {
             ModelError::permanent(kind, DeliveryState::NotStarted, diagnostic)

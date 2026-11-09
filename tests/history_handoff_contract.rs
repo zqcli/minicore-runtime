@@ -9,8 +9,8 @@ use minicore_runtime::model::{ModelEvent, ModelFinishReason, ProviderReplay, Usa
 use minicore_runtime::prompt::{PromptError, PromptFuture, PromptProvider, PromptRequest};
 use minicore_runtime::tools::{ToolResultOutcome, ToolSet};
 use minicore_runtime::{
-    AgentLoop, BoundedText, CancelReason, HistoryFuture, HistoryItem, LoopFailureKind, LoopHistory,
-    LoopId, LoopOptions, LoopOutcome, SummaryHistory,
+    AgentLoop, CancelReason, HistoryFuture, HistoryItem, LoopFailureKind, LoopHistory, LoopId,
+    LoopOptions, LoopOutcome, SummaryHistory, Text,
 };
 use tokio::sync::{Semaphore, mpsc};
 
@@ -60,7 +60,7 @@ impl LoopHistory for RecordingHistory {
                 return Err(DiagnosticSummary::new(
                     DiagnosticCode::Internal,
                     DiagnosticCategory::Internal,
-                    BoundedText::new("test save failed").unwrap(),
+                    Text::new("test save failed"),
                     false,
                 )
                 .unwrap());
@@ -122,7 +122,7 @@ async fn incremental_handoffs_preserve_order_and_gate_tools_and_next_model() {
         None,
     ));
     request.history = Arc::from([HistoryItem::Summary(SummaryHistory {
-        content: BoundedText::new("base is never redelivered").unwrap(),
+        content: Text::new("base is never redelivered"),
     })]);
     let agent = AgentLoop::start(request, options(history.clone()), inputs.clone()).unwrap();
     let id = agent.id();
@@ -346,7 +346,7 @@ async fn unsupported_complete_finish_is_handed_off_before_failed_outcome() {
     let replay =
         ProviderReplay::new("test/v1", serde_json::json!({"opaque": "preserved"})).unwrap();
     let (model, _) = scripted_model(vec![Round::Events(vec![
-        ModelEvent::text_delta("complete provider response").unwrap(),
+        ModelEvent::text_delta("complete provider response"),
         ModelEvent::Usage { usage },
         ModelEvent::ProviderReplay {
             replay: replay.clone(),
@@ -394,7 +394,7 @@ async fn usage_overflow_retains_the_new_complete_response_before_failure() {
     let (model, attempts, _) = scripted_model_counted(vec![
         Round::Events(first),
         Round::Events(vec![
-            ModelEvent::text_delta("complete response before usage overflow").unwrap(),
+            ModelEvent::text_delta("complete response before usage overflow"),
             ModelEvent::Usage {
                 usage: Usage::new(1, 0, 0),
             },
@@ -440,7 +440,7 @@ fn primary_model_error() -> minicore_runtime::model::ModelError {
         DiagnosticSummary::new(
             DiagnosticCode::ModelUnavailable,
             DiagnosticCategory::Model,
-            BoundedText::new("primary provider failure").unwrap(),
+            Text::new("primary provider failure"),
             false,
         )
         .unwrap(),
@@ -476,7 +476,7 @@ async fn primary_prompt_failure_survives_failed_history_save() {
 async fn primary_model_and_assembly_errors_survive_failed_history_save() {
     for invalid_assembly in [false, true] {
         let (history, _receiver) = recorder(false, Some(0), None);
-        let events = vec![ModelEvent::text_delta("unfinished output").unwrap()];
+        let events = vec![ModelEvent::text_delta("unfinished output")];
         let round = if invalid_assembly {
             Round::Events(events)
         } else {
@@ -540,7 +540,7 @@ async fn complete_response_failures_survive_failed_history_save() {
     ] {
         let (history, _receiver) = recorder(false, Some(0), None);
         let (model, _) = scripted_model(vec![Round::Events(vec![
-            ModelEvent::text_delta("complete but unsuccessful response").unwrap(),
+            ModelEvent::text_delta("complete but unsuccessful response"),
             ModelEvent::Finish { reason },
         ])]);
         let agent = AgentLoop::start(
@@ -641,14 +641,14 @@ async fn failure_claim_survives_later_cancel_during_failed_response_or_final_sav
         let (history, mut receiver) = recorder(true, Some(0), None);
         let round = if complete {
             Round::Events(vec![
-                ModelEvent::text_delta("complete response").unwrap(),
+                ModelEvent::text_delta("complete response"),
                 ModelEvent::Finish {
                     reason: ModelFinishReason::Unknown,
                 },
             ])
         } else {
             Round::StreamError {
-                events: vec![ModelEvent::text_delta("partial").unwrap()],
+                events: vec![ModelEvent::text_delta("partial")],
                 error: primary_model_error(),
             }
         };

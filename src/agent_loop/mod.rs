@@ -12,7 +12,6 @@ use crate::execution::UserInput;
 use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::HistoryItem;
 use crate::ids::LoopId;
-use crate::limits::LoopLimits;
 use crate::model::{
     MAX_MODEL_CALL_TIMEOUT, MAX_MODEL_RETRY_DELAY, ModelError, ModelPartial, Usage,
 };
@@ -29,8 +28,6 @@ pub use state::{LoopState, LoopStatus};
 
 use control::LoopControl;
 
-const MAX_TOOL_ROUNDS: u16 = 1_024;
-const MAX_EVENT_CAPACITY: usize = 4_096;
 /// The reused model driver only honors up to four delivery retries; the public
 /// validation below enforces the same ceiling as `start`.
 const MAX_MODEL_RETRY_ATTEMPTS: u8 = 4;
@@ -42,16 +39,12 @@ const MAX_MODEL_RETRY_ATTEMPTS: u8 = 4;
 #[derive(Clone)]
 pub struct LoopOptions {
     pub deadline: Option<tokio::time::Instant>,
-    /// Zero disables the round limit. Positive values opt into a finite budget.
-    pub max_tool_rounds: u16,
-    pub event_capacity: usize,
     pub prompt_timeout: Duration,
     pub model_timeout: Duration,
     pub policy_timeout: Duration,
     pub tool_timeout: Duration,
     pub model_retry_attempts: u8,
     pub model_retry_base_delay: Duration,
-    pub limits: LoopLimits,
     /// Acknowledges ordered new history before the runner continues.
     pub history: Option<Arc<dyn LoopHistory>>,
 }
@@ -60,15 +53,12 @@ impl LoopOptions {
     pub fn default_checked() -> Result<Self, LoopStartError> {
         let options = Self {
             deadline: None,
-            max_tool_rounds: 0,
-            event_capacity: 256,
             prompt_timeout: Duration::from_secs(30),
             model_timeout: Duration::from_secs(10 * 60),
             policy_timeout: Duration::from_secs(30),
             tool_timeout: Duration::from_secs(30 * 60),
             model_retry_attempts: 2,
             model_retry_base_delay: Duration::from_millis(100),
-            limits: LoopLimits::default(),
             history: None,
         };
         options.validate()?;
@@ -76,9 +66,7 @@ impl LoopOptions {
     }
 
     pub fn validate(&self) -> Result<(), LoopStartError> {
-        if self.max_tool_rounds > MAX_TOOL_ROUNDS
-            || !(1..=MAX_EVENT_CAPACITY).contains(&self.event_capacity)
-            || self.prompt_timeout.is_zero()
+        if self.prompt_timeout.is_zero()
             || self.model_timeout.is_zero()
             || self.model_timeout > MAX_MODEL_CALL_TIMEOUT
             || self.policy_timeout.is_zero()
@@ -93,9 +81,7 @@ impl LoopOptions {
         {
             return Err(LoopStartError::InvalidOptions);
         }
-        self.limits
-            .validate()
-            .map_err(|_| LoopStartError::InvalidOptions)
+        Ok(())
     }
 }
 
@@ -104,15 +90,12 @@ impl fmt::Debug for LoopOptions {
         formatter
             .debug_struct("LoopOptions")
             .field("deadline", &self.deadline)
-            .field("max_tool_rounds", &self.max_tool_rounds)
-            .field("event_capacity", &self.event_capacity)
             .field("prompt_timeout", &self.prompt_timeout)
             .field("model_timeout", &self.model_timeout)
             .field("policy_timeout", &self.policy_timeout)
             .field("tool_timeout", &self.tool_timeout)
             .field("model_retry_attempts", &self.model_retry_attempts)
             .field("model_retry_base_delay", &self.model_retry_base_delay)
-            .field("limits", &self.limits)
             .field("history", &self.history.as_ref().map(|_| "<callback>"))
             .finish()
     }
@@ -158,7 +141,7 @@ impl LoopRequest {
 /// included) and again once a prompt is prepared; a non-empty answer rebuilds
 /// that prompt. A model answer without tool calls always ends the loop, so
 /// `take` is not called after it. Inputs are trusted: the host validates them
-/// (non-empty, within `max_user_input_bytes`) where it accepts them.
+/// (non-empty) where it accepts them.
 ///
 /// `take` runs synchronously on the runner task and must not block, await or
 /// do IO.
@@ -184,22 +167,13 @@ impl AgentLoop {
     ) -> Result<Self, LoopStartError> {
         tokio::runtime::Handle::try_current().map_err(|_| LoopStartError::NoTokioRuntime)?;
         options.validate()?;
-        // Same config-vs-LoopLimits validation as `LoopHandle::update`: the
-        // initial config must satisfy the loop's runtime budgets too.
-        request
-            .config
-            .validate_against_limits(&options.limits)
-            .map_err(|_| LoopStartError::InvalidConfig)?;
-        let input_bytes = request.input.as_text().len();
-        if input_bytes == 0 || input_bytes > options.limits.max_user_input_bytes {
+        if request.input.as_text().is_empty() {
             return Err(LoopStartError::InvalidInput);
         }
 
         let id = LoopId::new().map_err(|_| LoopStartError::IdGeneration)?;
         let options = Arc::new(options);
-        let (control, sink, events, completion_tx) =
-            LoopControl::new(id, options.event_capacity, options.limits)
-                .map_err(|_| LoopStartError::InvalidOptions)?;
+        let (control, sink, events, completion_tx) = LoopControl::new(id);
         let control = Arc::new(control);
 
         let join = tokio::spawn(runner::run_loop(
@@ -272,7 +246,7 @@ pub struct LoopReport {
     pub history_failure: Option<DiagnosticSummary>,
     pub usage: Usage,
     pub requests: u32,
-    /// Number of tool batches entered; independent of the optional u16 budget.
+    /// Number of tool batches entered.
     pub tool_rounds: u64,
     pub final_config_revision: ConfigRevision,
 }
@@ -325,7 +299,6 @@ pub enum LoopFailureKind {
     Policy,
     Interaction,
     History,
-    MaxToolRounds,
     Internal,
 }
 
@@ -337,8 +310,6 @@ pub enum LoopStartError {
     NoTokioRuntime,
     #[error("loop options are invalid")]
     InvalidOptions,
-    #[error("execution config is invalid")]
-    InvalidConfig,
     #[error("loop input is invalid")]
     InvalidInput,
     #[error("loop id generation failed")]
@@ -361,8 +332,6 @@ pub enum AnswerError {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum UpdateError {
-    #[error("config does not satisfy the loop limits")]
-    InvalidConfig,
     #[error("the loop is not accepting config updates")]
     NotActive,
 }

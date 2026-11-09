@@ -42,7 +42,7 @@ async fn excessive_retry_after_started_unknown_and_nonretryable_do_not_retry() {
     let diag = DiagnosticSummary::new(
         DiagnosticCode::ModelUnavailable,
         DiagnosticCategory::Model,
-        BoundedText::new("test model error").unwrap(),
+        Text::new("test model error"),
         false,
     )
     .expect("valid diagnostic text");
@@ -90,7 +90,7 @@ async fn semantic_event_blocks_retry_and_normalizes_lying_not_started_error() {
         descriptor(),
         vec![
             Behavior::Events(vec![
-                Ok(ModelEvent::text_delta("partial").unwrap()),
+                Ok(ModelEvent::text_delta("partial")),
                 Err(retryable_error(None)),
             ]),
             Behavior::Events(text_success("unexpected")),

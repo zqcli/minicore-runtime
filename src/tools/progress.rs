@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::value::{BoundedText, valid_text};
+use crate::value::{Text, valid_text};
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct ToolProgress {
-    pub message: Option<BoundedText>,
+    pub message: Option<Text>,
     pub completed: Option<u64>,
     pub total: Option<u64>,
 }
@@ -16,10 +16,7 @@ impl fmt::Debug for ToolProgress {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ToolProgress")
-            .field(
-                "message_bytes",
-                &self.message.as_ref().map(BoundedText::byte_len),
-            )
+            .field("message_bytes", &self.message.as_ref().map(Text::byte_len))
             .field("completed", &self.completed)
             .field("total", &self.total)
             .finish()
@@ -36,7 +33,7 @@ pub enum ToolProgressError {
 
 impl ToolProgress {
     pub fn new(
-        message: Option<BoundedText>,
+        message: Option<Text>,
         completed: Option<u64>,
         total: Option<u64>,
     ) -> Result<Self, ToolProgressError> {
@@ -53,7 +50,7 @@ impl ToolProgress {
         if self
             .message
             .as_ref()
-            .is_some_and(|message| !valid_text(message.as_str(), BoundedText::MAX_BYTES, true))
+            .is_some_and(|message| !valid_text(message.as_str(), true))
         {
             return Err(ToolProgressError::InvalidText);
         }
@@ -114,7 +111,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{ToolProgress, ToolProgressEmitter, ToolProgressSink};
-    use crate::value::BoundedText;
+    use crate::value::Text;
 
     struct ChannelEmitter {
         sender: mpsc::Sender<ToolProgress>,
@@ -135,7 +132,7 @@ mod tests {
     }
 
     fn progress() -> ToolProgress {
-        ToolProgress::new(Some(BoundedText::new("working").unwrap()), Some(1), Some(2)).unwrap()
+        ToolProgress::new(Some(Text::new("working")), Some(1), Some(2)).unwrap()
     }
 
     #[test]

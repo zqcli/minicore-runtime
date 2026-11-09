@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use minicore_runtime::model::{DeliveryState, ModelError, ModelErrorKind, RetryHint};
-use minicore_runtime::value::BoundedText;
+use minicore_runtime::value::Text;
 use serde_json::json;
 
 #[test]
@@ -10,14 +10,14 @@ fn model_errors_enforce_delivery_retry_and_panic_invariants() {
     let diag_unretryable = DiagnosticSummary::new(
         DiagnosticCode::ModelUnavailable,
         DiagnosticCategory::Model,
-        BoundedText::new("rate limited").unwrap(),
+        Text::new("rate limited"),
         false,
     )
     .expect("valid diagnostic text");
     let diag_retryable = DiagnosticSummary::new(
         DiagnosticCode::ModelUnavailable,
         DiagnosticCategory::Model,
-        BoundedText::new("rate limited").unwrap(),
+        Text::new("rate limited"),
         true,
     )
     .expect("valid diagnostic text");

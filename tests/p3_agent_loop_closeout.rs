@@ -35,7 +35,7 @@ use minicore_runtime::tools::{
     ApprovalDecision, Tool, ToolContext, ToolFuture, ToolInvocation, ToolPolicy, ToolResultOutcome,
     ToolSet, ToolSpec,
 };
-use minicore_runtime::value::BoundedText;
+use minicore_runtime::value::Text;
 use minicore_runtime::{
     AgentLoop, AnswerError, ConfigRevision, ExecutionConfig, HistoryItem, InteractionAnswer,
     LoopEvent, LoopFailureKind, LoopOptions, LoopOutcome, LoopReport, LoopRequest, LoopStartError,
@@ -79,7 +79,7 @@ fn tool_call_event(name: &str, call_id: &str) -> Vec<ModelEvent> {
             tool_call_id: call_id.parse().unwrap(),
             tool_name: name.parse().unwrap(),
         },
-        ModelEvent::tool_call_arguments_delta(call_id.parse().unwrap(), "{}").unwrap(),
+        ModelEvent::tool_call_arguments_delta(call_id.parse().unwrap(), "{}"),
         ModelEvent::ToolCallEnd {
             tool_call_id: call_id.parse().unwrap(),
         },
@@ -552,7 +552,7 @@ async fn missing_tool_call_terminal_is_invalid_and_not_appended() {
     };
     let malformed = model(vec![Round::Events(vec![
         start_event,
-        ModelEvent::tool_call_arguments_delta("call_1".parse().unwrap(), "{}").unwrap(),
+        ModelEvent::tool_call_arguments_delta("call_1".parse().unwrap(), "{}"),
         ModelEvent::Finish {
             reason: ModelFinishReason::ToolCalls,
         },
@@ -626,13 +626,13 @@ async fn partial_stream_failure_is_a_model_failure_without_an_assistant_item() {
         ) -> ModelStartFuture<'a> {
             Box::pin(async move {
                 Ok::<ModelStream, ModelError>(Box::pin(stream::iter(vec![
-                    Ok(ModelEvent::text_delta("partial").unwrap()),
+                    Ok(ModelEvent::text_delta("partial")),
                     Err(ModelError::started(
                         ModelErrorKind::Unavailable,
                         DiagnosticSummary::new(
                             DiagnosticCode::ModelUnavailable,
                             DiagnosticCategory::Model,
-                            BoundedText::new("stream died").unwrap(),
+                            Text::new("stream died"),
                             false,
                         )
                         .expect("valid diagnostic text"),
@@ -699,7 +699,7 @@ async fn run_malformed(events: Vec<ModelEvent>) -> Arc<LoopReport> {
 async fn unknown_finish_without_tool_call_fails_without_assistant_history() {
     let usage = Usage::new(12, 8, 4);
     let report = run_malformed(vec![
-        ModelEvent::text_delta("invalid").unwrap(),
+        ModelEvent::text_delta("invalid"),
         ModelEvent::Usage { usage },
         ModelEvent::Finish {
             reason: ModelFinishReason::Unknown,
@@ -733,7 +733,7 @@ async fn unknown_finish_without_tool_call_fails_without_assistant_history() {
 #[tokio::test]
 async fn tool_calls_finish_without_tool_call_is_invalid_and_not_appended() {
     let report = run_malformed(vec![
-        ModelEvent::text_delta("stray").unwrap(),
+        ModelEvent::text_delta("stray"),
         ModelEvent::Finish {
             reason: ModelFinishReason::ToolCalls,
         },
@@ -760,7 +760,7 @@ async fn tool_calls_finish_without_tool_call_is_invalid_and_not_appended() {
 #[tokio::test]
 async fn stop_finish_completes_and_keeps_the_assistant_text() {
     let report = run_malformed(vec![
-        ModelEvent::text_delta("done").unwrap(),
+        ModelEvent::text_delta("done"),
         ModelEvent::Finish {
             reason: ModelFinishReason::Stop,
         },
@@ -775,7 +775,7 @@ async fn stop_finish_completes_and_keeps_the_assistant_text() {
 #[tokio::test]
 async fn length_finish_fails_as_output_limit_and_keeps_assistant_text() {
     let report = run_malformed(vec![
-        ModelEvent::text_delta("truncated").unwrap(),
+        ModelEvent::text_delta("truncated"),
         ModelEvent::Finish {
             reason: ModelFinishReason::Length,
         },
@@ -808,7 +808,7 @@ async fn refused_and_content_filtered_finishes_keep_their_kinds_and_assistant_te
         ),
     ] {
         let report = run_malformed(vec![
-            ModelEvent::text_delta(text).unwrap(),
+            ModelEvent::text_delta(text),
             ModelEvent::Finish { reason },
         ])
         .await;
@@ -851,14 +851,14 @@ async fn delivery_retry_recovers_at_the_loop_level() {
                         DiagnosticSummary::new(
                             DiagnosticCode::ModelUnavailable,
                             DiagnosticCategory::Model,
-                            BoundedText::new("retry me").unwrap(),
+                            Text::new("retry me"),
                             true,
                         )
                         .expect("valid diagnostic text"),
                     ))
                 } else {
                     Ok::<ModelStream, ModelError>(Box::pin(stream::iter(vec![
-                        Ok(ModelEvent::text_delta("recovered").unwrap()),
+                        Ok(ModelEvent::text_delta("recovered")),
                         Ok(ModelEvent::Finish {
                             reason: ModelFinishReason::Stop,
                         }),
@@ -936,7 +936,7 @@ async fn shared_model_and_toolset_loops_cancel_isolated_without_orphans() {
             Box::pin(async move {
                 gate.notified().await;
                 Ok::<ModelStream, ModelError>(Box::pin(stream::iter(vec![
-                    Ok(ModelEvent::text_delta("shared").unwrap()),
+                    Ok(ModelEvent::text_delta("shared")),
                     Ok(ModelEvent::Finish {
                         reason: ModelFinishReason::Stop,
                     }),

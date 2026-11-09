@@ -31,7 +31,7 @@ use minicore_runtime::tools::{
     ApprovalDecision, ToolInputAnswer, ToolInputAnswerKind, ToolInputRequest, ToolPolicy,
     ToolResultOutcome, ToolSet, ToolSpec,
 };
-use minicore_runtime::value::BoundedText;
+use minicore_runtime::value::Text;
 use minicore_runtime::{
     AgentLoop, AnswerError, CancelReason, ConfigRevision, ExecutionConfig, HistoryItem,
     HistoryView, InteractionAnswer, LoopEvent, LoopFailureKind, LoopInputs, LoopOptions,
@@ -487,9 +487,7 @@ async fn interactions_without_a_deadline_outlive_twenty_four_hours() {
         let answer = if approval {
             InteractionAnswer::Approval(ApprovalDecision::AllowOnce)
         } else {
-            InteractionAnswer::ToolInput(ToolInputAnswer::Text(
-                BoundedText::new("line one\n\tline two").unwrap(),
-            ))
+            InteractionAnswer::ToolInput(ToolInputAnswer::Text(Text::new("line one\n\tline two")))
         };
         handle.answer(pending.interaction_id, answer).unwrap();
         assert_completed_with_text(finish(agent).await.as_ref(), "done");
@@ -578,7 +576,7 @@ async fn wrong_interaction_answers_are_rejected_and_loop_stays_waiting() {
     assert_eq!(
         handle.answer(
             pending.interaction_id,
-            InteractionAnswer::ToolInput(ToolInputAnswer::Text(BoundedText::new("sure").unwrap()))
+            InteractionAnswer::ToolInput(ToolInputAnswer::Text(Text::new("sure")))
         ),
         Err(AnswerError::WrongInteraction)
     );
@@ -654,9 +652,7 @@ async fn tool_input_interaction_feeds_an_input_provided_result() {
     handle
         .answer(
             pending.interaction_id,
-            InteractionAnswer::ToolInput(ToolInputAnswer::Text(
-                BoundedText::new("the answer is 42").unwrap(),
-            )),
+            InteractionAnswer::ToolInput(ToolInputAnswer::Text(Text::new("the answer is 42"))),
         )
         .unwrap();
 
@@ -910,10 +906,10 @@ impl Model for TimedDeltaModel {
             let stream: ModelStream =
                 Box::pin(futures_util::stream::unfold(0_u8, move |step| async move {
                     match step {
-                        0 => Some((Ok(ModelEvent::text_delta("one").unwrap()), 1)),
+                        0 => Some((Ok(ModelEvent::text_delta("one")), 1)),
                         1 => {
                             tokio::time::sleep(gap).await;
-                            Some((Ok(ModelEvent::text_delta("two").unwrap()), 2))
+                            Some((Ok(ModelEvent::text_delta("two")), 2))
                         }
                         2 => Some((
                             Ok(ModelEvent::Finish {
@@ -3384,7 +3380,7 @@ async fn default_provider_projects_history_in_order_with_summary_and_optional_sy
         user_item(UserMessageKind::Prompt, "base q"),
         assistant_item("host:model-a", "base a"),
         HistoryItem::Summary(minicore_runtime::history::SummaryHistory {
-            content: BoundedText::new("s1").unwrap(),
+            content: Text::new("s1"),
         }),
     ];
     let appended = vec![
@@ -3424,7 +3420,7 @@ async fn default_provider_projects_history_in_order_with_summary_and_optional_sy
     assert_eq!(rendered.messages, expected_without_system);
 
     // Non-empty system prompt is emitted first.
-    let with_system = DefaultPromptProvider::new(Some(BoundedText::new("SYS").unwrap()))
+    let with_system = DefaultPromptProvider::new(Some(Text::new("SYS")))
         .prepare(default_request(view, false, &descriptor, &tools))
         .await
         .unwrap();
@@ -3433,7 +3429,7 @@ async fn default_provider_projects_history_in_order_with_summary_and_optional_sy
     assert_eq!(with_system.messages, expected);
 
     // An empty (but present) system prompt is omitted too.
-    let empty_system = DefaultPromptProvider::new(Some(BoundedText::new("").unwrap()))
+    let empty_system = DefaultPromptProvider::new(Some(Text::new("")))
         .prepare(default_request(view, false, &descriptor, &tools))
         .await
         .unwrap();
@@ -3554,9 +3550,7 @@ async fn default_provider_runs_a_loop_end_to_end_with_system_prompt() {
             ReasoningPreference::Auto,
             ToolSet::default(),
             None,
-            Arc::new(DefaultPromptProvider::new(Some(
-                BoundedText::new("SYSTEM").unwrap(),
-            ))),
+            Arc::new(DefaultPromptProvider::new(Some(Text::new("SYSTEM")))),
         )),
         LoopOptions::default_checked().unwrap(),
         no_inputs(),
@@ -3576,10 +3570,10 @@ async fn default_provider_truncates_large_summary_at_the_absolute_limit() {
     let descriptor = default_descriptor();
     let tools: Vec<ToolSpec> = Vec::new();
     let prefix = "Conversation summary:\n";
-    let absolute = BoundedText::MAX_BYTES;
+    let absolute = Text::MAX_BYTES;
 
     async fn render(
-        content: &BoundedText,
+        content: &Text,
         descriptor: &minicore_runtime::model::ModelDescriptor,
         tools: &[ToolSpec],
     ) -> Result<Vec<ModelMessage>, PromptError> {
@@ -3597,7 +3591,7 @@ async fn default_provider_truncates_large_summary_at_the_absolute_limit() {
 
     // Max ASCII content: must truncate but keep the exact prefix, stay within
     // the absolute ceiling, and produce a valid ModelMessage.
-    let ascii = BoundedText::new("x".repeat(absolute)).unwrap();
+    let ascii = Text::new("x".repeat(absolute));
     let messages = render(&ascii, &descriptor, &tools).await.unwrap();
     assert_eq!(messages.len(), 1);
     let ModelMessage::System(text) = &messages[0] else {
@@ -3613,7 +3607,7 @@ async fn default_provider_truncates_large_summary_at_the_absolute_limit() {
     // Multi-byte content crossing the truncation point: the cut must land on a
     // character boundary and never panic.
     let budget = absolute - prefix.len();
-    let multibyte = BoundedText::new(format!("{}€€", "x".repeat(budget - 2))).unwrap();
+    let multibyte = Text::new(format!("{}€€", "x".repeat(budget - 2)));
     let messages = render(&multibyte, &descriptor, &tools).await.unwrap();
     let ModelMessage::System(text) = &messages[0] else {
         panic!("summary must project to a System message");
@@ -3624,7 +3618,7 @@ async fn default_provider_truncates_large_summary_at_the_absolute_limit() {
     messages[0].validate().unwrap();
 
     // Exactly the remaining budget: no truncation at all.
-    let exact = BoundedText::new("y".repeat(budget)).unwrap();
+    let exact = Text::new("y".repeat(budget));
     let messages = render(&exact, &descriptor, &tools).await.unwrap();
     let ModelMessage::System(text) = &messages[0] else {
         panic!("summary must project to a System message");
@@ -3800,9 +3794,7 @@ async fn tool_input_answer_exceeding_limit_fails_and_bounded() {
     handle
         .answer(
             pending.interaction_id,
-            InteractionAnswer::ToolInput(ToolInputAnswer::Text(
-                BoundedText::new(large_answer.clone()).unwrap(),
-            )),
+            InteractionAnswer::ToolInput(ToolInputAnswer::Text(Text::new(large_answer.clone()))),
         )
         .unwrap();
 
@@ -3838,9 +3830,9 @@ async fn policy_denied_reason_exceeding_limit_remains_denied_and_bounded() {
 
     let large_reason = "x".repeat(64);
     let policy = Arc::new(ScriptedPolicy {
-        plan: Arc::new(vec![PolicyPlan::DenyReason(
-            BoundedText::new(large_reason.clone()).unwrap(),
-        )]),
+        plan: Arc::new(vec![PolicyPlan::DenyReason(Text::new(
+            large_reason.clone(),
+        ))]),
         calls: Arc::new(AtomicUsize::new(0)),
     });
     let agent = AgentLoop::start(
@@ -4139,7 +4131,7 @@ async fn assert_invalid_tool_input_request_fails(invalid_request: ToolInputReque
 #[tokio::test]
 async fn invalid_tool_input_single_choice_empty_choices_fails_without_interaction() {
     let invalid_request = ToolInputRequest {
-        prompt: BoundedText::new("choose").unwrap(),
+        prompt: Text::new("choose"),
         choices: vec![],
         answer_kind: ToolInputAnswerKind::SingleChoice,
     };
@@ -4150,8 +4142,8 @@ async fn invalid_tool_input_single_choice_empty_choices_fails_without_interactio
 #[tokio::test]
 async fn invalid_tool_input_empty_prompt_fails_without_interaction() {
     let invalid_request = ToolInputRequest {
-        prompt: BoundedText::new("").unwrap(),
-        choices: vec![BoundedText::new("choice_1").unwrap()],
+        prompt: Text::new(""),
+        choices: vec![Text::new("choice_1")],
         answer_kind: ToolInputAnswerKind::SingleChoice,
     };
     assert_invalid_tool_input_request_fails(invalid_request).await;
@@ -4161,10 +4153,8 @@ async fn invalid_tool_input_empty_prompt_fails_without_interaction() {
 #[tokio::test]
 async fn invalid_tool_input_too_many_choices_fails_without_interaction() {
     let invalid_request = ToolInputRequest {
-        prompt: BoundedText::new("choose").unwrap(),
-        choices: (0..33)
-            .map(|i| BoundedText::new(format!("choice_{i}")).unwrap())
-            .collect(),
+        prompt: Text::new("choose"),
+        choices: (0..33).map(|i| Text::new(format!("choice_{i}"))).collect(),
         answer_kind: ToolInputAnswerKind::SingleChoice,
     };
     assert_invalid_tool_input_request_fails(invalid_request).await;
@@ -4174,8 +4164,8 @@ async fn invalid_tool_input_too_many_choices_fails_without_interaction() {
 #[tokio::test]
 async fn invalid_tool_input_oversized_choice_fails_without_interaction() {
     let invalid_request = ToolInputRequest {
-        prompt: BoundedText::new("choose").unwrap(),
-        choices: vec![BoundedText::new("x".repeat(1025)).unwrap()],
+        prompt: Text::new("choose"),
+        choices: vec![Text::new("x".repeat(1025))],
         answer_kind: ToolInputAnswerKind::SingleChoice,
     };
     assert_invalid_tool_input_request_fails(invalid_request).await;
@@ -4228,7 +4218,7 @@ async fn model_error_auth_rejected_preserves_classification_and_diagnostic() {
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::InvalidConfiguration,
         DiagnosticCategory::Model,
-        BoundedText::new("invalid credentials").unwrap(),
+        Text::new("invalid credentials"),
         false,
     )
     .expect("valid diagnostic text");
@@ -4277,7 +4267,7 @@ async fn retry_backoff_keeps_the_model_cause_and_honors_loop_deadlines() {
         DiagnosticSummary::new(
             DiagnosticCode::ModelUnavailable,
             DiagnosticCategory::Model,
-            BoundedText::new("provider rate limited").unwrap(),
+            Text::new("provider rate limited"),
             true,
         )
         .unwrap(),
@@ -4325,7 +4315,7 @@ async fn model_error_rate_limited_exhausting_retry_preserves_diagnostic() {
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::ModelTimeout,
         DiagnosticCategory::Model,
-        BoundedText::new("rate limit exceeded").unwrap(),
+        Text::new("rate limit exceeded"),
         true,
     )
     .expect("valid diagnostic text");
@@ -4395,7 +4385,7 @@ async fn model_error_quota_exceeded_preserves_diagnostic() {
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::ToolFailed,
         DiagnosticCategory::Model,
-        BoundedText::new("quota depleted").unwrap(),
+        Text::new("quota depleted"),
         false,
     )
     .expect("valid diagnostic text");
@@ -4434,7 +4424,7 @@ async fn model_error_context_overflow_preserves_diagnostic() {
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::ContextFailed,
         DiagnosticCategory::Model,
-        BoundedText::new("context length exceeded").unwrap(),
+        Text::new("context length exceeded"),
         false,
     )
     .expect("valid diagnostic text");
@@ -4473,7 +4463,7 @@ async fn model_error_request_outcome_unknown_preserves_diagnostic() {
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::RuntimeTerminated,
         DiagnosticCategory::Model,
-        BoundedText::new("network connection reset").unwrap(),
+        Text::new("network connection reset"),
         false,
     )
     .expect("valid diagnostic text");
@@ -4517,13 +4507,13 @@ async fn model_error_stream_started_preserves_diagnostic_and_omits_partial_histo
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::ModelUnavailable,
         DiagnosticCategory::Model,
-        BoundedText::new("stream severed after partial chunk").unwrap(),
+        Text::new("stream severed after partial chunk"),
         false,
     )
     .expect("valid diagnostic text");
     let expected_error = ModelError::started(ModelErrorKind::Unavailable, diagnostic.clone());
     let (model, _) = scripted_model(vec![Round::StreamError {
-        events: vec![ModelEvent::text_delta("partial response text").unwrap()],
+        events: vec![ModelEvent::text_delta("partial response text")],
         error: expected_error.clone(),
     }]);
 
@@ -4562,7 +4552,7 @@ async fn model_error_invalid_provider_response_preserves_diagnostic() {
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::ModelMalformedResponse,
         DiagnosticCategory::Model,
-        BoundedText::new("corrupt json response payload").unwrap(),
+        Text::new("corrupt json response payload"),
         false,
     )
     .expect("valid diagnostic text");
@@ -4684,7 +4674,7 @@ async fn loop_failure_debug_does_not_leak_diagnostic_message() {
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::InvalidConfiguration,
         DiagnosticCategory::Model,
-        BoundedText::new(secret).unwrap(),
+        Text::new(secret),
         false,
     )
     .expect("valid diagnostic text");
@@ -4720,7 +4710,7 @@ async fn first_request_start_error_counts_as_one_request_with_state_zero() {
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::ModelUnavailable,
         DiagnosticCategory::Model,
-        BoundedText::new("start rejected").unwrap(),
+        Text::new("start rejected"),
         false,
     )
     .expect("valid diagnostic text");
@@ -4773,7 +4763,7 @@ async fn first_request_stream_failure_counts_as_one_request_with_state_zero() {
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::ModelUnavailable,
         DiagnosticCategory::Model,
-        BoundedText::new("stream aborted").unwrap(),
+        Text::new("stream aborted"),
         false,
     )
     .expect("valid diagnostic text");
@@ -4816,7 +4806,7 @@ async fn second_request_failure_counts_as_two_requests_with_state_one() {
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::ModelUnavailable,
         DiagnosticCategory::Model,
-        BoundedText::new("fail on round 2").unwrap(),
+        Text::new("fail on round 2"),
         false,
     )
     .expect("valid diagnostic text");
@@ -5195,7 +5185,7 @@ async fn replay_survives_runner_history_serde_and_default_projection() {
             replay: replay.clone(),
         }];
         if with_text {
-            events.push(ModelEvent::text_delta("answer").unwrap());
+            events.push(ModelEvent::text_delta("answer"));
         }
         events.push(ModelEvent::Finish {
             reason: ModelFinishReason::Stop,

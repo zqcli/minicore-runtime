@@ -6,11 +6,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
-/// Absolute ceiling for a single `ModelMessage` text payload (system, user,
-/// or an assistant text part). Default prompt projection truncates summary
-/// tails so this bound is always satisfied.
-pub(crate) const MAX_MODEL_MESSAGE_TEXT_BYTES: usize = 262_144;
-
 #[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AssistantPart {
@@ -56,10 +51,10 @@ impl ReasoningContent {
         encrypted: Option<String>,
         signature: Option<String>,
     ) -> Result<Self, ModelValueError> {
-        let text = normalize_optional_text(text, 262_144)?;
-        let summary = normalize_optional_text(summary, 131_072)?;
-        validate_optional_opaque(&encrypted, 262_144)?;
-        validate_optional_opaque(&signature, 16_384)?;
+        let text = normalize_optional_text(text);
+        let summary = normalize_optional_text(summary);
+        validate_optional_opaque(&encrypted)?;
+        validate_optional_opaque(&signature)?;
         if text.is_none() && summary.is_none() && encrypted.is_none() && signature.is_none() {
             return Err(ModelValueError::EmptyReasoningContent);
         }
@@ -133,25 +128,13 @@ impl<'de> Deserialize<'de> for ReasoningContent {
     }
 }
 
-fn normalize_optional_text(
-    value: Option<String>,
-    maximum: usize,
-) -> Result<Option<Arc<str>>, ModelValueError> {
-    value
-        .map(|value| {
-            let text = normalize_model_text(&value);
-            if text.len() > maximum {
-                return Err(ModelValueError::InvalidText);
-            }
-            Ok(Arc::from(text.as_ref()))
-        })
-        .transpose()
+fn normalize_optional_text(value: Option<String>) -> Option<Arc<str>> {
+    value.map(|value| Arc::from(normalize_model_text(&value).as_ref()))
 }
 
-fn validate_optional_opaque(value: &Option<String>, maximum: usize) -> Result<(), ModelValueError> {
+fn validate_optional_opaque(value: &Option<String>) -> Result<(), ModelValueError> {
     if value.as_deref().is_some_and(|value| {
         value.is_empty()
-            || value.len() > maximum
             || value
                 .bytes()
                 .any(|byte| !(0x21..=0x7e).contains(&byte) || matches!(byte, b'"' | b'\\'))
@@ -166,7 +149,7 @@ impl AssistantPart {
     pub fn validate(&self) -> Result<(), ModelValueError> {
         match self {
             Self::Text(text) => {
-                if valid_text(text, MAX_MODEL_MESSAGE_TEXT_BYTES, true) {
+                if valid_text(text, true) {
                     Ok(())
                 } else {
                     Err(ModelValueError::InvalidText)
@@ -237,25 +220,7 @@ impl ToolCall {
         arguments: Value,
         call_index: u32,
     ) -> Result<Self, ModelValueError> {
-        Self::new_with_max_bytes(
-            tool_call_id,
-            name,
-            arguments,
-            call_index,
-            crate::value::MAX_JSON_BYTES,
-        )
-    }
-
-    pub(crate) fn new_with_max_bytes(
-        tool_call_id: ToolCallId,
-        name: ToolName,
-        arguments: Value,
-        call_index: u32,
-        max_bytes: usize,
-    ) -> Result<Self, ModelValueError> {
-        if !arguments.is_object()
-            || crate::value::validate_json_size(&arguments, max_bytes).is_err()
-        {
+        if !arguments.is_object() || crate::value::validate_json_nesting(&arguments).is_err() {
             return Err(ModelValueError::InvalidToolArguments);
         }
         Ok(Self {
@@ -435,7 +400,7 @@ impl fmt::Debug for ModelMessage {
 impl ModelMessage {
     pub fn system(text: impl Into<String>) -> Result<Self, ModelValueError> {
         let text = text.into();
-        if !valid_text(&text, MAX_MODEL_MESSAGE_TEXT_BYTES, false) {
+        if !valid_text(&text, false) {
             return Err(ModelValueError::InvalidText);
         }
         Ok(Self::System(text.into()))
@@ -443,7 +408,7 @@ impl ModelMessage {
 
     pub fn user(text: impl Into<String>) -> Result<Self, ModelValueError> {
         let text = text.into();
-        if !valid_text(&text, MAX_MODEL_MESSAGE_TEXT_BYTES, false) {
+        if !valid_text(&text, false) {
             return Err(ModelValueError::InvalidText);
         }
         Ok(Self::User(text.into()))
@@ -485,7 +450,7 @@ impl ModelMessage {
     pub fn validate(&self) -> Result<(), ModelValueError> {
         match self {
             Self::System(text) | Self::User(text) => {
-                if valid_text(text, MAX_MODEL_MESSAGE_TEXT_BYTES, false) {
+                if valid_text(text, false) {
                     Ok(())
                 } else {
                     Err(ModelValueError::InvalidText)

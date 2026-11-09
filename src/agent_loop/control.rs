@@ -7,9 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::ids::{InteractionId, LoopId};
 use crate::interaction::InteractionAnswer;
-use crate::limits::LoopLimits;
 
-use super::event::EventSinkError;
 use super::{AnswerError, CancelReason, LoopReport, LoopState, LoopStatus, UpdateError};
 
 /// Single linearizable state machine for cancelling and sealing a loop.
@@ -44,7 +42,6 @@ pub(crate) enum FinishSeal {
 pub(crate) struct LoopControl {
     pub(crate) id: LoopId,
     pub(crate) cancel: CancellationToken,
-    limits: LoopLimits,
 
     state_tx: watch::Sender<LoopState>,
     /// Seed receiver shared by all waiters. The sender is owned by the runner
@@ -101,18 +98,15 @@ fn lock_control(inner: &Mutex<ControlState>) -> MutexGuard<'_, ControlState> {
 }
 
 /// Bundle created by `LoopControl::new` for `AgentLoop::start`.
-pub(crate) type ControlParts = Result<
-    (
-        LoopControl,
-        super::event::LoopEventSink,
-        super::event::LoopEventStream,
-        watch::Sender<Option<Arc<LoopReport>>>,
-    ),
-    EventSinkError,
->;
+pub(crate) type ControlParts = (
+    LoopControl,
+    super::event::LoopEventSink,
+    super::event::LoopEventStream,
+    watch::Sender<Option<Arc<LoopReport>>>,
+);
 
 impl LoopControl {
-    pub(crate) fn new(id: LoopId, event_capacity: usize, limits: LoopLimits) -> ControlParts {
+    pub(crate) fn new(id: LoopId) -> ControlParts {
         let initial = LoopState::new(
             id,
             LoopStatus::Starting,
@@ -121,12 +115,11 @@ impl LoopControl {
         );
         let (state_tx, _) = watch::channel(initial);
         let (completion_tx, completion_rx) = watch::channel(None);
-        let (sink, stream) = super::event::LoopEventSink::channel(event_capacity)?;
-        Ok((
+        let (sink, stream) = super::event::LoopEventSink::channel();
+        (
             Self {
                 id,
                 cancel: CancellationToken::new(),
-                limits,
                 state_tx,
                 completion_rx,
                 state: AtomicU8::new(STATE_NONE),
@@ -141,7 +134,7 @@ impl LoopControl {
             sink,
             stream,
             completion_tx,
-        ))
+        )
     }
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -178,18 +171,11 @@ impl LoopControl {
         );
     }
 
-    /// Accepts a full config replacement; it takes effect at the next request
-    /// boundary. `config` is validated against the loop limits *before* the
-    /// lock so an invalid config consumes no revision and never disturbs the
-    /// pending slot. Repeated updates before a boundary each hand out a
-    /// monotonic revision while the runner only ever applies the latest.
+    /// Accepts a checked immutable config for the next request boundary.
     pub(crate) fn update(&self, config: ExecutionConfig) -> Result<ConfigRevision, UpdateError> {
         if !self.is_active() {
             return Err(UpdateError::NotActive);
         }
-        config
-            .validate_against_limits(&self.limits)
-            .map_err(|_| UpdateError::InvalidConfig)?;
         let mut candidate = Some(Arc::new(config));
         let mut replaced = None;
         let revision = {
@@ -401,7 +387,6 @@ mod tests {
     use crate::agent_loop::{CancelReason, UpdateError};
     use crate::execution::{ConfigRevision, ExecutionConfig};
     use crate::ids::LoopId;
-    use crate::limits::LoopLimits;
     use crate::model::{
         Model, ModelCallContext, ModelDescriptor, ModelRef, ModelRequest, ModelStartFuture,
         ModelStream, ReasoningPreference,

@@ -25,7 +25,7 @@ use minicore_runtime::tools::{
     Tool, ToolContext, ToolExecutionOutcome, ToolFuture, ToolInvocation, ToolName, ToolOutput,
     ToolResultOutcome, ToolSet, ToolSpec,
 };
-use minicore_runtime::value::BoundedText;
+use minicore_runtime::value::Text;
 use minicore_runtime::{
     AssistantHistory, CancelReason, ConfigRevision, ExecutionConfig, ExecutionConfigError,
     HistoryItem, HistoryView, LoopEvent, LoopId, LoopLimits, LoopLimitsError, LoopOptions,
@@ -53,7 +53,7 @@ impl Model for FakeModel {
                 DiagnosticSummary::new(
                     DiagnosticCode::Internal,
                     DiagnosticCategory::Internal,
-                    BoundedText::new("fake model start is not exercised here").unwrap(),
+                    Text::new("fake model start is not exercised here"),
                     false,
                 )
                 .expect("valid diagnostic text"),
@@ -81,7 +81,7 @@ impl Tool for FakeTool {
 }
 
 struct CapturingPrompt {
-    system: Option<BoundedText>,
+    system: Option<Text>,
 }
 
 impl PromptProvider for CapturingPrompt {
@@ -169,7 +169,7 @@ fn sample_items(loop_id: LoopId) -> (HistoryItem, HistoryItem, HistoryItem, Hist
         output: ToolOutput::new("ok").unwrap(),
     });
     let summary = HistoryItem::Summary(SummaryHistory {
-        content: BoundedText::new("earlier context").unwrap(),
+        content: Text::new("earlier context"),
     });
     (user, assistant, tool_result, summary)
 }
@@ -534,7 +534,7 @@ async fn prompt_provider_receives_the_full_history_view() {
     .unwrap();
 
     let provider = CapturingPrompt {
-        system: Some(BoundedText::new("be concise").unwrap()),
+        system: Some(Text::new("be concise")),
     };
     let request = PromptRequest {
         loop_id,

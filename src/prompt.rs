@@ -7,11 +7,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::history::{HistoryItem, HistoryView};
 use crate::ids::LoopId;
-use crate::model::{
-    MAX_MODEL_MESSAGE_TEXT_BYTES, ModelDescriptor, ModelMessage, ReasoningPreference,
-};
+use crate::model::{ModelDescriptor, ModelMessage, ReasoningPreference};
 use crate::tools::ToolSpec;
-use crate::value::BoundedText;
+use crate::value::Text;
 
 /// Domain error returned by a `PromptProvider` while preparing a request.
 #[non_exhaustive]
@@ -83,12 +81,12 @@ impl<T: PromptProvider + ?Sized> PromptProvider for Arc<T> {
 /// the absolute `ModelMessage` text ceiling, only the *tail* of the content is
 /// truncated at a UTF-8 character boundary (never mid-character).
 pub struct DefaultPromptProvider {
-    system_prompt: Option<BoundedText>,
+    system_prompt: Option<Text>,
 }
 
 impl DefaultPromptProvider {
     /// `Some` text is emitted first only when it is non-empty.
-    pub fn new(system_prompt: Option<BoundedText>) -> Self {
+    pub fn new(system_prompt: Option<Text>) -> Self {
         Self { system_prompt }
     }
 }
@@ -99,7 +97,7 @@ impl std::fmt::Debug for DefaultPromptProvider {
             .debug_struct("DefaultPromptProvider")
             .field(
                 "system_prompt_bytes",
-                &self.system_prompt.as_ref().map(BoundedText::byte_len),
+                &self.system_prompt.as_ref().map(Text::byte_len),
             )
             .finish()
     }
@@ -158,19 +156,8 @@ fn assistant_message(
 /// Fixed leading text of a projected summary; always preserved verbatim.
 const SUMMARY_PREFIX: &str = "Conversation summary:\n";
 
-/// Projects a summary, keeping the fixed prefix and truncating the content
-/// tail at a UTF-8 character boundary when it would exceed the absolute
-/// `ModelMessage` text ceiling.
 fn summary_message(
     summary: &crate::history::SummaryHistory,
 ) -> Result<ModelMessage, crate::model::ModelValueError> {
-    let content = summary.content.as_str();
-    let mut end = content.len();
-    if SUMMARY_PREFIX.len() + end > MAX_MODEL_MESSAGE_TEXT_BYTES {
-        end = MAX_MODEL_MESSAGE_TEXT_BYTES - SUMMARY_PREFIX.len();
-        while end > 0 && !content.is_char_boundary(end) {
-            end -= 1;
-        }
-    }
-    ModelMessage::system(format!("{SUMMARY_PREFIX}{}", &content[..end]))
+    ModelMessage::system(format!("{SUMMARY_PREFIX}{}", summary.content.as_str()))
 }

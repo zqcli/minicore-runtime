@@ -91,8 +91,8 @@ async fn preflight_rejects_reasoning_tools_context_and_mutated_tool_specs_before
 async fn progress_is_best_effort_for_accepted_full_and_closed_channels() {
     let events = || {
         vec![
-            Ok(ModelEvent::text_delta("text").unwrap()),
-            Ok(ModelEvent::reasoning_delta("reason").unwrap()),
+            Ok(ModelEvent::text_delta("text")),
+            Ok(ModelEvent::reasoning_delta("reason")),
             Ok(finish(ModelFinishReason::Stop)),
         ]
     };
@@ -128,10 +128,8 @@ async fn progress_is_best_effort_for_accepted_full_and_closed_channels() {
     ));
 
     let (full, _full_rx) = mpsc::channel(1);
-    full.try_send(ModelDriverProgress::TextDelta(
-        BoundedText::new("occupied").unwrap(),
-    ))
-    .unwrap();
+    full.try_send(ModelDriverProgress::TextDelta(Text::new("occupied")))
+        .unwrap();
     assert!(
         driver
             .run(

@@ -1,37 +1,35 @@
-use minicore_runtime::BoundedText as RootBoundedText;
+use minicore_runtime::Text as RootText;
 use minicore_runtime::value::{
-    BoundedText, MAX_JSON_BYTES, MAX_JSON_DEPTH, MAX_JSON_NODES, MAX_TEXT_BYTES, ValueError,
+    MAX_JSON_BYTES, MAX_JSON_DEPTH, MAX_JSON_NODES, MAX_TEXT_BYTES, Text, ValueError,
     validate_json_size,
 };
 use serde_json::{Value, json};
 
 #[test]
 fn bounded_text_enforces_absolute_and_caller_byte_limits() {
-    let exact_absolute = BoundedText::new("x".repeat(MAX_TEXT_BYTES)).unwrap();
+    let exact_absolute = Text::new("x".repeat(MAX_TEXT_BYTES));
     assert_eq!(exact_absolute.byte_len(), MAX_TEXT_BYTES);
     assert_eq!(
-        BoundedText::new("x".repeat(MAX_TEXT_BYTES + 1)).unwrap_err(),
+        Text::new("x".repeat(MAX_TEXT_BYTES + 1)).unwrap_err(),
         ValueError::TextTooLarge
     );
 
     let multibyte = "ééa";
     assert_eq!(multibyte.len(), 5);
     assert_eq!(
-        BoundedText::new_with_max_bytes(multibyte, 5)
-            .unwrap()
-            .as_str(),
+        Text::new_with_max_bytes(multibyte, 5).unwrap().as_str(),
         multibyte
     );
     assert_eq!(
-        BoundedText::new_with_max_bytes("ééab", 5).unwrap_err(),
+        Text::new_with_max_bytes("ééab", 5).unwrap_err(),
         ValueError::TextTooLarge
     );
     assert_eq!(
-        BoundedText::new_with_max_bytes("", MAX_TEXT_BYTES + 1).unwrap_err(),
+        Text::new_with_max_bytes("", MAX_TEXT_BYTES + 1).unwrap_err(),
         ValueError::TextLimitTooLarge
     );
 
-    let empty = BoundedText::new("").unwrap();
+    let empty = Text::new("");
     assert!(empty.is_empty());
     assert_eq!(empty.into_string(), "");
 }
@@ -39,25 +37,19 @@ fn bounded_text_enforces_absolute_and_caller_byte_limits() {
 #[test]
 fn bounded_text_accepts_control_characters_without_extra_policy() {
     let control = "nul\0tab\tnewline\nunit\u{0001}";
-    let value = BoundedText::new(control).unwrap();
+    let value = Text::new(control);
     assert_eq!(value.as_str(), control);
     let encoded = serde_json::to_string(&value).unwrap();
-    assert_eq!(
-        serde_json::from_str::<BoundedText>(&encoded).unwrap(),
-        value
-    );
+    assert_eq!(serde_json::from_str::<Text>(&encoded).unwrap(), value);
 }
 
 #[test]
 fn bounded_text_serde_roundtrip_and_debug_are_safe() {
     let secret = "secret text";
-    let value = RootBoundedText::new(secret).unwrap();
+    let value = RootText::new(secret);
     let encoded = serde_json::to_string(&value).unwrap();
     assert_eq!(encoded, format!("\"{secret}\""));
-    assert_eq!(
-        serde_json::from_str::<RootBoundedText>(&encoded).unwrap(),
-        value
-    );
+    assert_eq!(serde_json::from_str::<RootText>(&encoded).unwrap(), value);
 
     let debug = format!("{value:?}");
     assert!(!debug.contains(secret));
@@ -65,9 +57,9 @@ fn bounded_text_serde_roundtrip_and_debug_are_safe() {
     assert_eq!(value.to_string(), secret);
 
     let exact = serde_json::to_string(&"x".repeat(MAX_TEXT_BYTES)).unwrap();
-    assert!(serde_json::from_str::<BoundedText>(&exact).is_ok());
+    assert!(serde_json::from_str::<Text>(&exact).is_ok());
     let oversized = serde_json::to_string(&"x".repeat(MAX_TEXT_BYTES + 1)).unwrap();
-    let error = serde_json::from_str::<BoundedText>(&oversized).unwrap_err();
+    let error = serde_json::from_str::<Text>(&oversized).unwrap_err();
     assert!(
         error
             .to_string()

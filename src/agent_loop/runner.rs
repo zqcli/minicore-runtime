@@ -16,7 +16,6 @@ use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::WorkingHistory;
 use crate::ids::LoopId;
 use crate::model::{ModelError, ModelFinishReason, ModelPartial, Usage};
-use crate::tools::ToolResultOutcome;
 use crate::usage::UsageAccumulator;
 
 use super::control::{FinishSeal, LoopControl};
@@ -27,7 +26,7 @@ mod model;
 mod tools;
 
 use self::model::{PromptPrep, build_model_request, map_model_failure, prepare_prompt, run_model};
-use self::tools::{run_tool_batch, settle_calls};
+use self::tools::run_tool_batch;
 
 #[cfg(test)]
 mod tests;
@@ -79,7 +78,7 @@ impl LoopCtx<'_> {
         {
             Ok(Ok(())) => return Ok(()),
             Ok(Err(diagnostic)) => diagnostic,
-            Err(_) => DiagnosticSummary::bounded_static(
+            Err(_) => DiagnosticSummary::static_text(
                 DiagnosticCode::Internal,
                 DiagnosticCategory::Internal,
                 "history callback panicked",
@@ -120,7 +119,7 @@ fn take_boundary(
 }
 
 /// The single runner task for one agent loop. All control touches are short
-/// critical sections; every event is a best-effort `try_send`. The final watch
+/// critical sections; every event is a non-awaiting unbounded send. The final watch
 /// sender is owned exclusively by this task: when it drops (normal exit or an
 /// external abort) every waiter sees the completion channel as closed.
 pub(crate) async fn run_loop(
@@ -330,7 +329,7 @@ async fn run_loop_inner(
                 ModelFinishReason::Unknown | ModelFinishReason::ToolCalls => {
                     Some(FailPath::InvalidModelResponse(ModelError::started(
                         crate::model::ModelErrorKind::InvalidProviderResponse,
-                        DiagnosticSummary::bounded_static(
+                        DiagnosticSummary::static_text(
                             DiagnosticCode::ModelMalformedResponse,
                             DiagnosticCategory::Model,
                             "model returned an invalid response",
@@ -357,17 +356,6 @@ async fn run_loop_inner(
                 discarded_config = ctx.control.begin_final();
             }
             break path;
-        }
-        if options.max_tool_rounds != 0 && tool_rounds >= u64::from(options.max_tool_rounds) {
-            settle_calls(
-                &ctx,
-                &mut working,
-                request_index,
-                &tool_calls,
-                ToolResultOutcome::Failed,
-                "tool round limit reached",
-            );
-            break FailPath::MaxToolRounds;
         }
         tool_rounds = tool_rounds.saturating_add(1);
 
@@ -599,12 +587,6 @@ fn outcome_for(control: &LoopControl, path: FailPath) -> LoopOutcome {
             diagnostic,
             model_error: None,
         }),
-        FailPath::MaxToolRounds => LoopOutcome::Failed(failure(
-            LoopFailureKind::MaxToolRounds,
-            DiagnosticCode::TurnBudgetExceeded,
-            DiagnosticCategory::Internal,
-            "maximum tool rounds reached",
-        )),
         FailPath::Internal => LoopOutcome::Failed(failure(
             LoopFailureKind::Internal,
             DiagnosticCode::Internal,
@@ -622,7 +604,7 @@ fn failure(
 ) -> LoopFailure {
     LoopFailure {
         kind,
-        diagnostic: DiagnosticSummary::bounded_static(code, category, message, false),
+        diagnostic: DiagnosticSummary::static_text(code, category, message, false),
         model_error: None,
     }
 }
@@ -654,6 +636,5 @@ enum FailPath {
     Policy,
     Interaction,
     History(DiagnosticSummary),
-    MaxToolRounds,
     Internal,
 }

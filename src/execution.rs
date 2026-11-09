@@ -4,34 +4,31 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::limits::LoopLimits;
 use crate::model::{Model, ModelDescriptor, ReasoningPreference};
 use crate::prompt::PromptProvider;
 use crate::tools::{ToolPolicy, ToolSet};
-use crate::value::BoundedText;
+use crate::value::Text;
 
 /// Errors constructing user input.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum UserInputError {
-    #[error("user input is empty or exceeds the absolute text limit")]
+    #[error("user input is empty")]
     InvalidText,
 }
 
 /// User input for one agent loop (the initial request or an input from `LoopInputs`).
 ///
-/// Constructors enforce absolute structural bounds (`BoundedText::MAX_BYTES` and
-/// non-empty text). The live loop's `LoopLimits::max_user_input_bytes` is
-/// applied by `AgentLoop::start`; the host checks the inputs it hands to `LoopInputs`.
+/// Constructors require non-empty UTF-8 text without a byte limit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserInput {
-    Text(BoundedText),
+    Text(Text),
 }
 
 impl UserInput {
-    /// Creates text user input within absolute structural bounds.
+    /// Creates non-empty text user input.
     pub fn text(value: impl AsRef<str>) -> Result<Self, UserInputError> {
-        let text = BoundedText::new(value).map_err(|_| UserInputError::InvalidText)?;
+        let text = Text::new(value);
         if text.is_empty() {
             return Err(UserInputError::InvalidText);
         }
@@ -84,8 +81,6 @@ pub enum ExecutionConfigError {
     UnsupportedReasoning,
     #[error("model does not support tools but tools are configured")]
     ToolsUnsupported,
-    #[error("tool set contains invalid tool specs")]
-    InvalidTools,
 }
 
 /// Immutable capability snapshot for one agent-loop request.
@@ -156,22 +151,5 @@ impl ExecutionConfig {
 
     pub fn prompt(&self) -> &Arc<dyn PromptProvider> {
         &self.prompt
-    }
-
-    /// Re-applies a live loop's runtime budgets to this config: per-spec tool
-    /// name and schema byte caps. Descriptor and per-spec validity were
-    /// already checked at construction. Tool *count* is deliberately not a
-    /// loop budget — the registered set size is a product decision. Used
-    /// identically by `AgentLoop::start` and `LoopHandle::update` (both fail
-    /// outside any lock).
-    pub(crate) fn validate_against_limits(
-        &self,
-        limits: &LoopLimits,
-    ) -> Result<(), ExecutionConfigError> {
-        for spec in self.tools.frozen_specs() {
-            spec.validate_for_bindings(limits.max_tool_name_bytes, limits.max_tool_schema_bytes)
-                .map_err(|_| ExecutionConfigError::InvalidTools)?;
-        }
-        Ok(())
     }
 }

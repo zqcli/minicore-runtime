@@ -10,7 +10,7 @@ use minicore_runtime::tools::{
     ToolProgress, ToolResultOutcome, ToolSet, ToolSpec,
 };
 use minicore_runtime::value::{MAX_JSON_BYTES, MAX_JSON_DEPTH, MAX_JSON_NODES, MAX_TEXT_BYTES};
-use minicore_runtime::{BoundedText, LoopId, ToolCallId};
+use minicore_runtime::{LoopId, Text, ToolCallId};
 use serde_json::json;
 
 #[test]
@@ -23,7 +23,7 @@ fn diagnostic_progress_and_input_text_share_the_control_policy() {
         ("bad\0", false),
         ("bad\x1b", false),
     ] {
-        let text = BoundedText::new(text).unwrap();
+        let text = Text::new(text);
         assert_eq!(
             DiagnosticSummary::new(
                 DiagnosticCode::Internal,
@@ -53,7 +53,7 @@ fn diagnostic_progress_and_input_text_share_the_control_policy() {
 #[test]
 fn request_payload_clones_share_storage_and_output_constructors_normalize_text() {
     use minicore_runtime::model::{ProviderReplay, ReasoningPreference};
-    let text = BoundedText::new("long history".repeat(1000)).unwrap();
+    let text = Text::new("long history".repeat(1000));
     assert!(std::ptr::eq(text.as_str(), text.clone().as_str()));
     let replay = ProviderReplay::new("test", json!({"large": "x".repeat(1000)})).unwrap();
     assert!(std::ptr::eq(replay.payload(), replay.clone().payload()));
@@ -268,15 +268,11 @@ fn tool_output_and_input_request_use_exact_boundary_values() {
     assert!(ToolOutput::new("x".repeat(MAX_TEXT_BYTES)).is_ok());
     assert!(ToolOutput::new("x".repeat(MAX_TEXT_BYTES + 1)).is_err());
 
-    let exact_choices = (0..32)
-        .map(|_| BoundedText::new("choice").unwrap())
-        .collect();
+    let exact_choices = (0..32).map(|_| Text::new("choice")).collect();
     assert!(
         ToolInputRequest::new("prompt", exact_choices, ToolInputAnswerKind::SingleChoice,).is_ok()
     );
-    let too_many_choices = (0..33)
-        .map(|_| BoundedText::new("choice").unwrap())
-        .collect();
+    let too_many_choices = (0..33).map(|_| Text::new("choice")).collect();
     assert!(
         ToolInputRequest::new(
             "prompt",
@@ -288,7 +284,7 @@ fn tool_output_and_input_request_use_exact_boundary_values() {
     assert!(
         ToolInputRequest::new(
             "x".repeat(8_192),
-            vec![BoundedText::new("choice").unwrap()],
+            vec![Text::new("choice")],
             ToolInputAnswerKind::SingleChoice,
         )
         .is_ok()
@@ -296,7 +292,7 @@ fn tool_output_and_input_request_use_exact_boundary_values() {
     assert!(
         ToolInputRequest::new(
             "x".repeat(8_193),
-            vec![BoundedText::new("choice").unwrap()],
+            vec![Text::new("choice")],
             ToolInputAnswerKind::SingleChoice,
         )
         .is_err()
@@ -304,7 +300,7 @@ fn tool_output_and_input_request_use_exact_boundary_values() {
     assert!(
         ToolInputRequest::new(
             "prompt",
-            vec![BoundedText::new("x".repeat(1_024)).unwrap()],
+            vec![Text::new("x".repeat(1_024))],
             ToolInputAnswerKind::SingleChoice,
         )
         .is_ok()
@@ -312,7 +308,7 @@ fn tool_output_and_input_request_use_exact_boundary_values() {
     assert!(
         ToolInputRequest::new(
             "prompt",
-            vec![BoundedText::new("x".repeat(1_025)).unwrap()],
+            vec![Text::new("x".repeat(1_025))],
             ToolInputAnswerKind::SingleChoice,
         )
         .is_err()
@@ -323,10 +319,7 @@ fn tool_output_and_input_request_use_exact_boundary_values() {
 fn input_request_and_answer_validation_is_strict() {
     let request = ToolInputRequest::new(
         "Choose a file",
-        vec![
-            BoundedText::new("first").unwrap(),
-            BoundedText::new("second").unwrap(),
-        ],
+        vec![Text::new("first"), Text::new("second")],
         ToolInputAnswerKind::SingleChoice,
     )
     .unwrap();
@@ -340,7 +333,7 @@ fn input_request_and_answer_validation_is_strict() {
             .is_err()
     );
     assert!(
-        ToolInputAnswer::Text(BoundedText::new("answer").unwrap())
+        ToolInputAnswer::Text(Text::new("answer"))
             .validate(&request)
             .is_err()
     );

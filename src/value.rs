@@ -3,57 +3,29 @@ use std::io::{self, Write};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use serde::de::{self, Visitor};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::de;
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-pub const MAX_TEXT_BYTES: usize = 256 * 1024;
-pub const MAX_JSON_BYTES: usize = 64 * 1024;
-pub const MAX_JSON_DEPTH: usize = 32;
-pub const MAX_JSON_NODES: usize = 4_096;
+/// Matches serde_json's default recursion guard: 127 nested arrays or objects.
+pub const MAX_JSON_NESTING: usize = 127;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ValueError {
     #[error("text contains disallowed control characters")]
     InvalidText,
-    #[error("bounded text limit exceeds the absolute cap")]
-    TextLimitTooLarge,
-    #[error("bounded text exceeds its byte limit")]
-    TextTooLarge,
-    #[error("JSON limit exceeds the absolute cap")]
-    JsonLimitTooLarge,
-    #[error("JSON value exceeds the requested byte limit")]
-    JsonTooLarge,
-    #[error("JSON value exceeds the absolute nesting depth")]
+    #[error("JSON nesting exceeds the parser's stack-safety guard")]
     JsonTooDeep,
-    #[error("JSON value exceeds the absolute node limit")]
-    JsonTooManyNodes,
-    #[error("JSON value could not be serialized")]
-    JsonSerialization,
 }
 
-#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct BoundedText(Arc<str>);
+/// Shared UTF-8 text without an application byte limit.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Text(Arc<str>);
 
-impl BoundedText {
-    pub const MAX_BYTES: usize = MAX_TEXT_BYTES;
-
-    pub fn new(value: impl AsRef<str>) -> Result<Self, ValueError> {
-        Self::new_with_max_bytes(value, Self::MAX_BYTES)
-    }
-
-    pub fn new_with_max_bytes(
-        value: impl AsRef<str>,
-        max_bytes: usize,
-    ) -> Result<Self, ValueError> {
-        let value = value.as_ref();
-        if max_bytes > Self::MAX_BYTES {
-            return Err(ValueError::TextLimitTooLarge);
-        }
-        if value.len() > max_bytes {
-            return Err(ValueError::TextTooLarge);
-        }
-        Ok(Self(Arc::from(value)))
+impl Text {
+    pub fn new(value: impl AsRef<str>) -> Self {
+        Self(Arc::from(value.as_ref()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -77,9 +49,8 @@ impl BoundedText {
     }
 }
 
-pub(crate) fn valid_text(value: &str, maximum: usize, allow_empty: bool) -> bool {
+pub(crate) fn valid_text(value: &str, allow_empty: bool) -> bool {
     (allow_empty || !value.is_empty())
-        && value.len() <= maximum
         && value
             .chars()
             .all(|c| !c.is_control() || matches!(c, '\n' | '\t'))
@@ -87,7 +58,7 @@ pub(crate) fn valid_text(value: &str, maximum: usize, allow_empty: bool) -> bool
 
 /// Normalize model text without increasing its UTF-8 byte length.
 pub(crate) fn normalize_model_text(value: &str) -> std::borrow::Cow<'_, str> {
-    if valid_text(value, usize::MAX, true) {
+    if valid_text(value, true) {
         return std::borrow::Cow::Borrowed(value);
     }
     let mut text = String::with_capacity(value.len());
@@ -144,161 +115,69 @@ macro_rules! string_newtype_serde {
 }
 pub(crate) use string_newtype_serde;
 
-pub(crate) fn json_bytes(value: &serde_json::Value) -> usize {
-    let mut sink = JsonCountingWriter::new(usize::MAX);
+pub(crate) fn json_bytes(value: &impl Serialize) -> usize {
+    let mut sink = JsonCountingWriter(0);
     serde_json::to_writer(&mut sink, value)
-        .expect("JSON Value serialization to a counter cannot fail");
-    sink.written
+        .expect("validated JSON serialization to a counter cannot fail");
+    sink.0
 }
 
-impl AsRef<str> for BoundedText {
+impl AsRef<str> for Text {
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 
-impl fmt::Debug for BoundedText {
+impl fmt::Debug for Text {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("BoundedText")
+            .debug_struct("Text")
             .field("bytes", &self.byte_len())
             .finish()
     }
 }
 
-impl fmt::Display for BoundedText {
+impl fmt::Display for Text {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
 }
 
-impl Serialize for BoundedText {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-struct BoundedTextVisitor;
-
-impl<'de> Visitor<'de> for BoundedTextVisitor {
-    type Value = BoundedText;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a UTF-8 string within the absolute byte cap")
-    }
-
-    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        BoundedText::new(value).map_err(E::custom)
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        BoundedText::new(value).map_err(E::custom)
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        BoundedText::new(value).map_err(E::custom)
-    }
-}
-
-impl<'de> Deserialize<'de> for BoundedText {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_string(BoundedTextVisitor)
-    }
-}
-
-pub fn validate_json_size(value: &serde_json::Value, max_bytes: usize) -> Result<(), ValueError> {
-    if max_bytes > MAX_JSON_BYTES {
-        return Err(ValueError::JsonLimitTooLarge);
-    }
-
-    let mut nodes = 0;
-    validate_json_shape(value, 0, &mut nodes)?;
-    let mut sink = JsonCountingWriter::new(max_bytes);
-    match serde_json::to_writer(&mut sink, value) {
-        Ok(()) => Ok(()),
-        Err(_) if sink.exceeded => Err(ValueError::JsonTooLarge),
-        Err(_) => Err(ValueError::JsonSerialization),
-    }
-}
-
-struct JsonCountingWriter {
-    max_bytes: usize,
-    written: usize,
-    exceeded: bool,
-}
-
-impl JsonCountingWriter {
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            max_bytes,
-            written: 0,
-            exceeded: false,
+/// Rejects nesting that would exceed serde_json's default stack-safety guard.
+pub fn validate_json_nesting(value: &serde_json::Value) -> Result<(), ValueError> {
+    fn visit(value: &serde_json::Value, containers: usize) -> Result<(), ValueError> {
+        if value.is_array() || value.is_object() {
+            if containers == MAX_JSON_NESTING {
+                return Err(ValueError::JsonTooDeep);
+            }
+            match value {
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        visit(value, containers + 1)?;
+                    }
+                }
+                serde_json::Value::Object(values) => {
+                    for value in values.values() {
+                        visit(value, containers + 1)?;
+                    }
+                }
+                _ => unreachable!(),
+            }
         }
+        Ok(())
     }
+    visit(value, 0)
 }
+
+struct JsonCountingWriter(usize);
 
 impl Write for JsonCountingWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let remaining = self.max_bytes.saturating_sub(self.written);
-        if bytes.len() > remaining {
-            self.exceeded = true;
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "JSON byte limit exceeded",
-            ));
-        }
-        self.written += bytes.len();
+        self.0 += bytes.len();
         Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
-}
-
-fn validate_json_shape(
-    value: &serde_json::Value,
-    depth: usize,
-    nodes: &mut usize,
-) -> Result<(), ValueError> {
-    if depth > MAX_JSON_DEPTH {
-        return Err(ValueError::JsonTooDeep);
-    }
-    *nodes += 1;
-    if *nodes > MAX_JSON_NODES {
-        return Err(ValueError::JsonTooManyNodes);
-    }
-
-    match value {
-        serde_json::Value::Array(values) => {
-            for value in values {
-                validate_json_shape(value, depth + 1, nodes)?;
-            }
-        }
-        serde_json::Value::Object(values) => {
-            for value in values.values() {
-                validate_json_shape(value, depth + 1, nodes)?;
-            }
-        }
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => {}
-    }
-    Ok(())
 }

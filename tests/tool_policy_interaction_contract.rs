@@ -8,7 +8,7 @@ use minicore_runtime::tools::{
     ToolInputAnswer, ToolInputAnswerKind, ToolInputRequest, ToolInvocation, ToolPolicy,
     ToolPolicyError, ToolPolicyFuture, ToolPolicyRequest, ToolSpec, ToolValueError,
 };
-use minicore_runtime::value::BoundedText;
+use minicore_runtime::value::Text;
 use minicore_runtime::{
     InteractionAnswer, InteractionId, InteractionKind, PendingInteraction, ToolCallId,
 };
@@ -170,7 +170,7 @@ fn policy_text_is_checked_at_the_exact_boundary_and_debug_is_redacted() {
     );
 
     let invalid_approval = ApprovalRequest {
-        prompt: BoundedText::new(oversized).unwrap(),
+        prompt: Text::new(oversized),
         risk: ApprovalRisk::High,
     };
     assert_eq!(
@@ -178,7 +178,7 @@ fn policy_text_is_checked_at_the_exact_boundary_and_debug_is_redacted() {
         Err(ToolPolicyError::InvalidDecision)
     );
     let invalid_denial = ToolDecision::Deny {
-        reason: BoundedText::new("").unwrap(),
+        reason: Text::new(""),
     };
     assert_eq!(
         invalid_denial.validate(),
@@ -220,10 +220,7 @@ fn pending_interactions_keep_checked_ids_kinds_and_redacted_debug() {
 
     let input = ToolInputRequest::new(
         "choose secret target",
-        vec![
-            BoundedText::new("secret-a").unwrap(),
-            BoundedText::new("secret-b").unwrap(),
-        ],
+        vec![Text::new("secret-a"), Text::new("secret-b")],
         ToolInputAnswerKind::SingleChoice,
     )
     .unwrap();
@@ -247,10 +244,7 @@ fn interaction_answers_validate_kind_and_delegate_exact_tool_input_rules() {
 
     let choice_request = ToolInputRequest::new(
         "choose",
-        vec![
-            BoundedText::new("alpha").unwrap(),
-            BoundedText::new("beta").unwrap(),
-        ],
+        vec![Text::new("alpha"), Text::new("beta")],
         ToolInputAnswerKind::SingleChoice,
     )
     .unwrap();
@@ -266,7 +260,7 @@ fn interaction_answers_validate_kind_and_delegate_exact_tool_input_rules() {
     );
     assert_eq!(
         pending_choice.validate_answer(&InteractionAnswer::ToolInput(ToolInputAnswer::Text(
-            BoundedText::new("alpha").unwrap(),
+            Text::new("alpha"),
         ))),
         Err(ToolValueError::InvalidAnswer)
     );
@@ -278,9 +272,8 @@ fn interaction_answers_validate_kind_and_delegate_exact_tool_input_rules() {
     let text_request =
         ToolInputRequest::new("answer", Vec::new(), ToolInputAnswerKind::Text).unwrap();
     let pending_text = pending(InteractionKind::ToolInput(text_request));
-    let text_answer = InteractionAnswer::ToolInput(ToolInputAnswer::Text(
-        BoundedText::new("private answer").unwrap(),
-    ));
+    let text_answer =
+        InteractionAnswer::ToolInput(ToolInputAnswer::Text(Text::new("private answer")));
     assert!(pending_text.validate_answer(&text_answer).is_ok());
     assert_eq!(
         pending_text.validate_answer(&InteractionAnswer::ToolInput(ToolInputAnswer::Choice {
@@ -290,7 +283,7 @@ fn interaction_answers_validate_kind_and_delegate_exact_tool_input_rules() {
     );
     assert_eq!(
         pending_text.validate_answer(&InteractionAnswer::ToolInput(ToolInputAnswer::Text(
-            BoundedText::new("x".repeat(8_193)).unwrap(),
+            Text::new("x".repeat(8_193)),
         ))),
         Err(ToolValueError::InvalidAnswer)
     );
@@ -354,14 +347,12 @@ fn valid_tool_input_constructors_and_interactions_regression() {
 
     let single_choice_min = ToolInputRequest::new(
         "choose one",
-        vec![BoundedText::new("only_choice").unwrap()],
+        vec![Text::new("only_choice")],
         ToolInputAnswerKind::SingleChoice,
     );
     assert!(single_choice_min.is_ok());
 
-    let boundary_choices: Vec<_> = (0..32)
-        .map(|i| BoundedText::new(format!("choice_{i}")).unwrap())
-        .collect();
+    let boundary_choices: Vec<_> = (0..32).map(|i| Text::new(format!("choice_{i}"))).collect();
     let single_choice_max = ToolInputRequest::new(
         "choose one",
         boundary_choices,
@@ -374,7 +365,7 @@ fn valid_tool_input_constructors_and_interactions_regression() {
     assert!(valid_answer.validate(&req).is_ok());
 
     let text_req = text_req.unwrap();
-    let valid_text_answer = ToolInputAnswer::Text(BoundedText::new("some answer").unwrap());
+    let valid_text_answer = ToolInputAnswer::Text(Text::new("some answer"));
     assert!(valid_text_answer.validate(&text_req).is_ok());
 }
 
@@ -383,7 +374,7 @@ fn valid_tool_input_constructors_and_interactions_regression() {
 fn invalid_tool_input_requests_rejected_by_validate() {
     // FIX-05-T01: SingleChoice with empty choices
     let empty_choices_single_choice = ToolInputRequest {
-        prompt: BoundedText::new("choose").unwrap(),
+        prompt: Text::new("choose"),
         choices: vec![],
         answer_kind: ToolInputAnswerKind::SingleChoice,
     };
@@ -395,8 +386,8 @@ fn invalid_tool_input_requests_rejected_by_validate() {
 
     // FIX-05-T02: Empty prompt
     let empty_prompt = ToolInputRequest {
-        prompt: BoundedText::new("").unwrap(),
-        choices: vec![BoundedText::new("choice_1").unwrap()],
+        prompt: Text::new(""),
+        choices: vec![Text::new("choice_1")],
         answer_kind: ToolInputAnswerKind::SingleChoice,
     };
     assert_eq!(
@@ -407,10 +398,8 @@ fn invalid_tool_input_requests_rejected_by_validate() {
 
     // FIX-05-T03: Too many choices (33 choices > 32 max)
     let too_many_choices = ToolInputRequest {
-        prompt: BoundedText::new("choose").unwrap(),
-        choices: (0..33)
-            .map(|i| BoundedText::new(format!("choice_{i}")).unwrap())
-            .collect(),
+        prompt: Text::new("choose"),
+        choices: (0..33).map(|i| Text::new(format!("choice_{i}"))).collect(),
         answer_kind: ToolInputAnswerKind::SingleChoice,
     };
     assert_eq!(
@@ -421,8 +410,8 @@ fn invalid_tool_input_requests_rejected_by_validate() {
 
     // FIX-05-T04: Oversized choice (1025 bytes > 1024 max)
     let oversized_choice = ToolInputRequest {
-        prompt: BoundedText::new("choose").unwrap(),
-        choices: vec![BoundedText::new("x".repeat(1025)).unwrap()],
+        prompt: Text::new("choose"),
+        choices: vec![Text::new("x".repeat(1025))],
         answer_kind: ToolInputAnswerKind::SingleChoice,
     };
     assert_eq!(

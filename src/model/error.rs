@@ -13,7 +13,7 @@ pub enum DeliveryState {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
 pub enum ModelValueError {
-    #[error("model text is empty, unsafe, or exceeds its limit")]
+    #[error("model text is empty or contains disallowed control characters")]
     InvalidText,
     #[error("reasoning content has no artifact")]
     EmptyReasoningContent,
@@ -39,9 +39,7 @@ pub enum ModelValueError {
     InvalidToolCallOrder,
     #[error("model descriptor is invalid")]
     InvalidDescriptor,
-    #[error("model stream event is invalid")]
-    InvalidEvent,
-    #[error("provider replay format or payload exceeds its bounds")]
+    #[error("provider replay format is invalid or payload nesting is unsafe")]
     InvalidProviderReplay,
     #[error("model request tools are invalid or not strictly ordered")]
     InvalidTools,

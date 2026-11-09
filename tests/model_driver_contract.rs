@@ -75,8 +75,8 @@ fn canonical_driver_is_private_bounded_and_adapter_neutral() {
         .and_then(|(_, rest)| rest.split_once('}'))
         .map(|(body, _)| body)
         .unwrap();
-    assert!(progress.contains("TextDelta(BoundedText)"));
-    assert!(progress.contains("ReasoningDelta(BoundedText)"));
+    assert!(progress.contains("TextDelta(Text)"));
+    assert!(progress.contains("ReasoningDelta(Text)"));
     assert_eq!(
         progress
             .lines()

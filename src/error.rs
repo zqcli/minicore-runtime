@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::value::{BoundedText, ValueError, valid_text};
+use crate::value::{Text, ValueError, valid_text};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,7 +32,6 @@ pub enum DiagnosticCode {
     ToolFailed,
     InteractionNotFound,
     InteractionKindMismatch,
-    TurnBudgetExceeded,
     Internal,
 }
 
@@ -40,7 +39,7 @@ pub enum DiagnosticCode {
 pub struct DiagnosticSummary {
     pub code: DiagnosticCode,
     pub category: DiagnosticCategory,
-    message: BoundedText,
+    message: Text,
     pub retryable: bool,
 }
 
@@ -57,17 +56,17 @@ impl fmt::Debug for DiagnosticSummary {
 }
 
 impl DiagnosticSummary {
-    pub const fn message(&self) -> &BoundedText {
+    pub const fn message(&self) -> &Text {
         &self.message
     }
 
     pub fn new(
         code: DiagnosticCode,
         category: DiagnosticCategory,
-        message: BoundedText,
+        message: Text,
         retryable: bool,
     ) -> Result<Self, ValueError> {
-        if !valid_text(message.as_str(), BoundedText::MAX_BYTES, true) {
+        if !valid_text(message.as_str(), true) {
             return Err(ValueError::InvalidText);
         }
         Ok(Self {
@@ -78,19 +77,14 @@ impl DiagnosticSummary {
         })
     }
 
-    pub(crate) fn bounded_static(
+    pub(crate) fn static_text(
         code: DiagnosticCode,
         category: DiagnosticCategory,
         message: &'static str,
         retryable: bool,
     ) -> Self {
-        Self::new(
-            code,
-            category,
-            BoundedText::new(message).expect("static diagnostic must fit BoundedText"),
-            retryable,
-        )
-        .expect("static diagnostic text is valid")
+        Self::new(code, category, Text::new(message), retryable)
+            .expect("static diagnostic text is valid")
     }
 }
 
@@ -99,7 +93,7 @@ impl DiagnosticSummary {
 struct DiagnosticSummaryWire {
     code: DiagnosticCode,
     category: DiagnosticCategory,
-    message: BoundedText,
+    message: Text,
     retryable: bool,
 }
 

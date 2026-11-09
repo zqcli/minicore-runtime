@@ -8,11 +8,9 @@ use std::time::Instant;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::value::BoundedText;
+use crate::value::Text;
 
 use super::tool::{ToolInvocation, ToolSpec};
-
-pub const MAX_TOOL_POLICY_TEXT_BYTES: usize = 8_192;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolPolicyError {
@@ -57,7 +55,7 @@ pub enum ApprovalRisk {
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct ApprovalRequest {
-    pub prompt: BoundedText,
+    pub prompt: Text,
     pub risk: ApprovalRisk,
 }
 
@@ -95,7 +93,7 @@ pub enum ApprovalDecision {
 #[derive(Clone, Eq, PartialEq)]
 pub enum ToolDecision {
     Allow,
-    Deny { reason: BoundedText },
+    Deny { reason: Text },
     RequireApproval { request: ApprovalRequest },
 }
 
@@ -152,14 +150,13 @@ impl<T: ToolPolicy + ?Sized> ToolPolicy for Arc<T> {
     }
 }
 
-fn checked_policy_text(value: &str) -> Result<BoundedText, ToolPolicyError> {
+fn checked_policy_text(value: &str) -> Result<Text, ToolPolicyError> {
     validate_policy_text(value)?;
-    BoundedText::new_with_max_bytes(value, MAX_TOOL_POLICY_TEXT_BYTES)
-        .map_err(|_| ToolPolicyError::InvalidDecision)
+    Ok(Text::new(value))
 }
 
 fn validate_policy_text(value: &str) -> Result<(), ToolPolicyError> {
-    if valid_text(value, MAX_TOOL_POLICY_TEXT_BYTES, false) {
+    if valid_text(value, false) {
         Ok(())
     } else {
         Err(ToolPolicyError::InvalidDecision)

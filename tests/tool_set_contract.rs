@@ -12,7 +12,7 @@ use minicore_runtime::tools::{
     ToolInputAnswerKind, ToolInputRequest, ToolInvocation, ToolOutput, ToolProgress,
     ToolProgressSink, ToolSet, ToolSetError, ToolSpec,
 };
-use minicore_runtime::value::{BoundedText, MAX_JSON_BYTES, MAX_JSON_DEPTH, MAX_JSON_NODES};
+use minicore_runtime::value::{MAX_JSON_BYTES, MAX_JSON_DEPTH, MAX_JSON_NODES, Text};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -274,10 +274,7 @@ fn invocation_serde_is_strict_bounded_and_redacted() {
 fn input_answers_reject_extra_fields_bad_shapes_and_invalid_text() {
     let request = ToolInputRequest::new(
         "choose",
-        vec![
-            BoundedText::new("yes").unwrap(),
-            BoundedText::new("no").unwrap(),
-        ],
+        vec![Text::new("yes"), Text::new("no")],
         ToolInputAnswerKind::SingleChoice,
     )
     .unwrap();
@@ -292,7 +289,7 @@ fn input_answers_reject_extra_fields_bad_shapes_and_invalid_text() {
             .is_err()
     );
     assert!(
-        ToolInputAnswer::Text(BoundedText::new("yes").unwrap())
+        ToolInputAnswer::Text(Text::new("yes"))
             .validate(&request)
             .is_err()
     );
@@ -318,8 +315,8 @@ fn input_answers_reject_extra_fields_bad_shapes_and_invalid_text() {
     );
     let text_request =
         ToolInputRequest::new("prompt", Vec::new(), ToolInputAnswerKind::Text).unwrap();
-    let exact_text = ToolInputAnswer::Text(BoundedText::new("x".repeat(8_192)).unwrap());
-    let oversized_text = ToolInputAnswer::Text(BoundedText::new("x".repeat(8_193)).unwrap());
+    let exact_text = ToolInputAnswer::Text(Text::new("x".repeat(8_192)));
+    let oversized_text = ToolInputAnswer::Text(Text::new("x".repeat(8_193)));
     assert!(
         serde_json::from_value::<ToolInputAnswer>(serde_json::to_value(&exact_text).unwrap())
             .is_ok()
@@ -399,8 +396,7 @@ async fn context_cancellation_deadline_progress_and_outcomes_are_typed() {
         deadline: Instant::now() + Duration::from_secs(60),
         progress: ToolProgressSink::default(),
     };
-    let progress =
-        ToolProgress::new(Some(BoundedText::new("working").unwrap()), Some(1), Some(2)).unwrap();
+    let progress = ToolProgress::new(Some(Text::new("working")), Some(1), Some(2)).unwrap();
     assert!(!context.progress.emit(progress));
     assert!(ToolProgress::new(None, Some(3), Some(2)).is_err());
 

@@ -4,7 +4,6 @@ pub mod execution;
 pub mod history;
 mod ids;
 pub mod interaction;
-pub mod limits;
 pub mod model;
 mod port_call;
 pub mod prompt;
@@ -29,5 +28,4 @@ pub use history::{
 };
 pub use ids::{InteractionId, LoopId, ToolCallId};
 pub use interaction::{InteractionAnswer, InteractionKind, PendingInteraction};
-pub use limits::{LoopLimits, LoopLimitsError};
-pub use value::BoundedText;
+pub use value::Text;

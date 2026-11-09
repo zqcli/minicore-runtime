@@ -4,18 +4,17 @@ use serde_json::Value;
 use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::ids::ToolCallId;
 use crate::tools::{ToolName, ToolSpec};
-use crate::value::{BoundedText, MAX_JSON_BYTES, normalize_model_text};
+use crate::value::{Text, normalize_model_text};
 
 use super::super::{
     AssistantPart, IncompleteToolCall, ModelFinishReason, ModelPartial, ModelResponse,
     ReasoningContent, ToolCall, Usage,
 };
 use super::super::{ModelError, ModelErrorKind, ModelEvent};
-use super::{LoopLimits, ModelDriverProgress};
+use super::ModelDriverProgress;
 
 pub(super) struct Assembler<'a> {
     request_tools: &'a [ToolSpec],
-    limits: &'a LoopLimits,
     slots: Vec<PartSlot>,
     text: String,
     reasoning: String,
@@ -44,10 +43,9 @@ struct ToolAssembly {
 }
 
 impl<'a> Assembler<'a> {
-    pub(super) fn new(request_tools: &'a [ToolSpec], limits: &'a LoopLimits) -> Self {
+    pub(super) fn new(request_tools: &'a [ToolSpec]) -> Self {
         Self {
             request_tools,
-            limits,
             slots: Vec::new(),
             text: String::new(),
             reasoning: String::new(),
@@ -65,7 +63,7 @@ impl<'a> Assembler<'a> {
         &mut self,
         event: ModelEvent,
     ) -> Result<Option<ModelDriverProgress>, ModelError> {
-        if self.finish_reason.is_some() || event.validate().is_err() {
+        if self.finish_reason.is_some() {
             return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
         }
         match event {
@@ -77,11 +75,7 @@ impl<'a> Assembler<'a> {
                 if self.text.is_empty() {
                     self.slots.push(PartSlot::Text);
                 }
-                append_bounded(
-                    &mut self.text,
-                    delta.as_str(),
-                    self.limits.max_model_text_bytes,
-                )?;
+                self.text.push_str(delta.as_str());
                 Ok(Some(ModelDriverProgress::TextDelta(delta)))
             }
             ModelEvent::ReasoningDelta { delta } => {
@@ -92,11 +86,7 @@ impl<'a> Assembler<'a> {
                 if self.reasoning.is_empty() {
                     self.slots.push(PartSlot::Reasoning);
                 }
-                append_bounded(
-                    &mut self.reasoning,
-                    delta.as_str(),
-                    self.limits.max_model_reasoning_bytes,
-                )?;
+                self.reasoning.push_str(delta.as_str());
                 Ok(Some(ModelDriverProgress::ReasoningDelta(delta)))
             }
             ModelEvent::ToolCallStart {
@@ -110,11 +100,10 @@ impl<'a> Assembler<'a> {
                 {
                     return Err(assembler_error(ModelErrorKind::UnexpectedToolCall));
                 }
-                if self.tools.len() >= self.limits.max_tool_calls_per_response
-                    || self
-                        .tools
-                        .iter()
-                        .any(|tool| tool.tool_call_id == tool_call_id)
+                if self
+                    .tools
+                    .iter()
+                    .any(|tool| tool.tool_call_id == tool_call_id)
                 {
                     return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
                 }
@@ -140,11 +129,10 @@ impl<'a> Assembler<'a> {
                 if tool.call.is_some() {
                     return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
                 }
-                append_bounded(&mut tool.arguments_text, &delta, MAX_JSON_BYTES)?;
+                tool.arguments_text.push_str(&delta);
                 Ok(None)
             }
             ModelEvent::ToolCallEnd { tool_call_id } => {
-                let maximum = self.limits.max_tool_arguments_bytes;
                 let tool = self.tool_mut(&tool_call_id)?;
                 if tool.call.is_some() || tool.arguments_text.is_empty() {
                     return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
@@ -152,12 +140,11 @@ impl<'a> Assembler<'a> {
                 let arguments: Value = serde_json::from_str(&tool.arguments_text)
                     .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
                 tool.call = Some(
-                    ToolCall::new_with_max_bytes(
+                    ToolCall::new(
                         tool.tool_call_id.clone(),
                         tool.name.clone(),
                         arguments,
                         tool.call_index,
-                        maximum,
                     )
                     .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))?,
                 );
@@ -262,7 +249,7 @@ impl<'a> Assembler<'a> {
                             None,
                             None,
                         )
-                        .expect("assembled reasoning is normalized and bounded"),
+                        .expect("assembled reasoning is normalized"),
                     ));
                 }
                 PartSlot::Tool(index) => {
@@ -302,7 +289,7 @@ impl<'a> Assembler<'a> {
     }
 }
 
-fn normalized_delta(delta: BoundedText, ended_with_cr: &mut bool) -> BoundedText {
+fn normalized_delta(delta: Text, ended_with_cr: &mut bool) -> Text {
     if delta.is_empty() {
         return delta;
     }
@@ -315,7 +302,7 @@ fn normalized_delta(delta: BoundedText, ended_with_cr: &mut bool) -> BoundedText
     *ended_with_cr = raw.ends_with('\r');
     match normalize_model_text(text) {
         std::borrow::Cow::Borrowed(text) if text.len() == raw.len() => delta,
-        text => BoundedText::new(text).expect("normalization cannot expand bounded text"),
+        text => Text::new(text),
     }
 }
 
@@ -327,21 +314,9 @@ fn assembler_error(kind: ModelErrorKind) -> ModelError {
     let diagnostic = DiagnosticSummary::new(
         DiagnosticCode::ModelMalformedResponse,
         DiagnosticCategory::Model,
-        BoundedText::new(message).expect("static diagnostic must fit BoundedText"),
+        Text::new(message),
         false,
     )
     .expect("valid diagnostic text");
     ModelError::started(kind, diagnostic)
-}
-
-fn append_bounded(target: &mut String, delta: &str, maximum: usize) -> Result<(), ModelError> {
-    let length = target
-        .len()
-        .checked_add(delta.len())
-        .ok_or_else(|| assembler_error(ModelErrorKind::InvalidProviderResponse))?;
-    if length > maximum {
-        return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
-    }
-    target.push_str(delta);
-    Ok(())
 }

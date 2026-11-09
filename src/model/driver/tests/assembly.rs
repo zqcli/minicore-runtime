@@ -5,7 +5,7 @@ async fn eof_delivery_depends_on_whether_an_event_was_observed() {
     for (events, delivery) in [
         (vec![], DeliveryState::Unknown),
         (
-            vec![Ok(ModelEvent::text_delta("partial").unwrap())],
+            vec![Ok(ModelEvent::text_delta("partial"))],
             DeliveryState::Started,
         ),
     ] {
@@ -43,16 +43,16 @@ fn split_crlf_matches_whole_text_in_each_channel_and_progress() {
                 let events = if direct {
                     [
                         ModelEvent::TextDelta {
-                            delta: BoundedText::new(chunk).unwrap(),
+                            delta: Text::new(chunk),
                         },
                         ModelEvent::ReasoningDelta {
-                            delta: BoundedText::new(chunk).unwrap(),
+                            delta: Text::new(chunk),
                         },
                     ]
                 } else {
                     [
-                        ModelEvent::text_delta(chunk).unwrap(),
-                        ModelEvent::reasoning_delta(chunk).unwrap(),
+                        ModelEvent::text_delta(chunk),
+                        ModelEvent::reasoning_delta(chunk),
                     ]
                 };
                 for event in events {
@@ -105,7 +105,7 @@ async fn direct_and_constructed_deltas_enforce_normalized_byte_limits() {
     ] {
         assert!(normalized.len() <= raw.len());
         for reasoning in [false, true] {
-            let delta = BoundedText::new(&raw).unwrap();
+            let delta = Text::new(&raw);
             let (direct, constructed) = if reasoning {
                 (
                     ModelEvent::ReasoningDelta { delta },
@@ -158,17 +158,17 @@ async fn model_text_is_normalized_and_empty_deltas_do_not_emit_progress() {
     let model = ScriptModel::new(
         descriptor(),
         vec![Behavior::Events(vec![
-            Ok(ModelEvent::text_delta("").unwrap()),
-            Ok(ModelEvent::reasoning_delta("").unwrap()),
+            Ok(ModelEvent::text_delta("")),
+            Ok(ModelEvent::reasoning_delta("")),
             Ok(ModelEvent::TextDelta {
-                delta: BoundedText::new("a\r\nb\rc\0\x1b\t").unwrap(),
+                delta: Text::new("a\r\nb\rc\0\x1b\t"),
             }),
-            Ok(ModelEvent::reasoning_delta("r\r\n\x7f").unwrap()),
+            Ok(ModelEvent::reasoning_delta("r\r\n\x7f")),
             Ok(start(call_id(1), "search")),
             Ok(args(call_id(1), "")),
             Ok(ModelEvent::ToolCallArgumentsDelta {
                 tool_call_id: call_id(1),
-                delta: BoundedText::new("{\r\n\"q\":\"a\x1bb\"}").unwrap(),
+                delta: Text::new("{\r\n\"q\":\"a\x1bb\"}"),
             }),
             Ok(end(call_id(1))),
             Ok(finish(ModelFinishReason::ToolCalls)),
@@ -203,9 +203,9 @@ async fn model_text_is_normalized_and_empty_deltas_do_not_emit_progress() {
 async fn assembles_text_reasoning_tool_usage_and_preserves_first_slot_order() {
     let id = call_id(1);
     let events = vec![
-        Ok(ModelEvent::reasoning_delta("reason").unwrap()),
+        Ok(ModelEvent::reasoning_delta("reason")),
         Ok(start(id.clone(), "search")),
-        Ok(ModelEvent::text_delta("answer").unwrap()),
+        Ok(ModelEvent::text_delta("answer")),
         Ok(args(id.clone(), "{\"q\":")),
         Ok(args(id.clone(), "\"rust\"}")),
         Ok(end(id.clone())),
@@ -382,7 +382,7 @@ async fn rejects_every_malformed_stream_sequence() {
             "duplicate finish",
             request(),
             vec![
-                Ok(ModelEvent::text_delta("x").unwrap()),
+                Ok(ModelEvent::text_delta("x")),
                 Ok(finish(ModelFinishReason::Stop)),
                 Ok(finish(ModelFinishReason::Stop)),
             ],
@@ -392,7 +392,7 @@ async fn rejects_every_malformed_stream_sequence() {
             "post finish event",
             request(),
             vec![
-                Ok(ModelEvent::text_delta("x").unwrap()),
+                Ok(ModelEvent::text_delta("x")),
                 Ok(finish(ModelFinishReason::Stop)),
                 Ok(usage.clone()),
             ],
@@ -401,7 +401,7 @@ async fn rejects_every_malformed_stream_sequence() {
         (
             "eof before finish",
             request(),
-            vec![Ok(ModelEvent::text_delta("x").unwrap())],
+            vec![Ok(ModelEvent::text_delta("x"))],
             ModelErrorKind::IncompleteResponse,
         ),
         (
@@ -446,7 +446,7 @@ async fn rejects_every_malformed_stream_sequence() {
             "tool reason without tools",
             request(),
             vec![
-                Ok(ModelEvent::text_delta("x").unwrap()),
+                Ok(ModelEvent::text_delta("x")),
                 Ok(finish(ModelFinishReason::ToolCalls)),
             ],
             ModelErrorKind::InvalidProviderResponse,
@@ -519,7 +519,7 @@ async fn aggregate_text_reasoning_and_arguments_enforce_exact_semantic_boundarie
         run_events(
             request(),
             vec![
-                Ok(ModelEvent::text_delta("abc").unwrap()),
+                Ok(ModelEvent::text_delta("abc")),
                 Ok(finish(ModelFinishReason::Stop)),
             ],
             kernel.clone(),
@@ -531,7 +531,7 @@ async fn aggregate_text_reasoning_and_arguments_enforce_exact_semantic_boundarie
         run_events(
             request(),
             vec![
-                Ok(ModelEvent::text_delta("abcd").unwrap()),
+                Ok(ModelEvent::text_delta("abcd")),
                 Ok(finish(ModelFinishReason::Stop)),
             ],
             kernel.clone(),
@@ -545,7 +545,7 @@ async fn aggregate_text_reasoning_and_arguments_enforce_exact_semantic_boundarie
         run_events(
             request(),
             vec![
-                Ok(ModelEvent::reasoning_delta("abc").unwrap()),
+                Ok(ModelEvent::reasoning_delta("abc")),
                 Ok(finish(ModelFinishReason::Stop)),
             ],
             kernel.clone(),
@@ -557,7 +557,7 @@ async fn aggregate_text_reasoning_and_arguments_enforce_exact_semantic_boundarie
         run_events(
             request(),
             vec![
-                Ok(ModelEvent::reasoning_delta("abcd").unwrap()),
+                Ok(ModelEvent::reasoning_delta("abcd")),
                 Ok(finish(ModelFinishReason::Stop)),
             ],
             kernel.clone(),
@@ -612,7 +612,7 @@ async fn replay_is_retained_once_never_forwarded_and_requires_finish() {
     for with_text in [false, true] {
         let mut events = vec![Ok(replay_event())];
         if with_text {
-            events.push(Ok(ModelEvent::text_delta("answer").unwrap()));
+            events.push(Ok(ModelEvent::text_delta("answer")));
         }
         events.push(Ok(finish(ModelFinishReason::Stop)));
         let model = ScriptModel::new(descriptor(), vec![Behavior::Events(events)]);
@@ -650,7 +650,7 @@ async fn replay_is_retained_once_never_forwarded_and_requires_finish() {
         ),
         (
             vec![
-                Ok(ModelEvent::text_delta("ok").unwrap()),
+                Ok(ModelEvent::text_delta("ok")),
                 Ok(finish(ModelFinishReason::Stop)),
                 Ok(replay_event()),
             ],

@@ -106,12 +106,12 @@ async fn repeated_text_and_reasoning_aggregate_in_first_occurrence_order() {
     let response = run_events(
         tool_request(),
         vec![
-            Ok(ModelEvent::text_delta("answer-").unwrap()),
+            Ok(ModelEvent::text_delta("answer-")),
             Ok(start(id.clone(), "search")),
-            Ok(ModelEvent::reasoning_delta("reason-").unwrap()),
-            Ok(ModelEvent::text_delta("continued").unwrap()),
+            Ok(ModelEvent::reasoning_delta("reason-")),
+            Ok(ModelEvent::text_delta("continued")),
             Ok(args(id.clone(), "{}")),
-            Ok(ModelEvent::reasoning_delta("continued").unwrap()),
+            Ok(ModelEvent::reasoning_delta("continued")),
             Ok(end(id.clone())),
             Ok(finish(ModelFinishReason::ToolCalls)),
         ],
@@ -141,7 +141,7 @@ async fn refused_and_filtered_require_nonempty_text_not_reasoning_only() {
         let response = run_events(
             request(),
             vec![
-                Ok(ModelEvent::text_delta("provider message").unwrap()),
+                Ok(ModelEvent::text_delta("provider message")),
                 Ok(finish(reason)),
             ],
             with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
@@ -154,7 +154,7 @@ async fn refused_and_filtered_require_nonempty_text_not_reasoning_only() {
         let error = run_events(
             request(),
             vec![
-                Ok(ModelEvent::reasoning_delta("internal reason").unwrap()),
+                Ok(ModelEvent::reasoning_delta("internal reason")),
                 Ok(finish(reason)),
             ],
             with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),

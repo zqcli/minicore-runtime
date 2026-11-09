@@ -64,8 +64,7 @@ fn clock_call_events() -> Vec<ModelEvent> {
             tool_call_id: call_id.clone(),
             tool_name: "clock".parse().unwrap(),
         },
-        ModelEvent::tool_call_arguments_delta(call_id.clone(), r#"{"question":"what time is it"}"#)
-            .unwrap(),
+        ModelEvent::tool_call_arguments_delta(call_id.clone(), r#"{"question":"what time is it"}"#),
         ModelEvent::ToolCallEnd {
             tool_call_id: call_id,
         },
@@ -92,7 +91,7 @@ impl Model for EchoModel {
     ) -> ModelStartFuture<'a> {
         Box::pin(async move {
             Ok::<ModelStream, _>(Box::pin(stream::iter(vec![
-                Ok(ModelEvent::text_delta("Hello from the model").unwrap()),
+                Ok(ModelEvent::text_delta("Hello from the model")),
                 Ok(ModelEvent::Finish {
                     reason: ModelFinishReason::Stop,
                 }),
@@ -120,7 +119,7 @@ impl Model for ToolModel {
             clock_call_events().into_iter().map(Ok).collect()
         } else {
             vec![
-                Ok(ModelEvent::text_delta("It is 12:00").unwrap()),
+                Ok(ModelEvent::text_delta("It is 12:00")),
                 Ok(ModelEvent::Finish {
                     reason: ModelFinishReason::Stop,
                 }),
@@ -159,7 +158,7 @@ impl Model for FirstModel {
         } else {
             Box::pin(async move {
                 Ok::<ModelStream, _>(Box::pin(stream::iter(vec![
-                    Ok(ModelEvent::text_delta("first-again").unwrap()),
+                    Ok(ModelEvent::text_delta("first-again")),
                     Ok(ModelEvent::Finish {
                         reason: ModelFinishReason::Stop,
                     }),
@@ -187,7 +186,7 @@ impl Model for SecondModel {
     ) -> ModelStartFuture<'a> {
         Box::pin(async move {
             Ok::<ModelStream, _>(Box::pin(stream::iter(vec![
-                Ok(ModelEvent::text_delta("after-update").unwrap()),
+                Ok(ModelEvent::text_delta("after-update")),
                 Ok(ModelEvent::Finish {
                     reason: ModelFinishReason::Stop,
                 }),

@@ -1,7 +1,5 @@
-use crate::limits::LoopLimits;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::{FutureExt, StreamExt};
@@ -9,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant as TokioInstant;
 
 use crate::time::{DeadlineSource, effective_deadline};
-use crate::value::BoundedText;
+use crate::value::Text;
 
 use super::port::{Model, ModelCallContext, ModelDescriptor};
 #[cfg(test)]
@@ -34,7 +32,6 @@ pub(crate) const MAX_MODEL_RETRY_DELAY: Duration = Duration::from_secs(30);
 pub(crate) struct ModelDriverConfig {
     model_call_timeout: Duration,
     retry_policy: RetryPolicySnapshot,
-    limits: LoopLimits,
 }
 
 impl ModelDriverConfig {
@@ -42,20 +39,18 @@ impl ModelDriverConfig {
         model_call_timeout: Duration,
         max_attempts: u8,
         base_delay: Duration,
-        limits: LoopLimits,
     ) -> Self {
         Self {
             model_call_timeout,
             retry_policy: RetryPolicySnapshot::new(max_attempts, base_delay),
-            limits,
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ModelDriverProgress {
-    TextDelta(BoundedText),
-    ReasoningDelta(BoundedText),
+    TextDelta(Text),
+    ReasoningDelta(Text),
 }
 
 pub(crate) struct ModelDriver {
@@ -63,7 +58,6 @@ pub(crate) struct ModelDriver {
     descriptor: ModelDescriptor,
     model_call_timeout: Duration,
     retry_policy: RetryPolicySnapshot,
-    limits: LoopLimits,
 }
 
 impl ModelDriver {
@@ -90,7 +84,6 @@ impl ModelDriver {
             descriptor,
             model_call_timeout: config.model_call_timeout,
             retry_policy: config.retry_policy,
-            limits: config.limits,
         }
     }
 
@@ -99,10 +92,9 @@ impl ModelDriver {
         &self,
         request: ModelRequest,
         context: ModelCallContext,
-        progress: &mpsc::Sender<ModelDriverProgress>,
+        progress: &mpsc::UnboundedSender<ModelDriverProgress>,
     ) -> Result<ModelResponse, ModelError> {
-        let progress_dropped = AtomicU64::new(0);
-        self.run_detailed(request, context, progress, &progress_dropped)
+        self.run_detailed(request, context, progress)
             .await
             .map_err(ModelDriverFailure::into_error)
     }
@@ -111,8 +103,7 @@ impl ModelDriver {
         &self,
         request: ModelRequest,
         context: ModelCallContext,
-        progress: &mpsc::Sender<ModelDriverProgress>,
-        progress_dropped: &AtomicU64,
+        progress: &mpsc::UnboundedSender<ModelDriverProgress>,
     ) -> Result<ModelResponse, ModelDriverFailure> {
         let deadline =
             effective_deadline(context.deadline, self.model_call_timeout).map_err(|_| {
@@ -139,7 +130,6 @@ impl ModelDriver {
                     deadline.tokio(),
                     deadline.source(),
                     progress,
-                    progress_dropped,
                 )
                 .await
             {
@@ -191,8 +181,7 @@ impl ModelDriver {
         context: ModelCallContext,
         deadline: TokioInstant,
         deadline_source: DeadlineSource,
-        progress: &mpsc::Sender<ModelDriverProgress>,
-        progress_dropped: &AtomicU64,
+        progress: &mpsc::UnboundedSender<ModelDriverProgress>,
     ) -> Result<ModelResponse, AttemptFailure> {
         let cancellation = context.cancellation.clone();
         let request_index = context.request_index;
@@ -237,7 +226,7 @@ impl ModelDriver {
 
         let mut stream = stream;
         let _stream_cancel = cancellation.clone().drop_guard();
-        let mut assembler = Assembler::new(request.tools(), &self.limits);
+        let mut assembler = Assembler::new(request.tools());
         let result = async {
             loop {
                 let next = AssertUnwindSafe(stream.next()).catch_unwind();
@@ -272,13 +261,7 @@ impl ModelDriver {
                             AttemptFailure::new(error, assembler.observed_event)
                         })?;
                         if let Some(progress_event) = progress_event {
-                            match progress.try_send(progress_event) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    progress_dropped.fetch_add(1, Ordering::Relaxed);
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {}
-                            }
+                            let _ = progress.send(progress_event);
                             // Let the runner forward this delta before polling another ready event.
                             tokio::task::yield_now().await;
                         }

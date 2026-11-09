@@ -17,7 +17,7 @@ use minicore_runtime::prompt::{
     DefaultPromptProvider, PromptFuture, PromptProvider, PromptRequest,
 };
 use minicore_runtime::tools::{ApprovalDecision, ToolInputAnswer, ToolInputAnswerKind, ToolSet};
-use minicore_runtime::value::BoundedText;
+use minicore_runtime::value::Text;
 use minicore_runtime::{
     AgentLoop, CancelReason, ConfigRevision, HistoryItem, InteractionAnswer, InteractionKind,
     LoopEvent, LoopHandle, LoopInputs, LoopOptions, LoopOutcome, LoopStatus, UserInput,
@@ -513,14 +513,14 @@ async fn a_driver_retry_is_one_request_and_reuses_the_candidate_index() {
                             DiagnosticSummary::new(
                                 DiagnosticCode::ModelUnavailable,
                                 DiagnosticCategory::Model,
-                                BoundedText::new("retry me").unwrap(),
+                                Text::new("retry me"),
                                 true,
                             )
                             .unwrap(),
                         ))
                     } else {
                         Ok::<ModelStream, ModelError>(Box::pin(futures_util::stream::iter(vec![
-                            Ok(minicore_runtime::model::ModelEvent::text_delta("done").unwrap()),
+                            Ok(minicore_runtime::model::ModelEvent::text_delta("done")),
                             Ok(minicore_runtime::model::ModelEvent::Finish {
                                 reason: minicore_runtime::model::ModelFinishReason::Stop,
                             }),

@@ -8,7 +8,7 @@ async fn finish_then_stream_error_is_not_success_or_retryable_after_observation(
         vec![
             Behavior::ProbedStream {
                 events: vec![
-                    Ok(ModelEvent::text_delta("complete-looking").unwrap()),
+                    Ok(ModelEvent::text_delta("complete-looking")),
                     Ok(ModelEvent::ProviderReplay {
                         replay: crate::model::ProviderReplay::new(
                             "test/v1",
@@ -50,7 +50,7 @@ async fn finish_then_pending_requires_eof_and_drops_on_cancel_or_observed_timeou
         descriptor(),
         vec![Behavior::ProbedStream {
             events: vec![
-                Ok(ModelEvent::text_delta("complete-looking").unwrap()),
+                Ok(ModelEvent::text_delta("complete-looking")),
                 Ok(ModelEvent::ProviderReplay {
                     replay: crate::model::ProviderReplay::new(
                         "test/v1",
@@ -92,7 +92,7 @@ async fn finish_then_pending_requires_eof_and_drops_on_cancel_or_observed_timeou
         descriptor(),
         vec![Behavior::ProbedStream {
             events: vec![
-                Ok(ModelEvent::text_delta("complete-looking").unwrap()),
+                Ok(ModelEvent::text_delta("complete-looking")),
                 Ok(ModelEvent::ProviderReplay {
                     replay: crate::model::ProviderReplay::new(
                         "test/v1",
@@ -138,7 +138,7 @@ async fn event_then_stream_poll_panic_is_started_dropped_and_never_retried() {
         descriptor(),
         vec![
             Behavior::ProbedStream {
-                events: vec![Ok(ModelEvent::text_delta("observed").unwrap())],
+                events: vec![Ok(ModelEvent::text_delta("observed"))],
                 terminal: StreamTerminal::Panic,
                 probe: Arc::clone(&dropped),
             },

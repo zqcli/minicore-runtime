@@ -11,9 +11,7 @@ use minicore_runtime::model::{
     ModelEvent, ModelPartial, ModelRequest, ModelStartFuture, ModelStream, ProviderReplay, Usage,
 };
 use minicore_runtime::tools::{ToolResultOutcome, ToolSet};
-use minicore_runtime::{
-    AgentLoop, BoundedText, CancelReason, HistoryItem, LoopOptions, LoopOutcome,
-};
+use minicore_runtime::{AgentLoop, CancelReason, HistoryItem, LoopOptions, LoopOutcome, Text};
 use tokio::sync::Notify;
 
 use support::loops::*;
@@ -24,7 +22,7 @@ fn interrupted() -> ModelError {
         DiagnosticSummary::new(
             DiagnosticCode::ModelUnavailable,
             DiagnosticCategory::Model,
-            BoundedText::new("test stream failed").unwrap(),
+            Text::new("test stream failed"),
             false,
         )
         .unwrap(),
@@ -34,8 +32,8 @@ fn interrupted() -> ModelError {
 #[tokio::test]
 async fn failure_returns_assembled_partial_and_unfinished_tool_arguments_without_execution() {
     let mut events = vec![
-        ModelEvent::reasoning_delta("think\r").unwrap(),
-        ModelEvent::text_delta("Hello\r").unwrap(),
+        ModelEvent::reasoning_delta("think\r"),
+        ModelEvent::text_delta("Hello\r"),
     ];
     let mut completed = tool_call_events(vec![("echo", "complete-call")]);
     completed.pop();
@@ -45,9 +43,8 @@ async fn failure_returns_assembled_partial_and_unfinished_tool_arguments_without
             tool_call_id: "unfinished".parse().unwrap(),
             tool_name: "echo".parse().unwrap(),
         },
-        ModelEvent::tool_call_arguments_delta("unfinished".parse().unwrap(), "{\"secret\":")
-            .unwrap(),
-        ModelEvent::text_delta("\nworld").unwrap(),
+        ModelEvent::tool_call_arguments_delta("unfinished".parse().unwrap(), "{\"secret\":"),
+        ModelEvent::text_delta("\nworld"),
         ModelEvent::Usage {
             usage: Usage::new(5, 7, 2),
         },
@@ -139,11 +136,7 @@ fn holding(events: Vec<ModelEvent>) -> (Arc<dyn Model>, Arc<Notify>) {
 
 #[tokio::test]
 async fn cancellation_keeps_partial_without_an_event_subscriber() {
-    let (model, drained) = holding(
-        (0..100)
-            .map(|_| ModelEvent::text_delta("delta ").unwrap())
-            .collect(),
-    );
+    let (model, drained) = holding((0..100).map(|_| ModelEvent::text_delta("delta ")).collect());
     let mut options = LoopOptions::default_checked().unwrap();
     options.event_capacity = 1;
     let agent = AgentLoop::start(
@@ -170,7 +163,7 @@ async fn cancellation_keeps_partial_without_an_event_subscriber() {
 
 #[tokio::test(start_paused = true)]
 async fn deadline_keeps_partial_from_actual_assembly() {
-    let (model, drained) = holding(vec![ModelEvent::text_delta("before deadline").unwrap()]);
+    let (model, drained) = holding(vec![ModelEvent::text_delta("before deadline")]);
     let mut options = LoopOptions::default_checked().unwrap();
     options.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(2));
     let agent = AgentLoop::start(
@@ -265,7 +258,7 @@ async fn incomplete_second_request_has_original_index_without_reclassifying_firs
             calls: vec![("echo", "ran-once")],
         },
         Round::StreamError {
-            events: vec![ModelEvent::text_delta("unfinished second answer").unwrap()],
+            events: vec![ModelEvent::text_delta("unfinished second answer")],
             error: interrupted(),
         },
     ]);
@@ -287,15 +280,14 @@ async fn incomplete_second_request_has_original_index_without_reclassifying_firs
 #[tokio::test]
 async fn eof_and_invalid_tool_end_retain_unfinished_content() {
     for malformed_tool in [false, true] {
-        let mut events = vec![ModelEvent::text_delta("retained").unwrap()];
+        let mut events = vec![ModelEvent::text_delta("retained")];
         if malformed_tool {
             events.extend([
                 ModelEvent::ToolCallStart {
                     tool_call_id: "unfinished".parse().unwrap(),
                     tool_name: "echo".parse().unwrap(),
                 },
-                ModelEvent::tool_call_arguments_delta("unfinished".parse().unwrap(), "{invalid")
-                    .unwrap(),
+                ModelEvent::tool_call_arguments_delta("unfinished".parse().unwrap(), "{invalid"),
                 ModelEvent::ToolCallEnd {
                     tool_call_id: "unfinished".parse().unwrap(),
                 },

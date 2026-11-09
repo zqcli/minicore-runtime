@@ -1,4 +1,4 @@
-use minicore_runtime::BoundedText;
+use minicore_runtime::Text;
 use minicore_runtime::model::{
     Model, ModelCallContext, ModelDescriptor, ModelError, ModelEvent, ModelFinishReason,
     ModelRequest, ModelStartFuture, ModelStream, ReasoningPreference,
@@ -200,8 +200,8 @@ impl Model for ScriptedModel {
 pub fn round_stream(round: Round) -> ModelStream {
     match round {
         Round::ReasoningThenText { reasoning, text } => round_stream(Round::Events(vec![
-            ModelEvent::reasoning_delta(reasoning).unwrap(),
-            ModelEvent::text_delta(text).unwrap(),
+            ModelEvent::reasoning_delta(reasoning),
+            ModelEvent::text_delta(text),
             ModelEvent::Finish {
                 reason: ModelFinishReason::Stop,
             },
@@ -209,7 +209,7 @@ pub fn round_stream(round: Round) -> ModelStream {
         Round::Events(events) => Box::pin(futures_util::stream::iter(events.into_iter().map(Ok))),
         Round::Hold => Box::pin(futures_util::stream::pending()),
         Round::Final { text } => Box::pin(futures_util::stream::iter(vec![
-            Ok(ModelEvent::text_delta(text).unwrap()),
+            Ok(ModelEvent::text_delta(text)),
             Ok(ModelEvent::Finish {
                 reason: ModelFinishReason::Stop,
             }),
@@ -220,7 +220,7 @@ pub fn round_stream(round: Round) -> ModelStream {
         Round::GatedTools { calls, gate } => gated_stream(tool_call_events(calls), gate),
         Round::GatedFinal { text, gate } => gated_stream(
             vec![
-                ModelEvent::text_delta(text).unwrap(),
+                ModelEvent::text_delta(text),
                 ModelEvent::Finish {
                     reason: ModelFinishReason::Stop,
                 },
@@ -230,7 +230,7 @@ pub fn round_stream(round: Round) -> ModelStream {
         Round::BurstDeltas { count, chunk } => {
             let mut events = Vec::with_capacity(count + 1);
             for _ in 0..count {
-                events.push(ModelEvent::text_delta(chunk).unwrap());
+                events.push(ModelEvent::text_delta(chunk));
             }
             events.push(ModelEvent::Finish {
                 reason: ModelFinishReason::Stop,
@@ -259,7 +259,7 @@ pub fn tool_call_events(calls: Vec<(&'static str, &'static str)>) -> Vec<ModelEv
             tool_call_id: call_id.clone(),
             tool_name: name.parse().unwrap(),
         });
-        events.push(ModelEvent::tool_call_arguments_delta(call_id.clone(), "{}").unwrap());
+        events.push(ModelEvent::tool_call_arguments_delta(call_id.clone(), "{}"));
         events.push(ModelEvent::ToolCallEnd {
             tool_call_id: call_id,
         });
@@ -368,10 +368,7 @@ impl Tool for RecordingTool {
                 ToolBehavior::RequestChoiceInput => {
                     let request = ToolInputRequest::new(
                         "choose the option",
-                        vec![
-                            BoundedText::new("alpha").unwrap(),
-                            BoundedText::new("beta").unwrap(),
-                        ],
+                        vec![Text::new("alpha"), Text::new("beta")],
                         ToolInputAnswerKind::SingleChoice,
                     )
                     .unwrap();
@@ -382,7 +379,7 @@ impl Tool for RecordingTool {
                 }
                 ToolBehavior::ProgressBurst(count) => {
                     for i in 0..count {
-                        let msg = BoundedText::new(format!("progress-{i}")).unwrap();
+                        let msg = Text::new(format!("progress-{i}"));
                         let _ = context.progress.emit(
                             ToolProgress::new(Some(msg), Some(i as u64), Some(count as u64))
                                 .unwrap(),
@@ -398,7 +395,7 @@ impl Tool for RecordingTool {
                     gate,
                 } => {
                     for i in 0..count {
-                        let msg = BoundedText::new(format!("progress-{i}")).unwrap();
+                        let msg = Text::new(format!("progress-{i}"));
                         let _ = context.progress.emit(
                             ToolProgress::new(Some(msg), Some(i as u64), Some(count as u64))
                                 .unwrap(),
@@ -465,7 +462,7 @@ pub fn tool_set_full(
 pub enum PolicyPlan {
     Allow,
     Deny,
-    DenyReason(BoundedText),
+    DenyReason(Text),
     RequireApproval,
     Invalid,
     Hold,
@@ -492,7 +489,7 @@ impl ToolPolicy for ScriptedPolicy {
                 ),
                 PolicyPlan::Invalid => Ok(ToolDecision::RequireApproval {
                     request: ApprovalRequest {
-                        prompt: BoundedText::new("").unwrap(),
+                        prompt: Text::new(""),
                         risk: ApprovalRisk::High,
                     },
                 }),
