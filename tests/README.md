@@ -19,6 +19,7 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 | `tool_policy_interaction_contract.rs` | 8 | policy decisions, interaction DTO contracts, and ToolInputRequest validation |
 | `tool_set_contract.rs` | 11 | `ToolSet` registration, spec validation, enabled subsets |
 | `provider_replay.rs` | 2 | replay bounds, serde and legacy wire compatibility |
+| `history_handoff_contract.rs` | 6 | ordered incremental handoffs, backpressure, failure, cancellation-safe saving and callback panic isolation |
 
 ## Unit (`src/**` inline and driver)
 
@@ -32,7 +33,7 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 
   - `src/usage.rs` (1 test): partial usage accumulates reported fields.
 
-Total main-crate volume: **283 tests** (80 unit + 203 integration across 12 targets).
+Total main-crate volume: **289 tests** (80 unit + 209 integration across 13 targets).
 Two compile-fail doctests protect private `ToolSpec` and `ToolOutput` fields.
 `tests/support/` shares scripted model/tool/policy builders, config/start/join helpers
 and report extractors across separate binaries. Driver tests use the actual

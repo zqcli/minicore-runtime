@@ -43,11 +43,39 @@ struct LoopCtx<'a> {
     options: &'a LoopOptions,
     sink: &'a mut LoopEventSink,
     completion_tx: &'a watch::Sender<Option<Arc<LoopReport>>>,
+    history_offset: usize,
 }
 
 impl LoopCtx<'_> {
     fn publish(&mut self, state: LoopState) {
         publish(self.control, &mut *self.sink, state);
+    }
+
+    async fn handoff_history(&mut self, working: &WorkingHistory) -> Result<(), FailPath> {
+        let appended = working.view().appended();
+        let offset = self.history_offset;
+        self.history_offset = appended.len();
+        let Some(history) = &self.options.history else {
+            return Ok(());
+        };
+        if offset == appended.len() {
+            return Ok(());
+        }
+        // A callback may already own the range when saving fails or cancellation arrives.
+        // Never retry it or drop its future in response to loop cancellation.
+        match AssertUnwindSafe(async { history.append(self.id, offset, &appended[offset..]).await })
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(diagnostic)) => Err(FailPath::History(diagnostic)),
+            Err(_) => Err(FailPath::History(DiagnosticSummary::bounded_static(
+                DiagnosticCode::Internal,
+                DiagnosticCategory::Internal,
+                "history callback panicked",
+                false,
+            ))),
+        }
     }
 }
 
@@ -122,6 +150,7 @@ async fn run_loop_inner(
         options: &options,
         sink: &mut sink,
         completion_tx: &completion_tx,
+        history_offset: 0,
     };
 
     ctx.sink.try_emit(LoopEvent::Started { loop_id: id });
@@ -149,7 +178,7 @@ async fn run_loop_inner(
     let mut usage = UsageAccumulator::default();
     let mut discarded_config = None;
 
-    let end = loop {
+    let mut end = loop {
         if cancellation.is_cancelled() {
             break FailPath::Cancelled;
         }
@@ -300,6 +329,10 @@ async fn run_loop_inner(
             usage: round_usage,
         });
 
+        if let Err(path) = ctx.handoff_history(&working).await {
+            break path;
+        }
+
         if let Some(path) = no_tool_finish {
             if path == FailPath::Completed {
                 // Closes accepting in the same critical section as the seal
@@ -330,19 +363,26 @@ async fn run_loop_inner(
             pending_interaction: None,
         });
 
-        if let Some(path) = run_tool_batch(
+        let batch_end = run_tool_batch(
             &mut ctx,
             &mut working,
             request_index,
             &snapshot,
             &tool_calls,
         )
-        .await
-        {
+        .await;
+        if let Err(path) = ctx.handoff_history(&working).await {
+            break path;
+        }
+        if let Some(path) = batch_end {
             break path;
         }
         request_index = request_index.saturating_add(1);
     };
+
+    if let Err(path) = ctx.handoff_history(&working).await {
+        end = path;
+    }
 
     let report = finish_loop(
         &mut ctx,
@@ -531,6 +571,11 @@ fn outcome_for(control: &LoopControl, path: FailPath) -> LoopOutcome {
             DiagnosticCategory::Internal,
             "pending interaction was not resolved",
         )),
+        FailPath::History(diagnostic) => LoopOutcome::Failed(LoopFailure {
+            kind: LoopFailureKind::History,
+            diagnostic,
+            model_error: None,
+        }),
         FailPath::MaxToolRounds => LoopOutcome::Failed(failure(
             LoopFailureKind::MaxToolRounds,
             DiagnosticCode::TurnBudgetExceeded,
@@ -585,6 +630,7 @@ enum FailPath {
     ContentFiltered,
     Policy,
     Interaction,
+    History(DiagnosticSummary),
     MaxToolRounds,
     Internal,
 }

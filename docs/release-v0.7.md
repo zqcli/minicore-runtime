@@ -3,6 +3,17 @@
 Versioned sections describe changes at that version. Current behavior is
 defined by the contracts and the latest README compatibility notes.
 
+## 0.10.0 (unreleased)
+
+- Add the optional `LoopOptions.history` receiver and root-exported `LoopHistory`
+  and `HistoryFuture`. It acknowledges only new complete records, in order, at
+  response, tool-batch and final-unwind boundaries before continuation.
+- Handoffs use the existing `LoopId` and offsets within the full final delta.
+  Failure does not retry accepted ranges or completed tools; callback errors and
+  panics produce `LoopFailureKind::History`. Cancellation waits for already-owned
+  callback work. Events remain independent, best-effort observations.
+- The package version remains 0.9.2 until a release is explicitly prepared.
+
 ## 0.7.0
 
 The one-loop host boundary, JSON representations and storage-independent design

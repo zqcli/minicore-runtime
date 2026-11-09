@@ -222,6 +222,7 @@ async fn finish_loop_losing_the_seal_returns_the_published_arc() {
         options: &options,
         sink: &mut sink,
         completion_tx: &completion_tx,
+        history_offset: 0,
     };
     let report = finish_loop(
         &mut ctx,
@@ -257,6 +258,7 @@ async fn completion_preserves_tool_round_counts_beyond_u16() {
             options: &options,
             sink: &mut sink,
             completion_tx: &completion_tx,
+            history_offset: 0,
         };
         let report = finish_loop(
             &mut ctx,

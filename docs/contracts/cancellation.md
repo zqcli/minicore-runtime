@@ -36,6 +36,10 @@ Cancellation and deadline behavior of one loop.
   when it wins, the loop ends as `Cancelled(Deadline)` through the same
   linearization as every other ending path.
 
+- Cancellation does not drop an in-flight `LoopHistory` acknowledgement; the
+  runner waits for owned saving before publishing its report. Deadlines stop
+  subsequent execution but do not cut off that host-owned work.
+
 ## Best Effort
 
 `cancel()` never blocks and never guarantees that any particular tool call

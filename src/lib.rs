@@ -14,10 +14,11 @@ mod usage;
 pub mod value;
 
 pub use agent_loop::{
-    AgentLoop, AnswerError, CancelReason, LoopEvent, LoopEventEnvelope, LoopEventStream,
-    LoopFailure, LoopFailureKind, LoopHandle, LoopInputs, LoopJoinError, LoopOptions, LoopOutcome,
-    LoopOutcomeSummary, LoopReport, LoopRequest, LoopStartError, LoopState, LoopStatus,
-    LoopWaitError, OutputChannel, TakeEventsError, UpdateError,
+    AgentLoop, AnswerError, CancelReason, HistoryFuture, LoopEvent, LoopEventEnvelope,
+    LoopEventStream, LoopFailure, LoopFailureKind, LoopHandle, LoopHistory, LoopInputs,
+    LoopJoinError, LoopOptions, LoopOutcome, LoopOutcomeSummary, LoopReport, LoopRequest,
+    LoopStartError, LoopState, LoopStatus, LoopWaitError, OutputChannel, TakeEventsError,
+    UpdateError,
 };
 pub use execution::{
     ConfigRevision, ExecutionConfig, ExecutionConfigError, UserInput, UserInputError,

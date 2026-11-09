@@ -287,7 +287,7 @@ async fn decide_policy(
     .await;
     match outcome {
         PortCallOutcome::Returned(Ok(decision)) => {
-            if !decision.validate().is_ok() {
+            if decision.validate().is_err() {
                 return PolicyStep::Invalid;
             }
             match decision {

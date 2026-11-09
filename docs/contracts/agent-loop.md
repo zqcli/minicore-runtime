@@ -90,6 +90,13 @@ The runner loops:
   `RequestStarted` for that: cancellation or preparation failure can leave
   taken inputs in `appended` without issuing their request.
 
+## Complete Record Boundaries
+
+An optional `LoopOptions.history` receiver acknowledges each new history range
+before tools or the next model request run. The existing start signature and
+input handoff do not change. See [incremental handoff](history.md#incremental-handoff)
+for offsets, cancellation-safe saving and failure ownership.
+
 ## Final Report
 
 - `LoopReport` carries `outcome`, `appended` (only in-memory items this loop

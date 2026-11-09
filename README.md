@@ -118,7 +118,8 @@ The Runtime executes one loop. The host owns everything around it:
 - Sessions are owned by the host. There is no session type, lifecycle, or
   open/load/save surface.
 - History is passed in by the host. The Runtime reads `HistoryItem`s, returns
-  its new items in `LoopReport::appended`, and never persists anything.
+  its new items in `LoopReport::appended`, and never persists anything. An optional
+  `LoopHistory` receiver acknowledges incremental complete records while it runs.
 - `LoopReport` is saved by the host. `wait` and `join` return the same
   `Arc<LoopReport>` for as long as the owner or any handle lives.
 - Events are not authoritative. The stream is bounded and single-consumer;
@@ -193,6 +194,20 @@ changes. See [tests/README.md](tests/README.md)
 for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 
 ## Compatibility Notes
+
+### 0.10.0 (unreleased)
+
+- `LoopOptions.history` optionally installs `Arc<dyn LoopHistory>`; the default
+  remains `None`. `LoopHistory::append` returns `HistoryFuture` and acknowledges
+  ordered incremental records before tools, the next request, or final unwind.
+  `AgentLoop::start` and `LoopInputs` retain their existing signatures.
+- Callbacks receive the original `LoopId`, an offset into `LoopReport.appended`,
+  and a borrowed slice of only new items. Callbacks are never retried, even after
+  failure, and are not dropped by cancellation. Hosts track accepted records
+  separately from successful saving and reconcile the full final report by offset.
+- Callback failures use `LoopFailureKind::History`, never model retry or tool
+  business-error paths. Hosts using `LoopOptions` struct literals must add
+  `history`; cloning options shares the receiver without requiring `Debug`.
 
 ### 0.9.2
 

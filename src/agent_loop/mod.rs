@@ -1,3 +1,6 @@
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +37,7 @@ const MAX_MODEL_RETRY_ATTEMPTS: u8 = 4;
 ///
 /// All fields are public; start from [`LoopOptions::default_checked`] and
 /// mutate only what the call site needs. There is deliberately no builder.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LoopOptions {
     pub deadline: Option<tokio::time::Instant>,
     /// Zero disables the round limit. Positive values opt into a finite budget.
@@ -47,6 +50,8 @@ pub struct LoopOptions {
     pub model_retry_attempts: u8,
     pub model_retry_base_delay: Duration,
     pub limits: LoopLimits,
+    /// Acknowledges ordered new history before the runner continues.
+    pub history: Option<Arc<dyn LoopHistory>>,
 }
 
 impl LoopOptions {
@@ -62,6 +67,7 @@ impl LoopOptions {
             model_retry_attempts: 2,
             model_retry_base_delay: Duration::from_millis(100),
             limits: LoopLimits::default(),
+            history: None,
         };
         options.validate()?;
         Ok(options)
@@ -89,6 +95,39 @@ impl LoopOptions {
             .validate()
             .map_err(|_| LoopStartError::InvalidOptions)
     }
+}
+
+impl fmt::Debug for LoopOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoopOptions")
+            .field("deadline", &self.deadline)
+            .field("max_tool_rounds", &self.max_tool_rounds)
+            .field("event_capacity", &self.event_capacity)
+            .field("prompt_timeout", &self.prompt_timeout)
+            .field("model_timeout", &self.model_timeout)
+            .field("policy_timeout", &self.policy_timeout)
+            .field("tool_timeout", &self.tool_timeout)
+            .field("model_retry_attempts", &self.model_retry_attempts)
+            .field("model_retry_base_delay", &self.model_retry_base_delay)
+            .field("limits", &self.limits)
+            .field("history", &self.history.as_ref().map(|_| "<callback>"))
+            .finish()
+    }
+}
+
+pub type HistoryFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), DiagnosticSummary>> + Send + 'a>>;
+
+/// Accepts each new history range once and acknowledges any host-owned saving before continuation.
+pub trait LoopHistory: Send + Sync {
+    /// The offset is relative to this loop's appended history, never its base history.
+    fn append<'a>(
+        &'a self,
+        loop_id: LoopId,
+        offset: usize,
+        items: &'a [HistoryItem],
+    ) -> HistoryFuture<'a>;
 }
 
 /// Everything the runner needs for one task: host history, the fresh user
@@ -279,6 +318,7 @@ pub enum LoopFailureKind {
     ContentFiltered,
     Policy,
     Interaction,
+    History,
     MaxToolRounds,
     Internal,
 }
