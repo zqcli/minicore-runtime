@@ -104,6 +104,7 @@ pub struct LoopEventStream {
 }
 
 /// Non-awaiting observation sender; a disconnected consumer never affects execution.
+#[derive(Clone)]
 pub(crate) struct LoopEventSink {
     sender: mpsc::UnboundedSender<LoopEventEnvelope>,
 }

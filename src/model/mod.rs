@@ -6,6 +6,7 @@ mod port;
 mod replay;
 mod request;
 mod response;
+mod retry;
 mod usage;
 
 pub use error::{DeliveryState, ModelError, ModelErrorKind, ModelValueError, RetryHint};
@@ -17,9 +18,10 @@ pub use request::{ModelLimits, ModelLimitsError, ModelRequest, ReasoningPreferen
 pub use response::{
     IncompleteToolCall, ModelEvent, ModelFinishReason, ModelPartial, ModelResponse,
 };
+pub use retry::{ModelRetryPhase, ModelRetryProgress};
 pub use usage::Usage;
 
 pub(crate) use driver::{
     MAX_MODEL_CALL_TIMEOUT, MAX_MODEL_RETRY_DELAY, ModelDriver, ModelDriverConfig,
-    ModelDriverFailure, ModelDriverProgress,
+    ModelDriverFailure, ModelDriverProgress, ModelDriverUpdate,
 };

@@ -1,7 +1,7 @@
 use crate::execution::ConfigRevision;
 use crate::ids::LoopId;
 use crate::interaction::PendingInteraction;
-use crate::model::ModelRef;
+use crate::model::{ModelRef, ModelRetryProgress};
 
 /// Point-in-time public state of one agent loop.
 ///
@@ -16,6 +16,9 @@ pub struct LoopState {
     pub config_revision: ConfigRevision,
 
     pub model: Option<ModelRef>,
+    /// Actual model starts for this request, retained after settlement until the next preparation.
+    pub model_attempts: u8,
+    pub model_retry: Option<ModelRetryProgress>,
     pub pending_interaction: Option<PendingInteraction>,
 }
 
@@ -43,6 +46,8 @@ impl LoopState {
             request_index,
             config_revision,
             model: None,
+            model_attempts: 0,
+            model_retry: None,
             pending_interaction: None,
         }
     }

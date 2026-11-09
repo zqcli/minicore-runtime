@@ -246,6 +246,8 @@ pub struct LoopReport {
     pub history_failure: Option<DiagnosticSummary>,
     pub usage: Usage,
     pub requests: u32,
+    /// Actual model starts per logical request, indexed by request index and including the initial call.
+    pub model_attempts: Arc<[u8]>,
     /// Number of tool batches entered.
     pub tool_rounds: u64,
     pub final_config_revision: ConfigRevision,

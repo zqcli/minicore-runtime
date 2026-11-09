@@ -41,7 +41,10 @@ The runner loops:
    request fails, it is counted in `LoopReport.requests` and the final
    `LoopState.request_index` matches the last issued `RequestStarted`.
    Driver-internal retries execute within that single logical request; the
-   runtime does not perform automatic whole-loop retries.
+   runtime does not perform automatic whole-loop retries. `LoopState.model_retry`
+   and `model_attempts` expose driver-owned retry progress and actual calls for
+   the current request; `LoopReport.model_attempts` retains the actual call count
+   for each zero-based request index. See [retry state](model.md#retry-state).
 6. On a response with tool calls, execute the tool batch pinned to the
    snapshot of the producing request; then loop back.
 7. On a response without tool calls, close accepting and end. The host's

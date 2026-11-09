@@ -99,6 +99,44 @@ model-only timeout during backoff reports `Failed(Model)` with that prior cause.
   interpreted as an instruction for the runtime to automatically retry the
   entire loop.
 
+## Retry State
+
+The driver is the sole retry authority. A private synchronous handoff publishes
+actual attempts and retry scheduling directly into `LoopState` before emitting
+its normal optional `StateChanged` observation. This handoff does not use the
+output-progress queue or a public callback. Events can be absent, disconnected
+or undrained without changing the state, attempt count or execution.
+
+`LoopState.model_retry` is `None` outside an active retry. `ModelRetryProgress`
+retains the enclosing state's original loop and request association without
+repeating their IDs. Its `attempt` includes the initial request, starts at two,
+and never exceeds `max_attempts`; `error` is the preceding attempt's exact
+structured `ModelError`, not a new synthesized failure.
+
+- `ModelRetryPhase::Waiting` means that attempt is scheduled, not issued.
+  `retry_at: SystemTime` is sampled at the source for a host's UTC/RFC3339 display.
+  `retry_deadline: tokio::time::Instant` is the actual monotonic sleep target.
+  No wall-clock adjustment or client countdown affects execution.
+- `Requesting` means `Model::start` has actually been invoked, including a call
+  whose synchronous start panics. `LoopState.model_attempts` increments only
+  then and includes the initial call. It remains unchanged during backoff.
+- The driver synchronously clears retry state when the model request settles,
+  including success, failure, timeout and cancellation, before any history
+  acknowledgement, tool execution or next request preparation. A normal state
+  update publishes that clearing. The actual count remains through tool work
+  and resets at the next preparation; final state uses the last issued request.
+- `LoopReport.model_attempts` retains a count per issued logical request in
+  zero-based index order, independently of watch coalescing. A logical request
+  stopped by a preflight check before `Model::start` has count zero. Internal
+  retries do not increment `LoopReport.requests` or change `request_index`.
+
+The existing safe-retry predicate, total-attempt range 1–4 (default 2), capped
+exponential delay, Retry-After lower bound, overall deadline and cancellation
+rules are unchanged. Retry-After above 30 seconds or a delay that does not fit
+strictly before the deadline stops retrying without scheduling a shorter wait.
+There is no new event kind, retry object, acknowledgement, polling loop or host
+retry policy. Watches retain current state rather than replay every transition.
+
 ## Limits and Stack Safety
 
 `ModelLimits` retains actual context-window and output-token limits, and model

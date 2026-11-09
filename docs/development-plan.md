@@ -48,6 +48,20 @@ are implemented, including independent history diagnostics and first-outcome
 claims. See the [host handoff guide](integration/host-boundary.md#incremental-history-and-partial-output)
 and [release notes](release-v0.7.md).
 
+### Authoritative retry state follow-up
+
+This separate work starts from quota closeout `cd59b6e` and does not rewrite or
+publish its history. The first implementation adds synchronous driver-to-state
+updates, source/monotonic retry timing and actual per-request invocation counts.
+The existing retry policy, history acknowledgements, partial output and
+independent primary/history failures remain unchanged.
+
+Initial verification on Linux: `cargo test --all-features --locked --test
+model_retry_state_contract` (3 passed), `cargo test --all-features --locked --lib
+model::driver` (46 passed), and `./scripts/check.sh` (313 main-crate tests,
+Clippy/rustdoc warnings denied, docs/architecture/acceptance and mutation
+self-tests passed). Additional boundary regressions follow separately.
+
 ### Historical post-handoff cleanup audit (before quota removal)
 
 The 2026-11-09 audit compared `3fd5ecd..49a6e8b` and checked production, test

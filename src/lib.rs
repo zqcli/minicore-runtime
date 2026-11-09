@@ -28,4 +28,5 @@ pub use history::{
 };
 pub use ids::{InteractionId, LoopId, ToolCallId};
 pub use interaction::{InteractionAnswer, InteractionKind, PendingInteraction};
+pub use model::{ModelRetryPhase, ModelRetryProgress};
 pub use value::Text;

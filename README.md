@@ -199,6 +199,19 @@ define the present API.
 
 ### 0.10.0
 
+- `LoopState` adds `model_retry: Option<ModelRetryProgress>` and
+  `model_attempts: u8`. The root-exported `ModelRetryProgress` carries the next
+  or active total attempt, configured maximum, original `ModelError`, and
+  `ModelRetryPhase::Waiting { retry_at, retry_deadline }` or `Requesting`.
+  Waiting exposes a source `SystemTime` estimate and the actual Tokio monotonic
+  target; only the latter schedules execution. Retry state clears before
+  complete-history handoff on success, failure or cancellation.
+- `LoopReport.model_attempts: Arc<[u8]>` retains actual `Model::start` counts for
+  each zero-based request index, including the first attempt. A cancelled wait
+  does not add a call. `requests` remains the logical-request count. Struct
+  literals for `LoopState` and `LoopReport` need the new fields. State reads and
+  initial watch snapshots do not require a public event subscription.
+
 - **Breaking:** `BoundedText` becomes `Text`, with infallible `Text::new` and
   the same plain-string wire format. Remove `new_with_max_bytes` and obsolete
   byte/node constants. Model delta constructors are also infallible; remove

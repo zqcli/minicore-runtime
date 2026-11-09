@@ -3,6 +3,23 @@
 Versioned sections describe changes at that version. Current behavior is
 defined by the contracts and the latest README compatibility notes.
 
+## 0.10.0 retry-state follow-up (prepared locally)
+
+- Add `LoopState.model_retry` and `model_attempts`, root-exported
+  `ModelRetryProgress` / `ModelRetryPhase`, and `LoopReport.model_attempts`.
+  Counts include the initial actual model invocation; report entries use the
+  zero-based logical request index. Waiting does not count a planned call.
+- A narrow private synchronous driver handoff updates authoritative loop state
+  before optional normal state events. Waiting retains the preceding structured
+  error, total attempt and maximum, source wall-clock estimate and exact
+  monotonic target. Requesting starts only on an actual `Model::start` call.
+- Settlement clears retry state before history saving, tools or a later request.
+  No observer, late state subscriptions and dropped events preserve the same
+  outcome and counters. Safe retry, maximum four total attempts, deadlines,
+  partial output and complete-history acknowledgement remain unchanged.
+- The implementation starts from the independent quota closeout at `cd59b6e`;
+  these additions are not part of its seven-commit quota change or publication.
+
 ## 0.10.0 (prepared locally)
 
 ### Application quotas and API migration

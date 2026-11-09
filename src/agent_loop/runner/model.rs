@@ -10,8 +10,8 @@ use crate::agent_loop::event::{LoopEvent, OutputChannel};
 use crate::execution::ExecutionConfig;
 use crate::history::HistoryView;
 use crate::model::{
-    ModelCallContext, ModelDriverFailure, ModelDriverProgress, ModelLimits, ModelMessage,
-    ModelRequest, ModelValueError,
+    ModelCallContext, ModelDriverFailure, ModelDriverProgress, ModelDriverUpdate, ModelLimits,
+    ModelMessage, ModelRequest, ModelRetryPhase, ModelValueError,
 };
 use crate::port_call::{PortCallOutcome, run_port_call};
 use crate::prompt::PromptRequest;
@@ -113,7 +113,27 @@ pub(super) async fn run_model(
     let context = ModelCallContext::new(ctx.id, request_index, cancellation.clone(), turn_deadline);
 
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-    let run = driver.run_detailed(request, context, &progress_tx);
+    let control = ctx.control;
+    let mut state_sink = ctx.sink.clone();
+    let mut update = |value| {
+        let mut state = control.current_state();
+        match value {
+            ModelDriverUpdate::AttemptStarted(attempt) => {
+                state.model_attempts = attempt;
+                if let Some(retry) = &mut state.model_retry {
+                    retry.phase = ModelRetryPhase::Requesting;
+                }
+            }
+            ModelDriverUpdate::RetryWaiting(retry) => state.model_retry = Some(retry),
+            ModelDriverUpdate::Finished => {
+                if state.model_retry.take().is_none() {
+                    return;
+                }
+            }
+        }
+        super::publish(control, &mut state_sink, state);
+    };
+    let run = driver.run_observed(request, context, &progress_tx, &mut update);
     tokio::pin!(run);
     let result = loop {
         tokio::select! {
@@ -127,6 +147,8 @@ pub(super) async fn run_model(
     while let Ok(value) = progress_rx.try_recv() {
         forward_progress(ctx, request_index, value);
     }
+    ctx.model_attempts
+        .push(control.current_state().model_attempts);
     result
 }
 

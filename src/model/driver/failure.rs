@@ -210,10 +210,9 @@ pub(super) async fn wait_for_retry(
     context: &ModelCallContext,
     deadline: TokioInstant,
     deadline_source: DeadlineSource,
-    delay: Duration,
+    retry_at: TokioInstant,
     error: ModelError,
 ) -> Result<(), ModelDriverFailure> {
-    let retry_at = TokioInstant::now() + delay;
     let deadline_source = tokio::select! {
         biased;
         _ = context.cancellation.cancelled() => None,

@@ -43,6 +43,7 @@ struct LoopCtx<'a> {
     sink: &'a mut LoopEventSink,
     completion_tx: &'a watch::Sender<Option<Arc<LoopReport>>>,
     history_offset: usize,
+    model_attempts: Vec<u8>,
     partial: Option<ModelPartial>,
     history_failure: Option<DiagnosticSummary>,
 }
@@ -162,6 +163,7 @@ async fn run_loop_inner(
         sink: &mut sink,
         completion_tx: &completion_tx,
         history_offset: 0,
+        model_attempts: Vec::new(),
         partial: None,
         history_failure: None,
     };
@@ -280,6 +282,8 @@ async fn run_loop_inner(
             request_index,
             config_revision: revision,
             model: Some(snapshot.descriptor().model_ref.clone()),
+            model_attempts: 0,
+            model_retry: None,
             pending_interaction: None,
         });
 
@@ -365,6 +369,8 @@ async fn run_loop_inner(
             request_index,
             config_revision: revision,
             model: Some(snapshot.descriptor().model_ref.clone()),
+            model_attempts: ctx.control.current_state().model_attempts,
+            model_retry: None,
             pending_interaction: None,
         });
 
@@ -447,11 +453,18 @@ fn finish_loop(
         history_failure: ctx.history_failure.take(),
         usage,
         requests,
+        model_attempts: std::mem::take(&mut ctx.model_attempts).into(),
         tool_rounds,
         final_config_revision: revision,
     });
 
-    publish_final_states(ctx, id, final_request_index, revision);
+    publish_final_states(
+        ctx,
+        id,
+        final_request_index,
+        revision,
+        report.model_attempts.last().copied().unwrap_or(0),
+    );
     let _ = ctx.completion_tx.send_replace(Some(Arc::clone(&report)));
     ctx.sink.try_emit(LoopEvent::Finished {
         loop_id: id,
@@ -473,14 +486,18 @@ fn publish_final_states(
     id: LoopId,
     request_index: u32,
     revision: ConfigRevision,
+    model_attempts: u8,
 ) {
-    let model = ctx.control.current_state().model;
+    let previous = ctx.control.current_state();
+    let model = previous.model;
     ctx.publish(LoopState {
         loop_id: id,
         status: LoopStatus::Finishing,
         request_index,
         config_revision: revision,
         model,
+        model_attempts,
+        model_retry: None,
         pending_interaction: None,
     });
     ctx.publish(LoopState {
@@ -489,6 +506,8 @@ fn publish_final_states(
         request_index,
         config_revision: revision,
         model: ctx.control.current_state().model,
+        model_attempts,
+        model_retry: None,
         pending_interaction: None,
     });
 }
@@ -510,6 +529,7 @@ fn panic_report(
         history_failure: None,
         usage: Usage::default(),
         requests: 0,
+        model_attempts: Arc::from([]),
         tool_rounds: 0,
         final_config_revision: ConfigRevision::INITIAL,
     });
