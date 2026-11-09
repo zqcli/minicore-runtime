@@ -195,6 +195,7 @@ impl ModelDriver {
         progress_dropped: &AtomicU64,
     ) -> Result<ModelResponse, AttemptFailure> {
         let cancellation = context.cancellation.clone();
+        let request_index = context.request_index;
         let start = catch_unwind(AssertUnwindSafe(|| {
             self.model.start(request.clone(), context)
         }))
@@ -237,71 +238,77 @@ impl ModelDriver {
         let mut stream = stream;
         let _stream_cancel = cancellation.clone().drop_guard();
         let mut assembler = Assembler::new(request.tools(), &self.limits);
-        loop {
-            let next = AssertUnwindSafe(stream.next()).catch_unwind();
-            tokio::pin!(next);
-            let item = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => {
-                    return Err(AttemptFailure::new(
-                        generated_error(
-                            ModelErrorKind::Cancelled,
-                            observed_delivery(assembler.observed_event),
-                        ),
-                        assembler.observed_event,
-                    ));
-                }
-                _ = &mut timeout => {
-                    return Err(AttemptFailure::deadline(
-                        generated_error(
-                            ModelErrorKind::Timeout,
-                            observed_delivery(assembler.observed_event),
-                        ),
-                        assembler.observed_event,
-                        deadline_source,
-                    ));
-                }
-                result = &mut next => result,
-            };
-            match item {
-                Ok(Some(Ok(event))) => {
-                    assembler.observed_event = true;
-                    let progress_event = assembler
-                        .push(event)
-                        .map_err(|error| AttemptFailure::new(error, assembler.observed_event))?;
-                    if let Some(progress_event) = progress_event {
-                        match progress.try_send(progress_event) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                progress_dropped.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {}
-                        }
-                        // Let the runner forward this delta before polling another ready event.
-                        tokio::task::yield_now().await;
+        let result = async {
+            loop {
+                let next = AssertUnwindSafe(stream.next()).catch_unwind();
+                tokio::pin!(next);
+                let item = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        return Err(AttemptFailure::new(
+                            generated_error(
+                                ModelErrorKind::Cancelled,
+                                observed_delivery(assembler.observed_event),
+                            ),
+                            assembler.observed_event,
+                        ));
                     }
-                }
-                Ok(Some(Err(error))) => {
-                    let error = normalize_after_event(error, assembler.observed_event);
-                    return Err(AttemptFailure::new(error, assembler.observed_event));
-                }
-                Ok(None) => {
-                    let observed_event = assembler.observed_event;
-                    return assembler
-                        .finish()
-                        .map_err(|error| AttemptFailure::new(error, observed_event));
-                }
-                Err(_) => {
-                    return Err(AttemptFailure::new(
-                        generated_error(
-                            ModelErrorKind::Panicked,
-                            observed_delivery(assembler.observed_event),
-                        ),
-                        assembler.observed_event,
-                    ));
+                    _ = &mut timeout => {
+                        return Err(AttemptFailure::deadline(
+                            generated_error(
+                                ModelErrorKind::Timeout,
+                                observed_delivery(assembler.observed_event),
+                            ),
+                            assembler.observed_event,
+                            deadline_source,
+                        ));
+                    }
+                    result = &mut next => result,
+                };
+                match item {
+                    Ok(Some(Ok(event))) => {
+                        assembler.observed_event = true;
+                        let progress_event = assembler.push(event).map_err(|error| {
+                            AttemptFailure::new(error, assembler.observed_event)
+                        })?;
+                        if let Some(progress_event) = progress_event {
+                            match progress.try_send(progress_event) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    progress_dropped.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {}
+                            }
+                            // Let the runner forward this delta before polling another ready event.
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    Ok(Some(Err(error))) => {
+                        let error = normalize_after_event(error, assembler.observed_event);
+                        return Err(AttemptFailure::new(error, assembler.observed_event));
+                    }
+                    Ok(None) => {
+                        let observed_event = assembler.observed_event;
+                        return assembler
+                            .finish()
+                            .map_err(|error| AttemptFailure::new(error, observed_event));
+                    }
+                    Err(_) => {
+                        return Err(AttemptFailure::new(
+                            generated_error(
+                                ModelErrorKind::Panicked,
+                                observed_delivery(assembler.observed_event),
+                            ),
+                            assembler.observed_event,
+                        ));
+                    }
                 }
             }
         }
+        .await;
+        result.map_err(|failure: AttemptFailure| {
+            failure.with_partial(assembler.into_partial(request_index))
+        })
     }
 }
 

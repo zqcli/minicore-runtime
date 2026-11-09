@@ -17,6 +17,41 @@ pub enum ModelFinishReason {
     Unknown,
 }
 
+/// Assembled output of an unfinished request, distinct from complete model-context history.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPartial {
+    pub request_index: u32,
+    pub content: Vec<AssistantPart>,
+    pub incomplete_tool_calls: Vec<IncompleteToolCall>,
+    pub usage: Option<Usage>,
+    pub provider_replay: Option<ProviderReplay>,
+}
+
+/// An unfinished tool fragment with its original position among the assembled content parts.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncompleteToolCall {
+    pub part_index: usize,
+    pub call_index: u32,
+    pub tool_call_id: ToolCallId,
+    pub tool_name: ToolName,
+    pub arguments_text: String,
+}
+
+impl fmt::Debug for IncompleteToolCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IncompleteToolCall")
+            .field("part_index", &self.part_index)
+            .field("call_index", &self.call_index)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("tool_name", &self.tool_name)
+            .field("arguments_bytes", &self.arguments_text.len())
+            .finish()
+    }
+}
+
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ModelResponse {
     parts: Vec<AssistantPart>,

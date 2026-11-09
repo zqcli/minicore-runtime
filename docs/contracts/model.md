@@ -138,3 +138,36 @@ Old assistant message content arrays and absent history/response metadata still
 round-trip unchanged. Replay-bearing messages use an assistant content object
 with `parts` and `provider_replay`. Debug shows only replay byte counts; host API
 access and explicit serde serialization intentionally retain the full payload.
+
+## Unfinished Model Output
+
+`LoopReport.partial: Option<ModelPartial>` carries output from the one model
+request that failed or was cancelled before producing a complete response. The
+assembly state, not `LoopEvent` or driver progress, supplies this data on error,
+EOF without a valid response, timeout, cancellation and isolated stream-poll
+panic. No output means `None`; a usage-only event does not manufacture a reply.
+A response requires the existing valid Finish and clean EOF contract.
+
+`ModelPartial` is serializable and contains:
+
+- `request_index`: the original zero-based request within this loop, unchanged
+  by driver retries, with loop association provided by the enclosing report.
+- `content`: existing `AssistantPart` text, reasoning and actually validated
+  complete tool calls, in original canonical order excluding unfinished slots.
+- `incomplete_tool_calls`: `IncompleteToolCall` values retaining `part_index`
+  (zero-based original canonical position), `call_index`, `tool_call_id`,
+  `tool_name` and assembled `arguments_text`. Insert these at their part indices
+  among `content` to recover the canonical ordering. Their raw arguments are
+  never completed, parsed speculatively or turned into executable calls.
+- `usage` and `provider_replay`: only the optional values actually observed for
+  this unfinished request; complete-response report usage remains unchanged.
+
+The model port already supplies a validated full tool name on `ToolCallStart`;
+this change does not invent a new name-streaming port. Text and reasoning keep
+existing assembly normalization and bounds. Debug output redacts argument text.
+No second error or loop identity is stored in a partial. A subsequent tool-stage
+failure/cancellation retains the original complete assistant history and finish
+reason with `partial: None`. Partial content is never appended as `HistoryItem`
+or automatically fed into a future model request, including any complete tool
+call parts inside the unfinished response. Persistence and replay adaptation
+remain separate host responsibilities.

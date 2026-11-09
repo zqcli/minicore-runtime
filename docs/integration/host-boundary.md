@@ -9,7 +9,7 @@ one loop and returns control. Concretely:
   fresh `UserInput`, and the immutable `ExecutionConfig` (model, reasoning,
   tools, optional policy, prompt provider).
 - **The runtime supplies** `LoopReport` (outcome, `appended` in-memory items,
-  `usage`, `requests`, `tool_rounds`, final `ConfigRevision`), current
+  optional model `partial`, `usage`, `requests`, `tool_rounds`, final `ConfigRevision`), current
   `LoopState` through `state`/`watch_state`, and an optional best-effort
   `LoopEventStream`.
 - **The host persists** whatever it wants: the report, selected appended
@@ -71,6 +71,23 @@ Old hosts that owned sessions via the v0.3 runtime lose session
 open/load/save and durable conversation. See
 [`docs/migrations/v0.3-to-v0.4.md`](../migrations/v0.3-to-v0.4.md) for the
 concrete upgrade path, including what is intentionally not migrated.
+## Incremental History and Partial Output
+
+Hosts may install `LoopOptions.history` without changing the start/input API.
+Use the original loop ID and appended offset to accept each complete range
+exactly once, then save outside owner-state locks before acknowledging it. Keep
+accepted and saved offsets separate: an error does not unaccept a range, and
+join still returns the entire delta. The callback future must retain ownership
+until saving settles, including after cancellation or caller wait abandonment.
+See [history handoff](../contracts/history.md#incremental-handoff).
+
+Save `LoopReport.partial` separately from complete history when present. It is
+assembled authoritative content, independent of subscriber availability, and
+is never a complete assistant message or executable tool request. Preserve the
+original loop/request association, and do not append it as a second response
+to previously observed output. Complete responses remain complete when tools
+later fail or cancel. See [unfinished model output](../contracts/model.md#unfinished-model-output).
+
 ## Adapter Obligations
 
 - Futures and streams, including host tools, must cooperate with the executor

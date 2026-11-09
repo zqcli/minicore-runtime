@@ -15,7 +15,7 @@ use crate::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::WorkingHistory;
 use crate::ids::LoopId;
-use crate::model::{ModelError, ModelFinishReason, Usage};
+use crate::model::{ModelError, ModelFinishReason, ModelPartial, Usage};
 use crate::tools::ToolResultOutcome;
 use crate::usage::UsageAccumulator;
 
@@ -44,6 +44,7 @@ struct LoopCtx<'a> {
     sink: &'a mut LoopEventSink,
     completion_tx: &'a watch::Sender<Option<Arc<LoopReport>>>,
     history_offset: usize,
+    partial: Option<ModelPartial>,
 }
 
 impl LoopCtx<'_> {
@@ -151,6 +152,7 @@ async fn run_loop_inner(
         sink: &mut sink,
         completion_tx: &completion_tx,
         history_offset: 0,
+        partial: None,
     };
 
     ctx.sink.try_emit(LoopEvent::Started { loop_id: id });
@@ -281,7 +283,10 @@ async fn run_loop_inner(
         .await
         {
             Ok(response) => response,
-            Err(driver) => break map_model_failure(&control, driver),
+            Err(mut driver) => {
+                ctx.partial = driver.partial.take().map(|partial| *partial);
+                break map_model_failure(&control, driver);
+            }
         };
 
         let round_usage = response.usage().copied().unwrap_or_default();
@@ -436,6 +441,7 @@ fn finish_loop(
         loop_id: id,
         outcome: outcome.clone(),
         appended: working.into_appended(),
+        partial: ctx.partial.take(),
         usage,
         requests,
         tool_rounds,
@@ -497,6 +503,7 @@ fn panic_report(
             "loop runner panicked",
         )),
         appended: Arc::from([]),
+        partial: None,
         usage: Usage::default(),
         requests: 0,
         tool_rounds: 0,

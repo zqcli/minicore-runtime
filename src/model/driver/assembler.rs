@@ -7,7 +7,8 @@ use crate::tools::{ToolName, ToolSpec};
 use crate::value::{BoundedText, MAX_JSON_BYTES, normalize_model_text};
 
 use super::super::{
-    AssistantPart, ModelFinishReason, ModelResponse, ReasoningContent, ToolCall, Usage,
+    AssistantPart, IncompleteToolCall, ModelFinishReason, ModelPartial, ModelResponse,
+    ReasoningContent, ToolCall, Usage,
 };
 use super::super::{ModelError, ModelErrorKind, ModelEvent};
 use super::{LoopLimits, ModelDriverProgress};
@@ -184,7 +185,7 @@ impl<'a> Assembler<'a> {
         }
     }
 
-    pub(super) fn finish(mut self) -> Result<ModelResponse, ModelError> {
+    pub(super) fn finish(&mut self) -> Result<ModelResponse, ModelError> {
         let reason = self.finish_reason.ok_or_else(|| {
             super::failure::generated_error(
                 ModelErrorKind::IncompleteResponse,
@@ -208,8 +209,11 @@ impl<'a> Assembler<'a> {
         {
             return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
         }
+        if self.slots.is_empty() && self.provider_replay.is_none() {
+            return Err(assembler_error(ModelErrorKind::InvalidProviderResponse));
+        }
         let mut parts = Vec::with_capacity(self.slots.len());
-        for slot in self.slots {
+        for slot in std::mem::take(&mut self.slots) {
             match slot {
                 PartSlot::Text => {
                     parts.push(AssistantPart::Text(std::mem::take(&mut self.text).into()))
@@ -237,9 +241,57 @@ impl<'a> Assembler<'a> {
             parts,
             reason,
             Some(self.usage.unwrap_or_default()),
-            self.provider_replay,
+            self.provider_replay.take(),
         )
         .map_err(|_| assembler_error(ModelErrorKind::InvalidProviderResponse))
+    }
+
+    pub(super) fn into_partial(mut self, request_index: u32) -> Option<ModelPartial> {
+        let mut content = Vec::with_capacity(self.slots.len());
+        let mut incomplete_tool_calls = Vec::new();
+        for (part_index, slot) in self.slots.into_iter().enumerate() {
+            match slot {
+                PartSlot::Text if !self.text.is_empty() => {
+                    content.push(AssistantPart::Text(std::mem::take(&mut self.text).into()));
+                }
+                PartSlot::Reasoning if !self.reasoning.is_empty() => {
+                    content.push(AssistantPart::Reasoning(
+                        ReasoningContent::new(
+                            Some(std::mem::take(&mut self.reasoning)),
+                            None,
+                            None,
+                            None,
+                        )
+                        .expect("assembled reasoning is normalized and bounded"),
+                    ));
+                }
+                PartSlot::Tool(index) => {
+                    let tool = &mut self.tools[index];
+                    match tool.call.take() {
+                        Some(call) => content.push(AssistantPart::ToolCall(call)),
+                        None => incomplete_tool_calls.push(IncompleteToolCall {
+                            part_index,
+                            call_index: tool.call_index,
+                            tool_call_id: tool.tool_call_id.clone(),
+                            tool_name: tool.name.clone(),
+                            arguments_text: std::mem::take(&mut tool.arguments_text),
+                        }),
+                    }
+                }
+                PartSlot::Text | PartSlot::Reasoning => {}
+            }
+        }
+        if content.is_empty() && incomplete_tool_calls.is_empty() && self.provider_replay.is_none()
+        {
+            return None;
+        }
+        Some(ModelPartial {
+            request_index,
+            content,
+            incomplete_tool_calls,
+            usage: self.usage,
+            provider_replay: self.provider_replay,
+        })
     }
 
     fn tool_mut(&mut self, tool_call_id: &ToolCallId) -> Result<&mut ToolAssembly, ModelError> {

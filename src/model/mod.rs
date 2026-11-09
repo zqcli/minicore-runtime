@@ -14,7 +14,10 @@ pub use model_ref::{ModelRef, ModelRefError};
 pub use port::{Model, ModelCallContext, ModelDescriptor, ModelStartFuture, ModelStream};
 pub use replay::ProviderReplay;
 pub use request::{ModelLimits, ModelLimitsError, ModelRequest, ReasoningPreference};
-pub use response::{MAX_MODEL_EVENT_TEXT_BYTES, ModelEvent, ModelFinishReason, ModelResponse};
+pub use response::{
+    IncompleteToolCall, MAX_MODEL_EVENT_TEXT_BYTES, ModelEvent, ModelFinishReason, ModelPartial,
+    ModelResponse,
+};
 pub use usage::Usage;
 
 pub(crate) use driver::{

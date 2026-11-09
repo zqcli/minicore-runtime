@@ -205,6 +205,14 @@ for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
   and a borrowed slice of only new items. Callbacks are never retried, even after
   failure, and are not dropped by cancellation. Hosts track accepted records
   separately from successful saving and reconcile the full final report by offset.
+- `LoopReport.partial` is an optional serializable `model::ModelPartial` from
+  the actual failed/cancelled model assembly, not the observation stream. It
+  preserves the original `request_index`, canonical `AssistantPart`s, unfinished
+  tool argument fragments, and any observed usage/replay metadata. Add `partial`
+  when constructing report literals.
+- `model::IncompleteToolCall` retains the original part/call indices, call ID,
+  tool name and raw argument text; no missing arguments or executable calls are
+  invented. Partial content is not a `HistoryItem` or automatic replay input.
 - Callback failures use `LoopFailureKind::History`, never model retry or tool
   business-error paths. Hosts using `LoopOptions` struct literals must add
   `history`; cloning options shares the receiver without requiring `Debug`.

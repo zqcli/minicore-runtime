@@ -100,14 +100,17 @@ for offsets, cancellation-safe saving and failure ownership.
 ## Final Report
 
 - `LoopReport` carries `outcome`, `appended` (only in-memory items this loop
-  produced), `usage`, `requests`, `tool_rounds`, and the final
+  produced), optional model `partial`, `usage`, `requests`, `tool_rounds`, and the final
   `ConfigRevision`. `tool_rounds` is a `u64` count of entered tool batches,
   not a saturated `u16` budget counter. `LoopOptions.max_tool_rounds` remains
   `u16`: zero (the default) disables that optional limit; positive values
   retain the existing finite-budget validation.
 - `appended` is the loop's history delta. The host decides whether and where
   to persist it and the report's outcome and counters. Nothing is durable in
-  the runtime.
+  the runtime. `partial` is distinct from that complete history and carries
+  actual unfinished assembly only; a tool-stage cancellation does not turn a
+  previously complete response into partial content. See the
+  [model partial contract](model.md#unfinished-model-output).
 - A failed inner port (model/prompt/policy/tool) maps to a `LoopOutcome:
   Failed(LoopFailure { kind, diagnostic })`; cancellation maps to
   `Cancelled(CancelReason)`.

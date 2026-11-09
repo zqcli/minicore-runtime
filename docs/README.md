@@ -1,7 +1,8 @@
 # Documentation Authority
 
 The current v0.9.2 package retains the v0.4 one-loop architecture and the
-v0.9.0 input-pull semantics. The current source tree and contracts define
+v0.9.0 input-pull semantics, with unreleased history handoff and partial reporting
+additions. The current source tree and contracts define
 behavior; the root README records compatibility changes. Versioned v0.4
 acceptance/release pages remain historical evidence:
 

@@ -13,7 +13,9 @@ use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::HistoryItem;
 use crate::ids::LoopId;
 use crate::limits::LoopLimits;
-use crate::model::{MAX_MODEL_CALL_TIMEOUT, MAX_MODEL_RETRY_DELAY, ModelError, Usage};
+use crate::model::{
+    MAX_MODEL_CALL_TIMEOUT, MAX_MODEL_RETRY_DELAY, ModelError, ModelPartial, Usage,
+};
 
 mod control;
 mod event;
@@ -264,6 +266,8 @@ pub struct LoopReport {
     pub loop_id: LoopId,
     pub outcome: LoopOutcome,
     pub appended: Arc<[HistoryItem]>,
+    /// Assembled output from the one request that did not form a complete response.
+    pub partial: Option<ModelPartial>,
     pub usage: Usage,
     pub requests: u32,
     /// Number of tool batches entered; independent of the optional u16 budget.

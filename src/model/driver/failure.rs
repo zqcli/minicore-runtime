@@ -7,7 +7,7 @@ use crate::time::DeadlineSource;
 use crate::value::BoundedText;
 
 use super::super::port::ModelCallContext;
-use super::super::{DeliveryState, ModelError, ModelErrorKind, RetryHint};
+use super::super::{DeliveryState, ModelError, ModelErrorKind, ModelPartial, RetryHint};
 use super::MAX_MODEL_RETRY_DELAY;
 
 #[derive(Clone, Copy)]
@@ -72,6 +72,7 @@ impl RetryPolicySnapshot {
 pub(crate) struct ModelDriverFailure {
     pub(super) error: ModelError,
     pub(super) deadline_source: Option<DeadlineSource>,
+    pub(crate) partial: Option<Box<ModelPartial>>,
 }
 
 impl ModelDriverFailure {
@@ -92,6 +93,7 @@ impl ModelDriverFailure {
         Self {
             error,
             deadline_source: None,
+            partial: None,
         }
     }
 
@@ -99,6 +101,7 @@ impl ModelDriverFailure {
         Self {
             error,
             deadline_source: Some(source),
+            partial: None,
         }
     }
 }
@@ -107,6 +110,7 @@ pub(super) struct AttemptFailure {
     pub(super) error: ModelError,
     pub(super) observed_event: bool,
     pub(super) deadline_source: Option<DeadlineSource>,
+    partial: Option<Box<ModelPartial>>,
 }
 
 impl AttemptFailure {
@@ -115,6 +119,7 @@ impl AttemptFailure {
             error,
             observed_event,
             deadline_source: None,
+            partial: None,
         }
     }
 
@@ -127,6 +132,7 @@ impl AttemptFailure {
             error,
             observed_event,
             deadline_source: Some(source),
+            partial: None,
         }
     }
 
@@ -134,7 +140,13 @@ impl AttemptFailure {
         ModelDriverFailure {
             error: self.error,
             deadline_source: self.deadline_source,
+            partial: self.partial,
         }
+    }
+
+    pub(super) fn with_partial(mut self, partial: Option<ModelPartial>) -> Self {
+        self.partial = partial.map(Box::new);
+        self
     }
 }
 
@@ -216,5 +228,6 @@ pub(super) async fn wait_for_retry(
     Err(ModelDriverFailure {
         error,
         deadline_source,
+        partial: None,
     })
 }

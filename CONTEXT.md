@@ -1,9 +1,10 @@
 # Current Implementation Context
 
-The current package is v0.9.2. The 0.9.1–0.9.2 work adds host-observation
-contract tests and aligns documentation; production code, dependencies,
-Rust APIs and behavior remain those of 0.9.0. It retains the one-loop boundary from the
-v0.4 reset and the 0.9.0 input-pull semantics. Tool-batch statistics are now
+The package version remains v0.9.2 pending a release. Unreleased 0.10.0 changes
+add optional acknowledged complete-history handoff and authoritative unfinished
+model output in the existing final report; the 0.9.1–0.9.2 releases themselves
+were documentation and test maintenance. The one-loop boundary from the v0.4
+reset and the 0.9.0 input-pull/start signatures remain unchanged. Tool-batch statistics are now
 `u64` end to end within Runtime;
 the optional legacy `u16` round budget still defaults to zero (unlimited).
 Each real prompt preparation publishes one `Starting` event. Session-owned
