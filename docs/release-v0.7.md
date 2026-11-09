@@ -19,6 +19,12 @@ defined by the contracts and the latest README compatibility notes.
   partial output and complete-history acknowledgement remain unchanged.
 - The implementation starts from the independent quota closeout at `cd59b6e`;
   these additions are not part of its seven-commit quota change or publication.
+- Verification: all 321 main-crate tests, two doctests, the full quality gate,
+  release example builds and both actual example runs pass on Linux. Eleven
+  retry-state regressions and three red-to-green mutations cover the new
+  contract; see the [development record](development-plan.md#authoritative-retry-state-follow-up).
+  Provider adapters/dependencies and the public event vocabulary are unchanged;
+  no live-provider or cross-platform execution is claimed.
 
 ## 0.10.0 (prepared locally)
 

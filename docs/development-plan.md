@@ -60,7 +60,45 @@ Initial verification on Linux: `cargo test --all-features --locked --test
 model_retry_state_contract` (3 passed), `cargo test --all-features --locked --lib
 model::driver` (46 passed), and `./scripts/check.sh` (313 main-crate tests,
 Clippy/rustdoc warnings denied, docs/architecture/acceptance and mutation
-self-tests passed). Additional boundary regressions follow separately.
+self-tests passed). Production implementation commit: `142412b`.
+
+The follow-up contract suite now has 11 deterministic tests covering late state
+reads, absent/slow observers, exact preceding errors through four total attempts,
+clearing before success/failure/cancellation saving, tools and later preparation,
+Retry-After/deadline bounds and partial-output preservation. An independent
+checkout of `142412b` with these tests verifies three mutations go red:
+
+- Remove the driver's `Finished` state handoff: the before-saving clear test
+  times out instead of observing a clear state.
+- Count `RetryWaiting.attempt` as already issued: cancellation during waiting
+  reports two actual calls instead of one.
+- Shorten the monotonic backoff by one second: the 30-second Retry-After test
+  observes an early second model invocation.
+
+Each mutation is restored before the next; all 11 tests pass after restoration.
+The mutation targets are respectively
+`failed_and_cancelled_started_retries_clear_before_history_handoff`,
+`cancellation_during_wait_clears_before_saving_without_counting_planned_attempt`
+and `retry_after_at_cap_uses_the_full_lower_bound`, run with
+`cargo test --all-features --locked --test model_retry_state_contract <name> -- --exact`.
+
+Final verification on Linux with Rust/Cargo 1.90.0:
+
+- `./scripts/check.sh`: 321 tests (81 unit and 240 integration across 16 targets),
+  fmt, Clippy and rustdoc with warnings denied, docs/architecture mutation
+  self-tests and all 70 acceptance rows passed.
+- `cargo test --all-features --locked --doc`: two compile-fail doctests passed.
+- `cargo metadata --locked --format-version 1 --no-deps` and
+  `cargo build --locked --release --examples`: passed.
+- `cargo run --locked --release --example agent_loop` and
+  `cargo run --locked --release --example memory_agent`: both examples executed
+  successfully, including input/update and cancellation assertions.
+
+No dependency or provider harness changed, so the opt-in provider gate was not
+rerun. No live provider, macOS/Windows execution, Host integration, remote push
+or tag is claimed by these Runtime checks. Watch coalescing is intentional;
+consumers use the latest state and authoritative per-request report counts,
+not an expectation of every intermediate transition.
 
 ### Historical post-handoff cleanup audit (before quota removal)
 

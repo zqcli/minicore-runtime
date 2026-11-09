@@ -21,6 +21,12 @@ Optional observation of a live loop. **Events are not authoritative.**
 
 ## Current-State Observation
 
+Retry scheduling, actual attempt starts and settlement clearing update
+`LoopState.model_retry` / `model_attempts` through the driver-owned synchronous
+handoff. Optional `StateChanged` events only reflect already-registered state;
+consumers must not infer retry state or actual counts from output events. See
+[retry state](model.md#retry-state).
+
 - `LoopHandle::state()` reads the latest `LoopState`; `watch_state()` subscribes
   to the same retained value independently of event consumption. A late
   subscription can already contain an actionable `pending_interaction` or

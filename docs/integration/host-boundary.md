@@ -10,6 +10,7 @@ one loop and returns control. Concretely:
   tools, optional policy, prompt provider).
 - **The runtime supplies** `LoopReport` (outcome, `appended` in-memory items,
   optional model `partial`, optional `history_failure`, `usage`, `requests`,
+  per-request `model_attempts`,
   `tool_rounds`, final `ConfigRevision`), current
   `LoopState` through `state`/`watch_state`, and an optional best-effort
   `LoopEventStream`.
@@ -41,6 +42,28 @@ one loop and returns control. Concretely:
   delivery. Read the initial watch value, handle coalesced updates, and use
   `wait`/`join` rather than state-channel closure for completion. See the
   [current-state contract](../contracts/event-stream.md#current-state-observation).
+
+## Model Retry Observation
+
+Read `LoopState.model_retry` from `state` or the initial/current value of
+`watch_state`. Keep the original `loop_id` and zero-based `request_index` when
+projecting it into host execution state. The driver supplies the exact preceding
+`ModelError`; the host can map it into its own error vocabulary without parsing
+messages. Format `Waiting.retry_at: SystemTime` as UTC/RFC3339 for display.
+Do not reschedule using that wall time: the driver's `retry_deadline` is the
+monotonic execution target.
+
+`Waiting` describes a planned attempt, while `Requesting` means a real model
+start. Use `model_attempts`, not the retry attempt number or received event count,
+for actual invocation accounting. It includes the initial call, and the final
+report retains every request's count at `report.model_attempts[request_index]`.
+Watch updates can coalesce; the report does not require seeing intermediate
+states. An unissued preparation contributes no report entry.
+
+Clearing is a normal state update before history handoff, including failure and
+cancellation. Apply `None` to remove a previous retry indicator even when the
+host is still saving the request's output. No public retry event or separate
+subscription is needed. See [retry state](../contracts/model.md#retry-state).
 
 ## Concurrency Notes
 
