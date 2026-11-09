@@ -17,6 +17,11 @@ defined by the contracts and the latest README compatibility notes.
   content into the report without relying on events. Existing complete parts
   are reused; unfinished calls retain raw arguments and positions without
   becoming executable. A complete response remains complete if tools later fail.
+- Preserve complete `Unknown`-finish no-tool responses in history and handoff
+  before returning the existing `InvalidModelResponse` outcome. Output and
+  actual finish metadata are no longer discarded or mistaken for a partial.
+  Aggregate usage overflow likewise retains the new complete response before
+  returning the existing internal-failure outcome.
 - The package version remains 0.9.2 until a release is explicitly prepared.
 
 ## 0.7.0
@@ -108,7 +113,7 @@ bash scripts/check-architecture.sh
 
 Since 0.7.3 no minimum Rust version is tested; the gate runs on current stable.
 
-The main suite has 296 tests: 80 unit and 216 integration tests in 14 binaries.
+The main suite has 298 tests: 80 unit and 218 integration tests in 14 binaries.
 Two compile-fail doctests additionally protect the checked tool DTO boundaries.
 The two examples compile as test targets. The acceptance checker preserves all
 70 Passed rows and validates their source/test references. See the

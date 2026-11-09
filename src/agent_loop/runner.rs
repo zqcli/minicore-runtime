@@ -290,6 +290,16 @@ async fn run_loop_inner(
         };
 
         let round_usage = response.usage().copied().unwrap_or_default();
+        working.append_assistant(AssistantHistory {
+            loop_id: id,
+            request_index,
+            model: snapshot.descriptor().model_ref.clone(),
+            reasoning: snapshot.reasoning(),
+            content: response.parts().to_vec(),
+            provider_replay: response.provider_replay().cloned(),
+            finish_reason: response.finish_reason(),
+            usage: round_usage,
+        });
         if usage.add(round_usage).is_err() {
             break FailPath::Internal;
         }
@@ -306,9 +316,7 @@ async fn run_loop_inner(
                 ModelFinishReason::Refused => Some(FailPath::Refused),
                 ModelFinishReason::ContentFiltered => Some(FailPath::ContentFiltered),
                 ModelFinishReason::Unknown | ModelFinishReason::ToolCalls => {
-                    // An unsupported finish without tool calls is detected
-                    // before the response ever enters Assistant history.
-                    break FailPath::InvalidModelResponse(ModelError::started(
+                    Some(FailPath::InvalidModelResponse(ModelError::started(
                         crate::model::ModelErrorKind::InvalidProviderResponse,
                         DiagnosticSummary::bounded_static(
                             DiagnosticCode::ModelMalformedResponse,
@@ -316,23 +324,12 @@ async fn run_loop_inner(
                             "model returned an invalid response",
                             false,
                         ),
-                    ));
+                    )))
                 }
             }
         } else {
             None
         };
-
-        working.append_assistant(AssistantHistory {
-            loop_id: id,
-            request_index,
-            model: snapshot.descriptor().model_ref.clone(),
-            reasoning: snapshot.reasoning(),
-            content: response.parts().to_vec(),
-            provider_replay: response.provider_replay().cloned(),
-            finish_reason: response.finish_reason(),
-            usage: round_usage,
-        });
 
         if let Err(path) = ctx.handoff_history(&working).await {
             break path;

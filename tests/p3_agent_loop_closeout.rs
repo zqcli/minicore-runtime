@@ -694,9 +694,7 @@ async fn run_malformed(events: Vec<ModelEvent>) -> Arc<LoopReport> {
     .unwrap()
 }
 
-/// An Unknown finish with no tool calls is an invalid model response. The
-/// streamed text never becomes Assistant history; the report keeps only the
-/// loop's own prompt, while the issued request's usage is still counted.
+/// An unsupported no-tool finish fails the loop but retains its complete response.
 #[tokio::test]
 async fn unknown_finish_without_tool_call_fails_without_assistant_history() {
     let usage = Usage::new(12, 8, 4);
@@ -728,13 +726,12 @@ async fn unknown_finish_without_tool_call_fails_without_assistant_history() {
         })
         .collect();
     assert_eq!(user_texts, vec!["hello"], "the loop's own prompt is kept");
-    assert!(
-        report
-            .appended
-            .iter()
-            .all(|item| !matches!(item, HistoryItem::Assistant(_))),
-        "an invalid response must never enter Assistant history"
-    );
+    let [HistoryItem::User(_), HistoryItem::Assistant(assistant)] = &report.appended[..] else {
+        panic!("the complete response must survive its unsupported finish reason");
+    };
+    assert_eq!(assistant.finish_reason, ModelFinishReason::Unknown);
+    assert_eq!(assistant_texts(&report), vec!["invalid"]);
+    assert!(report.partial.is_none());
     assert!(
         report
             .appended

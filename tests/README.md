@@ -19,7 +19,7 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 | `tool_policy_interaction_contract.rs` | 8 | policy decisions, interaction DTO contracts, and ToolInputRequest validation |
 | `tool_set_contract.rs` | 11 | `ToolSet` registration, spec validation, enabled subsets |
 | `provider_replay.rs` | 2 | replay bounds, serde and legacy wire compatibility |
-| `history_handoff_contract.rs` | 6 | ordered incremental handoffs, backpressure, failure, cancellation-safe saving and callback panic isolation |
+| `history_handoff_contract.rs` | 8 | ordered incremental handoffs, backpressure, failure, cancellation-safe saving, callback panic isolation and unsupported complete finish preservation |
 | `model_partial_contract.rs` | 7 | authoritative assembly on failure, EOF, cancellation and deadline, partial tool arguments, request identity and complete-response preservation |
 
 ## Unit (`src/**` inline and driver)
@@ -34,7 +34,7 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 
   - `src/usage.rs` (1 test): partial usage accumulates reported fields.
 
-Total main-crate volume: **296 tests** (80 unit + 216 integration across 14 targets).
+Total main-crate volume: **298 tests** (80 unit + 218 integration across 14 targets).
 Two compile-fail doctests protect private `ToolSpec` and `ToolOutput` fields.
 `tests/support/` shares scripted model/tool/policy builders, config/start/join helpers
 and report extractors across separate binaries. Driver tests use the actual
@@ -69,7 +69,7 @@ The standalone provider harness has 25 tests and is not included in this runtime
   empty-delta suppression; per-attempt child-token
   cleanup; handle shutdown versus dropped-join cancellation.
 - History: delta-only reports, mixed model refs, no history or prompt size cap.
-- Malformed model responses never enter Assistant history.
+- Malformed model assembly never enters Assistant history; a complete response with an unsupported terminal reason remains complete while the loop fails.
 - Loop-level delivery retry; shared model/toolset cancel isolation.
 
 ## Acceptance

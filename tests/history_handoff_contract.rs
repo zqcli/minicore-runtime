@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
-use minicore_runtime::model::ModelFinishReason;
+use minicore_runtime::model::{ModelEvent, ModelFinishReason, ProviderReplay, Usage};
 use minicore_runtime::prompt::{PromptError, PromptFuture, PromptProvider, PromptRequest};
 use minicore_runtime::tools::ToolSet;
 use minicore_runtime::{
@@ -314,4 +314,92 @@ async fn panicking_history_callback_preserves_full_report_without_retry() {
     );
     assert_eq!(report.appended.len(), 2);
     assert_eq!(history.deliveries.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn unsupported_complete_finish_is_handed_off_before_failed_outcome() {
+    let (history, _receiver) = recorder(false, None, None);
+    let usage = Usage::new(3, 4, 1);
+    let replay =
+        ProviderReplay::new("test/v1", serde_json::json!({"opaque": "preserved"})).unwrap();
+    let (model, _) = scripted_model(vec![Round::Events(vec![
+        ModelEvent::text_delta("complete provider response").unwrap(),
+        ModelEvent::Usage { usage },
+        ModelEvent::ProviderReplay {
+            replay: replay.clone(),
+        },
+        ModelEvent::Finish {
+            reason: ModelFinishReason::Unknown,
+        },
+    ])]);
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        options(history.clone()),
+        no_inputs(),
+    )
+    .unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(5), agent.join())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&report.outcome, LoopOutcome::Failed(failure) if failure.kind == LoopFailureKind::InvalidModelResponse)
+    );
+    assert!(report.partial.is_none());
+    let [HistoryItem::User(_), HistoryItem::Assistant(assistant)] = &report.appended[..] else {
+        panic!("a complete response must be retained independently of the ending outcome");
+    };
+    assert_eq!(assistant.finish_reason, ModelFinishReason::Unknown);
+    assert_eq!(assistant.usage, usage);
+    assert_eq!(assistant.provider_replay.as_ref(), Some(&replay));
+    let deliveries = history.deliveries.lock().unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].offset, 0);
+    assert_eq!(&deliveries[0].items, report.appended.as_ref());
+}
+
+#[tokio::test]
+async fn usage_overflow_retains_the_new_complete_response_before_failure() {
+    let (history, _receiver) = recorder(false, None, None);
+    let mut first = tool_call_events(vec![("echo", "once")]);
+    first.insert(
+        0,
+        ModelEvent::Usage {
+            usage: Usage::new(u64::MAX, 0, 0),
+        },
+    );
+    let (model, attempts, _) = scripted_model_counted(vec![
+        Round::Events(first),
+        Round::Events(vec![
+            ModelEvent::text_delta("complete response before usage overflow").unwrap(),
+            ModelEvent::Usage {
+                usage: Usage::new(1, 0, 0),
+            },
+            ModelEvent::Finish {
+                reason: ModelFinishReason::Stop,
+            },
+        ]),
+    ]);
+    let (agent, calls) = start_echo(model, ToolBehavior::Succeed, options(history.clone()));
+    let report = tokio::time::timeout(Duration::from_secs(5), agent.join())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&report.outcome, LoopOutcome::Failed(failure) if failure.kind == LoopFailureKind::Internal)
+    );
+    assert!(report.partial.is_none());
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(report.appended.len(), 4);
+    let HistoryItem::Assistant(assistant) = &report.appended[3] else {
+        panic!("usage accumulation failure must not discard a complete response");
+    };
+    assert_eq!(assistant.request_index, 1);
+    assert_eq!(assistant.finish_reason, ModelFinishReason::Stop);
+    assert_eq!(assistant.usage, Usage::new(1, 0, 0));
+    let deliveries = history.deliveries.lock().unwrap();
+    assert_eq!(deliveries.len(), 3);
+    assert_eq!(deliveries[2].offset, 3);
+    assert_eq!(&deliveries[2].items[..], &report.appended[3..]);
 }

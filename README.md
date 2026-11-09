@@ -213,6 +213,10 @@ for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 - `model::IncompleteToolCall` retains the original part/call indices, call ID,
   tool name and raw argument text; no missing arguments or executable calls are
   invented. Partial content is not a `HistoryItem` or automatic replay input.
+- A fully assembled response with unsupported no-tool `Unknown` finish still
+  fails the loop, but now remains complete history with its actual finish reason
+  and is handed off before termination; it is never reclassified as partial.
+  Aggregate usage overflow also retains the already complete response.
 - Callback failures use `LoopFailureKind::History`, never model retry or tool
   business-error paths. Hosts using `LoopOptions` struct literals must add
   `history`; cloning options shares the receiver without requiring `Debug`.

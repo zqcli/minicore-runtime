@@ -79,7 +79,10 @@ model-only timeout during backoff reports `Failed(Model)` with that prior cause.
 - `ModelFinishReason::Stop` with no tool calls ends the loop (subject to the
   final-seal decision). `Length` / `ContentFiltered` / `Refused` map to the
   corresponding failure kinds; `Unknown`/`ToolCalls` mislabels are
-  `InvalidModelResponse`.
+  `InvalidModelResponse`. A fully assembled `Unknown` no-tool response is
+  retained in complete history and handed off with its actual finish reason
+  before that failure outcome; it is not partial. A `ToolCalls` label without
+  calls fails assembly and does not create complete history.
 - Streaming: the driver yields after progress and the runner drains ready
   progress before polling the driver again, so back-to-back deltas do not
   starve forwarding. `TextDelta` and `ReasoningDelta` remain best-effort
