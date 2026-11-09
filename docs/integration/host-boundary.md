@@ -13,9 +13,10 @@ one loop and returns control. Concretely:
   `tool_rounds`, final `ConfigRevision`), current
   `LoopState` through `state`/`watch_state`, and an optional best-effort
   `LoopEventStream`.
-- **The host persists** whatever it wants: the report, selected appended
-  items, or transcripts it built from streamed events. None of that happens
-  in the runtime.
+- **The host persists** complete records from the optional history callback
+  and final report, plus unfinished model output from `report.partial`.
+  Streamed events are observation only, never the source of authoritative
+  history or partial output. Runtime performs no persistence itself.
 
 ## One-Shot Contract
 
@@ -101,8 +102,11 @@ later fail or cancel. See [unfinished model output](../contracts/model.md#unfini
   preempt synchronous code. Tool calls run sequentially in response order.
 - Enable unwinding (`panic = "unwind"`) for panic isolation. Abort-mode panics
   terminate the process and cannot produce a report.
-- Futures/streams are dropped on cancellation or timeout. Make them cancellation
-  safe, and arrange cleanup of any spawned work using the supplied child token.
+- Model, prompt, policy and tool futures/streams are dropped on cancellation
+  or timeout. Make them cancellation safe and arrange cleanup of spawned work
+  using the supplied child token. History acknowledgements are different:
+  Runtime awaits owned saving without dropping the callback on cancellation
+  or timeout.
 - Tool deadlines win ties with ready results. Side effects may already have
   happened even when the report records failure; hosts own reconciliation and
   must not assume that retrying the whole loop is safe.

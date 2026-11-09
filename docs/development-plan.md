@@ -32,6 +32,51 @@ shared test fixtures. See [release notes](release-v0.7.md) for compatibility and
   cover late watches, terminal event loss and input-boundary identity; current
   documentation distinguishes those contracts from historical release work.
 
+## Unreleased 0.10.0
+
+Acknowledged complete-history handoffs and authoritative unfinished model output
+are implemented, including independent history diagnostics and first-outcome
+claims. See the [host handoff guide](integration/host-boundary.md#incremental-history-and-partial-output)
+and [release notes](release-v0.7.md).
+
+### Post-handoff cleanup audit
+
+The 2026-11-09 audit compared `3fd5ecd..49a6e8b` and checked production, test
+and example uses. No production function was made obsolete by those changes.
+The cleanup removes the old user-history collection and redundant no-tool-result
+scan from the unsupported-finish regression: its exact `[User, Assistant]`
+match now checks both properties without allocation. The acceptance-linked test
+name is unchanged. Current host guidance no longer suggests deriving durable
+records from events or dropping history acknowledgements on cancellation.
+
+The following paths remain required:
+
+- `history: None` and full `LoopReport.appended` preserve join-only hosts and
+  let callback users reconcile by accepted position, not saved position.
+- The final tail handoff covers prompt/model failure, usage overflow and
+  unhanded inputs or settlements; earlier handoffs cannot replace it.
+- `begin_final`, pending-config disposal and the update gate retain normal
+  completion ordering and post-publication destruction. Non-completed claims
+  preserve the primary outcome while owned saving settles.
+- Driver failure mapping still preserves structured model errors and deadline
+  provenance after moving unfinished assembly into `LoopReport.partial`.
+- The no-tool `ToolCalls` rejection already existed at both assembler and
+  runner boundaries in `3fd5ecd`; it is not newly obsolete handoff code. The
+  adjacent `Unknown` failure remains reachable and must retain complete history.
+
+Verification on Linux with Rust/Cargo 1.90.0:
+
+- `./scripts/check.sh`: 307 tests, Clippy/rustdoc warning checks, docs and
+  architecture mutation self-tests, and 70 acceptance rows passed.
+- Focused `history_handoff_contract`, `model_partial_contract`,
+  `host_observation_contract` and `p3_agent_loop_closeout` targets: 51 passed.
+- `cargo test --all-features --locked --doc`: 2 passed.
+- `cargo metadata --locked --format-version 1 --no-deps` and
+  `cargo build --locked --release --examples`: passed.
+
+Provider evidence and dependencies are unchanged, so the opt-in provider gate
+was not run. macOS and Windows CI were not run locally.
+
 ## Remaining
 
 No planned phases remain. Maintenance keeps the gates in the next section

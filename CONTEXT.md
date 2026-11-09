@@ -46,7 +46,8 @@ library type.
 - Completion is owned by the runner task; its drop surfaces as
   `LoopWaitError::CompletionClosed` to waiters.
 - Update and the final seal linearize on one short `std::sync::Mutex`;
-  cancel/finish use a single `AtomicU8` single-CAS state machine; replaced or
+  cancellation, non-completed ending claims and final sealing compete in one
+  `AtomicU8` state machine; replaced or
   discarded `ExecutionConfig` instances are dropped outside the mutex. Finalization
   returns discarded configs to the runner for panic-isolated drop after publication.
 - Revision commits and `LoopReport.requests` accounting happen at the real
@@ -61,6 +62,12 @@ library type.
   task at the A and F request boundaries; inputs the loop took are in the
   report for every ending, the rest stay with the host. A no-tool answer
   always ends the loop.
+- Optional `LoopHistory` handoffs await applicable saving before tools, the
+  next request or final publication. The final tail handoff covers inputs and
+  settlements not delivered earlier; `appended` still contains the full delta.
+  `history_failure` does not replace an already-known business outcome.
+- `LoopReport.partial` comes from the unfinished model assembler, not events;
+  complete responses remain complete even when their loop fails or is cancelled.
 - `take` carries no request identity. Host prompt/model wrappers observe the
   candidate preparation and issued request on every installed config,
   including updates; a candidate can remain unissued after cancellation.
