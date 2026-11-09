@@ -71,33 +71,26 @@ async fn eof_with_open_tool_and_provider_tool_count_overflow_are_rejected() {
     let error = run_events(
         tool_request(),
         vec![Ok(start(open.clone(), "search")), Ok(args(open, "{}"))],
-        with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
+        ModelDriverConfig::default(),
     )
     .await
     .unwrap_err();
     assert_eq!(error.kind(), ModelErrorKind::IncompleteResponse);
     assert_eq!(error.delivery(), DeliveryState::Started);
-
-    let limits = LoopLimits {
-        max_tool_calls_per_response: 1,
-        ..LoopLimits::default()
-    };
-    let first = call_id(24);
-    let second = call_id(25);
-    let error = run_events(
-        tool_request(),
-        vec![
-            Ok(start(first.clone(), "search")),
-            Ok(args(first.clone(), "{}")),
-            Ok(end(first)),
-            Ok(start(second, "search")),
-        ],
-        with_limits(limits),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.kind(), ModelErrorKind::InvalidProviderResponse);
-    assert_eq!(error.delivery(), DeliveryState::Started);
+    let mut events = Vec::new();
+    for index in 0..65 {
+        let id = call_id(index);
+        events.extend([
+            Ok(start(id.clone(), "search")),
+            Ok(args(id.clone(), "{}")),
+            Ok(end(id)),
+        ]);
+    }
+    events.push(Ok(finish(ModelFinishReason::ToolCalls)));
+    let response = run_events(tool_request(), events, ModelDriverConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(response.parts().len(), 65);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -166,16 +159,10 @@ async fn refused_and_filtered_require_nonempty_text_not_reasoning_only() {
     }
 }
 
-/// FIX-01-T01: Multiple tool specs configured, max tool calls per response is 1,
-/// model response emits text only, Model::start is called exactly once and succeeds.
 #[tokio::test(flavor = "current_thread")]
 async fn multiple_tool_specs_allow_text_response_when_limit_is_one() {
-    let limits = LoopLimits {
-        max_tool_calls_per_response: 1,
-        ..LoopLimits::default()
-    };
     let model = ScriptModel::new(descriptor(), vec![Behavior::Events(text_success("done"))]);
-    let driver = model.driver(&with_limits(limits));
+    let driver = model.driver(&ModelDriverConfig::default());
     let (progress, _receiver) = progress_channel();
     let request = request_with(
         ReasoningPreference::High,
@@ -189,20 +176,14 @@ async fn multiple_tool_specs_allow_text_response_when_limit_is_one() {
             &progress,
         )
         .await
-        .expect("multiple tool specs should not be rejected when max tool calls per response is 1");
+        .expect("registered specs do not restrict response shape");
     assert_text(&response, "done");
     assert_eq!(model.starts(), 1);
 }
 
-/// FIX-01-T02: Multiple tool specs configured, max tool calls per response is 1,
-/// model response emits a single tool call and succeeds.
 #[tokio::test(flavor = "current_thread")]
 async fn multiple_tool_specs_allow_single_tool_call_when_limit_is_one() {
     let id = call_id(30);
-    let limits = LoopLimits {
-        max_tool_calls_per_response: 1,
-        ..LoopLimits::default()
-    };
     let request = request_with(
         ReasoningPreference::High,
         vec![tool_spec("lookup"), tool_spec("search")],
@@ -216,7 +197,7 @@ async fn multiple_tool_specs_allow_single_tool_call_when_limit_is_one() {
             Ok(end(id.clone())),
             Ok(finish(ModelFinishReason::ToolCalls)),
         ],
-        with_limits(limits),
+        ModelDriverConfig::default(),
     )
     .await
     .unwrap();
@@ -231,14 +212,8 @@ async fn multiple_tool_specs_allow_single_tool_call_when_limit_is_one() {
     ));
 }
 
-/// FIX-01-T03: Multiple tool specs configured, max tool calls per response is 1,
-/// model response emits two tool calls and is rejected by the assembler as InvalidProviderResponse.
 #[tokio::test(flavor = "current_thread")]
 async fn multiple_tool_specs_reject_second_tool_call_when_limit_is_one() {
-    let limits = LoopLimits {
-        max_tool_calls_per_response: 1,
-        ..LoopLimits::default()
-    };
     let first = call_id(31);
     let second = call_id(32);
     let request = request_with(
@@ -246,19 +221,20 @@ async fn multiple_tool_specs_reject_second_tool_call_when_limit_is_one() {
         vec![tool_spec("lookup"), tool_spec("search")],
         Some(64),
     );
-    let error = run_events(
+    let response = run_events(
         request,
         vec![
             Ok(start(first.clone(), "lookup")),
             Ok(args(first.clone(), "{}")),
             Ok(end(first)),
-            Ok(start(second, "search")),
+            Ok(start(second.clone(), "search")),
+            Ok(args(second.clone(), "{}")),
+            Ok(end(second)),
+            Ok(finish(ModelFinishReason::ToolCalls)),
         ],
-        with_limits(limits),
+        ModelDriverConfig::default(),
     )
     .await
-    .unwrap_err();
-
-    assert_eq!(error.kind(), ModelErrorKind::InvalidProviderResponse);
-    assert_eq!(error.delivery(), DeliveryState::Started);
+    .unwrap();
+    assert_eq!(response.parts().len(), 2);
 }

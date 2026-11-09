@@ -60,8 +60,7 @@ impl LoopHandle {
     /// effect at the next model-request boundary (the in-flight model and the
     /// tool batch it produced keep the previous snapshot); `Ok` carries the
     /// monotonic revision handed to this update. After cancellation or sealing
-    /// this returns `NotActive`; a config that violates the loop limits is
-    /// rejected as `InvalidConfig` without consuming a revision.
+    /// this returns `NotActive`; config invariants are checked at construction.
     pub fn update(&self, config: ExecutionConfig) -> Result<ConfigRevision, UpdateError> {
         self.control.update(config)
     }

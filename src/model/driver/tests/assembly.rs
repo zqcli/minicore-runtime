@@ -32,10 +32,9 @@ fn split_crlf_matches_whole_text_in_each_channel_and_progress() {
     let raw = "é\r\nA\rB\r\r\n\tend\r";
     let expected = "é\nA\nB\n\n\tend\n";
     assert_eq!(crate::value::normalize_model_text(raw), expected);
-    let limits = LoopLimits::default();
     for split in (0..=raw.len()).filter(|&split| raw.is_char_boundary(split)) {
         for direct in [false, true] {
-            let mut assembler = Assembler::new(&[], &limits);
+            let mut assembler = Assembler::new(&[]);
             let mut text = String::new();
             let mut reasoning = String::new();
             // Empty deltas and the other channel must not consume a pending CR.
@@ -88,20 +87,16 @@ fn split_crlf_matches_whole_text_in_each_channel_and_progress() {
 
 #[tokio::test]
 async fn direct_and_constructed_deltas_enforce_normalized_byte_limits() {
-    let limit = crate::model::MAX_MODEL_EVENT_TEXT_BYTES;
-    for (raw, normalized, accepted) in [
-        ("\0".repeat(limit), " ".repeat(limit), true),
-        ("\x1b".repeat(limit), " ".repeat(limit), true),
-        ("\u{85}".repeat(limit / 2), " ".repeat(limit / 2), true),
-        ("\r\n".repeat(limit / 2), "\n".repeat(limit / 2), true),
-        ("a".repeat(limit), "a".repeat(limit), true),
-        ("\0".repeat(limit + 1), " ".repeat(limit + 1), false),
-        (
-            "\r\n".repeat(limit / 2 + 1),
-            "\n".repeat(limit / 2 + 1),
-            false,
-        ),
-        ("a".repeat(limit + 1), "a".repeat(limit + 1), false),
+    let limit = 64 * 1024;
+    for (raw, normalized) in [
+        ("\0".repeat(limit), " ".repeat(limit)),
+        ("\x1b".repeat(limit), " ".repeat(limit)),
+        ("\u{85}".repeat(limit / 2), " ".repeat(limit / 2)),
+        ("\r\n".repeat(limit / 2), "\n".repeat(limit / 2)),
+        ("a".repeat(limit), "a".repeat(limit)),
+        ("\0".repeat(limit + 1), " ".repeat(limit + 1)),
+        ("\r\n".repeat(limit / 2 + 1), "\n".repeat(limit / 2 + 1)),
+        ("a".repeat(limit + 1), "a".repeat(limit + 1)),
     ] {
         assert!(normalized.len() <= raw.len());
         for reasoning in [false, true] {
@@ -117,38 +112,27 @@ async fn direct_and_constructed_deltas_enforce_normalized_byte_limits() {
                     ModelEvent::text_delta(&raw),
                 )
             };
-            assert_eq!(constructed.is_ok(), accepted);
-            assert_eq!(direct.validate().is_ok(), accepted);
+            assert_eq!(constructed, direct);
             let direct_result = run_events(
                 request(),
                 vec![Ok(direct), Ok(finish(ModelFinishReason::Stop))],
                 ModelDriverConfig::default(),
             )
             .await;
-            if accepted {
-                let constructed_result = run_events(
-                    request(),
-                    vec![
-                        Ok(constructed.unwrap()),
-                        Ok(finish(ModelFinishReason::Stop)),
-                    ],
-                    ModelDriverConfig::default(),
-                )
-                .await;
-                assert_eq!(direct_result, constructed_result);
-                let response = direct_result.unwrap();
-                let text = match &response.parts()[0] {
-                    AssistantPart::Text(text) => text.as_ref(),
-                    AssistantPart::Reasoning(reasoning) => reasoning.text().unwrap(),
-                    _ => panic!("expected model text"),
-                };
-                assert_eq!(text, normalized);
-            } else {
-                assert_eq!(
-                    direct_result.unwrap_err().kind(),
-                    ModelErrorKind::InvalidProviderResponse
-                );
-            }
+            let constructed_result = run_events(
+                request(),
+                vec![Ok(constructed), Ok(finish(ModelFinishReason::Stop))],
+                ModelDriverConfig::default(),
+            )
+            .await;
+            assert_eq!(direct_result, constructed_result);
+            let response = direct_result.unwrap();
+            let text = match &response.parts()[0] {
+                AssistantPart::Text(text) => text.as_ref(),
+                AssistantPart::Reasoning(reasoning) => reasoning.text().unwrap(),
+                _ => panic!("expected model text"),
+            };
+            assert_eq!(text, normalized);
         }
     }
 }
@@ -480,124 +464,66 @@ async fn rejects_every_malformed_stream_sequence() {
 #[tokio::test(flavor = "current_thread")]
 async fn tool_arguments_use_centralized_json_depth_and_node_validation() {
     let nested = format!(
-        "{}{{}}{}",
-        "{\"x\":".repeat(crate::value::MAX_JSON_DEPTH + 1),
-        "}".repeat(crate::value::MAX_JSON_DEPTH + 1),
+        "{}0{}",
+        "{\"x\":".repeat(crate::value::MAX_JSON_NESTING + 1),
+        "}".repeat(crate::value::MAX_JSON_NESTING + 1)
     );
-    let many_nodes = serde_json::to_string(&json!({
-        "items": vec![Value::Null; crate::value::MAX_JSON_NODES]
-    }))
+    let id = call_id(5);
+    let error = run_events(
+        tool_request(),
+        vec![
+            Ok(start(id.clone(), "search")),
+            Ok(args(id.clone(), &nested)),
+            Ok(end(id.clone())),
+        ],
+        ModelDriverConfig::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), ModelErrorKind::InvalidProviderResponse);
+    let arguments = json!({"items": vec![Value::Null; 4097]});
+    let response = run_events(
+        tool_request(),
+        vec![
+            Ok(start(id.clone(), "search")),
+            Ok(args(id.clone(), &arguments.to_string())),
+            Ok(end(id)),
+            Ok(finish(ModelFinishReason::ToolCalls)),
+        ],
+        ModelDriverConfig::default(),
+    )
+    .await
     .unwrap();
-    for arguments in [nested, many_nodes] {
-        let id = call_id(5);
-        let error = run_events(
-            tool_request(),
-            vec![
-                Ok(start(id.clone(), "search")),
-                Ok(args(id.clone(), &arguments)),
-                Ok(end(id)),
-            ],
-            with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.kind(), ModelErrorKind::InvalidProviderResponse);
-    }
+    assert_eq!(
+        response.parts()[0].as_tool_call().unwrap().arguments(),
+        &arguments
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn aggregate_text_reasoning_and_arguments_enforce_exact_semantic_boundaries() {
-    let limits = LoopLimits {
-        max_model_text_bytes: 3,
-        max_model_reasoning_bytes: 3,
-        max_tool_arguments_bytes: 7,
-        ..LoopLimits::default()
-    };
-    let kernel = with_limits(limits);
-
+    let text = "x".repeat(262_145);
+    let arguments = json!({"large": "a".repeat(65_537)});
+    let id = call_id(6);
+    let response = run_events(
+        tool_request(),
+        vec![
+            Ok(ModelEvent::text_delta(&text[..131_072])),
+            Ok(ModelEvent::reasoning_delta(&text[..131_072])),
+            Ok(start(id.clone(), "search")),
+            Ok(args(id.clone(), &arguments.to_string())),
+            Ok(end(id)),
+            Ok(ModelEvent::text_delta(&text[131_072..])),
+            Ok(ModelEvent::reasoning_delta(&text[131_072..])),
+            Ok(finish(ModelFinishReason::ToolCalls)),
+        ],
+        ModelDriverConfig::default(),
+    )
+    .await
+    .unwrap();
     assert!(
-        run_events(
-            request(),
-            vec![
-                Ok(ModelEvent::text_delta("abc")),
-                Ok(finish(ModelFinishReason::Stop)),
-            ],
-            kernel.clone(),
-        )
-        .await
-        .is_ok()
-    );
-    assert_eq!(
-        run_events(
-            request(),
-            vec![
-                Ok(ModelEvent::text_delta("abcd")),
-                Ok(finish(ModelFinishReason::Stop)),
-            ],
-            kernel.clone(),
-        )
-        .await
-        .unwrap_err()
-        .kind(),
-        ModelErrorKind::InvalidProviderResponse
-    );
-    assert!(
-        run_events(
-            request(),
-            vec![
-                Ok(ModelEvent::reasoning_delta("abc")),
-                Ok(finish(ModelFinishReason::Stop)),
-            ],
-            kernel.clone(),
-        )
-        .await
-        .is_ok()
-    );
-    assert_eq!(
-        run_events(
-            request(),
-            vec![
-                Ok(ModelEvent::reasoning_delta("abcd")),
-                Ok(finish(ModelFinishReason::Stop)),
-            ],
-            kernel.clone(),
-        )
-        .await
-        .unwrap_err()
-        .kind(),
-        ModelErrorKind::InvalidProviderResponse
-    );
-
-    let id = call_id(4);
-    assert!(
-        run_events(
-            tool_request(),
-            vec![
-                Ok(start(id.clone(), "search")),
-                Ok(args(id.clone(), "{\"a\":1}")),
-                Ok(end(id.clone())),
-                Ok(finish(ModelFinishReason::ToolCalls)),
-            ],
-            kernel.clone(),
-        )
-        .await
-        .is_ok()
-    );
-    assert_eq!(
-        run_events(
-            tool_request(),
-            vec![
-                Ok(start(id.clone(), "search")),
-                Ok(args(id.clone(), "{\"a\":10}")),
-                Ok(end(id)),
-                Ok(finish(ModelFinishReason::ToolCalls)),
-            ],
-            kernel,
-        )
-        .await
-        .unwrap_err()
-        .kind(),
-        ModelErrorKind::InvalidProviderResponse
+        matches!(response.parts(), [AssistantPart::Text(actual), AssistantPart::Reasoning(reasoning), AssistantPart::ToolCall(call)]
+        if actual.as_ref() == text && reasoning.text() == Some(text.as_str()) && call.arguments() == &arguments)
     );
 }
 

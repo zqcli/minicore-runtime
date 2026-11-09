@@ -40,7 +40,6 @@ impl Default for ModelDriverConfig {
         Self {
             model_call_timeout: Duration::from_secs(60),
             retry_policy: RetryPolicySnapshot::new(2, Duration::ZERO),
-            limits: LoopLimits::default(),
         }
     }
 }
@@ -105,15 +104,6 @@ fn with_retry(retry_policy: RetryPolicySnapshot) -> ModelDriverConfig {
     ModelDriverConfig {
         model_call_timeout: Duration::from_secs(60),
         retry_policy,
-        ..ModelDriverConfig::default()
-    }
-}
-
-fn with_limits(limits: LoopLimits) -> ModelDriverConfig {
-    ModelDriverConfig {
-        model_call_timeout: Duration::from_secs(60),
-        limits,
-        ..ModelDriverConfig::default()
     }
 }
 
@@ -166,10 +156,10 @@ fn test_error(kind: ModelErrorKind) -> ModelError {
 }
 
 fn progress_channel() -> (
-    mpsc::Sender<ModelDriverProgress>,
-    mpsc::Receiver<ModelDriverProgress>,
+    mpsc::UnboundedSender<ModelDriverProgress>,
+    mpsc::UnboundedReceiver<ModelDriverProgress>,
 ) {
-    mpsc::channel(16)
+    mpsc::unbounded_channel()
 }
 
 async fn run_events(

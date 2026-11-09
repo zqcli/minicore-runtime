@@ -76,14 +76,9 @@ async fn preflight_rejects_reasoning_tools_context_and_mutated_tool_specs_before
         ModelErrorKind::InvalidRequest
     );
 
-    for schema in [
-        json!([]),
-        json!({"padding": "x".repeat(crate::value::MAX_JSON_BYTES)}),
-    ] {
-        let mut wire = serde_json::to_value(tool_spec("search")).unwrap();
-        wire["input_schema"] = schema;
-        assert!(serde_json::from_value::<ToolSpec>(wire).is_err());
-    }
+    let mut wire = serde_json::to_value(tool_spec("search")).unwrap();
+    wire["input_schema"] = json!([]);
+    assert!(serde_json::from_value::<ToolSpec>(wire).is_err());
     assert_eq!(model.starts(), 0);
 }
 
@@ -107,7 +102,7 @@ async fn progress_is_best_effort_for_accepted_full_and_closed_channels() {
     );
     let driver = model.driver(&with_retry(RetryPolicySnapshot::new(1, Duration::ZERO)));
 
-    let (accepted, mut accepted_rx) = mpsc::channel(2);
+    let (accepted, mut accepted_rx) = mpsc::unbounded_channel();
     assert!(
         driver
             .run(
@@ -127,8 +122,8 @@ async fn progress_is_best_effort_for_accepted_full_and_closed_channels() {
         Ok(ModelDriverProgress::ReasoningDelta(_))
     ));
 
-    let (full, _full_rx) = mpsc::channel(1);
-    full.try_send(ModelDriverProgress::TextDelta(Text::new("occupied")))
+    let (full, mut full_rx) = mpsc::unbounded_channel();
+    full.send(ModelDriverProgress::TextDelta(Text::new("occupied")))
         .unwrap();
     assert!(
         driver
@@ -141,7 +136,11 @@ async fn progress_is_best_effort_for_accepted_full_and_closed_channels() {
             .is_ok()
     );
 
-    let (closed, closed_rx) = mpsc::channel(1);
+    assert_eq!(full_rx.len(), 3);
+    assert!(
+        matches!(full_rx.try_recv(), Ok(ModelDriverProgress::TextDelta(text)) if text.as_str() == "occupied")
+    );
+    let (closed, closed_rx) = mpsc::unbounded_channel();
     drop(closed_rx);
     assert!(
         driver

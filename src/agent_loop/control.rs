@@ -431,9 +431,7 @@ mod tests {
     }
 
     fn control() -> LoopControl {
-        LoopControl::new(LoopId::new().unwrap(), 16, LoopLimits::default())
-            .unwrap()
-            .0
+        LoopControl::new(LoopId::new().unwrap()).0
     }
 
     #[test]

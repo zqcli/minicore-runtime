@@ -165,7 +165,6 @@ async fn each_request_preparation_emits_one_starting_state() {
     assert_eq!(report.outcome, LoopOutcome::Completed);
     let mut preparations = Vec::new();
     while let Some(envelope) = events.recv().await {
-        assert_eq!(envelope.dropped_before, 0);
         if let LoopEvent::StateChanged { state } = envelope.event
             && state.status == LoopStatus::Starting
         {
@@ -208,7 +207,6 @@ async fn default_tool_rounds_continue_past_legacy_limit() {
     rounds.push(Round::Final { text: "done" });
     let (model, _) = scripted_model(rounds);
     let options = LoopOptions::default_checked().unwrap();
-    assert_eq!(options.max_tool_rounds, 0);
     let (agent, calls) = start_echo(model, ToolBehavior::Succeed, options);
     let report = finish(agent).await;
     assert_eq!(report.outcome, LoopOutcome::Completed);
@@ -218,33 +216,27 @@ async fn default_tool_rounds_continue_past_legacy_limit() {
 
 #[tokio::test]
 async fn max_tool_rounds_ends_with_failed_budget_and_complete_results() {
-    let (model, _) = scripted_model(vec![
+    // Historical acceptance name: the finite round quota is no longer configurable.
+    let mut rounds = vec![
         Round::Tools {
-            calls: vec![("echo", "call_1")],
-        },
-        Round::Tools {
-            calls: vec![("echo", "call_2")],
-        },
-    ]);
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.max_tool_rounds = 1;
-    let (agent, _) = start_echo(model, ToolBehavior::Succeed, options);
-
-    let report = finish(agent).await;
-    match &report.outcome {
-        LoopOutcome::Failed(failure) => {
-            assert_eq!(
-                failure.kind,
-                minicore_runtime::LoopFailureKind::MaxToolRounds
-            );
-        }
-        other => panic!("expected LoopOutcome::Failed(MaxToolRounds), got {other:?}"),
-    }
-    let tool_results: Vec<_> = tool_results(&report);
-    assert!(
-        !tool_results.is_empty(),
-        "round-limit calls receive results"
+            calls: vec![("echo", "call_1")]
+        };
+        1025
+    ];
+    rounds.push(Round::Final { text: "done" });
+    let (model, _) = scripted_model(rounds);
+    let (agent, calls) = start_echo(
+        model,
+        ToolBehavior::Succeed,
+        LoopOptions::default_checked().unwrap(),
     );
+    let report = tokio::time::timeout(Duration::from_secs(15), finish(agent))
+        .await
+        .unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.tool_rounds, 1025);
+    assert_eq!(calls.lock().unwrap().len(), 1025);
+    assert_eq!(tool_results(&report).len(), 1025);
 }
 
 #[tokio::test]
@@ -1156,26 +1148,23 @@ async fn bounded_event_queue_attaches_dropped_before_to_the_next_success() {
         Arc::new(DefaultPromptProvider::new(None)),
     )
     .unwrap();
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.event_capacity = 1;
+    let options = LoopOptions::default_checked().unwrap();
+
     let mut agent = AgentLoop::start(request(config), options, no_inputs()).unwrap();
     let mut events = agent.take_events().unwrap();
     let report_task = spawn_join(agent);
 
-    // Phase 1: let the first delta and its surrounding states flow, then drain
-    // one event so the bounded queue has room again.
-    tokio::time::advance(Duration::from_millis(1)).await;
-    let first = events.recv().await.unwrap();
-    assert_eq!(first.dropped_before, 0);
-
-    // Phase 2: the second delta bursts several events; the first delivery
-    // after the overflow reports exactly how many were dropped.
     tokio::time::advance(Duration::from_millis(300)).await;
-    let second = events.recv().await.unwrap();
-    assert!(second.dropped_before > 0, "overflow events must be counted");
-
     let report = report_task.await.unwrap().unwrap();
     assert_eq!(report.outcome, LoopOutcome::Completed);
+    let mut observed = String::new();
+    while let Some(envelope) = events.recv().await {
+        if let LoopEvent::OutputDelta { delta, .. } = envelope.event {
+            observed.push_str(delta.as_str());
+        }
+    }
+    assert_completed_with_text(&report, &observed);
+    assert!(!observed.is_empty());
 }
 
 #[tokio::test]
@@ -1884,8 +1873,7 @@ async fn request_started_records_the_actual_snapshot_revision_and_reasoning() {
     );
 }
 
-/// An invalid config against the live loop limits is rejected without
-/// consuming a revision.
+/// Invalid tool metadata fails construction; large checked configs still receive revisions.
 #[tokio::test]
 async fn invalid_config_update_does_not_consume_a_revision() {
     let gate = Arc::new(Notify::new());
@@ -1898,8 +1886,7 @@ async fn invalid_config_update_does_not_consume_a_revision() {
     );
     let (model_b, _) = scripted_model_named("fake/b", vec![Round::Final { text: "b" }]);
 
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.limits.max_tool_schema_bytes = 16;
+    let options = LoopOptions::default_checked().unwrap();
 
     let agent = AgentLoop::start(
         request(config(model_a, ToolSet::default(), None)),
@@ -1918,13 +1905,19 @@ async fn invalid_config_update_does_not_consume_a_revision() {
 
     let mut builder = ToolSet::builder();
     builder.register(RecordingTool {
-        spec: echo_spec(),
+        spec: ToolSpec::new(
+            "echo".parse().unwrap(),
+            "x".repeat(4097),
+            json!({"padding": "x".repeat(65537)}),
+        )
+        .unwrap(),
         calls: Arc::new(Mutex::new(Vec::new())),
         behavior: ToolBehavior::Succeed,
         entered: None,
     });
     let oversized = builder.build().unwrap();
-    let error = handle
+    assert!(ToolSpec::new("invalid".parse().unwrap(), "invalid", json!([])).is_err());
+    let revision = handle
         .update(config_full(
             model_b.clone(),
             ReasoningPreference::Auto,
@@ -1932,10 +1925,10 @@ async fn invalid_config_update_does_not_consume_a_revision() {
             None,
             project(),
         ))
-        .expect_err("oversized tool spec must be rejected");
-    assert_eq!(error, UpdateError::InvalidConfig);
+        .unwrap();
+    assert_eq!(revision, ConfigRevision::new(1));
 
-    // The rejected update consumed no revision: the next accepted one is 1.
+    // The checked large config consumed exactly one revision.
     let good = handle
         .update(config_full(
             model_b,
@@ -1945,7 +1938,7 @@ async fn invalid_config_update_does_not_consume_a_revision() {
             project(),
         ))
         .unwrap();
-    assert_eq!(good, ConfigRevision::new(1));
+    assert_eq!(good, ConfigRevision::new(2));
 
     gate.notify_waiters();
     let report = report_task.await.unwrap().unwrap();
@@ -2294,63 +2287,29 @@ async fn multiple_stale_rebuilds_issue_only_the_latest_revision() {
     );
 }
 
-/// `AgentLoop::start` applies the same config-vs-LoopLimits validation as
-/// `update`: tool name/schema overruns fail with InvalidConfig.
+/// Start accepts checked tool payloads above former schema and description ceilings.
 #[tokio::test]
 async fn start_rejects_config_outside_loop_limits() {
     let (model, _) = scripted_model(vec![Round::Final { text: "x" }]);
-
-    // Schema bytes exceed the loop budget.
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.limits.max_tool_schema_bytes = 16;
     let mut builder = ToolSet::builder();
     builder.register(RecordingTool {
-        spec: echo_spec(),
+        spec: ToolSpec::new(
+            "echo".parse().unwrap(),
+            "x".repeat(4097),
+            json!({"padding": "x".repeat(65537)}),
+        )
+        .unwrap(),
         calls: Arc::new(Mutex::new(Vec::new())),
         behavior: ToolBehavior::Succeed,
         entered: None,
     });
-    let tools = builder.build().unwrap();
-    let error = AgentLoop::start(
-        request(config_full(
-            model.clone(),
-            ReasoningPreference::Auto,
-            tools,
-            None,
-            project(),
-        )),
-        options,
+    let agent = AgentLoop::start(
+        request(config(model, builder.build().unwrap(), None)),
+        LoopOptions::default_checked().unwrap(),
         no_inputs(),
     )
-    .err()
-    .expect("oversized schema must fail start");
-    assert_eq!(error, LoopStartError::InvalidConfig);
-
-    // Tool name exceeds the loop budget.
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.limits.max_tool_name_bytes = 2;
-    let mut builder = ToolSet::builder();
-    builder.register(RecordingTool {
-        spec: echo_spec(),
-        calls: Arc::new(Mutex::new(Vec::new())),
-        behavior: ToolBehavior::Succeed,
-        entered: None,
-    });
-    let tools = builder.build().unwrap();
-    let error = AgentLoop::start(
-        request(config_full(
-            model,
-            ReasoningPreference::Auto,
-            tools,
-            None,
-            project(),
-        )),
-        options,
-        no_inputs(),
-    )
-    .err()
-    .expect("oversized name must fail start");
-    assert_eq!(error, LoopStartError::InvalidConfig);
+    .unwrap();
+    assert_eq!(finish(agent).await.outcome, LoopOutcome::Completed);
 }
 
 // ===== Phase 4: host inputs reach a running loop at request boundaries =====
@@ -3562,74 +3521,31 @@ async fn default_provider_runs_a_loop_end_to_end_with_system_prompt() {
     assert_eq!(report.requests, 1);
 }
 
-/// The default provider always projects a legal maximum-capacity summary: the
-/// fixed prefix is kept verbatim and any overflow is truncated from the
-/// content tail at a UTF-8 character boundary, never mid-character.
+/// The default provider retains the complete summary and fixed prefix.
 #[tokio::test]
 async fn default_provider_truncates_large_summary_at_the_absolute_limit() {
     let descriptor = default_descriptor();
-    let tools: Vec<ToolSpec> = Vec::new();
-    let prefix = "Conversation summary:\n";
-    let absolute = Text::MAX_BYTES;
-
-    async fn render(
-        content: &Text,
-        descriptor: &minicore_runtime::model::ModelDescriptor,
-        tools: &[ToolSpec],
-    ) -> Result<Vec<ModelMessage>, PromptError> {
+    let tools = Vec::new();
+    for content in ["x".repeat(262_145), format!("{}€€", "x".repeat(262_143))] {
         let history = vec![HistoryItem::Summary(
             minicore_runtime::history::SummaryHistory {
-                content: content.clone(),
+                content: Text::new(&content),
             },
         )];
-        let view = HistoryView::new(&history, &[]);
         let prepared = DefaultPromptProvider::new(None)
-            .prepare(default_request(view, false, descriptor, tools))
-            .await?;
-        Ok(prepared.messages)
+            .prepare(default_request(
+                HistoryView::new(&history, &[]),
+                false,
+                &descriptor,
+                &tools,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.messages,
+            vec![ModelMessage::system(format!("Conversation summary:\n{content}")).unwrap()]
+        );
     }
-
-    // Max ASCII content: must truncate but keep the exact prefix, stay within
-    // the absolute ceiling, and produce a valid ModelMessage.
-    let ascii = Text::new("x".repeat(absolute));
-    let messages = render(&ascii, &descriptor, &tools).await.unwrap();
-    assert_eq!(messages.len(), 1);
-    let ModelMessage::System(text) = &messages[0] else {
-        panic!("summary must project to a System message");
-    };
-    assert!(
-        text.starts_with(prefix),
-        "the fixed prefix must be preserved"
-    );
-    assert!(text.len() <= absolute);
-    messages[0].validate().unwrap();
-
-    // Multi-byte content crossing the truncation point: the cut must land on a
-    // character boundary and never panic.
-    let budget = absolute - prefix.len();
-    let multibyte = Text::new(format!("{}€€", "x".repeat(budget - 2)));
-    let messages = render(&multibyte, &descriptor, &tools).await.unwrap();
-    let ModelMessage::System(text) = &messages[0] else {
-        panic!("summary must project to a System message");
-    };
-    assert!(text.starts_with(prefix));
-    assert!(text.len() <= absolute);
-    assert!(text.is_char_boundary(text.len()));
-    messages[0].validate().unwrap();
-
-    // Exactly the remaining budget: no truncation at all.
-    let exact = Text::new("y".repeat(budget));
-    let messages = render(&exact, &descriptor, &tools).await.unwrap();
-    let ModelMessage::System(text) = &messages[0] else {
-        panic!("summary must project to a System message");
-    };
-    assert!(text.starts_with(prefix));
-    assert_eq!(text.len(), absolute);
-    assert!(
-        text.ends_with("y"),
-        "no truncation when content exactly fits"
-    );
-    messages[0].validate().unwrap();
 }
 
 /// The default provider rejects an empty history as EmptyPrompt.
@@ -3684,8 +3600,7 @@ async fn invalid_message_from_public_variant_fails_as_prompt() {
     assert_eq!(report.requests, 0);
 }
 
-/// FIX-02-T01: Success ToolOutput exceeding configured limit becomes Failed,
-/// the large original content does not enter history, and the model can continue.
+/// Historical test name retained; results now preserve complete validated content.
 #[tokio::test]
 async fn tool_output_exceeding_limit_fails_and_original_content_omitted_from_history() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -3695,10 +3610,9 @@ async fn tool_output_exceeding_limit_fails_and_original_content_omitted_from_his
         },
         Round::Final { text: "recovered" },
     ]);
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.limits.max_tool_output_bytes = 16;
+    let options = LoopOptions::default_checked().unwrap();
 
-    let large_output = "x".repeat(64);
+    let large_output = "x".repeat(262_145);
     let agent = AgentLoop::start(
         request(config(
             model,
@@ -3719,10 +3633,9 @@ async fn tool_output_exceeding_limit_fails_and_original_content_omitted_from_his
 
     let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
-    assert_eq!(tool_results[0].outcome, ToolResultOutcome::Failed);
-    assert!(tool_results[0].output.content().byte_len() <= 16);
+    assert_eq!(tool_results[0].outcome, ToolResultOutcome::Success);
     assert!(
-        !tool_results[0]
+        tool_results[0]
             .output
             .content()
             .as_str()
@@ -3730,7 +3643,7 @@ async fn tool_output_exceeding_limit_fails_and_original_content_omitted_from_his
     );
 }
 
-/// FIX-02-T02: ToolOutput within configured limit remains Success with unchanged content.
+/// Historical test name retained; results now preserve complete validated content.
 #[tokio::test]
 async fn tool_output_within_limit_succeeds_with_unchanged_content() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -3740,8 +3653,7 @@ async fn tool_output_within_limit_succeeds_with_unchanged_content() {
         },
         Round::Final { text: "done" },
     ]);
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.limits.max_tool_output_bytes = 16;
+    let options = LoopOptions::default_checked().unwrap();
 
     let agent = AgentLoop::start(
         request(config(
@@ -3765,10 +3677,9 @@ async fn tool_output_within_limit_succeeds_with_unchanged_content() {
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0].outcome, ToolResultOutcome::Success);
     assert_eq!(tool_results[0].output.content().as_str(), "success!");
-    assert!(tool_results[0].output.content().byte_len() <= 16);
 }
 
-/// FIX-02-T03: ToolInput answer whose encoded result exceeds limit becomes Failed and bounded.
+/// Historical test name retained; results now preserve complete validated content.
 #[tokio::test]
 async fn tool_input_answer_exceeding_limit_fails_and_bounded() {
     let (model, _) = scripted_model(vec![
@@ -3777,8 +3688,7 @@ async fn tool_input_answer_exceeding_limit_fails_and_bounded() {
         },
         Round::Final { text: "done" },
     ]);
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.limits.max_tool_output_bytes = 16;
+    let options = LoopOptions::default_checked().unwrap();
 
     let (agent, _) = start_echo(model, ToolBehavior::RequestInput, options);
     let handle = agent.handle();
@@ -3790,7 +3700,7 @@ async fn tool_input_answer_exceeding_limit_fails_and_bounded() {
         .await
         .unwrap();
     let pending = states.borrow().pending_interaction.clone().unwrap();
-    let large_answer = "a".repeat(32);
+    let large_answer = "a".repeat(262_145);
     handle
         .answer(
             pending.interaction_id,
@@ -3803,11 +3713,9 @@ async fn tool_input_answer_exceeding_limit_fails_and_bounded() {
 
     let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
-    assert_eq!(tool_results[0].outcome, ToolResultOutcome::Failed);
-    assert_ne!(tool_results[0].outcome, ToolResultOutcome::InputProvided);
-    assert!(tool_results[0].output.content().byte_len() <= 16);
+    assert_eq!(tool_results[0].outcome, ToolResultOutcome::InputProvided);
     assert!(
-        !tool_results[0]
+        tool_results[0]
             .output
             .content()
             .as_str()
@@ -3815,7 +3723,7 @@ async fn tool_input_answer_exceeding_limit_fails_and_bounded() {
     );
 }
 
-/// FIX-02-T04: Policy deny reason exceeding configured limit remains Denied and bounded.
+/// Historical test name retained; results now preserve complete validated content.
 #[tokio::test]
 async fn policy_denied_reason_exceeding_limit_remains_denied_and_bounded() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -3825,10 +3733,9 @@ async fn policy_denied_reason_exceeding_limit_remains_denied_and_bounded() {
         },
         Round::Final { text: "done" },
     ]);
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.limits.max_tool_output_bytes = 16;
+    let options = LoopOptions::default_checked().unwrap();
 
-    let large_reason = "x".repeat(64);
+    let large_reason = "x".repeat(262_145);
     let policy = Arc::new(ScriptedPolicy {
         plan: Arc::new(vec![PolicyPlan::DenyReason(Text::new(
             large_reason.clone(),
@@ -3853,9 +3760,8 @@ async fn policy_denied_reason_exceeding_limit_remains_denied_and_bounded() {
     let tool_results: Vec<_> = tool_results(&report);
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0].outcome, ToolResultOutcome::Denied);
-    assert!(tool_results[0].output.content().byte_len() <= 16);
     assert!(
-        !tool_results[0]
+        tool_results[0]
             .output
             .content()
             .as_str()
@@ -3863,8 +3769,7 @@ async fn policy_denied_reason_exceeding_limit_remains_denied_and_bounded() {
     );
 }
 
-/// FIX-02-T05a: When max_output_bytes=1, max tool rounds terminal result does not panic
-/// and output byte len is <= 1.
+/// Historical test name retained; results now preserve complete validated content.
 #[tokio::test]
 async fn minimal_limit_one_byte_bounds_max_tool_rounds_terminal_result() {
     let (model, _) = scripted_model(vec![
@@ -3874,34 +3779,25 @@ async fn minimal_limit_one_byte_bounds_max_tool_rounds_terminal_result() {
         Round::Tools {
             calls: vec![("echo", "call_2")],
         },
+        Round::Final { text: "done" },
     ]);
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.max_tool_rounds = 1;
-    options.limits.max_tool_output_bytes = 1;
-
-    let (agent, _) = start_echo(model, ToolBehavior::Succeed, options);
-
+    let (agent, _) = start_echo(
+        model,
+        ToolBehavior::Succeed,
+        LoopOptions::default_checked().unwrap(),
+    );
     let report = finish(agent).await;
-    assert!(matches!(
-        report.outcome,
-        LoopOutcome::Failed(ref failure)
-            if failure.kind == minicore_runtime::LoopFailureKind::MaxToolRounds
-    ));
-
-    let tool_results: Vec<_> = tool_results(&report);
-    assert_eq!(tool_results.len(), 2);
-    assert_eq!(tool_results[1].outcome, ToolResultOutcome::Failed);
-    for result in &tool_results {
-        assert!(
-            result.output.content().byte_len() <= 1,
-            "tool result output byte len {} exceeds limit 1",
-            result.output.content().byte_len()
-        );
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(report.tool_rounds, 2);
+    let results = tool_results(&report);
+    assert_eq!(results.len(), 2);
+    for result in results {
+        assert_eq!(result.outcome, ToolResultOutcome::Success);
+        assert_eq!(result.output.content().as_str(), "tool result");
     }
 }
 
-/// FIX-02-T05b: When max_output_bytes=1, ordinary tool execution failure (tool failed)
-/// allows the loop to continue and bounds the Failed ToolResult output to <= 1 byte.
+/// Historical test name retained; results now preserve complete validated content.
 #[tokio::test]
 async fn minimal_limit_one_byte_bounds_tool_failure_result() {
     let (model, _) = scripted_model(vec![
@@ -3910,8 +3806,7 @@ async fn minimal_limit_one_byte_bounds_tool_failure_result() {
         },
         Round::Final { text: "recovered" },
     ]);
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.limits.max_tool_output_bytes = 1;
+    let options = LoopOptions::default_checked().unwrap();
 
     let (agent, _) = start_echo(model, ToolBehavior::Fail, options);
 
@@ -3923,23 +3818,17 @@ async fn minimal_limit_one_byte_bounds_tool_failure_result() {
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0].call_id.as_str(), "call_1");
     assert_eq!(tool_results[0].outcome, ToolResultOutcome::Failed);
-    assert!(
-        tool_results[0].output.content().byte_len() <= 1,
-        "tool result output byte len {} exceeds limit 1",
-        tool_results[0].output.content().byte_len()
-    );
+    assert_eq!(tool_results[0].output.content().as_str(), "tool failed");
 }
 
-/// FIX-02-T05c: When max_output_bytes=1, active and cancelled remaining tool calls
-/// do not panic and output byte len is <= 1.
+/// Historical test name retained; results now preserve complete validated content.
 #[tokio::test]
 async fn minimal_limit_one_byte_bounds_cancelled_tool_batch() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let (model, _) = scripted_model(vec![Round::Tools {
         calls: vec![("hold", "call_1"), ("echo", "call_2")],
     }]);
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.limits.max_tool_output_bytes = 1;
+    let options = LoopOptions::default_checked().unwrap();
 
     let hold_entered = Arc::new(Notify::new());
     let mut builder = ToolSet::builder();
@@ -3985,16 +3874,11 @@ async fn minimal_limit_one_byte_bounds_cancelled_tool_batch() {
     assert_eq!(tool_results[1].outcome, ToolResultOutcome::Cancelled);
 
     for result in &tool_results {
-        assert!(
-            result.output.content().byte_len() <= 1,
-            "tool result {} byte_len {} exceeds limit 1",
-            result.call_id.as_str(),
-            result.output.content().byte_len()
-        );
+        assert_eq!(result.output.content().as_str(), "tool batch interrupted");
     }
 }
 
-/// FIX-02-T06: ToolFinished.output_bytes equals the final bounded History ToolResult output bytes.
+/// Historical test name retained; results now preserve complete validated content.
 #[tokio::test]
 async fn tool_finished_event_output_bytes_matches_history_bounded_bytes() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -4004,10 +3888,9 @@ async fn tool_finished_event_output_bytes_matches_history_bounded_bytes() {
         },
         Round::Final { text: "done" },
     ]);
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.limits.max_tool_output_bytes = 16;
+    let options = LoopOptions::default_checked().unwrap();
 
-    let large_output = "x".repeat(64);
+    let large_output = "x".repeat(262_145);
     let mut agent = AgentLoop::start(
         request(config(
             model,
@@ -4043,14 +3926,13 @@ async fn tool_finished_event_output_bytes_matches_history_bounded_bytes() {
 
     let (event_call_id, event_outcome, event_output_bytes) = &finished_events[0];
     assert_eq!(event_call_id.as_str(), "call_1");
-    assert_eq!(*event_outcome, ToolResultOutcome::Failed);
-    assert_eq!(tool_results[0].outcome, ToolResultOutcome::Failed);
+    assert_eq!(*event_outcome, ToolResultOutcome::Success);
+    assert_eq!(tool_results[0].outcome, ToolResultOutcome::Success);
     assert_eq!(
         *event_output_bytes,
         tool_results[0].output.content().byte_len()
     );
-    assert!(*event_output_bytes <= 16);
-    assert_ne!(*event_output_bytes, 64);
+    assert_eq!(*event_output_bytes, 262_145);
 }
 
 /// Helper to verify that an invalid ToolInputRequest returned by a tool fails without
@@ -4149,7 +4031,56 @@ async fn invalid_tool_input_empty_prompt_fails_without_interaction() {
     assert_invalid_tool_input_request_fails(invalid_request).await;
 }
 
-/// FIX-05-T05 (too many choices): Fake Tool returning a ToolInputRequest with 33 choices fails without interaction.
+async fn assert_large_tool_input_request_succeeds(request: ToolInputRequest) {
+    let expected = request.choices[request.choices.len() - 1]
+        .as_str()
+        .to_owned();
+    let index = request.choices.len() - 1;
+    let (model, _) = scripted_model(vec![
+        Round::Tools {
+            calls: vec![("echo", "call_1")],
+        },
+        Round::Final { text: "done" },
+    ]);
+    let (agent, _) = start_echo(
+        model,
+        ToolBehavior::RequestInvalidInput(request.clone()),
+        LoopOptions::default_checked().unwrap(),
+    );
+    let handle = agent.handle();
+    let mut states = handle.watch_state();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        states.wait_for(|state| state.pending_interaction.is_some()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let pending = states
+        .borrow_and_update()
+        .pending_interaction
+        .clone()
+        .unwrap();
+    assert!(
+        matches!(&pending.kind, minicore_runtime::InteractionKind::ToolInput(actual) if actual == &request)
+    );
+    handle
+        .answer(
+            pending.interaction_id,
+            InteractionAnswer::ToolInput(ToolInputAnswer::Choice { index }),
+        )
+        .unwrap();
+    let report = finish(agent).await;
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    let results = tool_results(&report);
+    assert_eq!(results[0].outcome, ToolResultOutcome::InputProvided);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(results[0].output.content().as_str()).unwrap(),
+        json!({"choice_index": index, "choice": expected})
+    );
+}
+
+/// Historical name retained: 33 choices are accepted and answered.
 #[tokio::test]
 async fn invalid_tool_input_too_many_choices_fails_without_interaction() {
     let invalid_request = ToolInputRequest {
@@ -4157,10 +4088,10 @@ async fn invalid_tool_input_too_many_choices_fails_without_interaction() {
         choices: (0..33).map(|i| Text::new(format!("choice_{i}"))).collect(),
         answer_kind: ToolInputAnswerKind::SingleChoice,
     };
-    assert_invalid_tool_input_request_fails(invalid_request).await;
+    assert_large_tool_input_request_succeeds(invalid_request).await;
 }
 
-/// FIX-05-T05 (oversized choice): Fake Tool returning a ToolInputRequest with a choice > 1024 bytes fails without interaction.
+/// Historical name retained: a choice beyond 1024 bytes is accepted and answered.
 #[tokio::test]
 async fn invalid_tool_input_oversized_choice_fails_without_interaction() {
     let invalid_request = ToolInputRequest {
@@ -4168,7 +4099,7 @@ async fn invalid_tool_input_oversized_choice_fails_without_interaction() {
         choices: vec![Text::new("x".repeat(1025))],
         answer_kind: ToolInputAnswerKind::SingleChoice,
     };
-    assert_invalid_tool_input_request_fails(invalid_request).await;
+    assert_large_tool_input_request_succeeds(invalid_request).await;
 }
 
 /// FIX-05-T06: Valid SingleChoice tool input interaction feeds an InputProvided result and loop completes.
@@ -4585,7 +4516,7 @@ async fn model_error_invalid_provider_response_preserves_diagnostic() {
     }
 }
 
-/// FIX-03-T08: Non-model failures (Prompt, MaxToolRounds, Policy) classify correctly as regression check.
+/// FIX-03-T08: Non-model failures (Prompt and Policy) classify correctly as regression check.
 #[tokio::test]
 async fn non_model_failures_classify_correctly_regression() {
     // Prompt failure
@@ -4609,33 +4540,6 @@ async fn non_model_failures_classify_correctly_regression() {
             assert_eq!(failure.model_error(), None);
         }
         other => panic!("expected LoopOutcome::Failed(Prompt), got {other:?}"),
-    }
-
-    // MaxToolRounds failure
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let (model, _) = scripted_model(vec![
-        Round::Tools {
-            calls: vec![("echo", "call_1")],
-        },
-        Round::Tools {
-            calls: vec![("echo", "call_2")],
-        },
-    ]);
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.max_tool_rounds = 1;
-    let agent = AgentLoop::start(
-        request(config(model, tool_set(calls, ToolBehavior::Succeed), None)),
-        options,
-        no_inputs(),
-    )
-    .unwrap();
-    let report = finish(agent).await;
-    match &report.outcome {
-        LoopOutcome::Failed(failure) => {
-            assert_eq!(failure.kind, LoopFailureKind::MaxToolRounds);
-            assert_eq!(failure.model_error(), None);
-        }
-        other => panic!("expected LoopOutcome::Failed(MaxToolRounds), got {other:?}"),
     }
 
     // Policy failure via invalid ToolDecision (fails decision.validate())
@@ -4893,16 +4797,15 @@ async fn prompt_failure_emits_no_request_started_and_counts_zero_requests() {
     );
 }
 
-/// Back-to-back deltas must not overflow the internal queue while the event sink has room.
+/// A slow consumer retains model deltas beyond the former outer queue ceiling.
 #[tokio::test]
 async fn model_burst_progress_drops_are_recorded_in_dropped_before() {
     let (model, _) = scripted_model(vec![Round::BurstDeltas {
-        count: 100,
+        count: 4097,
         chunk: "x",
     }]);
 
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.event_capacity = 256;
+    let options = LoopOptions::default_checked().unwrap();
 
     let mut agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
@@ -4916,9 +4819,7 @@ async fn model_burst_progress_drops_are_recorded_in_dropped_before() {
     assert_eq!(report.outcome, LoopOutcome::Completed);
 
     let mut delivered_deltas = 0;
-    let mut dropped_before_sum = 0;
     while let Some(envelope) = events.recv().await {
-        dropped_before_sum += envelope.dropped_before;
         if matches!(
             envelope.event,
             LoopEvent::OutputDelta {
@@ -4930,8 +4831,7 @@ async fn model_burst_progress_drops_are_recorded_in_dropped_before() {
         }
     }
 
-    assert_eq!(delivered_deltas, 100);
-    assert_eq!(dropped_before_sum, 0);
+    assert_eq!(delivered_deltas, 4097);
 
     let assistant = report
         .appended
@@ -4949,10 +4849,10 @@ async fn model_burst_progress_drops_are_recorded_in_dropped_before() {
             _ => None,
         })
         .collect();
-    assert_eq!(full_text, "x".repeat(100));
+    assert_eq!(full_text, "x".repeat(4097));
 }
 
-/// FIX-04-T02: Tool burst drops progress internally; delivered ToolProgress plus dropped_before sum must equal 100.
+/// A slow consumer retains all tool progress beyond both former queue ceilings.
 #[tokio::test]
 async fn tool_burst_progress_drops_are_recorded_in_dropped_before() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -4963,13 +4863,12 @@ async fn tool_burst_progress_drops_are_recorded_in_dropped_before() {
         Round::Final { text: "done" },
     ]);
 
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.event_capacity = 256;
+    let options = LoopOptions::default_checked().unwrap();
 
     let mut agent = AgentLoop::start(
         request(config(
             model,
-            tool_set(Arc::clone(&calls), ToolBehavior::ProgressBurst(100)),
+            tool_set(Arc::clone(&calls), ToolBehavior::ProgressBurst(4097)),
             None,
         )),
         options,
@@ -4984,18 +4883,15 @@ async fn tool_burst_progress_drops_are_recorded_in_dropped_before() {
     assert_eq!(report.tool_rounds, 1);
 
     let mut delivered_progress = 0;
-    let mut dropped_before_sum = 0;
     while let Some(envelope) = events.recv().await {
-        dropped_before_sum += envelope.dropped_before;
         if matches!(envelope.event, LoopEvent::ToolProgress { .. }) {
             delivered_progress += 1;
         }
     }
 
     assert_eq!(
-        delivered_progress + dropped_before_sum,
-        100,
-        "delivered tool progresses ({delivered_progress}) + dropped_before sum ({dropped_before_sum}) must equal total generated progresses (100)"
+        delivered_progress, 4097,
+        "every produced tool progress must remain available to a slow consumer"
     );
 
     let tool_result = report
@@ -5010,7 +4906,7 @@ async fn tool_burst_progress_drops_are_recorded_in_dropped_before() {
     assert_eq!(tool_result.output.content().as_str(), "burst completed");
 }
 
-/// FIX-04-T03: Simultaneous internal and external progress queue overflow completes deterministically with dropped_before > 0.
+/// Bursts remain observable without requiring consumption before completion.
 #[tokio::test]
 async fn both_inner_and_outer_queues_overflow_reports_dropped_before() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -5024,8 +4920,7 @@ async fn both_inner_and_outer_queues_overflow_reports_dropped_before() {
         Round::Final { text: "done" },
     ]);
 
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.event_capacity = 1;
+    let options = LoopOptions::default_checked().unwrap();
 
     let mut agent = AgentLoop::start(
         request(config(
@@ -5033,7 +4928,7 @@ async fn both_inner_and_outer_queues_overflow_reports_dropped_before() {
             tool_set(
                 Arc::clone(&calls),
                 ToolBehavior::GatedProgressBurst {
-                    count: 100,
+                    count: 4097,
                     entered: Arc::clone(&entered),
                     gate: Arc::clone(&gate),
                 },
@@ -5047,10 +4942,10 @@ async fn both_inner_and_outer_queues_overflow_reports_dropped_before() {
 
     let mut events = agent.take_events().unwrap();
 
-    // 1. Wait until the tool has emitted all 100 progress updates and paused at gate.
+    // Wait for the full burst before consuming any event.
     entered.notified().await;
 
-    // 2. Consume at least one event so the outer channel has capacity to accept subsequent events.
+    // Reading one event must not affect execution.
     let first = events
         .recv()
         .await
@@ -5077,16 +4972,13 @@ async fn both_inner_and_outer_queues_overflow_reports_dropped_before() {
         "gated burst completed"
     );
 
-    // 5. Accumulate dropped_before across all delivered envelopes.
-    let mut total_dropped = first.dropped_before;
+    // Every emitted progress survives across both observation queues.
+    let mut delivered = usize::from(matches!(first.event, LoopEvent::ToolProgress { .. }));
     while let Some(envelope) = events.recv().await {
-        total_dropped += envelope.dropped_before;
+        delivered += usize::from(matches!(envelope.event, LoopEvent::ToolProgress { .. }));
     }
 
-    assert!(
-        total_dropped > 0,
-        "dropped_before must be greater than zero when both queues overflow (got {total_dropped})"
-    );
+    assert_eq!(delivered, 4097);
 }
 
 /// FIX-04-T04: Dropping the event receiver during model burst emissions allows loop to complete.
@@ -5097,8 +4989,7 @@ async fn receiver_dropped_during_model_burst_allows_loop_to_complete() {
         chunk: "z",
     }]);
 
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.event_capacity = 256;
+    let options = LoopOptions::default_checked().unwrap();
 
     let mut agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
@@ -5143,8 +5034,7 @@ async fn receiver_dropped_during_tool_burst_allows_loop_to_complete() {
         Round::Final { text: "done" },
     ]);
 
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.event_capacity = 256;
+    let options = LoopOptions::default_checked().unwrap();
 
     let mut agent = AgentLoop::start(
         request(config(

@@ -1,5 +1,3 @@
-use std::sync::atomic::AtomicU64;
-
 use super::*;
 use crate::time::DeadlineSource;
 
@@ -10,7 +8,6 @@ fn deadline_with_retry(
     ModelDriverConfig {
         model_call_timeout: model_timeout,
         retry_policy,
-        ..ModelDriverConfig::default()
     }
 }
 
@@ -42,14 +39,12 @@ async fn pending_stream_reports_exact_turn_or_port_deadline_source() {
             RetryPolicySnapshot::new(1, Duration::ZERO),
         ));
         let (progress, _receiver) = progress_channel();
-        let dropped = AtomicU64::new(0);
         let run = tokio::spawn(async move {
             driver
                 .run_detailed(
                     request(),
                     context(CancellationToken::new(), turn_after),
                     &progress,
-                    &dropped,
                 )
                 .await
         });
@@ -78,7 +73,6 @@ async fn adapter_timeout_has_no_core_deadline_provenance() {
             request(),
             context(CancellationToken::new(), Duration::from_secs(30)),
             &progress,
-            &AtomicU64::new(0),
         )
         .await
         .unwrap_err();
@@ -97,7 +91,7 @@ async fn expired_turn_deadline_is_reported_before_model_invocation() {
     call_context.deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     let (progress, _receiver) = progress_channel();
     let failure = driver
-        .run_detailed(request(), call_context, &progress, &AtomicU64::new(0))
+        .run_detailed(request(), call_context, &progress)
         .await
         .unwrap_err();
     assert_eq!(failure.error().kind(), ModelErrorKind::Timeout);
@@ -120,7 +114,6 @@ async fn cancellation_and_panic_have_no_deadline_provenance() {
             request(),
             context(cancellation, Duration::from_secs(30)),
             &progress,
-            &AtomicU64::new(0),
         )
         .await
         .unwrap_err();
@@ -137,7 +130,6 @@ async fn cancellation_and_panic_have_no_deadline_provenance() {
             request(),
             context(CancellationToken::new(), Duration::from_secs(30)),
             &progress,
-            &AtomicU64::new(0),
         )
         .await
         .unwrap_err();
@@ -158,14 +150,12 @@ async fn retry_timeout_source(turn_after: Duration, model_timeout: Duration) -> 
         RetryPolicySnapshot::new(2, Duration::from_secs(5)),
     ));
     let (progress, _receiver) = progress_channel();
-    let dropped = AtomicU64::new(0);
     let run = tokio::spawn(async move {
         driver
             .run_detailed(
                 request(),
                 context(CancellationToken::new(), turn_after),
                 &progress,
-                &dropped,
             )
             .await
     });

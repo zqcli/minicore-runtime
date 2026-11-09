@@ -41,7 +41,7 @@ pub struct PromptRequest<'a> {
 
 /// Final prompt output for a request.
 ///
-/// Model, reasoning, tools, and limits are taken from the active
+/// Model, reasoning, and tools are taken from the active
 /// `ExecutionConfig` snapshot by Core; a provider only produces messages.
 #[derive(Clone, Debug)]
 pub struct PreparedPrompt {

@@ -114,17 +114,17 @@ mod tests {
     use crate::value::Text;
 
     struct ChannelEmitter {
-        sender: mpsc::Sender<ToolProgress>,
+        sender: mpsc::UnboundedSender<ToolProgress>,
     }
 
     impl ToolProgressEmitter for ChannelEmitter {
         fn emit(&self, progress: ToolProgress) -> bool {
-            self.sender.try_send(progress).is_ok()
+            self.sender.send(progress).is_ok()
         }
     }
 
-    fn channel(capacity: usize) -> (ToolProgressSink, mpsc::Receiver<ToolProgress>) {
-        let (sender, receiver) = mpsc::channel(capacity);
+    fn channel() -> (ToolProgressSink, mpsc::UnboundedReceiver<ToolProgress>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
         (
             ToolProgressSink::from_emitter(ChannelEmitter { sender }),
             receiver,
@@ -136,24 +136,27 @@ mod tests {
     }
 
     #[test]
-    fn try_send_is_positive_when_the_bounded_channel_accepts() {
-        let (sink, mut receiver) = channel(1);
+    fn send_is_positive_when_the_channel_accepts() {
+        let (sink, mut receiver) = channel();
         assert!(sink.emit(progress()));
         assert!(receiver.try_recv().is_ok());
     }
 
     #[test]
-    fn try_send_reports_full_and_closed_without_waiting() {
-        let (sink, receiver) = channel(1);
+    fn send_retains_bursts_and_reports_closed_without_waiting() {
+        let (sink, receiver) = channel();
         assert!(sink.emit(progress()));
-        assert!(!sink.emit(progress()));
+        for _ in 0..4097 {
+            assert!(sink.emit(progress()));
+        }
+        assert_eq!(receiver.len(), 4098);
         drop(receiver);
         assert!(!sink.emit(progress()));
     }
 
     #[test]
     fn invalid_progress_is_rejected_before_the_emitter() {
-        let (sink, mut receiver) = channel(1);
+        let (sink, mut receiver) = channel();
         let invalid = ToolProgress {
             message: None,
             completed: Some(2),

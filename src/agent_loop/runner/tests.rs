@@ -15,7 +15,6 @@ use crate::agent_loop::{
 use crate::execution::{ConfigRevision, ExecutionConfig};
 use crate::history::WorkingHistory;
 use crate::ids::{LoopId, ToolCallId};
-use crate::limits::LoopLimits;
 use crate::model::{
     Model, ModelCallContext, ModelDescriptor, ModelError, ModelRequest, ModelStartFuture,
     ModelStream, ReasoningPreference, ToolCall, Usage,
@@ -198,8 +197,7 @@ async fn aborted_runner_makes_wait_return_completion_closed() {
 #[tokio::test]
 async fn finish_loop_losing_the_seal_returns_the_published_arc() {
     let id = LoopId::new().unwrap();
-    let (control, mut sink, _stream, completion_tx) =
-        LoopControl::new(id, 8, LoopLimits::default()).unwrap();
+    let (control, mut sink, _stream, completion_tx) = LoopControl::new(id);
     let control = Arc::new(control);
 
     // Simulate a prior completion that won the seal and published its report.
@@ -252,8 +250,7 @@ async fn finish_loop_losing_the_seal_returns_the_published_arc() {
 async fn completion_preserves_tool_round_counts_beyond_u16() {
     for tool_rounds in [65_535_u64, 65_536, 70_000] {
         let id = LoopId::new().unwrap();
-        let (control, mut sink, _stream, completion_tx) =
-            LoopControl::new(id, 8, LoopLimits::default()).unwrap();
+        let (control, mut sink, _stream, completion_tx) = LoopControl::new(id);
         let control = Arc::new(control);
         let options = LoopOptions::default_checked().unwrap();
         let mut ctx = LoopCtx {
@@ -288,8 +285,7 @@ async fn completion_preserves_tool_round_counts_beyond_u16() {
 #[tokio::test]
 async fn completion_is_exactly_once_and_token_cancel_is_terminal() {
     let id = LoopId::new().unwrap();
-    let (control, _sink, _stream, completion_tx) =
-        LoopControl::new(id, 8, LoopLimits::default()).unwrap();
+    let (control, _sink, _stream, completion_tx) = LoopControl::new(id);
     let control = Arc::new(control);
     let handle = LoopHandle::new(Arc::clone(&control));
 
@@ -326,7 +322,6 @@ async fn completion_is_exactly_once_and_token_cancel_is_terminal() {
     assert!(control.is_finished());
 }
 
-/// FIX-02-T05: Runner terminal tool result messages must be bounded to max_output_bytes.
 #[test]
 fn terminal_tool_result_messages_are_bounded_to_max_output_bytes() {
     let loop_id = LoopId::new().unwrap();
@@ -338,7 +333,7 @@ fn terminal_tool_result_messages_are_bounded_to_max_output_bytes() {
     )
     .unwrap();
 
-    let messages = ["tool batch interrupted", "tool round limit reached"];
+    let messages = ["tool batch interrupted", "tool failed"];
 
     for message in messages {
         let result = super::tools::terminal_tool_result(
@@ -348,13 +343,8 @@ fn terminal_tool_result_messages_are_bounded_to_max_output_bytes() {
             call.name(),
             ToolResultOutcome::Failed,
             message,
-            1,
         );
-        assert!(
-            result.output.content().byte_len() <= 1,
-            "message '{message}' byte len {} exceeds expected max 1",
-            result.output.content().byte_len(),
-        );
+        assert_eq!(result.output.content().as_str(), message);
     }
 }
 
@@ -412,8 +402,7 @@ async fn discarded_config_drop_panics_cannot_lose_or_replace_the_report() {
 
     for finish in [ModelFinishReason::Stop, ModelFinishReason::Length] {
         let id = LoopId::new().unwrap();
-        let (control, sink, _events, completion_tx) =
-            LoopControl::new(id, 16, LoopLimits::default()).unwrap();
+        let (control, sink, _events, completion_tx) = LoopControl::new(id);
         let control = Arc::new(control);
         let published = Arc::new(AtomicBool::new(false));
         let base = holding_config();
