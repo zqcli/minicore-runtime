@@ -12,7 +12,7 @@ use minicore_runtime::tools::{
     ToolInputAnswerKind, ToolInputRequest, ToolInvocation, ToolOutput, ToolProgress,
     ToolProgressSink, ToolSet, ToolSetError, ToolSpec,
 };
-use minicore_runtime::value::{MAX_JSON_BYTES, MAX_JSON_DEPTH, MAX_JSON_NODES, Text};
+use minicore_runtime::value::{MAX_JSON_NESTING, Text};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -134,7 +134,14 @@ fn tool_spec_and_output_use_checked_bounded_content() {
 #[test]
 fn tool_spec_description_boundary_is_checked() {
     assert!(ToolSpec::new("bounded".parse().unwrap(), "x".repeat(4_096), json!({}),).is_ok());
-    assert!(ToolSpec::new("bounded".parse().unwrap(), "x".repeat(4_097), json!({}),).is_err());
+    assert!(
+        ToolSpec::new(
+            "bounded".parse().unwrap(),
+            "x".repeat(256 * 1024 + 1),
+            json!({}),
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -153,7 +160,7 @@ fn tool_spec_serde_rejects_invalid_shapes_and_round_trips_valid_fields() {
     assert!(
         serde_json::from_value::<ToolSpec>(json!({
             "name": "read_file",
-            "description": "x".repeat(4_097),
+            "description": "bad\0description",
             "input_schema": {}
         }))
         .is_err()
@@ -170,13 +177,13 @@ fn tool_spec_serde_rejects_invalid_shapes_and_round_trips_valid_fields() {
         serde_json::from_value::<ToolSpec>(json!({
             "name": "read_file",
             "description": "ok",
-            "input_schema": {"padding": "x".repeat(MAX_JSON_BYTES)}
+            "input_schema": {"padding": "x".repeat(64 * 1024 + 1)}
         }))
-        .is_err()
+        .is_ok()
     );
 
     let mut deep = json!({});
-    for _ in 0..=MAX_JSON_DEPTH {
+    for _ in 0..MAX_JSON_NESTING {
         deep = json!({"nested": deep});
     }
     assert!(
@@ -192,10 +199,10 @@ fn tool_spec_serde_rejects_invalid_shapes_and_round_trips_valid_fields() {
             "name": "read_file",
             "description": "ok",
             "input_schema": {
-                "items": vec![serde_json::Value::Null; MAX_JSON_NODES - 1]
+                "items": vec![serde_json::Value::Null; 16_385]
             }
         }))
-        .is_err()
+        .is_ok()
     );
 }
 
@@ -252,10 +259,10 @@ fn invocation_serde_is_strict_bounded_and_redacted() {
     }
 
     let mut oversized = wire.clone();
-    oversized["arguments"] = json!({"padding": "x".repeat(MAX_JSON_BYTES)});
-    assert!(serde_json::from_value::<ToolInvocation>(oversized).is_err());
+    oversized["arguments"] = json!({"padding": "x".repeat(64 * 1024 + 1)});
+    assert!(serde_json::from_value::<ToolInvocation>(oversized).is_ok());
     let mut deep_arguments = json!({});
-    for _ in 0..=MAX_JSON_DEPTH {
+    for _ in 0..MAX_JSON_NESTING {
         deep_arguments = json!({"nested": deep_arguments});
     }
     let mut deep = wire.clone();
@@ -263,9 +270,9 @@ fn invocation_serde_is_strict_bounded_and_redacted() {
     assert!(serde_json::from_value::<ToolInvocation>(deep).is_err());
     let mut node_heavy = wire;
     node_heavy["arguments"] = json!({
-        "items": vec![serde_json::Value::Null; MAX_JSON_NODES - 1]
+        "items": vec![serde_json::Value::Null; 16_385]
     });
-    assert!(serde_json::from_value::<ToolInvocation>(node_heavy).is_err());
+    assert!(serde_json::from_value::<ToolInvocation>(node_heavy).is_ok());
 
     assert!(!include_str!("../src/tools/tool.rs").contains("continuation"));
 }
@@ -311,7 +318,7 @@ fn input_answers_reject_extra_fields_bad_shapes_and_invalid_text() {
             "kind": "text",
             "data": "x".repeat(8_193)
         }))
-        .is_err()
+        .is_ok()
     );
     let text_request =
         ToolInputRequest::new("prompt", Vec::new(), ToolInputAnswerKind::Text).unwrap();
@@ -323,10 +330,10 @@ fn input_answers_reject_extra_fields_bad_shapes_and_invalid_text() {
     );
     assert!(
         serde_json::from_value::<ToolInputAnswer>(serde_json::to_value(&oversized_text).unwrap())
-            .is_err()
+            .is_ok()
     );
     assert!(exact_text.validate(&text_request).is_ok());
-    assert!(oversized_text.validate(&text_request).is_err());
+    assert!(oversized_text.validate(&text_request).is_ok());
 }
 
 #[test]

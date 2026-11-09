@@ -18,14 +18,14 @@ fn canonical_driver_is_private_bounded_and_adapter_neutral() {
         "model: Arc<dyn Model>",
         "model_call_timeout: Duration",
         "retry_policy: RetryPolicySnapshot",
-        "limits: LoopLimits",
+        "progress: &mpsc::UnboundedSender<ModelDriverProgress>",
         "pub(crate) fn new(",
         "pub(crate) fn from_validated(",
         "pub(crate) async fn run(",
         "pub(crate) async fn run_detailed(",
         "effective_deadline(context.deadline, self.model_call_timeout)",
         "deadline_source: Option<DeadlineSource>",
-        "try_send(progress_event)",
+        "let _ = progress.send(progress_event)",
         "AssertUnwindSafe(start).catch_unwind()",
         "AssertUnwindSafe(stream.next()).catch_unwind()",
         "evaluate_retry(",
@@ -39,6 +39,8 @@ fn canonical_driver_is_private_bounded_and_adapter_neutral() {
     }
     assert!(!driver.contains("validate_capabilities"));
     assert!(!driver.contains("run_port_call"));
+    assert!(!driver.contains("try_send"));
+    assert!(!driver.contains("LoopLimits"));
     assert!(driver.contains("!self.descriptor.supports_reasoning(request.reasoning())"));
     assert!(driver.contains("!request.tools().is_empty() && !self.descriptor.supports_tools"));
     assert!(!driver.contains("fn effective_deadline("));
@@ -114,7 +116,7 @@ fn public_model_port_remains_free_of_driver_implementation() {
 fn assembler_uses_checked_dtos_and_centralized_json_validation() {
     let assembler = include_str!("../src/model/driver/assembler.rs");
     for required in [
-        "ToolCall::new_with_max_bytes(",
+        "ToolCall::new(",
         "ReasoningContent::new(",
         "ModelResponse::new_with_provider_replay(",
         "ModelErrorKind::IncompleteResponse",
@@ -125,7 +127,7 @@ fn assembler_uses_checked_dtos_and_centralized_json_validation() {
         assert!(assembler.contains(required), "assembler misses {required}");
     }
     let message = include_str!("../src/model/message.rs");
-    assert!(message.contains("validate_json_size(&arguments, max_bytes)"));
+    assert!(message.contains("validate_json_nesting(&arguments)"));
     for forbidden in ["unsafe", "serde_json::from_slice", "unwrap_unchecked"] {
         assert!(!assembler.contains(forbidden));
     }

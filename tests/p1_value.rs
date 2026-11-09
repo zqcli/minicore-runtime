@@ -1,37 +1,16 @@
 use minicore_runtime::Text as RootText;
-use minicore_runtime::value::{
-    MAX_JSON_BYTES, MAX_JSON_DEPTH, MAX_JSON_NODES, MAX_TEXT_BYTES, Text, ValueError,
-    validate_json_size,
-};
+use minicore_runtime::value::{MAX_JSON_NESTING, Text, ValueError, validate_json_nesting};
 use serde_json::{Value, json};
 
 #[test]
 fn bounded_text_enforces_absolute_and_caller_byte_limits() {
-    let exact_absolute = Text::new("x".repeat(MAX_TEXT_BYTES));
-    assert_eq!(exact_absolute.byte_len(), MAX_TEXT_BYTES);
-    assert_eq!(
-        Text::new("x".repeat(MAX_TEXT_BYTES + 1)).unwrap_err(),
-        ValueError::TextTooLarge
-    );
-
-    let multibyte = "ééa";
-    assert_eq!(multibyte.len(), 5);
-    assert_eq!(
-        Text::new_with_max_bytes(multibyte, 5).unwrap().as_str(),
-        multibyte
-    );
-    assert_eq!(
-        Text::new_with_max_bytes("ééab", 5).unwrap_err(),
-        ValueError::TextTooLarge
-    );
-    assert_eq!(
-        Text::new_with_max_bytes("", MAX_TEXT_BYTES + 1).unwrap_err(),
-        ValueError::TextLimitTooLarge
-    );
-
-    let empty = Text::new("");
-    assert!(empty.is_empty());
-    assert_eq!(empty.into_string(), "");
+    for value in ["".to_owned(), "ééab".to_owned(), "x".repeat(256 * 1024 + 1)] {
+        let text = Text::new(&value);
+        assert_eq!(text.byte_len(), value.len());
+        assert_eq!(text.is_empty(), value.is_empty());
+        assert_eq!(text.as_str(), value);
+        assert_eq!(text.into_string(), value);
+    }
 }
 
 #[test]
@@ -50,80 +29,53 @@ fn bounded_text_serde_roundtrip_and_debug_are_safe() {
     let encoded = serde_json::to_string(&value).unwrap();
     assert_eq!(encoded, format!("\"{secret}\""));
     assert_eq!(serde_json::from_str::<RootText>(&encoded).unwrap(), value);
-
     let debug = format!("{value:?}");
     assert!(!debug.contains(secret));
     assert!(debug.contains(&value.byte_len().to_string()));
     assert_eq!(value.to_string(), secret);
-
-    let exact = serde_json::to_string(&"x".repeat(MAX_TEXT_BYTES)).unwrap();
-    assert!(serde_json::from_str::<Text>(&exact).is_ok());
-    let oversized = serde_json::to_string(&"x".repeat(MAX_TEXT_BYTES + 1)).unwrap();
-    let error = serde_json::from_str::<Text>(&oversized).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("bounded text exceeds its byte limit")
+    let beyond_former_limit = "x".repeat(256 * 1024 + 1);
+    let encoded = serde_json::to_string(&beyond_former_limit).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Text>(&encoded).unwrap().as_str(),
+        beyond_former_limit
     );
+    assert!(serde_json::from_str::<Text>("17").is_err());
 }
 
 #[test]
 fn json_validation_enforces_compact_bytes_depth_and_nodes() {
-    let exact_text = Value::String("x".repeat(MAX_JSON_BYTES - 2));
-    assert_eq!(
-        serde_json::to_vec(&exact_text).unwrap().len(),
-        MAX_JSON_BYTES
-    );
-    assert!(validate_json_size(&exact_text, MAX_JSON_BYTES).is_ok());
-    assert_eq!(
-        validate_json_size(&exact_text, MAX_JSON_BYTES - 1).unwrap_err(),
-        ValueError::JsonTooLarge
-    );
-
-    let over_text = Value::String("x".repeat(MAX_JSON_BYTES - 1));
-    assert_eq!(
-        validate_json_size(&over_text, MAX_JSON_BYTES).unwrap_err(),
-        ValueError::JsonTooLarge
-    );
-    assert_eq!(
-        validate_json_size(&Value::Null, MAX_JSON_BYTES + 1).unwrap_err(),
-        ValueError::JsonLimitTooLarge
-    );
-    assert_eq!(
-        validate_json_size(&Value::Null, 0).unwrap_err(),
-        ValueError::JsonTooLarge
-    );
-
-    let large_text = Value::String("x".repeat(MAX_JSON_BYTES + 1_024));
-    assert_eq!(
-        validate_json_size(&large_text, MAX_JSON_BYTES).unwrap_err(),
-        ValueError::JsonTooLarge
-    );
-
-    let mut within_depth = Value::Null;
-    for _ in 0..MAX_JSON_DEPTH {
-        within_depth = Value::Array(vec![within_depth]);
+    for value in [
+        Value::String("x".repeat(64 * 1024 + 1)),
+        Value::Array(vec![Value::Null; 16_385]),
+        json!({"message": "hello"}),
+    ] {
+        assert!(validate_json_nesting(&value).is_ok());
+        let wire = serde_json::to_string(&value).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&wire).unwrap(), value);
     }
-    assert!(validate_json_size(&within_depth, MAX_JSON_BYTES).is_ok());
-    let too_deep = Value::Array(vec![within_depth]);
-    assert_eq!(
-        validate_json_size(&too_deep, MAX_JSON_BYTES).unwrap_err(),
-        ValueError::JsonTooDeep
-    );
-
-    let within_nodes = Value::Array(vec![Value::Null; MAX_JSON_NODES - 1]);
-    assert!(validate_json_size(&within_nodes, MAX_JSON_BYTES).is_ok());
-    let too_many_nodes = Value::Array(vec![Value::Null; MAX_JSON_NODES]);
-    assert_eq!(
-        validate_json_size(&too_many_nodes, MAX_JSON_BYTES).unwrap_err(),
-        ValueError::JsonTooManyNodes
-    );
-
-    let compact_object = json!({"message": "hello"});
-    let compact_size = serde_json::to_vec(&compact_object).unwrap().len();
-    assert!(validate_json_size(&compact_object, compact_size).is_ok());
-    assert_eq!(
-        validate_json_size(&compact_object, compact_size - 1).unwrap_err(),
-        ValueError::JsonTooLarge
-    );
+    assert_eq!(MAX_JSON_NESTING, 127);
+    for objects in [false, true] {
+        let mut value = Value::Null;
+        for nesting in 1..=MAX_JSON_NESTING + 1 {
+            value = if objects {
+                json!({"nested": value})
+            } else {
+                json!([value])
+            };
+            let wire = serde_json::to_string(&value).unwrap();
+            let parsed = serde_json::from_str::<Value>(&wire);
+            if nesting <= MAX_JSON_NESTING {
+                assert!(validate_json_nesting(&value).is_ok());
+                assert_eq!(parsed.unwrap(), value);
+            } else {
+                assert_eq!(validate_json_nesting(&value), Err(ValueError::JsonTooDeep));
+                assert!(
+                    parsed
+                        .unwrap_err()
+                        .to_string()
+                        .contains("recursion limit exceeded")
+                );
+            }
+        }
+    }
 }

@@ -93,7 +93,6 @@ fn recorder(
 fn options(history: Arc<RecordingHistory>) -> LoopOptions {
     let mut options = LoopOptions::default_checked().unwrap();
     options.history = Some(history);
-    options.event_capacity = 1;
     options
 }
 

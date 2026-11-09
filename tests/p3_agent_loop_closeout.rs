@@ -1080,49 +1080,45 @@ async fn wait_for_request(events: &mut minicore_runtime::LoopEventStream, index:
     panic!("loop ended before request {index}");
 }
 
-/// FIX-01-T04: Registering multiple tools succeeds in AgentLoop when max_tool_calls_per_response is 1.
+/// Tool catalogs and per-response call counts have no application quota.
 #[tokio::test]
 async fn loop_completes_with_multiple_registered_tools_under_single_call_limit() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
     let mut builder = ToolSet::builder();
-    builder.register(RecordingTool {
-        spec: ToolSpec::new(
-            "lookup".parse().unwrap(),
-            "lookup tool",
-            json!({"type": "object"}),
-        )
-        .unwrap(),
-        calls: Arc::new(Mutex::new(Vec::new())),
-        behavior: ToolBehavior::Succeed,
-        entered: None,
-    });
-    builder.register(RecordingTool {
-        spec: ToolSpec::new(
-            "search".parse().unwrap(),
-            "search tool",
-            json!({"type": "object"}),
-        )
-        .unwrap(),
-        calls: Arc::new(Mutex::new(Vec::new())),
-        behavior: ToolBehavior::Succeed,
-        entered: None,
-    });
+    for index in 0..65 {
+        builder.register(RecordingTool {
+            spec: ToolSpec::new(
+                format!("tool_{index}").parse().unwrap(),
+                "registered tool",
+                json!({"type": "object"}),
+            )
+            .unwrap(),
+            calls: Arc::clone(&calls),
+            behavior: ToolBehavior::Succeed,
+            entered: None,
+        });
+    }
     let tools = builder.build().unwrap();
-
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.limits.max_tool_calls_per_response = 1;
-
     let agent = start_with(
         request(config(
-            model(vec![Round::Final { text: "completed" }]),
+            model(vec![
+                Round::Tools {
+                    calls: vec![("tool_0", "call_1"), ("tool_64", "call_2")],
+                },
+                Round::Final { text: "completed" },
+            ]),
             tools,
             None,
         )),
-        options,
+        LoopOptions::default_checked().unwrap(),
     )
     .unwrap();
-    let report = finish(agent).await;
+    let report = tokio::time::timeout(Duration::from_secs(5), finish(agent))
+        .await
+        .unwrap();
     assert_eq!(report.outcome, LoopOutcome::Completed);
-    assert_eq!(report.requests, 1);
+    assert_eq!(report.requests, 2);
+    assert_eq!(calls.lock().unwrap().len(), 2);
 }
 
 /// FIX-01-T05: Model timeout exceeding 24 hours fails in AgentLoop::start.

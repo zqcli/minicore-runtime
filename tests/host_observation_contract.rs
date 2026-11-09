@@ -49,8 +49,7 @@ async fn late_watch_observes_actionable_interaction_without_its_event() {
             } else {
                 ToolBehavior::RequestChoiceInput
             };
-            let mut options = LoopOptions::default_checked().unwrap();
-            options.event_capacity = 1;
+            let options = LoopOptions::default_checked().unwrap();
             let mut agent = AgentLoop::start(
                 request(config(model, tool_set(Arc::default(), behavior), policy)),
                 options,
@@ -99,10 +98,14 @@ async fn late_watch_observes_actionable_interaction_without_its_event() {
             let report = agent.join().await.unwrap();
             assert_completed_with_text(&report, "done");
 
-            let only = events.recv().await.unwrap();
-            assert!(matches!(only.event, LoopEvent::Started { .. }));
-            assert_eq!(only.dropped_before, 0);
-            assert!(events.recv().await.is_none());
+            let mut saw_interaction = false;
+            let mut saw_finished = false;
+            while let Some(envelope) = events.recv().await {
+                saw_interaction |= matches!(envelope.event, LoopEvent::InteractionRequested { .. });
+                saw_finished |= matches!(envelope.event, LoopEvent::Finished { .. });
+            }
+            assert!(saw_interaction);
+            assert!(saw_finished);
         }
     })
     .await
@@ -148,11 +151,10 @@ async fn state_sender_stays_open_after_join_until_the_handle_is_dropped() {
 async fn final_state_and_report_survive_unreported_terminal_event_loss() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (model, _) = scripted_model(vec![Round::BurstDeltas {
-            count: 4,
+            count: 2_049,
             chunk: "part",
         }]);
-        let mut options = LoopOptions::default_checked().unwrap();
-        options.event_capacity = 1;
+        let options = LoopOptions::default_checked().unwrap();
         let mut agent = AgentLoop::start(
             request(config(model, ToolSet::default(), None)),
             options,
@@ -164,7 +166,7 @@ async fn final_state_and_report_survive_unreported_terminal_event_loss() {
         let mut events = agent.take_events().unwrap();
         let report = agent.join().await.unwrap();
 
-        assert_completed_with_text(&report, "partpartpartpart");
+        assert_completed_with_text(&report, &"part".repeat(2_049));
         assert_eq!(report.requests, 1);
         assert!(Arc::ptr_eq(&report, &handle.wait().await.unwrap()));
         let final_state = states.borrow_and_update().clone();
@@ -174,10 +176,14 @@ async fn final_state_and_report_survive_unreported_terminal_event_loss() {
         assert_eq!(final_state.request_index, 0);
         assert!(final_state.pending_interaction.is_none());
 
-        let only = events.recv().await.unwrap();
-        assert!(matches!(only.event, LoopEvent::Started { .. }));
-        assert_eq!(only.dropped_before, 0);
-        assert!(events.recv().await.is_none());
+        let mut output_count = 0;
+        let mut saw_finished = false;
+        while let Some(envelope) = events.recv().await {
+            output_count += usize::from(matches!(envelope.event, LoopEvent::OutputDelta { .. }));
+            saw_finished |= matches!(envelope.event, LoopEvent::Finished { .. });
+        }
+        assert_eq!(output_count, 2_049);
+        assert!(saw_finished);
     })
     .await
     .expect("terminal event loss test timed out");

@@ -28,9 +28,9 @@ use minicore_runtime::tools::{
 use minicore_runtime::value::Text;
 use minicore_runtime::{
     AssistantHistory, CancelReason, ConfigRevision, ExecutionConfig, ExecutionConfigError,
-    HistoryItem, HistoryView, LoopEvent, LoopId, LoopLimits, LoopLimitsError, LoopOptions,
-    LoopOutcome, LoopReport, LoopStartError, SummaryHistory, ToolCallId, ToolResultHistory,
-    UserHistory, UserInput, UserMessageKind,
+    HistoryItem, HistoryView, LoopEvent, LoopId, LoopOptions, LoopOutcome, LoopReport,
+    LoopStartError, SummaryHistory, ToolCallId, ToolResultHistory, UserHistory, UserInput,
+    UserMessageKind,
 };
 
 struct FakeModel {
@@ -265,13 +265,14 @@ fn history_view_projects_base_and_appended_in_order() {
 
 #[test]
 fn loop_limits_default_is_valid_and_bad_values_fail() {
-    assert!(LoopLimits::default().validate().is_ok());
-
-    let zero_output = LoopLimits {
-        max_tool_output_bytes: 0,
-        ..LoopLimits::default()
-    };
-    assert_eq!(zero_output.validate(), Err(LoopLimitsError::InvalidBounds));
+    let options = LoopOptions::default_checked().unwrap();
+    assert!(options.validate().is_ok());
+    let debug = format!("{options:?}");
+    for removed in ["limits", "max_tool_rounds", "event_capacity"] {
+        assert!(!debug.contains(removed));
+    }
+    let input = UserInput::text("x".repeat(256 * 1024 + 1)).unwrap();
+    assert_eq!(input.as_text().len(), 256 * 1024 + 1);
 }
 
 #[test]

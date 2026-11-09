@@ -4,9 +4,9 @@ use support::{invocation, spec};
 use std::time::{Duration, Instant};
 
 use minicore_runtime::tools::{
-    ApprovalDecision, ApprovalRequest, ApprovalRisk, MAX_TOOL_POLICY_TEXT_BYTES, ToolDecision,
-    ToolInputAnswer, ToolInputAnswerKind, ToolInputRequest, ToolInvocation, ToolPolicy,
-    ToolPolicyError, ToolPolicyFuture, ToolPolicyRequest, ToolSpec, ToolValueError,
+    ApprovalDecision, ApprovalRequest, ApprovalRisk, ToolDecision, ToolInputAnswer,
+    ToolInputAnswerKind, ToolInputRequest, ToolInvocation, ToolPolicy, ToolPolicyError,
+    ToolPolicyFuture, ToolPolicyRequest, ToolSpec, ToolValueError,
 };
 use minicore_runtime::value::Text;
 use minicore_runtime::{
@@ -148,29 +148,25 @@ async fn policy_request_carries_exact_owned_invocation_spec_cancellation_and_dea
 
 #[test]
 fn policy_text_is_checked_at_the_exact_boundary_and_debug_is_redacted() {
-    let exact = "x".repeat(MAX_TOOL_POLICY_TEXT_BYTES);
-    let oversized = "x".repeat(MAX_TOOL_POLICY_TEXT_BYTES + 1);
+    let exact = "x".repeat(4_096);
+    let oversized = "x".repeat(256 * 1024 + 1);
     assert!(ToolDecision::deny(&exact).is_ok());
-    assert_eq!(
-        ToolDecision::deny(&oversized),
-        Err(ToolPolicyError::InvalidDecision)
-    );
+    let large_denial = ToolDecision::deny(&oversized).unwrap();
+    assert!(matches!(large_denial, ToolDecision::Deny { reason } if reason.as_str() == oversized));
     assert_eq!(
         ToolDecision::deny(""),
         Err(ToolPolicyError::InvalidDecision)
     );
     assert!(ApprovalRequest::new(&exact, ApprovalRisk::Low).is_ok());
-    assert_eq!(
-        ApprovalRequest::new(&oversized, ApprovalRisk::Medium),
-        Err(ToolPolicyError::InvalidDecision)
-    );
+    let large_approval = ApprovalRequest::new(&oversized, ApprovalRisk::Medium).unwrap();
+    assert_eq!(large_approval.prompt.as_str(), oversized);
     assert_eq!(
         ApprovalRequest::new("", ApprovalRisk::High),
         Err(ToolPolicyError::InvalidDecision)
     );
 
     let invalid_approval = ApprovalRequest {
-        prompt: Text::new(oversized),
+        prompt: Text::new("bad\0prompt"),
         risk: ApprovalRisk::High,
     };
     assert_eq!(
@@ -281,9 +277,16 @@ fn interaction_answers_validate_kind_and_delegate_exact_tool_input_rules() {
         })),
         Err(ToolValueError::InvalidAnswer)
     );
+    assert!(
+        pending_text
+            .validate_answer(&InteractionAnswer::ToolInput(ToolInputAnswer::Text(
+                Text::new("x".repeat(256 * 1024 + 1)),
+            )))
+            .is_ok()
+    );
     assert_eq!(
         pending_text.validate_answer(&InteractionAnswer::ToolInput(ToolInputAnswer::Text(
-            Text::new("x".repeat(8_193)),
+            Text::new("bad\0answer"),
         ))),
         Err(ToolValueError::InvalidAnswer)
     );
@@ -396,27 +399,19 @@ fn invalid_tool_input_requests_rejected_by_validate() {
         "Empty prompt must be rejected"
     );
 
-    // FIX-05-T03: Too many choices (33 choices > 32 max)
-    let too_many_choices = ToolInputRequest {
-        prompt: Text::new("choose"),
-        choices: (0..33).map(|i| Text::new(format!("choice_{i}"))).collect(),
+    let large_choices = ToolInputRequest {
+        prompt: Text::new("p".repeat(8_193)),
+        choices: (0..65)
+            .map(|i| Text::new(format!("{i}:{}", "x".repeat(1_025))))
+            .collect(),
         answer_kind: ToolInputAnswerKind::SingleChoice,
     };
-    assert_eq!(
-        too_many_choices.validate(),
-        Err(ToolValueError::InvalidText),
-        "More than 32 choices must be rejected"
-    );
-
-    // FIX-05-T04: Oversized choice (1025 bytes > 1024 max)
-    let oversized_choice = ToolInputRequest {
-        prompt: Text::new("choose"),
-        choices: vec![Text::new("x".repeat(1025))],
-        answer_kind: ToolInputAnswerKind::SingleChoice,
-    };
-    assert_eq!(
-        oversized_choice.validate(),
-        Err(ToolValueError::InvalidText),
-        "Choice exceeding 1024 bytes must be rejected"
-    );
+    assert!(large_choices.validate().is_ok());
+    for choice in ["", "bad\0choice"] {
+        let invalid = ToolInputRequest {
+            choices: vec![Text::new(choice)],
+            ..large_choices.clone()
+        };
+        assert_eq!(invalid.validate(), Err(ToolValueError::InvalidText));
+    }
 }

@@ -137,8 +137,7 @@ fn holding(events: Vec<ModelEvent>) -> (Arc<dyn Model>, Arc<Notify>) {
 #[tokio::test]
 async fn cancellation_keeps_partial_without_an_event_subscriber() {
     let (model, drained) = holding((0..100).map(|_| ModelEvent::text_delta("delta ")).collect());
-    let mut options = LoopOptions::default_checked().unwrap();
-    options.event_capacity = 1;
+    let options = LoopOptions::default_checked().unwrap();
     let agent = AgentLoop::start(
         request(config(model, ToolSet::default(), None)),
         options,

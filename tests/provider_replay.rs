@@ -1,6 +1,7 @@
 use minicore_runtime::model::{
     AssistantPart, ModelEvent, ModelFinishReason, ModelMessage, ModelResponse, ProviderReplay,
 };
+use minicore_runtime::value::MAX_JSON_NESTING;
 use serde_json::{Value, json};
 
 fn replay() -> ProviderReplay {
@@ -9,23 +10,15 @@ fn replay() -> ProviderReplay {
 
 #[test]
 fn envelope_bounds_depth_nodes_and_serde_validation() {
-    let overhead = ProviderReplay::new("x", json!("")).unwrap().byte_len();
-    let exact =
-        ProviderReplay::new("x", json!("a".repeat(ProviderReplay::MAX_BYTES - overhead))).unwrap();
-    assert_eq!(exact.byte_len(), ProviderReplay::MAX_BYTES);
-    assert_eq!(serde_json::to_vec(&exact).unwrap().len(), exact.byte_len());
-    assert!(
-        ProviderReplay::new(
-            "x",
-            json!("a".repeat(ProviderReplay::MAX_BYTES - overhead + 1))
-        )
-        .is_err()
-    );
-    assert!(
-        serde_json::from_value::<ProviderReplay>(
-            json!({"format":"x", "payload":"a".repeat(ProviderReplay::MAX_BYTES)})
-        )
-        .is_err()
+    let payload = json!({"large": "a".repeat(256 * 1024 + 1), "wide": vec![Value::Null; 16_385]});
+    let replay = ProviderReplay::new("x", payload.clone()).unwrap();
+    assert_eq!(replay.payload(), &payload);
+    let wire = serde_json::to_vec(&replay).unwrap();
+    assert_eq!(wire.len(), replay.byte_len());
+    assert!(wire.len() > 256 * 1024);
+    assert_eq!(
+        serde_json::from_slice::<ProviderReplay>(&wire).unwrap(),
+        replay
     );
     for format in ["", "bad format", "bad\nformat"] {
         assert!(ProviderReplay::new(format, Value::Null).is_err());
@@ -36,7 +29,7 @@ fn envelope_bounds_depth_nodes_and_serde_validation() {
             .is_err()
     );
     let mut deep = Value::Null;
-    for _ in 0..ProviderReplay::MAX_DEPTH {
+    for _ in 0..MAX_JSON_NESTING {
         deep = json!([deep]);
     }
     assert!(ProviderReplay::new("x", deep.clone()).is_ok());
@@ -45,7 +38,6 @@ fn envelope_bounds_depth_nodes_and_serde_validation() {
     assert!(
         serde_json::from_value::<ProviderReplay>(json!({"format":"x","payload":too_deep})).is_err()
     );
-    assert!(ProviderReplay::new("x", json!(vec![Value::Null; ProviderReplay::MAX_NODES])).is_err());
 }
 
 #[test]

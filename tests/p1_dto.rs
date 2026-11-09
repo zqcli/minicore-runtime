@@ -9,7 +9,7 @@ use minicore_runtime::tools::{
     ToolInputAnswer, ToolInputAnswerKind, ToolInputRequest, ToolInvocation, ToolName, ToolOutput,
     ToolProgress, ToolResultOutcome, ToolSet, ToolSpec,
 };
-use minicore_runtime::value::{MAX_JSON_BYTES, MAX_JSON_DEPTH, MAX_JSON_NODES, MAX_TEXT_BYTES};
+use minicore_runtime::value::MAX_JSON_NESTING;
 use minicore_runtime::{LoopId, Text, ToolCallId};
 use serde_json::json;
 
@@ -198,40 +198,24 @@ fn object_with_nodes(nodes: usize) -> serde_json::Value {
 #[test]
 fn tool_schema_and_invocation_share_json_byte_depth_and_node_bounds() {
     let (_, call_id) = id_values();
-    let name: ToolName = "bounded".parse().unwrap();
+    let name: ToolName = "unbounded".parse().unwrap();
     let make_invocation = |arguments| ToolInvocation::new(call_id.clone(), name.clone(), arguments);
-
-    let exact_bytes = object_json_exact_bytes(MAX_JSON_BYTES);
-    assert!(ToolSpec::new(name.clone(), "schema", exact_bytes.clone()).is_ok());
-    assert!(
-        ToolSpec::new(
-            name.clone(),
-            "schema",
-            object_json_exact_bytes(MAX_JSON_BYTES + 1),
-        )
-        .is_err()
-    );
-    assert!(make_invocation(exact_bytes).is_ok());
-    assert!(make_invocation(object_json_exact_bytes(MAX_JSON_BYTES + 1)).is_err());
-
-    let exact_depth = nested_object(MAX_JSON_DEPTH);
+    for value in [
+        object_json_exact_bytes(64 * 1024 + 1),
+        object_with_nodes(16_385),
+    ] {
+        let schema = ToolSpec::new(name.clone(), "schema", value.clone()).unwrap();
+        assert_eq!(schema.input_schema(), &value);
+        let invocation = make_invocation(value.clone()).unwrap();
+        assert_eq!(invocation.arguments(), &value);
+        assert_json_round_trip(&schema);
+        assert_json_round_trip(&invocation);
+    }
+    let exact_depth = nested_object(MAX_JSON_NESTING - 1);
     assert!(ToolSpec::new(name.clone(), "schema", exact_depth.clone()).is_ok());
-    assert!(ToolSpec::new(name.clone(), "schema", nested_object(MAX_JSON_DEPTH + 1)).is_err());
     assert!(make_invocation(exact_depth).is_ok());
-    assert!(make_invocation(nested_object(MAX_JSON_DEPTH + 1)).is_err());
-
-    let exact_nodes = object_with_nodes(MAX_JSON_NODES);
-    assert!(ToolSpec::new(name.clone(), "schema", exact_nodes.clone()).is_ok());
-    assert!(
-        ToolSpec::new(
-            name.clone(),
-            "schema",
-            object_with_nodes(MAX_JSON_NODES + 1)
-        )
-        .is_err()
-    );
-    assert!(make_invocation(exact_nodes).is_ok());
-    assert!(make_invocation(object_with_nodes(MAX_JSON_NODES + 1)).is_err());
+    assert!(ToolSpec::new(name.clone(), "schema", nested_object(MAX_JSON_NESTING)).is_err());
+    assert!(make_invocation(nested_object(MAX_JSON_NESTING)).is_err());
 }
 
 #[test]
@@ -265,53 +249,36 @@ fn tool_spec_debug_redacts_description_and_schema_payload() {
 
 #[test]
 fn tool_output_and_input_request_use_exact_boundary_values() {
-    assert!(ToolOutput::new("x".repeat(MAX_TEXT_BYTES)).is_ok());
-    assert!(ToolOutput::new("x".repeat(MAX_TEXT_BYTES + 1)).is_err());
-
-    let exact_choices = (0..32).map(|_| Text::new("choice")).collect();
+    let output = ToolOutput::new("x".repeat(256 * 1024 + 1)).unwrap();
+    assert_eq!(output.content().byte_len(), 256 * 1024 + 1);
+    assert_json_round_trip(&output);
+    let choices = (0..65)
+        .map(|i| Text::new(format!("{i}:{}", "x".repeat(1_025))))
+        .collect();
+    let request = ToolInputRequest::new(
+        "p".repeat(8_193),
+        choices,
+        ToolInputAnswerKind::SingleChoice,
+    )
+    .unwrap();
+    assert_eq!(request.prompt.byte_len(), 8_193);
+    assert_eq!(request.choices.len(), 65);
     assert!(
-        ToolInputRequest::new("prompt", exact_choices, ToolInputAnswerKind::SingleChoice,).is_ok()
+        request
+            .choices
+            .iter()
+            .all(|choice| choice.byte_len() > 1_024)
     );
-    let too_many_choices = (0..33).map(|_| Text::new("choice")).collect();
+    assert_json_round_trip(&request);
     assert!(
-        ToolInputRequest::new(
-            "prompt",
-            too_many_choices,
-            ToolInputAnswerKind::SingleChoice,
-        )
-        .is_err()
-    );
-    assert!(
-        ToolInputRequest::new(
-            "x".repeat(8_192),
-            vec![Text::new("choice")],
-            ToolInputAnswerKind::SingleChoice,
-        )
-        .is_ok()
-    );
-    assert!(
-        ToolInputRequest::new(
-            "x".repeat(8_193),
-            vec![Text::new("choice")],
-            ToolInputAnswerKind::SingleChoice,
-        )
-        .is_err()
+        ToolInputAnswer::Choice { index: 64 }
+            .validate(&request)
+            .is_ok()
     );
     assert!(
-        ToolInputRequest::new(
-            "prompt",
-            vec![Text::new("x".repeat(1_024))],
-            ToolInputAnswerKind::SingleChoice,
-        )
-        .is_ok()
-    );
-    assert!(
-        ToolInputRequest::new(
-            "prompt",
-            vec![Text::new("x".repeat(1_025))],
-            ToolInputAnswerKind::SingleChoice,
-        )
-        .is_err()
+        ToolInputAnswer::Choice { index: 65 }
+            .validate(&request)
+            .is_err()
     );
 }
 
@@ -344,8 +311,8 @@ fn input_request_and_answer_validation_is_strict() {
         json!({"prompt": "", "choices": [], "answer_kind": "text"}),
         json!({"prompt": "bad\u{0001}", "choices": [], "answer_kind": "text"}),
         json!({"prompt": "x", "choices": [""], "answer_kind": "single_choice"}),
-        json!({"prompt": "x", "choices": ["x".repeat(1_025)], "answer_kind": "single_choice"}),
-        json!({"prompt": "x".repeat(8_193), "choices": [], "answer_kind": "text"}),
+        json!({"prompt": "x", "choices": ["bad\0choice"], "answer_kind": "single_choice"}),
+        json!({"prompt": "x", "choices": [], "answer_kind": "unknown"}),
     ] {
         assert!(serde_json::from_value::<ToolInputRequest>(invalid).is_err());
     }

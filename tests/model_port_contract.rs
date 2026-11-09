@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use futures_util::{StreamExt, stream};
 use minicore_runtime::model::{
-    MAX_MODEL_EVENT_TEXT_BYTES, Model, ModelCallContext, ModelDescriptor, ModelEvent,
-    ModelFinishReason, ModelLimits, ModelMessage, ModelRef, ModelRequest, ModelStartFuture,
-    ModelStream, ModelValueError, ReasoningPreference, Usage,
+    Model, ModelCallContext, ModelDescriptor, ModelEvent, ModelFinishReason, ModelLimits,
+    ModelMessage, ModelRef, ModelRequest, ModelStartFuture, ModelStream, ModelValueError,
+    ReasoningPreference, Usage,
 };
 use minicore_runtime::tools::{ToolName, ToolSpec};
 use minicore_runtime::value::Text;
@@ -257,31 +257,28 @@ fn stream_events_are_typed_bounded_complete_and_redacted() {
         },
     ];
     for event in &events {
-        assert!(event.validate().is_ok());
         assert!(!event_name(event).is_empty());
     }
-    assert!(ModelEvent::text_delta("x".repeat(MAX_MODEL_EVENT_TEXT_BYTES)).is_ok());
-    assert!(ModelEvent::text_delta("x".repeat(MAX_MODEL_EVENT_TEXT_BYTES + 1)).is_err());
-    assert!(ModelEvent::reasoning_delta("x".repeat(MAX_MODEL_EVENT_TEXT_BYTES)).is_ok());
-    assert!(ModelEvent::reasoning_delta("x".repeat(MAX_MODEL_EVENT_TEXT_BYTES + 1)).is_err());
-    assert!(
-        ModelEvent::tool_call_arguments_delta(call_id(), "x".repeat(MAX_MODEL_EVENT_TEXT_BYTES))
-            .is_ok()
-    );
-    assert!(
-        ModelEvent::tool_call_arguments_delta(
-            call_id(),
-            "x".repeat(MAX_MODEL_EVENT_TEXT_BYTES + 1),
-        )
-        .is_err()
-    );
+    let payload = "x".repeat(256 * 1024 + 1);
+    for event in [
+        ModelEvent::text_delta(&payload),
+        ModelEvent::reasoning_delta(&payload),
+        ModelEvent::tool_call_arguments_delta(call_id(), &payload),
+        ModelEvent::TextDelta {
+            delta: Text::new(&payload),
+        },
+    ] {
+        let delta = match event {
+            ModelEvent::TextDelta { delta }
+            | ModelEvent::ReasoningDelta { delta }
+            | ModelEvent::ToolCallArgumentsDelta { delta, .. } => delta,
+            _ => unreachable!(),
+        };
+        assert_eq!(delta.as_str(), payload);
+    }
     assert!(
         matches!(ModelEvent::reasoning_delta(""), ModelEvent::ReasoningDelta { delta } if delta.is_empty())
     );
-    let malformed = ModelEvent::TextDelta {
-        delta: Text::new("x".repeat(MAX_MODEL_EVENT_TEXT_BYTES + 1)),
-    };
-    assert_eq!(malformed.validate(), Err(ModelValueError::InvalidEvent));
 
     let debug = events
         .iter()
