@@ -3,9 +3,9 @@
 //! Every gap here is one the p1/p2 suites did not pin exactly: reasoning vs
 //! text deltas, event-free runs, multi-tool cancel settlement, repeated
 //! answers, policy snapshot swaps, history limits, report delta-only
-//! semantics, malformed model responses that must never enter Assistant
-//! history, loop-level delivery retry, shared-resource cancel isolation, and
-//! inputs surviving a later prompt failure.
+//! semantics, malformed assembly excluded from Assistant history, complete
+//! responses retained despite unsupported finish reasons, loop-level delivery
+//! retry, shared-resource cancel isolation, and inputs surviving prompt failure.
 //!
 //! All synchronization is deterministic (Notify / watch / oneshot /
 //! start_paused + advance); no test sleeps.
@@ -717,27 +717,13 @@ async fn unknown_finish_without_tool_call_fails_without_assistant_history() {
         }
         other => panic!("expected InvalidModelResponse, got {other:?}"),
     }
-    let user_texts: Vec<String> = report
-        .appended
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::User(user) => Some(user.input.as_text().to_string()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(user_texts, vec!["hello"], "the loop's own prompt is kept");
-    let [HistoryItem::User(_), HistoryItem::Assistant(assistant)] = &report.appended[..] else {
+    let [HistoryItem::User(user), HistoryItem::Assistant(assistant)] = &report.appended[..] else {
         panic!("the complete response must survive its unsupported finish reason");
     };
+    assert_eq!(user.input.as_text(), "hello");
     assert_eq!(assistant.finish_reason, ModelFinishReason::Unknown);
     assert_eq!(assistant_texts(&report), vec!["invalid"]);
     assert!(report.partial.is_none());
-    assert!(
-        report
-            .appended
-            .iter()
-            .all(|item| !matches!(item, HistoryItem::ToolResult(_)))
-    );
     assert_eq!(report.usage, usage);
 }
 
@@ -785,8 +771,7 @@ async fn stop_finish_completes_and_keeps_the_assistant_text() {
     assert_eq!(assistant_texts(&report), vec!["done"]);
 }
 
-/// A Length finish fails as OutputLimit but keeps the partial text in
-/// Assistant history.
+/// A Length finish fails as OutputLimit but keeps the complete response in Assistant history.
 #[tokio::test]
 async fn length_finish_fails_as_output_limit_and_keeps_assistant_text() {
     let report = run_malformed(vec![
