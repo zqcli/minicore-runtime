@@ -15,8 +15,9 @@ defined by the contracts and the latest README compatibility notes.
   `max_tool_rounds` and `event_capacity`. Remove budget-only failure/error
   variants listed in the [migration notes](../README.md#0100).
 - Remove application byte/node/count limits for text, reasoning, tool
-  schemas/arguments/results, interactions, replay, tool calls, rounds, history
-  and prompts. Preserve the full default summary prefix and content. Large
+  schemas/arguments/results, interactions, replay, tool calls and rounds.
+  History and prompt size were already unrestricted. Preserve the full default
+  summary prefix and content. Large
   successful tool output remains successful, not downgraded or truncated.
 - Public events and internal model/tool progress use unbounded, non-awaiting
   channels. Remove full/drop paths and `LoopEventEnvelope::dropped_before`.
@@ -37,16 +38,27 @@ defined by the contracts and the latest README compatibility notes.
 
 ### Local verification
 
-- The 13 migrated integration targets pass all 114 existing tests, with their
-  function identities unchanged; focused Clippy also passes with warnings denied.
-  The standalone Value guard is checked against the locked parser for both arrays
-  and objects at 127/128 containers.
-- Documentation, architecture and acceptance gates and their mutation self-tests
-  pass. The acceptance matrix retains all 70 stable identities.
-- Full integration with the source-unit, loop and new stress tests is checked
-  by the integrating workstream before release. Provider evidence has no Runtime
-  dependency and no affected caller, so its opt-in gate is not rerun for this
-  migration. No live-provider result is claimed.
+- The full `./scripts/check.sh` gate passes: formatting, all 310 tests (81 unit
+  and 229 integration across 15 targets), both example builds, Clippy with
+  warnings denied, rustdoc, documentation, architecture and acceptance checks.
+  The 70-row acceptance matrix and mutation self-tests pass.
+- Actual loops retain exact input, model text/reasoning, schemas/arguments,
+  outputs, interactions, summary and replay payloads above former thresholds;
+  65 calls, 1,025 rounds and 4,097-event bursts complete without capacity loss.
+  The history callback, final report and next model request retain full content.
+- Large unfinished output survives a model failure plus a history callback
+  failure with the observer dropped: the primary model error and exact partial
+  remain, with no complete assistant record or executed unfinished call.
+- JSON tests compare standalone arrays/objects against the locked parser at
+  127/128 containers. Actual tool-call assembly accepts 33 and 127 containers
+  and rejects 128, preserving stack protection without byte/node quotas.
+- A detached 18a6ac9 baseline with only mechanical old-API adaptation of the
+  regression tests fails 12 migrated loop cases and both initial new large-
+  payload tests. Queue evidence includes 252/4,097 model deltas and 64/4,097
+  tool progress events on that baseline; the current tests retain all of them.
+- The standalone provider evidence package has no Runtime dependency or
+  affected caller, so its opt-in gate is not rerun. No live-provider result,
+  cross-platform execution, remote publication or tag is claimed.
 
 ### Complete-history handoff and unfinished output
 

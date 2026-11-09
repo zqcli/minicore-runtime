@@ -251,3 +251,63 @@ async fn large_approval_and_choice_payloads_round_trip_through_live_interactions
         assert_eq!(serde_json::from_str::<Value>(results[0].output.content().as_str()).unwrap(), json!({"choice_index": 32, "choice": expected}));
     }).await.unwrap();
 }
+
+struct RejectHistory(minicore_runtime::error::DiagnosticSummary);
+impl LoopHistory for RejectHistory {
+    fn append<'a>(
+        &'a self,
+        _loop_id: LoopId,
+        _offset: usize,
+        _items: &'a [HistoryItem],
+    ) -> HistoryFuture<'a> {
+        Box::pin(async { Err(self.0.clone()) })
+    }
+}
+
+#[tokio::test]
+async fn large_unfinished_output_survives_model_and_history_failure_without_observation() {
+    use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
+    use minicore_runtime::model::{ModelError, ModelErrorKind};
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let text = "t".repeat(262_145);
+        let reasoning = "r".repeat(262_145);
+        let arguments = format!("{{\"unfinished\":\"{}", "a".repeat(65_537));
+        let replay = ProviderReplay::new("fixture/v1", json!({"payload": "p".repeat(262_145)})).unwrap();
+        let id: ToolCallId = "unfinished".parse().unwrap();
+        let model_error = ModelError::started(ModelErrorKind::StreamInterrupted, DiagnosticSummary::new(
+            DiagnosticCode::ModelUnavailable, DiagnosticCategory::Model, Text::new("stream failed"), false,
+        ).unwrap());
+        let save_error = DiagnosticSummary::new(DiagnosticCode::Internal, DiagnosticCategory::Internal, Text::new("history failed"), false).unwrap();
+        let (model, _) = scripted_model(vec![Round::StreamError {
+            events: vec![
+                ModelEvent::text_delta(&text), ModelEvent::reasoning_delta(&reasoning),
+                ModelEvent::ToolCallStart { tool_call_id: id.clone(), tool_name: "echo".parse().unwrap() },
+                ModelEvent::tool_call_arguments_delta(id.clone(), &arguments),
+                ModelEvent::ProviderReplay { replay: replay.clone() },
+            ],
+            error: model_error.clone(),
+        }]);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut options = LoopOptions::default_checked().unwrap();
+        options.history = Some(Arc::new(RejectHistory(save_error.clone())));
+        let mut agent = AgentLoop::start(request(config(model, tool_set(calls.clone(), ToolBehavior::Succeed), None)), options, no_inputs()).unwrap();
+        drop(agent.take_events().unwrap());
+        let report = finish(agent).await;
+        assert!(matches!(&report.outcome, LoopOutcome::Failed(failure) if failure.model_error() == Some(&model_error)));
+        assert_eq!(report.history_failure, Some(save_error));
+        assert_eq!((report.requests, report.tool_rounds), (1, 0));
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(matches!(report.appended.as_ref(), [HistoryItem::User(_)]));
+        let partial = report.partial.as_ref().unwrap();
+        assert_eq!(partial.request_index, 0);
+        assert!(matches!(partial.content.as_slice(), [AssistantPart::Text(actual), AssistantPart::Reasoning(actual_reasoning)]
+            if actual.as_ref() == text && actual_reasoning.text() == Some(reasoning.as_str())));
+        assert_eq!(partial.provider_replay.as_ref(), Some(&replay));
+        assert_eq!(partial.incomplete_tool_calls.len(), 1);
+        let unfinished = &partial.incomplete_tool_calls[0];
+        assert_eq!((unfinished.part_index, unfinished.call_index), (2, 0));
+        assert_eq!(unfinished.tool_call_id, id);
+        assert_eq!(unfinished.tool_name.as_str(), "echo");
+        assert_eq!(unfinished.arguments_text, arguments);
+    }).await.unwrap();
+}

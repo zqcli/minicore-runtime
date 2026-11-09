@@ -136,8 +136,8 @@ The Runtime executes one loop. The host owns everything around it:
   snapshot of the request that produced it.
 - Inputs come from the host's `LoopInputs::take`, called synchronously on the
   runner task with no Runtime lock held, so it must not block, await or do IO.
-  The host owns the queue and validates each input (non-empty, within
-  `max_user_input_bytes`) where it accepts it; the Runtime does not re-check.
+  The host owns the queue and validates each input as non-empty where it
+  accepts it; the Runtime does not re-check.
   Returning inputs from `take` hands them over for good: they join the loop's
   history as `UserMessageKind::Steering` items in order and appear in
   `LoopReport::appended` for every outcome, cancellation included. Inputs the
@@ -203,6 +203,12 @@ define the present API.
   the same plain-string wire format. Remove `new_with_max_bytes` and obsolete
   byte/node constants. Model delta constructors are also infallible; remove
   their `?`/`unwrap` calls. `ModelEvent::validate` is removed.
+- Remove `value::{MAX_TEXT_BYTES, MAX_JSON_BYTES, MAX_JSON_DEPTH, MAX_JSON_NODES}`,
+  `BoundedText::MAX_BYTES`, `MAX_MODEL_EVENT_TEXT_BYTES`,
+  `MAX_TOOL_POLICY_TEXT_BYTES`, and `ProviderReplay::{MAX_BYTES, MAX_DEPTH, MAX_NODES}`.
+  Replace `validate_json_size` with `validate_json_nesting` when explicit JSON
+  safety validation is needed. `ValueError` retains only `InvalidText` and
+  `JsonTooDeep`; its byte/node/serialization quota errors no longer exist.
 - **Breaking:** remove `LoopLimits`, `LoopLimitsError`, the `limits` module,
   and `LoopOptions::{limits, max_tool_rounds, event_capacity}`. Remove
   `LoopEventEnvelope::dropped_before`, budget-only `LoopFailureKind::MaxToolRounds`,
@@ -215,6 +221,10 @@ define the present API.
   `DefaultPromptProvider` preserves the entire summary prefix and content.
   Public and internal progress channels use non-awaiting unbounded sends;
   observation never determines the outcome, and there is no full/drop path.
+- The removed finite tool-round option was already disabled by default; there
+  was no active default round limit. The removed 64 KiB raw-delta ceiling did
+  not prevent adapters from losslessly splitting larger provider frames, and
+  those adapters may retain chunking as a streaming choice.
 - Keep symbolic ID/name grammar and lengths, nonempty/control/type/association
   checks, actual `ModelLimits`, and existing model timeout/retry rules.
   `ModelFinishReason::Length` still reports `OutputLimit`. The shared

@@ -21,7 +21,7 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 | `provider_replay.rs` | 2 | large replay payloads, stack safety, serde and legacy wire compatibility |
 | `history_handoff_contract.rs` | 16 | ordered incremental handoffs, backpressure, failure, cancellation-safe saving, callback panic isolation and unsupported complete finish preservation, combined failures and first-outcome claims |
 | `model_partial_contract.rs` | 7 | authoritative assembly on failure, EOF, cancellation and deadline, partial tool arguments, request identity and complete-response preservation |
-| `unbounded_execution_contract.rs` | 2 | real-loop payload/count/progress stress, exact handoff/report/next-request retention, large interaction payloads |
+| `unbounded_execution_contract.rs` | 3 | real-loop payload/count/progress stress, exact handoff/report/next-request retention, large interaction payloads, unfinished output with primary model and secondary history failures |
 
 ## Unit (`src/**` inline and driver)
 
@@ -35,7 +35,7 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 
   - `src/usage.rs` (1 test): partial usage accumulates reported fields.
 
-Total main-crate volume: **309 tests** (81 unit + 228 integration across 15 targets).
+Total main-crate volume: **310 tests** (81 unit + 229 integration across 15 targets).
 Two compile-fail doctests protect private `ToolSpec` and `ToolOutput` fields.
 `tests/support/` shares scripted model/tool/policy builders, config/start/join helpers
 and report extractors across separate binaries. Driver tests use the actual
