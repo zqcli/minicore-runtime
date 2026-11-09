@@ -3,7 +3,7 @@
 ## Completed Phases
 
 These phases describe the v0.4 implementation history, not the current public
-API. Later changes below remove its Runtime-owned steer queue and history limits.
+API. Later changes below remove its Runtime-owned steer queue and application quotas.
 
 - **Phase 1** `feat(v0.4): introduce loop history and execution configuration` — `HistoryItem`/`HistoryView` and `ExecutionConfig` as the host boundary inputs.
 - **Phase 2** `feat(v0.4): run one agent loop without session ownership` — one-shot `AgentLoop`, runner-owned completion, single-CAS cancel/final state machine, `MAX_MODEL_RETRY_ATTEMPTS=4`.
@@ -32,14 +32,23 @@ shared test fixtures. See [release notes](release-v0.7.md) for compatibility and
   cover late watches, terminal event loss and input-boundary identity; current
   documentation distinguishes those contracts from historical release work.
 
-## Unreleased 0.10.0
+## 0.10.0 (prepared locally)
+
+Application quotas are removed without compatibility modes: payload text/bytes,
+JSON width/node counts, tool-call/round counts, history/prompts and observation
+queue capacities. `Text` and model delta construction are infallible; default
+summary projection retains all content. Public/internal observation queues are
+unbounded and non-awaiting, with no lost-on-full behavior. Protocol grammar and
+associations, actual model limits, timeout/retry behavior and parser-aligned
+JSON stack safety remain. Current acceptance summaries retain historical test
+identities. This local package preparation does not constitute publication.
 
 Acknowledged complete-history handoffs and authoritative unfinished model output
 are implemented, including independent history diagnostics and first-outcome
 claims. See the [host handoff guide](integration/host-boundary.md#incremental-history-and-partial-output)
 and [release notes](release-v0.7.md).
 
-### Post-handoff cleanup audit
+### Historical post-handoff cleanup audit (before quota removal)
 
 The 2026-11-09 audit compared `3fd5ecd..49a6e8b` and checked production, test
 and example uses. No production function was made obsolete by those changes.

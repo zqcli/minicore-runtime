@@ -1,12 +1,10 @@
 # Current Implementation Context
 
-The package version remains v0.9.2 pending a release. Unreleased 0.10.0 changes
-add optional acknowledged complete-history handoff and authoritative unfinished
-model output in the existing final report; the 0.9.1–0.9.2 releases themselves
-were documentation and test maintenance. The one-loop boundary from the v0.4
-reset and the 0.9.0 input-pull/start signatures remain unchanged. Tool-batch statistics are now
-`u64` end to end within Runtime;
-the optional legacy `u16` round budget still defaults to zero (unlimited).
+The package version is v0.10.0, prepared locally and not yet published. It adds
+optional acknowledged complete-history handoff and authoritative unfinished
+model output in the existing final report, and removes arbitrary application
+quotas. The one-loop boundary and 0.9.0 input-pull/start signatures remain.
+Tool-batch statistics are `u64`; there is no round-budget setting.
 Each real prompt preparation publishes one `Starting` event. Session-owned
 post-turn/manual summaries and emergency recovery remain Agent policies,
 not new Runtime responsibilities. See the root README compatibility notes.
@@ -26,23 +24,23 @@ library type.
   `state`, and `runner` — split into `runner.rs` (main loop / control /
   final), `runner/model.rs` (prompt preparation + model driver), and
   `runner/tools.rs` (policy, interaction, tool execution). One `tokio::spawn`
-  per loop; no async mutex; all events are `try_send` best-effort.
+  per loop; no async mutex; optional events use non-awaiting unbounded sends.
 - `src/execution.rs` holds `ExecutionConfig` + `UserInput`; `src/history.rs`
   the host-facing `HistoryItem` vocabulary; `src/prompt.rs` the
   `PromptProvider` seam with `DefaultPromptProvider`.
-- `src/model`, `src/tools`, `src/limits`, `src/usage`, `src/interaction`,
+- `src/model`, `src/tools`, `src/usage`, `src/interaction`,
   `src/ids`, `src/value`, `src/time`, `src/error`, `src/port_call` carry the
   typed seams and validation the loop builds on. No sessions or durable state.
 - The public root re-exports only loop, execution, history, model, prompt,
-  tools, interaction, ids, limits, value, and error types (see `src/lib.rs`).
+  tools, interaction, ids, value, and error types (see `src/lib.rs`).
 
 ## Engine Rules
 
 - One runner task per loop; `wait`/`join` return the same `Arc<LoopReport>`.
 - `state`/`watch_state` retain the latest control observation independently of
   event delivery. Read an initial watch value before waiting; a retained handle
-  keeps the sender open after `join`. Watch changes can coalesce, and terminal
-  event loss need not produce a later `dropped_before` notification.
+  keeps the sender open after `join`. Watch changes can coalesce; they are not
+  a transition log or substitute for the authoritative final report.
 - Completion is owned by the runner task; its drop surfaces as
   `LoopWaitError::CompletionClosed` to waiters.
 - Update and the final seal linearize on one short `std::sync::Mutex`;
@@ -55,9 +53,14 @@ library type.
   stale rebuilds are not; driver-internal retries remain one logical request.
 - `LoopFailure::model_error()` preserves structured request-level `ModelError`
   for model/invalid-response failures; this does not indicate whole-loop auto-retry.
-- Tool outputs in history are bounded by `max_tool_output_bytes`; invalid tool
-  input requests fail fast without entering `WaitingForInput`.
-- Internal model and tool progress queue drops are merged into `dropped_before`.
+- Text/reasoning, tool schema/arguments/results, interactions, replay payloads,
+  rounds, history and prompts have no application quotas or truncation. Invalid
+  tool input requests still fail without entering `WaitingForInput`.
+- Public and internal progress queues are unbounded and non-awaiting, with no
+  full/drop path. Disconnected observers never affect business execution.
+- Protocol grammar/lengths, semantic associations, actual model limits and
+  timeout/retry behavior remain. JSON nesting matches serde_json's default
+  stack-safety guard (127 arrays/objects); byte/node counts are unrestricted.
 - User inputs come from the host's `LoopInputs::take`, called on the runner
   task at the A and F request boundaries; inputs the loop took are in the
   report for every ending, the rest stay with the host. A no-tool answer
@@ -71,7 +74,7 @@ library type.
 - `take` carries no request identity. Host prompt/model wrappers observe the
   candidate preparation and issued request on every installed config,
   including updates; a candidate can remain unissued after cancellation.
-- Tool catalog size is independent from per-response `ToolCall` limits.
+- Neither tool catalog size nor per-response `ToolCall` count has an application quota.
 - Built with current stable Rust, no declared minimum; production code forbids `unsafe`; no async mutex, no
   `parking_lot`.
 - Negative scope preserved: no session runtime, no session logs/manifests,
@@ -110,9 +113,9 @@ without merging binaries or changing acceptance names. See
 
 ## v0.6.1 Opaque Replay Transport
 
-The existing response/history/prompt path carries bounded `ProviderReplay` metadata
+The existing response/history/prompt path carries opaque `ProviderReplay` metadata
 without provider logic or a second state owner. It is non-display and redacted in
 Debug; only host API/explicit serde expose its payload. Canonical parts remain the
 execution authority. The legacy assistant tuple and old JSON are retained, with
 `AssistantWithReplay` for metadata-bearing requests. See the model contract for
-bounds, stream ordering, and the narrow replay-only empty-content case.
+format grammar, JSON stack safety, stream ordering and replay-only empty content.

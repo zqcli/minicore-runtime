@@ -1,10 +1,11 @@
 # Documentation Authority
 
-The current v0.9.2 package retains the v0.4 one-loop architecture and the
-v0.9.0 input-pull semantics, with unreleased history handoff and partial reporting
-additions. The current source tree and contracts define
-behavior; the root README records compatibility changes. Versioned v0.4
-acceptance/release pages remain historical evidence:
+The current v0.10.0 package retains the v0.4 one-loop architecture and the
+v0.9.0 input-pull semantics, adds history handoff and partial reporting, and
+removes application quotas while retaining protocol/model/stack-safety checks. The current source tree and contracts define
+behavior; the root README records compatibility changes. The v0.4 release page
+is historical evidence; the acceptance matrix keeps stable row/test identities
+with summaries updated to current guarantees:
 
 1. [Architecture](architecture.md) for the one-loop boundary, ownership, and dependency direction.
 2. [Canonical module map](modules/README.md) for physical source ownership and public/private boundaries.

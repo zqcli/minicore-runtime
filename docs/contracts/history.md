@@ -8,7 +8,7 @@ The host-facing conversation vocabulary passed in and returned by the loop.
 
 - `User(UserHistory { loop_id, kind, input })` — `kind` is `Prompt` (the
   input that started the loop) or `Steering` (an input taken from
-  `LoopInputs` at a request boundary). `input: UserInput` is bounded text.
+  `LoopInputs` at a request boundary). `input: UserInput` is checked text without a byte quota.
 - `Assistant(AssistantHistory { loop_id, request_index, model, reasoning,
   content, provider_replay, finish_reason, usage })` — a complete, locally
   validated model response with typed `AssistantPart`s (text / reasoning /
@@ -35,16 +35,16 @@ The host-facing conversation vocabulary passed in and returned by the loop.
 
 ## Invariants
 
-- Items must be constructible with the bounded value types (`BoundedText`,
-  `UserInput`, `ToolOutput`); malformed values are rejected at construction
-  or by the loop as `Prompt`-path failures.
+- `Text` stores unrestricted UTF-8. Domain types such as `UserInput` and
+  `ToolOutput` enforce their nonempty/control/shape rules without byte quotas;
+  malformed values fail construction or the request's `Prompt` path.
 - A `ToolResult` must agree with the tool-exchange the model actually
   produced; `ModelRequest` validates that every `ToolCall` is matched by a
   `ToolResult` with the same id.
 - Host-provided history is trusted for semantics; the loop only enforces the
   structural validation described in the [prompt contract](prompt.md).
-- The loop caps neither the number nor the total size of history items; the
-  host bounds history, for example by token-based compaction.
+- The loop caps neither individual item size nor the number or total size of
+  history items. Context selection and compaction are host responsibilities.
   `estimate_history_bytes` is a host-side size estimate only.
 
 ## Incremental Handoff

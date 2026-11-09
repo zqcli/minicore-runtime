@@ -248,10 +248,12 @@
     {
       "id": "V4-027",
       "status": "Passed",
-      "summary": "无静默能力降级（非法update被拒绝、失败保留）",
+      "summary": "Constructed configurations are accepted without application quotas; unsupported model capabilities still fail construction",
       "evidence": [
         "tests/p2_agent_loop.rs::invalid_config_update_does_not_consume_a_revision",
-        "tests/p2_agent_loop.rs::start_rejects_config_outside_loop_limits"
+        "tests/p2_agent_loop.rs::start_rejects_config_outside_loop_limits",
+        "tests/p1_v04_loop_dtos.rs::execution_config_rejects_untrusted_reasoning",
+        "tests/p1_v04_loop_dtos.rs::execution_config_rejects_tools_without_model_support"
       ]
     },
     {
@@ -289,7 +291,7 @@
     {
       "id": "V4-032",
       "status": "Passed",
-      "summary": "queue有界（Runtime不再持有steer队列：队列由Host持有并限界，未取走的input留在Host）",
+      "summary": "Input queues remain host-owned; Runtime imposes no queue-count quota and untaken inputs stay with the host",
       "evidence": [
         "docs/contracts/agent-loop.md",
         "tests/p2_agent_loop.rs::an_input_not_taken_before_cancellation_stays_out_of_the_report"
@@ -333,12 +335,13 @@
     {
       "id": "V4-037",
       "status": "Passed",
-      "summary": "当前Model Response严格验证",
+      "summary": "Model response structure and tool associations are validated without a per-response tool-call quota",
       "evidence": [
         "tests/p2_agent_loop.rs::unknown_tool_call_closes_the_loop_with_invalid_response",
         "tests/p3_agent_loop_closeout.rs::missing_tool_call_terminal_is_invalid_and_not_appended",
         "src/model/driver/tests/semantics.rs::multiple_tool_specs_reject_second_tool_call_when_limit_is_one",
-        "tests/p3_agent_loop_closeout.rs::loop_completes_with_multiple_registered_tools_under_single_call_limit"
+        "tests/p3_agent_loop_closeout.rs::loop_completes_with_multiple_registered_tools_under_single_call_limit",
+        "tests/p1_value.rs::json_validation_enforces_compact_bytes_depth_and_nodes"
       ]
     },
     {
@@ -352,7 +355,7 @@
     {
       "id": "V4-039",
       "status": "Passed",
-      "summary": "当前ToolCall都有受限且确定的ToolResult",
+      "summary": "Every tool call is settled exactly once; complete tool output is retained without size downgrades or truncation",
       "evidence": [
         "tests/p3_agent_loop_closeout.rs::cancelling_a_multi_tool_batch_settles_each_call_exactly_once",
         "tests/p2_agent_loop.rs::cancel_during_tool_ends_cancelled_with_results_for_every_call",
@@ -416,7 +419,7 @@
     {
       "id": "V4-045",
       "status": "Passed",
-      "summary": "max rounds生效",
+      "summary": "Tool rounds have no application limit and complete results remain intact beyond former budgets",
       "evidence": [
         "tests/p2_agent_loop.rs::max_tool_rounds_ends_with_failed_budget_and_complete_results"
       ]
@@ -434,15 +437,16 @@
     {
       "id": "V4-047",
       "status": "Passed",
-      "summary": "Event full不阻塞",
+      "summary": "Unbounded observation sends do not await a consumer and cannot become full",
       "evidence": [
-        "tests/p2_agent_loop.rs::bounded_event_queue_attaches_dropped_before_to_the_next_success"
+        "tests/p2_agent_loop.rs::bounded_event_queue_attaches_dropped_before_to_the_next_success",
+        "scripts/check_v04_architecture.py"
       ]
     },
     {
       "id": "V4-048",
       "status": "Passed",
-      "summary": "Event drop报告dropped_before",
+      "summary": "Public and internal model/tool progress queues retain connected-consumer bursts without full/drop paths or counters",
       "evidence": [
         "tests/p2_agent_loop.rs::bounded_event_queue_attaches_dropped_before_to_the_next_success",
         "tests/p2_agent_loop.rs::model_burst_progress_drops_are_recorded_in_dropped_before",
@@ -514,7 +518,7 @@
     {
       "id": "V4-056",
       "status": "Passed",
-      "summary": "History超限安全失败（该限制已移除：History与Prompt大小不再由Core限制）",
+      "summary": "History and prompt counts and bytes have no Runtime application quota",
       "evidence": [
         "tests/p2_agent_loop.rs::loop_accepts_history_and_prompt_beyond_former_count_and_byte_caps",
         "docs/contracts/history.md"
@@ -549,7 +553,7 @@
     {
       "id": "V4-060",
       "status": "Passed",
-      "summary": "DefaultPrompt可运行简单Agent",
+      "summary": "DefaultPromptProvider projects full history and summary content without truncation",
       "evidence": [
         "tests/p2_agent_loop.rs::default_provider_runs_a_loop_end_to_end_with_system_prompt"
       ]

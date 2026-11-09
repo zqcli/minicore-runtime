@@ -15,8 +15,9 @@ pub trait Tool: Send + Sync + 'static {
 
 `ToolSpec` has private fields and read-only accessors for its name, description
 and JSON schema. Constructors and deserialization validate it; `ToolSet` freezes
-that checked value at registration. `ExecutionConfig` checks model compatibility,
-and loop start/update applies per-tool budgets.
+that checked value at registration. `ExecutionConfig` checks model compatibility.
+Descriptions, schemas and arguments have no application byte/node quotas; names,
+JSON-object shape and parser stack-safety validation remain enforced.
 
 The runtime executes tools sequentially in response order, pinned to the snapshot
 of the request that produced the batch. Host tools must not block executor threads:
@@ -36,18 +37,15 @@ deadlines cannot preempt synchronous code.
 
 ## Execution Outcomes
 
-- All tool outputs recorded into `ToolResultHistory` (`Success`, `Failed`,
-  `Denied`) are strictly bounded by `max_tool_output_bytes`.
-- `Completed(output)` appends a `Success` tool result and the model
-  continues. If completed tool output exceeds `max_tool_output_bytes`, it is
-  downgraded to a `Failed` result with diagnostic explanation rather than
-  corrupting history.
+- Tool outputs recorded into `ToolResultHistory` (`Success`, `Failed`,
+  `Denied`) retain their full validated text without byte caps or truncation.
+- `Completed(output)` appends a `Success` tool result and the model continues;
+  a large result is not downgraded or replaced because of its size.
 - An ordinary tool error, timeout, or panic appends a `Failed` terminal
   result (the model continues); only cancellation, turn-deadline, or a
-  broken interaction end the batch. Bounding limits apply uniformly across
-  all failure and denial textual outputs.
-- `ToolFinished` event output byte counts strictly match the bounded bytes
-  stored in `ToolResultHistory`.
+  broken interaction end the batch. Failure and denial messages retain their
+  complete text too.
+- `ToolFinished` output byte counts match the full bytes in `ToolResultHistory`.
 - `RequestInput(request)` stalls the call for a host interaction (see
   below).
 
@@ -58,13 +56,13 @@ deadlines cannot preempt synchronous code.
 - `ToolInputRequest` enforces invariant validation (`validate(&self)`)
   shared across its constructors, deserialization, and the port runner
   boundary. If a tool returns `RequestInput(request)` with a malformed
-  request (empty prompt, empty SingleChoice choices, >32 choices, or
-  oversized choice text), the runtime rejects it immediately as an ordinary
+  request (empty prompt, empty SingleChoice choices, or forbidden controls), the runtime rejects it as an ordinary
   tool failure (`Failed`) without generating an `InteractionId`, emitting
   `InteractionRequested`, or entering `WaitingForInput`.
 - The host resolves via `LoopHandle::answer` (`InteractionAnswer::Approval`
   or `InteractionAnswer::ToolInput`). The runtime enforces the interaction
-  type contract; a mismatched answer returns `AnswerError::WrongInteraction`
+  type and choice-index contract without prompt/choice/answer byte or count
+  quotas; a mismatched answer returns `AnswerError::WrongInteraction`
   to the caller and leaves the interaction waiting.
 - While waiting, the loop deadline still wins; cancellation also ends the
   wait without an `InteractionResolved` event. After cancellation, `answer`
@@ -73,8 +71,9 @@ deadlines cannot preempt synchronous code.
 ## Progress
 
 - Tools may emit `ToolProgress` through `ToolContext`; each emission is
-  validated and forwarded as a best-effort `ToolProgress` event. Progress is
-  observation only, never correctness.
+  validated and forwarded through unbounded, non-awaiting progress queues.
+  There is no full/drop path. Progress is observation only, never correctness;
+  an absent or disconnected observer does not change tool execution.
 
 ## Snapshot Rule
 

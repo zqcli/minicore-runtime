@@ -15,9 +15,9 @@ file allow-list):
   6. Cargo (via `tomllib`, including renamed packages) and Cargo.lock carry no
      provider / workspace / storage dependencies.
   7. The public root re-exports no session-era API.
-  8. Events stay best-effort and out of the correctness path: the sink is
-     `try_send`-only, `try_emit` returns unit so callers cannot branch on
-     delivery, and the mpsc receiver stays inside `agent_loop/event.rs`.
+  8. Events stay optional and out of the correctness path: public/internal
+     observation queues are unbounded and non-awaiting, `try_emit` returns unit,
+     and the public mpsc receiver stays inside `agent_loop/event.rs`.
   9. Production source forbids `unsafe`.
 
 `--self-test` runs a real mutation test in a temporary tree: it plants a
@@ -252,29 +252,50 @@ def check_public_root(root: Path) -> list[str]:
     ]
 
 
+OBSERVATION_PATHS = [
+    "src/agent_loop/event.rs",
+    "src/agent_loop/runner/model.rs",
+    "src/agent_loop/runner/tools.rs",
+    "src/model/driver.rs",
+]
+
+
 def check_events_best_effort(root: Path) -> list[str]:
-    event_rs = root / "src" / "agent_loop" / "event.rs"
-    if not event_rs.exists():
-        return [f"{event_rs} missing"]
-    text = event_rs.read_text(encoding="utf-8")
     problems = []
-    if "try_send" not in text:
-        problems.append("event sink never uses try_send")
-    if "mpsc::" not in text:
-        problems.append("event stream is not mpsc-backed")
-    if re.search(r"sender\.send\(", text):
-        problems.append("event sink has a blocking send()")
-    signature = re.search(r"fn try_emit[^{]*", text)
-    if not signature or "->" in signature.group(0):
-        problems.append("try_emit must return unit so callers cannot branch on delivery")
+    sources = {}
+    for relative in OBSERVATION_PATHS:
+        path = root / relative
+        if not path.exists():
+            problems.append(f"{relative} missing")
+            continue
+        text = "\n".join(line for _, line in production_lines(path))
+        sources[relative] = text
+        if re.search(r"mpsc::(?:channel|Sender|Receiver)\b|try_send|TrySendError|dropped_before", text):
+            problems.append(f"{relative}: bounded or lost-on-full observation path")
+        if re.search(r"\.send\([^;]*\.await", text):
+            problems.append(f"{relative}: observation send must not await")
+        if relative != "src/model/driver.rs" and "mpsc::unbounded_channel()" not in text:
+            problems.append(f"{relative}: observation queue must be unbounded")
+    event = sources.get("src/agent_loop/event.rs", "")
+    for required in [
+        "mpsc::UnboundedSender<LoopEventEnvelope>",
+        "mpsc::UnboundedReceiver<LoopEventEnvelope>",
+        "let _ = self.sender.send(LoopEventEnvelope { event });",
+    ]:
+        if required not in event:
+            problems.append(f"event sink misses {required}")
+    signature = re.search(r"(?:async\s+)?fn try_emit[^{]*", event)
+    if not signature or "->" in signature.group(0) or "async" in signature.group(0):
+        problems.append("try_emit must be synchronous and return unit")
+    if "mpsc::UnboundedSender<ModelDriverProgress>" not in sources.get("src/model/driver.rs", ""):
+        problems.append("model progress sender must be unbounded")
     for path in source_files(root):
         relative = path.relative_to(root / "src").as_posix()
-        if relative == "agent_loop/event.rs":
+        if relative == "agent_loop/event.rs" or is_test_path(relative):
             continue
-        if re.search(r"mpsc::Receiver<\s*LoopEventEnvelope\s*>", path.read_text(encoding="utf-8")):
-            problems.append(
-                f"loop event receiver must stay in event.rs (found in src/{relative})"
-            )
+        text = "\n".join(line for _, line in production_lines(path))
+        if re.search(r"mpsc::(?:Unbounded)?Receiver<\s*LoopEventEnvelope\s*>", text):
+            problems.append(f"loop event receiver must stay in event.rs (found in src/{relative})")
     return problems
 
 
@@ -373,6 +394,40 @@ def self_test() -> list[str]:
             problems.append("self-test: deleted-path scanner is vacuous")
         if not check_events_best_effort(root):
             problems.append("self-test: event best-effort scanner is vacuous")
+
+        for relative in OBSERVATION_PATHS:
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text((ROOT / relative).read_text(encoding="utf-8"), encoding="utf-8")
+        if check_events_best_effort(root):
+            problems.append("self-test: valid observation paths were rejected")
+        mutations = [
+            ("src/agent_loop/event.rs", "mpsc::unbounded_channel()", "mpsc::channel(1)"),
+            ("src/agent_loop/event.rs", "fn try_emit(&mut self, event: LoopEvent)",
+             "fn try_emit(&mut self, event: LoopEvent) -> bool"),
+            ("src/agent_loop/event.rs", "self.sender.send(LoopEventEnvelope { event });",
+             "self.sender.send(LoopEventEnvelope { event }).await;"),
+            ("src/agent_loop/runner/model.rs", "mpsc::unbounded_channel()", "mpsc::channel(1)"),
+            ("src/agent_loop/runner/tools.rs", "mpsc::unbounded_channel()", "mpsc::channel(1)"),
+            ("src/model/driver.rs", "progress.send(progress_event)", "progress.try_send(progress_event)"),
+            ("src/model/driver.rs", "mpsc::UnboundedSender<ModelDriverProgress>",
+             "mpsc::Sender<ModelDriverProgress>"),
+        ]
+        for relative, old, new in mutations:
+            target = root / relative
+            original = target.read_text(encoding="utf-8")
+            if old not in original:
+                problems.append(f"self-test: missing observation mutation target: {relative}: {old}")
+                continue
+            target.write_text(original.replace(old, new), encoding="utf-8")
+            if not check_events_best_effort(root):
+                problems.append(f"self-test: observation mutation escaped: {relative}: {new}")
+            target.write_text(original, encoding="utf-8")
+        (src / "receiver_leak.rs").write_text(
+            "struct Leaked { rx: mpsc::UnboundedReceiver<LoopEventEnvelope> }\n", encoding="utf-8"
+        )
+        if not check_events_best_effort(root):
+            problems.append("self-test: public event receiver leak escaped")
 
     after = run_checks(ROOT)
     if after:

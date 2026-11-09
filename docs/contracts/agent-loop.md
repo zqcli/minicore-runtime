@@ -10,8 +10,9 @@ contract; the focused contracts ([model](model.md), [event-stream](event-stream.
 - An `AgentLoop` runs **exactly once**. `start` accepts a `LoopRequest`
   (host history + fresh `UserInput` + `ExecutionConfig`) and spawns a single
   runner task. There is no resume, reload, reopen, or save.
-- `start` validates options and configuration up front and rejects with
-  `LoopStartError` / `ExecutionConfigError` before any task runs.
+- `ExecutionConfig::new` validates model capabilities and the selected tools.
+  `start` validates options and nonempty input before any task runs; it does
+  not revalidate typed configuration or impose payload/count quotas.
 - `join()` returns `Result<Arc<LoopReport>, LoopJoinError>`; `wait()` on the
   control handle returns the same `Arc<LoopReport>`. Both `wait` and `join`
   see the same published report; a runner that exits before publishing closes
@@ -49,8 +50,8 @@ The runner loops:
 ## Configuration Updates
 
 - `LoopHandle::update(ExecutionConfig) -> Result<ConfigRevision, UpdateError>`.
-  Accepted while the loop is active and not finalizing (`NotActive` after cancellation or sealing), and
-  invalid configs are rejected without effect.
+  Accepted while the loop is active and not finalizing (`NotActive` after cancellation or sealing).
+  Configuration invariants are checked at construction, not against loop quotas.
 - An update takes effect at the **next model request**; the revision is
   committed only at the true issue boundary. A `Prompt`/timeout/cancel in
   between keeps the last issued revision.
@@ -66,8 +67,8 @@ The runner loops:
 - `AgentLoop::start(request, options, inputs)` takes an `Arc<dyn LoopInputs>`
   implemented by the host. `LoopInputs::take(&self) -> Vec<UserInput>` returns
   the inputs to append before the next model request, in order, and hands them
-  over for good. The host owns the queue and validates each input (non-empty,
-  within `max_user_input_bytes`); the Runtime trusts `take`.
+  over for good. The host owns the queue and validates each input as nonempty
+  where it accepts it; the Runtime trusts `take` and has no input byte quota.
 - `take` runs synchronously on the runner task with no Runtime lock held. It
   must not block, await or do IO. The loop calls it at the A-step and the
   F-step only: never during a model call, a tool batch or an interaction wait.
@@ -103,9 +104,8 @@ for offsets, cancellation-safe saving and failure ownership.
   produced), optional model `partial`, optional `history_failure`, `usage`,
   `requests`, `tool_rounds`, and the final
   `ConfigRevision`. `tool_rounds` is a `u64` count of entered tool batches,
-  not a saturated `u16` budget counter. `LoopOptions.max_tool_rounds` remains
-  `u16`: zero (the default) disables that optional limit; positive values
-  retain the existing finite-budget validation.
+  not a saturated `u16` budget counter. There is no round limit or optional
+  round-budget mode. Tool batches remain sequential.
 - `appended` is the loop's history delta. The host decides whether and where
   to persist it and the report's outcome and counters. Nothing is durable in
   the runtime. `partial` is distinct from that complete history and carries
@@ -132,8 +132,9 @@ for offsets, cancellation-safe saving and failure ownership.
 `update`, `answer`, and the final seal linearize on one short mutex;
 cancellation, non-completed ending claims and final sealing use an `AtomicU8`
 state machine. The first outcome claim wins, while report publication waits for
-owned saving. All event
-emissions are best-effort `try_send`s and never block the loop. Waiting for
-input or events never affects loop correctness.
+owned saving. Event and progress sends are non-awaiting and unbounded;
+no event queue can become full, and consumer disconnection never changes the
+business outcome. Interaction answers remain part of execution control;
+consuming observations is optional.
 Usage totals sum each reported field independently; a field is `None` only if
 no request reported it. Missing usage does not erase known counts.

@@ -28,7 +28,7 @@ stays in that host.
 | `src/model/` | The `Model` seam, request/message/response types, provider replay. `driver.rs` and `driver/` handle retries, deadlines, and stream assembly |
 | `src/tools/` | The `Tool` and `ToolPolicy` seams, `ToolSpec`, `ToolSet`, interactions, progress |
 | `src/execution.rs`, `src/history.rs`, `src/prompt.rs` | `ExecutionConfig`/`UserInput`, `HistoryItem`, the `PromptProvider` seam |
-| `src/limits.rs`, `src/value.rs`, `src/error.rs`, `src/port_call.rs` | Bounds, bounded values, diagnostics, timeout/panic-isolated port calls |
+| `src/value.rs`, `src/error.rs`, `src/port_call.rs` | Shared text, JSON stack-safety validation, diagnostics, timeout/panic-isolated port calls |
 | `tests/*.rs`, `tests/support/` | Contract and integration targets with shared builders |
 | `examples/` | `agent_loop.rs` and `memory_agent.rs`, compiled by the gates and packaged by CI |
 | `scripts/` | Quality gates; `acceptance_v04.json` is the v0.4 acceptance manifest |
@@ -57,8 +57,10 @@ dependency changes.
   `AgentLoop::start`. Do not use `tokio::sync::Mutex` or `parking_lot`. Keep
   the control `std::sync::Mutex` critical sections short, and drop replaced or
   discarded configs outside the lock.
-- Events are best-effort: emit with `try_send`/`try_emit` and never branch
-  correctness on delivery. The `LoopReport` is the only authoritative outcome.
+- Events are optional observations: use unbounded, non-awaiting sends and never
+  branch correctness on delivery. `try_emit` returns unit, with no full/drop
+  path. `LoopReport` is the authoritative outcome; `LoopHistory` acknowledges
+  complete records before continuation. Neither is reconstructed from events.
 - `state`/`watch_state` expose the latest control observation, not an event log.
   Read a watch's initial value and do not wait for channel closure to detect
   completion: retained handles keep its sender alive after `join`.
@@ -72,9 +74,11 @@ dependency changes.
 - No defensive programming: validate once at construction or deserialization,
   and do not re-check invariants the types already guarantee.
 - Delete dead code, unused parameters and always-true flags.
-- Keep per-input, per-response, tool-payload and event-queue bounds explicit
-  (`src/limits.rs`). Whole-history size and prompt message count are host
-  policies; do not restore the Runtime limits removed in 0.8.0.
+- Do not add application quotas for text, payload bytes/nodes, tool counts,
+  rounds, history, prompts or observation queues. No compatibility limit modes
+  or truncation. Preserve protocol grammar, actual model token/capability
+  limits, timeout/retry rules and serde_json's default JSON stack-safety guard
+  (127 nested arrays/objects, checked against the locked parser).
 - Comments:
   - `///` is one sentence, and only where the name and signature leave
     something unsaid.

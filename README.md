@@ -13,7 +13,7 @@ host.
 
 | | |
 |---|---|
-| Version | 0.9.2 |
+| Version | 0.10.0 |
 | Rust | edition 2024, current stable |
 | Async runtime | Tokio (the loop spawns one task) |
 | Production dependencies | serde, serde_json, tokio, tokio-util, futures-util, thiserror, getrandom |
@@ -31,14 +31,13 @@ host.
   bundled.
 - **Model driver.** Bounded retries that honor provider retry hints, request and
   turn deadlines, and text normalization that never grows a delta.
-- **Bounded by construction.** Limits cover each input, model text, tool call
-  and tool output, and the event queue. Oversized tool output becomes a failed
-  tool result instead of corrupting history. Whole-history size is the host's
-  to bound, for example by token-based compaction.
-- **Best-effort events.** A bounded stream reports dropped events in
-  `dropped_before` and never blocks the loop.
+- **No application quotas.** Text, tool payloads and counts, rounds, history
+  and prompts are not capped or truncated. Protocol validity, actual model
+  token/capability limits, and JSON parser stack safety remain enforced.
+- **Optional events.** Unbounded, non-awaiting observation channels never drop
+  progress because a queue is full. A disconnected consumer cannot affect execution.
 - **Current-state observation.** `LoopHandle::state` and `watch_state` expose
-  the latest loop state and pending interaction independently of event loss.
+  the latest loop state and pending interaction independently of event consumption.
   The watch coalesces updates; `wait`/`join` establish the final outcome.
 
 ## Installation
@@ -122,10 +121,10 @@ The Runtime executes one loop. The host owns everything around it:
   `LoopHistory` receiver acknowledges incremental complete records while it runs.
 - `LoopReport` is saved by the host. `wait` and `join` return the same
   `Arc<LoopReport>` for as long as the owner or any handle lives.
-- Events are not authoritative. The stream is bounded and single-consumer;
-  lost events, including internal model and tool progress, are counted in
-  the next delivered event's `dropped_before` and never reconstructed. A lost
-  terminal event may have no later event to carry that count.
+- Events are not authoritative. The single-consumer stream and internal model
+  and tool progress queues are unbounded and non-awaiting. There is no queue
+  capacity, lost-on-full path, drop counter, event acknowledgement or replay store.
+  An absent or disconnected consumer has no business effect.
 - Read a new `watch_state` receiver's initial value before waiting for changes;
   it may already contain a pending interaction or the final state. Retained
   handles keep the state channel open after `join`, so channel closure is not
@@ -176,7 +175,7 @@ focused modules:
 | `model` | The `Model` trait, `ModelRequest`/`ModelMessage`, events, errors, provider replay |
 | `prompt` | The `PromptProvider` trait and `DefaultPromptProvider` |
 | `tools` | The `Tool` trait, `ToolSpec`, `ToolSet`, policies, interactions, progress |
-| `limits`, `interaction`, `value`, `error` | Bounds, interaction DTOs, bounded text, diagnostics |
+| `interaction`, `value`, `error` | Interaction DTOs, shared `Text`, JSON stack safety, diagnostics |
 
 Generate the API docs with `cargo doc --no-deps --open`.
 
@@ -195,7 +194,36 @@ for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 
 ## Compatibility Notes
 
-### 0.10.0 (unreleased)
+Versioned sections describe that version; the latest notes and current contracts
+define the present API.
+
+### 0.10.0
+
+- **Breaking:** `BoundedText` becomes `Text`, with infallible `Text::new` and
+  the same plain-string wire format. Remove `new_with_max_bytes` and obsolete
+  byte/node constants. Model delta constructors are also infallible; remove
+  their `?`/`unwrap` calls. `ModelEvent::validate` is removed.
+- **Breaking:** remove `LoopLimits`, `LoopLimitsError`, the `limits` module,
+  and `LoopOptions::{limits, max_tool_rounds, event_capacity}`. Remove
+  `LoopEventEnvelope::dropped_before`, budget-only `LoopFailureKind::MaxToolRounds`,
+  `LoopStartError::InvalidConfig`, `UpdateError::InvalidConfig`,
+  `ExecutionConfigError::InvalidTools`, `DiagnosticCode::TurnBudgetExceeded`,
+  and `ModelValueError::InvalidEvent` match arms. No alias, no-op option,
+  unlimited sentinel or compatibility mode replaces these APIs.
+- Valid text/reasoning, tool schemas/arguments/results, interaction text/choices,
+  replay payloads and tool-call/round counts have no application quota.
+  `DefaultPromptProvider` preserves the entire summary prefix and content.
+  Public and internal progress channels use non-awaiting unbounded sends;
+  observation never determines the outcome, and there is no full/drop path.
+- Keep symbolic ID/name grammar and lengths, nonempty/control/type/association
+  checks, actual `ModelLimits`, and existing model timeout/retry rules.
+  `ModelFinishReason::Length` still reports `OutputLimit`. The shared
+  `validate_json_nesting` guard accepts at most `MAX_JSON_NESTING = 127`
+  nested arrays/objects, matching locked serde_json's default stack guard;
+  it does not cap JSON byte size or width/node count. Serialized enclosing
+  DTO objects also count toward the parser's depth when reading a whole wire value.
+- The version is prepared locally; these notes do not imply a tag, push or
+  published release.
 
 - `LoopOptions.history` optionally installs `Arc<dyn LoopHistory>`; the default
   remains `None`. `LoopHistory::append` returns `HistoryFuture` and acknowledges

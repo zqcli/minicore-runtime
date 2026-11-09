@@ -3,7 +3,52 @@
 Versioned sections describe changes at that version. Current behavior is
 defined by the contracts and the latest README compatibility notes.
 
-## 0.10.0 (unreleased)
+## 0.10.0 (prepared locally)
+
+### Application quotas and API migration
+
+- Rename `BoundedText` to `Text`; `Text::new` and model delta constructors are
+  infallible. Text serialization remains a plain JSON string. Remove quota
+  constructors/constants and `ModelEvent::validate` rather than retaining
+  aliases or Result/no-op compatibility shells.
+- Remove `LoopLimits`/`LoopLimitsError` and `LoopOptions`'s `limits`,
+  `max_tool_rounds` and `event_capacity`. Remove budget-only failure/error
+  variants listed in the [migration notes](../README.md#0100).
+- Remove application byte/node/count limits for text, reasoning, tool
+  schemas/arguments/results, interactions, replay, tool calls, rounds, history
+  and prompts. Preserve the full default summary prefix and content. Large
+  successful tool output remains successful, not downgraded or truncated.
+- Public events and internal model/tool progress use unbounded, non-awaiting
+  channels. Remove full/drop paths and `LoopEventEnvelope::dropped_before`.
+  Observation stays optional; no persistent event store, acknowledgement or
+  replay mode is added. History callbacks and final reports remain authoritative.
+- Retain protocol grammar and ID/name lengths, nonempty/control/type checks,
+  valid tool associations, model capabilities/token limits, and timeout/retry
+  rules. `Length` still means the model reached an output limit.
+- Replace arbitrary JSON depth 32 with the locked serde_json default
+  stack-safety boundary: 127 nested arrays/objects accepted, 128 rejected.
+  Tests compare the guard directly with the parser, and accept payloads above
+  the former byte/node limits. Enclosing wire objects also count in the parser.
+- Historical acceptance test function names remain stable while their bodies
+  and current summaries describe removed quotas honestly. The architecture
+  gate mutation-tests unbounded/non-awaiting observations and a unit-return sink.
+- Package version fields change to 0.10.0 without dependency updates. No tag
+  or remote publication is implied; the integrating workstream runs final gates.
+
+### Local verification
+
+- The 13 migrated integration targets pass all 114 existing tests, with their
+  function identities unchanged; focused Clippy also passes with warnings denied.
+  The standalone Value guard is checked against the locked parser for both arrays
+  and objects at 127/128 containers.
+- Documentation, architecture and acceptance gates and their mutation self-tests
+  pass. The acceptance matrix retains all 70 stable identities.
+- Full integration with the source-unit, loop and new stress tests is checked
+  by the integrating workstream before release. Provider evidence has no Runtime
+  dependency and no affected caller, so its opt-in gate is not rerun for this
+  migration. No live-provider result is claimed.
+
+### Complete-history handoff and unfinished output
 
 - Add the optional `LoopOptions.history` receiver and root-exported `LoopHistory`
   and `HistoryFuture`. It acknowledges only new complete records, in order, at
@@ -28,7 +73,6 @@ defined by the contracts and the latest README compatibility notes.
   endings claim their outcome before awaited saving; an earlier cancellation
   still wins. A completed no-tool candidate can retain `Completed` with a
   history failure, which the host must treat as a blocked save boundary.
-- The package version remains 0.9.2 until a release is explicitly prepared.
 
 ## 0.7.0
 

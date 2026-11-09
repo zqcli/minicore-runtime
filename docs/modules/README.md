@@ -18,12 +18,11 @@ the crate root (`src/lib.rs`); every other module is reached through them.
 | `src/prompt.rs` | `PromptProvider` seam, `DefaultPromptProvider` | `prompt` module |
 | `src/model/` | `Model` seam, `ModelDriver`, typed request/response | `model` module |
 | `src/tools/` | `Tool` seam, `ToolSet`, policies, interactions | `tools` module |
-| `src/limits.rs` | `LoopLimits` | Re-exported at root |
 | `src/model/usage.rs` | `Usage` | `model::Usage` |
 | `src/usage.rs` | `UsageAccumulator` | crate-private |
 | `src/interaction.rs` | `PendingInteraction`, `InteractionAnswer`/`Kind` | Re-exported at root |
 | `src/ids.rs` | `LoopId`, `InteractionId`, `ToolCallId` | Re-exported at root |
-| `src/value.rs` | `BoundedText`, byte budgets | `value` module |
+| `src/value.rs` | Shared `Text`, JSON nesting stack-safety guard | `value` module, `Text` re-exported at root |
 | `src/time.rs` | deadline sources | crate-private |
 | `src/error.rs` | `DiagnosticCategory/Code/Summary` | Re-exported at root |
 | `src/port_call.rs` | per-port cancel/timeout/panic isolation | crate-private |
@@ -31,8 +30,9 @@ the crate root (`src/lib.rs`); every other module is reached through them.
 The model module separates the adapter seam (`port.rs`), symbolic references
 (`model_ref.rs`), messages/parts (`message.rs`), requests/limits (`request.rs`),
 responses/events (`response.rs`), errors (`error.rs`), replay (`replay.rs`) and
-usage DTO (`usage.rs`). Public `model::*` paths are unchanged. Driver config
-uses the already-validated `LoopLimits`; it does not mirror their validation.
+usage DTO (`usage.rs`). Driver config contains timeout and retry settings;
+actual model token/capability limits remain separate from removed application
+quotas. JSON stack safety is centralized in `value::validate_json_nesting`.
 
 ## Test Ownership
 
@@ -45,14 +45,15 @@ uses the already-validated `LoopLimits`; it does not mirror their validation.
 - `tests/p2_agent_loop.rs` — end-to-end loop contract evidence (text, tools,
   host inputs/update/cancel, deadlines, report semantics).
 - `tests/host_observation_contract.rs` — late and terminal state observation,
-  event loss, and host-owned input/request-boundary association.
+  delayed event consumption, and host-owned input/request-boundary association.
 - `tests/p2_*` follow the same pattern for further contract domains, if
   added; integration test files live directly in `tests/`.
 
 ## Boundaries
 
-- `agent_loop` is the only module that spawns tasks (one per loop) and
-  touches `tokio::sync::watch`/`mpsc` for loop plumbing.
+- `agent_loop` is the only module that spawns tasks (one per loop). It owns
+  watch state and unbounded event/progress queues; the private model driver
+  sends to its supplied unbounded progress channel without awaiting.
 - No module owns a session, a store, or a provider implementation.
 - Runner implementation slices (`runner/model.rs`, `runner/tools.rs`) are
   private to `agent_loop::runner` and exist only to keep physical files

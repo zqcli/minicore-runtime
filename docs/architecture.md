@@ -53,7 +53,7 @@ events. The host decides what to persist, where, and when.
 - `model/` — `Model` seam, typed `ModelRequest`/`ModelMessage`/responses,
   and the delivery-aware `ModelDriver`.
 - `tools/` — `Tool` seam, `ToolSet`, `ToolPolicy`, interactions, progress.
-- `limits.rs`, `usage.rs`, `interaction.rs`, `ids.rs`, `value.rs`,
+- `usage.rs`, `interaction.rs`, `ids.rs`, `value.rs`,
   `time.rs`, `error.rs`, `port_call.rs` — validation, accounting, id and
   value types, and per-port isolation.
 
@@ -63,16 +63,27 @@ events. The host decides what to persist, where, and when.
 - `runner.rs` keeps the main loop, control/final handling, and finish
   reporting; `runner/model.rs` holds prompt preparation and the model
   driver; `runner/tools.rs` holds batch settlement, policy, interaction, and tool execution.
-- Every control touch is a short critical section; every event is a
-  best-effort `try_send`.
+- Every control touch is a short critical section. Public and internal progress
+  queues are unbounded; sends do not await, and no full/drop path exists. The
+  optional public sink returns unit and ignores disconnection.
 - `LoopControl` retains the latest `LoopState` in a watch channel shared by
-  `state` and `watch_state`; this is independent of the lossy event stream.
+  `state` and `watch_state`; this is independent of the optional event stream.
   Completion has a separate runner-owned sender and returns the final report.
+
+## Validation Boundary
+
+Runtime imposes no application limits on payload bytes/nodes, response/tool
+counts, rounds, history, prompts or observation queue sizes, and performs no
+quota-driven truncation. Typed protocol grammar, associations, real model
+capabilities/token limits and timeout/retry behavior remain unchanged.
+JSON nesting follows the locked serde_json parser's default stack-safety guard:
+127 arrays/objects are accepted, 128 rejected. Width and node count are unrestricted.
+No session, storage, queue policy or tool-parallelism mode is added.
 
 ## Dependency Direction
 
 `agent_loop` depends on `model`, `tools`, `prompt`, `history`,
-`execution`, `limits`, `usage`, `interaction`, `ids`, `value`, `time`,
+`execution`, `usage`, `interaction`, `ids`, `value`, `time`,
 `error`, `port_call`. None of those modules depends on `agent_loop`. Every
 seam points outward: the runtime defines traits, hosts implement adapters.
 

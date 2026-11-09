@@ -32,11 +32,9 @@ pub trait PromptProvider: Send + Sync + 'static {
 - `ToolResult` -> a typed tool message;
 - `Summary` -> `ModelMessage::system("Conversation summary:\n{content}")`.
 
-The fixed summary prefix is always preserved verbatim. When the summary
-content would push the message past the absolute model message text ceiling
-(`MAX_MODEL_MESSAGE_TEXT_BYTES`), only the content *tail* is truncated at a
-UTF-8 character boundary (never mid-character), so the default provider
-always projects a legal message for any legal maximum `BoundedText`.
+The fixed summary prefix and the entire summary content are preserved verbatim.
+The provider does not truncate text or impose a per-message byte quota. Context
+selection for actual model limits remains the host's responsibility.
 
 ## Core Enforcement
 

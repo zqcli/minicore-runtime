@@ -25,12 +25,13 @@ pub trait Model: Send + Sync + 'static {
 ## Request Semantics
 
 - Public `ModelRequest::new` validates non-empty messages, per-message text
-  validity (`MAX_MODEL_MESSAGE_TEXT_BYTES`), tool-exchange consistency (a
+  validity, tool-exchange consistency (a
   `ToolCall` is balanced with a `ToolResult` carrying the same id), and tool
   catalog order. `ToolSpec` constructors/deserialization already validate schemas.
   The runner uses a crate-private path that reuses the frozen `ToolSet` catalog
-  without revalidating it; loop start/update checks catalog budgets. Host-produced prompt
-  messages are still validated on every request; failures take the `Prompt` path.
+  without revalidating it. There is no catalog-count, schema-byte or message-byte
+  quota. Host-produced prompt messages are still validated on every request;
+  failures take the `Prompt` path.
 - `ModelCallContext { loop_id, request_index, cancellation, deadline }` is
   per request; the driver uses it for cancel/timeout/panic isolation.
 - One `ModelRequest` maps to one streamed response (`ToolCall`s + finish
@@ -46,23 +47,23 @@ control character except LF/TAB becomes one ASCII space. Normalization never
 increases UTF-8 byte length. Assistant text and reasoning text/summary constructors
 apply this policy to their whole payloads.
 
-Model delta constructors preserve raw text and enforce `MAX_MODEL_EVENT_TEXT_BYTES`
-on its raw byte length; direct event variants receive the same size check at the
-adapter boundary. Hosts can chunk raw text at any UTF-8 character boundary up to
-that limit, without reserving expansion space or avoiding CRLF boundaries.
+Model delta constructors are infallible and preserve raw text without a byte
+quota. Direct event variants have the same semantics. Hosts can chunk raw text
+at any UTF-8 character boundary without reserving normalization space or
+avoiding CRLF boundaries.
 
 Assembly normalizes text and reasoning independently across events. A trailing CR
 is emitted immediately as LF; a leading LF in the next non-empty delta of that
 same channel is dropped. Empty deltas and events in another channel leave this
 state unchanged. Canonical text equals normalization of the concatenated raw
 text, regardless of chunk boundaries. Forwarded progress uses those same
-normalized deltas, omitting empty ones. Per-round text/reasoning budgets count
-normalized bytes, not raw bytes.
+normalized deltas, omitting empty ones. Neither deltas nor assembled
+text/reasoning have an application byte quota.
 
 Tool-argument deltas use the same character replacements before JSON assembly,
-but are never forwarded as progress; arguments must still form a bounded JSON
-object. Opaque replay, encrypted reasoning and signatures retain their own
-validation rules.
+but are never forwarded as progress; arguments must still form a valid JSON
+object within the parser's stack-safety guard. Opaque replay, encrypted reasoning
+and signatures retain their own validation rules.
 
 Each model attempt receives a child cancellation token, cancelled on every
 attempt ending, including successful EOF, failure, timeout and dropped futures.
@@ -85,10 +86,10 @@ model-only timeout during backoff reports `Failed(Model)` with that prior cause.
   calls fails assembly and does not create complete history.
 - Streaming: the driver yields after progress and the runner drains ready
   progress before polling the driver again, so back-to-back deltas do not
-  starve forwarding. `TextDelta` and `ReasoningDelta` remain best-effort
-  events; a full host event queue may still drop them and they carry no correctness
-  weight. Tool-argument deltas are assembled
-  privately and are never forwarded as progress.
+  starve forwarding. `TextDelta` and `ReasoningDelta` use unbounded,
+  non-awaiting queues with no capacity-driven loss. They remain optional
+  observations and carry no correctness weight. Tool-argument deltas are
+  assembled privately and are never forwarded as progress.
 - Model timeouts, retry exhaustion, start/poll panics, and malformed responses surface
   as `Failed(Model)` or `Failed(InvalidModelResponse)` (or the specific
   mapping in the loop contract), never as a hang. In both model and
@@ -98,28 +99,31 @@ model-only timeout during backoff reports `Failed(Model)` with that prior cause.
   interpreted as an instruction for the runtime to automatically retry the
   entire loop.
 
-## Budgets
+## Limits and Stack Safety
 
-Request-level budgets come from `LoopLimits` (max tool calls per response,
-max tool name/schema/arguments bytes, max model text/reasoning bytes) and
-are enforced by the driver and the assembler. Crucially,
-`max_tool_calls_per_response` limits only the number of tool calls permitted
-in a single model response; it does not restrict the tool catalog size in
-`ModelRequest::tools` (`max_tool_schema_bytes` is a per-tool bound, not a total
-catalog bound). For N registered tools, compact schema payloads total at most
-N × `max_tool_schema_bytes` (at most 64 KiB per tool); the runtime does not cap N,
-so hosts own catalog-count limits. `LoopOptions::validate` fail-fast enforces upper
-bounds on model timeout (<= 24h) and retry base delay (<= 30s) aligned with
-`ModelDriver` constants. The per-message text ceiling
-is the shared crate-private `MAX_MODEL_MESSAGE_TEXT_BYTES` constant used by
-both `ModelMessage` validation and default prompt projection.
+`ModelLimits` retains actual context-window and output-token limits, and model
+capability validation remains enforced. `ModelFinishReason::Length` still means
+`OutputLimit`; removing application quotas does not change a provider's limits.
+`LoopOptions::validate` retains model timeout (<= 24h), retry attempts (1–4),
+retry base delay (<= 30s), nonzero port timeouts and future loop-deadline rules.
+
+There is no `LoopLimits`, text/reasoning byte cap, per-response tool-call quota,
+schema/argument byte or node cap, or round budget. Typed tool names and IDs keep
+their protocol grammar and lengths. Duplicate IDs, invalid ordering, malformed
+JSON and invalid tool associations remain errors.
+
+`validate_json_nesting` accepts 127 nested arrays/objects and rejects 128, the
+locked serde_json parser's default stack-safety boundary. Width and node count
+are unrestricted. Deserializing an entire DTO also counts its enclosing objects
+toward the parser's guard; the shared value guard checks the payload itself.
 
 ## Opaque provider replay (v0.6.1)
 
 `ProviderReplay::new(format, payload)` validates a provider-owned JSON envelope:
-format is 1–128 symbolic ASCII bytes, compact serialized envelope at most 256 KiB,
-payload depth at most 32 (root zero), and at most 16,384 nodes. Deserialization
-runs the same validation. Runtime never interprets or truncates provider content.
+format is 1–128 symbolic ASCII bytes and payload nesting follows the shared
+JSON stack-safety guard. Envelope size and payload node count have no application
+quota. Deserialization runs the same validation. Runtime never interprets or
+truncates provider content.
 `byte_len()` includes all envelope keys and punctuation, and history accounting
 includes these bytes in its size estimate; the runtime does not cap total
 history size.
@@ -167,7 +171,7 @@ A response requires the existing valid Finish and clean EOF contract.
 
 The model port already supplies a validated full tool name on `ToolCallStart`;
 this change does not invent a new name-streaming port. Text and reasoning keep
-existing assembly normalization and bounds. Debug output redacts argument text.
+existing assembly normalization without application byte quotas. Debug output redacts argument text.
 No second error or loop identity is stored in a partial. A subsequent tool-stage
 failure/cancellation retains the original complete assistant history and finish
 reason with `partial: None`. Partial content is never appended as `HistoryItem`

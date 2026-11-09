@@ -137,7 +137,9 @@ def render_markdown(phase: str, rows: list[dict]) -> str:
     lines = [
         "# Acceptance Matrix (V4-001..V4-070)",
         "",
-        "v0.4 delivery acceptance. Rows are generated from",
+        "Stable v0.4 acceptance identities with summaries mapped to current guarantees.",
+        "Historical test names are retained even when quotas they once tested were removed.",
+        "Rows are generated from",
         "`scripts/acceptance_v04.json` by `scripts/check_acceptance.py`; edit the JSON,",
         "not this file. Evidence names real tests, gates, docs, or examples.",
         "",

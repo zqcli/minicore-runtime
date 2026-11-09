@@ -28,9 +28,10 @@ one loop and returns control. Concretely:
 
 ## Events Are Best Effort
 
-- `take_events()` hands the caller the single bounded stream for this loop.
-- Every emission is a `try_send`; a full or closed queue never blocks the
-  runner. `LoopEventEnvelope.dropped_before` counts what you missed.
+- `take_events()` hands the caller the single unbounded stream for this loop.
+- Public events and internal model/tool progress use non-awaiting sends. There
+  is no capacity-driven loss, drop counter or persistent/replay event store.
+  A disconnected observer never blocks the runner or changes its outcome.
 - **Events are not authoritative.** Do not reconcile your durable transcript
   against the event stream, and never assume a Missing event means a tool
   never ran: tool side effects and the on-disk log are not atomic. If the
@@ -52,7 +53,8 @@ one loop and returns control. Concretely:
   The loop calls `take` on the runner task before every request preparation
   and again once a prompt is prepared; it must not block, await or do IO, and
   runs with no Runtime lock held. The host validates inputs where it accepts
-  them and bounds its own queue. Handing inputs over is final: they are in
+  them and owns its queue. Runtime imposes no input byte or queue-count quota.
+  Handing inputs over is final: they are in
   `LoopReport::appended` for every outcome. A model answer without tool
   calls always ends the loop, so a host with queued inputs starts the next
   loop itself. Hosts that want a loop-scoped view of their queue create the
