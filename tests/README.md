@@ -19,13 +19,13 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 | `tool_policy_interaction_contract.rs` | 8 | policy decisions, interaction DTO contracts, and ToolInputRequest validation |
 | `tool_set_contract.rs` | 11 | `ToolSet` registration, spec validation, enabled subsets |
 | `provider_replay.rs` | 2 | replay bounds, serde and legacy wire compatibility |
-| `history_handoff_contract.rs` | 8 | ordered incremental handoffs, backpressure, failure, cancellation-safe saving, callback panic isolation and unsupported complete finish preservation |
+| `history_handoff_contract.rs` | 16 | ordered incremental handoffs, backpressure, failure, cancellation-safe saving, callback panic isolation and unsupported complete finish preservation, combined failures and first-outcome claims |
 | `model_partial_contract.rs` | 7 | authoritative assembly on failure, EOF, cancellation and deadline, partial tool arguments, request identity and complete-response preservation |
 
 ## Unit (`src/**` inline and driver)
 
-- 80 unit tests in `src/`:
-  - `src/agent_loop/control.rs` (9 tests): control-layer CAS/seal, post-cancel rejection, 512 randomized multi-thread cancel/finish/update races, revision monotonicity, and outside-lock config drop probes.
+- 81 unit tests in `src/`:
+  - `src/agent_loop/control.rs` (10 tests): control-layer CAS/seal, post-cancel rejection, 512 randomized multi-thread cancel/finish/update races, revision monotonicity, and outside-lock config drop probes.
   - `src/agent_loop/runner/tests.rs` (7 tests): real runner panic with one published report, completion identity, wide counts, bounded settlement and post-publication config-destructor panics.
   - `src/model/driver/tests/` (46 tests): assembly (11), retry (8), deadline (6), preflight/progress (3), settlement (3), semantics (8), cancellation (7).
   - `src/tools/` (4 tests): input request validation (1) and progress channel semantics (3).
@@ -34,7 +34,7 @@ oneshot / watch / `start_paused` + `advance` only, no long sleeps.
 
   - `src/usage.rs` (1 test): partial usage accumulates reported fields.
 
-Total main-crate volume: **298 tests** (80 unit + 218 integration across 14 targets).
+Total main-crate volume: **307 tests** (81 unit + 226 integration across 14 targets).
 Two compile-fail doctests protect private `ToolSpec` and `ToolOutput` fields.
 `tests/support/` shares scripted model/tool/policy builders, config/start/join helpers
 and report extractors across separate binaries. Driver tests use the actual

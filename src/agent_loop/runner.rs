@@ -45,11 +45,18 @@ struct LoopCtx<'a> {
     completion_tx: &'a watch::Sender<Option<Arc<LoopReport>>>,
     history_offset: usize,
     partial: Option<ModelPartial>,
+    history_failure: Option<DiagnosticSummary>,
 }
 
 impl LoopCtx<'_> {
     fn publish(&mut self, state: LoopState) {
         publish(self.control, &mut *self.sink, state);
+    }
+
+    fn claim_noncompleted_end(&self, path: &FailPath) {
+        if !matches!(path, FailPath::Completed) {
+            self.control.claim_ending();
+        }
     }
 
     async fn handoff_history(&mut self, working: &WorkingHistory) -> Result<(), FailPath> {
@@ -64,19 +71,23 @@ impl LoopCtx<'_> {
         }
         // A callback may already own the range when saving fails or cancellation arrives.
         // Never retry it or drop its future in response to loop cancellation.
-        match AssertUnwindSafe(async { history.append(self.id, offset, &appended[offset..]).await })
-            .catch_unwind()
-            .await
+        let diagnostic = match AssertUnwindSafe(async {
+            history.append(self.id, offset, &appended[offset..]).await
+        })
+        .catch_unwind()
+        .await
         {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(diagnostic)) => Err(FailPath::History(diagnostic)),
-            Err(_) => Err(FailPath::History(DiagnosticSummary::bounded_static(
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(diagnostic)) => diagnostic,
+            Err(_) => DiagnosticSummary::bounded_static(
                 DiagnosticCode::Internal,
                 DiagnosticCategory::Internal,
                 "history callback panicked",
                 false,
-            ))),
-        }
+            ),
+        };
+        self.history_failure = Some(diagnostic.clone());
+        Err(FailPath::History(diagnostic))
     }
 }
 
@@ -153,6 +164,7 @@ async fn run_loop_inner(
         completion_tx: &completion_tx,
         history_offset: 0,
         partial: None,
+        history_failure: None,
     };
 
     ctx.sink.try_emit(LoopEvent::Started { loop_id: id });
@@ -180,7 +192,7 @@ async fn run_loop_inner(
     let mut usage = UsageAccumulator::default();
     let mut discarded_config = None;
 
-    let mut end = loop {
+    let end = loop {
         if cancellation.is_cancelled() {
             break FailPath::Cancelled;
         }
@@ -331,8 +343,11 @@ async fn run_loop_inner(
             None
         };
 
+        if let Some(path) = &no_tool_finish {
+            ctx.claim_noncompleted_end(path);
+        }
         if let Err(path) = ctx.handoff_history(&working).await {
-            break path;
+            break no_tool_finish.unwrap_or(path);
         }
 
         if let Some(path) = no_tool_finish {
@@ -373,8 +388,11 @@ async fn run_loop_inner(
             &tool_calls,
         )
         .await;
+        if let Some(path) = &batch_end {
+            ctx.claim_noncompleted_end(path);
+        }
         if let Err(path) = ctx.handoff_history(&working).await {
-            break path;
+            break batch_end.unwrap_or(path);
         }
         if let Some(path) = batch_end {
             break path;
@@ -382,9 +400,8 @@ async fn run_loop_inner(
         request_index = request_index.saturating_add(1);
     };
 
-    if let Err(path) = ctx.handoff_history(&working).await {
-        end = path;
-    }
+    ctx.claim_noncompleted_end(&end);
+    let _ = ctx.handoff_history(&working).await;
 
     let report = finish_loop(
         &mut ctx,
@@ -439,6 +456,7 @@ fn finish_loop(
         outcome: outcome.clone(),
         appended: working.into_appended(),
         partial: ctx.partial.take(),
+        history_failure: ctx.history_failure.take(),
         usage,
         requests,
         tool_rounds,
@@ -501,6 +519,7 @@ fn panic_report(
         )),
         appended: Arc::from([]),
         partial: None,
+        history_failure: None,
         usage: Usage::default(),
         requests: 0,
         tool_rounds: 0,

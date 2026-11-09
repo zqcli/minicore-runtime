@@ -20,9 +20,14 @@ Cancellation and deadline behavior of one loop.
   even before the runner publishes its report. Calls overlapping cancellation
   may already have been accepted; acceptance does not guarantee application.
 
-- Cancel/finish uses a single-CAS `AtomicU8` state machine: `mark_cancel`
-  and `finish_once` each perform one compare-and-swap, so cancel and report
-  sealing cannot race or double-publish.
+- Cancellation, non-completed ending claims and final sealing compete in one
+  `AtomicU8` state machine. The first claim wins; a known failure or deadline is
+  claimed before awaited history saving, preventing later cancellation from
+  replacing its primary reason. Claiming an ending does not publish completion;
+  `is_finished` stays false and `wait`/`join` still wait for saving to settle.
+- A no-tool completed candidate stays cancellable while saving is pending.
+  A callback error or panic is retained separately in `history_failure`; it does
+  not overwrite an earlier cancellation, failure or completed candidate.
 - A cancel that lands after the report is published returns `false` (the
   loop already ended); a completed loop that is later cancelled stays
   `Completed`.
@@ -52,4 +57,5 @@ requests `OwnerDropped` cancellation. Use `LoopHandle::wait()` for a cancellable
 wait that does not own the loop. With no loop deadline an interaction waits
 until answered or cancelled; it has no artificial 24-hour horizon. A deadline
 ending is sealed by the runner, not written as a cancellation state marker;
-a concurrent explicit cancellation that wins the seal determines the reason.
+an explicit cancellation that wins before the deadline ending is claimed
+determines the reason.

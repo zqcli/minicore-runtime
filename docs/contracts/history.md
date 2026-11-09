@@ -66,11 +66,25 @@ The receiver must own accepted work and keep its accepted position separately
 from saved position, including when saving fails. Runtime awaits the callback
 without cancelling or timing out that future, even if the loop is cancelled,
 its owner is dropped, or its deadline passes. Hosts must complete or fail their
-own saving; a callback that never settles prevents report publication.
+own save-task lifetime and termination; a callback that never settles prevents
+report publication. Runtime does not impose a timeout that abandons this work.
 
-A failed or panicking callback stops subsequent model/tool work with a `History`
-failure, subject to the existing cancel/seal race. It is never retried, and no
-completed tool is replayed. The final report still includes every complete item.
+A failed or panicking callback always records its diagnostic in
+`LoopReport.history_failure` and stops subsequent model/tool work. It never
+replaces a known primary business outcome: prompt/model/response/policy failures
+retain their original diagnostics, including structured `model_error`, and
+already-claimed cancellation remains cancellation. Those non-completed endings
+claim their outcome before awaiting saving, so a later cancel cannot replace
+them. If no primary ending was known and saving prevents otherwise-required
+tools or a next request, the outcome is `Failed(History)`.
+
+A complete no-tool candidate may return `Completed` with `history_failure`.
+This is an execution candidate, not saved completion: the host must block
+continuation and public completion until its applicable saving is confirmed.
+A completed candidate remains cancellable while its callback is pending; a
+cancel that wins first yields `Cancelled` with the same history diagnostic.
+The callback is never retried, and no completed tool is replayed. The final
+report still includes every complete item.
 The host reconciles any missing tail using its accepted offset, not its saved
 offset; it must not append an accepted but unsaved range twice. Callback arguments
 remain valid only for the call, so the receiver copies or shares needed items

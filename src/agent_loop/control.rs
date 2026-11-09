@@ -14,15 +14,14 @@ use super::{AnswerError, CancelReason, LoopReport, LoopState, LoopStatus, Update
 
 /// Single linearizable state machine for cancelling and sealing a loop.
 ///
-/// `mark_cancel` and `finish_once` are both atomic transitions out of `NONE`;
-/// whichever wins first is the authoritative outcome and every later call is
-/// a no-op. This gives one linearization point for the final-seal race (no
-/// load-then-CAS window).
+/// Cancellation, a non-completed ending claim, and final sealing compete for
+/// the first transition out of `NONE` without a load-then-CAS window.
 const STATE_NONE: u8 = 0;
 const STATE_CANCEL_USER: u8 = 1;
 const STATE_CANCEL_OWNER_DROPPED: u8 = 2;
 const STATE_CANCEL_SHUTDOWN: u8 = 3;
 const STATE_FINISHED: u8 = 4;
+const STATE_ENDING: u8 = 5;
 
 /// Outcome of the exactly-once completion seal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,7 +149,7 @@ impl LoopControl {
     }
 
     /// Requests cancellation. Returns whether this call performed the actual
-    /// transition; it is `false` once the loop is already cancelled or sealed.
+    /// transition; it is `false` once cancellation or an ending has been claimed.
     pub(crate) fn mark_cancel(&self, reason: CancelSource) -> bool {
         let target = match reason {
             CancelSource::User => STATE_CANCEL_USER,
@@ -167,6 +166,16 @@ impl LoopControl {
         } else {
             false
         }
+    }
+
+    /// Claims an already-known ending before waiting for host-owned cleanup without publishing completion.
+    pub(crate) fn claim_ending(&self) {
+        let _ = self.state.compare_exchange(
+            STATE_NONE,
+            STATE_ENDING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 
     /// Accepts a full config replacement; it takes effect at the next request
@@ -270,6 +279,10 @@ impl LoopControl {
                     FinishSeal::CancelledPrior(cancel_reason_value(cancel))
                 }
                 Err(STATE_FINISHED) => FinishSeal::AlreadyFinished,
+                Err(STATE_ENDING) => {
+                    self.state.store(STATE_FINISHED, Ordering::SeqCst);
+                    FinishSeal::Clean
+                }
                 Err(_) => unreachable!("unknown loop state value"),
             };
             guard.accepting_updates = false;
@@ -588,6 +601,28 @@ mod tests {
         assert!(!control.mark_cancel(CancelSource::Shutdown));
         assert_eq!(control.cancel_reason(), CancelReason::User);
         assert_eq!(control.update(config()), Err(UpdateError::NotActive));
+    }
+
+    #[test]
+    fn ending_claim_preserves_the_first_outcome_without_publishing_completion() {
+        let ending_first = control();
+        ending_first.claim_ending();
+        assert!(!ending_first.is_finished());
+        assert!(!ending_first.mark_cancel(CancelSource::User));
+        assert_eq!(ending_first.update(config()), Err(UpdateError::NotActive));
+        assert_eq!(ending_first.finish_once().0, FinishSeal::Clean);
+        assert!(ending_first.is_finished());
+        assert_eq!(ending_first.finish_once().0, FinishSeal::AlreadyFinished);
+
+        let cancel_first = control();
+        assert!(cancel_first.mark_cancel(CancelSource::Shutdown));
+        cancel_first.claim_ending();
+        assert!(!cancel_first.is_finished());
+        assert_eq!(
+            cancel_first.finish_once().0,
+            FinishSeal::CancelledPrior(CancelReason::Shutdown)
+        );
+        assert_eq!(cancel_first.finish_once().0, FinishSeal::AlreadyFinished);
     }
 
     /// begin_final closes accepting in the same lock and hands the pending

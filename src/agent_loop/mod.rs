@@ -268,6 +268,8 @@ pub struct LoopReport {
     pub appended: Arc<[HistoryItem]>,
     /// Assembled output from the one request that did not form a complete response.
     pub partial: Option<ModelPartial>,
+    /// A callback failure retained independently of the primary execution outcome.
+    pub history_failure: Option<DiagnosticSummary>,
     pub usage: Usage,
     pub requests: u32,
     /// Number of tool batches entered; independent of the optional u16 budget.

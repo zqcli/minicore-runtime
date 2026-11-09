@@ -9,7 +9,8 @@ one loop and returns control. Concretely:
   fresh `UserInput`, and the immutable `ExecutionConfig` (model, reasoning,
   tools, optional policy, prompt provider).
 - **The runtime supplies** `LoopReport` (outcome, `appended` in-memory items,
-  optional model `partial`, `usage`, `requests`, `tool_rounds`, final `ConfigRevision`), current
+  optional model `partial`, optional `history_failure`, `usage`, `requests`,
+  `tool_rounds`, final `ConfigRevision`), current
   `LoopState` through `state`/`watch_state`, and an optional best-effort
   `LoopEventStream`.
 - **The host persists** whatever it wants: the report, selected appended
@@ -79,6 +80,11 @@ exactly once, then save outside owner-state locks before acknowledging it. Keep
 accepted and saved offsets separate: an error does not unaccept a range, and
 join still returns the entire delta. The callback future must retain ownership
 until saving settles, including after cancellation or caller wait abandonment.
+Inspect `report.history_failure` independently of `report.outcome`, preserving
+business faults separately from persistence faults. Even `Completed` with a
+history failure is blocked: it cannot authorize continuation or public completion
+until the applicable saving is confirmed. Runtime does not discard or time out
+owned saving, so the host owns its eventual successful or failed termination.
 See [history handoff](../contracts/history.md#incremental-handoff).
 
 Save `LoopReport.partial` separately from complete history when present. It is

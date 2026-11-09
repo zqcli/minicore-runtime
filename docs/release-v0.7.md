@@ -22,6 +22,12 @@ defined by the contracts and the latest README compatibility notes.
   actual finish metadata are no longer discarded or mistaken for a partial.
   Aggregate usage overflow likewise retains the new complete response before
   returning the existing internal-failure outcome.
+- `LoopReport.history_failure` preserves a callback diagnostic separately from
+  the primary business outcome. Model/prompt/policy failures are not replaced by
+  later saving failures, and structured model errors survive. Non-completed
+  endings claim their outcome before awaited saving; an earlier cancellation
+  still wins. A completed no-tool candidate can retain `Completed` with a
+  history failure, which the host must treat as a blocked save boundary.
 - The package version remains 0.9.2 until a release is explicitly prepared.
 
 ## 0.7.0
@@ -113,7 +119,7 @@ bash scripts/check-architecture.sh
 
 Since 0.7.3 no minimum Rust version is tested; the gate runs on current stable.
 
-The main suite has 298 tests: 80 unit and 218 integration tests in 14 binaries.
+The main suite has 307 tests: 81 unit and 226 integration tests in 14 binaries.
 Two compile-fail doctests additionally protect the checked tool DTO boundaries.
 The two examples compile as test targets. The acceptance checker preserves all
 70 Passed rows and validates their source/test references. See the

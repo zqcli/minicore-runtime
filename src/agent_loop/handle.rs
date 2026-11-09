@@ -50,7 +50,7 @@ impl LoopHandle {
     }
 
     /// Requests host shutdown; the report records `CancelReason::Shutdown`.
-    /// Returns `false` if cancellation or completion already won.
+    /// Returns `false` if cancellation or another ending already won.
     pub fn shutdown(&self) -> bool {
         self.control
             .mark_cancel(crate::agent_loop::control::CancelSource::Shutdown)

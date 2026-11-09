@@ -100,7 +100,8 @@ for offsets, cancellation-safe saving and failure ownership.
 ## Final Report
 
 - `LoopReport` carries `outcome`, `appended` (only in-memory items this loop
-  produced), optional model `partial`, `usage`, `requests`, `tool_rounds`, and the final
+  produced), optional model `partial`, optional `history_failure`, `usage`,
+  `requests`, `tool_rounds`, and the final
   `ConfigRevision`. `tool_rounds` is a `u64` count of entered tool batches,
   not a saturated `u16` budget counter. `LoopOptions.max_tool_rounds` remains
   `u16`: zero (the default) disables that optional limit; positive values
@@ -111,6 +112,10 @@ for offsets, cancellation-safe saving and failure ownership.
   actual unfinished assembly only; a tool-stage cancellation does not turn a
   previously complete response into partial content. See the
   [model partial contract](model.md#unfinished-model-output).
+- `history_failure` records a history callback diagnostic without replacing a
+  prior business failure or cancellation. `Completed` with this field present
+  remains blocked on host saving and must not trigger a new loop or public
+  completion until that boundary is confirmed.
 - A failed inner port (model/prompt/policy/tool) maps to a `LoopOutcome:
   Failed(LoopFailure { kind, diagnostic })`; cancellation maps to
   `Cancelled(CancelReason)`.
@@ -125,7 +130,9 @@ for offsets, cancellation-safe saving and failure ownership.
 ## Determinism of Control
 
 `update`, `answer`, and the final seal linearize on one short mutex;
-cancel/finish use a single-CAS `AtomicU8` state machine. All event
+cancellation, non-completed ending claims and final sealing use an `AtomicU8`
+state machine. The first outcome claim wins, while report publication waits for
+owned saving. All event
 emissions are best-effort `try_send`s and never block the loop. Waiting for
 input or events never affects loop correctness.
 Usage totals sum each reported field independently; a field is `None` only if

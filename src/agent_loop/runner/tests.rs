@@ -208,6 +208,7 @@ async fn finish_loop_losing_the_seal_returns_the_published_arc() {
         outcome: LoopOutcome::Completed,
         appended: Arc::from([]),
         partial: None,
+        history_failure: None,
         usage: Usage::default(),
         requests: 0,
         tool_rounds: 0,
@@ -225,6 +226,7 @@ async fn finish_loop_losing_the_seal_returns_the_published_arc() {
         completion_tx: &completion_tx,
         history_offset: 0,
         partial: None,
+        history_failure: None,
     };
     let report = finish_loop(
         &mut ctx,
@@ -262,6 +264,7 @@ async fn completion_preserves_tool_round_counts_beyond_u16() {
             completion_tx: &completion_tx,
             history_offset: 0,
             partial: None,
+            history_failure: None,
         };
         let report = finish_loop(
             &mut ctx,

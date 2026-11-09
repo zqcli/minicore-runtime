@@ -7,7 +7,7 @@ use std::time::Duration;
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use minicore_runtime::model::{ModelEvent, ModelFinishReason, ProviderReplay, Usage};
 use minicore_runtime::prompt::{PromptError, PromptFuture, PromptProvider, PromptRequest};
-use minicore_runtime::tools::ToolSet;
+use minicore_runtime::tools::{ToolResultOutcome, ToolSet};
 use minicore_runtime::{
     AgentLoop, BoundedText, CancelReason, HistoryFuture, HistoryItem, LoopFailureKind, LoopHistory,
     LoopId, LoopOptions, LoopOutcome, SummaryHistory,
@@ -165,6 +165,7 @@ async fn incremental_handoffs_preserve_order_and_gate_tools_and_next_model() {
         .unwrap()
         .unwrap();
     assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert!(report.history_failure.is_none());
     let delivered: Vec<_> = history
         .deliveries
         .lock()
@@ -191,6 +192,7 @@ async fn failed_response_handoff_never_starts_tools_or_retries_accepted_range() 
     assert!(
         matches!(&report.outcome, LoopOutcome::Failed(failure) if failure.kind == LoopFailureKind::History && failure.model_error().is_none())
     );
+    assert_save_failure(&report);
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     assert!(calls.lock().unwrap().is_empty());
     assert_eq!(report.appended.len(), 2);
@@ -200,23 +202,34 @@ async fn failed_response_handoff_never_starts_tools_or_retries_accepted_range() 
 
 #[tokio::test]
 async fn failed_tool_result_handoff_preserves_side_effects_and_stops_next_request() {
-    let (history, _receiver) = recorder(false, Some(1), None);
-    let (model, attempts, _) = scripted_model_counted(vec![Round::Tools {
-        calls: vec![("echo", "first"), ("echo", "second")],
-    }]);
-    let (agent, calls) = start_echo(model, ToolBehavior::Succeed, options(history.clone()));
-    let report = tokio::time::timeout(Duration::from_secs(5), agent.join())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        matches!(&report.outcome, LoopOutcome::Failed(failure) if failure.kind == LoopFailureKind::History)
-    );
-    assert_eq!(attempts.load(Ordering::SeqCst), 1);
-    assert_eq!(calls.lock().unwrap().len(), 2);
-    assert_eq!(report.appended.len(), 4);
-    assert_eq!(history.deliveries.lock().unwrap().len(), 2);
-    assert_eq!(history.saved.load(Ordering::SeqCst), 2);
+    for (behavior, expected_result) in [
+        (ToolBehavior::Succeed, ToolResultOutcome::Success),
+        (ToolBehavior::Fail, ToolResultOutcome::Failed),
+    ] {
+        let (history, _receiver) = recorder(false, Some(1), None);
+        let (model, attempts, _) = scripted_model_counted(vec![Round::Tools {
+            calls: vec![("echo", "first"), ("echo", "second")],
+        }]);
+        let (agent, calls) = start_echo(model, behavior, options(history.clone()));
+        let report = tokio::time::timeout(Duration::from_secs(5), agent.join())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&report.outcome, LoopOutcome::Failed(failure) if failure.kind == LoopFailureKind::History)
+        );
+        assert_save_failure(&report);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(report.appended.len(), 4);
+        assert!(
+            tool_results(&report)
+                .iter()
+                .all(|result| result.outcome == expected_result)
+        );
+        assert_eq!(history.deliveries.lock().unwrap().len(), 2);
+        assert_eq!(history.saved.load(Ordering::SeqCst), 2);
+    }
 }
 
 struct FailingPrompt;
@@ -257,8 +270,8 @@ async fn final_unwind_hands_off_consumed_inputs_after_prompt_failure() {
 
 #[tokio::test]
 async fn cancellation_and_owner_drop_do_not_drop_pending_history_save() {
-    for drop_owner in [false, true] {
-        let (history, mut receiver) = recorder(true, None, None);
+    for (drop_owner, fail_save) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (history, mut receiver) = recorder(true, fail_save.then_some(0), None);
         let (model, _) = scripted_model(vec![Round::Final {
             text: "complete response",
         }]);
@@ -286,7 +299,15 @@ async fn cancellation_and_owner_drop_do_not_drop_pending_history_save() {
             .unwrap()
             .unwrap();
         assert_eq!(report.outcome, LoopOutcome::Cancelled(expected));
-        assert_eq!(history.saved.load(Ordering::SeqCst), delivered.items.len());
+        assert_eq!(
+            history.saved.load(Ordering::SeqCst),
+            if fail_save { 0 } else { delivered.items.len() }
+        );
+        if fail_save {
+            assert_save_failure(&report);
+        } else {
+            assert!(report.history_failure.is_none());
+        }
         let HistoryItem::Assistant(assistant) = &report.appended[1] else {
             panic!("complete response lost")
         };
@@ -309,8 +330,10 @@ async fn panicking_history_callback_preserves_full_report_without_retry() {
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        matches!(&report.outcome, LoopOutcome::Failed(failure) if failure.kind == LoopFailureKind::History)
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_eq!(
+        report.history_failure.as_ref().unwrap().message().as_str(),
+        "history callback panicked"
     );
     assert_eq!(report.appended.len(), 2);
     assert_eq!(history.deliveries.lock().unwrap().len(), 1);
@@ -402,4 +425,323 @@ async fn usage_overflow_retains_the_new_complete_response_before_failure() {
     assert_eq!(deliveries.len(), 3);
     assert_eq!(deliveries[2].offset, 3);
     assert_eq!(&deliveries[2].items[..], &report.appended[3..]);
+}
+
+fn assert_save_failure(report: &minicore_runtime::LoopReport) {
+    assert_eq!(
+        report.history_failure.as_ref().unwrap().message().as_str(),
+        "test save failed"
+    );
+}
+
+fn primary_model_error() -> minicore_runtime::model::ModelError {
+    minicore_runtime::model::ModelError::started(
+        minicore_runtime::model::ModelErrorKind::ProviderUnavailable,
+        DiagnosticSummary::new(
+            DiagnosticCode::ModelUnavailable,
+            DiagnosticCategory::Model,
+            BoundedText::new("primary provider failure").unwrap(),
+            false,
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn primary_prompt_failure_survives_failed_history_save() {
+    let (history, _receiver) = recorder(false, Some(0), None);
+    let (model, attempts, _) = scripted_model_counted(vec![]);
+    let config = config_full(
+        model,
+        minicore_runtime::model::ReasoningPreference::Auto,
+        ToolSet::default(),
+        None,
+        Arc::new(FailingPrompt),
+    );
+    let agent = AgentLoop::start(request(config), options(history.clone()), no_inputs()).unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(5), agent.join())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&report.outcome, LoopOutcome::Failed(failure) if failure.kind == LoopFailureKind::Prompt && failure.diagnostic.code == DiagnosticCode::ContextFailed)
+    );
+    assert_save_failure(&report);
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(report.appended.len(), 1);
+    assert_eq!(history.deliveries.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn primary_model_and_assembly_errors_survive_failed_history_save() {
+    for invalid_assembly in [false, true] {
+        let (history, _receiver) = recorder(false, Some(0), None);
+        let events = vec![ModelEvent::text_delta("unfinished output").unwrap()];
+        let round = if invalid_assembly {
+            Round::Events(events)
+        } else {
+            Round::StreamError {
+                events,
+                error: primary_model_error(),
+            }
+        };
+        let (model, attempts, _) = scripted_model_counted(vec![round]);
+        let agent = AgentLoop::start(
+            request(config(model, ToolSet::default(), None)),
+            options(history.clone()),
+            no_inputs(),
+        )
+        .unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(5), agent.join())
+            .await
+            .unwrap()
+            .unwrap();
+        let LoopOutcome::Failed(failure) = &report.outcome else {
+            panic!("primary failure lost")
+        };
+        let expected = if invalid_assembly {
+            LoopFailureKind::InvalidModelResponse
+        } else {
+            LoopFailureKind::Model
+        };
+        assert_eq!(failure.kind, expected);
+        let model_error = failure
+            .model_error()
+            .expect("structured model error must survive saving failure");
+        if invalid_assembly {
+            assert_eq!(
+                model_error.kind(),
+                minicore_runtime::model::ModelErrorKind::IncompleteResponse
+            );
+        } else {
+            assert_eq!(model_error, &primary_model_error());
+        }
+        assert_save_failure(&report);
+        assert!(report.partial.is_some());
+        assert_eq!(report.appended.len(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(history.deliveries.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn complete_response_failures_survive_failed_history_save() {
+    for (reason, expected) in [
+        (ModelFinishReason::Length, LoopFailureKind::OutputLimit),
+        (ModelFinishReason::Refused, LoopFailureKind::Refused),
+        (
+            ModelFinishReason::ContentFiltered,
+            LoopFailureKind::ContentFiltered,
+        ),
+        (
+            ModelFinishReason::Unknown,
+            LoopFailureKind::InvalidModelResponse,
+        ),
+    ] {
+        let (history, _receiver) = recorder(false, Some(0), None);
+        let (model, _) = scripted_model(vec![Round::Events(vec![
+            ModelEvent::text_delta("complete but unsuccessful response").unwrap(),
+            ModelEvent::Finish { reason },
+        ])]);
+        let agent = AgentLoop::start(
+            request(config(model, ToolSet::default(), None)),
+            options(history.clone()),
+            no_inputs(),
+        )
+        .unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(5), agent.join())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&report.outcome, LoopOutcome::Failed(failure) if failure.kind == expected)
+        );
+        assert_save_failure(&report);
+        assert!(report.partial.is_none());
+        let HistoryItem::Assistant(assistant) = &report.appended[1] else {
+            panic!("complete response lost")
+        };
+        assert_eq!(assistant.finish_reason, reason);
+        assert_eq!(history.deliveries.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn completed_candidate_survives_failed_save_with_explicit_history_fault() {
+    let (history, _receiver) = recorder(false, Some(0), None);
+    let (model, _) = scripted_model(vec![Round::Final {
+        text: "completed answer",
+    }]);
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        options(history.clone()),
+        no_inputs(),
+    )
+    .unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(5), agent.join())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Completed);
+    assert_save_failure(&report);
+    assert_eq!(report.appended.len(), 2);
+    assert_eq!(history.saved.load(Ordering::SeqCst), 0);
+    assert_eq!(history.deliveries.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn policy_failure_claim_survives_later_cancel_and_failed_batch_save() {
+    let (history, mut receiver) = recorder(true, Some(1), None);
+    let (model, attempts, _) = scripted_model_counted(vec![Round::Tools {
+        calls: vec![("echo", "not-executed")],
+    }]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let policy = Arc::new(ScriptedPolicy {
+        plan: Arc::new(vec![PolicyPlan::Invalid]),
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let agent = AgentLoop::start(
+        request(config(
+            model,
+            tool_set(calls.clone(), ToolBehavior::Succeed),
+            Some(policy),
+        )),
+        options(history.clone()),
+        no_inputs(),
+    )
+    .unwrap();
+    let first = next(&mut receiver).await;
+    assert_eq!(first.offset, 0);
+    history.gate.as_ref().unwrap().add_permits(1);
+    let batch = next(&mut receiver).await;
+    assert_eq!(batch.offset, 2);
+    assert!(
+        !agent.handle().cancel(),
+        "known policy failure must win before saving awaits"
+    );
+    assert!(futures_util::poll!(Box::pin(agent.handle().wait())).is_pending());
+    history.gate.as_ref().unwrap().add_permits(1);
+    let report = tokio::time::timeout(Duration::from_secs(5), agent.join())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&report.outcome, LoopOutcome::Failed(failure) if failure.kind == LoopFailureKind::Policy && failure.diagnostic.code == DiagnosticCode::PolicyFailed)
+    );
+    assert_save_failure(&report);
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(report.appended.len(), 3);
+    assert_eq!(history.deliveries.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn failure_claim_survives_later_cancel_during_failed_response_or_final_save() {
+    for complete in [false, true] {
+        let (history, mut receiver) = recorder(true, Some(0), None);
+        let round = if complete {
+            Round::Events(vec![
+                ModelEvent::text_delta("complete response").unwrap(),
+                ModelEvent::Finish {
+                    reason: ModelFinishReason::Unknown,
+                },
+            ])
+        } else {
+            Round::StreamError {
+                events: vec![ModelEvent::text_delta("partial").unwrap()],
+                error: primary_model_error(),
+            }
+        };
+        let (model, _) = scripted_model(vec![round]);
+        let agent = AgentLoop::start(
+            request(config(model, ToolSet::default(), None)),
+            options(history.clone()),
+            no_inputs(),
+        )
+        .unwrap();
+        next(&mut receiver).await;
+        assert!(
+            !agent.handle().cancel(),
+            "the original failure must be claimed before saving awaits"
+        );
+        history.gate.as_ref().unwrap().add_permits(1);
+        let report = tokio::time::timeout(Duration::from_secs(5), agent.join())
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = if complete {
+            LoopFailureKind::InvalidModelResponse
+        } else {
+            LoopFailureKind::Model
+        };
+        assert!(
+            matches!(&report.outcome, LoopOutcome::Failed(failure) if failure.kind == expected && failure.model_error().is_some())
+        );
+        assert_save_failure(&report);
+    }
+}
+
+#[tokio::test]
+async fn cancellation_claim_survives_failed_final_save() {
+    let (history, mut receiver) = recorder(true, Some(0), None);
+    let (model, started) = scripted_model(vec![Round::Hold]);
+    let notified = started.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        options(history.clone()),
+        no_inputs(),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), notified)
+        .await
+        .unwrap();
+    assert!(agent.handle().cancel());
+    next(&mut receiver).await;
+    history.gate.as_ref().unwrap().add_permits(1);
+    let report = tokio::time::timeout(Duration::from_secs(5), agent.join())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.outcome, LoopOutcome::Cancelled(CancelReason::User));
+    assert_save_failure(&report);
+    assert!(report.partial.is_none());
+    assert_eq!(report.appended.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn deadline_claim_survives_later_cancel_and_failed_final_save() {
+    let (history, mut receiver) = recorder(true, Some(0), None);
+    let (model, started) = scripted_model(vec![Round::Hold]);
+    let notified = started.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let mut options = options(history.clone());
+    options.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(2));
+    let agent = AgentLoop::start(
+        request(config(model, ToolSet::default(), None)),
+        options,
+        no_inputs(),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), notified)
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    next(&mut receiver).await;
+    assert!(
+        !agent.handle().cancel(),
+        "deadline was claimed before the save callback"
+    );
+    history.gate.as_ref().unwrap().add_permits(1);
+    let report = tokio::time::timeout(Duration::from_secs(1), agent.join())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report.outcome,
+        LoopOutcome::Cancelled(CancelReason::Deadline)
+    );
+    assert_save_failure(&report);
 }

@@ -595,6 +595,7 @@ fn loop_report_and_outcome_are_constructible() {
         outcome: LoopOutcome::Cancelled(CancelReason::User),
         appended: Arc::new([]),
         partial: None,
+        history_failure: None,
         usage: Usage::new(1, 2, 0),
         requests: 1,
         tool_rounds: 0,

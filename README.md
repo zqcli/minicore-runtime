@@ -209,7 +209,7 @@ for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
   the actual failed/cancelled model assembly, not the observation stream. It
   preserves the original `request_index`, canonical `AssistantPart`s, unfinished
   tool argument fragments, and any observed usage/replay metadata. Add `partial`
-  when constructing report literals.
+  and `history_failure` when constructing report literals.
 - `model::IncompleteToolCall` retains the original part/call indices, call ID,
   tool name and raw argument text; no missing arguments or executable calls are
   invented. Partial content is not a `HistoryItem` or automatic replay input.
@@ -217,8 +217,16 @@ for the test inventory and [AGENTS.md](AGENTS.md) for coding-agent guidance.
   fails the loop, but now remains complete history with its actual finish reason
   and is handed off before termination; it is never reclassified as partial.
   Aggregate usage overflow also retains the already complete response.
-- Callback failures use `LoopFailureKind::History`, never model retry or tool
-  business-error paths. Hosts using `LoopOptions` struct literals must add
+- `LoopReport.history_failure` retains a callback error or panic independently
+  of the primary outcome. Known business failures keep their diagnostic and
+  structured model error; prior cancellation remains cancellation. A no-tool
+  completed candidate may have `Completed` plus a history failure, so hosts must
+  check this field before continuation or claiming saved completion.
+- A save failure that prevents otherwise-required tools or the next request
+  uses `LoopFailureKind::History`; it never becomes a model retry or tool
+  business error. Known non-completed endings are claimed before awaiting
+  saving, so later cancellation cannot replace them; completed candidates stay
+  cancellable while saving. Hosts using `LoopOptions` struct literals must add
   `history`; cloning options shares the receiver without requiring `Debug`.
 
 ### 0.9.2
