@@ -210,6 +210,7 @@ async fn finish_loop_losing_the_seal_returns_the_published_arc() {
         usage: Usage::default(),
         requests: 0,
         model_attempts: Arc::from([]),
+        model_retry_wait_elapsed: Arc::from([]),
         tool_rounds: 0,
         final_config_revision: ConfigRevision::INITIAL,
     });
@@ -225,6 +226,7 @@ async fn finish_loop_losing_the_seal_returns_the_published_arc() {
         completion_tx: &completion_tx,
         history_offset: 0,
         model_attempts: Vec::new(),
+        model_retry_wait_elapsed: Vec::new(),
         partial: None,
         history_failure: None,
     };
@@ -263,6 +265,7 @@ async fn completion_preserves_tool_round_counts_beyond_u16() {
             completion_tx: &completion_tx,
             history_offset: 0,
             model_attempts: Vec::new(),
+            model_retry_wait_elapsed: Vec::new(),
             partial: None,
             history_failure: None,
         };

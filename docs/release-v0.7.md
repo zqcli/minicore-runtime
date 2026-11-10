@@ -3,6 +3,28 @@
 Versioned sections describe changes at that version. Current behavior is
 defined by the contracts and the latest README compatibility notes.
 
+## 0.10.0 retry-wait timing follow-up (prepared locally)
+
+- Add `LoopReport.model_retry_wait_elapsed: Arc<[Duration]>`; struct literals
+  need the new field. Entries align with `model_attempts` by zero-based issued
+  request index. No wait means zero; unissued preparation adds no entry.
+- Each entry sums actual Tokio monotonic elapsed inside retry waits, including
+  cancellation/deadline interruption and delayed re-poll. It excludes prompt,
+  provider execution, tools and history saving. The source is neither scheduled
+  backoff nor received observation timing, and no observer is needed.
+- The private settlement handoff carries the sum without new public events or
+  state fields. The initial model call remains included in `model_attempts`;
+  planned but unstarted retries add no attempt. Original errors, partial output,
+  history acknowledgement and retry/deadline policy remain unchanged.
+- Fourteen deterministic retry-state tests and three red-to-green timing
+  mutations cover the contract; see the
+  [development record](development-plan.md#actual-retry-wait-timing-follow-up).
+  The full quality gate passes all 324 main-crate tests; two doctests, a unique
+  test-list inventory and ten focused repeats pass on Linux. No Host,
+  live-provider or cross-platform execution is claimed.
+  This local change does not publish a branch or tag or change the package
+  version, dependencies or provider harness.
+
 ## 0.10.0 retry-state follow-up (prepared locally)
 
 - Add `LoopState.model_retry` and `model_attempts`, root-exported

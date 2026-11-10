@@ -211,6 +211,13 @@ define the present API.
   does not add a call. `requests` remains the logical-request count. Struct
   literals for `LoopState` and `LoopReport` need the new fields. State reads and
   initial watch snapshots do not require a public event subscription.
+- `LoopReport.model_retry_wait_elapsed: Arc<[Duration]>` adds actual elapsed
+  backoff per issued logical request, aligned with `model_attempts`. Update
+  report struct literals with the new field. Each entry sums the driver's
+  monotonic time inside retry waits, including interrupted waits and delayed
+  re-polls, not scheduled delays or observer receipt times. No wait means zero;
+  an unissued preparation has no entry. Prompt, model execution, tools and
+  history saving are excluded. No new state field or event kind is needed.
 
 - **Breaking:** `BoundedText` becomes `Text`, with infallible `Text::new` and
   the same plain-string wire format. Remove `new_with_max_bytes` and obsolete

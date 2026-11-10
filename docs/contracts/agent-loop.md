@@ -44,7 +44,9 @@ The runner loops:
    runtime does not perform automatic whole-loop retries. `LoopState.model_retry`
    and `model_attempts` expose driver-owned retry progress and actual calls for
    the current request; `LoopReport.model_attempts` retains the actual call count
-   for each zero-based request index. See [retry state](model.md#retry-state).
+   for each zero-based request index. `LoopReport.model_retry_wait_elapsed`
+   retains actual accumulated backoff duration at those same indices, including
+   interrupted waits. See [retry state](model.md#retry-state).
 6. On a response with tool calls, execute the tool batch pinned to the
    snapshot of the producing request; then loop back.
 7. On a response without tool calls, close accepting and end. The host's

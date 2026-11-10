@@ -129,6 +129,22 @@ structured `ModelError`, not a new synthesized failure.
   zero-based index order, independently of watch coalescing. A logical request
   stopped by a preflight check before `Model::start` has count zero. Internal
   retries do not increment `LoopReport.requests` or change `request_index`.
+- `LoopReport.model_retry_wait_elapsed: Arc<[Duration]>` has the same length
+  and zero-based index association as `model_attempts`. Each entry sums elapsed
+  Tokio monotonic time measured immediately around the driver's retry-wait
+  awaits, including cancellation or model/loop deadline interruption. A delayed
+  re-poll can make elapsed time longer than the planned backoff or deadline;
+  neither scheduled delays nor event/watch receipt times supply the duration.
+  Prompt preparation, model execution, tools and history saving are excluded.
+  No wait, including an issued request stopped before its first start, gives
+  zero. Unissued preparations add no entry to either report array.
+
+The private settlement handoff carries the accumulated duration even when the
+wait returns an error, before history acknowledgement or final publication.
+It neither replaces the original failure nor requires an observer. Actual
+recovery calls are `model_attempts[index].saturating_sub(1)`; elapsed wait does
+not imply the planned next attempt started. The internal-panic fallback keeps
+both arrays empty alongside its existing zero request count.
 
 The existing safe-retry predicate, total-attempt range 1–4 (default 2), capped
 exponential delay, Retry-After lower bound, overall deadline and cancellation

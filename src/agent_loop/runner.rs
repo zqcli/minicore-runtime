@@ -44,6 +44,7 @@ struct LoopCtx<'a> {
     completion_tx: &'a watch::Sender<Option<Arc<LoopReport>>>,
     history_offset: usize,
     model_attempts: Vec<u8>,
+    model_retry_wait_elapsed: Vec<Duration>,
     partial: Option<ModelPartial>,
     history_failure: Option<DiagnosticSummary>,
 }
@@ -164,6 +165,7 @@ async fn run_loop_inner(
         completion_tx: &completion_tx,
         history_offset: 0,
         model_attempts: Vec::new(),
+        model_retry_wait_elapsed: Vec::new(),
         partial: None,
         history_failure: None,
     };
@@ -454,6 +456,7 @@ fn finish_loop(
         usage,
         requests,
         model_attempts: std::mem::take(&mut ctx.model_attempts).into(),
+        model_retry_wait_elapsed: std::mem::take(&mut ctx.model_retry_wait_elapsed).into(),
         tool_rounds,
         final_config_revision: revision,
     });
@@ -530,6 +533,7 @@ fn panic_report(
         usage: Usage::default(),
         requests: 0,
         model_attempts: Arc::from([]),
+        model_retry_wait_elapsed: Arc::from([]),
         tool_rounds: 0,
         final_config_revision: ConfigRevision::INITIAL,
     });

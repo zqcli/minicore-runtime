@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::time::Instant as TokioInstant;
@@ -115,33 +115,37 @@ pub(super) async fn run_model(
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
     let control = ctx.control;
     let mut state_sink = ctx.sink.clone();
-    let mut update = |value| {
-        let mut state = control.current_state();
-        match value {
-            ModelDriverUpdate::AttemptStarted(attempt) => {
-                state.model_attempts = attempt;
-                if let Some(retry) = &mut state.model_retry {
-                    retry.phase = ModelRetryPhase::Requesting;
+    let mut retry_wait_elapsed = Duration::ZERO;
+    let result = {
+        let mut update = |value| {
+            let mut state = control.current_state();
+            match value {
+                ModelDriverUpdate::AttemptStarted(attempt) => {
+                    state.model_attempts = attempt;
+                    if let Some(retry) = &mut state.model_retry {
+                        retry.phase = ModelRetryPhase::Requesting;
+                    }
+                }
+                ModelDriverUpdate::RetryWaiting(retry) => state.model_retry = Some(retry),
+                ModelDriverUpdate::Finished(elapsed) => {
+                    retry_wait_elapsed = elapsed;
+                    if state.model_retry.take().is_none() {
+                        return;
+                    }
                 }
             }
-            ModelDriverUpdate::RetryWaiting(retry) => state.model_retry = Some(retry),
-            ModelDriverUpdate::Finished => {
-                if state.model_retry.take().is_none() {
-                    return;
+            super::publish(control, &mut state_sink, state);
+        };
+        let run = driver.run_observed(request, context, &progress_tx, &mut update);
+        tokio::pin!(run);
+        loop {
+            tokio::select! {
+                biased;
+                Some(value) = progress_rx.recv() => {
+                    forward_progress(ctx, request_index, value);
                 }
+                result = &mut run => break result,
             }
-        }
-        super::publish(control, &mut state_sink, state);
-    };
-    let run = driver.run_observed(request, context, &progress_tx, &mut update);
-    tokio::pin!(run);
-    let result = loop {
-        tokio::select! {
-            biased;
-            Some(value) = progress_rx.recv() => {
-                forward_progress(ctx, request_index, value);
-            }
-            result = &mut run => break result,
         }
     };
     while let Ok(value) = progress_rx.try_recv() {
@@ -149,6 +153,7 @@ pub(super) async fn run_model(
     }
     ctx.model_attempts
         .push(control.current_state().model_attempts);
+    ctx.model_retry_wait_elapsed.push(retry_wait_elapsed);
     result
 }
 

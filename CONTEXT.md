@@ -6,7 +6,10 @@ model output in the existing final report, and removes arbitrary application
 quotas. The one-loop boundary and 0.9.0 input-pull/start signatures remain.
 Tool-batch statistics are `u64`; there is no round-budget setting. A follow-up
 adds authoritative retry state and per-request actual attempt counts without
-changing the retry policy or public event vocabulary.
+changing the retry policy or public event vocabulary. The retry-wait timing
+follow-up retains actual monotonic backoff elapsed per request in
+`LoopReport.model_retry_wait_elapsed`, including interrupted waits, without
+adding public state or events.
 Each real prompt preparation publishes one `Starting` event. Session-owned
 post-turn/manual summaries and emergency recovery remain Agent policies,
 not new Runtime responsibilities. See the root README compatibility notes.

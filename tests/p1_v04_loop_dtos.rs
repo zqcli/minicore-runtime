@@ -600,6 +600,7 @@ fn loop_report_and_outcome_are_constructible() {
         usage: Usage::new(1, 2, 0),
         requests: 1,
         model_attempts: Arc::from([1]),
+        model_retry_wait_elapsed: Arc::from([Duration::ZERO]),
         tool_rounds: 0,
         final_config_revision: ConfigRevision::INITIAL,
     };

@@ -1,4 +1,4 @@
-//! Authoritative retry state and actual model-call accounting.
+//! Authoritative retry state, actual model calls and elapsed backoff accounting.
 
 mod support;
 
@@ -220,6 +220,7 @@ async fn waiting_uses_source_time_and_actual_start_updates_late_state_without_ev
         assert_eq!(active.model_attempts, 2);
         assert_eq!(active.model_retry.as_ref().unwrap().error, error);
         assert_eq!(model.calls(), [(handle.id(), 0), (handle.id(), 0)]);
+        tokio::time::advance(Duration::from_secs(3)).await;
         release.notify_one();
         history.entered.notified().await;
         let cleared = late
@@ -229,11 +230,13 @@ async fn waiting_uses_source_time_and_actual_start_updates_late_state_without_ev
             .clone();
         assert_eq!(cleared.status, LoopStatus::RunningModel);
         assert_eq!(cleared.model_attempts, 2);
+        tokio::time::advance(Duration::from_secs(7)).await;
         history.release.notify_one();
         let report = agent.join().await.unwrap();
         assert_eq!(report.outcome, LoopOutcome::Completed);
         assert_eq!(report.requests, 1);
         assert_eq!(&*report.model_attempts, [2]);
+        assert_eq!(&*report.model_retry_wait_elapsed, [DELAY]);
         assert!(handle.state().model_retry.is_none());
         assert_eq!(handle.state().model_attempts, 2);
     })
@@ -254,6 +257,7 @@ async fn cancellation_during_wait_clears_before_saving_without_counting_planned_
         waiting(&handle, 2).await;
         let mut watch = handle.watch_state();
         watch.borrow_and_update();
+        tokio::time::advance(Duration::from_millis(750)).await;
         handle.cancel();
         history.entered.notified().await;
         let cleared = watch
@@ -268,6 +272,10 @@ async fn cancellation_during_wait_clears_before_saving_without_counting_planned_
         assert_eq!(report.outcome, LoopOutcome::Cancelled(CancelReason::User));
         assert_eq!(report.requests, 1);
         assert_eq!(&*report.model_attempts, [1]);
+        assert_eq!(
+            &*report.model_retry_wait_elapsed,
+            [Duration::from_millis(750)]
+        );
         assert_eq!(handle.state().model_attempts, 1);
     })
     .await
@@ -311,6 +319,7 @@ async fn failed_and_cancelled_started_retries_clear_before_history_handoff() {
             history.release.notify_one();
             let report = agent.join().await.unwrap();
             assert_eq!(&*report.model_attempts, [2]);
+            assert_eq!(&*report.model_retry_wait_elapsed, [DELAY]);
             if cancel {
                 assert_eq!(report.outcome, LoopOutcome::Cancelled(CancelReason::User));
             } else {
@@ -363,6 +372,7 @@ async fn retry_clears_for_tools_and_resets_at_the_next_logical_request() {
         assert_eq!(tools.request_index, 0);
         assert_eq!(tools.model_attempts, 2);
         assert!(tools.model_retry.is_none());
+        tokio::time::advance(Duration::from_secs(3)).await;
         tool_gate.notify_one();
         let next = watch
             .wait_for(|state| state.request_index == 1 && state.model_attempts == 1)
@@ -380,6 +390,7 @@ async fn retry_clears_for_tools_and_resets_at_the_next_logical_request() {
         assert_eq!(report.outcome, LoopOutcome::Completed);
         assert_eq!(report.requests, 2);
         assert_eq!(&*report.model_attempts, [2, 1]);
+        assert_eq!(&*report.model_retry_wait_elapsed, [DELAY, Duration::ZERO]);
         assert_eq!(handle.state().request_index, 1);
         assert_eq!(handle.state().model_attempts, 1);
         assert!(handle.state().model_retry.is_none());
@@ -406,6 +417,7 @@ async fn no_observer_is_needed_for_retries_or_late_terminal_state() {
         assert_eq!(report.outcome, LoopOutcome::Completed);
         assert_eq!(report.requests, 1);
         assert_eq!(&*report.model_attempts, [3]);
+        assert_eq!(&*report.model_retry_wait_elapsed, [DELAY * 3]);
         assert_eq!(model.calls(), vec![(handle.id(), 0); 3]);
         let mut late = handle.watch_state();
         let state = late.borrow_and_update().clone();
@@ -433,6 +445,7 @@ async fn delayed_events_preserve_four_total_attempts_and_each_preceding_error() 
         let report = agent.join().await.unwrap();
         assert_eq!(report.requests, 1);
         assert_eq!(&*report.model_attempts, [4]);
+        assert_eq!(&*report.model_retry_wait_elapsed, [DELAY * 7]);
         assert_eq!(model.calls(), vec![(handle.id(), 0); 4]);
         let LoopOutcome::Failed(failure) = &report.outcome else {
             panic!("failed")
@@ -491,6 +504,7 @@ async fn retry_after_over_cap_or_not_fitting_deadline_never_schedules_a_shorter_
             let handle = agent.handle();
             let report = agent.join().await.unwrap();
             assert_eq!(&*report.model_attempts, [1]);
+            assert_eq!(&*report.model_retry_wait_elapsed, [Duration::ZERO]);
             assert_eq!(model.calls(), [(handle.id(), 0)]);
             let LoopOutcome::Failed(failure) = &report.outcome else {
                 panic!("failed")
@@ -535,6 +549,7 @@ async fn retry_after_at_cap_uses_the_full_lower_bound() {
         let report = agent.join().await.unwrap();
         assert_eq!(report.outcome, LoopOutcome::Completed);
         assert_eq!(&*report.model_attempts, [2]);
+        assert_eq!(&*report.model_retry_wait_elapsed, [after]);
     })
     .await
     .expect("retry-after lower bound test timed out");
@@ -559,6 +574,7 @@ async fn crossing_original_model_or_loop_deadline_clears_wait_without_another_st
             tokio::time::advance(Duration::from_secs(10)).await;
             let report = agent.join().await.unwrap();
             assert_eq!(&*report.model_attempts, [1]);
+            assert_eq!(&*report.model_retry_wait_elapsed, [Duration::from_secs(10)]);
             assert_eq!(model.calls(), [(handle.id(), 0)]);
             assert!(handle.state().model_retry.is_none());
             if loop_deadline {
@@ -595,6 +611,7 @@ async fn an_event_on_the_retried_attempt_prevents_replay_and_preserves_partial()
         release.notify_one();
         let report = agent.join().await.unwrap();
         assert_eq!(&*report.model_attempts, [2]);
+        assert_eq!(&*report.model_retry_wait_elapsed, [DELAY]);
         assert_eq!(model.calls().len(), 2);
         assert!(handle.state().model_retry.is_none());
         let LoopOutcome::Failed(failure) = &report.outcome else { panic!("failed") };
@@ -653,6 +670,7 @@ async fn failed_next_preparation_keeps_the_last_issued_request_attempt_count() {
         let report = agent.join().await.unwrap();
         assert_eq!(report.requests, 1);
         assert_eq!(&*report.model_attempts, [2]);
+        assert_eq!(&*report.model_retry_wait_elapsed, [DELAY]);
         assert_eq!(handle.state().request_index, 0);
         assert_eq!(handle.state().model_attempts, 2);
         assert!(handle.state().model_retry.is_none());
@@ -676,4 +694,153 @@ async fn failed_next_preparation_keeps_the_last_issued_request_attempt_count() {
     })
     .await
     .expect("failed next preparation test timed out");
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_wait_elapsed_counts_delayed_repolls_separately_for_each_request() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (second, release_second) = gated(Ok(Round::Tools {
+            calls: vec![("echo", "call_retry")],
+        }));
+        let (fourth, release_fourth) = gated(Ok(Round::Final { text: "done" }));
+        let model = AttemptModel::new(vec![
+            failure(retryable("first request", None)),
+            second,
+            failure(retryable("next request", None)),
+            fourth,
+        ]);
+        let mut agent = AgentLoop::start(
+            request(config(
+                model.clone(),
+                tool_set(Arc::default(), ToolBehavior::Succeed),
+                None,
+            )),
+            options(),
+            no_inputs(),
+        )
+        .unwrap();
+        drop(agent.take_events().unwrap());
+        let handle = agent.handle();
+        waiting(&handle, 2).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        requesting(&handle, 2).await;
+        release_second.notify_one();
+        handle
+            .watch_state()
+            .wait_for(|state| {
+                state.request_index == 1
+                    && state
+                        .model_retry
+                        .as_ref()
+                        .is_some_and(|retry| matches!(retry.phase, ModelRetryPhase::Waiting { .. }))
+            })
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(7)).await;
+        requesting(&handle, 2).await;
+        release_fourth.notify_one();
+        let report = agent.join().await.unwrap();
+        assert_eq!(report.outcome, LoopOutcome::Completed);
+        assert_eq!(report.requests, 2);
+        assert_eq!(&*report.model_attempts, [2, 2]);
+        assert_eq!(
+            &*report.model_retry_wait_elapsed,
+            [Duration::from_secs(5), Duration::from_secs(7)]
+        );
+        assert_eq!(
+            model.calls(),
+            [
+                (handle.id(), 0),
+                (handle.id(), 0),
+                (handle.id(), 1),
+                (handle.id(), 1)
+            ]
+        );
+    })
+    .await
+    .expect("elapsed retry wait test timed out");
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_retry_wait_reports_zero_for_success_and_nonretryable_failure() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let error = ModelError::unknown(
+            ModelErrorKind::Unavailable,
+            retryable("not safe to retry", None).diagnostic().clone(),
+        );
+        for result in [Ok(Round::Final { text: "done" }), Err(error.clone())] {
+            let fails = result.is_err();
+            let model = AttemptModel::new(vec![Step { gate: None, result }]);
+            let report = start(model.clone(), options()).join().await.unwrap();
+            assert_eq!(report.requests, 1);
+            assert_eq!(&*report.model_attempts, [1]);
+            assert_eq!(&*report.model_retry_wait_elapsed, [Duration::ZERO]);
+            assert_eq!(model.calls().len(), 1);
+            if fails {
+                let LoopOutcome::Failed(failure) = &report.outcome else {
+                    panic!("failed")
+                };
+                assert_eq!(failure.model_error(), Some(&error));
+            } else {
+                assert_eq!(report.outcome, LoopOutcome::Completed);
+            }
+        }
+    })
+    .await
+    .expect("no retry wait test timed out");
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_wait_entries_distinguish_unstarted_requests_from_unissued_preparations() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CancelOnFinalTake {
+        takes: AtomicUsize,
+        handle: Mutex<Option<LoopHandle>>,
+        rebuild: bool,
+    }
+
+    impl minicore_runtime::LoopInputs for CancelOnFinalTake {
+        fn take(&self) -> Vec<minicore_runtime::UserInput> {
+            if self.takes.fetch_add(1, Ordering::SeqCst) == 1 {
+                assert!(self.handle.lock().unwrap().as_ref().unwrap().cancel());
+                if self.rebuild {
+                    return vec![minicore_runtime::UserInput::text("rebuild").unwrap()];
+                }
+            }
+            Vec::new()
+        }
+    }
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        for rebuild in [false, true] {
+            let model = AttemptModel::new(Vec::new());
+            let inputs = Arc::new(CancelOnFinalTake {
+                takes: AtomicUsize::new(0),
+                handle: Mutex::new(None),
+                rebuild,
+            });
+            let agent = AgentLoop::start(
+                request(config(model.clone(), Default::default(), None)),
+                options(),
+                inputs.clone(),
+            )
+            .unwrap();
+            *inputs.handle.lock().unwrap() = Some(agent.handle());
+            let report = agent.join().await.unwrap();
+            assert_eq!(report.outcome, LoopOutcome::Cancelled(CancelReason::User));
+            assert!(model.calls().is_empty());
+            if rebuild {
+                assert_eq!(report.requests, 0);
+                assert!(report.model_attempts.is_empty());
+                assert!(report.model_retry_wait_elapsed.is_empty());
+            } else {
+                assert_eq!(report.requests, 1);
+                assert_eq!(&*report.model_attempts, [0]);
+                assert_eq!(&*report.model_retry_wait_elapsed, [Duration::ZERO]);
+            }
+        }
+    })
+    .await
+    .expect("unstarted retry accounting test timed out");
 }

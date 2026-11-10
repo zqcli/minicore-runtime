@@ -100,6 +100,58 @@ or tag is claimed by these Runtime checks. Watch coalescing is intentional;
 consumers use the latest state and authoritative per-request report counts,
 not an expectation of every intermediate transition.
 
+### Actual retry-wait timing follow-up
+
+The independent change based on `69faf91` adds
+`LoopReport.model_retry_wait_elapsed: Arc<[Duration]>`, aligned with the existing
+actual-attempt array. The driver measures Tokio monotonic elapsed immediately
+around each retry-wait await and carries its sum through the private `Finished`
+handoff, including waits interrupted by cancellation or a deadline. It does
+not estimate time from a configured delay, wall clock or observer receipt.
+No public state/event, retry policy, task, dependency, provider or host concern
+is added. Existing failure causes, partial output and history barriers remain.
+
+The 14-test retry-state target extends its existing fixtures to verify partial
+wait cancellation, model/loop deadline crossing, multiple waits, delayed events
+and no observation, exhausted retries, exact Retry-After, no-wait success and
+failure, unstarted issued requests versus unissued preparations, per-request
+reset and retained partials. Controlled model/tool/history delays are excluded
+from the reported time. New delayed-repoll coverage records five and seven
+seconds for two separate requests whose scheduled backoffs were each two
+seconds.
+
+Three restored timing mutations fail behavior assertions:
+
+- Replace actual elapsed with scheduled delay: the delayed-repoll test reports
+  `[2s, 2s]` instead of `[5s, 7s]`.
+- Accumulate only after a successful wait: cancellation reports zero instead
+  of the actual 750ms partial wait.
+- Replace the running sum with the last wait: two waits report 4s instead of 6s
+  with no event or state observer.
+
+The mutation targets are respectively
+`retry_wait_elapsed_counts_delayed_repolls_separately_for_each_request`,
+`cancellation_during_wait_clears_before_saving_without_counting_planned_attempt`
+and `no_observer_is_needed_for_retries_or_late_terminal_state`, run with
+`cargo test --all-features --locked --test model_retry_state_contract <name> -- --exact`.
+All 14 tests pass after all mutations are restored.
+
+Final local verification on Linux with Rust/Cargo 1.90.0 and an exclusive target
+folder for this checkout:
+
+- `./scripts/check.sh`: all 324 main-crate tests pass (81 unit and 243 integration
+  across 16 targets), along with fmt, Clippy/rustdoc with warnings denied,
+  docs/architecture mutation self-tests, all 70 acceptance rows and diff checks.
+- `cargo test --all-features --locked --doc`: two compile-fail doctests pass.
+- `cargo test --all-targets --all-features --locked -- --list`: 324 unique tests;
+  `tests/README.md` matches the per-target counts.
+- `cargo test --all-features --locked --test model_retry_state_contract`: all
+  14 tests pass on each of ten consecutive focused repeats.
+
+These are fake-adapter Linux Runtime checks, not Host integration, live-provider
+or macOS/Windows evidence. The provider harness and dependencies are unchanged;
+no remote push or tag is performed by this local change.
+
 ### Historical post-handoff cleanup audit (before quota removal)
 
 The 2026-11-09 audit compared `3fd5ecd..49a6e8b` and checked production, test

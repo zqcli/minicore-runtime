@@ -56,7 +56,7 @@ pub(crate) enum ModelDriverProgress {
 pub(crate) enum ModelDriverUpdate {
     AttemptStarted(u8),
     RetryWaiting(ModelRetryProgress),
-    Finished,
+    Finished(Duration),
 }
 
 type StateUpdate<'a> = &'a mut (dyn FnMut(ModelDriverUpdate) + Send);
@@ -125,8 +125,11 @@ impl ModelDriver {
         progress: &mpsc::UnboundedSender<ModelDriverProgress>,
         update: StateUpdate<'_>,
     ) -> Result<ModelResponse, ModelDriverFailure> {
-        let result = self.run_requests(request, context, progress, update).await;
-        update(ModelDriverUpdate::Finished);
+        let mut retry_wait_elapsed = Duration::ZERO;
+        let result = self
+            .run_requests(request, context, progress, update, &mut retry_wait_elapsed)
+            .await;
+        update(ModelDriverUpdate::Finished(retry_wait_elapsed));
         result
     }
 
@@ -136,6 +139,7 @@ impl ModelDriver {
         context: ModelCallContext,
         progress: &mpsc::UnboundedSender<ModelDriverProgress>,
         update: StateUpdate<'_>,
+        retry_wait_elapsed: &mut Duration,
     ) -> Result<ModelResponse, ModelDriverFailure> {
         let deadline =
             effective_deadline(context.deadline, self.model_call_timeout).map_err(|_| {
@@ -192,14 +196,17 @@ impl ModelDriver {
                                     retry_deadline,
                                 },
                             }));
-                            wait_for_retry(
+                            let wait_started = TokioInstant::now();
+                            let waited = wait_for_retry(
                                 &context,
                                 deadline.tokio(),
                                 deadline.source(),
                                 retry_deadline,
                                 failure.error,
                             )
-                            .await?;
+                            .await;
+                            *retry_wait_elapsed += wait_started.elapsed();
+                            waited?;
                             attempt += 1;
                         }
                         None => return Err(failure.into_driver_failure()),

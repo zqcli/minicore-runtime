@@ -10,7 +10,7 @@ one loop and returns control. Concretely:
   tools, optional policy, prompt provider).
 - **The runtime supplies** `LoopReport` (outcome, `appended` in-memory items,
   optional model `partial`, optional `history_failure`, `usage`, `requests`,
-  per-request `model_attempts`,
+  per-request `model_attempts` and `model_retry_wait_elapsed`,
   `tool_rounds`, final `ConfigRevision`), current
   `LoopState` through `state`/`watch_state`, and an optional best-effort
   `LoopEventStream`.
@@ -59,6 +59,17 @@ for actual invocation accounting. It includes the initial call, and the final
 report retains every request's count at `report.model_attempts[request_index]`.
 Watch updates can coalesce; the report does not require seeing intermediate
 states. An unissued preparation contributes no report entry.
+
+Use `report.model_retry_wait_elapsed[request_index]` for actual accumulated
+backoff time, not a sum of configured delays or time between received states.
+Runtime measures each wait with its monotonic clock through settlement, so
+cancellation includes the elapsed partial wait and delayed re-poll includes
+scheduler delay. Time in prompt preparation, model execution, tools or saving
+is excluded. Zero means no elapsed wait; a request with zero actual starts has
+zero wait. Actual recovery attempts are the actual count minus the initial
+call, using `saturating_sub(1)` for the no-start case. A positive duration alone
+does not prove a recovery attempt started. Neither metric requires an event
+consumer or a state subscription.
 
 Clearing is a normal state update before history handoff, including failure and
 cancellation. Apply `None` to remove a previous retry indicator even when the
